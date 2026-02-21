@@ -711,6 +711,49 @@ def _get_store_name_by_db(db_filename: str) -> str:
         return db_filename or "알 수 없음"
 
 
+def get_store_assigned_employee_names(db_filename: str) -> list[str]:
+    """
+    해당 매장(db_filename)에 배정된 직원(로그인 계정)의 표시명 목록.
+    직원 명부(Master Users + UserStores)와 동일한 소스라서 판매입력 담당 직원으로 사용.
+    반환: [표시명, ...] (name 있으면 name, 없으면 username)
+    """
+    if not db_filename:
+        return []
+    conn = get_master_conn()
+    try:
+        row = conn.execute("SELECT id FROM Stores WHERE db_filename = ?", (db_filename,)).fetchone()
+        if not row:
+            return []
+        store_id = row[0]
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+        if cur.fetchone() is not None:
+            rows = conn.execute(
+                """
+                SELECT u.name, u.username
+                FROM Users u
+                JOIN UserStores us ON u.id = us.user_id
+                WHERE us.store_id = ?
+                ORDER BY u.name, u.username
+                """,
+                (store_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT name, username FROM Users WHERE store_id = ? ORDER BY name, username",
+                (store_id,),
+            ).fetchall()
+        result = []
+        for r in rows:
+            display = (str(r[0] or "").strip() or str(r[1] or "").strip()) or None
+            if display and display not in result:
+                result.append(display)
+        return result
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
 def _get_store_tag_key(store_name: str) -> str:
     """
     채널톡 태그용 매장 키 추출. 예: '울산삼산점' -> '삼산', '학성점' -> '학성'.
@@ -4006,9 +4049,14 @@ def render_new_sales():
     address_detail = st.session_state.get("address_detail", "")
     address_full = " ".join(filter(None, [address_base.strip(), address_detail.strip()])) or None
 
-    emp_names = employees["name"].tolist() if not employees.empty and "name" in employees.columns else []
+    # 담당 직원: 직원 명부(현재 매장 배정 사용자) 우선 사용, 없으면 매장별 직원 마스터(Employees) 사용
+    store_emp_names = get_store_assigned_employee_names(db_filename)
+    if store_emp_names:
+        emp_names = store_emp_names
+    else:
+        emp_names = employees["name"].tolist() if not employees.empty and "name" in employees.columns else []
     if not emp_names:
-        st.warning("등록된 활성 직원이 없습니다. **매장 관리자 메뉴**에서 직원을 추가한 뒤 담당 직원을 선택할 수 있습니다.")
+        st.warning("이 매장에 배정된 직원이 없습니다. **직원 계정 관리**에서 해당 매장을 배정해 주세요. (또는 매장 관리자 메뉴 → 직원 마스터에서 등록)")
     # key로 선택 값 유지(리런 시 초기화 방지), 복수 선택 가능
     selected_employees = st.multiselect(
         "담당 직원 (복수 선택, 1/n 실적 분배 대상) *",
