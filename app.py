@@ -3297,6 +3297,7 @@ def render_employee_management():
                 st.error("관리자 API를 사용할 수 없어 계정을 생성할 수 없습니다.")
             else:
                 with st.spinner("계정 생성 중입니다..."):
+                    supabase_already_exists = False
                     try:
                         admin_client.auth.admin.create_user({
                             "email": str(emp_email).strip(),
@@ -3306,10 +3307,10 @@ def render_employee_management():
                     except Exception as e:
                         err_msg = str(e).strip() or "알 수 없는 오류"
                         if "already been registered" in err_msg or "already exists" in err_msg.lower():
-                            st.error("이미 등록된 이메일입니다. 다른 이메일을 사용해 주세요.")
+                            supabase_already_exists = True
                         else:
                             st.error(f"Supabase 계정 생성에 실패했습니다: {err_msg}")
-                        st.stop()
+                            st.stop()
 
                     store_pairs = _get_store_ids_by_display_names(emp_stores)
                     first_store_id = store_pairs[0][0] if store_pairs else None
@@ -3318,22 +3319,44 @@ def render_employee_management():
                     emp_name_val = str(emp_name).strip() if emp_name else ""
                     conn = get_master_conn()
                     try:
-                        conn.execute(
-                            """
-                            INSERT INTO Users (username, password, email, role, store_id, name)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            """,
-                            (username, hashlib.sha256("supabase_managed".encode()).hexdigest(), str(emp_email).strip(), role, first_store_id, emp_name_val or None),
-                        )
-                        conn.commit()
-                        user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-                        if cur.fetchone() is not None and store_pairs:
-                            for sid, _ in store_pairs:
-                                conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
+                        existing = conn.execute(
+                            "SELECT id FROM Users WHERE email IS NOT NULL AND TRIM(LOWER(email)) = ?",
+                            (username.lower(),),
+                        ).fetchone()
+                        if existing:
+                            user_id = existing[0]
+                            conn.execute(
+                                "UPDATE Users SET name = ?, role = ?, store_id = ? WHERE id = ?",
+                                (emp_name_val or None, role, first_store_id, user_id),
+                            )
+                            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+                            if cur.fetchone() is not None:
+                                conn.execute("DELETE FROM UserStores WHERE user_id = ?", (user_id,))
+                                for sid, _ in store_pairs:
+                                    conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
                             conn.commit()
+                            st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+                        else:
+                            conn.execute(
+                                """
+                                INSERT INTO Users (username, password, email, role, store_id, name)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                """,
+                                (username, hashlib.sha256("supabase_managed".encode()).hexdigest(), str(emp_email).strip(), role, first_store_id, emp_name_val or None),
+                            )
+                            conn.commit()
+                            user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+                            if cur.fetchone() is not None and store_pairs:
+                                for sid, _ in store_pairs:
+                                    conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
+                                conn.commit()
+                            if supabase_already_exists:
+                                st.success("이 이메일은 Supabase에 이미 있어 앱 권한만 부여했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+                            else:
+                                st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
                     except sqlite3.IntegrityError:
-                        st.error("Master DB에 이미 같은 사용자명/이메일이 등록되어 있습니다. Supabase에는 계정이 생성되었을 수 있으니, 관리자에게 문의해 주세요.")
+                        st.error("Master DB에 이미 같은 사용자명/이메일이 등록되어 있습니다. 직원 수정 메뉴에서 기존 직원을 수정해 주세요.")
                         conn.rollback()
                         conn.close()
                         st.stop()
@@ -3345,7 +3368,6 @@ def render_employee_management():
                     finally:
                         conn.close()
 
-                st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
                 st.rerun()
 
     st.subheader("직원 수정 · 매장 변경 · 삭제")
