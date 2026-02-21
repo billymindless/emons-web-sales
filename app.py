@@ -77,6 +77,17 @@ def _inject_mobile_css():
 
 # ========== Supabase 연결 (st.secrets 기반) ==========
 # Customers·Sales는 Supabase 테이블 사용. id(기본키) 기준으로만 단일 행 조회/수정하여 중복·오조회 방지.
+def _sales_tenant_column() -> str | None:
+    """Sales 테이블 테넌트 구분 컬럼명. secrets의 sales_tenant_column 값 사용. 빈 문자열이면 None(단일 테넌트)."""
+    try:
+        val = (st.secrets.get("supabase") or {}).get("sales_tenant_column", "db_filename")
+        if val is None or str(val).strip() == "":
+            return None
+        return str(val).strip()
+    except Exception:
+        return "db_filename"
+
+
 def get_supabase_client():
     """st.secrets에서 URL/Key를 읽어 Supabase 클라이언트 반환. (client, None) 또는 (None, error_message)."""
     if _create_supabase_client is None:
@@ -776,7 +787,11 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
             st.session_state["supabase_error"] = err
         return pd.DataFrame(columns=["transaction_date", "amount"])
     try:
-        q = client.table("Sales").select("transaction_date, amount").eq("db_filename", db_filename).order("id", desc=True)
+        q = client.table("Sales").select("transaction_date, amount")
+        tenant_col = _sales_tenant_column()
+        if tenant_col:
+            q = q.eq(tenant_col, db_filename)
+        q = q.order("id", desc=True)
         if limit:
             q = q.limit(limit)
         r = q.execute()
@@ -974,21 +989,24 @@ def _ensure_tenant_schema(conn: sqlite3.Connection):
 
 
 def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = ""):
-    """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). id는 지정하지 않음(자동증가). db_filename으로 테넌트 구분."""
+    """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). id는 지정하지 않음(자동증가). 테넌트 컬럼은 sales_tenant_column 설정에 따름."""
     client, err = get_supabase_client()
     if err:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = err
         return
     try:
-        client.table("Sales").insert({
+        payload = {
             "order_id": order_id,
             "transaction_date": transaction_date,
             "amount": amount,
             "note": note or "",
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "db_filename": db_filename,
-        }).execute()
+        }
+        tenant_col = _sales_tenant_column()
+        if tenant_col:
+            payload[tenant_col] = db_filename
+        client.table("Sales").insert(payload).execute()
     except Exception as e:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
