@@ -78,14 +78,14 @@ def _inject_mobile_css():
 # ========== Supabase 연결 (st.secrets 기반) ==========
 # Customers·Sales는 Supabase 테이블 사용. id(기본키) 기준으로만 단일 행 조회/수정하여 중복·오조회 방지.
 def _sales_tenant_column() -> str | None:
-    """Sales 테이블 테넌트 구분 컬럼명. secrets의 sales_tenant_column 값 사용. 빈 문자열이면 None(단일 테넌트)."""
+    """Sales 테이블 테넌트 구분 컬럼명. secrets에 sales_tenant_column이 있고 비어있지 않을 때만 사용. 없거나 비면 None(테넌트 컬럼 미사용)."""
     try:
-        val = (st.secrets.get("supabase") or {}).get("sales_tenant_column", "db_filename")
+        val = (st.secrets.get("supabase") or {}).get("sales_tenant_column")
         if val is None or str(val).strip() == "":
             return None
         return str(val).strip()
     except Exception:
-        return "db_filename"
+        return None
 
 
 def get_supabase_client():
