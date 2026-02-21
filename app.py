@@ -776,7 +776,7 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
             st.session_state["supabase_error"] = err
         return pd.DataFrame(columns=["transaction_date", "amount"])
     try:
-        q = client.table("sales").select("transaction_date, amount").eq("db_filename", db_filename).order("id", desc=True)
+        q = client.table("Sales").select("transaction_date, amount").eq("db_filename", db_filename).order("id", desc=True)
         if limit:
             q = q.limit(limit)
         r = q.execute()
@@ -981,7 +981,7 @@ def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date:
             st.session_state["supabase_error"] = err
         return
     try:
-        client.table("sales").insert({
+        client.table("Sales").insert({
             "order_id": order_id,
             "transaction_date": transaction_date,
             "amount": amount,
@@ -3895,8 +3895,10 @@ def render_new_sales():
         conn.close()
     customers = load_customers_cached(db_filename, limit=50)
 
-    # 고객 선택 또는 신규
-    customer_options = ["[신규 고객]"] + customers["name"].tolist()
+    # 고객 선택 또는 신규 (Supabase 오류 시 빈 DataFrame 방어)
+    customer_options = ["[신규 고객]"]
+    if not customers.empty and "name" in customers.columns:
+        customer_options += customers["name"].astype(str).tolist()
     selected_customer_label = st.selectbox("고객 선택 *", customer_options)
     is_new_customer = selected_customer_label == "[신규 고객]"
 
@@ -3905,7 +3907,7 @@ def render_new_sales():
         default_name, default_phone1, default_phone2 = "", "", ""
         default_addr = st.session_state.get("address_manual", "")
     else:
-        row = customers[customers["name"] == selected_customer_label].iloc[0]
+        row = customers[customers["name"].astype(str) == selected_customer_label].iloc[0]
         default_name = row["name"] or ""
         default_phone1 = row["phone1"] or ""
         default_phone2 = row["phone2"] or ""
@@ -4196,7 +4198,7 @@ def render_new_sales():
                     st.stop()
                 customer_id = int(r.data[0]["id"])
             else:
-                customer_id = int(customers[customers["name"] == selected_customer_label]["id"].iloc[0])
+                customer_id = int(customers[customers["name"].astype(str) == selected_customer_label]["id"].iloc[0])
             # 신규 주문 생성 시 초기 잔금 상태(balance_status)도 함께 설정
             conn.execute("""
                 INSERT INTO Orders (customer_id, employee_names, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, display_sales_amount, display_cost_amount, balance_status)
