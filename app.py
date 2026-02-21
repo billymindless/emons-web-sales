@@ -605,7 +605,7 @@ def ensure_master_schema(conn: sqlite3.Connection):
             )
         """)
         conn.commit()
-    # Supabase Auth 연동: Users 테이블에 email 컬럼 추가 (이메일로 앱 사용자 조회)
+    # Supabase Auth 연동: Users 테이블에 email, name 컬럼 추가
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Users'")
     if cur.fetchone() is not None:
         cur2 = conn.execute("PRAGMA table_info(Users)")
@@ -613,6 +613,26 @@ def ensure_master_schema(conn: sqlite3.Connection):
         if "email" not in cols:
             conn.execute("ALTER TABLE Users ADD COLUMN email TEXT")
             conn.commit()
+        if "name" not in cols:
+            conn.execute("ALTER TABLE Users ADD COLUMN name TEXT")
+            conn.commit()
+    # 한 직원이 여러 매장 접근: UserStores (user_id, store_id) 다대다
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+    if cur.fetchone() is None:
+        conn.execute("""
+            CREATE TABLE UserStores (
+                user_id INTEGER NOT NULL REFERENCES Users(id) ON DELETE CASCADE,
+                store_id INTEGER NOT NULL REFERENCES Stores(id) ON DELETE CASCADE,
+                PRIMARY KEY (user_id, store_id)
+            )
+        """)
+        conn.commit()
+        # 기존 Users.store_id를 UserStores로 이전
+        conn.execute("""
+            INSERT OR IGNORE INTO UserStores (user_id, store_id)
+            SELECT id, store_id FROM Users WHERE store_id IS NOT NULL
+        """)
+        conn.commit()
 
 
 def _insert_admin_alert(store_name: str, alert_type: str, message: str):
@@ -1111,6 +1131,49 @@ def get_app_user_by_email(email: str):
         return None
     except Exception:
         return None
+    finally:
+        conn.close()
+
+
+def get_user_allowed_stores(user_id: int):
+    """
+    한 직원이 접근 가능한 매장 목록 (여러 매장 지원).
+    반환: [(store_id, db_filename, store_name), ...] (UserStores 기준, 없으면 Users.store_id 1건으로 대체)
+    superadmin은 이 목록을 쓰지 않고 전체 매장 선택하므로 빈 리스트 또는 불필요.
+    """
+    if not user_id:
+        return []
+    conn = get_master_conn()
+    try:
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+        if cur.fetchone() is None:
+            # UserStores 미존재 시 기존 방식: Users.store_id 1건
+            row = conn.execute("""
+                SELECT u.store_id, s.db_filename, s.store_name
+                FROM Users u
+                LEFT JOIN Stores s ON u.store_id = s.id
+                WHERE u.id = ? AND u.store_id IS NOT NULL
+            """, (user_id,)).fetchone()
+            return [row] if row and row[0] else []
+        rows = conn.execute("""
+            SELECT s.id, s.db_filename, s.store_name
+            FROM UserStores us
+            JOIN Stores s ON us.store_id = s.id
+            WHERE us.user_id = ?
+            ORDER BY s.store_name
+        """, (user_id,)).fetchall()
+        if rows:
+            return [tuple(r) for r in rows]
+        # UserStores에 없으면 Users.store_id 1건으로 fallback
+        row = conn.execute("""
+            SELECT u.store_id, s.db_filename, s.store_name
+            FROM Users u
+            LEFT JOIN Stores s ON u.store_id = s.id
+            WHERE u.id = ? AND u.store_id IS NOT NULL
+        """, (user_id,)).fetchone()
+        return [row] if row and row[0] else []
+    except Exception:
+        return []
     finally:
         conn.close()
 
@@ -1787,10 +1850,14 @@ def render_login():
                                 st.error("이 이메일은 등록된 사용자가 아닙니다. 관리자에게 문의하세요.")
                             else:
                                 user_id, uname, role, store_id, db_filename = app_user
+                                allowed_stores = get_user_allowed_stores(user_id) if role != "superadmin" else []
+                                if allowed_stores:
+                                    store_id, db_filename = allowed_stores[0][0], allowed_stores[0][1]
                                 st.session_state.logged_in = True
                                 st.session_state.current_user = {
                                     "id": user_id, "username": uname, "role": role,
                                     "store_id": store_id, "db_filename": db_filename,
+                                    "allowed_stores": allowed_stores,
                                 }
                                 st.session_state.current_db = db_filename if role != "superadmin" else None
                                 st.session_state["supabase_session"] = {
@@ -3140,18 +3207,54 @@ EMPLOYEE_ROLE_OPTIONS = [
 
 
 def _get_store_id_by_display_name(display_name: str):
-    """배정 매장 표시명(삼산점, 학성점, 양산점, 본사) → Stores.id. 본사는 NULL."""
+    """배정 매장 표시명(삼산점, 학성점, 양산점, 본사) → Stores.id. 본사는 NULL. 정확 일치 후 LIKE(울산삼산점 등) 매칭."""
     if not display_name or str(display_name).strip() == "본사":
         return None
+    n = str(display_name).strip()
     conn = get_master_conn()
     try:
-        row = conn.execute(
-            "SELECT id FROM Stores WHERE TRIM(store_name) = ?",
-            (str(display_name).strip(),),
-        ).fetchone()
-        return row[0] if row else None
+        row = conn.execute("SELECT id FROM Stores WHERE TRIM(store_name) = ?", (n,)).fetchone()
+        if row:
+            return row[0]
+        keyword = n.replace("점", "").strip()
+        if keyword:
+            row = conn.execute(
+                "SELECT id FROM Stores WHERE store_name LIKE ? LIMIT 1",
+                ("%" + keyword + "%",),
+            ).fetchone()
+            return row[0] if row else None
+        return None
     finally:
         conn.close()
+
+
+def _get_store_ids_by_display_names(display_names: list):
+    """배정 매장 표시명 여러 개 → [(store_id, store_name), ...] (본사 제외). 정확 일치 후 LIKE로 매칭(울산삼산점 등)."""
+    result = []
+    seen_ids = set()
+    for name in (display_names or []):
+        n = str(name).strip()
+        if not n or n == "본사":
+            continue
+        conn = get_master_conn()
+        try:
+            row = conn.execute(
+                "SELECT id, store_name FROM Stores WHERE TRIM(store_name) = ?",
+                (n,),
+            ).fetchone()
+            if not row:
+                keyword = n.replace("점", "").strip()
+                if keyword:
+                    row = conn.execute(
+                        "SELECT id, store_name FROM Stores WHERE store_name LIKE ? LIMIT 1",
+                        ("%" + keyword + "%",),
+                    ).fetchone()
+            if row and row[0] not in seen_ids:
+                seen_ids.add(row[0])
+                result.append((row[0], row[1]))
+        finally:
+            conn.close()
+    return result
 
 
 def render_employee_management():
@@ -3168,7 +3271,11 @@ def render_employee_management():
         emp_email = st.text_input("이메일 (로그인 ID)", placeholder="예: employee@example.com", key="emp_email")
         emp_password = st.text_input("초기 비밀번호", type="password", key="emp_password")
         emp_name = st.text_input("직원 이름", placeholder="홍길동", key="emp_name")
-        emp_store = st.selectbox("배정 매장", EMPLOYEE_STORE_OPTIONS, key="emp_store")
+        emp_stores = st.multiselect(
+            "배정 매장 (여러 개 선택 가능, 예: 학성점+양산점)",
+            EMPLOYEE_STORE_OPTIONS,
+            key="emp_stores",
+        )
         emp_role_choice = st.selectbox(
             "부여 권한",
             options=[r[0] for r in EMPLOYEE_ROLE_OPTIONS],
@@ -3204,19 +3311,27 @@ def render_employee_management():
                             st.error(f"Supabase 계정 생성에 실패했습니다: {err_msg}")
                         st.stop()
 
-                    store_id = _get_store_id_by_display_name(emp_store)
+                    store_pairs = _get_store_ids_by_display_names(emp_stores)
+                    first_store_id = store_pairs[0][0] if store_pairs else None
                     username = str(emp_email).strip()
                     role = str(emp_role_choice).strip()
+                    emp_name_val = str(emp_name).strip() if emp_name else ""
                     conn = get_master_conn()
                     try:
                         conn.execute(
                             """
-                            INSERT INTO Users (username, password, email, role, store_id)
-                            VALUES (?, ?, ?, ?, ?)
+                            INSERT INTO Users (username, password, email, role, store_id, name)
+                            VALUES (?, ?, ?, ?, ?, ?)
                             """,
-                            (username, hashlib.sha256("supabase_managed".encode()).hexdigest(), str(emp_email).strip(), role, store_id),
+                            (username, hashlib.sha256("supabase_managed".encode()).hexdigest(), str(emp_email).strip(), role, first_store_id, emp_name_val or None),
                         )
                         conn.commit()
+                        user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+                        if cur.fetchone() is not None and store_pairs:
+                            for sid, _ in store_pairs:
+                                conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
+                            conn.commit()
                     except sqlite3.IntegrityError:
                         st.error("Master DB에 이미 같은 사용자명/이메일이 등록되어 있습니다. Supabase에는 계정이 생성되었을 수 있으니, 관리자에게 문의해 주세요.")
                         conn.rollback()
@@ -3233,18 +3348,89 @@ def render_employee_management():
                 st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
                 st.rerun()
 
+    st.subheader("배정 매장 수정")
+    conn = get_master_conn()
+    try:
+        users_list = pd.read_sql(
+            "SELECT id, username, email, role FROM Users ORDER BY username",
+            conn,
+        )
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+        has_user_stores = cur.fetchone() is not None
+        stores_df = pd.read_sql("SELECT id, store_name FROM Stores ORDER BY store_name", conn) if has_user_stores else pd.DataFrame()
+    finally:
+        conn.close()
+
+    if len(users_list) > 0 and has_user_stores and len(stores_df) > 0:
+        with st.expander("직원별 배정 매장 수정", expanded=False):
+            edit_user_id = st.selectbox(
+                "수정할 직원 선택",
+                users_list["id"].tolist(),
+                format_func=lambda uid: users_list[users_list["id"] == uid].iloc[0]["username"] + " (" + (str(users_list[users_list["id"] == uid].iloc[0]["email"] or "")) + ")",
+                key="emp_edit_user_id",
+            )
+            if edit_user_id:
+                conn = get_master_conn()
+                try:
+                    current = conn.execute(
+                        "SELECT store_id FROM UserStores WHERE user_id = ? ORDER BY store_id",
+                        (edit_user_id,),
+                    ).fetchall()
+                    current_ids = [r[0] for r in current]
+                finally:
+                    conn.close()
+                current_names = stores_df[stores_df["id"].isin(current_ids)]["store_name"].tolist()
+                edited_stores = st.multiselect(
+                    "배정 매장 (여러 개 선택 가능)",
+                    stores_df["store_name"].tolist(),
+                    default=current_names,
+                    key="emp_edit_stores",
+                )
+                if st.button("배정 매장 저장", key="emp_edit_save_btn"):
+                    conn = get_master_conn()
+                    try:
+                        store_ids = stores_df[stores_df["store_name"].isin(edited_stores)]["id"].tolist()
+                        conn.execute("DELETE FROM UserStores WHERE user_id = ?", (edit_user_id,))
+                        for sid in store_ids:
+                            conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (edit_user_id, sid))
+                        first_sid = store_ids[0] if store_ids else None
+                        conn.execute("UPDATE Users SET store_id = ? WHERE id = ?", (first_sid, edit_user_id))
+                        conn.commit()
+                        st.success("배정 매장이 저장되었습니다.")
+                        st.rerun()
+                    except Exception as e:
+                        conn.rollback()
+                        st.error(f"저장 실패: {str(e)}")
+                    finally:
+                        conn.close()
+
     st.subheader("직원 명부")
     conn = get_master_conn()
     try:
-        df = pd.read_sql(
-            """
-            SELECT u.id, u.email, u.username, u.role, s.store_name AS 배정매장
-            FROM Users u
-            LEFT JOIN Stores s ON u.store_id = s.id
-            ORDER BY u.id
-            """,
-            conn,
-        )
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+        if cur.fetchone() is not None:
+            df = pd.read_sql(
+                """
+                SELECT u.id, u.email, u.username, u.name, u.role,
+                    COALESCE(
+                        (SELECT GROUP_CONCAT(s.store_name, ', ') FROM UserStores us JOIN Stores s ON us.store_id = s.id WHERE us.user_id = u.id),
+                        (SELECT s.store_name FROM Stores s WHERE s.id = u.store_id)
+                    ) AS 배정매장
+                FROM Users u
+                ORDER BY u.id
+                """,
+                conn,
+            )
+        else:
+            df = pd.read_sql(
+                """
+                SELECT u.id, u.email, u.username, u.name, u.role, s.store_name AS 배정매장
+                FROM Users u
+                LEFT JOIN Stores s ON u.store_id = s.id
+                ORDER BY u.id
+                """,
+                conn,
+            )
     finally:
         conn.close()
 
@@ -3255,7 +3441,15 @@ def render_employee_management():
     role_display = df["role"].map(lambda r: next((x[1] for x in EMPLOYEE_ROLE_OPTIONS if x[0] == r), r))
     df_display = df.copy()
     df_display["권한"] = role_display
-    df_display = df_display[["id", "email", "username", "권한", "배정매장"]]
+    if "name" in df_display.columns:
+        df_display["사용자명"] = df_display.apply(
+            lambda r: (str(r.get("name") or "").strip() or str(r.get("username") or "")),
+            axis=1,
+        )
+    else:
+        df_display["사용자명"] = df_display["username"]
+    df_display["배정매장"] = df_display["배정매장"].fillna("")
+    df_display = df_display[["id", "email", "사용자명", "권한", "배정매장"]]
     df_display.columns = ["ID", "이메일", "사용자명", "권한", "배정 매장"]
     st.dataframe(df_display, use_container_width=True)
 
@@ -4991,6 +5185,24 @@ def main():
         if "active_admin_page" in st.session_state:
             del st.session_state["active_admin_page"]
         st.rerun()
+    # 한 직원이 여러 매장: 매장 선택 드롭다운 (superadmin 제외)
+    allowed_stores = user.get("allowed_stores") or []
+    if role != "superadmin" and len(allowed_stores) > 1:
+        options = [s[2] for s in allowed_stores]
+        current_sid = user.get("store_id")
+        current_idx = next((i for i, s in enumerate(allowed_stores) if s[0] == current_sid), 0)
+        sel_idx = st.sidebar.selectbox(
+            "매장 선택",
+            range(len(options)),
+            format_func=lambda i: options[i],
+            index=current_idx,
+            key="sidebar_store_sel",
+        )
+        if sel_idx != current_idx:
+            st.session_state.current_user["store_id"] = allowed_stores[sel_idx][0]
+            st.session_state.current_user["db_filename"] = allowed_stores[sel_idx][1]
+            st.session_state.current_db = allowed_stores[sel_idx][1]
+            st.rerun()
     store_display = get_store_display_name(user)
     st.sidebar.markdown(
         f"<div style='padding:0.4rem 0; border-radius:0.4rem;'>"
