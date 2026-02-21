@@ -3348,11 +3348,11 @@ def render_employee_management():
                 st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
                 st.rerun()
 
-    st.subheader("배정 매장 수정")
+    st.subheader("직원 수정 · 매장 변경 · 삭제")
     conn = get_master_conn()
     try:
         users_list = pd.read_sql(
-            "SELECT id, username, email, role FROM Users ORDER BY username",
+            "SELECT id, username, email, role, name FROM Users ORDER BY username",
             conn,
         )
         cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
@@ -3361,48 +3361,168 @@ def render_employee_management():
     finally:
         conn.close()
 
-    if len(users_list) > 0 and has_user_stores and len(stores_df) > 0:
-        with st.expander("직원별 배정 매장 수정", expanded=False):
+    if len(users_list) == 0:
+        st.info("등록된 직원이 없습니다. 신규 등록 후 수정/삭제할 수 있습니다.")
+    else:
+        def _user_label(uid):
+            row = users_list[users_list["id"] == uid].iloc[0]
+            name = (row.get("name") or "").strip() or row.get("username") or ""
+            email = row.get("email") or ""
+            return f"{name} ({email})" if email else name
+
+        # ----- 직원 정보 수정 (이름, 권한, 배정 매장) -----
+        with st.expander("✏️ 직원 정보 수정", expanded=False):
             edit_user_id = st.selectbox(
                 "수정할 직원 선택",
                 users_list["id"].tolist(),
-                format_func=lambda uid: users_list[users_list["id"] == uid].iloc[0]["username"] + " (" + (str(users_list[users_list["id"] == uid].iloc[0]["email"] or "")) + ")",
+                format_func=_user_label,
                 key="emp_edit_user_id",
             )
             if edit_user_id:
                 conn = get_master_conn()
                 try:
-                    current = conn.execute(
+                    row = conn.execute(
+                        "SELECT username, email, role, name FROM Users WHERE id = ?",
+                        (edit_user_id,),
+                    ).fetchone()
+                    current_stores = conn.execute(
                         "SELECT store_id FROM UserStores WHERE user_id = ? ORDER BY store_id",
                         (edit_user_id,),
                     ).fetchall()
-                    current_ids = [r[0] for r in current]
+                    current_store_ids = [r[0] for r in current_stores]
                 finally:
                     conn.close()
-                current_names = stores_df[stores_df["id"].isin(current_ids)]["store_name"].tolist()
-                edited_stores = st.multiselect(
-                    "배정 매장 (여러 개 선택 가능)",
-                    stores_df["store_name"].tolist(),
-                    default=current_names,
-                    key="emp_edit_stores",
+                if row and len(stores_df) > 0:
+                    with st.form("employee_update_form"):
+                        st.text_input("이메일 (로그인 ID)", value=row[1] or "", disabled=True, help="이메일 변경은 불가합니다.")
+                        edit_name = st.text_input("직원 이름", value=(row[3] or "").strip() or (row[0] or ""), key="emp_update_name")
+                        edit_role = st.selectbox(
+                            "권한",
+                            options=[r[0] for r in EMPLOYEE_ROLE_OPTIONS],
+                            format_func=lambda x: next((r[1] for r in EMPLOYEE_ROLE_OPTIONS if r[0] == x), x),
+                            index=next((i for i, r in enumerate(EMPLOYEE_ROLE_OPTIONS) if r[0] == row[2]), 0),
+                            key="emp_update_role",
+                        )
+                        current_names = stores_df[stores_df["id"].isin(current_store_ids)]["store_name"].tolist()
+                        edit_stores = st.multiselect(
+                            "배정 매장 (여러 개 선택 가능)",
+                            stores_df["store_name"].tolist(),
+                            default=current_names,
+                            key="emp_update_stores",
+                        )
+                        if st.form_submit_button("저장"):
+                            conn = get_master_conn()
+                            try:
+                                store_ids = stores_df[stores_df["store_name"].isin(edit_stores)]["id"].tolist()
+                                first_sid = store_ids[0] if store_ids else None
+                                conn.execute(
+                                    "UPDATE Users SET name = ?, role = ?, store_id = ? WHERE id = ?",
+                                    ((edit_name or "").strip() or None, edit_role, first_sid, edit_user_id),
+                                )
+                                conn.execute("DELETE FROM UserStores WHERE user_id = ?", (edit_user_id,))
+                                for sid in store_ids:
+                                    conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (edit_user_id, sid))
+                                conn.commit()
+                                st.success("직원 정보가 저장되었습니다.")
+                                st.rerun()
+                            except Exception as e:
+                                conn.rollback()
+                                st.error(f"저장 실패: {str(e)}")
+                            finally:
+                                conn.close()
+
+        # ----- 직원 매장 변경 (배정 매장만 빠르게 변경) -----
+        if has_user_stores and len(stores_df) > 0:
+            with st.expander("🏪 직원 매장 변경 (배정 매장만)", expanded=False):
+                store_edit_user_id = st.selectbox(
+                    "매장을 변경할 직원 선택",
+                    users_list["id"].tolist(),
+                    format_func=_user_label,
+                    key="emp_store_change_user_id",
                 )
-                if st.button("배정 매장 저장", key="emp_edit_save_btn"):
+                if store_edit_user_id:
                     conn = get_master_conn()
                     try:
-                        store_ids = stores_df[stores_df["store_name"].isin(edited_stores)]["id"].tolist()
-                        conn.execute("DELETE FROM UserStores WHERE user_id = ?", (edit_user_id,))
-                        for sid in store_ids:
-                            conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (edit_user_id, sid))
-                        first_sid = store_ids[0] if store_ids else None
-                        conn.execute("UPDATE Users SET store_id = ? WHERE id = ?", (first_sid, edit_user_id))
-                        conn.commit()
-                        st.success("배정 매장이 저장되었습니다.")
-                        st.rerun()
-                    except Exception as e:
-                        conn.rollback()
-                        st.error(f"저장 실패: {str(e)}")
+                        current = conn.execute(
+                            "SELECT store_id FROM UserStores WHERE user_id = ? ORDER BY store_id",
+                            (store_edit_user_id,),
+                        ).fetchall()
+                        current_ids = [r[0] for r in current]
                     finally:
                         conn.close()
+                    current_names = stores_df[stores_df["id"].isin(current_ids)]["store_name"].tolist()
+                    edited_stores = st.multiselect(
+                        "배정 매장 (여러 개 선택 가능)",
+                        stores_df["store_name"].tolist(),
+                        default=current_names,
+                        key="emp_edit_stores",
+                    )
+                    if st.button("배정 매장 저장", key="emp_edit_save_btn"):
+                        conn = get_master_conn()
+                        try:
+                            store_ids = stores_df[stores_df["store_name"].isin(edited_stores)]["id"].tolist()
+                            conn.execute("DELETE FROM UserStores WHERE user_id = ?", (store_edit_user_id,))
+                            for sid in store_ids:
+                                conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (store_edit_user_id, sid))
+                            first_sid = store_ids[0] if store_ids else None
+                            conn.execute("UPDATE Users SET store_id = ? WHERE id = ?", (first_sid, store_edit_user_id))
+                            conn.commit()
+                            st.success("배정 매장이 저장되었습니다.")
+                            st.rerun()
+                        except Exception as e:
+                            conn.rollback()
+                            st.error(f"저장 실패: {str(e)}")
+                        finally:
+                            conn.close()
+
+        # ----- 직원 삭제 -----
+        with st.expander("🗑️ 직원 삭제", expanded=False):
+            del_user_id = st.selectbox(
+                "삭제할 직원 선택",
+                users_list["id"].tolist(),
+                format_func=_user_label,
+                key="emp_del_user_id",
+            )
+            if del_user_id:
+                del_email = users_list[users_list["id"] == del_user_id].iloc[0].get("email") or ""
+                st.warning(f"**{_user_label(del_user_id)}** 직원을 삭제하면 로그인할 수 없습니다. Supabase 계정도 삭제됩니다.")
+                del_confirm = st.checkbox("위 직원을 삭제하는 것에 동의합니다.", key="emp_del_confirm")
+                if st.button("직원 삭제", key="emp_del_btn", type="primary"):
+                    if not del_confirm:
+                        st.error("삭제하려면 동의 체크박스를 선택해 주세요.")
+                    else:
+                        with st.spinner("삭제 중..."):
+                            try:
+                                if admin_client and not admin_err and del_email:
+                                    try:
+                                        r = admin_client.auth.admin.list_users()
+                                        users = getattr(r, "users", None) or getattr(r, "data", None)
+                                        if users is None and hasattr(r, "model_dump"):
+                                            d = r.model_dump()
+                                            users = d.get("users", d.get("data", []))
+                                        for u in (users or []):
+                                            em = getattr(u, "email", None) if hasattr(u, "email") else (u.get("email") if isinstance(u, dict) else None)
+                                            if em == del_email:
+                                                uid = getattr(u, "id", None) if hasattr(u, "id") else (u.get("id") if isinstance(u, dict) else None)
+                                                if uid:
+                                                    admin_client.auth.admin.delete_user(uid)
+                                                break
+                                    except Exception:
+                                        pass
+                                conn = get_master_conn()
+                                conn.execute("DELETE FROM UserStores WHERE user_id = ?", (del_user_id,))
+                                conn.execute("DELETE FROM Users WHERE id = ?", (del_user_id,))
+                                conn.commit()
+                                conn.close()
+                                st.success("직원이 삭제되었습니다.")
+                                st.rerun()
+                            except Exception as e:
+                                try:
+                                    conn.rollback()
+                                    conn.close()
+                                except Exception:
+                                    pass
+                                st.error(f"삭제 실패: {str(e)}")
 
     st.subheader("직원 명부")
     conn = get_master_conn()
