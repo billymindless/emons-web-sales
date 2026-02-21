@@ -1,0 +1,6 @@
+# .gitignore
+.streamlit/secrets.toml
+databases/
+__pycache__/
+*.db
+.env
