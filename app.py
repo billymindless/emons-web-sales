@@ -43,32 +43,50 @@ st.set_page_config(
 
 
 def _inject_mobile_css():
-    """모바일/스마트폰 환경용 CSS: 반응형 열 배치, 표 여백 최소화, 터치 친화적 입력창·버튼."""
+    """모바일/스마트폰 환경용 CSS: 헤더·로고·여백·간격 전반 개선, 반응형 열·표·터치 친화."""
     st.markdown(
         """
         <style>
-        /* 모바일 구간 (768px 이하) */
+        /* ----- 로고/이미지 최적화: 화면 밖으로 잘리지 않게 (전체 화면) ----- */
+        .block-container img, [data-testid="stSidebar"] img, .stMarkdown img, main img {
+            max-width: 100% !important;
+            height: auto !important;
+            object-fit: contain !important;
+        }
+        .mobile-menu-hint { display: none; }
+        /* ----- 모바일 구간 (768px 이하) ----- */
         @media (max-width: 768px) {
+            /* 반응형 글꼴 크기: 헤더 한 줄에 들어오게 */
+            h1, [data-testid="stMarkdown"] h1 { font-size: 1.5rem !important; line-height: 1.3 !important; font-weight: 600 !important; }
+            h2, [data-testid="stMarkdown"] h2 { font-size: 1.2rem !important; line-height: 1.3 !important; font-weight: 600 !important; }
+            h3, [data-testid="stMarkdown"] h3 { font-size: 1rem !important; line-height: 1.3 !important; font-weight: 600 !important; }
+            /* 여백 최소화: 화면 최대한 넓게 */
+            .block-container {
+                padding-top: 1rem !important;
+                padding-left: 1rem !important;
+                padding-right: 1rem !important;
+                padding-bottom: 1rem !important;
+                max-width: 100% !important;
+            }
+            /* 요소 간격 축소: 입력창·버튼 사이 상하 간격 줄여 스크롤 감소 */
+            [data-testid="stVerticalBlock"] > div { margin-bottom: 0.35rem !important; }
+            .stTextInput, .stNumberInput, [data-testid="stSelectbox"], .stMultiSelect, .stTextArea { margin-bottom: 0.25rem !important; }
+            .stButton > button { margin-bottom: 0.25rem !important; }
             /* 열(columns) 세로 배치 */
             [data-testid="column"] { min-width: 100% !important; }
             [data-testid="stHorizontalBlock"] > div { flex: 1 1 100% !important; min-width: 0 !important; }
-            /* 표 영역 패딩 최소화, 가로 스크롤 자연스럽게 */
+            /* 표 영역 패딩 최소화, 가로 스크롤 */
             [data-testid="stDataFrame"] { padding: 0 2px !important; overflow-x: auto !important; }
             [data-testid="stDataFrame"] > div { margin: 0 !important; max-width: 100vw !important; }
-            /* 메인 블록 패딩 줄이기 */
-            .block-container { padding-top: 1rem !important; padding-left: 0.5rem !important; padding-right: 0.5rem !important; padding-bottom: 1rem !important; max-width: 100% !important; }
             /* 탭 가로 스크롤 */
             [data-testid="stTabs"] > div > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
             [data-testid="stTabs"] [role="tablist"] { flex-wrap: nowrap !important; }
             .mobile-menu-hint { display: block !important; }
-        }
-        .mobile-menu-hint { display: none; }
-        /* 터치 친화: 버튼·입력창 최소 높이 (전체 화면) */
-        @media (max-width: 768px) {
+            /* 터치 친화: 버튼·입력창 최소 높이 */
             button[kind="primary"], button[kind="secondary"], .stButton > button { min-height: 44px !important; padding: 0.5rem 0.75rem !important; font-size: 1rem !important; }
             .stTextInput > div > div > input, .stTextArea > div > div { min-height: 44px !important; font-size: 16px !important; }
             [data-testid="stSelectbox"] > div { min-height: 44px !important; }
-            /* 지도 말풍선(마커 클릭): 모바일 가독성 */
+            /* 지도 말풍선: 모바일 가독성 */
             .leaflet-popup-content .map-popup { font-size: 14px !important; line-height: 1.4 !important; max-width: min(280px, 85vw) !important; padding: 6px 8px !important; }
         }
         /* 지도 말풍선 공통 */
