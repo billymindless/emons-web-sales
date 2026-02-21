@@ -1083,13 +1083,32 @@ def get_app_user_by_email(email: str):
     conn = get_master_conn()
     try:
         email_clean = str(email).strip().lower()
+        # email 컬럼이 없으면 추가 (스키마 호환)
+        cur = conn.execute("PRAGMA table_info(Users)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "email" not in cols:
+            conn.execute("ALTER TABLE Users ADD COLUMN email TEXT")
+            conn.commit()
         row = conn.execute("""
             SELECT u.id, u.username, u.role, u.store_id, s.db_filename
             FROM Users u
             LEFT JOIN Stores s ON u.store_id = s.id
             WHERE u.email IS NOT NULL AND TRIM(u.email) != '' AND LOWER(TRIM(u.email)) = ?
         """, (email_clean,)).fetchone()
-        return row
+        if row is not None:
+            return row
+        # 복구: 해당 이메일이 superadmin 계정(billymind@gmail.com)인데 미연결 상태면 superadmin 행에 이메일 설정 후 재조회
+        if email_clean == "billymind@gmail.com":
+            conn.execute("UPDATE Users SET email = ? WHERE username = 'superadmin'", (email_clean,))
+            conn.commit()
+            row = conn.execute("""
+                SELECT u.id, u.username, u.role, u.store_id, s.db_filename
+                FROM Users u
+                LEFT JOIN Stores s ON u.store_id = s.id
+                WHERE u.email IS NOT NULL AND TRIM(u.email) != '' AND LOWER(TRIM(u.email)) = ?
+            """, (email_clean,)).fetchone()
+            return row
+        return None
     except Exception:
         return None
     finally:
