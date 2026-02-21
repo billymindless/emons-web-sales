@@ -34,7 +34,45 @@ except ImportError:
     _create_supabase_client = None
 
 # 브라우저 탭 타이틀 및 레이아웃 (반드시 최상단에서 호출)
-st.set_page_config(page_title="에몬스판매관리 프로그램", layout="wide")
+# 모바일: 넓은 화면 사용 + 사이드바 접힌 상태로 시작
+st.set_page_config(
+    page_title="에몬스판매관리 프로그램",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+def _inject_mobile_css():
+    """모바일/스마트폰 환경용 CSS: 반응형 열 배치, 표 여백 최소화, 터치 친화적 입력창·버튼."""
+    st.markdown(
+        """
+        <style>
+        /* 모바일 구간 (768px 이하) */
+        @media (max-width: 768px) {
+            /* 열(columns) 세로 배치 */
+            [data-testid="column"] { min-width: 100% !important; }
+            [data-testid="stHorizontalBlock"] > div { flex: 1 1 100% !important; min-width: 0 !important; }
+            /* 표 영역 패딩 최소화, 가로 스크롤 자연스럽게 */
+            [data-testid="stDataFrame"] { padding: 0 2px !important; overflow-x: auto !important; }
+            [data-testid="stDataFrame"] > div { margin: 0 !important; max-width: 100vw !important; }
+            /* 메인 블록 패딩 줄이기 */
+            .block-container { padding-top: 1rem !important; padding-left: 0.5rem !important; padding-right: 0.5rem !important; padding-bottom: 1rem !important; max-width: 100% !important; }
+            /* 탭 가로 스크롤 */
+            [data-testid="stTabs"] > div > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
+            [data-testid="stTabs"] [role="tablist"] { flex-wrap: nowrap !important; }
+            .mobile-menu-hint { display: block !important; }
+        }
+        .mobile-menu-hint { display: none; }
+        /* 터치 친화: 버튼·입력창 최소 높이 (전체 화면) */
+        @media (max-width: 768px) {
+            button[kind="primary"], button[kind="secondary"], .stButton > button { min-height: 44px !important; padding: 0.5rem 0.75rem !important; font-size: 1rem !important; }
+            .stTextInput > div > div > input, .stTextArea > div > div { min-height: 44px !important; font-size: 16px !important; }
+            [data-testid="stSelectbox"] > div { min-height: 44px !important; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ========== Supabase 연결 (st.secrets 기반) ==========
@@ -1442,7 +1480,7 @@ def render_payment_history_monitor():
 
     # 표시용 DataFrame에서는 receipt_image_path 제외 (테이블에는 경로만 보이면 됨)
     display_cols = [c for c in df_f.columns if c != "receipt_image_path"]
-    st.dataframe(df_f[display_cols].style.apply(_highlight_cancel, axis=1), width='stretch')
+    st.dataframe(df_f[display_cols].style.apply(_highlight_cancel, axis=1), use_container_width=True)
 
     # 영수증 이미지가 있는 이력만 아코디언으로 표시
     has_receipts = "receipt_image_path" in df_f.columns and (df_f["receipt_image_path"].notna() & (df_f["receipt_image_path"].astype(str).str.strip() != "")).any()
@@ -2048,7 +2086,7 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig1 = px.pie(region_sales, values="total_amount", names="region", title="① 지역별 매출 분포 (Pie Chart)")
             fig1.update_traces(textposition="inside", textinfo="percent+label", hovertemplate="%{label}<br>매출: %{value:,.0f}원<br>비중: %{percent}<extra></extra>")
             fig1.update_layout(margin=dict(t=40, b=20, l=20, r=20), height=320)
-            st.plotly_chart(fig1, width='stretch')
+            st.plotly_chart(fig1, use_container_width=True)
 
     with c2:
         visit_counts = merged["visit_reason"].fillna("미기입").value_counts().reset_index()
@@ -2060,7 +2098,7 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig2 = go.Figure(data=[go.Pie(labels=visit_counts["visit_reason"], values=visit_counts["count"], hole=0.5, textinfo="percent+label")])
             fig2.update_traces(hovertemplate="%{label}<br>건수: %{value:,}건<extra></extra>")
             fig2.update_layout(title="② 방문 경로 분석", margin=dict(t=40, b=20, l=20, r=20), height=320, showlegend=True)
-            st.plotly_chart(fig2, width='stretch')
+            st.plotly_chart(fig2, use_container_width=True)
 
     with c1:
         purchase_sales = merged.groupby("purchase_reason", as_index=False)["total_amount"].sum()
@@ -2073,7 +2111,7 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig3 = px.bar(purchase_sales, x="total_amount", y="purchase_reason", orientation="h", title="③ 구매 이유별 총 판매 금액")
             fig3.update_traces(hovertemplate="%{y}<br>총액: %{x:,.0f}원<extra></extra>")
             fig3.update_layout(margin=dict(t=40, b=20, l=20, r=20), height=320, xaxis_title="총 판매 금액(원)", yaxis_title="")
-            st.plotly_chart(fig3, width='stretch')
+            st.plotly_chart(fig3, use_container_width=True)
 
     with c2:
         cats = merged["category"].fillna("").str.split(",").explode()
@@ -2088,7 +2126,7 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig4 = px.bar(cat_counts, x="count", y="category", orientation="h", title="④ 카테고리별 인기 품목(판매 횟수)")
             fig4.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
             fig4.update_layout(margin=dict(t=40, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig4, width='stretch')
+            st.plotly_chart(fig4, use_container_width=True)
 
 
 # 지도 기본 중심/줌 (한국)
@@ -2183,7 +2221,7 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
             return
         m = _create_folium_map(map_data, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_single")
         if m:
-            st_folium(m, returned_objects=[], width='stretch', key=f"{key_prefix}_map_single")
+            st_folium(m, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_single")
     else:
         col1, col2 = st.columns(2)
         year1_opts = [str(y) for y in years]
@@ -2205,7 +2243,7 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
                 else:
                     m1 = _create_folium_map(md1, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_m1")
                     if m1:
-                        st_folium(m1, returned_objects=[], width='stretch', key=f"{key_prefix}_map_left")
+                        st_folium(m1, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_left")
         with col2:
             st.caption(f"📅 {y2}년")
             if len(df2) == 0:
@@ -2217,7 +2255,7 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
                 else:
                     m2 = _create_folium_map(md2, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_m2")
                     if m2:
-                        st_folium(m2, returned_objects=[], width='stretch', key=f"{key_prefix}_map_right")
+                        st_folium(m2, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_right")
 
 
 def _render_marketing_multi_period_comparison(
@@ -2258,7 +2296,7 @@ def _render_marketing_multi_period_comparison(
             fig_a1 = px.bar(vc_a, x="count", y="visit_reason", orientation="h", title="방문 경로별 고객 수")
             fig_a1.update_traces(hovertemplate="%{y}<br>건수: %{x:,}건<extra></extra>")
             fig_a1.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, yaxis_title="", xaxis_title="건수")
-            st.plotly_chart(fig_a1, width='stretch', key=f"{key_prefix}_visit_route_a")
+            st.plotly_chart(fig_a1, use_container_width=True, key=f"{key_prefix}_visit_route_a")
     with c2:
         st.caption(f"기간 B: {label_b}")
         vc_b = df_period_b["visit_reason"].fillna("미기입").value_counts().reset_index()
@@ -2269,7 +2307,7 @@ def _render_marketing_multi_period_comparison(
             fig_b1 = px.bar(vc_b, x="count", y="visit_reason", orientation="h", title="방문 경로별 고객 수")
             fig_b1.update_traces(hovertemplate="%{y}<br>건수: %{x:,}건<extra></extra>")
             fig_b1.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, yaxis_title="", xaxis_title="건수")
-            st.plotly_chart(fig_b1, width='stretch', key=f"{key_prefix}_visit_route_b")
+            st.plotly_chart(fig_b1, use_container_width=True, key=f"{key_prefix}_visit_route_b")
 
     # ---------- ② 구매 이유별 총판매금액: 세로형 막대, y축 콤마 포맷 ----------
     st.subheader("② 구매 이유별 총판매금액")
@@ -2286,7 +2324,7 @@ def _render_marketing_multi_period_comparison(
             fig_a2.update_traces(hovertemplate="%{x}<br>총액: %{y:,.0f}원<extra></extra>")
             fig_a2.update_layout(margin=dict(t=30, b=80, l=20, r=20), height=320, xaxis_title="", yaxis_title="총 판매금액(원)", xaxis_tickangle=-45)
             fig_a2.update_yaxes(tickformat=",", title="총 판매금액(원)")
-            st.plotly_chart(fig_a2, width='stretch', key=f"{key_prefix}_purchase_reason_a")
+            st.plotly_chart(fig_a2, use_container_width=True, key=f"{key_prefix}_purchase_reason_a")
     with c2:
         st.caption(f"기간 B: {label_b}")
         pr_b = df_period_b.groupby("purchase_reason", as_index=False)["total_amount"].sum()
@@ -2299,7 +2337,7 @@ def _render_marketing_multi_period_comparison(
             fig_b2.update_traces(hovertemplate="%{x}<br>총액: %{y:,.0f}원<extra></extra>")
             fig_b2.update_layout(margin=dict(t=30, b=80, l=20, r=20), height=320, xaxis_title="", yaxis_title="총 판매금액(원)", xaxis_tickangle=-45)
             fig_b2.update_yaxes(tickformat=",", title="총 판매금액(원)")
-            st.plotly_chart(fig_b2, width='stretch', key=f"{key_prefix}_purchase_reason_b")
+            st.plotly_chart(fig_b2, use_container_width=True, key=f"{key_prefix}_purchase_reason_b")
 
     # ---------- ③ 카테고리별 인기 품목 Top 10: 가로형 막대 또는 DataFrame ----------
     st.subheader("③ 카테고리별 인기 품목 (Top 10)")
@@ -2317,8 +2355,8 @@ def _render_marketing_multi_period_comparison(
             fig_a3 = px.bar(cat_a, x="판매건수", y="품목", orientation="h", title="품목별 판매 횟수 Top 10")
             fig_a3.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
             fig_a3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig_a3, width='stretch', key=f"{key_prefix}_category_top10_a")
-            st.dataframe(cat_a[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_a", height=min(280, 50 + len(cat_a) * 32))
+            st.plotly_chart(fig_a3, use_container_width=True, key=f"{key_prefix}_category_top10_a")
+            st.dataframe(cat_a[["순위", "품목", "판매건수"]], use_container_width=True, key=f"{key_prefix}_category_df_a", height=min(280, 50 + len(cat_a) * 32))
     with c2:
         st.caption(f"기간 B: {label_b}")
         cats_b = df_period_b["category"].fillna("").str.split(",").explode().str.strip()
@@ -2332,8 +2370,8 @@ def _render_marketing_multi_period_comparison(
             fig_b3 = px.bar(cat_b, x="판매건수", y="품목", orientation="h", title="품목별 판매 횟수 Top 10")
             fig_b3.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
             fig_b3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig_b3, width='stretch', key=f"{key_prefix}_category_top10_b")
-            st.dataframe(cat_b[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_b", height=min(280, 50 + len(cat_b) * 32))
+            st.plotly_chart(fig_b3, use_container_width=True, key=f"{key_prefix}_category_top10_b")
+            st.dataframe(cat_b[["순위", "품목", "판매건수"]], use_container_width=True, key=f"{key_prefix}_category_df_b", height=min(280, 50 + len(cat_b) * 32))
 
     # ---------- ④ 지역별 매출 분포 지도 (Folium 좌우 비교) ----------
     st.subheader("④ 지역별 매출 분포 지도")
@@ -2410,7 +2448,7 @@ def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str,
         return
     m = _create_folium_map(map_data, _MAP_CENTER, _MAP_ZOOM, key_prefix)
     if m:
-        st_folium(m, returned_objects=[], width='stretch', key=f"{key_prefix}_single_map")
+        st_folium(m, returned_objects=[], use_container_width=True, key=f"{key_prefix}_single_map")
 
 
 def render_marketing_insights_superadmin():
@@ -2575,7 +2613,7 @@ def _superadmin_tab1_integrated_dashboard():
     rank_df = pd.DataFrame(rows).sort_values("이번 달 판매금액", ascending=False).reset_index(drop=True)
     rank_df["순위"] = range(1, len(rank_df) + 1)
     rank_display = _format_df_display(rank_df[["순위", "매장명", "이번 달 판매금액", "미수금 합계"]], ["이번 달 판매금액", "미수금 합계"])
-    st.dataframe(rank_display, width='stretch')
+    st.dataframe(rank_display, use_container_width=True)
 
 
 def _superadmin_tab2_hr_store_employees():
@@ -2664,7 +2702,7 @@ def _superadmin_tab2_hr_store_employees():
     emp_df["전시품 판매액"] = emp_df["display_sales"].round(0).astype(int)
     display_df = emp_df[["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]].rename(columns={"employee": "직원명"})
     display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
-    st.dataframe(display_fmt, width='stretch')
+    st.dataframe(display_fmt, use_container_width=True)
 
 
 def _superadmin_tab3_notices():
@@ -2889,7 +2927,7 @@ def _superadmin_tab_unpaid_report():
         return
     out_df = pd.DataFrame(rows)
     display_df = _format_df_display(out_df, ["총판매금액", "미수금액(잔금)"])
-    st.dataframe(display_df, width='stretch')
+    st.dataframe(display_df, use_container_width=True)
     csv_str = out_df.to_csv(index=False)
     try:
         csv_content = csv_str.encode("cp949")
@@ -3177,7 +3215,7 @@ def render_monthly_payment_report(is_superadmin: bool):
     pivot = pivot.astype(int)
 
     display_df = pivot.map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
-    st.dataframe(display_df, width='stretch')
+    st.dataframe(display_df, use_container_width=True)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -3261,6 +3299,13 @@ def render_employee_management():
     """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + Master DB Users 반영. superadmin 전용."""
     st.header("👥 직원 계정 관리 및 발령")
 
+    conn = get_master_conn()
+    try:
+        all_stores_df = pd.read_sql("SELECT id, store_name FROM Stores ORDER BY store_name", conn)
+    finally:
+        conn.close()
+    store_options = all_stores_df["store_name"].tolist() if len(all_stores_df) > 0 else []
+
     admin_client, admin_err = get_supabase_admin_client()
     if admin_err:
         st.error(f"⚠️ {admin_err}")
@@ -3272,9 +3317,10 @@ def render_employee_management():
         emp_password = st.text_input("초기 비밀번호", type="password", key="emp_password")
         emp_name = st.text_input("직원 이름", placeholder="홍길동", key="emp_name")
         emp_stores = st.multiselect(
-            "배정 매장 (여러 개 선택 가능, 예: 학성점+양산점)",
-            EMPLOYEE_STORE_OPTIONS,
+            "배정 매장 (여러 개 선택 가능)",
+            store_options,
             key="emp_stores",
+            help="등록된 매장 목록에서 선택합니다. 매장이 없으면 최고관리자 메뉴 → ⑤ 매장 계정 관리에서 먼저 매장을 추가하세요.",
         )
         emp_role_choice = st.selectbox(
             "부여 권한",
@@ -3312,8 +3358,8 @@ def render_employee_management():
                             st.error(f"Supabase 계정 생성에 실패했습니다: {err_msg}")
                             st.stop()
 
-                    store_pairs = _get_store_ids_by_display_names(emp_stores)
-                    first_store_id = store_pairs[0][0] if store_pairs else None
+                    selected_store_ids = all_stores_df[all_stores_df["store_name"].isin(emp_stores or [])]["id"].tolist()
+                    first_store_id = selected_store_ids[0] if selected_store_ids else None
                     username = str(emp_email).strip()
                     role = str(emp_role_choice).strip()
                     emp_name_val = str(emp_name).strip() if emp_name else ""
@@ -3330,9 +3376,9 @@ def render_employee_management():
                                 (emp_name_val or None, role, first_store_id, user_id),
                             )
                             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-                            if cur.fetchone() is not None:
+                            if cur.fetchone() is not None and selected_store_ids:
                                 conn.execute("DELETE FROM UserStores WHERE user_id = ?", (user_id,))
-                                for sid, _ in store_pairs:
+                                for sid in selected_store_ids:
                                     conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
                             conn.commit()
                             st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
@@ -3347,8 +3393,8 @@ def render_employee_management():
                             conn.commit()
                             user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-                            if cur.fetchone() is not None and store_pairs:
-                                for sid, _ in store_pairs:
+                            if cur.fetchone() is not None and selected_store_ids:
+                                for sid in selected_store_ids:
                                     conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
                                 conn.commit()
                             if supabase_already_exists:
@@ -3379,7 +3425,6 @@ def render_employee_management():
         )
         cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
         has_user_stores = cur.fetchone() is not None
-        stores_df = pd.read_sql("SELECT id, store_name FROM Stores ORDER BY store_name", conn) if has_user_stores else pd.DataFrame()
     finally:
         conn.close()
 
@@ -3414,7 +3459,7 @@ def render_employee_management():
                     current_store_ids = [r[0] for r in current_stores]
                 finally:
                     conn.close()
-                if row and len(stores_df) > 0:
+                if row and len(all_stores_df) > 0:
                     with st.form("employee_update_form"):
                         st.text_input("이메일 (로그인 ID)", value=row[1] or "", disabled=True, help="이메일 변경은 불가합니다.")
                         edit_name = st.text_input("직원 이름", value=(row[3] or "").strip() or (row[0] or ""), key="emp_update_name")
@@ -3425,17 +3470,17 @@ def render_employee_management():
                             index=next((i for i, r in enumerate(EMPLOYEE_ROLE_OPTIONS) if r[0] == row[2]), 0),
                             key="emp_update_role",
                         )
-                        current_names = stores_df[stores_df["id"].isin(current_store_ids)]["store_name"].tolist()
+                        current_names = all_stores_df[all_stores_df["id"].isin(current_store_ids)]["store_name"].tolist()
                         edit_stores = st.multiselect(
                             "배정 매장 (여러 개 선택 가능)",
-                            stores_df["store_name"].tolist(),
+                            all_stores_df["store_name"].tolist(),
                             default=current_names,
                             key="emp_update_stores",
                         )
                         if st.form_submit_button("저장"):
                             conn = get_master_conn()
                             try:
-                                store_ids = stores_df[stores_df["store_name"].isin(edit_stores)]["id"].tolist()
+                                store_ids = all_stores_df[all_stores_df["store_name"].isin(edit_stores)]["id"].tolist()
                                 first_sid = store_ids[0] if store_ids else None
                                 conn.execute(
                                     "UPDATE Users SET name = ?, role = ?, store_id = ? WHERE id = ?",
@@ -3454,7 +3499,7 @@ def render_employee_management():
                                 conn.close()
 
         # ----- 직원 매장 변경 (배정 매장만 빠르게 변경) -----
-        if has_user_stores and len(stores_df) > 0:
+        if has_user_stores and len(all_stores_df) > 0:
             with st.expander("🏪 직원 매장 변경 (배정 매장만)", expanded=False):
                 store_edit_user_id = st.selectbox(
                     "매장을 변경할 직원 선택",
@@ -3472,17 +3517,17 @@ def render_employee_management():
                         current_ids = [r[0] for r in current]
                     finally:
                         conn.close()
-                    current_names = stores_df[stores_df["id"].isin(current_ids)]["store_name"].tolist()
+                    current_names = all_stores_df[all_stores_df["id"].isin(current_ids)]["store_name"].tolist()
                     edited_stores = st.multiselect(
                         "배정 매장 (여러 개 선택 가능)",
-                        stores_df["store_name"].tolist(),
+                        all_stores_df["store_name"].tolist(),
                         default=current_names,
                         key="emp_edit_stores",
                     )
                     if st.button("배정 매장 저장", key="emp_edit_save_btn"):
                         conn = get_master_conn()
                         try:
-                            store_ids = stores_df[stores_df["store_name"].isin(edited_stores)]["id"].tolist()
+                            store_ids = all_stores_df[all_stores_df["store_name"].isin(edited_stores)]["id"].tolist()
                             conn.execute("DELETE FROM UserStores WHERE user_id = ?", (store_edit_user_id,))
                             for sid in store_ids:
                                 conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (store_edit_user_id, sid))
@@ -3658,7 +3703,7 @@ def render_store_admin_employees():
         if len(alerts) > 0:
             st.subheader("관리자 알림 (마진율 이상 등)")
             alerts_disp = alerts.rename(columns={"created_at": "발생 시각", "store_name": "매장", "alert_type": "유형", "message": "내용"})
-            st.dataframe(alerts_disp[["발생 시각", "매장", "유형", "내용"]], width='stretch')
+            st.dataframe(alerts_disp[["발생 시각", "매장", "유형", "내용"]], use_container_width=True)
         else:
             st.caption("최근 관리자 알림 없음 (마진율 이상 등록 시 여기에 표시됩니다).")
     except Exception:
@@ -4587,7 +4632,7 @@ def render_customer_balance():
                 orders["balance"] = orders["total_amount"] - orders["paid"]
                 orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
                 num_cols = [c for c in ["cost_price", "total_amount", "paid", "balance"] if c in orders.columns]
-                st.dataframe(_format_df_display(orders, num_cols), width='stretch')
+                st.dataframe(_format_df_display(orders, num_cols), use_container_width=True)
                 # 선택된 주문의 변경 이력 보기
                 with st.expander("선택 주문 변경 이력 보기"):
                     hist_oid = st.selectbox("주문 선택 (변경 이력 조회용)", orders["id"].tolist(), key="gen_order_history_sel")
@@ -4792,7 +4837,7 @@ def render_customer_balance():
                         pay_display["amount"] = pay_display["amount"].apply(lambda x: f"{x:,.0f}원")
                         pay_display["fee_amount"] = pay_display["fee_amount"].fillna(0).apply(lambda x: f"{x:,.0f}원")
                         pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사", "fee_amount": "수수료"})
-                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사", "수수료"]], width='stretch')
+                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사", "수수료"]], use_container_width=True)
                         order_row = orders[orders["id"] == order_id_pay].iloc[0]
                         total_sales = float(order_row["total_amount"] or 0)
                         current_balance = float(order_row["balance"] or 0)
@@ -4925,7 +4970,7 @@ def render_customer_balance():
             if len(list_d10) > 0:
                 list_d10["배송일"] = list_d10["delivery_date"].dt.strftime("%Y-%m-%d") if pd.api.types.is_datetime64_any_dtype(list_d10["delivery_date"]) else list_d10["delivery_date"].astype(str)
                 df_d10 = list_d10[["name", "phone1", "배송일", "category", "employee_names", "balance"]].rename(columns={"name": "고객명", "phone1": "전화번호", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
-                st.dataframe(_format_df_display(df_d10, ["잔금"]), width='stretch')
+                st.dataframe(_format_df_display(df_d10, ["잔금"]), use_container_width=True)
                 for _, row in list_d10.iterrows():
                     with st.expander(f"💰 {row['name']} — 잔금 {row['balance']:,.0f}원"):
                         _customer_balance_payment_ui(db_filename, row["id"], row["balance"], key_prefix=f"d10_{row['id']}")
@@ -4952,7 +4997,7 @@ def render_customer_balance():
             if len(list_overdue) > 0:
                 list_overdue["배송일"] = list_overdue["delivery_date"].dt.strftime("%Y-%m-%d")
                 df_over = list_overdue[["name", "phone1", "배송일", "category", "employee_names", "balance"]].rename(columns={"name": "고객명", "phone1": "전화번호", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
-                st.dataframe(_format_df_display(df_over, ["잔금"]), width='stretch')
+                st.dataframe(_format_df_display(df_over, ["잔금"]), use_container_width=True)
                 for _, row in list_overdue.iterrows():
                     with st.expander(f"🚨 {row['name']} — 잔금 {row['balance']:,.0f}원 (배송일 지남)"):
                         _customer_balance_payment_ui(db_filename, row["id"], row["balance"], key_prefix=f"over_{row['id']}")
@@ -5013,7 +5058,7 @@ def render_dashboard():
                 show_df = disp[["주문ID", "고객명", "총액", "결제합계", "실잔금", "표시상태"]].copy()
                 for col in ("총액", "결제합계", "실잔금"):
                     show_df[col] = show_df[col].apply(_fmt_num)
-                st.dataframe(show_df, width='stretch')
+                st.dataframe(show_df, use_container_width=True)
                 st.caption("결제 금액을 수정하려면 **고객 및 잔금 관리** → 고객 선택 → **결제 내역 조회 및 취소** / **잔금 추가 결제**에서 해당 주문을 수정하세요.")
             if st.button("🔄 잔금 상태 자동 보정 (결제 합계 기준으로 완납/미납 다시 계산)", key="dashboard_balance_fix_btn"):
                 conn = get_tenant_conn(db_filename)
@@ -5095,7 +5140,7 @@ def render_dashboard():
             unpaid_list["배송일"] = unpaid_list["배송일"].dt.strftime("%Y-%m-%d")
         if len(unpaid_list) > 0:
             unpaid_display = _format_df_display(unpaid_list, ["잔금"])
-            st.dataframe(unpaid_display, width='stretch')
+            st.dataframe(unpaid_display, use_container_width=True)
         else:
             st.info("해당 조건의 미수금 고객이 없습니다. (배송일 10일 이내·잔금 있음)")
     else:
@@ -5186,7 +5231,7 @@ def render_dashboard():
                 emp_df["전시품 판매액"] = emp_df["display_sales"].round(0).astype(int)
                 display_df = emp_df[["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]].rename(columns={"employee": "직원명"})
                 display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
-                st.dataframe(display_fmt, width='stretch')
+                st.dataframe(display_fmt, use_container_width=True)
             else:
                 st.info("선택한 월에 직원이 배정된 주문이 없습니다.")
         else:
@@ -5270,6 +5315,7 @@ def main():
     finally:
         conn_m.close()
     ensure_session()
+    _inject_mobile_css()
 
     # Supabase Auth: 로그인하지 않았으면 로그인 화면만 표시
     if not st.session_state.logged_in:
@@ -5323,7 +5369,7 @@ def main():
     """
     st.sidebar.markdown(clickable_logo_html, unsafe_allow_html=True)
     # 홈 버튼: 세션 상태만 초기화하고 rerun하여 로그아웃 없이 대시보드로 안전하게 복귀
-    if st.sidebar.button("🏠 첫 화면으로 (대시보드)", width='stretch', key="sidebar_home_btn"):
+    if st.sidebar.button("🏠 첫 화면으로 (대시보드)", use_container_width=True, key="sidebar_home_btn"):
         if "active_admin_page" in st.session_state:
             del st.session_state["active_admin_page"]
         st.rerun()
@@ -5379,13 +5425,13 @@ def main():
     st.sidebar.divider()
     # 관리자 전용: 결제 변경/취소 모니터링 화면 진입 버튼
     if role in ("store_admin", "superadmin"):
-        if st.sidebar.button("🚨 결제 변경/취소 모니터링", width='stretch'):
+        if st.sidebar.button("🚨 결제 변경/취소 모니터링", use_container_width=True):
             st.session_state["active_admin_page"] = "payment_monitor"
     # 최고 관리자 전용: 직원 계정 관리 및 발령
     if role == "superadmin":
-        if st.sidebar.button("👥 직원 관리", width='stretch'):
+        if st.sidebar.button("👥 직원 관리", use_container_width=True):
             st.session_state["active_admin_page"] = "employee_management"
-    if st.sidebar.button("🚪 로그아웃", width='stretch'):
+    if st.sidebar.button("🚪 로그아웃", use_container_width=True):
         try:
             client, _ = get_supabase_client()
             if client:
@@ -5411,28 +5457,43 @@ def main():
         render_superadmin()
         return
 
-    # 일반/매장 관리자: 경영 대시보드 + 마케팅 인사이트 등 탭
+    # 일반/매장 관리자: 메뉴를 상단 셀렉트로 노출 (모바일에서도 잘 보이게)
     if role == "store_admin":
-        tabs = ["경영 대시보드", "📊 마케팅 인사이트", "새로운 매출 등록", "고객 및 잔금 관리", "매장 관리자 메뉴", "월별 결제수단 집계표"]
+        tab_labels = ["경영 대시보드", "📊 마케팅 인사이트", "새로운 매출 등록", "고객 및 잔금 관리", "매장 관리자 메뉴", "월별 결제수단 집계표"]
     else:
-        tabs = ["경영 대시보드", "📊 마케팅 인사이트", "새로운 매출 등록", "고객 및 잔금 관리"]
-    # Supabase 연결 실패 시 친절한 경고 (load_customers_cached/load_sales_cached 등에서 설정됨)
+        tab_labels = ["경영 대시보드", "📊 마케팅 인사이트", "새로운 매출 등록", "고객 및 잔금 관리"]
+    if "main_tab_idx" not in st.session_state:
+        st.session_state["main_tab_idx"] = 0
+    if st.session_state["main_tab_idx"] >= len(tab_labels):
+        st.session_state["main_tab_idx"] = 0
+    # Supabase 연결 실패 시 친절한 경고
     if st.session_state.get("supabase_error"):
         st.error("⚠️ **Supabase 연결 실패**: " + st.session_state["supabase_error"] + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
-    t = st.tabs(tabs)
-    with t[0]:
+    # 상단 메뉴 선택 (스마트폰에서 탭이 잘리지 않도록 셀렉트박스로 제공)
+    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
+    st.markdown('<p class="mobile-menu-hint" style="margin:0 0 0.35rem 0; font-size:0.8rem; color:#888;">로그아웃·비밀번호는 왼쪽 상단 ☰에서</p>', unsafe_allow_html=True)
+    menu_sel = st.selectbox(
+        "메뉴",
+        tab_labels,
+        index=st.session_state["main_tab_idx"],
+        key="main_menu_select",
+        label_visibility="collapsed",
+    )
+    idx = tab_labels.index(menu_sel)
+    st.session_state["main_tab_idx"] = idx
+    st.divider()
+    if idx == 0:
         render_dashboard()
-    with t[1]:
+    elif idx == 1:
         render_marketing_insights_tenant()
-    with t[2]:
+    elif idx == 2:
         render_new_sales()
-    with t[3]:
+    elif idx == 3:
         render_customer_balance()
-    if role == "store_admin":
-        with t[4]:
-            render_store_admin_employees()
-        with t[5]:
-            render_monthly_payment_report(is_superadmin=False)
+    elif role == "store_admin" and idx == 4:
+        render_store_admin_employees()
+    elif role == "store_admin" and idx == 5:
+        render_monthly_payment_report(is_superadmin=False)
 
 
 if __name__ == "__main__":
