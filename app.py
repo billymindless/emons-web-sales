@@ -787,7 +787,7 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
             st.session_state["supabase_error"] = err
         return pd.DataFrame(columns=["transaction_date", "amount"])
     try:
-        q = client.table("Sales").select("transaction_date, amount")
+        q = client.table("sales").select("transaction_date, amount")
         tenant_col = _sales_tenant_column()
         if tenant_col:
             q = q.eq(tenant_col, db_filename)
@@ -1006,7 +1006,7 @@ def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date:
         tenant_col = _sales_tenant_column()
         if tenant_col:
             payload[tenant_col] = db_filename
-        client.table("Sales").insert(payload).execute()
+        client.table("sales").insert(payload).execute()
     except Exception as e:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
