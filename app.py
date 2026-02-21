@@ -67,6 +67,48 @@ def get_supabase_client_or_warn():
     return client
 
 
+def get_supabase_client_with_auth_session():
+    """
+    로그인된 사용자의 Supabase 세션을 복원한 클라이언트 반환.
+    비밀번호 변경(update_user) 등 인증이 필요한 API 호출 시 사용.
+    반환: (client, None) 또는 (None, error_message).
+    """
+    client, err = get_supabase_client()
+    if err or client is None:
+        return None, err or "Supabase 클라이언트를 사용할 수 없습니다."
+    sess = st.session_state.get("supabase_session")
+    if isinstance(sess, dict) and sess.get("access_token") and sess.get("refresh_token"):
+        try:
+            client.auth.set_session(sess["access_token"], sess["refresh_token"])
+        except Exception as e:
+            return None, f"세션 복원 실패: {str(e)}"
+    return client, None
+
+
+def get_supabase_admin_client():
+    """
+    Supabase Admin API용 클라이언트 (service_role_key 사용).
+    직원 계정 생성 등 관리자 전용 작업 시 사용. 현재 로그인 세션에 영향 없음.
+    반환: (client, None) 또는 (None, error_message).
+    """
+    if _create_supabase_client is None:
+        return None, "Supabase 라이브러리가 설치되지 않았습니다."
+    try:
+        secrets = st.secrets.get("supabase") or {}
+        url = (secrets.get("url") or "").strip()
+        if not url:
+            return None, "Supabase URL이 설정되지 않았습니다."
+        # service_role_key: secrets.toml의 service_role_key 또는 환경변수 SUPABASE_SERVICE_ROLE_KEY
+        key = (secrets.get("service_role_key") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+        if not key:
+            return None, "직원 계정 생성을 위해 Supabase service_role_key가 필요합니다. .streamlit/secrets.toml에 [supabase] service_role_key를 추가하거나, 환경변수 SUPABASE_SERVICE_ROLE_KEY를 설정해 주세요."
+        client = _create_supabase_client(url, key)
+        return client, None
+    except Exception as e:
+        err_msg = str(e).strip() or "연결 오류가 발생했습니다."
+        return None, f"Supabase Admin 연결 실패: {err_msg}"
+
+
 def _get_customer_name_supabase(db_filename: str, customer_id: int) -> str:
     """Supabase customers 테이블에서 id(기본키) 기준으로 고객명 조회. 중복 없이 단일 행만 반환."""
     client, err = get_supabase_client()
@@ -563,6 +605,14 @@ def ensure_master_schema(conn: sqlite3.Connection):
             )
         """)
         conn.commit()
+    # Supabase Auth 연동: Users 테이블에 email 컬럼 추가 (이메일로 앱 사용자 조회)
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Users'")
+    if cur.fetchone() is not None:
+        cur2 = conn.execute("PRAGMA table_info(Users)")
+        cols = [row[1] for row in cur2.fetchall()]
+        if "email" not in cols:
+            conn.execute("ALTER TABLE Users ADD COLUMN email TEXT")
+            conn.commit()
 
 
 def _insert_admin_alert(store_name: str, alert_type: str, message: str):
@@ -1018,6 +1068,30 @@ def verify_user(username: str, password: str):
             WHERE u.username = ? AND u.password = ?
         """, (username, pw_hash)).fetchone()
         return row
+    finally:
+        conn.close()
+
+
+def get_app_user_by_email(email: str):
+    """
+    Supabase Auth 로그인 후: 이메일로 Master DB의 사용자 정보 조회.
+    성공 시 (user_id, username, role, store_id, db_filename) 튜플 반환.
+    실패 시 None. (email이 비어있거나, 해당 이메일 사용자가 없을 때)
+    """
+    if not email or not str(email).strip():
+        return None
+    conn = get_master_conn()
+    try:
+        email_clean = str(email).strip().lower()
+        row = conn.execute("""
+            SELECT u.id, u.username, u.role, u.store_id, s.db_filename
+            FROM Users u
+            LEFT JOIN Stores s ON u.store_id = s.id
+            WHERE u.email IS NOT NULL AND TRIM(u.email) != '' AND LOWER(TRIM(u.email)) = ?
+        """, (email_clean,)).fetchone()
+        return row
+    except Exception:
+        return None
     finally:
         conn.close()
 
@@ -1653,37 +1727,108 @@ def _inject_js_login_form_attributes():
 
 def render_login():
     ensure_session()
+    # 이메일 자동 입력: URL의 email 파라미터 또는 localStorage(아래 스크립트에서 리다이렉트)로 복원
+    try:
+        default_email = (st.query_params.get("email") or "").strip()
+    except Exception:
+        default_email = ""
     # 로고: 로그인 화면에서도 좌측 상단 고정 (공통 레이아웃), 에러 시 빨간 메시지
     logo_html = _common_logo_html(_resolve_logo_path(), fallback_id="emons-logo-fallback-login")
     st.markdown(logo_html, unsafe_allow_html=True)
     st.title("에몬스판매관리 프로그램")
     st.subheader("로그인")
     with st.form("login_form"):
-        username = st.text_input("사용자명", key="username")
-        password = st.text_input("비밀번호", type="password", key="password")
+        email = st.text_input("이메일", value=default_email, key="login_email", type="default", placeholder="예: you@example.com")
+        password = st.text_input("비밀번호", type="password", key="login_password")
         submitted = st.form_submit_button("로그인")
-        if submitted and username and password:
-            user = verify_user(username, password)
-            if user:
-                user_id, uname, role, store_id, db_filename = user
-                st.session_state.logged_in = True
-                st.session_state.current_user = {
-                    "id": user_id, "username": uname, "role": role,
-                    "store_id": store_id, "db_filename": db_filename,
-                }
-                st.session_state.current_db = db_filename if role != "superadmin" else None
-                # 브라우저 localStorage 유지용: URL에 auth 토큰 추가 후 리다이렉트. 다음 런에서 JS가 localStorage에 저장.
-                auth_token = _create_auth_token(st.session_state.current_user)
-                try:
-                    st.query_params["auth"] = auth_token
-                except Exception:
-                    pass
-                st.rerun()
+        if submitted:
+            if not (email and str(email).strip()):
+                st.error("이메일을 입력해 주세요.")
+            elif not password:
+                st.error("비밀번호를 입력해 주세요.")
+            elif len(password) < 6:
+                st.error("비밀번호는 6자 이상이어야 합니다.")
             else:
-                st.error("사용자명 또는 비밀번호가 올바르지 않습니다.")
-        elif submitted:
-            st.warning("사용자명과 비밀번호를 입력하세요.")
-    _inject_js_login_form_attributes()
+                client, err = get_supabase_client()
+                if err:
+                    st.error(f"⚠️ {err}")
+                else:
+                    try:
+                        response = client.auth.sign_in_with_password({
+                            "email": str(email).strip(),
+                            "password": password,
+                        })
+                        session = response.session
+                        user = response.user
+                        if not session or not user:
+                            st.error("이메일 또는 비밀번호가 올바르지 않습니다.")
+                        else:
+                            app_user = get_app_user_by_email(user.email)
+                            if not app_user:
+                                st.error("이 이메일은 등록된 사용자가 아닙니다. 관리자에게 문의하세요.")
+                            else:
+                                user_id, uname, role, store_id, db_filename = app_user
+                                st.session_state.logged_in = True
+                                st.session_state.current_user = {
+                                    "id": user_id, "username": uname, "role": role,
+                                    "store_id": store_id, "db_filename": db_filename,
+                                }
+                                st.session_state.current_db = db_filename if role != "superadmin" else None
+                                st.session_state["supabase_session"] = {
+                                    "access_token": session.access_token,
+                                    "refresh_token": session.refresh_token,
+                                }
+                                st.rerun()
+                    except Exception as e:
+                        err_msg = str(e).strip() or "로그인에 실패했습니다."
+                        if "Invalid login" in err_msg or "invalid" in err_msg.lower():
+                            st.error("이메일 또는 비밀번호가 올바르지 않습니다.")
+                        else:
+                            st.error(f"로그인 중 오류가 발생했습니다: {err_msg}")
+
+    st.caption("💡 로그인할 때 사용한 이메일은 이 기기(브라우저)에만 저장되며, 다음 로그인 시 자동으로 채워집니다.")
+
+    # 이메일 자동 저장/자동 입력: localStorage 사용 (같은 브라우저에서 다음 로그인 시 이메일 유지)
+    st.markdown(
+        """
+        <script>
+        (function(){
+            var KEY = 'emons_login_email';
+            // 1) URL에 email이 없고 localStorage에 저장된 이메일이 있으면 ?email= 붙여서 이동 → 서버에서 기본값으로 채움
+            try {
+                var u = new URL(window.location.href);
+                if (!u.searchParams.get('email') && localStorage.getItem(KEY)) {
+                    u.searchParams.set('email', localStorage.getItem(KEY));
+                    window.location.replace(u.toString());
+                    return;
+                }
+            } catch(e) {}
+            // 2) 로그인 버튼 클릭 시 현재 이메일 입력값을 localStorage에 저장 (버튼 클릭 후 폼 제출 직전에 실행되도록 지연 등록)
+            function attachSaveOnLoginClick() {
+                var forms = document.querySelectorAll('form');
+                for (var i = 0; i < forms.length; i++) {
+                    var form = forms[i];
+                    var btn = form.querySelector('button[kind="primary"], button');
+                    if (!btn || btn.textContent.trim() !== '로그인') continue;
+                    var inputs = form.querySelectorAll('input:not([type="password"])');
+                    var emailInput = inputs[0];
+                    if (!emailInput) continue;
+                    btn.removeEventListener('click', _saveEmail);
+                    btn.addEventListener('click', _saveEmail);
+                    function _saveEmail() {
+                        var val = (emailInput.value || '').trim();
+                        if (val) try { localStorage.setItem(KEY, val); } catch(e) {}
+                    }
+                    break;
+                }
+            }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', attachSaveOnLoginClick);
+            else setTimeout(attachSaveOnLoginClick, 300);
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ========== 최고 관리자 (Superadmin) 전용: 공지 조회 ==========
@@ -2964,6 +3109,136 @@ def render_monthly_payment_report(is_superadmin: bool):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="monthly_payment_report_dl",
     )
+
+
+# ---------- 직원 계정 관리 및 발령 (superadmin 전용) ----------
+EMPLOYEE_STORE_OPTIONS = ["삼산점", "학성점", "양산점", "본사"]
+EMPLOYEE_ROLE_OPTIONS = [
+    ("user", "일반 직원 (user)"),
+    ("store_admin", "매장 관리자 (store admin)"),
+    ("superadmin", "최고 관리자 (superadmin)"),
+]
+
+
+def _get_store_id_by_display_name(display_name: str):
+    """배정 매장 표시명(삼산점, 학성점, 양산점, 본사) → Stores.id. 본사는 NULL."""
+    if not display_name or str(display_name).strip() == "본사":
+        return None
+    conn = get_master_conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM Stores WHERE TRIM(store_name) = ?",
+            (str(display_name).strip(),),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def render_employee_management():
+    """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + Master DB Users 반영. superadmin 전용."""
+    st.header("👥 직원 계정 관리 및 발령")
+
+    admin_client, admin_err = get_supabase_admin_client()
+    if admin_err:
+        st.error(f"⚠️ {admin_err}")
+        st.caption("Supabase Dashboard → Project Settings → API에서 service_role key를 복사해 .streamlit/secrets.toml의 [supabase] service_role_key 로 추가해 주세요.")
+
+    with st.form("employee_register_form", clear_on_submit=True):
+        st.subheader("신규 직원 등록")
+        emp_email = st.text_input("이메일 (로그인 ID)", placeholder="예: employee@example.com", key="emp_email")
+        emp_password = st.text_input("초기 비밀번호", type="password", key="emp_password")
+        emp_name = st.text_input("직원 이름", placeholder="홍길동", key="emp_name")
+        emp_store = st.selectbox("배정 매장", EMPLOYEE_STORE_OPTIONS, key="emp_store")
+        emp_role_choice = st.selectbox(
+            "부여 권한",
+            options=[r[0] for r in EMPLOYEE_ROLE_OPTIONS],
+            format_func=lambda x: next((r[1] for r in EMPLOYEE_ROLE_OPTIONS if r[0] == x), x),
+            key="emp_role",
+        )
+        submitted = st.form_submit_button("계정 생성")
+
+        if submitted:
+            if not (emp_email and str(emp_email).strip()):
+                st.error("이메일을 입력해 주세요.")
+            elif not emp_password:
+                st.error("초기 비밀번호를 입력해 주세요.")
+            elif len(emp_password) < 6:
+                st.error("초기 비밀번호는 6자 이상이어야 합니다.")
+            elif not (emp_name and str(emp_name).strip()):
+                st.error("직원 이름을 입력해 주세요.")
+            elif admin_err or admin_client is None:
+                st.error("관리자 API를 사용할 수 없어 계정을 생성할 수 없습니다.")
+            else:
+                with st.spinner("계정 생성 중입니다..."):
+                    try:
+                        admin_client.auth.admin.create_user({
+                            "email": str(emp_email).strip(),
+                            "password": emp_password,
+                            "email_confirm": True,
+                        })
+                    except Exception as e:
+                        err_msg = str(e).strip() or "알 수 없는 오류"
+                        if "already been registered" in err_msg or "already exists" in err_msg.lower():
+                            st.error("이미 등록된 이메일입니다. 다른 이메일을 사용해 주세요.")
+                        else:
+                            st.error(f"Supabase 계정 생성에 실패했습니다: {err_msg}")
+                        st.stop()
+
+                    store_id = _get_store_id_by_display_name(emp_store)
+                    username = str(emp_email).strip()
+                    role = str(emp_role_choice).strip()
+                    conn = get_master_conn()
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO Users (username, password, email, role, store_id)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (username, hashlib.sha256("supabase_managed".encode()).hexdigest(), str(emp_email).strip(), role, store_id),
+                        )
+                        conn.commit()
+                    except sqlite3.IntegrityError:
+                        st.error("Master DB에 이미 같은 사용자명/이메일이 등록되어 있습니다. Supabase에는 계정이 생성되었을 수 있으니, 관리자에게 문의해 주세요.")
+                        conn.rollback()
+                        conn.close()
+                        st.stop()
+                    except Exception as e:
+                        conn.rollback()
+                        st.error(f"Master DB 등록에 실패했습니다: {str(e)}")
+                        conn.close()
+                        st.stop()
+                    finally:
+                        conn.close()
+
+                st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
+                st.rerun()
+
+    st.subheader("직원 명부")
+    conn = get_master_conn()
+    try:
+        df = pd.read_sql(
+            """
+            SELECT u.id, u.email, u.username, u.role, s.store_name AS 배정매장
+            FROM Users u
+            LEFT JOIN Stores s ON u.store_id = s.id
+            ORDER BY u.id
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    if len(df) == 0:
+        st.info("등록된 직원이 없습니다.")
+        return
+
+    role_display = df["role"].map(lambda r: next((x[1] for x in EMPLOYEE_ROLE_OPTIONS if x[0] == r), r))
+    df_display = df.copy()
+    df_display["권한"] = role_display
+    df_display = df_display[["id", "email", "username", "권한", "배정매장"]]
+    df_display.columns = ["ID", "이메일", "사용자명", "권한", "배정 매장"]
+    st.dataframe(df_display, use_container_width=True)
 
 
 def render_superadmin():
@@ -4641,49 +4916,8 @@ def main():
         conn_m.close()
     ensure_session()
 
-    # 1) URL에 auth가 있으면 최우선: 토큰 저장 + replaceState로만 URL 정리 (pushState/리다이렉트 미사용 → Skippable 경고 방지)
-    try:
-        auth_in_url_top = st.query_params.get("auth")
-    except Exception:
-        auth_in_url_top = None
-    if auth_in_url_top:
-        _inject_js_url_auth_save_and_replace_state()
-
-    # 2) 동기적 상태 복구: URL의 auth를 읽어 검증 후 세션 설정 (비동기/useEffect 없이 최상단에서 1회만)
+    # Supabase Auth: 로그인하지 않았으면 로그인 화면만 표시
     if not st.session_state.logged_in:
-        try:
-            auth_in_url = st.query_params.get("auth")
-        except Exception:
-            auth_in_url = None
-        if auth_in_url:
-            restored = _try_restore_from_query_params()
-            if restored:
-                try:
-                    q = dict(st.query_params)
-                    q.pop("auth", None)
-                    st.query_params.from_dict(q)
-                except Exception:
-                    pass
-                st.rerun()
-                return
-            # 토큰 삭제는 "1시간 만료" 또는 "서명 무효"일 때만. URL 잘림/복사 손상 시에는 삭제하지 않음 (다중 새로고침 보호)
-            # auth 문자열이 너무 짧으면 URL 길이 제한으로 잘렸을 가능성이 있으므로 localStorage 삭제 금지
-            MIN_AUTH_LENGTH_TO_CLEAR = 80
-            if len(auth_in_url or "") >= MIN_AUTH_LENGTH_TO_CLEAR:
-                try:
-                    q = dict(st.query_params)
-                    q.pop("auth", None)
-                    st.query_params.from_dict(q)
-                except Exception:
-                    pass
-                _inject_js_clear_auth_and_remove_auth_param()
-
-    # (URL auth 저장/정리는 위 최상단 스크립트에서 replaceState로만 처리됨)
-
-    if not st.session_state.logged_in:
-        # 동기적 초기화: 로그아웃 시에만 토큰 삭제 → 반드시 redirect보다 먼저 실행되도록 먼저 삽입
-        _maybe_clear_localStorage_on_logout()
-        _inject_js_localStorage_redirect_with_auth()
         render_login()
         return
 
@@ -4722,23 +4956,11 @@ def main():
     <div style="cursor:pointer;"
          onclick="(function(){{ 
              try {{
-                 var key = 'emons_auth';
-                 var val = localStorage.getItem(key);
-                 if (!val) {{ val = sessionStorage.getItem(key); }}
                  var u = new URL(window.location.href);
                  u.searchParams.set('home', '1');
-                 if (val) {{
-                     u.searchParams.set('auth', val);
-                 }}
                  window.location.href = u.toString();
-             }} catch(e) {{
-                 try {{
-                     var u2 = new URL(window.location.href);
-                     u2.searchParams.set('home', '1');
-                     window.location.href = u2.toString();
-                 }} catch(e2) {{
-                     window.location.href = window.location.pathname + '?home=1';
-                 }}
+             }} catch(e2) {{
+                 window.location.href = window.location.pathname + '?home=1';
              }}
          }})();">
     {raw_logo_html}
@@ -4759,13 +4981,42 @@ def main():
         unsafe_allow_html=True
     )
     st.sidebar.divider()
+    # 비밀번호 변경 (Supabase Auth)
+    with st.sidebar.expander("🔐 비밀번호 변경"):
+        new_pw = st.text_input("새 비밀번호", type="password", key="new_password_input")
+        new_pw_confirm = st.text_input("새 비밀번호 확인", type="password", key="new_password_confirm")
+        if st.button("비밀번호 변경", key="sidebar_change_pw_btn"):
+            if not new_pw:
+                st.error("새 비밀번호를 입력해 주세요.")
+            elif len(new_pw) < 6:
+                st.error("비밀번호는 6자 이상이어야 합니다.")
+            elif new_pw != new_pw_confirm:
+                st.error("새 비밀번호가 일치하지 않습니다.")
+            else:
+                auth_client, auth_err = get_supabase_client_with_auth_session()
+                if auth_err:
+                    st.error(f"⚠️ {auth_err}")
+                else:
+                    try:
+                        auth_client.auth.update_user({"password": new_pw})
+                        st.success("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"비밀번호 변경에 실패했습니다: {str(e)}")
+    st.sidebar.divider()
     # 관리자 전용: 결제 변경/취소 모니터링 화면 진입 버튼
     if role in ("store_admin", "superadmin"):
         if st.sidebar.button("🚨 결제 변경/취소 모니터링", width='stretch'):
             st.session_state["active_admin_page"] = "payment_monitor"
+    # 최고 관리자 전용: 직원 계정 관리 및 발령
+    if role == "superadmin":
+        if st.sidebar.button("👥 직원 관리", width='stretch'):
+            st.session_state["active_admin_page"] = "employee_management"
     if st.sidebar.button("🚪 로그아웃", width='stretch'):
         try:
-            st.query_params["logout"] = "1"
+            client, _ = get_supabase_client()
+            if client:
+                client.auth.sign_out()
         except Exception:
             pass
         for key in list(st.session_state.keys()):
@@ -4775,6 +5026,11 @@ def main():
     # 관리자 전용 모니터링 화면 라우팅
     if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "payment_monitor":
         render_payment_history_monitor()
+        return
+
+    # 최고 관리자 전용: 직원 계정 관리 및 발령
+    if role == "superadmin" and st.session_state.get("active_admin_page") == "employee_management":
+        render_employee_management()
         return
 
     # Superadmin: 5탭 최고 관리자 메뉴
