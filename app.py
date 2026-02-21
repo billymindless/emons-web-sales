@@ -68,7 +68,11 @@ def _inject_mobile_css():
             button[kind="primary"], button[kind="secondary"], .stButton > button { min-height: 44px !important; padding: 0.5rem 0.75rem !important; font-size: 1rem !important; }
             .stTextInput > div > div > input, .stTextArea > div > div { min-height: 44px !important; font-size: 16px !important; }
             [data-testid="stSelectbox"] > div { min-height: 44px !important; }
+            /* 지도 말풍선(마커 클릭): 모바일 가독성 */
+            .leaflet-popup-content .map-popup { font-size: 14px !important; line-height: 1.4 !important; max-width: min(280px, 85vw) !important; padding: 6px 8px !important; }
         }
+        /* 지도 말풍선 공통 */
+        .leaflet-popup-content .map-popup { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1812,12 +1816,71 @@ def search_address_kakao(keyword: str, api_key: str = ""):
             raw = data.get("message") or data.get("msg") or "API 오류"
             return [], _kakao_local_error_hint(raw)
         docs = data.get("documents", [])
-        # 공식 문서: 각 document에 address_name(전체 지번/도로명 주소)이 최상위에 있음
+        # address_name(전체 주소), road_address.building_name(건물명), address.bname(법정동명) 수집
         result = []
         for d in docs[:15]:
             addr = d.get("address_name")
-            if addr and isinstance(addr, str):
-                result.append({"address_name": addr})
+            if not addr or not isinstance(addr, str):
+                continue
+            road = d.get("road_address") or {}
+            addr_obj = d.get("address") or {}
+            building_name = (road.get("building_name") or "").strip() or None
+            bname = (addr_obj.get("bname") or "").strip() or None
+            result.append({
+                "address_name": addr,
+                "building_name": building_name,
+                "bname": bname,
+            })
+        return result, None
+    except requests.exceptions.RequestException as e:
+        return [], f"연결 오류: {str(e)[:80]}"
+    except Exception as e:
+        return [], f"오류: {str(e)[:80]}"
+
+
+def search_keyword_kakao(keyword: str, api_key: str = ""):
+    """
+    카카오 로컬 API - 키워드 검색(장소/건물명).
+    GET https://dapi.kakao.com/v2/local/search/keyword.json
+    반환: ( [{"place_name", "address_name", "road_address_name", "x", "y", "source": "keyword"}, ...], None ) 또는 ( [], "오류메시지" )
+    """
+    if not keyword or not str(keyword).strip():
+        return [], None
+    KAKAO_REST_KEY_DEFAULT = "19911112315a182013d5ac8592852019"
+    key = api_key or os.environ.get("KAKAO_REST_KEY", KAKAO_REST_KEY_DEFAULT)
+    if not key:
+        return [], "KAKAO_REST_KEY를 설정해 주세요."
+    url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+    headers = {"Authorization": f"KakaoAK {key}"}
+    params = {"query": keyword.strip(), "size": 15}
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {}
+        if r.status_code != 200:
+            err_msg = data.get("msg") or data.get("message") or f"API 오류 (HTTP {r.status_code})"
+            return [], _kakao_local_error_hint(err_msg)
+        if data.get("errorType") or data.get("error"):
+            raw = data.get("message") or data.get("msg") or "API 오류"
+            return [], _kakao_local_error_hint(raw)
+        docs = data.get("documents", [])
+        result = []
+        for d in docs:
+            addr = (d.get("address_name") or d.get("road_address_name") or "").strip()
+            place = (d.get("place_name") or "").strip()
+            if not addr and not place:
+                continue
+            x, y = d.get("x"), d.get("y")
+            result.append({
+                "place_name": place or None,
+                "address_name": addr or place,
+                "road_address_name": (d.get("road_address_name") or "").strip() or None,
+                "x": x,
+                "y": y,
+                "source": "keyword",
+            })
         return result, None
     except requests.exceptions.RequestException as e:
         return [], f"연결 오류: {str(e)[:80]}"
@@ -1827,19 +1890,25 @@ def search_address_kakao(keyword: str, api_key: str = ""):
 
 def geocode_address_kakao(address: str):
     """주소 문자열을 카카오 API로 지오코딩하여 (lat, lon) 반환. 실패 시 None."""
+    ext = geocode_address_kakao_extended(address)
+    return (ext["latitude"], ext["longitude"]) if ext else None
+
+
+def geocode_address_kakao_extended(address: str) -> dict | None:
+    """
+    주소 문자열을 카카오 API로 지오코딩하여 좌표 + 건물명/법정동명 반환.
+    반환: {"latitude", "longitude", "address", "building_name", "bname"} 또는 None.
+    """
     if not address or not str(address).strip():
         return None
-    results, _ = search_address_kakao(str(address).strip())
-    if not results:
-        return None
-    # search_address_kakao는 address_name만 반환. 좌표는 API 응답에서 직접 조회 필요.
+    q = str(address).strip()
     KAKAO_REST_KEY_DEFAULT = "19911112315a182013d5ac8592852019"
     key = os.environ.get("KAKAO_REST_KEY", KAKAO_REST_KEY_DEFAULT)
     if not key:
         return None
     url = "https://dapi.kakao.com/v2/local/search/address.json"
     headers = {"Authorization": f"KakaoAK {key}"}
-    params = {"query": str(address).strip()}
+    params = {"query": q}
     try:
         r = requests.get(url, headers=headers, params=params, timeout=5)
         if r.status_code != 200:
@@ -1849,13 +1918,23 @@ def geocode_address_kakao(address: str):
         if not docs:
             return None
         d = docs[0]
-        x = d.get("x")
-        y = d.get("y")
-        if x is not None and y is not None:
-            return (float(y), float(x))  # Kakao: x=lon, y=lat
+        x, y = d.get("x"), d.get("y")
+        if x is None or y is None:
+            return None
+        road = d.get("road_address") or {}
+        addr_obj = d.get("address") or {}
+        building_name = (road.get("building_name") or "").strip() or None
+        bname = (addr_obj.get("bname") or "").strip() or None
+        addr_name = (d.get("address_name") or q) or ""
+        return {
+            "latitude": float(y),
+            "longitude": float(x),
+            "address": addr_name,
+            "building_name": building_name,
+            "bname": bname,
+        }
     except Exception:
-        pass
-    return None
+        return None
 
 
 def address_search(keyword: str):
@@ -2196,7 +2275,7 @@ _MAP_ZOOM = 7
 
 
 def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
-    """merged(orders+customers)에서 주소 지오코딩 후 latitude, longitude, 고객명, 품목, 금액, 배송일자 포함 DataFrame 반환."""
+    """merged(orders+customers)에서 주소 지오코딩 후 latitude, longitude, address, building_name, 고객명, 품목, 금액, 배송일자 포함 DataFrame 반환."""
     if "address" not in merged.columns or "name" not in merged.columns:
         return pd.DataFrame()
     if "geo_cache" not in st.session_state:
@@ -2208,16 +2287,26 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
         if not addr:
             continue
         if addr in cache:
-            lat, lon = cache[addr]
+            ent = cache[addr]
+            lat, lon = ent["latitude"], ent["longitude"]
+            addr_display = ent.get("address") or addr
+            building_name = ent.get("building_name")
+            bname = ent.get("bname")
         else:
-            coord = geocode_address_kakao(addr)
-            if coord is None:
+            ext = geocode_address_kakao_extended(addr)
+            if ext is None:
                 continue
-            lat, lon = coord
-            cache[addr] = (lat, lon)
+            lat, lon = ext["latitude"], ext["longitude"]
+            addr_display = ext.get("address") or addr
+            building_name = ext.get("building_name")
+            bname = ext.get("bname")
+            cache[addr] = {"latitude": lat, "longitude": lon, "address": addr_display, "building_name": building_name, "bname": bname}
         rows.append({
             "latitude": lat,
             "longitude": lon,
+            "address": addr_display,
+            "building_name": building_name,
+            "bname": bname,
             "customer_name": row.get("name") or "-",
             "category": row.get("category") or "-",
             "total_amount": int(row.get("total_amount") or 0),
@@ -2226,8 +2315,15 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# 말풍선(팝업) 가독성: 모바일에서 글자 크기·너비 조정 (Folium Popup 내부 스타일)
+_MAP_POPUP_STYLE = (
+    "font-size:14px;line-height:1.4;max-width:min(280px,85vw);padding:6px 8px;"
+    "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;"
+)
+
+
 def _create_folium_map(df: pd.DataFrame, center: tuple, zoom_start: int, key: str = "") -> "folium.Map | None":
-    """DataFrame(latitude, longitude, customer_name, category, total_amount, delivery_date)로 Folium 지도 생성."""
+    """DataFrame(latitude, longitude, address, building_name, customer_name, category, total_amount, delivery_date)로 Folium 지도 생성. 말풍선 상단에 [건물명] 굵게 표시."""
     if not FOLIUM_AVAILABLE or df.empty:
         return None
     m = folium.Map(location=center, zoom_start=zoom_start, tiles="OpenStreetMap")
@@ -2236,13 +2332,23 @@ def _create_folium_map(df: pd.DataFrame, center: tuple, zoom_start: int, key: st
         lat, lon = r["latitude"], r["longitude"]
         if pd.isna(lat) or pd.isna(lon):
             continue
+        building_name = r.get("building_name") or r.get("bname")
+        addr = (r.get("address") or "").strip()
+        line1 = ""
+        if building_name:
+            line1 = f"<strong>[{html.escape(str(building_name))}]</strong><br>"
+        line_addr = f"<b>주소:</b> {html.escape(addr or '-')}<br>" if addr else ""
         popup_html = (
+            f'<div class="map-popup" style="{_MAP_POPUP_STYLE}">'
+            f"{line1}"
+            f"{line_addr}"
             f"<b>고객명:</b> {html.escape(str(r.get('customer_name', '-')))}<br>"
             f"<b>품목:</b> {html.escape(str(r.get('category', '-')))}<br>"
             f"<b>금액:</b> {int(r.get('total_amount',0)):,.0f}원<br>"
             f"<b>배송일:</b> {html.escape(str(r.get('delivery_date', '-')))}"
+            f"</div>"
         )
-        folium.Marker([lat, lon], popup=folium.Popup(popup_html, max_width=250)).add_to(mc)
+        folium.Marker([lat, lon], popup=folium.Popup(popup_html, max_width=320)).add_to(mc)
     mc.add_to(m)
     return m
 
@@ -4007,27 +4113,61 @@ def render_new_sales():
         addr_keyword = st.text_input("주소 검색어 (예: 역삼동 123, 테헤란로) *", key="addr_keyword", placeholder="검색어 입력 후 아래 검색 버튼 클릭")
         search_clicked = st.form_submit_button("검색")
     if search_clicked:
-        keyword = st.session_state.get("addr_keyword", "")
+        keyword = (st.session_state.get("addr_keyword") or "").strip()
         st.session_state.address_search_error = None
-        if keyword and keyword.strip():
-            # 카카오 로컬 API GET 요청 (Authorization: KakaoAK {KAKAO_REST_KEY})
-            results, err = search_address_kakao(keyword)
-            st.session_state.address_search_results = results if results else []
-            if err:
-                st.session_state.address_search_error = err
-            elif not results:
-                st.session_state.address_search_error = "검색 결과가 없습니다. 검색어를 바꿔 보세요."
+        if keyword:
+            # 주소 검색 + 장소(키워드) 검색 병행: 도로명 주소와 건물명/상호명 모두 검색
+            results_addr, err_addr = search_address_kakao(keyword)
+            results_kw, err_kw = search_keyword_kakao(keyword)
+            combined = []
+            seen = set()
+            for r in (results_addr or []):
+                addr = r.get("address_name") or ""
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    r["source"] = "address"
+                    combined.append(r)
+            for r in (results_kw or []):
+                addr = r.get("address_name") or ""
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    combined.append(r)
+            st.session_state.address_search_results = combined
+            if err_addr and err_kw:
+                st.session_state.address_search_error = err_addr
+            elif not combined:
+                st.session_state.address_search_error = err_addr or err_kw or "검색 결과가 없습니다. 검색어를 바꿔 보세요."
         else:
             st.warning("검색어를 입력한 뒤 검색 버튼을 눌러 주세요.")
     if st.session_state.get("address_search_error"):
         st.error(st.session_state.address_search_error)
-    # 검색 결과를 st.selectbox로 표시, 선택 시 고객 주소로 반영
+    # 검색 결과를 st.selectbox로 표시 (건물명/장소명 상단 표시), 선택 시 고객 주소로 반영
     if st.session_state.address_search_results:
-        options = [r["address_name"] for r in st.session_state.address_search_results]
+        results = st.session_state.address_search_results
+        options = []
+        display_to_address = {}
+        for r in results:
+            addr = r.get("address_name") or ""
+            if r.get("source") == "keyword":
+                place = (r.get("place_name") or "").strip()
+                disp = f"장소: {place} — {addr}" if place else addr
+            else:
+                building_name = (r.get("building_name") or "").strip()
+                bname = (r.get("bname") or "").strip()
+                if building_name:
+                    disp = f"[{building_name}] {addr}"
+                elif bname:
+                    disp = f"[{bname}] {addr}"
+                else:
+                    disp = addr
+            options.append(disp)
+            display_to_address[disp] = addr
+        st.session_state._address_display_to_value = display_to_address
 
         def _on_address_select():
-            if st.session_state.get("address_selection"):
-                st.session_state["address_manual"] = st.session_state["address_selection"]
+            sel = st.session_state.get("address_selection")
+            if sel and hasattr(st.session_state, "_address_display_to_value"):
+                st.session_state["address_manual"] = st.session_state._address_display_to_value.get(sel, sel)
 
         chosen = st.selectbox(
             "검색 결과에서 주소 선택 *",
@@ -4037,7 +4177,8 @@ def render_new_sales():
             format_func=lambda x: x,
         )
         if chosen:
-            st.session_state["address_manual"] = chosen
+            addr_val = getattr(st.session_state, "_address_display_to_value", {}).get(chosen, chosen)
+            st.session_state["address_manual"] = addr_val
     # 주소: 기본 주소(검색/수동) + 상세 주소(동·호수) 분리 → DB에는 두 값 합쳐서 저장
     if "address_manual" not in st.session_state:
         st.session_state["address_manual"] = default_addr
