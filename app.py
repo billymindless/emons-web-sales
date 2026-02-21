@@ -3909,6 +3909,9 @@ def render_new_sales():
     st.header("새로운 매출 등록")
     try:
         employees = pd.read_sql("SELECT id, name FROM Employees WHERE is_active = 1", conn)
+    except Exception as e:
+        employees = pd.DataFrame(columns=["id", "name"])
+        st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
     finally:
         conn.close()
     customers = load_customers_cached(db_filename, limit=50)
@@ -4003,8 +4006,16 @@ def render_new_sales():
     address_detail = st.session_state.get("address_detail", "")
     address_full = " ".join(filter(None, [address_base.strip(), address_detail.strip()])) or None
 
-    emp_names = employees["name"].tolist()
-    selected_employees = st.multiselect("담당 직원 (복수 선택, 1/n 실적 분배 대상) *", emp_names)
+    emp_names = employees["name"].tolist() if not employees.empty and "name" in employees.columns else []
+    if not emp_names:
+        st.warning("등록된 활성 직원이 없습니다. **매장 관리자 메뉴**에서 직원을 추가한 뒤 담당 직원을 선택할 수 있습니다.")
+    # key로 선택 값 유지(리런 시 초기화 방지), 복수 선택 가능
+    selected_employees = st.multiselect(
+        "담당 직원 (복수 선택, 1/n 실적 분배 대상) *",
+        options=emp_names,
+        default=[],
+        key="new_sales_employee_multiselect",
+    )
     employee_names_str = ",".join(selected_employees) if selected_employees else ""
     if "order_date" not in st.session_state:
         st.session_state["order_date"] = date.today()
