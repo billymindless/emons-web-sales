@@ -926,19 +926,27 @@ def _format_phone_hyphen(s):
 
 
 # 결제 수단·카드사·수수료율 (가구 매장 결제 로직)
-PAYMENT_METHOD_OPTIONS = ["신용카드", "체크카드", "지역화폐", "이체", "온누리"]
-CARD_COMPANY_OPTIONS = ["신한카드", "삼성카드", "현대카드", "KB국민카드", "롯데카드", "하나카드", "NH농협카드", "우리카드", "IBK기업은행(BC)", "기타 BC카드"]
+PAYMENT_METHOD_OPTIONS = ["신용카드", "메인페이", "체크카드", "지역화폐", "이체", "온누리"]
+CARD_COMPANY_OPTIONS = ["신한카드", "삼성카드", "KB국민카드", "현대카드", "롯데카드", "우리카드", "하나카드", "BC카드", "NH농협카드", "기타"]
 
 
 def _payment_fee_amount(payment_method: str, amount: int) -> float:
-    """결제 수단별 수수료: 신용카드 2%, 체크카드 1.15%, 그 외 0%."""
+    """결제 수단별 수수료: 신용카드·메인페이 2.5%, 체크카드 1.5%, 그 외(현금·이체 등) 0%."""
     if not payment_method or amount <= 0:
         return 0.0
-    if payment_method == "신용카드":
-        return round(amount * 0.02, 0)
+    if payment_method in ("신용카드", "메인페이"):
+        return round(float(amount) * 0.025, 0)
     if payment_method == "체크카드":
-        return round(amount * 0.0115, 0)
+        return round(float(amount) * 0.015, 0)
     return 0.0
+
+
+def _compute_net_margin_rate(selling_price: float, cost: float, total_fee: float) -> float:
+    """실질 마진율(%) = (판매가 - 원가 - 수수료) / 판매가 * 100. 판매가 0이면 0 반환."""
+    if not selling_price or selling_price <= 0:
+        return 0.0
+    net_profit = selling_price - cost - total_fee
+    return round((net_profit / selling_price) * 100.0, 1)
 
 # ========== 경로 설정 ==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -4337,18 +4345,21 @@ def render_monthly_payment_report(is_superadmin: bool):
         pay_df["card_company"] = None
     pay_df["amount"] = pd.to_numeric(pay_df["amount"], errors="coerce").fillna(0)
 
-    # 상세 결제수단(파생 컬럼): 신용/체크카드 → 카드사별 분리 (신용_신한, 체크_국민 등)
-    # Payments.card_company 컬럼 사용 (없으면 _ensure_tenant_schema에서 ALTER TABLE로 추가됨)
-    _card_short = {"신한카드": "신한", "삼성카드": "삼성", "현대카드": "현대", "KB국민카드": "국민",
-                   "롯데카드": "롯데", "하나카드": "하나", "NH농협카드": "농협", "우리카드": "우리",
-                   "IBK기업은행(BC)": "기업", "기타 BC카드": "기타"}
+    # 상세 결제수단(파생 컬럼): 신용/체크/메인페이 → 카드사별 분리 (신용_신한, 메인페이_국민 등)
+    _card_short = {"신한카드": "신한", "삼성카드": "삼성", "KB국민카드": "국민", "현대카드": "현대",
+                   "롯데카드": "롯데", "우리카드": "우리", "하나카드": "하나", "BC카드": "BC", "NH농협카드": "농협", "기타": "기타"}
     def _to_detailed(row):
         meth = row["payment_method"] or "미지정"
-        if meth in ("신용카드", "체크카드"):
+        if meth in ("신용카드", "체크카드", "메인페이"):
             cc = row.get("card_company") or ""
             short = _card_short.get(cc, cc or "미지정")
-            prefix = "신용" if meth == "신용카드" else "체크"
-            return f"{prefix}_{short}"
+            if meth == "신용카드":
+                prefix = "신용"
+            elif meth == "체크카드":
+                prefix = "체크"
+            else:
+                prefix = "메인페이"
+            return f"{prefix}_{short}" if cc else meth
         return meth
     pay_df["detailed_payment"] = pay_df.apply(_to_detailed, axis=1)
 
@@ -5541,7 +5552,7 @@ def render_new_sales():
         with c1:
             method = st.selectbox(f"결제 수단 #{i+1} *", options=PAYMENT_METHOD_OPTIONS, key=row_key, index=0 if i == 0 else 0)
         with c2:
-            if method in ("신용카드", "체크카드"):
+            if method in ("신용카드", "메인페이"):
                 card_company = st.selectbox(f"카드사 #{i+1} *", options=CARD_COMPANY_OPTIONS, key=card_key)
             else:
                 card_company = None
@@ -5578,6 +5589,18 @@ def render_new_sales():
     balance = final_sales - total_payment_int
     st.metric("잔금 (미수금)", f"{balance:,}원", help="최종 총 판매금액 - 누적 결제금액")
 
+    # 예상 수수료·최종 실질 마진율 (결제 수단별 수수료 반영, 실시간)
+    total_fee_est = sum(
+        _payment_fee_amount(st.session_state.get(f"pay_method_{i}", ""), _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")))
+        for i in range(4)
+    )
+    net_margin_rate_est = _compute_net_margin_rate(float(final_sales), float(final_cost), total_fee_est)
+    fee_col, margin_col = st.columns(2)
+    with fee_col:
+        st.metric("예상 수수료", f"{int(total_fee_est):,}원", help="신용카드·메인페이 2.5%, 체크카드 1.5%, 그 외 0%")
+    with margin_col:
+        st.metric("최종 실질 마진율", f"{net_margin_rate_est:.1f}%", help="(판매가 - 원가 - 수수료) / 판매가 × 100")
+
     if st.button("매출 등록"):
         cust_name_ok = cust_name and cust_name.strip()
         phone1_ok = phone1 and phone1.strip()
@@ -5601,11 +5624,16 @@ def render_new_sales():
         # 결제 합계 및 미수금(잔금) 계산 — 완불이 아니어도 저장 가능(계약금만 받고 저장 가능)
         total_payment_slots = sum(_parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")) for i in range(4))
         unpaid_balance = final_sales_save - total_payment_slots  # 판매가 - 수납액 = 미수금
-        # 마진율 검증 (15%~25% 범위 이탈 시 경고, 저장은 가능)
-        margin_pct = (final_sales_save - final_cost_save) / final_sales_save * 100 if final_sales_save else 0
-        margin_out_of_range = margin_pct < 15 or margin_pct > 25
+        # 수수료 합계 및 실질 마진율 (신용카드·메인페이 2.5% 반영)
+        total_fees_save = 0.0
+        for i in range(4):
+            amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
+            method = st.session_state.get(f"pay_method_{i}", "")
+            total_fees_save += _payment_fee_amount(method, amt)
+        net_margin_rate_save = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees_save)
+        margin_out_of_range = net_margin_rate_save < 15 or net_margin_rate_save > 25
         if margin_out_of_range:
-            st.warning(f"⚠️ 주의: 마진율이 {margin_pct:.1f}%입니다. 적정 범위(15%~25%)를 벗어났습니다.")
+            st.warning(f"⚠️ 주의: 실질 마진율이 {net_margin_rate_save:.1f}%입니다. 적정 범위(15%~25%)를 벗어났습니다.")
         # 온누리상품권 결제에 대한 부정 사용 방지 검증
         # 1차: 승인번호 뒤 4자리 + 결제일 기준 중복 여부 확인 (금액 제외)
         # 중복 발견 시 해당 슬롯은 전체 승인번호(8자리 이상) 입력 단계로 전환
@@ -5698,7 +5726,7 @@ def render_new_sales():
                 if amt <= 0:
                     continue
                 method = st.session_state.get(f"pay_method_{i}", "")
-                card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "체크카드") else None
+                card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "메인페이") else None
                 fee = _payment_fee_amount(method, amt)
                 total_fees += fee
                 total_paid_initial += amt
@@ -5719,16 +5747,17 @@ def render_new_sales():
                     "fee_amount": fee,
                     "onnuri_approval_code": onnuri_code,
                 })
-            actual_margin = basic_margin_save - total_fees
+            actual_margin = basic_margin_save - total_fees  # 실질 마진 = 판매가 - 원가 - 수수료
             remaining = final_sales_save - total_paid_initial
             balance_status = "완납" if remaining == 0 else "미납"
             _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
             _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance)
             clear_data_cache()
+            net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
             st.session_state["_gamification_ctx"] = {
                 "amount": final_sales_save,
                 "cost": final_cost_save,
-                "margin_pct": margin_pct,
+                "margin_pct": net_margin_rate_ctx,
                 "employee_names": employee_names_str,
                 "db_filename": db_filename,
                 "order_date": order_date,
@@ -5770,7 +5799,7 @@ def render_new_sales():
                     if amt <= 0:
                         continue
                     method = st.session_state.get(f"pay_method_{i}", "")
-                    card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "체크카드") else None
+                    card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "메인페이") else None
                     fee = _payment_fee_amount(method, amt)
                     total_fees += fee
                     total_paid_initial += amt
@@ -5794,12 +5823,13 @@ def render_new_sales():
                 _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance)
                 conn.commit()
                 clear_data_cache()
+                net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
             finally:
                 conn.close()
             st.session_state["_gamification_ctx"] = {
                 "amount": final_sales_save,
                 "cost": final_cost_save,
-                "margin_pct": margin_pct,
+                "margin_pct": net_margin_rate_ctx,
                 "employee_names": employee_names_str,
                 "db_filename": db_filename,
                 "order_date": order_date,
@@ -5810,7 +5840,7 @@ def render_new_sales():
             # 마진율 이상 시 Superadmin/매장관리자 알림
             if margin_out_of_range:
                 store_name = _get_store_name_by_db(db_filename)
-                _insert_admin_alert(store_name, "margin", f"{store_name}에서 마진율 {margin_pct:.1f}% 건이 등록되었습니다.")
+                _insert_admin_alert(store_name, "margin", f"{store_name}에서 실질 마진율 {net_margin_rate_save:.1f}% 건이 등록되었습니다.")
             # 채널톡 PUSH: 백그라운드 스레드로 전송해 UI 블로킹 방지
             def _channel_talk_sync():
                 try:
@@ -5899,7 +5929,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
         st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
     st.caption("잔금 완납 처리 (결제 추가)")
     add_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
-    if add_method in ("신용카드", "체크카드"):
+    if add_method in ("신용카드", "메인페이"):
         add_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
     else:
         add_card = None
