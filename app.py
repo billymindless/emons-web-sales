@@ -7163,9 +7163,13 @@ def main():
         st.session_state["main_tab_idx"] = 0
     if st.session_state["main_tab_idx"] >= len(tab_labels):
         st.session_state["main_tab_idx"] = 0
-    # Supabase 연결 실패 시 친절한 경고
+    # Supabase 오류 시 안내 (테이블 없음 vs 연결 실패 구분)
     if st.session_state.get("supabase_error"):
-        st.error("⚠️ **Supabase 연결 실패**: " + st.session_state["supabase_error"] + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
+        err_text = st.session_state["supabase_error"] or ""
+        if "schema cache" in err_text or "Could not find the table" in err_text or "app_customers" in err_text:
+            st.error("⚠️ **Supabase에 app_customers 테이블이 없습니다.** Supabase 대시보드 → SQL Editor에서 프로젝트의 **SUPABASE_APP_CUSTOMERS.sql** 파일 내용을 실행해 주세요.")
+        else:
+            st.error("⚠️ **Supabase 연결 실패**: " + err_text + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
     # 상단 메뉴 고정(Sticky): 스크롤 시에도 메뉴가 상단에 유지되도록 CSS 주입
     st.markdown(
         """
