@@ -7020,19 +7020,24 @@ def render_dashboard():
     author_display_map = _get_app_user_display_name_map()
     if len(todos_df) > 0:
         for _, row in todos_df.iterrows():
+            is_done = bool(row.get("is_completed"))
             content_preview = (row["content"] or "")[:50]
             if len((row["content"] or "")) > 50:
                 content_preview += "..."
             raw_author = row.get("author") or ""
             author_display = author_display_map.get(str(raw_author).strip()) or author_display_map.get(str(raw_author).strip().lower()) or (raw_author or "—")
-            with st.expander(f"{'✅' if row['is_completed'] else '⬜'} {content_preview} (by {author_display})"):
+            expander_label = f"{'✅ 완료' if is_done else '⬜'} {content_preview} (by {author_display})"
+            with st.expander(expander_label, expanded=not is_done):
                 st.caption(row["created_date"])
+                if is_done:
+                    st.success("✅ **완료된 업무입니다.**")
                 st.write(row["content"] or "")
-                if not row["is_completed"] and st.button("완료 처리", key=f"todo_done_{row['id']}"):
+                if not is_done and st.button("완료 처리", key=f"todo_done_{row['id']}"):
                     conn = get_tenant_conn(db_filename)
                     conn.execute("UPDATE Todos SET is_completed = 1 WHERE id = ?", (row["id"],))
                     conn.commit()
                     conn.close()
+                    clear_data_cache()
                     st.rerun()
 
 
@@ -7219,12 +7224,14 @@ def main():
                 st.error("⚠️ **Supabase RLS 정책 오류**: " + err_text + " — 해당 테이블에 INSERT를 허용하는 RLS 정책을 추가해 주세요.")
         else:
             st.error("⚠️ **Supabase 연결 실패**: " + err_text + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
-    # 상단 메뉴 고정(Sticky): 스크롤 시에도 메뉴가 뷰포트 최상단에 유지, 배경으로 가독성 확보
+    # 상단 메뉴 고정(Sticky): 일반 유저/매장관리자 공통, 스크롤 시 메뉴가 뷰포트 최상단에 유지
     st.markdown(
         """
         <style>
-        /* 상단 네비게이션 고정: 메뉴 선택 + 힌트 + 셀렉트박스 + 구분선 */
-        .main .block-container > div:nth-child(-n+5) {
+        /* sticky 동작을 위해 부모 overflow 제거 */
+        .main, .main .block-container { overflow: visible !important; }
+        /* 상단 네비게이션 고정: 에러·메뉴 라벨·셀렉트박스·구분선 등 상단 영역 */
+        .main .block-container > div:nth-child(-n+8) {
             position: sticky !important;
             top: 0 !important;
             z-index: 9999 !important;
@@ -7232,7 +7239,7 @@ def main():
             padding-bottom: 0.5rem !important;
             box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important;
         }
-        .main .block-container > div:nth-child(6) { margin-top: 0.75rem !important; }
+        .main .block-container > div:nth-child(9) { margin-top: 0.75rem !important; }
         </style>
         """,
         unsafe_allow_html=True,
