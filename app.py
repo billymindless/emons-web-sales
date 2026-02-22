@@ -216,6 +216,351 @@ def get_supabase_admin_client():
         return None, f"Supabase Admin 연결 실패: {err_msg}"
 
 
+# ---------- Supabase 직원/매장 테이블 (app_users, app_user_stores, app_stores) ----------
+# 테이블이 없으면 ensure_supabase_app_tables()로 자동 생성 시도(database_url 있을 때) 또는 SQL Editor에서 SUPABASE_APP_TABLES.sql 실행.
+
+def _supabase_app_tables_available():
+    """Supabase에 app_users 테이블이 있는지 확인. (있으면 True, 없으면 False)"""
+    client, err = get_supabase_client()
+    if err or not client:
+        return False
+    try:
+        client.table("app_users").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _supabase_run_app_tables_sql():
+    """
+    Supabase DB에 app_stores, app_users, app_user_stores 테이블이 없으면 생성.
+    st.secrets의 supabase.database_url (Postgres 연결 문자열)이 있으면 psycopg2로 DDL 실행.
+    성공 시 True, 실패 또는 URL 없음 시 False.
+    """
+    try:
+        import psycopg2
+    except ImportError:
+        return False
+    secrets = (st.secrets.get("supabase") or {}) if "secrets" in dir(st) else {}
+    if not secrets:
+        try:
+            import streamlit as _st
+            secrets = _st.secrets.get("supabase") or {}
+        except Exception:
+            pass
+    db_url = (secrets.get("database_url") or secrets.get("db_url") or "").strip()
+    if not db_url:
+        return False
+    sql_path = os.path.join(BASE_DIR, "SUPABASE_APP_TABLES.sql")
+    if not os.path.isfile(sql_path):
+        return False
+    try:
+        with open(sql_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except Exception:
+        return False
+    # 줄 단위 주석 제거 후, 문장 단위로 분리
+    lines = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("--") or not s:
+            continue
+        lines.append(line)
+    raw_clean = "\n".join(lines)
+    statements = []
+    for part in raw_clean.split(";"):
+        s = part.strip()
+        if s and not s.upper().startswith("--"):
+            statements.append(s + ";")
+    if not statements:
+        return False
+    conn = None
+    try:
+        conn = psycopg2.connect(db_url)
+        conn.autocommit = True
+        cur = conn.cursor()
+        for stmt in statements:
+            stmt = stmt.strip()
+            if not stmt or stmt == ";":
+                continue
+            try:
+                cur.execute(stmt)
+            except Exception as e:
+                if "already exists" not in str(e).lower() and "duplicate" not in str(e).lower():
+                    try:
+                        cur.close()
+                        conn.close()
+                    except Exception:
+                        pass
+                    return False
+        cur.close()
+        return True
+    except Exception:
+        return False
+    finally:
+        if conn and not conn.closed:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def ensure_supabase_app_tables():
+    """
+    Supabase에 직원/매장용 테이블(app_users, app_user_stores, app_stores)이 있는지 확인.
+    없으면 database_url로 자동 생성 시도. 성공 시 True, 아니면 False.
+    """
+    if _supabase_app_tables_available():
+        return True
+    if _supabase_run_app_tables_sql():
+        return _supabase_app_tables_available()
+    return False
+
+
+def _get_supabase_stores_list():
+    """Supabase app_stores 목록. 반환: [{"id", "store_name", "db_filename"}, ...]"""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_stores").select("id, store_name, db_filename").order("id").execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+def _get_supabase_app_user_by_email(email: str):
+    """
+    Supabase app_users에서 이메일로 사용자 조회.
+    반환: (id, username, role, store_id, db_filename) 또는 None.
+    """
+    if not email or not str(email).strip():
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        email_clean = str(email).strip().lower()
+        r = client.table("app_users").select("id, username, role, store_id").eq("email", email_clean).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        if not rows:
+            return None
+        row = rows[0]
+        uid, username, role, store_id = row.get("id"), row.get("username"), row.get("role"), row.get("store_id")
+        db_filename = ""
+        first_sid = store_id
+        if not first_sid:
+            us = client.table("app_user_stores").select("store_id").eq("user_id", uid).limit(1).execute()
+            if us.data and us.data[0].get("store_id"):
+                first_sid = us.data[0]["store_id"]
+        if first_sid:
+            s = client.table("app_stores").select("db_filename").eq("id", first_sid).maybe_single().execute()
+            if s.data and s.data.get("db_filename"):
+                db_filename = s.data["db_filename"]
+        return (uid, username, role, store_id, db_filename)
+    except Exception:
+        return None
+
+
+def _get_supabase_user_allowed_stores(user_id: int):
+    """Supabase app_user_stores + app_stores에서 접근 가능 매장 목록. [(store_id, db_filename, store_name), ...]"""
+    if not user_id:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        us = client.table("app_user_stores").select("store_id").eq("user_id", user_id).execute()
+        store_ids = [x["store_id"] for x in (us.data or [])]
+        if not store_ids:
+            row = client.table("app_users").select("store_id").eq("id", user_id).maybe_single().execute()
+            if row.data and row.data.get("store_id"):
+                store_ids = [row.data["store_id"]]
+        if not store_ids:
+            return []
+        out = []
+        for sid in store_ids:
+            s = client.table("app_stores").select("id, db_filename, store_name").eq("id", sid).maybe_single().execute()
+            if s.data:
+                out.append((s.data["id"], s.data["db_filename"], s.data["store_name"]))
+        return sorted(out, key=lambda x: (x[2] or "", x[0]))
+    except Exception:
+        return []
+
+
+def _get_supabase_store_by_db_filename(db_filename: str):
+    """db_filename으로 app_stores에서 store id 조회. 반환: id 또는 None."""
+    if not db_filename:
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        r = client.table("app_stores").select("id").eq("db_filename", db_filename).maybe_single().execute()
+        return r.data.get("id") if r.data else None
+    except Exception:
+        return None
+
+
+def _ensure_supabase_superadmin_email(email_clean: str):
+    """app_users에서 username=superadmin인 행에 email 설정 (billymind@gmail.com 복구용)."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return
+    try:
+        client.table("app_users").update({"email": email_clean}).eq("username", "superadmin").execute()
+    except Exception:
+        pass
+
+
+def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
+    """해당 매장에 배정된 직원 표시명 목록 (Supabase). [name 또는 username, ...]"""
+    store_id = _get_supabase_store_by_db_filename(db_filename)
+    if not store_id:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        us = client.table("app_user_stores").select("user_id").eq("store_id", store_id).execute()
+        user_ids = [x["user_id"] for x in (us.data or [])]
+        if not user_ids:
+            u = client.table("app_users").select("id").eq("store_id", store_id).execute()
+            user_ids = [x["id"] for x in (u.data or [])]
+        out = []
+        for uid in user_ids:
+            r = client.table("app_users").select("name, username").eq("id", uid).maybe_single().execute()
+            if r.data:
+                display = (str(r.data.get("name") or "").strip() or str(r.data.get("username") or "").strip()) or None
+                if display and display not in out:
+                    out.append(display)
+        return out
+    except Exception:
+        return []
+
+
+def _get_supabase_users_list():
+    """Supabase app_users 전체 목록. 반환: [{"id", "username", "email", "role", "name", "store_id"}, ...]"""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_users").select("id, username, email, role, name, store_id").order("username").execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+def _get_supabase_user_store_ids(user_id: int):
+    """한 직원의 배정 매장 id 목록 (Supabase app_user_stores)."""
+    if not user_id:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_user_stores").select("store_id").eq("user_id", user_id).execute()
+        return [x["store_id"] for x in (r.data or [])]
+    except Exception:
+        return []
+
+
+def _get_supabase_employee_list_with_stores():
+    """직원 명부용: app_users + 배정매장 이름 문자열. 반환: list of dict id, email, username, name, role, 배정매장."""
+    users = _get_supabase_users_list()
+    if not users:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return [{"id": u["id"], "email": u.get("email"), "username": u.get("username"), "name": u.get("name"), "role": u.get("role"), "배정매장": ""} for u in users]
+    store_names_by_id = {}
+    try:
+        stores_r = client.table("app_stores").select("id, store_name").execute()
+        for s in (stores_r.data or []):
+            store_names_by_id[s["id"]] = s.get("store_name") or ""
+    except Exception:
+        pass
+    out = []
+    for u in users:
+        uid = u.get("id")
+        store_ids = _get_supabase_user_store_ids(uid)
+        names = [store_names_by_id.get(sid, "") for sid in store_ids if sid]
+        배정매장 = ", ".join(n for n in names if n)
+        if not 배정매장 and u.get("store_id"):
+            배정매장 = store_names_by_id.get(u["store_id"], "") or ""
+        out.append({
+            "id": uid,
+            "email": u.get("email"),
+            "username": u.get("username"),
+            "name": u.get("name"),
+            "role": u.get("role"),
+            "배정매장": 배정매장,
+        })
+    return out
+
+
+def _supabase_insert_app_user(username: str, email: str, role: str, store_id, name: str):
+    """app_users에 한 행 삽입 (비밀번호는 Supabase Auth에서 관리하므로 placeholder 저장). 반환: (user_id, None) 또는 (None, error_msg)."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return None, (err or "Supabase 연결 불가")
+    try:
+        pw_placeholder = hashlib.sha256("supabase_managed".encode()).hexdigest()
+        row = {
+            "username": username,
+            "password": pw_placeholder,
+            "email": email or None,
+            "role": role,
+            "store_id": store_id,
+            "name": name or None,
+        }
+        r = client.table("app_users").insert(row).execute()
+        data = (r.data or []) if hasattr(r, "data") else []
+        if data and len(data) > 0 and data[0].get("id") is not None:
+            return data[0]["id"], None
+        return None, "insert 후 id를 가져오지 못했습니다."
+    except Exception as e:
+        return None, str(e)
+
+
+def _supabase_update_app_user(user_id: int, name: str, role: str, store_id, store_ids: list):
+    """app_users 한 행 수정 + app_user_stores 교체. 에러 시 예외."""
+    client, err = get_supabase_client()
+    if err or not client:
+        raise RuntimeError(err or "Supabase 연결 불가")
+    client.table("app_users").update({
+        "name": (name or "").strip() or None,
+        "role": role,
+        "store_id": store_id,
+    }).eq("id", user_id).execute()
+    client.table("app_user_stores").delete().eq("user_id", user_id).execute()
+    for sid in (store_ids or []):
+        client.table("app_user_stores").insert({"user_id": user_id, "store_id": sid}).execute()
+
+
+def _supabase_delete_app_user(user_id: int):
+    """app_user_stores 삭제 후 app_users 삭제. 에러 시 예외."""
+    client, err = get_supabase_client()
+    if err or not client:
+        raise RuntimeError(err or "Supabase 연결 불가")
+    client.table("app_user_stores").delete().eq("user_id", user_id).execute()
+    client.table("app_users").delete().eq("id", user_id).execute()
+
+
+def _supabase_get_app_user_by_email(email: str):
+    """이메일로 app_users 한 행 조회. 없으면 None."""
+    if not email or not str(email).strip():
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        r = client.table("app_users").select("id, username, email, role, store_id, name").eq("email", str(email).strip().lower()).maybe_single().execute()
+        return r.data if r.data else None
+    except Exception:
+        return None
+
+
 def _get_customer_name_supabase(db_filename: str, customer_id: int) -> str:
     """Supabase customers 테이블에서 id(기본키) 기준으로 고객명 조회. 중복 없이 단일 행만 반환."""
     client, err = get_supabase_client()
@@ -780,11 +1125,13 @@ def _get_store_name_by_db(db_filename: str) -> str:
 def get_store_assigned_employee_names(db_filename: str) -> list[str]:
     """
     해당 매장(db_filename)에 배정된 직원(로그인 계정)의 표시명 목록.
-    직원 명부(Master Users + UserStores)와 동일한 소스라서 판매입력 담당 직원으로 사용.
+    Supabase app_users/app_user_stores가 있으면 그쪽 우선, 없으면 Master DB.
     반환: [표시명, ...] (name 있으면 name, 없으면 username)
     """
     if not db_filename:
         return []
+    if _supabase_app_tables_available():
+        return _get_supabase_store_assigned_employee_names(db_filename)
     conn = get_master_conn()
     try:
         row = conn.execute("SELECT id FROM Stores WHERE db_filename = ?", (db_filename,)).fetchone()
@@ -1275,16 +1622,23 @@ def verify_user(username: str, password: str):
 
 def get_app_user_by_email(email: str):
     """
-    Supabase Auth 로그인 후: 이메일로 Master DB의 사용자 정보 조회.
-    성공 시 (user_id, username, role, store_id, db_filename) 튜플 반환.
-    실패 시 None. (email이 비어있거나, 해당 이메일 사용자가 없을 때)
+    Supabase Auth 로그인 후: 이메일로 사용자 정보 조회.
+    Supabase app_users 테이블이 있으면 그쪽을 우선 사용, 없으면 Master DB 사용.
+    성공 시 (user_id, username, role, store_id, db_filename) 튜플 반환. 실패 시 None.
     """
     if not email or not str(email).strip():
         return None
+    email_clean = str(email).strip().lower()
+    if ensure_supabase_app_tables():
+        row = _get_supabase_app_user_by_email(email_clean)
+        if row is not None:
+            return row
+        if email_clean == "billymind@gmail.com":
+            _ensure_supabase_superadmin_email(email_clean)
+            return _get_supabase_app_user_by_email(email_clean)
+        return None
     conn = get_master_conn()
     try:
-        email_clean = str(email).strip().lower()
-        # email 컬럼이 없으면 추가 (스키마 호환)
         cur = conn.execute("PRAGMA table_info(Users)")
         cols = [r[1] for r in cur.fetchall()]
         if "email" not in cols:
@@ -1298,7 +1652,6 @@ def get_app_user_by_email(email: str):
         """, (email_clean,)).fetchone()
         if row is not None:
             return row
-        # 복구: 해당 이메일이 superadmin 계정(billymind@gmail.com)인데 미연결 상태면 superadmin 행에 이메일 설정 후 재조회
         if email_clean == "billymind@gmail.com":
             conn.execute("UPDATE Users SET email = ? WHERE username = 'superadmin'", (email_clean,))
             conn.commit()
@@ -1319,16 +1672,17 @@ def get_app_user_by_email(email: str):
 def get_user_allowed_stores(user_id: int):
     """
     한 직원이 접근 가능한 매장 목록 (여러 매장 지원).
-    반환: [(store_id, db_filename, store_name), ...] (UserStores 기준, 없으면 Users.store_id 1건으로 대체)
-    superadmin은 이 목록을 쓰지 않고 전체 매장 선택하므로 빈 리스트 또는 불필요.
+    Supabase app_users/app_user_stores가 있으면 그쪽 우선, 없으면 Master DB.
+    반환: [(store_id, db_filename, store_name), ...]
     """
     if not user_id:
         return []
+    if _supabase_app_tables_available():
+        return _get_supabase_user_allowed_stores(user_id)
     conn = get_master_conn()
     try:
         cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
         if cur.fetchone() is None:
-            # UserStores 미존재 시 기존 방식: Users.store_id 1건
             row = conn.execute("""
                 SELECT u.store_id, s.db_filename, s.store_name
                 FROM Users u
@@ -1345,7 +1699,6 @@ def get_user_allowed_stores(user_id: int):
         """, (user_id,)).fetchall()
         if rows:
             return [tuple(r) for r in rows]
-        # UserStores에 없으면 Users.store_id 1건으로 fallback
         row = conn.execute("""
             SELECT u.store_id, s.db_filename, s.store_name
             FROM Users u
@@ -3589,14 +3942,30 @@ def _get_store_ids_by_display_names(display_names: list):
 
 
 def render_employee_management():
-    """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + Master DB Users 반영. superadmin 전용."""
+    """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + 직원/매장은 Supabase app_users·app_stores 우선. superadmin 전용."""
     st.header("👥 직원 계정 관리 및 발령")
 
-    conn = get_master_conn()
-    try:
-        all_stores_df = pd.read_sql("SELECT id, store_name FROM Stores ORDER BY store_name", conn)
-    finally:
-        conn.close()
+    use_supabase = ensure_supabase_app_tables()
+    if use_supabase:
+        stores_list = _get_supabase_stores_list()
+        all_stores_df = pd.DataFrame(stores_list).sort_values("store_name", ignore_index=True) if stores_list else pd.DataFrame(columns=["id", "store_name", "db_filename"])
+        if "store_name" not in all_stores_df.columns and len(all_stores_df) == 0:
+            all_stores_df = pd.DataFrame(columns=["id", "store_name", "db_filename"])
+    else:
+        conn = get_master_conn()
+        try:
+            all_stores_df = pd.read_sql("SELECT id, store_name FROM Stores ORDER BY store_name", conn)
+        finally:
+            conn.close()
+        client, _ = get_supabase_client()
+        if client:
+            st.warning(
+                "직원 명부를 Supabase에 두려면 **app_users** 테이블이 필요합니다. "
+                "Supabase 대시보드 → SQL Editor에서 프로젝트 루트의 **SUPABASE_APP_TABLES.sql** 내용을 실행해 주세요. "
+                "또는 .streamlit/secrets.toml에 `database_url`(Postgres 연결 문자열)을 넣으면 앱이 테이블을 자동 생성합니다."
+            )
+        else:
+            st.info("💡 직원 명부를 Supabase에 저장하려면 Supabase URL/Key 설정 후, SQL Editor에서 **SUPABASE_APP_TABLES.sql**을 실행해 주세요.")
     store_options = all_stores_df["store_name"].tolist() if len(all_stores_df) > 0 else []
 
     admin_client, admin_err = get_supabase_admin_client()
@@ -3656,70 +4025,101 @@ def render_employee_management():
                     username = str(emp_email).strip()
                     role = str(emp_role_choice).strip()
                     emp_name_val = str(emp_name).strip() if emp_name else ""
-                    conn = get_master_conn()
-                    try:
-                        existing = conn.execute(
-                            "SELECT id FROM Users WHERE email IS NOT NULL AND TRIM(LOWER(email)) = ?",
-                            (username.lower(),),
-                        ).fetchone()
-                        if existing:
-                            user_id = existing[0]
-                            conn.execute(
-                                "UPDATE Users SET name = ?, role = ?, store_id = ? WHERE id = ?",
-                                (emp_name_val or None, role, first_store_id, user_id),
-                            )
-                            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-                            if cur.fetchone() is not None and selected_store_ids:
-                                conn.execute("DELETE FROM UserStores WHERE user_id = ?", (user_id,))
-                                for sid in selected_store_ids:
-                                    conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
-                            conn.commit()
-                            st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
-                        else:
-                            conn.execute(
-                                """
-                                INSERT INTO Users (username, password, email, role, store_id, name)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                                """,
-                                (username, hashlib.sha256("supabase_managed".encode()).hexdigest(), str(emp_email).strip(), role, first_store_id, emp_name_val or None),
-                            )
-                            conn.commit()
-                            user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-                            if cur.fetchone() is not None and selected_store_ids:
-                                for sid in selected_store_ids:
-                                    conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
-                                conn.commit()
-                            if supabase_already_exists:
-                                st.success("이 이메일은 Supabase에 이미 있어 앱 권한만 부여했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+
+                    if use_supabase:
+                        existing = _supabase_get_app_user_by_email(username)
+                        try:
+                            if existing:
+                                user_id = existing["id"]
+                                _supabase_update_app_user(user_id, emp_name_val, role, first_store_id, selected_store_ids)
+                                st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
                             else:
-                                st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
-                    except sqlite3.IntegrityError:
-                        st.error("Master DB에 이미 같은 사용자명/이메일이 등록되어 있습니다. 직원 수정 메뉴에서 기존 직원을 수정해 주세요.")
-                        conn.rollback()
-                        conn.close()
-                        st.stop()
-                    except Exception as e:
-                        conn.rollback()
-                        st.error(f"Master DB 등록에 실패했습니다: {str(e)}")
-                        conn.close()
-                        st.stop()
-                    finally:
-                        conn.close()
+                                user_id, ins_err = _supabase_insert_app_user(username, str(emp_email).strip(), role, first_store_id, emp_name_val)
+                                if ins_err:
+                                    st.error(f"직원 명부 등록 실패: {ins_err}")
+                                    st.stop()
+                                for sid in selected_store_ids:
+                                    try:
+                                        get_supabase_client()[0].table("app_user_stores").insert({"user_id": user_id, "store_id": sid}).execute()
+                                    except Exception:
+                                        pass
+                                if supabase_already_exists:
+                                    st.success("이 이메일은 Supabase에 이미 있어 앱 권한만 부여했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+                                else:
+                                    st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
+                        except Exception as e:
+                            st.error(f"Supabase 직원 정보 반영 실패: {str(e)}")
+                            st.stop()
+                    else:
+                        conn = get_master_conn()
+                        try:
+                            existing = conn.execute(
+                                "SELECT id FROM Users WHERE email IS NOT NULL AND TRIM(LOWER(email)) = ?",
+                                (username.lower(),),
+                            ).fetchone()
+                            if existing:
+                                user_id = existing[0]
+                                conn.execute(
+                                    "UPDATE Users SET name = ?, role = ?, store_id = ? WHERE id = ?",
+                                    (emp_name_val or None, role, first_store_id, user_id),
+                                )
+                                cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+                                if cur.fetchone() is not None and selected_store_ids:
+                                    conn.execute("DELETE FROM UserStores WHERE user_id = ?", (user_id,))
+                                    for sid in selected_store_ids:
+                                        conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
+                                conn.commit()
+                                st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+                            else:
+                                conn.execute(
+                                    """
+                                    INSERT INTO Users (username, password, email, role, store_id, name)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (username, hashlib.sha256("supabase_managed".encode()).hexdigest(), str(emp_email).strip(), role, first_store_id, emp_name_val or None),
+                                )
+                                conn.commit()
+                                user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                                cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+                                if cur.fetchone() is not None and selected_store_ids:
+                                    for sid in selected_store_ids:
+                                        conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (user_id, sid))
+                                    conn.commit()
+                                if supabase_already_exists:
+                                    st.success("이 이메일은 Supabase에 이미 있어 앱 권한만 부여했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+                                else:
+                                    st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
+                        except sqlite3.IntegrityError:
+                            conn.rollback()
+                            st.error("Master DB에 이미 같은 사용자명/이메일이 등록되어 있습니다. 직원 수정 메뉴에서 기존 직원을 수정해 주세요.")
+                            conn.close()
+                            st.stop()
+                        except Exception as e:
+                            conn.rollback()
+                            st.error(f"Master DB 등록에 실패했습니다: {str(e)}")
+                            conn.close()
+                            st.stop()
+                        finally:
+                            conn.close()
 
                 st.rerun()
 
     st.subheader("직원 수정 · 매장 변경 · 삭제")
-    conn = get_master_conn()
-    try:
-        users_list = pd.read_sql(
-            "SELECT id, username, email, role, name FROM Users ORDER BY username",
-            conn,
-        )
-        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-        has_user_stores = cur.fetchone() is not None
-    finally:
-        conn.close()
+    if use_supabase:
+        users_data = _get_supabase_users_list()
+        users_list = pd.DataFrame(users_data).sort_values("username", ignore_index=True) if users_data else pd.DataFrame(columns=["id", "username", "email", "role", "name"])
+        has_user_stores = True
+    else:
+        conn = get_master_conn()
+        try:
+            users_list = pd.read_sql(
+                "SELECT id, username, email, role, name FROM Users ORDER BY username",
+                conn,
+            )
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+            has_user_stores = cur.fetchone() is not None
+        finally:
+            conn.close()
 
     if len(users_list) == 0:
         st.info("등록된 직원이 없습니다. 신규 등록 후 수정/삭제할 수 있습니다.")
@@ -3739,19 +4139,24 @@ def render_employee_management():
                 key="emp_edit_user_id",
             )
             if edit_user_id:
-                conn = get_master_conn()
-                try:
-                    row = conn.execute(
-                        "SELECT username, email, role, name FROM Users WHERE id = ?",
-                        (edit_user_id,),
-                    ).fetchone()
-                    current_stores = conn.execute(
-                        "SELECT store_id FROM UserStores WHERE user_id = ? ORDER BY store_id",
-                        (edit_user_id,),
-                    ).fetchall()
-                    current_store_ids = [r[0] for r in current_stores]
-                finally:
-                    conn.close()
+                if use_supabase:
+                    urow = next((u for u in _get_supabase_users_list() if u.get("id") == edit_user_id), None)
+                    row = (urow.get("username"), urow.get("email"), urow.get("role"), urow.get("name")) if urow else None
+                    current_store_ids = _get_supabase_user_store_ids(edit_user_id)
+                else:
+                    conn = get_master_conn()
+                    try:
+                        row = conn.execute(
+                            "SELECT username, email, role, name FROM Users WHERE id = ?",
+                            (edit_user_id,),
+                        ).fetchone()
+                        current_stores = conn.execute(
+                            "SELECT store_id FROM UserStores WHERE user_id = ? ORDER BY store_id",
+                            (edit_user_id,),
+                        ).fetchall()
+                        current_store_ids = [r[0] for r in current_stores]
+                    finally:
+                        conn.close()
                 if row and len(all_stores_df) > 0:
                     with st.form("employee_update_form"):
                         st.text_input("이메일 (로그인 ID)", value=row[1] or "", disabled=True, help="이메일 변경은 불가합니다.")
@@ -3771,25 +4176,29 @@ def render_employee_management():
                             key="emp_update_stores",
                         )
                         if st.form_submit_button("저장"):
-                            conn = get_master_conn()
+                            store_ids = all_stores_df[all_stores_df["store_name"].isin(edit_stores)]["id"].tolist()
+                            first_sid = store_ids[0] if store_ids else None
                             try:
-                                store_ids = all_stores_df[all_stores_df["store_name"].isin(edit_stores)]["id"].tolist()
-                                first_sid = store_ids[0] if store_ids else None
-                                conn.execute(
-                                    "UPDATE Users SET name = ?, role = ?, store_id = ? WHERE id = ?",
-                                    ((edit_name or "").strip() or None, edit_role, first_sid, edit_user_id),
-                                )
-                                conn.execute("DELETE FROM UserStores WHERE user_id = ?", (edit_user_id,))
-                                for sid in store_ids:
-                                    conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (edit_user_id, sid))
-                                conn.commit()
-                                st.success("직원 정보가 저장되었습니다.")
+                                if use_supabase:
+                                    _supabase_update_app_user(edit_user_id, (edit_name or "").strip() or None, edit_role, first_sid, store_ids)
+                                    st.success("직원 정보가 저장되었습니다.")
+                                else:
+                                    conn = get_master_conn()
+                                    try:
+                                        conn.execute(
+                                            "UPDATE Users SET name = ?, role = ?, store_id = ? WHERE id = ?",
+                                            ((edit_name or "").strip() or None, edit_role, first_sid, edit_user_id),
+                                        )
+                                        conn.execute("DELETE FROM UserStores WHERE user_id = ?", (edit_user_id,))
+                                        for sid in store_ids:
+                                            conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (edit_user_id, sid))
+                                        conn.commit()
+                                        st.success("직원 정보가 저장되었습니다.")
+                                    finally:
+                                        conn.close()
                                 st.rerun()
                             except Exception as e:
-                                conn.rollback()
                                 st.error(f"저장 실패: {str(e)}")
-                            finally:
-                                conn.close()
 
         # ----- 직원 매장 변경 (배정 매장만 빠르게 변경) -----
         if has_user_stores and len(all_stores_df) > 0:
@@ -3801,15 +4210,18 @@ def render_employee_management():
                     key="emp_store_change_user_id",
                 )
                 if store_edit_user_id:
-                    conn = get_master_conn()
-                    try:
-                        current = conn.execute(
-                            "SELECT store_id FROM UserStores WHERE user_id = ? ORDER BY store_id",
-                            (store_edit_user_id,),
-                        ).fetchall()
-                        current_ids = [r[0] for r in current]
-                    finally:
-                        conn.close()
+                    if use_supabase:
+                        current_ids = _get_supabase_user_store_ids(store_edit_user_id)
+                    else:
+                        conn = get_master_conn()
+                        try:
+                            current = conn.execute(
+                                "SELECT store_id FROM UserStores WHERE user_id = ? ORDER BY store_id",
+                                (store_edit_user_id,),
+                            ).fetchall()
+                            current_ids = [r[0] for r in current]
+                        finally:
+                            conn.close()
                     current_names = all_stores_df[all_stores_df["id"].isin(current_ids)]["store_name"].tolist()
                     edited_stores = st.multiselect(
                         "배정 매장 (여러 개 선택 가능)",
@@ -3818,22 +4230,35 @@ def render_employee_management():
                         key="emp_edit_stores",
                     )
                     if st.button("배정 매장 저장", key="emp_edit_save_btn"):
-                        conn = get_master_conn()
+                        store_ids = all_stores_df[all_stores_df["store_name"].isin(edited_stores)]["id"].tolist()
+                        first_sid = store_ids[0] if store_ids else None
                         try:
-                            store_ids = all_stores_df[all_stores_df["store_name"].isin(edited_stores)]["id"].tolist()
-                            conn.execute("DELETE FROM UserStores WHERE user_id = ?", (store_edit_user_id,))
-                            for sid in store_ids:
-                                conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (store_edit_user_id, sid))
-                            first_sid = store_ids[0] if store_ids else None
-                            conn.execute("UPDATE Users SET store_id = ? WHERE id = ?", (first_sid, store_edit_user_id))
-                            conn.commit()
-                            st.success("배정 매장이 저장되었습니다.")
+                            if use_supabase:
+                                u = next((x for x in _get_supabase_users_list() if x.get("id") == store_edit_user_id), None)
+                                cur_name = (u.get("name") or "").strip() if u else None
+                                cur_role = u.get("role") if u else "user"
+                                _supabase_update_app_user(store_edit_user_id, cur_name, cur_role, first_sid, store_ids)
+                                st.success("배정 매장이 저장되었습니다.")
+                            else:
+                                conn = get_master_conn()
+                                try:
+                                    conn.execute("DELETE FROM UserStores WHERE user_id = ?", (store_edit_user_id,))
+                                    for sid in store_ids:
+                                        conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (store_edit_user_id, sid))
+                                    conn.execute("UPDATE Users SET store_id = ? WHERE id = ?", (first_sid, store_edit_user_id))
+                                    conn.commit()
+                                    st.success("배정 매장이 저장되었습니다.")
+                                finally:
+                                    conn.close()
                             st.rerun()
                         except Exception as e:
-                            conn.rollback()
+                            if not use_supabase:
+                                try:
+                                    conn.rollback()
+                                    conn.close()
+                                except Exception:
+                                    pass
                             st.error(f"저장 실패: {str(e)}")
-                        finally:
-                            conn.close()
 
         # ----- 직원 삭제 -----
         with st.expander("🗑️ 직원 삭제", expanded=False):
@@ -3869,12 +4294,16 @@ def render_employee_management():
                                                 break
                                     except Exception:
                                         pass
-                                conn = get_master_conn()
-                                conn.execute("DELETE FROM UserStores WHERE user_id = ?", (del_user_id,))
-                                conn.execute("DELETE FROM Users WHERE id = ?", (del_user_id,))
-                                conn.commit()
-                                conn.close()
-                                st.success("직원이 삭제되었습니다.")
+                                if use_supabase:
+                                    _supabase_delete_app_user(del_user_id)
+                                    st.success("직원이 삭제되었습니다.")
+                                else:
+                                    conn = get_master_conn()
+                                    conn.execute("DELETE FROM UserStores WHERE user_id = ?", (del_user_id,))
+                                    conn.execute("DELETE FROM Users WHERE id = ?", (del_user_id,))
+                                    conn.commit()
+                                    conn.close()
+                                    st.success("직원이 삭제되었습니다.")
                                 st.rerun()
                             except Exception as e:
                                 try:
@@ -3885,34 +4314,38 @@ def render_employee_management():
                                 st.error(f"삭제 실패: {str(e)}")
 
     st.subheader("직원 명부")
-    conn = get_master_conn()
-    try:
-        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-        if cur.fetchone() is not None:
-            df = pd.read_sql(
-                """
-                SELECT u.id, u.email, u.username, u.name, u.role,
-                    COALESCE(
-                        (SELECT GROUP_CONCAT(s.store_name, ', ') FROM UserStores us JOIN Stores s ON us.store_id = s.id WHERE us.user_id = u.id),
-                        (SELECT s.store_name FROM Stores s WHERE s.id = u.store_id)
-                    ) AS 배정매장
-                FROM Users u
-                ORDER BY u.id
-                """,
-                conn,
-            )
-        else:
-            df = pd.read_sql(
-                """
-                SELECT u.id, u.email, u.username, u.name, u.role, s.store_name AS 배정매장
-                FROM Users u
-                LEFT JOIN Stores s ON u.store_id = s.id
-                ORDER BY u.id
-                """,
-                conn,
-            )
-    finally:
-        conn.close()
+    if use_supabase:
+        emp_list = _get_supabase_employee_list_with_stores()
+        df = pd.DataFrame(emp_list) if emp_list else pd.DataFrame(columns=["id", "email", "username", "name", "role", "배정매장"])
+    else:
+        conn = get_master_conn()
+        try:
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
+            if cur.fetchone() is not None:
+                df = pd.read_sql(
+                    """
+                    SELECT u.id, u.email, u.username, u.name, u.role,
+                        COALESCE(
+                            (SELECT GROUP_CONCAT(s.store_name, ', ') FROM UserStores us JOIN Stores s ON us.store_id = s.id WHERE us.user_id = u.id),
+                            (SELECT s.store_name FROM Stores s WHERE s.id = u.store_id)
+                        ) AS 배정매장
+                    FROM Users u
+                    ORDER BY u.id
+                    """,
+                    conn,
+                )
+            else:
+                df = pd.read_sql(
+                    """
+                    SELECT u.id, u.email, u.username, u.name, u.role, s.store_name AS 배정매장
+                    FROM Users u
+                    LEFT JOIN Stores s ON u.store_id = s.id
+                    ORDER BY u.id
+                    """,
+                    conn,
+                )
+        finally:
+            conn.close()
 
     if len(df) == 0:
         st.info("등록된 직원이 없습니다.")
@@ -4606,7 +5039,8 @@ def render_new_sales():
             clear_data_cache()
             st.success("입력이 완료되었습니다.")
             # 마진율 이상 시 Superadmin/매장관리자 알림
-            if margin_out_of_range:
+            if margin_out_of_r.
+            35\098541dange:
                 store_name = _get_store_name_by_db(db_filename)
                 _insert_admin_alert(store_name, "margin", f"{store_name}에서 마진율 {margin_pct:.1f}% 건이 등록되었습니다.")
             # 채널톡 PUSH: 백그라운드 스레드로 전송해 UI 블로킹 방지
