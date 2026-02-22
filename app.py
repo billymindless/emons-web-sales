@@ -110,6 +110,17 @@ def _sales_tenant_column() -> str | None:
         return None
 
 
+def _customers_tenant_column() -> str | None:
+    """Customers 테이블 테넌트 구분 컬럼명. secrets에 customers_tenant_column이 있고 비어있지 않을 때만 사용. 없거나 비면 None(컬럼 미사용)."""
+    try:
+        val = (st.secrets.get("supabase") or {}).get("customers_tenant_column")
+        if val is None or str(val).strip() == "":
+            return None
+        return str(val).strip()
+    except Exception:
+        return None
+
+
 def get_supabase_client():
     """st.secrets에서 URL/Key를 읽어 Supabase 클라이언트 반환. (client, None) 또는 (None, error_message)."""
     if _create_supabase_client is None:
@@ -186,7 +197,11 @@ def _get_customer_name_supabase(db_filename: str, customer_id: int) -> str:
     if err or not customer_id:
         return ""
     try:
-        r = client.table("customers").select("name").eq("id", int(customer_id)).eq("db_filename", db_filename).maybe_single().execute()
+        q = client.table("customers").select("name").eq("id", int(customer_id))
+        tc = _customers_tenant_column()
+        if tc:
+            q = q.eq(tc, db_filename)
+        r = q.maybe_single().execute()
         row = r.data[0] if isinstance(r.data, list) and r.data else (r.data if isinstance(r.data, dict) else None)
         if row and row.get("name"):
             return (row["name"] or "").strip()
@@ -203,7 +218,11 @@ def _get_customers_by_ids_supabase(db_filename: str, customer_ids: list) -> dict
     if err:
         return {}
     try:
-        r = client.table("customers").select("id, name, phone1, phone2, address").eq("db_filename", db_filename).in_("id", customer_ids).execute()
+        q = client.table("customers").select("id, name, phone1, phone2, address").in_("id", customer_ids)
+        tc = _customers_tenant_column()
+        if tc:
+            q = q.eq(tc, db_filename)
+        r = q.execute()
         return {row["id"]: row for row in (r.data or [])}
     except Exception:
         return {}
@@ -829,7 +848,11 @@ def load_customers_cached(db_filename: str, limit: int | None = 50) -> pd.DataFr
             st.session_state["supabase_error"] = err
         return pd.DataFrame()
     try:
-        q = client.table("customers").select("id, name, phone1, phone2, address").eq("db_filename", db_filename).order("id", desc=True)
+        q = client.table("customers").select("id, name, phone1, phone2, address")
+        tc = _customers_tenant_column()
+        if tc:
+            q = q.eq(tc, db_filename)
+        q = q.order("id", desc=True)
         if limit:
             q = q.limit(limit)
         r = q.execute()
@@ -3974,7 +3997,10 @@ def render_store_admin_employees():
                                 try:
                                     sc, _ = get_supabase_client()
                                     if sc:
-                                        rc = sc.table("customers").select("id, name, phone1, phone2, address").eq("id", cid).eq("db_filename", db_filename).maybe_single().execute()
+                                        qc = sc.table("customers").select("id, name, phone1, phone2, address").eq("id", cid)
+                                        if _customers_tenant_column():
+                                            qc = qc.eq(_customers_tenant_column(), db_filename)
+                                        rc = qc.maybe_single().execute()
                                         if rc.data:
                                             cur_c = rc.data
                                 except Exception:
@@ -4032,12 +4058,16 @@ def render_store_admin_employees():
                                 try:
                                     sc, _ = get_supabase_client()
                                     if sc:
-                                        sc.table("customers").update({
+                                        upd = {
                                             "name": new_c.get("name") or cur_c.get("name"),
                                             "phone1": new_c.get("phone1") or cur_c.get("phone1"),
                                             "phone2": new_c.get("phone2") or cur_c.get("phone2"),
                                             "address": new_c.get("address") or cur_c.get("address"),
-                                        }).eq("id", cur_c["id"]).eq("db_filename", db_filename).execute()
+                                        }
+                                    uq = sc.table("customers").update(upd).eq("id", cur_c["id"])
+                                    if _customers_tenant_column():
+                                        uq = uq.eq(_customers_tenant_column(), db_filename)
+                                    uq.execute()
                                 except Exception:
                                     pass
                             conn.execute(
@@ -4422,13 +4452,16 @@ def render_new_sales():
                 if err:
                     st.error(f"⚠️ Supabase 연결 실패: {err}")
                     st.stop()
-                r = client.table("customers").insert({
+                payload = {
                     "name": cust_name.strip(),
                     "phone1": phone1.strip(),
                     "phone2": phone2 or None,
                     "address": address_full or None,
-                    "db_filename": db_filename,
-                }).execute()
+                }
+                tc = _customers_tenant_column()
+                if tc:
+                    payload[tc] = db_filename
+                r = client.table("customers").insert(payload).execute()
                 if not r.data or len(r.data) == 0:
                     st.error("고객 등록에 실패했습니다. Supabase 응답을 확인해 주세요.")
                     st.stop()
@@ -4741,7 +4774,10 @@ def render_customer_balance():
                                 st.error(f"⚠️ Supabase 연결 실패: {err}")
                             else:
                                 try:
-                                    r = client.table("customers").select("phone1").eq("db_filename", db_filename).execute()
+                                    qp = client.table("customers").select("phone1")
+                                    if _customers_tenant_column():
+                                        qp = qp.eq(_customers_tenant_column(), db_filename)
+                                    r = qp.execute()
                                     existing_phones = set()
                                     for row in (r.data or []):
                                         if row.get("phone1") and str(row["phone1"]).strip():
@@ -4761,14 +4797,16 @@ def render_customer_balance():
                                         if phone1_digits in existing_phones:
                                             skipped += 1
                                             continue
-                                        client.table("customers").insert({
+                                        excel_payload = {
                                             "name": name_val or "미입력",
                                             "phone1": phone1_val,
                                             "phone2": phone2_val,
                                             "address": address_val,
                                             "source": "엑셀",
-                                            "db_filename": db_filename,
-                                        }).execute()
+                                        }
+                                        if _customers_tenant_column():
+                                            excel_payload[_customers_tenant_column()] = db_filename
+                                        client.table("customers").insert(excel_payload).execute()
                                         existing_phones.add(phone1_digits)
                                         inserted += 1
                                     clear_data_cache()
@@ -4817,7 +4855,10 @@ def render_customer_balance():
             try:
                 sc, _ = get_supabase_client()
                 if sc:
-                    r = sc.table("customers").select("id, name, phone1, phone2, address, source").eq("db_filename", db_filename).in_("source", ["채널톡", "채널톡_웹훅"]).order("id", desc=True).limit(100).execute()
+                    qct = sc.table("customers").select("id, name, phone1, phone2, address, source").in_("source", ["채널톡", "채널톡_웹훅"])
+                    if _customers_tenant_column():
+                        qct = qct.eq(_customers_tenant_column(), db_filename)
+                    r = qct.order("id", desc=True).limit(100).execute()
                     ct_customers = pd.DataFrame(r.data) if r.data else pd.DataFrame()
                 else:
                     ct_customers = pd.DataFrame()
@@ -4835,7 +4876,10 @@ def render_customer_balance():
             try:
                 sc, _ = get_supabase_client()
                 if sc:
-                    r = sc.table("customers").select("id, name, phone1, phone2, address").eq("db_filename", db_filename).or_(f"name.ilike.%{q}%,phone1.ilike.%{q}%,phone2.ilike.%{q}%").order("id", desc=True).limit(50).execute()
+                    qcq = sc.table("customers").select("id, name, phone1, phone2, address").or_(f"name.ilike.%{q}%,phone1.ilike.%{q}%,phone2.ilike.%{q}%")
+                    if _customers_tenant_column():
+                        qcq = qcq.eq(_customers_tenant_column(), db_filename)
+                    r = qcq.order("id", desc=True).limit(50).execute()
                     customers = pd.DataFrame(r.data) if r.data else pd.DataFrame()
                 else:
                     customers = pd.DataFrame()
@@ -5029,12 +5073,16 @@ def render_customer_balance():
                                     try:
                                         sc, _ = get_supabase_client()
                                         if sc:
-                                            sc.table("customers").update({
+                                            upd_cust = {
                                                 "name": st.session_state[f"{edit_prefix}_name"].strip(),
                                                 "phone1": st.session_state[f"{edit_prefix}_phone1"].strip(),
                                                 "phone2": st.session_state.get(f"{edit_prefix}_phone2") or None,
                                                 "address": st.session_state.get(f"{edit_prefix}_address") or None,
-                                            }).eq("id", cid).eq("db_filename", db_filename).execute()
+                                            }
+                                            uq_cust = sc.table("customers").update(upd_cust).eq("id", cid)
+                                            if _customers_tenant_column():
+                                                uq_cust = uq_cust.eq(_customers_tenant_column(), db_filename)
+                                            uq_cust.execute()
                                     except Exception:
                                         pass
                                     # 주문 정보 업데이트
