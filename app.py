@@ -4969,9 +4969,19 @@ def render_superadmin():
     st.markdown(
         """
         <style>
-        /* Superadmin: 헤더 + 탭을 상단 고정 */
-        .main .block-container > div:nth-child(-n+3) { position: sticky !important; top: 0 !important; z-index: 9999 !important; background-color: #ffffff !important; padding-bottom: 0.5rem !important; box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important; }
-        .main .block-container > div:nth-child(4) { margin-top: 0.75rem !important; }
+        /* Superadmin: 헤더 + 탭 상단 고정 (선택자 범위 상향으로 실제 메뉴 블록 캡처) */
+        .main, .main .block-container { overflow: visible !important; }
+        .main .block-container > div:nth-child(-n+10),
+        div[data-testid="stBlock"] > div:nth-child(-n+10) {
+            position: sticky !important;
+            top: 0 !important;
+            z-index: 9999 !important;
+            background-color: #ffffff !important;
+            background: #ffffff none repeat scroll 0 0 !important;
+            padding-bottom: 0.5rem !important;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important;
+        }
+        .main .block-container > div:nth-child(11) { margin-top: 0.75rem !important; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -7224,22 +7234,22 @@ def main():
                 st.error("⚠️ **Supabase RLS 정책 오류**: " + err_text + " — 해당 테이블에 INSERT를 허용하는 RLS 정책을 추가해 주세요.")
         else:
             st.error("⚠️ **Supabase 연결 실패**: " + err_text + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
-    # 상단 메뉴 고정(Sticky): 일반 유저/매장관리자 공통, 스크롤 시 메뉴가 뷰포트 최상단에 유지
+    # 상단 메뉴 고정(Sticky): 일반 유저/매장관리자 공통, 선택자 범위 상향으로 메뉴 블록 확실히 캡처
     st.markdown(
         """
         <style>
-        /* sticky 동작을 위해 부모 overflow 제거 */
         .main, .main .block-container { overflow: visible !important; }
-        /* 상단 네비게이션 고정: 에러·메뉴 라벨·셀렉트박스·구분선 등 상단 영역 */
-        .main .block-container > div:nth-child(-n+8) {
+        .main .block-container > div:nth-child(-n+10),
+        div[data-testid="stBlock"] > div:nth-child(-n+10) {
             position: sticky !important;
             top: 0 !important;
             z-index: 9999 !important;
             background-color: #ffffff !important;
+            background: #ffffff none repeat scroll 0 0 !important;
             padding-bottom: 0.5rem !important;
             box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important;
         }
-        .main .block-container > div:nth-child(9) { margin-top: 0.75rem !important; }
+        .main .block-container > div:nth-child(11) { margin-top: 0.75rem !important; }
         </style>
         """,
         unsafe_allow_html=True,
