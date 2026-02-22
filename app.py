@@ -1621,6 +1621,153 @@ def _load_payments_supabase(db_filename: str, order_id: int | None = None) -> pd
         return pd.DataFrame()
 
 
+def _supabase_insert_customer(db_filename: str, name: str, phone1: str, phone2: str | None, address: str | None) -> int | None:
+    """
+    Supabase customers 테이블에 고객 1건 INSERT. tenant 컬럼이 없거나 스키마가 다르면 재시도.
+    반환: 새 customer id 또는 None.
+    """
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    payload = {
+        "name": (name or "").strip() or "미입력",
+        "phone1": (phone1 or "").strip() or "",
+        "phone2": (phone2 or "").strip() or None,
+        "address": (address or "").strip() or None,
+    }
+    tc = _customers_tenant_column()
+    if tc:
+        payload[tc] = db_filename
+    try:
+        r = client.table("customers").insert(payload).execute()
+        if r.data and len(r.data) > 0 and r.data[0].get("id") is not None:
+            return int(r.data[0]["id"])
+        return None
+    except Exception as e:
+        err_str = str(e).lower()
+        if "column" in err_str or "does not exist" in err_str or "apierror" in err_str or "42p01" in err_str:
+            payload_min = {"name": payload["name"], "phone1": payload["phone1"]}
+            if payload.get("phone2"):
+                payload_min["phone2"] = payload["phone2"]
+            if payload.get("address"):
+                payload_min["address"] = payload["address"]
+            try:
+                r = client.table("customers").insert(payload_min).execute()
+                if r.data and len(r.data) > 0 and r.data[0].get("id") is not None:
+                    return int(r.data[0]["id"])
+            except Exception:
+                pass
+        return None
+
+
+def _count_orders_on_date(db_filename: str, order_date_str: str) -> int:
+    """해당 매장·날짜의 주문 건수. 신규 등록 전 '오늘의 첫 매출' 판별용. Supabase/로컬 모두 지원."""
+    if not db_filename or not order_date_str:
+        return 0
+    if _supabase_orders_payments_available():
+        client, err = get_supabase_client()
+        if err or not client:
+            return 0
+        try:
+            r = client.table("app_orders").select("id").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("order_date", order_date_str).execute()
+            return len(r.data or [])
+        except Exception:
+            return 0
+    conn = get_tenant_conn(db_filename)
+    if not conn:
+        return 0
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM Orders WHERE order_date = ?", (order_date_str,)).fetchone()
+        return row[0] or 0
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=3600)
+def _cached_store_aov_30d(db_filename: str) -> float:
+    """해당 매장 직전 30일 평균 객단가(주문당 금액). 성과 축하 AOV 비교용. ttl=1시간."""
+    if not db_filename:
+        return 0.0
+    today = date.today()
+    start = today - timedelta(days=30)
+    start_str = start.isoformat()
+    end_str = today.isoformat()
+    if _supabase_orders_payments_available():
+        df = _load_orders_supabase(db_filename, "id, order_date, total_amount", limit=500)
+        if df.empty or "order_date" not in df.columns:
+            return 0.0
+        df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+        df = df.dropna(subset=["order_date"])
+        df["_dt"] = df["order_date"].dt.date
+        mask = (df["_dt"] >= start) & (df["_dt"] <= today)
+        subset = df.loc[mask]
+        if len(subset) == 0:
+            return 0.0
+        return float(subset["total_amount"].fillna(0).mean())
+    conn = get_tenant_conn(db_filename)
+    if not conn:
+        return 0.0
+    try:
+        df = pd.read_sql(
+            "SELECT order_date, total_amount FROM Orders WHERE order_date >= ? AND order_date <= ?",
+            conn,
+            params=(start_str, end_str),
+        )
+        if df.empty:
+            return 0.0
+        return float(df["total_amount"].fillna(0).mean())
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=3600)
+def _cached_employee_monthly_max(db_filename: str, employee_names: str, year: int, month: int) -> float:
+    """해당 매장·직원(들)·연월의 직원별 최고 주문 금액(당월). 성과 축하 개인 최고 기록 비교용. ttl=1시간."""
+    if not db_filename or not employee_names or not str(employee_names).strip():
+        return 0.0
+    month_start = date(year, month, 1)
+    from calendar import monthrange
+    month_end = date(year, month, monthrange(year, month)[1])
+    start_str = month_start.isoformat()
+    end_str = month_end.isoformat()
+    if _supabase_orders_payments_available():
+        df = _load_orders_supabase(db_filename, "id, order_date, total_amount, employee_names", limit=500)
+        if df.empty or "employee_names" not in df.columns:
+            return 0.0
+        df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+        df = df.dropna(subset=["order_date"])
+        df["_dt"] = df["order_date"].dt.date
+        mask = (df["_dt"] >= month_start) & (df["_dt"] <= month_end)
+        subset = df.loc[mask]
+        names_set = set(n.strip() for n in str(employee_names).split(",") if n.strip())
+        max_val = 0.0
+        for _, row in subset.iterrows():
+            row_names = (row.get("employee_names") or "").split(",")
+            if any(n.strip() in names_set for n in row_names):
+                max_val = max(max_val, float(row.get("total_amount") or 0))
+        return max_val
+    conn = get_tenant_conn(db_filename)
+    if not conn:
+        return 0.0
+    try:
+        df = pd.read_sql(
+            "SELECT order_date, total_amount, employee_names FROM Orders WHERE order_date >= ? AND order_date <= ?",
+            conn,
+            params=(start_str, end_str),
+        )
+        if df.empty or "employee_names" not in df.columns:
+            return 0.0
+        names_set = set(n.strip() for n in str(employee_names).split(",") if n.strip())
+        max_val = 0.0
+        for _, row in df.iterrows():
+            row_names = (str(row.get("employee_names") or "").split(","))
+            if any(n.strip() in names_set for n in row_names):
+                max_val = max(max_val, float(row.get("total_amount") or 0))
+        return max_val
+    finally:
+        conn.close()
+
+
 def _insert_order_supabase(db_filename: str, payload: dict) -> int | None:
     """app_orders에 1건 INSERT. payload에 db_filename 없으면 자동 설정. 반환: 새 id 또는 None."""
     if not db_filename:
@@ -5072,6 +5219,88 @@ def render_store_admin_employees():
     conn.close()
 
 
+# ========== 성과 축하 (Gamification) — 신규 주문 INSERT 시에만 트리거 ==========
+
+def _render_gamification_feedback(ctx: dict):
+    """
+    신규 매출 등록 성공 시 4가지 지표(매출규모, 마진율, AOV, 추가성과)를 평가해 카드/메시지로 표시.
+    ctx: amount, cost, margin_pct, employee_names, db_filename, order_date, is_today_first
+    """
+    amount = int(ctx.get("amount") or 0)
+    cost = int(ctx.get("cost") or 0)
+    margin_pct = float(ctx.get("margin_pct") or 0)
+    employee_names = (ctx.get("employee_names") or "").strip()
+    db_filename = ctx.get("db_filename") or ""
+    order_date = ctx.get("order_date")
+    is_today_first = bool(ctx.get("is_today_first"))
+    year = order_date.year if hasattr(order_date, "year") else date.today().year
+    month = order_date.month if hasattr(order_date, "month") else date.today().month
+
+    st.subheader("🎉 성과 축하")
+    cards_html = []
+
+    # A. 매출 규모 (Sales Volume)
+    if amount >= 10_000_000:
+        st.balloons()
+        cards_html.append(
+            '<div style="background:linear-gradient(135deg,#ffd700 0%,#ffb347 100%);color:#1a1a1a;padding:1rem 1.25rem;border-radius:12px;margin-bottom:0.75rem;box-shadow:0 2px 8px rgba(0,0,0,0.15);">'
+            '<strong>🏆 최고의 판매자입니다!</strong> 압도적인 실적을 달성했습니다.</div>'
+        )
+    elif amount >= 7_000_000:
+        cards_html.append(
+            '<div style="background:linear-gradient(135deg,#4a90d9 0%,#357abd 100%);color:#fff;padding:1rem 1.25rem;border-radius:12px;margin-bottom:0.75rem;box-shadow:0 2px 8px rgba(0,0,0,0.12);">'
+            '<strong>🚀 정말 대단해요!</strong> 탁월한 성과입니다.</div>'
+        )
+    elif amount >= 5_000_000:
+        cards_html.append(
+            '<div style="background:linear-gradient(135deg,#ff8c42 0%,#e67e22 100%);color:#fff;padding:1rem 1.25rem;border-radius:12px;margin-bottom:0.75rem;box-shadow:0 2px 8px rgba(0,0,0,0.12);">'
+            '<strong>🎉 축하합니다!</strong> 훌륭한 성과를 기록했습니다.</div>'
+        )
+
+    # B. 마진율 (Margin Rate)
+    if margin_pct >= 20:
+        cards_html.append(
+            '<div style="color:#0d8050;padding:0.5rem 0;margin-bottom:0.5rem;">'
+            '🎯 대단합니다. 목표된 마진율을 달성하였습니다.</div>'
+        )
+    elif margin_pct < 15 and amount > 0:
+        cards_html.append(
+            '<div style="color:#666;padding:0.5rem 0;margin-bottom:0.5rem;">'
+            '💡 우리 다음에는 개인 마진을 조금 더 관리해 보아요.</div>'
+        )
+
+    # C. 평균 객단가 (AOV)
+    try:
+        aov_30 = _cached_store_aov_30d(db_filename)
+        if aov_30 > 0 and amount >= aov_30:
+            cards_html.append(
+                '<div style="color:#1a73e8;padding:0.5rem 0;margin-bottom:0.5rem;">'
+                '📈 와우! 당월 평균 객단가 이상의 매출을 기록했습니다.</div>'
+            )
+    except Exception:
+        pass
+
+    # D. 추가 성과 (개인 최고: INSERT 전 당월 최대값 대비 경신 여부)
+    try:
+        prev_max = float(ctx.get("monthly_max_before") or 0)
+        if amount > prev_max and amount > 0:
+            cards_html.append(
+                '<div style="color:#c5221f;padding:0.5rem 0;margin-bottom:0.5rem;">'
+                '🔥 이번 달 개인 최고 매출액을 갱신했습니다!</div>'
+            )
+    except Exception:
+        pass
+    if is_today_first:
+        cards_html.append(
+            '<div style="color:#137333;padding:0.5rem 0;margin-bottom:0.5rem;">'
+            '🌅 오늘 매장의 첫 매출을 개시했습니다. 좋은 출발입니다!</div>'
+        )
+
+    if cards_html:
+        st.markdown("\n".join(cards_html), unsafe_allow_html=True)
+    st.divider()
+
+
 # ========== 탭 2: 새로운 매출 등록 ==========
 
 def render_new_sales():
@@ -5079,6 +5308,10 @@ def render_new_sales():
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
         return
+    # 신규 주문 INSERT 직후에만 설정된 성과 축하 컨텍스트 표시 (UPDATE/수정 시에는 절대 설정되지 않음)
+    if "_gamification_ctx" in st.session_state:
+        _render_gamification_feedback(st.session_state["_gamification_ctx"])
+        del st.session_state["_gamification_ctx"]
     conn = get_tenant_conn(db_filename)
     if not conn:
         st.error("매장 DB를 찾을 수 없습니다.")
@@ -5425,26 +5658,20 @@ def render_new_sales():
                     st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
                     st.stop()
         use_supabase_op = _supabase_orders_payments_available()
+        # 성과 축하는 신규 INSERT 시에만 1회 트리거 (UPDATE/수정 시 미설정). INSERT 전 메타데이터 수집.
+        today_iso = order_date.isoformat() if hasattr(order_date, "isoformat") else str(date.today())
+        _count_today_before = _count_orders_on_date(db_filename, today_iso)
+        is_today_first = _count_today_before == 0
+        _year = order_date.year if hasattr(order_date, "year") else date.today().year
+        _month = order_date.month if hasattr(order_date, "month") else date.today().month
+        monthly_max_before = _cached_employee_monthly_max(db_filename, employee_names_str, _year, _month)
+
         if use_supabase_op:
             if is_new_customer:
-                client, err = get_supabase_client()
-                if err:
-                    st.error(f"⚠️ Supabase 연결 실패: {err}")
+                customer_id = _supabase_insert_customer(db_filename, cust_name, phone1, phone2, address_full)
+                if customer_id is None:
+                    st.error("고객 등록에 실패했습니다. Supabase customers 테이블 스키마(컬럼명·테넌트 컬럼)를 확인해 주세요.")
                     st.stop()
-                payload = {
-                    "name": cust_name.strip(),
-                    "phone1": phone1.strip(),
-                    "phone2": phone2 or None,
-                    "address": address_full or None,
-                }
-                tc = _customers_tenant_column()
-                if tc:
-                    payload[tc] = db_filename
-                r = client.table("customers").insert(payload).execute()
-                if not r.data or len(r.data) == 0:
-                    st.error("고객 등록에 실패했습니다. Supabase 응답을 확인해 주세요.")
-                    st.stop()
-                customer_id = int(r.data[0]["id"])
             else:
                 customer_id = int(customers[customers["name"].astype(str) == selected_customer_label]["id"].iloc[0])
             order_payload = {
@@ -5499,28 +5726,24 @@ def render_new_sales():
             _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
             _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance)
             clear_data_cache()
+            st.session_state["_gamification_ctx"] = {
+                "amount": final_sales_save,
+                "cost": final_cost_save,
+                "margin_pct": margin_pct,
+                "employee_names": employee_names_str,
+                "db_filename": db_filename,
+                "order_date": order_date,
+                "is_today_first": is_today_first,
+                "monthly_max_before": monthly_max_before,
+            }
         else:
             conn = get_tenant_conn(db_filename)
             try:
                 if is_new_customer:
-                    client, err = get_supabase_client()
-                    if err:
-                        st.error(f"⚠️ Supabase 연결 실패: {err}")
+                    customer_id = _supabase_insert_customer(db_filename, cust_name, phone1, phone2, address_full)
+                    if customer_id is None:
+                        st.error("고객 등록에 실패했습니다. Supabase customers 테이블 스키마(컬럼명·테넌트 컬럼)를 확인해 주세요.")
                         st.stop()
-                    payload = {
-                        "name": cust_name.strip(),
-                        "phone1": phone1.strip(),
-                        "phone2": phone2 or None,
-                        "address": address_full or None,
-                    }
-                    tc = _customers_tenant_column()
-                    if tc:
-                        payload[tc] = db_filename
-                    r = client.table("customers").insert(payload).execute()
-                    if not r.data or len(r.data) == 0:
-                        st.error("고객 등록에 실패했습니다. Supabase 응답을 확인해 주세요.")
-                        st.stop()
-                    customer_id = int(r.data[0]["id"])
                 else:
                     customer_id = int(customers[customers["name"].astype(str) == selected_customer_label]["id"].iloc[0])
                 conn.execute("""
@@ -5574,6 +5797,16 @@ def render_new_sales():
                 clear_data_cache()
             finally:
                 conn.close()
+            st.session_state["_gamification_ctx"] = {
+                "amount": final_sales_save,
+                "cost": final_cost_save,
+                "margin_pct": margin_pct,
+                "employee_names": employee_names_str,
+                "db_filename": db_filename,
+                "order_date": order_date,
+                "is_today_first": is_today_first,
+                "monthly_max_before": monthly_max_before,
+            }
             st.success("입력이 완료되었습니다.")
             # 마진율 이상 시 Superadmin/매장관리자 알림
             if margin_out_of_range:
@@ -6499,20 +6732,37 @@ def render_dashboard():
                         st.error("매장 DB를 찾을 수 없습니다.")
 
     # ---------- 1. 오늘의 핵심 지표 (일일매출 / 누적매출 / 당일 마진율 / 판매건수) — 맨 위 표 ----------
+    # 일일 매출 상계(Netting): 당일 주문의 '현재' 합계로 산출 (금액 수정/취소 시 차액이 실시간 반영되도록 Orders 기준)
     with st.container():
         today_str = today.strftime("%Y-%m-%d")
         month_start = today.replace(day=1)
-        if len(sales_df) > 0:
+        daily_total = 0.0
+        cumulative = 0.0
+        if len(orders) > 0 and "order_date" in orders.columns:
+            orders_dt_calc = orders.copy()
+            orders_dt_calc["order_date"] = pd.to_datetime(orders_dt_calc["order_date"], errors="coerce")
+            orders_today_calc = orders_dt_calc[orders_dt_calc["order_date"].dt.strftime("%Y-%m-%d") == today_str]
+            if len(orders_today_calc) > 0:
+                tot_col = orders_today_calc["total_amount"].fillna(0)
+                if "display_sales_amount" in orders_today_calc.columns:
+                    tot_col = tot_col + orders_today_calc["display_sales_amount"].fillna(0)
+                daily_total = float(tot_col.sum())
+            month_ord = orders_dt_calc[(orders_dt_calc["order_date"].dt.date >= month_start) & (orders_dt_calc["order_date"].dt.date <= today)]
+            if len(month_ord) > 0:
+                tot_m = month_ord["total_amount"].fillna(0)
+                if "display_sales_amount" in month_ord.columns:
+                    tot_m = tot_m + month_ord["display_sales_amount"].fillna(0)
+                cumulative = float(tot_m.sum())
+        if len(sales_df) > 0 and (daily_total == 0.0 or cumulative == 0.0):
             sales_calc = sales_df.copy()
             sales_calc["transaction_date"] = pd.to_datetime(sales_calc["transaction_date"], errors="coerce")
             sales_calc = sales_calc.dropna(subset=["transaction_date"])
-            today_mask = sales_calc["transaction_date"].dt.strftime("%Y-%m-%d") == today_str
-            daily_total = float(sales_calc.loc[today_mask, "amount"].fillna(0).sum())
-            month_mask = (sales_calc["transaction_date"].dt.date >= month_start) & (sales_calc["transaction_date"].dt.date <= today)
-            cumulative = float(sales_calc.loc[month_mask, "amount"].fillna(0).sum())
-        else:
-            daily_total = 0.0
-            cumulative = 0.0
+            if daily_total == 0.0:
+                today_mask = sales_calc["transaction_date"].dt.strftime("%Y-%m-%d") == today_str
+                daily_total = float(sales_calc.loc[today_mask, "amount"].fillna(0).sum())
+            if cumulative == 0.0:
+                month_mask = (sales_calc["transaction_date"].dt.date >= month_start) & (sales_calc["transaction_date"].dt.date <= today)
+                cumulative = float(sales_calc.loc[month_mask, "amount"].fillna(0).sum())
         if len(orders) > 0 and "order_date" in orders.columns:
             orders_dt = orders.copy()
             orders_dt["order_date"] = pd.to_datetime(orders_dt["order_date"], errors="coerce")
