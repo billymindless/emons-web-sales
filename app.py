@@ -1101,8 +1101,8 @@ def _ensure_tenant_schema(conn: sqlite3.Connection):
     conn.commit()
 
 
-def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = ""):
-    """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). id는 지정하지 않음(자동증가). 테넌트 컬럼은 sales_tenant_column 설정에 따름."""
+def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = "", unpaid_balance: float | None = None):
+    """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). id는 지정하지 않음(자동증가). 테넌트 컬럼은 sales_tenant_column 설정에 따름. unpaid_balance(미수금)는 Supabase Sales 테이블에 해당 컬럼이 있을 때만 저장."""
     client, err = get_supabase_client()
     if err:
         if "supabase_error" not in st.session_state:
@@ -1119,7 +1119,18 @@ def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date:
         tenant_col = _sales_tenant_column()
         if tenant_col:
             payload[tenant_col] = db_filename
-        client.table("sales").insert(payload).execute()
+        if unpaid_balance is not None:
+            payload["unpaid_balance"] = round(float(unpaid_balance), 2)
+        try:
+            client.table("sales").insert(payload).execute()
+        except Exception as e1:
+            # Supabase Sales 테이블에 unpaid_balance 컬럼이 없으면 해당 필드 제외하고 재시도
+            err_str = str(e1).lower()
+            if unpaid_balance is not None and ("unpaid_balance" in err_str or "42703" in err_str or "does not exist" in err_str):
+                payload.pop("unpaid_balance", None)
+                client.table("sales").insert(payload).execute()
+            else:
+                raise
     except Exception as e:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
@@ -4349,8 +4360,8 @@ def render_new_sales():
     def _on_total_amount():
         st.session_state["total_amount"] = _format_number_comma(st.session_state.get("total_amount", ""))
 
-    st.text_input("일반제품 원가 *", key="cost_price", on_change=_on_cost_price)
-    st.text_input("일반제품 판매가 *", key="total_amount", on_change=_on_total_amount)
+    st.text_input("일반제품 판매가(Selling Price) *", key="total_amount", on_change=_on_total_amount)
+    st.text_input("일반제품 원가(Cost) *", key="cost_price", on_change=_on_cost_price)
     if has_display:
         if "display_sales_amount" not in st.session_state:
             st.session_state["display_sales_amount"] = "0"
@@ -4459,12 +4470,9 @@ def render_new_sales():
         final_sales_save = general_sales_int + display_sales_int
         final_cost_save = cost_price_int + display_cost_int
         basic_margin_save = final_sales_save - final_cost_save
-        # 결제 합계(계약금+중도금+잔금) — 잔금 불일치 시 저장 차단
+        # 결제 합계 및 미수금(잔금) 계산 — 완불이 아니어도 저장 가능(계약금만 받고 저장 가능)
         total_payment_slots = sum(_parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")) for i in range(4))
-        balance_check = final_sales_save - total_payment_slots
-        if balance_check != 0:
-            st.error("⛔ 결제 금액 불일치: 총 판매액과 결제 내역의 합계가 다릅니다. 확인 후 저장하세요.")
-            st.stop()
+        unpaid_balance = final_sales_save - total_payment_slots  # 판매가 - 수납액 = 미수금
         # 마진율 검증 (15%~25% 범위 이탈 시 경고, 저장은 가능)
         margin_pct = (final_sales_save - final_cost_save) / final_sales_save * 100 if final_sales_save else 0
         margin_out_of_range = margin_pct < 15 or margin_pct > 25
@@ -4591,10 +4599,11 @@ def render_new_sales():
             remaining = final_sales_save - total_paid_initial
             balance_status = "완납" if remaining == 0 else "미납"
             conn.execute("UPDATE Orders SET balance_status = ? WHERE id = ?", (balance_status, order_id))
-            # Sales: 신규 주문 1건을 transaction_date=주문일, amount=최종판매액으로 기록 (Supabase)
-            _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문")
+            # Sales: 신규 주문 1건을 transaction_date=주문일, amount=최종판매액, 미수금(unpaid_balance) 포함 기록 (Supabase)
+            _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance)
             conn.commit()
             clear_data_cache()
+            st.success("입력이 완료되었습니다.")
             # 마진율 이상 시 Superadmin/매장관리자 알림
             if margin_out_of_range:
                 store_name = _get_store_name_by_db(db_filename)
