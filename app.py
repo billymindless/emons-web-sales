@@ -33,6 +33,11 @@ try:
 except ImportError:
     _create_supabase_client = None
 
+# Supabase 클라이언트 Singleton 캐시 (연결 재사용으로 호출 횟수 47회+ 시 부하 감소)
+# 형식: (client, url, key) — URL/Key가 바뀌면 새로 생성
+_supabase_client_cache = None
+_supabase_admin_client_cache = None
+
 # 브라우저 탭 타이틀 및 레이아웃 (반드시 최상단에서 호출)
 # 모바일: 넓은 화면 사용 + 사이드바 접힌 상태로 시작
 # [아이콘] assets/apple-touch-icon.png 가 있으면 탭·홈화면 추가 아이콘으로 사용.
@@ -147,7 +152,11 @@ def _customers_tenant_column() -> str | None:
 
 
 def get_supabase_client():
-    """st.secrets에서 URL/Key를 읽어 Supabase 클라이언트 반환. (client, None) 또는 (None, error_message)."""
+    """
+    Supabase 클라이언트 반환 (Singleton). 동일 URL/Key면 한 번만 생성 후 재사용.
+    반환: (client, None) 또는 (None, error_message).
+    """
+    global _supabase_client_cache
     if _create_supabase_client is None:
         return None, "Supabase 라이브러리가 설치되지 않았습니다. pip install supabase 를 실행해 주세요."
     try:
@@ -156,7 +165,13 @@ def get_supabase_client():
         key = (secrets.get("key") or secrets.get("anon_key") or "").strip()
         if not url or not key:
             return None, "Supabase URL 또는 Key가 설정되지 않았습니다. .streamlit/secrets.toml에 [supabase] url, key를 추가해 주세요."
+        # 캐시된 클라이언트가 있고 URL/Key가 동일하면 재사용 (연결 중복 생성 방지)
+        if _supabase_client_cache is not None:
+            _client, _url, _key = _supabase_client_cache
+            if _url == url and _key == key:
+                return _client, None
         client = _create_supabase_client(url, key)
+        _supabase_client_cache = (client, url, key)
         return client, None
     except Exception as e:
         err_msg = str(e)
@@ -166,7 +181,7 @@ def get_supabase_client():
 
 
 def get_supabase_client_or_warn():
-    """Supabase 클라이언트 반환. 실패 시 화면에 경고를 띄우고 None 반환."""
+    """Supabase 클라이언트 반환 (내부적으로 Singleton 재사용). 실패 시 화면에 경고를 띄우고 None 반환."""
     client, err = get_supabase_client()
     if err:
         st.error(f"⚠️ {err}")
@@ -194,10 +209,11 @@ def get_supabase_client_with_auth_session():
 
 def get_supabase_admin_client():
     """
-    Supabase Admin API용 클라이언트 (service_role_key 사용).
-    직원 계정 생성 등 관리자 전용 작업 시 사용. 현재 로그인 세션에 영향 없음.
+    Supabase Admin API용 클라이언트 (service_role_key) — Singleton.
+    직원 계정 생성 등 관리자 전용 작업 시 사용. 동일 설정이면 한 번만 생성 후 재사용.
     반환: (client, None) 또는 (None, error_message).
     """
+    global _supabase_admin_client_cache
     if _create_supabase_client is None:
         return None, "Supabase 라이브러리가 설치되지 않았습니다."
     try:
@@ -205,11 +221,15 @@ def get_supabase_admin_client():
         url = (secrets.get("url") or "").strip()
         if not url:
             return None, "Supabase URL이 설정되지 않았습니다."
-        # service_role_key: secrets.toml의 service_role_key 또는 환경변수 SUPABASE_SERVICE_ROLE_KEY
         key = (secrets.get("service_role_key") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
         if not key:
             return None, "직원 계정 생성을 위해 Supabase service_role_key가 필요합니다. .streamlit/secrets.toml에 [supabase] service_role_key를 추가하거나, 환경변수 SUPABASE_SERVICE_ROLE_KEY를 설정해 주세요."
+        if _supabase_admin_client_cache is not None:
+            _client, _url, _key = _supabase_admin_client_cache
+            if _url == url and _key == key:
+                return _client, None
         client = _create_supabase_client(url, key)
+        _supabase_admin_client_cache = (client, url, key)
         return client, None
     except Exception as e:
         err_msg = str(e).strip() or "연결 오류가 발생했습니다."
@@ -218,6 +238,7 @@ def get_supabase_admin_client():
 
 # ---------- Supabase 직원/매장 테이블 (app_users, app_user_stores, app_stores) ----------
 # 테이블이 없으면 ensure_supabase_app_tables()로 자동 생성 시도(database_url 있을 때) 또는 SQL Editor에서 SUPABASE_APP_TABLES.sql 실행.
+# 아래 매장/직원 목록 등은 @st.cache_data(ttl=600)로 10분 캐시. 매장·직원 추가/수정/삭제 후 반드시 clear_data_cache() 호출하면 즉시 갱신됨.
 
 def _supabase_app_tables_available():
     """Supabase에 app_users 테이블이 있는지 확인. (있으면 True, 없으면 False)"""
@@ -317,8 +338,9 @@ def ensure_supabase_app_tables():
     return False
 
 
+@st.cache_data(ttl=600)
 def _get_supabase_stores_list():
-    """Supabase app_stores 목록. 반환: [{"id", "store_name", "db_filename"}, ...]"""
+    """Supabase app_stores 목록 캐시 (10분). 매장 추가/수정 후 clear_data_cache() 호출 시 갱신."""
     client, err = get_supabase_client()
     if err or not client:
         return []
@@ -362,8 +384,9 @@ def _get_supabase_app_user_by_email(email: str):
         return None
 
 
+@st.cache_data(ttl=300)
 def _get_supabase_user_allowed_stores(user_id: int):
-    """Supabase app_user_stores + app_stores에서 접근 가능 매장 목록. [(store_id, db_filename, store_name), ...]"""
+    """접근 가능 매장 목록 캐시 (5분). 로그인 사용자별로 캐시되며, 배정 변경 시 clear_data_cache()로 갱신."""
     if not user_id:
         return []
     client, err = get_supabase_client()
@@ -388,8 +411,9 @@ def _get_supabase_user_allowed_stores(user_id: int):
         return []
 
 
+@st.cache_data(ttl=600)
 def _get_supabase_store_by_db_filename(db_filename: str):
-    """db_filename으로 app_stores에서 store id 조회. 반환: id 또는 None."""
+    """db_filename → store id 조회 캐시 (10분). 매장 정보 변경 시 clear_data_cache()로 갱신."""
     if not db_filename:
         return None
     client, err = get_supabase_client()
@@ -413,8 +437,9 @@ def _ensure_supabase_superadmin_email(email_clean: str):
         pass
 
 
+@st.cache_data(ttl=600)
 def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
-    """해당 매장에 배정된 직원 표시명 목록 (Supabase). [name 또는 username, ...]"""
+    """매장별 배정 직원 표시명 목록 캐시 (10분). 직원/매장 배정 변경 시 clear_data_cache()로 갱신."""
     store_id = _get_supabase_store_by_db_filename(db_filename)
     if not store_id:
         return []
@@ -439,8 +464,9 @@ def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
         return []
 
 
+@st.cache_data(ttl=600)
 def _get_supabase_users_list():
-    """Supabase app_users 전체 목록. 반환: [{"id", "username", "email", "role", "name", "store_id"}, ...]"""
+    """Supabase app_users 전체 목록 캐시 (10분). 직원 추가/수정 후 clear_data_cache() 호출 시 갱신."""
     client, err = get_supabase_client()
     if err or not client:
         return []
@@ -465,8 +491,9 @@ def _get_supabase_user_store_ids(user_id: int):
         return []
 
 
+@st.cache_data(ttl=600)
 def _get_supabase_employee_list_with_stores():
-    """직원 명부용: app_users + 배정매장 이름 문자열. 반환: list of dict id, email, username, name, role, 배정매장."""
+    """직원 명부 + 배정매장 문자열 캐시 (10분). 직원/매장 변경 시 clear_data_cache()로 갱신."""
     users = _get_supabase_users_list()
     if not users:
         return []
@@ -945,6 +972,23 @@ def get_master_conn():
     return sqlite3.connect(MASTER_DB_PATH)
 
 
+@st.cache_data(ttl=600)
+def get_master_stores_dataframe_cached():
+    """
+    Master DB의 매장 목록(Stores)을 DataFrame으로 반환 — 10분 캐시.
+    Superadmin 대시/매장 선택 등 반복 조회 구간에서 DB 부하 감소.
+    매장 추가·수정·삭제 후 clear_data_cache() 호출 시 즉시 갱신됨.
+    반환: DataFrame 컬럼 id, store_name, db_filename (빈 DataFrame일 수 있음).
+    """
+    conn = get_master_conn()
+    try:
+        return pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn)
+    except Exception:
+        return pd.DataFrame(columns=["id", "store_name", "db_filename"])
+    finally:
+        conn.close()
+
+
 def init_master_db():
     """
     앱 실행 시 master_system.db가 없으면 생성하고,
@@ -1267,7 +1311,9 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
 
 @st.cache_data(ttl=600)
 def load_orders_cached(db_filename: str, order_col_list: str, limit: int | None = 50) -> pd.DataFrame:
-    """Orders 목록 캐시 로딩 (ttl=10분). limit=None이면 전체(대시보드 등)."""
+    """주문(Orders) 목록 캐시 로딩 (10분). Supabase app_orders 우선, 없으면 로컬 SQLite. 저장 후 clear_data_cache() 호출 시 갱신."""
+    if _supabase_orders_payments_available():
+        return _load_orders_supabase(db_filename, columns=order_col_list, limit=limit)
     conn = get_tenant_conn(db_filename)
     if not conn:
         return pd.DataFrame()
@@ -1286,7 +1332,9 @@ def load_orders_cached(db_filename: str, order_col_list: str, limit: int | None 
 
 @st.cache_data(ttl=600)
 def load_payments_cached(db_filename: str) -> pd.DataFrame:
-    """Payments 캐시 로딩 (ttl=10분)."""
+    """결제(Payments) 목록 캐시 로딩 (10분). Supabase app_payments 우선. 저장 후 clear_data_cache() 호출 시 갱신."""
+    if _supabase_orders_payments_available():
+        return _load_payments_supabase(db_filename)
     conn = get_tenant_conn(db_filename)
     if not conn:
         return pd.DataFrame()
@@ -1316,7 +1364,10 @@ def load_todos_cached(db_filename: str, limit: int = 100) -> pd.DataFrame:
 
 
 def clear_data_cache():
-    """저장 후 캐시 무효화로 다음 로딩 시 최신 데이터 반영."""
+    """
+    전체 데이터 캐시 무효화. 주문/결제/매장/직원 등 저장·수정·삭제 직후 호출하면
+    load_orders_cached, get_master_stores_dataframe_cached, _get_supabase_stores_list 등이 다음 조회 시 최신값을 가져옴.
+    """
     try:
         st.cache_data.clear()
     except Exception:
@@ -1446,6 +1497,198 @@ def _ensure_tenant_schema(conn: sqlite3.Connection):
             )
         """)
     conn.commit()
+
+
+# ========== Supabase 주문/결제 (app_orders, app_payments) — 매장별 db_filename 필수 ==========
+ORDERS_PAYMENTS_TENANT_COL = "db_filename"
+
+
+def _supabase_orders_payments_available() -> bool:
+    """Supabase에 app_orders 테이블이 있는지 확인."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return False
+    try:
+        client.table("app_orders").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | None = None) -> pd.DataFrame:
+    """app_orders 조회. db_filename으로 매장 필터 필수."""
+    if not db_filename:
+        return pd.DataFrame()
+    client, err = get_supabase_client()
+    if err or not client:
+        return pd.DataFrame()
+    try:
+        sel = client.table("app_orders").select(columns).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).order("id", desc=True)
+        if limit:
+            sel = sel.limit(limit)
+        r = sel.execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _load_payments_supabase(db_filename: str, order_id: int | None = None) -> pd.DataFrame:
+    """app_payments 조회. order_id 지정 시 해당 주문만."""
+    if not db_filename:
+        return pd.DataFrame()
+    client, err = get_supabase_client()
+    if err or not client:
+        return pd.DataFrame()
+    try:
+        q = client.table("app_payments").select("*").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+        if order_id is not None:
+            q = q.eq("order_id", order_id)
+        q = q.order("id")
+        r = q.execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _insert_order_supabase(db_filename: str, payload: dict) -> int | None:
+    """app_orders에 1건 INSERT. payload에 db_filename 없으면 자동 설정. 반환: 새 id 또는 None."""
+    if not db_filename:
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    payload = dict(payload)
+    payload[ORDERS_PAYMENTS_TENANT_COL] = db_filename
+    try:
+        r = client.table("app_orders").insert(payload).execute()
+        if r.data and len(r.data) > 0 and "id" in r.data[0]:
+            return int(r.data[0]["id"])
+        return None
+    except Exception:
+        return None
+
+
+def _update_order_supabase(db_filename: str, order_id: int, updates: dict) -> bool:
+    """app_orders 1건 업데이트. db_filename + id로 필터."""
+    if not db_filename:
+        return False
+    client, err = get_supabase_client()
+    if err or not client:
+        return False
+    try:
+        client.table("app_orders").update(updates).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", order_id).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _insert_payment_supabase(db_filename: str, payload: dict) -> int | None:
+    """app_payments에 1건 INSERT. payload에 db_filename 없으면 자동 설정. 반환: 새 id 또는 None."""
+    if not db_filename:
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    payload = dict(payload)
+    payload[ORDERS_PAYMENTS_TENANT_COL] = db_filename
+    try:
+        r = client.table("app_payments").insert(payload).execute()
+        if r.data and len(r.data) > 0 and "id" in r.data[0]:
+            return int(r.data[0]["id"])
+        return None
+    except Exception:
+        return None
+
+
+def _update_payment_supabase(db_filename: str, payment_id: int, updates: dict) -> bool:
+    """app_payments 1건 업데이트."""
+    if not db_filename:
+        return False
+    client, err = get_supabase_client()
+    if err or not client:
+        return False
+    try:
+        client.table("app_payments").update(updates).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", payment_id).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _delete_payment_supabase(db_filename: str, payment_id: int) -> bool:
+    """app_payments 1건 삭제."""
+    if not db_filename:
+        return False
+    client, err = get_supabase_client()
+    if err or not client:
+        return False
+    try:
+        client.table("app_payments").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", payment_id).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _get_order_supabase(db_filename: str, order_id: int) -> dict | None:
+    """app_orders 단일 행 조회. 없으면 None."""
+    if not db_filename:
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        r = client.table("app_orders").select("*").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", order_id).maybe_single().execute()
+        return r.data if r.data else None
+    except Exception:
+        return None
+
+
+def _get_order_customer_id_supabase(db_filename: str, order_id: int) -> int | None:
+    """주문의 customer_id만 조회."""
+    row = _get_order_supabase(db_filename, order_id)
+    return int(row["customer_id"]) if row and row.get("customer_id") is not None else None
+
+
+def _sum_payments_by_order_supabase(db_filename: str, order_id: int) -> tuple[float, float]:
+    """해당 주문의 결제 합계(amount), 수수료 합계(fee_amount). (paid_total, total_fees)."""
+    df = _load_payments_supabase(db_filename, order_id=order_id)
+    if df.empty:
+        return 0.0, 0.0
+    paid = float(df["amount"].sum()) if "amount" in df.columns else 0.0
+    fees = float(df["fee_amount"].fillna(0).sum()) if "fee_amount" in df.columns else 0.0
+    return paid, fees
+
+
+def _recalc_order_actual_margin_supabase(db_filename: str, order_id: int) -> bool:
+    """주문의 actual_margin, balance_status를 결제 기준으로 재계산하여 app_orders에 반영."""
+    order = _get_order_supabase(db_filename, order_id)
+    if not order:
+        return False
+    total_amt = float(order.get("total_amount") or 0)
+    cost_general = float(order.get("cost_price") or 0)
+    cost_display = float(order.get("display_cost_amount") or 0)
+    paid, total_fees = _sum_payments_by_order_supabase(db_filename, order_id)
+    basic_m = total_amt - (cost_general + cost_display)
+    actual_margin = basic_m - total_fees
+    remaining = total_amt - paid
+    balance_status = "완납" if remaining == 0 else "미납"
+    return _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
+
+
+def _count_payments_onnuri_dup_supabase(db_filename: str, payment_date: str, onnuri_last4: str) -> int:
+    """동일 결제일 + 온누리 승인번호 뒤 4자리 조합 개수 (중복 검증용)."""
+    if not db_filename or len(onnuri_last4) != 4:
+        return 0
+    client, err = get_supabase_client()
+    if err or not client:
+        return 0
+    try:
+        r = client.table("app_payments").select("onnuri_approval_code, payment_method").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("payment_date", payment_date).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return sum(1 for row in rows if "온누리" in str(row.get("payment_method") or "") and (str(row.get("onnuri_approval_code") or "")[-4:]) == onnuri_last4)
+    except Exception:
+        return 0
 
 
 def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = "", unpaid_balance: float | None = None):
@@ -3099,11 +3342,7 @@ def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str,
 
 def render_marketing_insights_superadmin():
     """최고 관리자: 다중 기간 비교 대시보드 (Comparative Analytics Dashboard)."""
-    conn_m = get_master_conn()
-    try:
-        stores = pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn_m)
-    finally:
-        conn_m.close()
+    stores = get_master_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3175,11 +3414,7 @@ def render_marketing_insights_superadmin():
 def _superadmin_tab1_integrated_dashboard():
     """① 전 지점 통합 대시보드: 이번 달 총매출/총마진/전체 미수금 + 매장별 랭킹."""
     _render_recent_notices_section()
-    conn_m = get_master_conn()
-    try:
-        stores = pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn_m)
-    finally:
-        conn_m.close()
+    stores = get_master_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3193,23 +3428,24 @@ def _superadmin_tab1_integrated_dashboard():
     store_payments = {}
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
-        conn = get_tenant_conn(db_fn)
-        if not conn:
-            continue
-        try:
+        if _supabase_orders_payments_available():
+            orders = _load_orders_supabase(db_fn, "id, order_date, total_amount, actual_margin", limit=None)
+            payments = _load_payments_supabase(db_fn)
+        else:
+            conn = get_tenant_conn(db_fn)
+            if not conn:
+                continue
             try:
-                orders = pd.read_sql(
-                    "SELECT id, order_date, total_amount, actual_margin FROM Orders",
-                    conn
-                )
-            except Exception:
-                orders = pd.DataFrame()
-            try:
-                payments = pd.read_sql("SELECT order_id, amount FROM Payments", conn)
-            except Exception:
-                payments = pd.DataFrame()
-        finally:
-            conn.close()
+                try:
+                    orders = pd.read_sql("SELECT id, order_date, total_amount, actual_margin FROM Orders", conn)
+                except Exception:
+                    orders = pd.DataFrame()
+                try:
+                    payments = pd.read_sql("SELECT order_id, amount FROM Payments", conn)
+                except Exception:
+                    payments = pd.DataFrame()
+            finally:
+                conn.close()
         if len(orders) == 0:
             store_orders[s["store_name"]] = pd.DataFrame()
             store_payments[s["store_name"]] = pd.DataFrame()
@@ -3264,11 +3500,7 @@ def _superadmin_tab1_integrated_dashboard():
 
 def _superadmin_tab2_hr_store_employees():
     """② 매장별 직원 평가 현황 (HR): 매장·연월 선택 후 100점 만점 KPI 표."""
-    conn_m = get_master_conn()
-    try:
-        stores = pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn_m)
-    finally:
-        conn_m.close()
+    stores = get_master_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3277,19 +3509,26 @@ def _superadmin_tab2_hr_store_employees():
     if not selected_store:
         return
     db_fn = stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
-    conn = get_tenant_conn(db_fn)
-    if not conn:
-        st.error("해당 매장 DB를 열 수 없습니다.")
+    if _supabase_orders_payments_available():
+        order_list = "id, order_date, total_amount, actual_margin, employee_names, display_sales_amount"
+        orders = _load_orders_supabase(db_fn, order_list, limit=None)
+    else:
+        conn = get_tenant_conn(db_fn)
+        if not conn:
+            st.error("해당 매장 DB를 열 수 없습니다.")
+            return
+        try:
+            cur = conn.execute("PRAGMA table_info(Orders)")
+            cols = [r[1] for r in cur.fetchall()]
+            order_list = "id, order_date, total_amount, actual_margin, employee_names"
+            if "display_sales_amount" in cols:
+                order_list += ", display_sales_amount"
+            orders = pd.read_sql(f"SELECT {order_list} FROM Orders", conn)
+        finally:
+            conn.close()
+    if orders.empty:
+        st.info("해당 매장에 주문 데이터가 없습니다.")
         return
-    try:
-        cur = conn.execute("PRAGMA table_info(Orders)")
-        cols = [r[1] for r in cur.fetchall()]
-        order_list = "id, order_date, total_amount, actual_margin, employee_names"
-        if "display_sales_amount" in cols:
-            order_list += ", display_sales_amount"
-        orders = pd.read_sql(f"SELECT {order_list} FROM Orders", conn)
-    finally:
-        conn.close()
     if "display_sales_amount" not in orders.columns:
         orders["display_sales_amount"] = 0
     orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0).astype(int)
@@ -3427,33 +3666,45 @@ def _superadmin_tab4_backup_csv():
     rows = []
     for _, s in stores.iterrows():
         conn = get_tenant_conn(s["db_filename"])
-        if not conn:
-            continue
-        try:
-            # Orders만 조회. 고객 정보는 Supabase에서 id 기준으로 채움
-            merged = pd.read_sql("""
-                SELECT o.id, o.customer_id, o.order_date, o.delivery_date,
-                       o.total_amount, o.cost_price, o.actual_margin, o.employee_names,
-                       o.category, o.visit_reason, o.purchase_reason,
-                       COALESCE(o.display_sales_amount, 0) as display_sales_amount,
-                       COALESCE(o.display_cost_amount, 0) as display_cost_amount,
-                       o.balance_status
-                FROM Orders o
-            """, conn)
-            customer_ids = merged["customer_id"].dropna().astype(int).unique().tolist()
-            cust_map = _get_customers_by_ids_supabase(s["db_filename"], customer_ids) if customer_ids else {}
-            merged["customer_name"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("name", "") if pd.notna(cid) else "")
-            merged["phone1"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("phone1", "") if pd.notna(cid) else "")
-            merged["phone2"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("phone2", "") if pd.notna(cid) else "")
-            merged["address"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("address", "") if pd.notna(cid) else "")
-            payments = pd.read_sql(
-                "SELECT order_id, amount, payment_method, onnuri_approval_code, card_company FROM Payments",
-                conn,
-            )
-        except Exception:
+        db_fn = s["db_filename"]
+        if _supabase_orders_payments_available():
+            merged = _load_orders_supabase(db_fn, "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, visit_reason, purchase_reason, display_sales_amount, display_cost_amount, balance_status", limit=None)
+            payments = _load_payments_supabase(db_fn)
+            if merged.empty:
+                continue
+            for col in ("display_sales_amount", "display_cost_amount"):
+                if col in merged.columns:
+                    merged[col] = merged[col].fillna(0)
+                else:
+                    merged[col] = 0
+        else:
+            conn = get_tenant_conn(db_fn)
+            if not conn:
+                continue
+            try:
+                merged = pd.read_sql("""
+                    SELECT o.id, o.customer_id, o.order_date, o.delivery_date,
+                           o.total_amount, o.cost_price, o.actual_margin, o.employee_names,
+                           o.category, o.visit_reason, o.purchase_reason,
+                           COALESCE(o.display_sales_amount, 0) as display_sales_amount,
+                           COALESCE(o.display_cost_amount, 0) as display_cost_amount,
+                           o.balance_status
+                    FROM Orders o
+                """, conn)
+                payments = pd.read_sql(
+                    "SELECT order_id, amount, payment_method, onnuri_approval_code, card_company FROM Payments",
+                    conn,
+                )
+            except Exception:
+                conn.close()
+                continue
             conn.close()
-            continue
-        conn.close()
+        customer_ids = merged["customer_id"].dropna().astype(int).unique().tolist()
+        cust_map = _get_customers_by_ids_supabase(s["db_filename"], customer_ids) if customer_ids else {}
+        merged["customer_name"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("name", "") if pd.notna(cid) else "")
+        merged["phone1"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("phone1", "") if pd.notna(cid) else "")
+        merged["phone2"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("phone2", "") if pd.notna(cid) else "")
+        merged["address"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("address", "") if pd.notna(cid) else "")
         merged["order_date"] = pd.to_datetime(merged["order_date"], errors="coerce")
         merged = merged[merged["order_date"].notna()]
         merged = merged[(merged["order_date"].dt.date >= backup_start) & (merged["order_date"].dt.date <= backup_end)]
@@ -3515,11 +3766,7 @@ def _superadmin_tab4_backup_csv():
 
 def _superadmin_tab_unpaid_report():
     """미수금(잔금) 전용 레포트: 기간 필터, 잔금 > 0 필터, 다운로드."""
-    conn_m = get_master_conn()
-    try:
-        stores = pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn_m)
-    finally:
-        conn_m.close()
+    stores = get_master_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3531,24 +3778,40 @@ def _superadmin_tab_unpaid_report():
         report_end = st.date_input("조회 종료일", value=date.today(), key="unpaid_report_end")
     rows = []
     for _, s in stores.iterrows():
-        conn = get_tenant_conn(s["db_filename"])
-        if not conn:
-            continue
-        try:
-            merged = pd.read_sql("""
-                SELECT o.id, o.customer_id, o.order_date, o.delivery_date, o.total_amount, o.employee_names,
-                       COALESCE(o.display_sales_amount, 0) as display_sales_amount
-                FROM Orders o
-            """, conn)
-            customer_ids = merged["customer_id"].dropna().astype(int).unique().tolist()
-            cust_map = _get_customers_by_ids_supabase(s["db_filename"], customer_ids) if customer_ids else {}
-            merged["customer_name"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("name", "") if pd.notna(cid) else "")
-            merged["phone1"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("phone1", "") if pd.notna(cid) else "")
-            payments = pd.read_sql("SELECT order_id, SUM(amount) as paid FROM Payments GROUP BY order_id", conn)
-        except Exception:
+        db_fn = s["db_filename"]
+        if _supabase_orders_payments_available():
+            merged = _load_orders_supabase(db_fn, "id, customer_id, order_date, delivery_date, total_amount, employee_names, display_sales_amount", limit=None)
+            if merged.empty:
+                continue
+            if "display_sales_amount" not in merged.columns:
+                merged["display_sales_amount"] = 0
+            else:
+                merged["display_sales_amount"] = merged["display_sales_amount"].fillna(0)
+            pay_df = _load_payments_supabase(db_fn)
+            if not pay_df.empty and "order_id" in pay_df.columns and "amount" in pay_df.columns:
+                payments = pay_df.groupby("order_id")["amount"].sum().reset_index()
+                payments.columns = ["order_id", "paid"]
+            else:
+                payments = pd.DataFrame(columns=["order_id", "paid"])
+        else:
+            conn = get_tenant_conn(db_fn)
+            if not conn:
+                continue
+            try:
+                merged = pd.read_sql("""
+                    SELECT o.id, o.customer_id, o.order_date, o.delivery_date, o.total_amount, o.employee_names,
+                           COALESCE(o.display_sales_amount, 0) as display_sales_amount
+                    FROM Orders o
+                """, conn)
+                payments = pd.read_sql("SELECT order_id, SUM(amount) as paid FROM Payments GROUP BY order_id", conn)
+            except Exception:
+                conn.close()
+                continue
             conn.close()
-            continue
-        conn.close()
+        customer_ids = merged["customer_id"].dropna().astype(int).unique().tolist()
+        cust_map = _get_customers_by_ids_supabase(s["db_filename"], customer_ids) if customer_ids else {}
+        merged["customer_name"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("name", "") if pd.notna(cid) else "")
+        merged["phone1"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("phone1", "") if pd.notna(cid) else "")
         merged = merged.merge(payments, left_on="id", right_on="order_id", how="left")
         merged["paid"] = merged["paid"].fillna(0)
         merged["total_sales"] = merged["total_amount"] + merged["display_sales_amount"]
@@ -3590,9 +3853,9 @@ def _superadmin_tab_unpaid_report():
 
 def _superadmin_tab5_store_accounts():
     """⑤ 매장 계정 관리: 신규 매장/계정 발급, 비밀번호 변경, 매장 삭제(이중 확인)."""
+    stores = get_master_stores_dataframe_cached()
     conn_m = get_master_conn()
     try:
-        stores = pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn_m)
         users = pd.read_sql("SELECT id, username, role, store_id FROM Users WHERE store_id IS NOT NULL", conn_m)
     finally:
         conn_m.close()
@@ -3610,6 +3873,7 @@ def _superadmin_tab5_store_accounts():
                 conn_m.commit()
                 create_tenant_db(db_filename)
                 conn_m.close()
+                clear_data_cache()
                 st.success(f"매장 '{store_name}'이(가) 생성되었습니다. DB: {db_filename}")
                 st.rerun()
             except sqlite3.IntegrityError:
@@ -3660,6 +3924,7 @@ def _superadmin_tab5_store_accounts():
                             conn_m.execute("UPDATE Stores SET store_name = ?, db_filename = ? WHERE id = ?", (edit_name.strip(), edit_db.strip(), s["id"]))
                             conn_m.commit()
                             conn_m.close()
+                            clear_data_cache()
                             st.success("저장되었습니다.")
                             st.rerun()
                         except sqlite3.IntegrityError:
@@ -3697,6 +3962,7 @@ def _superadmin_tab5_store_accounts():
                     conn_m.execute("DELETE FROM Stores WHERE id = ?", (s["id"],))
                     conn_m.commit()
                     conn_m.close()
+                    clear_data_cache()
                     db_path = os.path.join(DB_DIR, s["db_filename"])
                     if os.path.exists(db_path):
                         try:
@@ -3736,11 +4002,7 @@ def render_monthly_payment_report(is_superadmin: bool):
             return
 
     if is_superadmin:
-        conn_m = get_master_conn()
-        try:
-            stores = pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn_m)
-        finally:
-            conn_m.close()
+        stores = get_master_stores_dataframe_cached()
         if len(stores) == 0:
             st.info("등록된 매장이 없습니다.")
             return
@@ -3751,33 +4013,36 @@ def render_monthly_payment_report(is_superadmin: bool):
         if not db_filename:
             st.warning("매장에 로그인한 후 이용하세요.")
             return
-        conn_m = get_master_conn()
-        try:
-            row = conn_m.execute(
-                "SELECT store_name FROM Stores WHERE db_filename = ?",
-                (db_filename,),
-            ).fetchone()
-            selected_store = row[0] if row else "매장"
-        finally:
-            conn_m.close()
+        stores = get_master_stores_dataframe_cached()
+        match = stores[stores["db_filename"] == db_filename]
+        selected_store = match["store_name"].iloc[0] if len(match) > 0 else "매장"
 
     all_payments = []
     if is_superadmin and selected_store == "전체 매장 통합":
         for _, s in stores.iterrows():
-            conn = get_tenant_conn(s["db_filename"])
-            if not conn:
-                continue
-            try:
-                df = pd.read_sql(
-                    "SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''",
-                    conn,
-                )
-                df["_store"] = s["store_name"]
-                all_payments.append(df)
-            except Exception:
-                pass
-            finally:
-                conn.close()
+            db_fn = s["db_filename"]
+            if _supabase_orders_payments_available():
+                df = _load_payments_supabase(db_fn)
+                if not df.empty and "payment_date" in df.columns:
+                    df = df[df["payment_date"].notna() & (df["payment_date"] != "")]
+                    df = df[["payment_date", "payment_method", "card_company", "amount"]]
+                    df["_store"] = s["store_name"]
+                    all_payments.append(df)
+            else:
+                conn = get_tenant_conn(db_fn)
+                if not conn:
+                    continue
+                try:
+                    df = pd.read_sql(
+                        "SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''",
+                        conn,
+                    )
+                    df["_store"] = s["store_name"]
+                    all_payments.append(df)
+                except Exception:
+                    pass
+                finally:
+                    conn.close()
         if not all_payments:
             st.info("선택 기간/매장에 결제 데이터가 없습니다.")
             return
@@ -3788,20 +4053,28 @@ def render_monthly_payment_report(is_superadmin: bool):
         pay_df = pd.concat(all_payments_nonempty, ignore_index=True)
     else:
         db_fn = db_filename if not is_superadmin else stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
-        conn = get_tenant_conn(db_fn)
-        if not conn:
-            st.error("매장 DB를 찾을 수 없습니다.")
-            return
-        try:
-            pay_df = pd.read_sql(
-                "SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''",
-                conn,
-            )
-        except Exception:
-            st.error("결제 데이터를 불러올 수 없습니다.")
+        if _supabase_orders_payments_available():
+            pay_df = _load_payments_supabase(db_fn)
+            if pay_df.empty or "payment_date" not in pay_df.columns:
+                pay_df = pd.DataFrame(columns=["payment_date", "payment_method", "card_company", "amount"])
+            else:
+                pay_df = pay_df[pay_df["payment_date"].notna() & (pay_df["payment_date"] != "")]
+                pay_df = pay_df[["payment_date", "payment_method", "card_company", "amount"]]
+        else:
+            conn = get_tenant_conn(db_fn)
+            if not conn:
+                st.error("매장 DB를 찾을 수 없습니다.")
+                return
+            try:
+                pay_df = pd.read_sql(
+                    "SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''",
+                    conn,
+                )
+            except Exception:
+                st.error("결제 데이터를 불러올 수 없습니다.")
+                conn.close()
+                return
             conn.close()
-            return
-        conn.close()
 
     pay_df["payment_date"] = pd.to_datetime(pay_df["payment_date"], errors="coerce")
     pay_df = pay_df[pay_df["payment_date"].notna()]
@@ -4523,22 +4796,35 @@ def render_store_admin_employees():
                                             cur_c = rc.data
                                 except Exception:
                                     pass
-                            cur_o = conn.execute(
-                                "SELECT id, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason FROM Orders WHERE id = ?",
-                                (oid,),
-                            ).fetchone()
+                            cur_o = None
+                            if _supabase_orders_payments_available():
+                                cur_o = _get_order_supabase(db_filename, oid)
+                                if cur_o:
+                                    cur_o = (
+                                        cur_o.get("id"),
+                                        cur_o.get("order_date"),
+                                        cur_o.get("delivery_date"),
+                                        cur_o.get("category"),
+                                        cur_o.get("cost_price"),
+                                        cur_o.get("total_amount"),
+                                        cur_o.get("visit_reason"),
+                                        cur_o.get("purchase_reason"),
+                                    )
+                            else:
+                                cur_o = conn.execute(
+                                    "SELECT id, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason FROM Orders WHERE id = ?",
+                                    (oid,),
+                                ).fetchone()
                             new_c = payload.get("new_customer") or {}
                             new_o = payload.get("new_order") or {}
                             reason = r["reason"]
                             if cur_o:
-                                # cur_o: id, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason
                                 old_total = cur_o[5] or 0
                                 new_total = int(new_o.get("total_amount") or old_total)
                                 old_cost = cur_o[4] or 0
                                 new_cost = int(new_o.get("cost_price") or old_cost)
                                 if old_total != new_total:
                                     _insert_audit_log(conn, "Order", oid, "total_amount", old_total, new_total, reason)
-                                    # 회계 원칙: 차액을 오늘 날짜로 Sales 신규 Row INSERT
                                     delta = new_total - old_total
                                     today_str = datetime.now().strftime("%Y-%m-%d")
                                     order_date_val = cur_o[1] or today_str
@@ -4559,19 +4845,28 @@ def render_store_admin_employees():
                                 new_purchase = new_o.get("purchase_reason")
                                 if (old_purchase or "") != (new_purchase or ""):
                                     _insert_audit_log(conn, "Order", oid, "purchase_reason", old_purchase, new_purchase, reason)
-                                # 주문 업데이트
-                                conn.execute(
-                                    "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, visit_reason=?, purchase_reason=? WHERE id=?",
-                                    (
-                                        new_o.get("delivery_date") or cur_o[2],
-                                        new_o.get("category") or cur_o[3],
-                                        new_total,
-                                        new_cost,
-                                        new_visit or cur_o[6],
-                                        new_purchase or cur_o[7],
-                                        oid,
-                                    ),
-                                )
+                                if _supabase_orders_payments_available():
+                                    _update_order_supabase(db_filename, oid, {
+                                        "delivery_date": new_o.get("delivery_date") or cur_o[2],
+                                        "category": new_o.get("category") or cur_o[3],
+                                        "total_amount": new_total,
+                                        "cost_price": new_cost,
+                                        "visit_reason": new_visit or cur_o[6],
+                                        "purchase_reason": new_purchase or cur_o[7],
+                                    })
+                                else:
+                                    conn.execute(
+                                        "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, visit_reason=?, purchase_reason=? WHERE id=?",
+                                        (
+                                            new_o.get("delivery_date") or cur_o[2],
+                                            new_o.get("category") or cur_o[3],
+                                            new_total,
+                                            new_cost,
+                                            new_visit or cur_o[6],
+                                            new_purchase or cur_o[7],
+                                            oid,
+                                        ),
+                                    )
                             if cur_c and new_c:
                                 try:
                                     sc, _ = get_supabase_client()
@@ -4934,20 +5229,23 @@ def render_new_sales():
                     st.error("온누리상품권 결제의 승인번호 뒤 4자리를 정확히 입력하세요.")
                     st.stop()
                 # 동일 결제일+승인번호 4자리 조합이 이미 존재하는지 교차 검증 (금액 제외)
-                conn_chk = get_tenant_conn(db_filename)
-                try:
-                    dup_cnt = conn_chk.execute(
-                        """
-                        SELECT COUNT(*) FROM Payments
-                        WHERE payment_method LIKE '%온누리%'
-                          AND payment_date = ?
-                          AND onnuri_approval_code IS NOT NULL
-                          AND substr(onnuri_approval_code, -4) = ?
-                        """,
-                        (pay_date_str, last4_digits),
-                    ).fetchone()[0]
-                finally:
-                    conn_chk.close()
+                if _supabase_orders_payments_available():
+                    dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
+                else:
+                    conn_chk = get_tenant_conn(db_filename)
+                    try:
+                        dup_cnt = conn_chk.execute(
+                            """
+                            SELECT COUNT(*) FROM Payments
+                            WHERE payment_method LIKE '%온누리%'
+                              AND payment_date = ?
+                              AND onnuri_approval_code IS NOT NULL
+                              AND substr(onnuri_approval_code, -4) = ?
+                            """,
+                            (pay_date_str, last4_digits),
+                        ).fetchone()[0]
+                    finally:
+                        conn_chk.close()
                 if dup_cnt > 0:
                     # 전체 승인번호(8자리 이상) 입력 단계로 전환
                     st.session_state[stage_key] = "full"
@@ -4959,10 +5257,9 @@ def render_new_sales():
                 if len(full_digits) < 8:
                     st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
                     st.stop()
-        conn = get_tenant_conn(db_filename)
-        try:
+        use_supabase_op = _supabase_orders_payments_available()
+        if use_supabase_op:
             if is_new_customer:
-                # Supabase Customers INSERT (id 자동증가, RETURNING으로 id 조회)
                 client, err = get_supabase_client()
                 if err:
                     st.error(f"⚠️ Supabase 연결 실패: {err}")
@@ -4983,26 +5280,24 @@ def render_new_sales():
                 customer_id = int(r.data[0]["id"])
             else:
                 customer_id = int(customers[customers["name"].astype(str) == selected_customer_label]["id"].iloc[0])
-            # 신규 주문 생성 시 초기 잔금 상태(balance_status)도 함께 설정
-            conn.execute("""
-                INSERT INTO Orders (customer_id, employee_names, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, display_sales_amount, display_cost_amount, balance_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                customer_id,
-                employee_names_str or None,
-                order_date.isoformat(),
-                delivery_date.isoformat(),
-                category,
-                cost_price_int,
-                final_sales_save,
-                visit_reason or None,
-                purchase_reason or None,
-                display_sales_int,
-                display_cost_int,
-                "미납",  # 결제 추가 후 아래에서 실질 잔금 기준으로 다시 보정
-            ))
-            # id는 INSERT에 포함하지 않음(자동증가). 새로 생성된 주문 id 조회.
-            order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            order_payload = {
+                "customer_id": customer_id,
+                "employee_names": employee_names_str or None,
+                "order_date": order_date.isoformat(),
+                "delivery_date": delivery_date.isoformat() if delivery_date else None,
+                "category": category,
+                "cost_price": cost_price_int,
+                "total_amount": final_sales_save,
+                "visit_reason": visit_reason or None,
+                "purchase_reason": purchase_reason or None,
+                "display_sales_amount": display_sales_int,
+                "display_cost_amount": display_cost_int,
+                "balance_status": "미납",
+            }
+            order_id = _insert_order_supabase(db_filename, order_payload)
+            if order_id is None:
+                st.error("주문 등록에 실패했습니다. Supabase를 확인해 주세요.")
+                st.stop()
             total_fees = 0.0
             total_paid_initial = 0
             for i in range(4):
@@ -5014,7 +5309,6 @@ def render_new_sales():
                 fee = _payment_fee_amount(method, amt)
                 total_fees += fee
                 total_paid_initial += amt
-                # 온누리상품권 승인번호(4자리 또는 8자리 이상 전체) 저장
                 onnuri_code = None
                 if method and "온누리" in str(method):
                     stage = st.session_state.get(f"pay_onnuri_stage_{i}", "last4")
@@ -5023,20 +5317,96 @@ def render_new_sales():
                     else:
                         raw = (st.session_state.get(f"pay_onnuri_full_{i}", "") or "").strip()
                     onnuri_code = re.sub(r"\\D", "", raw) or None
-                conn.execute("""
-                    INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (order_id, order_date.isoformat(), amt, method or None, card_company, fee, onnuri_code))
+                _insert_payment_supabase(db_filename, {
+                    "order_id": order_id,
+                    "payment_date": order_date.isoformat(),
+                    "amount": amt,
+                    "payment_method": method or None,
+                    "card_company": card_company,
+                    "fee_amount": fee,
+                    "onnuri_approval_code": onnuri_code,
+                })
             actual_margin = basic_margin_save - total_fees
-            conn.execute("UPDATE Orders SET actual_margin = ? WHERE id = ?", (actual_margin, order_id))
-            # 초기 결제금액 기준으로 잔금 상태 업데이트
             remaining = final_sales_save - total_paid_initial
             balance_status = "완납" if remaining == 0 else "미납"
-            conn.execute("UPDATE Orders SET balance_status = ? WHERE id = ?", (balance_status, order_id))
-            # Sales: 신규 주문 1건을 transaction_date=주문일, amount=최종판매액, 미수금(unpaid_balance) 포함 기록 (Supabase)
+            _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
             _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance)
-            conn.commit()
             clear_data_cache()
+        else:
+            conn = get_tenant_conn(db_filename)
+            try:
+                if is_new_customer:
+                    client, err = get_supabase_client()
+                    if err:
+                        st.error(f"⚠️ Supabase 연결 실패: {err}")
+                        st.stop()
+                    payload = {
+                        "name": cust_name.strip(),
+                        "phone1": phone1.strip(),
+                        "phone2": phone2 or None,
+                        "address": address_full or None,
+                    }
+                    tc = _customers_tenant_column()
+                    if tc:
+                        payload[tc] = db_filename
+                    r = client.table("customers").insert(payload).execute()
+                    if not r.data or len(r.data) == 0:
+                        st.error("고객 등록에 실패했습니다. Supabase 응답을 확인해 주세요.")
+                        st.stop()
+                    customer_id = int(r.data[0]["id"])
+                else:
+                    customer_id = int(customers[customers["name"].astype(str) == selected_customer_label]["id"].iloc[0])
+                conn.execute("""
+                    INSERT INTO Orders (customer_id, employee_names, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, display_sales_amount, display_cost_amount, balance_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    customer_id,
+                    employee_names_str or None,
+                    order_date.isoformat(),
+                    delivery_date.isoformat(),
+                    category,
+                    cost_price_int,
+                    final_sales_save,
+                    visit_reason or None,
+                    purchase_reason or None,
+                    display_sales_int,
+                    display_cost_int,
+                    "미납",
+                ))
+                order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                total_fees = 0.0
+                total_paid_initial = 0
+                for i in range(4):
+                    amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
+                    if amt <= 0:
+                        continue
+                    method = st.session_state.get(f"pay_method_{i}", "")
+                    card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "체크카드") else None
+                    fee = _payment_fee_amount(method, amt)
+                    total_fees += fee
+                    total_paid_initial += amt
+                    onnuri_code = None
+                    if method and "온누리" in str(method):
+                        stage = st.session_state.get(f"pay_onnuri_stage_{i}", "last4")
+                        if stage == "last4":
+                            raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
+                        else:
+                            raw = (st.session_state.get(f"pay_onnuri_full_{i}", "") or "").strip()
+                        onnuri_code = re.sub(r"\\D", "", raw) or None
+                    conn.execute("""
+                        INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (order_id, order_date.isoformat(), amt, method or None, card_company, fee, onnuri_code))
+                actual_margin = basic_margin_save - total_fees
+                conn.execute("UPDATE Orders SET actual_margin = ? WHERE id = ?", (actual_margin, order_id))
+                remaining = final_sales_save - total_paid_initial
+                balance_status = "완납" if remaining == 0 else "미납"
+                conn.execute("UPDATE Orders SET balance_status = ? WHERE id = ?", (balance_status, order_id))
+                _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance)
+                conn.commit()
+                clear_data_cache()
+            finally:
+                conn.close()
             st.success("입력이 완료되었습니다.")
             # 마진율 이상 시 Superadmin/매장관리자 알림
             if margin_out_of_range:
@@ -5086,14 +5456,15 @@ def render_new_sales():
                     except Exception:
                         pass
             st.rerun()
-        finally:
-            conn.close()
 
 
 # ========== 탭 3: 고객 및 잔금 관리 (3개 하위 탭) ==========
 
-def _recalc_order_actual_margin(conn, order_id: int):
-    """해당 주문의 Payments 수수료 합계 및 잔금 상태(balance_status)를 Orders에 반영."""
+def _recalc_order_actual_margin(conn, order_id: int, db_filename: str | None = None):
+    """해당 주문의 Payments 수수료 합계 및 잔금 상태(balance_status)를 Orders에 반영. Supabase 사용 시 db_filename 필요."""
+    if _supabase_orders_payments_available() and db_filename:
+        _recalc_order_actual_margin_supabase(db_filename, order_id)
+        return
     row = conn.execute(
         "SELECT total_amount, cost_price, COALESCE(display_cost_amount,0) FROM Orders WHERE id = ?",
         (order_id,),
@@ -5110,7 +5481,6 @@ def _recalc_order_actual_margin(conn, order_id: int):
         "UPDATE Orders SET actual_margin = ? WHERE id = ?",
         (basic_m - total_fees, order_id),
     )
-    # 결제 합계 기준으로 balance_status도 보정
     paid = conn.execute(
         "SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?",
         (order_id,),
@@ -5175,20 +5545,23 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                     if len(last4_digits) != 4:
                         st.error("온누리상품권 결제의 승인번호 뒤 4자리를 정확히 입력하세요.")
                         return
-                    conn_chk = get_tenant_conn(db_filename)
-                    try:
-                        dup_cnt = conn_chk.execute(
-                            """
-                            SELECT COUNT(*) FROM Payments
-                            WHERE payment_method LIKE '%온누리%'
-                              AND payment_date = ?
-                              AND onnuri_approval_code IS NOT NULL
-                              AND substr(onnuri_approval_code, -4) = ?
-                            """,
-                            (pay_date_str, last4_digits),
-                        ).fetchone()[0]
-                    finally:
-                        conn_chk.close()
+                    if _supabase_orders_payments_available():
+                        dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
+                    else:
+                        conn_chk = get_tenant_conn(db_filename)
+                        try:
+                            dup_cnt = conn_chk.execute(
+                                """
+                                SELECT COUNT(*) FROM Payments
+                                WHERE payment_method LIKE '%온누리%'
+                                  AND payment_date = ?
+                                  AND onnuri_approval_code IS NOT NULL
+                                  AND substr(onnuri_approval_code, -4) = ?
+                                """,
+                                (pay_date_str, last4_digits),
+                            ).fetchone()[0]
+                        finally:
+                            conn_chk.close()
                     if dup_cnt > 0:
                         st.session_state[stage_key] = "full"
                         st.error("⚠️ 동일한 결제일, 금액, 승인번호 4자리를 가진 기록이 이미 존재합니다. 정상 중복 건일 경우 승인번호 '전체 8자리 이상'을 입력해 주세요.")
@@ -5202,36 +5575,66 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                         return
                     onnuri_code = full_digits
             fee = _payment_fee_amount(add_method, add_amt_int)
-            conn = get_tenant_conn(db_filename)
-            # 기존 결제 합계/잔금 기준으로 감사 로그 남김 (결제 금액/잔금 상태)
-            cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (order_id,))
-            old_paid_total = cur.fetchone()[0] or 0
-            new_paid_total = old_paid_total + add_amt_int
-            old_balance = balance
-            new_balance = balance - add_amt_int
-            conn.execute("""
-                INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (order_id, date.today().isoformat(), add_amt_int, add_method or None, add_card, fee, onnuri_code))
-            _recalc_order_actual_margin(conn, order_id)
-            _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
-            _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
-            # PaymentHistory 기록 (고객명: Supabase에서 id 기준 조회)
-            cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (order_id,)).fetchone()
-            customer_id_for_ph = cur_cid[0] if cur_cid else None
-            customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
-            old_payment_data = {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total}
-            new_payment_data = {
-                "order_id": order_id,
-                "added_amount": add_amt_int,
-                "method": add_method,
-                "card_company": add_card,
-                "balance_after": new_balance,
-                "paid_total_after": new_paid_total,
-            }
-            _insert_payment_history(conn, order_id, customer_name, "잔금결제", old_payment_data, new_payment_data, edit_reason)
-            conn.commit()
-            conn.close()
+            use_supabase_op = _supabase_orders_payments_available()
+            if use_supabase_op:
+                paid_total, _ = _sum_payments_by_order_supabase(db_filename, order_id)
+                old_paid_total = paid_total
+                new_paid_total = old_paid_total + add_amt_int
+                old_balance = balance
+                new_balance = balance - add_amt_int
+                _insert_payment_supabase(db_filename, {
+                    "order_id": order_id,
+                    "payment_date": date.today().isoformat(),
+                    "amount": add_amt_int,
+                    "payment_method": add_method or None,
+                    "card_company": add_card,
+                    "fee_amount": fee,
+                    "onnuri_approval_code": onnuri_code,
+                })
+                _recalc_order_actual_margin_supabase(db_filename, order_id)
+                conn = get_tenant_conn(db_filename)
+                if conn:
+                    try:
+                        _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
+                        _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
+                        customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
+                        customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
+                        _insert_payment_history(conn, order_id, customer_name, "잔금결제",
+                            {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
+                            {"order_id": order_id, "added_amount": add_amt_int, "method": add_method, "card_company": add_card, "balance_after": new_balance, "paid_total_after": new_paid_total},
+                            edit_reason)
+                        conn.commit()
+                    finally:
+                        conn.close()
+            else:
+                conn = get_tenant_conn(db_filename)
+                cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (order_id,))
+                old_paid_total = cur.fetchone()[0] or 0
+                new_paid_total = old_paid_total + add_amt_int
+                old_balance = balance
+                new_balance = balance - add_amt_int
+                conn.execute("""
+                    INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (order_id, date.today().isoformat(), add_amt_int, add_method or None, add_card, fee, onnuri_code))
+                _recalc_order_actual_margin(conn, order_id, db_filename)
+                _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
+                _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
+                cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (order_id,)).fetchone()
+                customer_id_for_ph = cur_cid[0] if cur_cid else None
+                customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
+                old_payment_data = {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total}
+                new_payment_data = {
+                    "order_id": order_id,
+                    "added_amount": add_amt_int,
+                    "method": add_method,
+                    "card_company": add_card,
+                    "balance_after": new_balance,
+                    "paid_total_after": new_paid_total,
+                }
+                _insert_payment_history(conn, order_id, customer_name, "잔금결제", old_payment_data, new_payment_data, edit_reason)
+                conn.commit()
+                conn.close()
             clear_data_cache()
             st.toast("등록되었습니다. 잔금이 0원이면 리스트에서 사라집니다.", icon="✅")
             st.rerun()
@@ -5415,16 +5818,21 @@ def render_customer_balance():
             )
             if selected_cid:
                 cid = selected_cid
-                conn = get_tenant_conn(db_filename)
-                try:
-                    orders = pd.read_sql(
-                        "SELECT id, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, employee_names FROM Orders WHERE customer_id = ?",
-                        conn, params=(cid,)
-                    )
-                    payments = pd.read_sql("SELECT order_id, amount, fee_amount FROM Payments", conn)
-                finally:
-                    conn.close()
-                pay_sum = payments.groupby("order_id")["amount"].sum()
+                if _supabase_orders_payments_available():
+                    all_orders = _load_orders_supabase(db_filename, "id, customer_id, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, employee_names", limit=None)
+                    orders = all_orders[all_orders["customer_id"] == cid].copy() if not all_orders.empty and "customer_id" in all_orders.columns else pd.DataFrame()
+                    payments = _load_payments_supabase(db_filename)
+                else:
+                    conn = get_tenant_conn(db_filename)
+                    try:
+                        orders = pd.read_sql(
+                            "SELECT id, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, employee_names FROM Orders WHERE customer_id = ?",
+                            conn, params=(cid,)
+                        )
+                        payments = pd.read_sql("SELECT order_id, amount, fee_amount FROM Payments", conn)
+                    finally:
+                        conn.close()
+                pay_sum = payments.groupby("order_id")["amount"].sum() if not payments.empty and "order_id" in payments.columns else pd.Series(dtype=float)
                 orders = orders.copy()
                 orders["paid"] = orders["id"].map(pay_sum).fillna(0)
                 orders["balance"] = orders["total_amount"] - orders["paid"]
@@ -5548,8 +5956,11 @@ def render_customer_balance():
                                     new_visit = st.session_state.get(f"{edit_prefix}_visit") or None
                                     new_purchase = st.session_state.get(f"{edit_prefix}_purchase") or None
                                     # 잔금 불일치 검증: 총 판매액 vs 결제 합계
-                                    pay_sum_row = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM Payments WHERE order_id = ?", (sel_oid,)).fetchone()
-                                    payment_total = float(pay_sum_row[0]) if pay_sum_row else 0
+                                    if _supabase_orders_payments_available():
+                                        payment_total, _ = _sum_payments_by_order_supabase(db_filename, sel_oid)
+                                    else:
+                                        pay_sum_row = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM Payments WHERE order_id = ?", (sel_oid,)).fetchone()
+                                        payment_total = float(pay_sum_row[0]) if pay_sum_row else 0
                                     balance_check = new_total - payment_total
                                     if balance_check != 0:
                                         st.error("⛔ 결제 금액 불일치: 총 판매액과 결제 내역의 합계가 다릅니다. 확인 후 저장하세요.")
@@ -5602,19 +6013,30 @@ def render_customer_balance():
                                     except Exception:
                                         pass
                                     # 주문 정보 업데이트
-                                    conn.execute(
-                                        "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, visit_reason=?, purchase_reason=? WHERE id=?",
-                                        (
-                                            delivery_str,
-                                            category_edit_val,
-                                            new_total,
-                                            new_cost,
-                                            new_visit,
-                                            new_purchase,
-                                            sel_oid,
-                                        ),
-                                    )
-                                    conn.commit()
+                                    if _supabase_orders_payments_available():
+                                        _update_order_supabase(db_filename, sel_oid, {
+                                            "delivery_date": delivery_str,
+                                            "category": category_edit_val,
+                                            "total_amount": new_total,
+                                            "cost_price": new_cost,
+                                            "visit_reason": new_visit,
+                                            "purchase_reason": new_purchase,
+                                        })
+                                        conn.commit()
+                                    else:
+                                        conn.execute(
+                                            "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, visit_reason=?, purchase_reason=? WHERE id=?",
+                                            (
+                                                delivery_str,
+                                                category_edit_val,
+                                                new_total,
+                                                new_cost,
+                                                new_visit,
+                                                new_purchase,
+                                                sel_oid,
+                                            ),
+                                        )
+                                        conn.commit()
                                     conn.close()
                                     clear_data_cache()
                                     st.toast("수정되었습니다.", icon="✅")
@@ -5624,15 +6046,20 @@ def render_customer_balance():
                 st.caption("신용카드 → 현금 등으로 변경하려면: 아래에서 해당 결제를 취소한 뒤, 하단 '잔금 추가 결제'에서 같은 금액을 새 수단으로 등록하세요.")
                 order_id_pay = st.selectbox("주문 선택", orders["id"].tolist(), key="gen_pay_list_order")
                 if order_id_pay:
-                    conn = get_tenant_conn(db_filename)
-                    try:
-                        pay_list = pd.read_sql(
-                            "SELECT id, payment_date, amount, payment_method, card_company, fee_amount FROM Payments WHERE order_id = ? ORDER BY id",
-                            conn, params=(order_id_pay,)
-                        )
-                    finally:
-                        conn.close()
-                    if len(pay_list) == 0:
+                    if _supabase_orders_payments_available():
+                        pay_list = _load_payments_supabase(db_filename, order_id_pay)
+                        if not pay_list.empty:
+                            pay_list = pay_list[["id", "payment_date", "amount", "payment_method", "card_company", "fee_amount"]]
+                    else:
+                        conn = get_tenant_conn(db_filename)
+                        try:
+                            pay_list = pd.read_sql(
+                                "SELECT id, payment_date, amount, payment_method, card_company, fee_amount FROM Payments WHERE order_id = ? ORDER BY id",
+                                conn, params=(order_id_pay,)
+                            )
+                        finally:
+                            conn.close()
+                    if pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0:
                         st.info("해당 주문의 결제 내역이 없습니다.")
                     else:
                         pay_display = pay_list.copy()
@@ -5680,12 +6107,6 @@ def render_customer_balance():
                                                 receipt_path_saved = os.path.join(RECEIPTS_UPLOAD_DIR, fname)
                                                 with open(receipt_path_saved, "wb") as f:
                                                     f.write(receipt_upload.getvalue())
-                                            conn = get_tenant_conn(db_filename)
-                                            cur = conn.execute(
-                                                "SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?",
-                                                (order_id_pay,),
-                                            )
-                                            old_paid_total = cur.fetchone()[0] or 0
                                             old_balance = float(orders[orders["id"] == order_id_pay]["balance"].iloc[0])
                                             old_payment = {
                                                 "payment_id": int(prow["id"]),
@@ -5693,47 +6114,68 @@ def render_customer_balance():
                                                 "method": prow["payment_method"],
                                                 "card_company": prow["card_company"],
                                             }
-                                            if new_amount == 0:
-                                                conn.execute("DELETE FROM Payments WHERE id = ?", (prow["id"],))
-                                                action = "결제취소"
-                                                new_payment = {}
+                                            if _supabase_orders_payments_available():
+                                                old_paid_total, _ = _sum_payments_by_order_supabase(db_filename, order_id_pay)
+                                                if new_amount == 0:
+                                                    _delete_payment_supabase(db_filename, int(prow["id"]))
+                                                    action = "결제취소"
+                                                    new_payment = {}
+                                                else:
+                                                    _update_payment_supabase(db_filename, int(prow["id"]), {"amount": new_amount})
+                                                    action = "금액변경"
+                                                    new_payment = {"payment_id": int(prow["id"]), "amount": float(new_amount)}
+                                                _recalc_order_actual_margin_supabase(db_filename, order_id_pay)
+                                                new_paid_total, _ = _sum_payments_by_order_supabase(db_filename, order_id_pay)
+                                                new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
+                                                conn = get_tenant_conn(db_filename)
+                                                if conn:
+                                                    try:
+                                                        _insert_audit_log(conn, "Order", order_id_pay, "payment_total", old_paid_total, new_paid_total, del_reason)
+                                                        _insert_audit_log(conn, "Order", order_id_pay, "balance_amount", old_balance, new_balance, del_reason)
+                                                        cid_ph = _get_order_customer_id_supabase(db_filename, order_id_pay)
+                                                        customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
+                                                        old_data = {"order_id": int(order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
+                                                        new_data = {"order_id": int(order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
+                                                        _insert_payment_history(conn, order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved)
+                                                        conn.commit()
+                                                    finally:
+                                                        conn.close()
                                             else:
-                                                conn.execute(
-                                                    "UPDATE Payments SET amount = ? WHERE id = ?",
-                                                    (new_amount, int(prow["id"])),
-                                                )
-                                                action = "금액변경"
-                                                new_payment = {
-                                                    "payment_id": int(prow["id"]),
-                                                    "amount": float(new_amount),
+                                                conn = get_tenant_conn(db_filename)
+                                                cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (order_id_pay,))
+                                                old_paid_total = cur.fetchone()[0] or 0
+                                                if new_amount == 0:
+                                                    conn.execute("DELETE FROM Payments WHERE id = ?", (prow["id"],))
+                                                    action = "결제취소"
+                                                    new_payment = {}
+                                                else:
+                                                    conn.execute("UPDATE Payments SET amount = ? WHERE id = ?", (new_amount, int(prow["id"])))
+                                                    action = "금액변경"
+                                                    new_payment = {"payment_id": int(prow["id"]), "amount": float(new_amount)}
+                                                _recalc_order_actual_margin(conn, order_id_pay, db_filename)
+                                                cur2 = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (order_id_pay,))
+                                                new_paid_total = cur2.fetchone()[0] or 0
+                                                new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
+                                                _insert_audit_log(conn, "Order", order_id_pay, "payment_total", old_paid_total, new_paid_total, del_reason)
+                                                _insert_audit_log(conn, "Order", order_id_pay, "balance_amount", old_balance, new_balance, del_reason)
+                                                cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (order_id_pay,)).fetchone()
+                                                cid_ph = cur_cid[0] if cur_cid else None
+                                                customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
+                                                old_data = {
+                                                    "order_id": int(order_id_pay),
+                                                    "paid_total_before": old_paid_total,
+                                                    "balance_before": old_balance,
+                                                    "payment": old_payment,
                                                 }
-                                            _recalc_order_actual_margin(conn, order_id_pay)
-                                            cur2 = conn.execute(
-                                                "SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?",
-                                                (order_id_pay,),
-                                            )
-                                            new_paid_total = cur2.fetchone()[0] or 0
-                                            new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
-                                            _insert_audit_log(conn, "Order", order_id_pay, "payment_total", old_paid_total, new_paid_total, del_reason)
-                                            _insert_audit_log(conn, "Order", order_id_pay, "balance_amount", old_balance, new_balance, del_reason)
-                                            cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (order_id_pay,)).fetchone()
-                                            cid_ph = cur_cid[0] if cur_cid else None
-                                            customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
-                                            old_data = {
-                                                "order_id": int(order_id_pay),
-                                                "paid_total_before": old_paid_total,
-                                                "balance_before": old_balance,
-                                                "payment": old_payment,
-                                            }
-                                            new_data = {
-                                                "order_id": int(order_id_pay),
-                                                "paid_total_after": new_paid_total,
-                                                "balance_after": new_balance,
-                                                "payment": new_payment,
-                                            }
-                                            _insert_payment_history(conn, order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved)
-                                            conn.commit()
-                                            conn.close()
+                                                new_data = {
+                                                    "order_id": int(order_id_pay),
+                                                    "paid_total_after": new_paid_total,
+                                                    "balance_after": new_balance,
+                                                    "payment": new_payment,
+                                                }
+                                                _insert_payment_history(conn, order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved)
+                                                conn.commit()
+                                                conn.close()
                                             st.toast("✅ 결제 내역과 영수증이 성공적으로 업데이트되었습니다!")
                                             st.balloons()
                                             clear_data_cache()
@@ -5863,21 +6305,31 @@ def render_dashboard():
                 st.dataframe(show_df, use_container_width=True)
                 st.caption("결제 금액을 수정하려면 **고객 및 잔금 관리** → 고객 선택 → **결제 내역 조회 및 취소** / **잔금 추가 결제**에서 해당 주문을 수정하세요.")
             if st.button("🔄 잔금 상태 자동 보정 (결제 합계 기준으로 완납/미납 다시 계산)", key="dashboard_balance_fix_btn"):
-                conn = get_tenant_conn(db_filename)
-                if conn:
+                if _supabase_orders_payments_available():
                     try:
                         for oid in suspicious["id"].tolist():
-                            _recalc_order_actual_margin(conn, int(oid))
-                        conn.commit()
+                            _recalc_order_actual_margin_supabase(db_filename, int(oid))
                         clear_data_cache()
                         st.toast(f"✅ {len(suspicious)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
                         st.rerun()
                     except Exception as e:
                         st.error(f"보정 중 오류가 발생했습니다: {e}")
-                    finally:
-                        conn.close()
                 else:
-                    st.error("매장 DB를 찾을 수 없습니다.")
+                    conn = get_tenant_conn(db_filename)
+                    if conn:
+                        try:
+                            for oid in suspicious["id"].tolist():
+                                _recalc_order_actual_margin(conn, int(oid), db_filename)
+                            conn.commit()
+                            clear_data_cache()
+                            st.toast(f"✅ {len(suspicious)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"보정 중 오류가 발생했습니다: {e}")
+                        finally:
+                            conn.close()
+                    else:
+                        st.error("매장 DB를 찾을 수 없습니다.")
 
     # ---------- 1. 오늘의 핵심 지표 (일일매출 / 누적매출 / 당일 마진율 / 판매건수) — 맨 위 표 ----------
     with st.container():
@@ -6058,10 +6510,18 @@ def render_dashboard():
         total_contract = period_orders["total_amount"].sum()
         order_ids = period_orders["id"].tolist()
         if order_ids:
-            conn2 = get_tenant_conn(db_filename)
-            pay_per = pd.read_sql("SELECT order_id, amount FROM Payments WHERE order_id IN ({})".format(",".join("?" * len(order_ids))), conn2, params=order_ids)
-            conn2.close()
-            paid_per = pay_per.groupby("order_id")["amount"].sum()
+            if _supabase_orders_payments_available():
+                pay_df = _load_payments_supabase(db_filename)
+                if not pay_df.empty:
+                    pay_per = pay_df[pay_df["order_id"].isin(order_ids)][["order_id", "amount"]]
+                    paid_per = pay_per.groupby("order_id")["amount"].sum()
+                else:
+                    paid_per = pd.Series(dtype=float)
+            else:
+                conn2 = get_tenant_conn(db_filename)
+                pay_per = pd.read_sql("SELECT order_id, amount FROM Payments WHERE order_id IN ({})".format(",".join("?" * len(order_ids))), conn2, params=order_ids)
+                conn2.close()
+                paid_per = pay_per.groupby("order_id")["amount"].sum()
             period_orders = period_orders.copy()
             period_orders["_paid"] = period_orders["id"].map(paid_per).fillna(0)
             period_orders["_bal"] = period_orders["total_amount"] - period_orders["_paid"]
