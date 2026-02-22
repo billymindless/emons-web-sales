@@ -35,11 +35,36 @@ except ImportError:
 
 # 브라우저 탭 타이틀 및 레이아웃 (반드시 최상단에서 호출)
 # 모바일: 넓은 화면 사용 + 사이드바 접힌 상태로 시작
+# [아이콘] assets/apple-touch-icon.png 가 있으면 탭·홈화면 추가 아이콘으로 사용.
+#         파일 위치: app.py와 같은 디렉터리 기준 assets/apple-touch-icon.png (예: 프로젝트루트/assets/apple-touch-icon.png)
+#         권장: 180x180 또는 192x192 PNG, 에몬스 'e' 로고 또는 가구 아이콘.
+_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "apple-touch-icon.png")
 st.set_page_config(
     page_title="에몬스판매관리 프로그램",
     layout="wide",
     initial_sidebar_state="collapsed",
+    page_icon=_ICON_PATH if os.path.exists(_ICON_PATH) else "🪑",
 )
+
+
+def _inject_favicon():
+    """웹 탭 아이콘(favicon) 및 iOS 홈화면 추가용 apple-touch-icon을 <head>에 주입.
+    assets/apple-touch-icon.png 가 있으면 data URL로 넣고, 없으면 무시."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "apple-touch-icon.png")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return
+    b64 = base64.b64encode(raw).decode("utf-8")
+    data_url = f"data:image/png;base64,{b64}"
+    st.markdown(
+        f'<link rel="icon" href="{html.escape(data_url)}" type="image/png">'
+        f'<link rel="apple-touch-icon" href="{html.escape(data_url)}">',
+        unsafe_allow_html=True,
+    )
 
 
 def _inject_mobile_css():
@@ -2033,8 +2058,40 @@ def render_login():
         default_email = (st.query_params.get("email") or "").strip()
     except Exception:
         default_email = ""
+    # 로그인 화면 로고 전용 CSS: @media로 모바일/PC 구분
+    st.markdown(
+        """
+        <style>
+        /* 로그인 화면 emons 로고: PC — 적당한 크기로 제한 */
+        .emons-login-logo img {
+            max-width: 350px !important;
+            width: auto !important;
+            height: auto !important;
+            object-fit: contain;
+        }
+        @media (max-width: 768px) {
+            /* 모바일: 상단 여백으로 잘림 방지, 화면 너비의 60% 크기 */
+            .emons-login-logo {
+                margin-top: 1.5rem;
+                padding-top: 1rem;
+                box-sizing: border-box;
+            }
+            .emons-login-logo img {
+                width: 60% !important;
+                max-width: 60% !important;
+                height: auto !important;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     # 로고: 로그인 화면에서도 좌측 상단 고정 (공통 레이아웃), 에러 시 빨간 메시지
-    logo_html = _common_logo_html(_resolve_logo_path(), fallback_id="emons-logo-fallback-login")
+    logo_html = (
+        '<div class="emons-login-logo">'
+        + _common_logo_html(_resolve_logo_path(), fallback_id="emons-logo-fallback-login")
+        + "</div>"
+    )
     st.markdown(logo_html, unsafe_allow_html=True)
     st.title("에몬스판매관리 프로그램")
     st.subheader("로그인")
@@ -2083,6 +2140,8 @@ def render_login():
                                     "access_token": session.access_token,
                                     "refresh_token": session.refresh_token,
                                 }
+                                # 성공 시 다음 접속을 위해 이메일을 브라우저에 저장할 예정(메인 로드 시 스크립트로 저장)
+                                st.session_state["_pending_save_login_email"] = str(email).strip()
                                 st.rerun()
                     except Exception as e:
                         err_msg = str(e).strip() or "로그인에 실패했습니다."
@@ -2094,12 +2153,13 @@ def render_login():
     st.caption("💡 로그인할 때 사용한 이메일은 이 기기(브라우저)에만 저장되며, 다음 로그인 시 자동으로 채워집니다.")
 
     # 이메일 자동 저장/자동 입력: localStorage 사용 (같은 브라우저에서 다음 로그인 시 이메일 유지)
+    # 1) URL에 email이 없고 localStorage에 저장된 이메일이 있으면 ?email= 붙여서 이동 → 서버에서 default value로 채움
+    # 2) 로그인 성공 시에는 메인 화면 로드 시 한 번만 localStorage에 저장(위에서 _pending_save_login_email 설정)
     st.markdown(
         """
         <script>
         (function(){
             var KEY = 'emons_login_email';
-            // 1) URL에 email이 없고 localStorage에 저장된 이메일이 있으면 ?email= 붙여서 이동 → 서버에서 기본값으로 채움
             try {
                 var u = new URL(window.location.href);
                 if (!u.searchParams.get('email') && localStorage.getItem(KEY)) {
@@ -2108,7 +2168,6 @@ def render_login():
                     return;
                 }
             } catch(e) {}
-            // 2) 로그인 버튼 클릭 시 현재 이메일 입력값을 localStorage에 저장 (버튼 클릭 후 폼 제출 직전에 실행되도록 지연 등록)
             function attachSaveOnLoginClick() {
                 var forms = document.querySelectorAll('form');
                 for (var i = 0; i < forms.length; i++) {
@@ -2134,6 +2193,8 @@ def render_login():
         """,
         unsafe_allow_html=True,
     )
+    # 로그인 폼 input에 autocomplete 등 속성 최적화 (브라우저 자동 완성 동작)
+    _inject_js_login_form_attributes()
 
 
 # ========== 최고 관리자 (Superadmin) 전용: 공지 조회 ==========
@@ -2604,11 +2665,23 @@ def render_marketing_insights_tenant():
     order_cols_mi = "id, customer_id, order_date, delivery_date, total_amount, visit_reason, purchase_reason, category"
     orders = load_orders_cached(db_filename, order_cols_mi, limit=None)
     customers = load_customers_cached(db_filename, limit=None)
-    if not customers.empty and "address" in customers.columns:
-        customers = customers[["id", "name", "address"]].copy()
-    elif not customers.empty:
-        customers = customers[["id", "name"]].copy()
-        customers["address"] = None
+
+    # 데이터 빈 값 체크
+    if orders.empty or customers.empty:
+        st.info("아직 분석할 데이터가 없습니다.")
+        return
+
+    # 컬럼 존재 여부 체크: 있는 컬럼만 사용
+    wanted_cols = ["id", "name", "address"]
+    available_cols = [c for c in wanted_cols if c in customers.columns]
+    if "id" not in available_cols:
+        st.info("고객 데이터에 id 컬럼이 없어 병합할 수 없습니다.")
+        return
+    customers_sub = customers[available_cols].copy()
+    for c in wanted_cols:
+        if c not in customers_sub.columns:
+            customers_sub[c] = None
+
     today = date.today()
     month_start = today.replace(day=1)
     last_month_end = month_start - timedelta(days=1)
@@ -2629,7 +2702,7 @@ def render_marketing_insights_tenant():
     if range_start_b > range_end_b:
         range_end_b = range_start_b
 
-    merged = orders.merge(customers[["id", "name", "address"]], left_on="customer_id", right_on="id", how="left")
+    merged = orders.merge(customers_sub, left_on="customer_id", right_on="id", how="left")
     if len(merged) == 0:
         st.info("등록된 매출 데이터가 없습니다. 기간을 선택해도 비교할 데이터가 없습니다.")
         return
@@ -5602,6 +5675,16 @@ def main():
         conn_m.close()
     ensure_session()
     _inject_mobile_css()
+    _inject_favicon()
+
+    # 로그인 성공 직후: 브라우저 localStorage에 이메일 저장(한 번만 실행 후 플래그 제거)
+    _pending = st.session_state.pop("_pending_save_login_email", None)
+    if _pending:
+        _val_js = json.dumps(str(_pending))
+        st.markdown(
+            f'<script>(function(){{ try {{ localStorage.setItem("emons_login_email", {_val_js}); }} catch(e) {{}} }})();</script>',
+            unsafe_allow_html=True,
+        )
 
     # Supabase Auth: 로그인하지 않았으면 로그인 화면만 표시
     if not st.session_state.logged_in:
