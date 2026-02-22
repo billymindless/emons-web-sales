@@ -351,6 +351,22 @@ def _get_supabase_stores_list():
         return []
 
 
+@st.cache_data(ttl=600)
+def get_supabase_stores_dataframe_cached():
+    """
+    Supabase app_stores 매장 목록을 DataFrame으로 반환 — 10분 캐시.
+    단일 데이터 소스(Supabase) 전용. clear_data_cache() 호출 시 갱신.
+    반환: DataFrame 컬럼 id, store_name, db_filename (빈 DataFrame일 수 있음).
+    """
+    data = _get_supabase_stores_list()
+    if not data:
+        return pd.DataFrame(columns=["id", "store_name", "db_filename"])
+    df = pd.DataFrame(data)
+    if "id" in df.columns:
+        df = df.sort_values("id", ignore_index=True)
+    return df
+
+
 def _get_supabase_app_user_by_email(email: str):
     """
     Supabase app_users에서 이메일로 사용자 조회.
@@ -972,21 +988,43 @@ def get_master_conn():
     return sqlite3.connect(MASTER_DB_PATH)
 
 
-@st.cache_data(ttl=600)
-def get_master_stores_dataframe_cached():
+def migrate_stores_to_supabase():
     """
-    Master DB의 매장 목록(Stores)을 DataFrame으로 반환 — 10분 캐시.
-    Superadmin 대시/매장 선택 등 반복 조회 구간에서 DB 부하 감소.
-    매장 추가·수정·삭제 후 clear_data_cache() 호출 시 즉시 갱신됨.
-    반환: DataFrame 컬럼 id, store_name, db_filename (빈 DataFrame일 수 있음).
+    [일회성] 로컬 Master DB의 Stores 테이블 데이터를 Supabase app_stores로 복사합니다.
+    수동으로 한 번만 실행하면 됩니다. 동일 store_name이 있으면 db_filename만 갱신(upsert).
+    반환: (성공 개수, None) 또는 (0, "에러 메시지")
     """
     conn = get_master_conn()
     try:
-        return pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn)
-    except Exception:
-        return pd.DataFrame(columns=["id", "store_name", "db_filename"])
+        rows = conn.execute("SELECT id, store_name, db_filename FROM Stores ORDER BY id").fetchall()
     finally:
         conn.close()
+    if not rows:
+        return 0, None
+    client, err = get_supabase_client()
+    if err or not client:
+        return 0, (err or "Supabase 연결 실패")
+    count = 0
+    for row in rows:
+        _id, store_name, db_filename = row[0], row[1], row[2]
+        if not store_name or not db_filename:
+            continue
+        try:
+            client.table("app_stores").upsert(
+                [{"store_name": store_name.strip(), "db_filename": db_filename.strip()}],
+                on_conflict="store_name",
+            ).execute()
+            count += 1
+        except Exception as e:
+            try:
+                client.table("app_stores").insert({
+                    "store_name": store_name.strip(),
+                    "db_filename": db_filename.strip(),
+                }).execute()
+                count += 1
+            except Exception as e2:
+                return count, f"매장 '{store_name}' 반영 실패: {str(e2)}"
+    return count, None
 
 
 def init_master_db():
@@ -1154,14 +1192,16 @@ def _insert_admin_alert(store_name: str, alert_type: str, message: str):
 
 
 def _get_store_name_by_db(db_filename: str) -> str:
-    """current_db(db_filename)로 Stores에서 store_name 조회."""
+    """db_filename으로 Supabase app_stores에서 store_name 조회. 단일 데이터 소스(Supabase) 전용."""
     if not db_filename:
         return "알 수 없음"
+    client, err = get_supabase_client()
+    if err or not client:
+        return db_filename or "알 수 없음"
     try:
-        conn = get_master_conn()
-        row = conn.execute("SELECT store_name FROM Stores WHERE db_filename = ?", (db_filename,)).fetchone()
-        conn.close()
-        return row[0] if row else db_filename
+        r = client.table("app_stores").select("store_name").eq("db_filename", db_filename).maybe_single().execute()
+        data = r.data if isinstance(r.data, dict) else (r.data[0] if r.data and len(r.data) else None)
+        return (data.get("store_name") or db_filename) if data else (db_filename or "알 수 없음")
     except Exception:
         return db_filename or "알 수 없음"
 
@@ -1169,46 +1209,14 @@ def _get_store_name_by_db(db_filename: str) -> str:
 def get_store_assigned_employee_names(db_filename: str) -> list[str]:
     """
     해당 매장(db_filename)에 배정된 직원(로그인 계정)의 표시명 목록.
-    Supabase app_users/app_user_stores가 있으면 그쪽 우선, 없으면 Master DB.
+    Supabase app_stores 단일 데이터 소스 — app_users/app_user_stores만 조회.
     반환: [표시명, ...] (name 있으면 name, 없으면 username)
     """
     if not db_filename:
         return []
-    if _supabase_app_tables_available():
-        return _get_supabase_store_assigned_employee_names(db_filename)
-    conn = get_master_conn()
-    try:
-        row = conn.execute("SELECT id FROM Stores WHERE db_filename = ?", (db_filename,)).fetchone()
-        if not row:
-            return []
-        store_id = row[0]
-        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-        if cur.fetchone() is not None:
-            rows = conn.execute(
-                """
-                SELECT u.name, u.username
-                FROM Users u
-                JOIN UserStores us ON u.id = us.user_id
-                WHERE us.store_id = ?
-                ORDER BY u.name, u.username
-                """,
-                (store_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT name, username FROM Users WHERE store_id = ? ORDER BY name, username",
-                (store_id,),
-            ).fetchall()
-        result = []
-        for r in rows:
-            display = (str(r[0] or "").strip() or str(r[1] or "").strip()) or None
-            if display and display not in result:
-                result.append(display)
-        return result
-    except Exception:
+    if not _supabase_app_tables_available():
         return []
-    finally:
-        conn.close()
+    return _get_supabase_store_assigned_employee_names(db_filename)
 
 
 def _get_store_tag_key(store_name: str) -> str:
@@ -1366,7 +1374,7 @@ def load_todos_cached(db_filename: str, limit: int = 100) -> pd.DataFrame:
 def clear_data_cache():
     """
     전체 데이터 캐시 무효화. 주문/결제/매장/직원 등 저장·수정·삭제 직후 호출하면
-    load_orders_cached, get_master_stores_dataframe_cached, _get_supabase_stores_list 등이 다음 조회 시 최신값을 가져옴.
+    load_orders_cached, get_supabase_stores_dataframe_cached, _get_supabase_stores_list 등이 다음 조회 시 최신값을 가져옴.
     """
     try:
         st.cache_data.clear()
@@ -2808,18 +2816,21 @@ def render_login():
 # ========== 최고 관리자 (Superadmin) 전용: 공지 조회 ==========
 
 def get_store_display_name(user):
-    """로그인 사용자에 따른 사이드바용 매장명. superadmin이면 본사, 아니면 Stores에서 조회."""
+    """로그인 사용자에 따른 사이드바용 매장명. superadmin이면 본사, 아니면 Supabase app_stores에서 조회."""
     if user.get("role") == "superadmin":
         return "🏢 에몬스울산본점"
     store_id = user.get("store_id")
     if not store_id:
         return "🏢 매장"
-    conn = get_master_conn()
+    client, err = get_supabase_client()
+    if err or not client:
+        return "🏢 매장"
     try:
-        row = conn.execute("SELECT store_name FROM Stores WHERE id = ?", (store_id,)).fetchone()
-        return f"🏢 {row[0]}" if row else "🏢 매장"
-    finally:
-        conn.close()
+        r = client.table("app_stores").select("store_name").eq("id", int(store_id)).maybe_single().execute()
+        data = r.data if isinstance(r.data, dict) else (r.data[0] if r.data and len(r.data) else None)
+        return f"🏢 {data['store_name']}" if data and data.get("store_name") else "🏢 매장"
+    except Exception:
+        return "🏢 매장"
 
 
 def get_latest_active_notice():
@@ -3342,7 +3353,7 @@ def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str,
 
 def render_marketing_insights_superadmin():
     """최고 관리자: 다중 기간 비교 대시보드 (Comparative Analytics Dashboard)."""
-    stores = get_master_stores_dataframe_cached()
+    stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3414,7 +3425,7 @@ def render_marketing_insights_superadmin():
 def _superadmin_tab1_integrated_dashboard():
     """① 전 지점 통합 대시보드: 이번 달 총매출/총마진/전체 미수금 + 매장별 랭킹."""
     _render_recent_notices_section()
-    stores = get_master_stores_dataframe_cached()
+    stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3500,7 +3511,7 @@ def _superadmin_tab1_integrated_dashboard():
 
 def _superadmin_tab2_hr_store_employees():
     """② 매장별 직원 평가 현황 (HR): 매장·연월 선택 후 100점 만점 KPI 표."""
-    stores = get_master_stores_dataframe_cached()
+    stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3648,12 +3659,8 @@ def _superadmin_tab3_notices():
 
 def _superadmin_tab4_backup_csv():
     """④ 원클릭 데이터 백업: 기간 지정 후 전 매장 매출/결제 내역 CSV 다운로드 (한글 깨짐 방지).
-    고객명, 연락처, 품목, 총판매금액, 결제금액, 미수금, 결제수단, 온누리승인번호, 판매일자, 배송일자, 매장명, 판매담당자, 특이사항 등 전체 컬럼 포함."""
-    conn_m = get_master_conn()
-    try:
-        stores = pd.read_sql("SELECT id, store_name, db_filename FROM Stores ORDER BY id", conn_m)
-    finally:
-        conn_m.close()
+    고객명, 연락처, 품목, 총판매금액, 결제금액, 미수금, 결제수단, 온누리승인번호, 판매일자, 배송일자, 매장명, 판매담당자, 특이사항 등 전체 컬럼 포함. 매장 목록은 Supabase app_stores 전용."""
+    stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3766,7 +3773,7 @@ def _superadmin_tab4_backup_csv():
 
 def _superadmin_tab_unpaid_report():
     """미수금(잔금) 전용 레포트: 기간 필터, 잔금 > 0 필터, 다운로드."""
-    stores = get_master_stores_dataframe_cached()
+    stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
@@ -3852,34 +3859,50 @@ def _superadmin_tab_unpaid_report():
 
 
 def _superadmin_tab5_store_accounts():
-    """⑤ 매장 계정 관리: 신규 매장/계정 발급, 비밀번호 변경, 매장 삭제(이중 확인)."""
-    stores = get_master_stores_dataframe_cached()
-    conn_m = get_master_conn()
+    """⑤ 매장 계정 관리: Supabase app_stores / app_users만 사용. 매장 생성·수정·삭제 및 계정 발급·비밀번호 변경."""
+    client, err = get_supabase_client()
+    if err or not client:
+        st.error(f"Supabase 연결이 필요합니다: {err or '연결 실패'}")
+        return
+    stores_list = _get_supabase_stores_list()
+    stores = pd.DataFrame(stores_list).sort_values("store_name", ignore_index=True) if stores_list else pd.DataFrame(columns=["id", "store_name", "db_filename"])
+    if stores.empty or "store_name" not in stores.columns:
+        stores = pd.DataFrame(columns=["id", "store_name", "db_filename"])
+    users_list = _get_supabase_users_list()
+    us_pairs = set()
     try:
-        users = pd.read_sql("SELECT id, username, role, store_id FROM Users WHERE store_id IS NOT NULL", conn_m)
-    finally:
-        conn_m.close()
+        r = client.table("app_user_stores").select("user_id, store_id").execute()
+        for row in (r.data or []):
+            us_pairs.add((row["user_id"], row["store_id"]))
+    except Exception:
+        pass
+
     st.subheader("신규 매장 생성")
     with st.form("new_store_form"):
         store_name = st.text_input("매장명")
         submitted = st.form_submit_button("매장 생성")
         if submitted and store_name and store_name.strip():
+            stores_list = _get_supabase_stores_list()
+            max_id = max((s["id"] for s in stores_list), default=0)
+            db_filename = f"store_{max_id + 1}.db"
             try:
-                max_id = stores["id"].max() if len(stores) else 0
-                new_id = int(max_id) + 1 if pd.notna(max_id) else 1
-                db_filename = f"store_{new_id}.db"
-                conn_m = get_master_conn()
-                conn_m.execute("INSERT INTO Stores (store_name, db_filename) VALUES (?, ?)", (store_name.strip(), db_filename))
-                conn_m.commit()
+                client.table("app_stores").insert({
+                    "store_name": store_name.strip(),
+                    "db_filename": db_filename,
+                }).execute()
                 create_tenant_db(db_filename)
-                conn_m.close()
                 clear_data_cache()
                 st.success(f"매장 '{store_name}'이(가) 생성되었습니다. DB: {db_filename}")
                 st.rerun()
-            except sqlite3.IntegrityError:
-                st.error("이미 존재하는 매장명이거나 DB 파일명입니다.")
+            except Exception as e:
+                err_str = str(e).lower()
+                if "unique" in err_str or "duplicate" in err_str or "already exists" in err_str:
+                    st.error("이미 존재하는 매장명이거나 DB 파일명입니다.")
+                else:
+                    st.error(f"등록 실패: {e}")
         elif submitted:
             st.warning("매장명을 입력하세요.")
+
     st.subheader("매장별 계정 발급")
     if len(stores) > 0:
         with st.form("new_user_form"):
@@ -3891,28 +3914,37 @@ def _superadmin_tab5_store_accounts():
                 if new_username and new_username.strip() and new_password:
                     pw_hash = hashlib.sha256(new_password.encode()).hexdigest()
                     try:
-                        conn_m = get_master_conn()
-                        conn_m.execute(
-                            "INSERT INTO Users (username, password, role, store_id) VALUES (?, ?, ?, ?)",
-                            (new_username.strip(), pw_hash, new_role, store_id)
-                        )
-                        conn_m.commit()
-                        conn_m.close()
+                        client.table("app_users").insert({
+                            "username": new_username.strip(),
+                            "password": pw_hash,
+                            "role": new_role,
+                            "store_id": int(store_id),
+                            "name": None,
+                            "email": None,
+                        }).execute()
+                        clear_data_cache()
                         st.success("계정이 생성되었습니다.")
                         st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.error("이미 존재하는 사용자명입니다.")
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        if "unique" in err_str or "duplicate" in err_str:
+                            st.error("이미 존재하는 사용자명입니다.")
+                        else:
+                            st.error(f"계정 생성 실패: {e}")
                 else:
                     st.warning("사용자명과 비밀번호를 입력하세요.")
+
     st.subheader("매장 조회/수정")
     if len(stores) == 0:
-        st.info("매장이 없습니다.")
+        st.info("매장이 없습니다. 위에서 매장을 추가하거나, migrate_stores_to_supabase()를 실행해 Master DB 매장을 이전하세요.")
         return
     store_options = stores["store_name"].tolist()
     selected_store_name = st.selectbox("매장 선택 (조회·수정)", store_options, key="sa_edit_store_sel")
     if selected_store_name:
         s = stores[stores["store_name"] == selected_store_name].iloc[0]
-        store_users = users[users["store_id"] == s["id"]] if len(users) > 0 else pd.DataFrame()
+        sid = s["id"]
+        store_users = [u for u in users_list if u.get("store_id") == sid or (u["id"], sid) in us_pairs]
+        store_users_df = pd.DataFrame(store_users) if store_users else pd.DataFrame(columns=["id", "username", "role", "store_id"])
         with st.expander("📋 매장 정보 수정", expanded=True):
             with st.form("store_edit_form"):
                 edit_name = st.text_input("매장명", value=s["store_name"], key="sa_edit_name")
@@ -3920,57 +3952,67 @@ def _superadmin_tab5_store_accounts():
                 if st.form_submit_button("저장"):
                     if edit_name and edit_name.strip() and edit_db and edit_db.strip():
                         try:
-                            conn_m = get_master_conn()
-                            conn_m.execute("UPDATE Stores SET store_name = ?, db_filename = ? WHERE id = ?", (edit_name.strip(), edit_db.strip(), s["id"]))
-                            conn_m.commit()
-                            conn_m.close()
+                            client.table("app_stores").update({
+                                "store_name": edit_name.strip(),
+                                "db_filename": edit_db.strip(),
+                            }).eq("id", int(sid)).execute()
                             clear_data_cache()
                             st.success("저장되었습니다.")
                             st.rerun()
-                        except sqlite3.IntegrityError:
-                            st.error("매장명 또는 DB 파일명이 이미 사용 중입니다.")
+                        except Exception as e:
+                            err_str = str(e).lower()
+                            if "unique" in err_str or "duplicate" in err_str:
+                                st.error("매장명 또는 DB 파일명이 이미 사용 중입니다.")
+                            else:
+                                st.error(f"수정 실패: {e}")
                     else:
                         st.warning("매장명과 DB 파일명을 입력하세요.")
         st.caption("계정(ID) 조회 및 비밀번호 변경")
-        for _, u in store_users.iterrows():
+        for _, u in store_users_df.iterrows():
             with st.form(f"pw_{u['id']}"):
-                st.text_input("현재 ID (조회용)", value=u["username"], disabled=True, key=f"disp_id_{u['id']}")
+                st.text_input("현재 ID (조회용)", value=u.get("username", ""), disabled=True, key=f"disp_id_{u['id']}")
                 new_pw = st.text_input("새 비밀번호 (변경 시만 입력)", type="password", key=f"pw_input_{u['id']}")
                 if st.form_submit_button("비밀번호 변경"):
                     if new_pw:
-                        conn_m = get_master_conn()
-                        conn_m.execute("UPDATE Users SET password = ? WHERE id = ?", (hashlib.sha256(new_pw.encode()).hexdigest(), u["id"]))
-                        conn_m.commit()
-                        conn_m.close()
-                        st.success("변경되었습니다.")
-                        st.rerun()
+                        try:
+                            client.table("app_users").update({
+                                "password": hashlib.sha256(new_pw.encode()).hexdigest(),
+                            }).eq("id", int(u["id"])).execute()
+                            clear_data_cache()
+                            st.success("변경되었습니다.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"변경 실패: {e}")
                     else:
                         st.warning("새 비밀번호를 입력하세요.")
+
     st.subheader("매장 삭제 (이중 확인)")
     if len(stores) > 0:
         del_store_name = st.selectbox("삭제할 매장 선택", store_options, key="sa_del_store_sel")
         if del_store_name:
             s = stores[stores["store_name"] == del_store_name].iloc[0]
-            st.warning("매장 삭제 시 해당 매장 계정과 매장 데이터가 삭제됩니다. 복구할 수 없습니다.")
+            st.warning("매장 삭제 시 해당 매장 배정이 해제되고 매장 행이 삭제됩니다. 복구할 수 없습니다.")
             confirm = st.checkbox(f"'{s['store_name']}' 매장 삭제에 동의합니다.", key="del_confirm_final")
             if st.button("매장 삭제", key="del_btn_final"):
                 if not confirm:
                     st.error("위 체크박스를 선택한 후 삭제할 수 있습니다.")
                 else:
-                    conn_m = get_master_conn()
-                    conn_m.execute("DELETE FROM Users WHERE store_id = ?", (s["id"],))
-                    conn_m.execute("DELETE FROM Stores WHERE id = ?", (s["id"],))
-                    conn_m.commit()
-                    conn_m.close()
-                    clear_data_cache()
-                    db_path = os.path.join(DB_DIR, s["db_filename"])
-                    if os.path.exists(db_path):
-                        try:
-                            os.remove(db_path)
-                        except Exception:
-                            pass
-                    st.success("매장이 삭제되었습니다.")
-                    st.rerun()
+                    try:
+                        sid = int(s["id"])
+                        client.table("app_user_stores").delete().eq("store_id", sid).execute()
+                        client.table("app_users").update({"store_id": None}).eq("store_id", sid).execute()
+                        client.table("app_stores").delete().eq("id", sid).execute()
+                        clear_data_cache()
+                        db_path = os.path.join(DB_DIR, s["db_filename"])
+                        if os.path.exists(db_path):
+                            try:
+                                os.remove(db_path)
+                            except Exception:
+                                pass
+                        st.success("매장이 삭제되었습니다.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"삭제 실패: {e}")
 
 
 def render_monthly_payment_report(is_superadmin: bool):
@@ -4002,7 +4044,7 @@ def render_monthly_payment_report(is_superadmin: bool):
             return
 
     if is_superadmin:
-        stores = get_master_stores_dataframe_cached()
+        stores = get_supabase_stores_dataframe_cached()
         if len(stores) == 0:
             st.info("등록된 매장이 없습니다.")
             return
@@ -4013,7 +4055,7 @@ def render_monthly_payment_report(is_superadmin: bool):
         if not db_filename:
             st.warning("매장에 로그인한 후 이용하세요.")
             return
-        stores = get_master_stores_dataframe_cached()
+        stores = get_supabase_stores_dataframe_cached()
         match = stores[stores["db_filename"] == db_filename]
         selected_store = match["store_name"].iloc[0] if len(match) > 0 else "매장"
 
@@ -4164,53 +4206,39 @@ EMPLOYEE_ROLE_OPTIONS = [
 
 
 def _get_store_id_by_display_name(display_name: str):
-    """배정 매장 표시명(삼산점, 학성점, 양산점, 본사) → Stores.id. 본사는 NULL. 정확 일치 후 LIKE(울산삼산점 등) 매칭."""
+    """배정 매장 표시명(삼산점, 학성점, 양산점, 본사) → app_stores.id. 본사는 NULL. Supabase app_stores만 조회."""
     if not display_name or str(display_name).strip() == "본사":
         return None
     n = str(display_name).strip()
-    conn = get_master_conn()
-    try:
-        row = conn.execute("SELECT id FROM Stores WHERE TRIM(store_name) = ?", (n,)).fetchone()
-        if row:
-            return row[0]
-        keyword = n.replace("점", "").strip()
-        if keyword:
-            row = conn.execute(
-                "SELECT id FROM Stores WHERE store_name LIKE ? LIMIT 1",
-                ("%" + keyword + "%",),
-            ).fetchone()
-            return row[0] if row else None
-        return None
-    finally:
-        conn.close()
+    stores = _get_supabase_stores_list()
+    for s in stores:
+        if (s.get("store_name") or "").strip() == n:
+            return s.get("id")
+    keyword = n.replace("점", "").strip()
+    if keyword:
+        for s in stores:
+            if keyword in (s.get("store_name") or ""):
+                return s.get("id")
+    return None
 
 
 def _get_store_ids_by_display_names(display_names: list):
-    """배정 매장 표시명 여러 개 → [(store_id, store_name), ...] (본사 제외). 정확 일치 후 LIKE로 매칭(울산삼산점 등)."""
+    """배정 매장 표시명 여러 개 → [(store_id, store_name), ...] (본사 제외). Supabase app_stores만 조회."""
     result = []
     seen_ids = set()
+    stores = _get_supabase_stores_list()
     for name in (display_names or []):
         n = str(name).strip()
         if not n or n == "본사":
             continue
-        conn = get_master_conn()
-        try:
-            row = conn.execute(
-                "SELECT id, store_name FROM Stores WHERE TRIM(store_name) = ?",
-                (n,),
-            ).fetchone()
-            if not row:
-                keyword = n.replace("점", "").strip()
-                if keyword:
-                    row = conn.execute(
-                        "SELECT id, store_name FROM Stores WHERE store_name LIKE ? LIMIT 1",
-                        ("%" + keyword + "%",),
-                    ).fetchone()
-            if row and row[0] not in seen_ids:
-                seen_ids.add(row[0])
-                result.append((row[0], row[1]))
-        finally:
-            conn.close()
+        for s in stores:
+            sn = (s.get("store_name") or "").strip()
+            if sn == n or (n.replace("점", "").strip() in sn):
+                sid = s.get("id")
+                if sid is not None and sid not in seen_ids:
+                    seen_ids.add(sid)
+                    result.append((sid, sn))
+                break
     return result
 
 
@@ -4218,27 +4246,15 @@ def render_employee_management():
     """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + 직원/매장은 Supabase app_users·app_stores 우선. superadmin 전용."""
     st.header("👥 직원 계정 관리 및 발령")
 
-    use_supabase = ensure_supabase_app_tables()
-    if use_supabase:
-        stores_list = _get_supabase_stores_list()
-        all_stores_df = pd.DataFrame(stores_list).sort_values("store_name", ignore_index=True) if stores_list else pd.DataFrame(columns=["id", "store_name", "db_filename"])
-        if "store_name" not in all_stores_df.columns and len(all_stores_df) == 0:
-            all_stores_df = pd.DataFrame(columns=["id", "store_name", "db_filename"])
-    else:
-        conn = get_master_conn()
-        try:
-            all_stores_df = pd.read_sql("SELECT id, store_name FROM Stores ORDER BY store_name", conn)
-        finally:
-            conn.close()
+    ensure_supabase_app_tables()
+    stores_list = _get_supabase_stores_list()
+    all_stores_df = pd.DataFrame(stores_list).sort_values("store_name", ignore_index=True) if stores_list else pd.DataFrame(columns=["id", "store_name", "db_filename"])
+    if "store_name" not in all_stores_df.columns and len(all_stores_df) == 0:
+        all_stores_df = pd.DataFrame(columns=["id", "store_name", "db_filename"])
+    if len(all_stores_df) == 0:
         client, _ = get_supabase_client()
         if client:
-            st.warning(
-                "직원 명부를 Supabase에 두려면 **app_users** 테이블이 필요합니다. "
-                "Supabase 대시보드 → SQL Editor에서 프로젝트 루트의 **SUPABASE_APP_TABLES.sql** 내용을 실행해 주세요. "
-                "또는 .streamlit/secrets.toml에 `database_url`(Postgres 연결 문자열)을 넣으면 앱이 테이블을 자동 생성합니다."
-            )
-        else:
-            st.info("💡 직원 명부를 Supabase에 저장하려면 Supabase URL/Key 설정 후, SQL Editor에서 **SUPABASE_APP_TABLES.sql**을 실행해 주세요.")
+            st.caption("등록된 매장이 없거나 Supabase app_stores를 조회할 수 없습니다. Superadmin 매장 계정 탭에서 매장을 추가하거나, migrate_stores_to_supabase()를 실행하세요.")
     store_options = all_stores_df["store_name"].tolist() if len(all_stores_df) > 0 else []
 
     admin_client, admin_err = get_supabase_admin_client()
@@ -4594,29 +4610,25 @@ def render_employee_management():
         conn = get_master_conn()
         try:
             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='UserStores'")
-            if cur.fetchone() is not None:
-                df = pd.read_sql(
-                    """
-                    SELECT u.id, u.email, u.username, u.name, u.role,
-                        COALESCE(
-                            (SELECT GROUP_CONCAT(s.store_name, ', ') FROM UserStores us JOIN Stores s ON us.store_id = s.id WHERE us.user_id = u.id),
-                            (SELECT s.store_name FROM Stores s WHERE s.id = u.store_id)
-                        ) AS 배정매장
-                    FROM Users u
-                    ORDER BY u.id
-                    """,
-                    conn,
-                )
+            has_user_stores = cur.fetchone() is not None
+            if has_user_stores:
+                users_df = pd.read_sql("SELECT u.id, u.email, u.username, u.name, u.role, u.store_id FROM Users u ORDER BY u.id", conn)
+                us_rows = conn.execute("SELECT user_id, store_id FROM UserStores").fetchall()
+                store_ids_by_user = {}
+                for ur, sr in us_rows:
+                    store_ids_by_user.setdefault(ur, []).append(sr)
+                stores_map = {s["id"]: s.get("store_name") for s in _get_supabase_stores_list()}
+                def _fmt_stores(uid, single_sid):
+                    sids = store_ids_by_user.get(uid) or ([single_sid] if single_sid else [])
+                    names = [stores_map.get(sid) or str(sid) for sid in sids if sid]
+                    return ", ".join(names) if names else "-"
+                users_df["배정매장"] = users_df.apply(lambda r: _fmt_stores(r["id"], r.get("store_id")), axis=1)
+                df = users_df.drop(columns=["store_id"], errors="ignore")
             else:
-                df = pd.read_sql(
-                    """
-                    SELECT u.id, u.email, u.username, u.name, u.role, s.store_name AS 배정매장
-                    FROM Users u
-                    LEFT JOIN Stores s ON u.store_id = s.id
-                    ORDER BY u.id
-                    """,
-                    conn,
-                )
+                users_df = pd.read_sql("SELECT id, email, username, name, role, store_id FROM Users ORDER BY id", conn)
+                stores_map = {s["id"]: s.get("store_name") for s in _get_supabase_stores_list()}
+                users_df["배정매장"] = users_df["store_id"].map(lambda sid: stores_map.get(sid) or "-" if pd.notna(sid) and sid else "-")
+                df = users_df.drop(columns=["store_id"], errors="ignore")
         finally:
             conn.close()
 
