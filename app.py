@@ -4499,6 +4499,57 @@ def render_employee_management():
                             except Exception as e:
                                 st.error(f"저장 실패: {str(e)}")
 
+                    # ----- 비밀번호 리셋 (동일 직원 대상) -----
+                    with st.form("emp_password_reset_form"):
+                        st.caption("🔐 비밀번호 리셋 · 위에서 선택한 직원의 로그인 비밀번호를 변경합니다.")
+                        st.text_input("대상 (이메일)", value=(row[1] or row[0] or "").strip(), disabled=True, key="emp_pw_target_display")
+                        emp_reset_pw = st.text_input("새 비밀번호", type="password", key="emp_reset_pw")
+                        emp_reset_pw_confirm = st.text_input("새 비밀번호 확인", type="password", key="emp_reset_pw_confirm")
+                        if st.form_submit_button("비밀번호 변경"):
+                            if not emp_reset_pw or len(emp_reset_pw) < 6:
+                                st.error("비밀번호는 6자 이상 입력해 주세요.")
+                            elif emp_reset_pw != emp_reset_pw_confirm:
+                                st.error("새 비밀번호가 일치하지 않습니다.")
+                            else:
+                                target_email = (row[1] or row[0] or "").strip()
+                                if not target_email:
+                                    st.error("대상 직원의 이메일을 찾을 수 없습니다.")
+                                elif use_supabase and admin_client and not admin_err:
+                                    try:
+                                        r = admin_client.auth.admin.list_users()
+                                        users = getattr(r, "users", None) or getattr(r, "data", None)
+                                        if users is None and hasattr(r, "model_dump"):
+                                            d = r.model_dump()
+                                            users = d.get("users", d.get("data", []))
+                                        auth_uid = None
+                                        for u in (users or []):
+                                            em = getattr(u, "email", None) if hasattr(u, "email") else (u.get("email") if isinstance(u, dict) else None)
+                                            if em and str(em).strip().lower() == target_email.lower():
+                                                auth_uid = getattr(u, "id", None) if hasattr(u, "id") else (u.get("id") if isinstance(u, dict) else None)
+                                                break
+                                        if auth_uid:
+                                            admin_client.auth.admin.update_user_by_id(auth_uid, {"password": emp_reset_pw})
+                                            st.success("비밀번호가 변경되었습니다. 해당 직원은 다음 로그인부터 새 비밀번호를 사용합니다.")
+                                            clear_data_cache()
+                                            st.rerun()
+                                        else:
+                                            st.warning("Supabase Auth에 해당 이메일 계정이 없습니다. 로그인은 Supabase Auth를 사용하는 경우에만 비밀번호 변경이 적용됩니다.")
+                                    except Exception as e:
+                                        st.error(f"비밀번호 변경 실패: {str(e)}")
+                                elif not use_supabase:
+                                    try:
+                                        conn = get_master_conn()
+                                        pw_hash = hashlib.sha256(emp_reset_pw.encode()).hexdigest()
+                                        conn.execute("UPDATE Users SET password = ? WHERE id = ?", (pw_hash, edit_user_id))
+                                        conn.commit()
+                                        conn.close()
+                                        st.success("비밀번호가 변경되었습니다.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"비밀번호 변경 실패: {str(e)}")
+                                else:
+                                    st.error("비밀번호 변경을 위해 Supabase service_role_key(관리자 API)가 필요합니다.")
+
         # ----- 직원 매장 변경 (배정 매장만 빠르게 변경) -----
         if has_user_stores and len(all_stores_df) > 0:
             with st.expander("🏪 직원 매장 변경 (배정 매장만)", expanded=False):
