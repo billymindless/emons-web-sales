@@ -558,7 +558,7 @@ def _supabase_insert_app_user(username: str, email: str, role: str, store_id, na
             "store_id": int(store_id) if store_id is not None else None,
             "name": (name or "").strip() or None,
         }
-        r = client.table("app_users").insert(row).select("id").execute()
+        r = client.table("app_users").insert(row).execute()
         data = (r.data if hasattr(r, "data") else None)
         if data is not None and len(data) > 0:
             row_data = data[0] if isinstance(data, list) else data
