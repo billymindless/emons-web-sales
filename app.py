@@ -236,6 +236,41 @@ def get_supabase_admin_client():
         return None, f"Supabase Admin 연결 실패: {err_msg}"
 
 
+def _supabase_auth_uid_by_email(admin_client, email: str):
+    """
+    Supabase Auth에서 이메일로 사용자 UUID 조회. list_users는 기본 50명만 반환하므로 페이지네이션으로 전체 검색.
+    반환: auth.users.id (UUID 문자열) 또는 None.
+    """
+    if not admin_client or not email or not str(email).strip():
+        return None
+    target = str(email).strip().lower()
+    page = 1
+    per_page = 1000
+    while True:
+        try:
+            r = admin_client.auth.admin.list_users(per_page=per_page, page=page)
+        except TypeError:
+            try:
+                r = admin_client.auth.admin.list_users({"per_page": per_page, "page": page})
+            except Exception:
+                r = admin_client.auth.admin.list_users()
+        users = getattr(r, "users", None) or getattr(r, "data", None)
+        if users is None and hasattr(r, "model_dump"):
+            d = r.model_dump()
+            users = d.get("users", d.get("data", []))
+        for u in (users or []):
+            em = getattr(u, "email", None) if hasattr(u, "email") else (u.get("email") if isinstance(u, dict) else None)
+            if em and str(em).strip().lower() == target:
+                uid = getattr(u, "id", None) if hasattr(u, "id") else (u.get("id") if isinstance(u, dict) else None)
+                return uid
+        if not users or len(users) < per_page:
+            break
+        page += 1
+        if page > 100:
+            break
+    return None
+
+
 # ---------- Supabase 직원/매장 테이블 (app_users, app_user_stores, app_stores) ----------
 # 테이블이 없으면 ensure_supabase_app_tables()로 자동 생성 시도(database_url 있을 때) 또는 SQL Editor에서 SUPABASE_APP_TABLES.sql 실행.
 # 아래 매장/직원 목록 등은 @st.cache_data(ttl=600)로 10분 캐시. 매장·직원 추가/수정/삭제 후 반드시 clear_data_cache() 호출하면 즉시 갱신됨.
@@ -4516,17 +4551,7 @@ def render_employee_management():
                                     st.error("대상 직원의 이메일을 찾을 수 없습니다.")
                                 elif use_supabase and admin_client and not admin_err:
                                     try:
-                                        r = admin_client.auth.admin.list_users()
-                                        users = getattr(r, "users", None) or getattr(r, "data", None)
-                                        if users is None and hasattr(r, "model_dump"):
-                                            d = r.model_dump()
-                                            users = d.get("users", d.get("data", []))
-                                        auth_uid = None
-                                        for u in (users or []):
-                                            em = getattr(u, "email", None) if hasattr(u, "email") else (u.get("email") if isinstance(u, dict) else None)
-                                            if em and str(em).strip().lower() == target_email.lower():
-                                                auth_uid = getattr(u, "id", None) if hasattr(u, "id") else (u.get("id") if isinstance(u, dict) else None)
-                                                break
+                                        auth_uid = _supabase_auth_uid_by_email(admin_client, target_email)
                                         if auth_uid:
                                             admin_client.auth.admin.update_user_by_id(auth_uid, {"password": emp_reset_pw})
                                             st.success("비밀번호가 변경되었습니다. 해당 직원은 다음 로그인부터 새 비밀번호를 사용합니다.")
@@ -4630,18 +4655,9 @@ def render_employee_management():
                             try:
                                 if admin_client and not admin_err and del_email:
                                     try:
-                                        r = admin_client.auth.admin.list_users()
-                                        users = getattr(r, "users", None) or getattr(r, "data", None)
-                                        if users is None and hasattr(r, "model_dump"):
-                                            d = r.model_dump()
-                                            users = d.get("users", d.get("data", []))
-                                        for u in (users or []):
-                                            em = getattr(u, "email", None) if hasattr(u, "email") else (u.get("email") if isinstance(u, dict) else None)
-                                            if em == del_email:
-                                                uid = getattr(u, "id", None) if hasattr(u, "id") else (u.get("id") if isinstance(u, dict) else None)
-                                                if uid:
-                                                    admin_client.auth.admin.delete_user(uid)
-                                                break
+                                        uid = _supabase_auth_uid_by_email(admin_client, del_email)
+                                        if uid:
+                                            admin_client.auth.admin.delete_user(uid)
                                     except Exception:
                                         pass
                                 if use_supabase:
