@@ -7163,11 +7163,16 @@ def main():
         st.session_state["main_tab_idx"] = 0
     if st.session_state["main_tab_idx"] >= len(tab_labels):
         st.session_state["main_tab_idx"] = 0
-    # Supabase 오류 시 안내 (테이블 없음 vs 연결 실패 구분)
+    # Supabase 오류 시 안내 (테이블 없음 / RLS / 연결 실패 구분)
     if st.session_state.get("supabase_error"):
-        err_text = st.session_state["supabase_error"] or ""
+        err_text = str(st.session_state["supabase_error"] or "")
         if "schema cache" in err_text or "Could not find the table" in err_text or "app_customers" in err_text:
             st.error("⚠️ **Supabase에 app_customers 테이블이 없습니다.** Supabase 대시보드 → SQL Editor에서 프로젝트의 **SUPABASE_APP_CUSTOMERS.sql** 파일 내용을 실행해 주세요.")
+        elif "42501" in err_text or "row-level security" in err_text or "violates row-level security" in err_text:
+            if "sales" in err_text.lower():
+                st.error("⚠️ **sales 테이블 RLS 정책 오류**: Supabase 대시보드 → SQL Editor에서 **SUPABASE_SALES.sql** 파일의 RLS 정책 부분(또는 전체)을 실행해 주세요.")
+            else:
+                st.error("⚠️ **Supabase RLS 정책 오류**: " + err_text + " — 해당 테이블에 INSERT를 허용하는 RLS 정책을 추가해 주세요.")
         else:
             st.error("⚠️ **Supabase 연결 실패**: " + err_text + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
     # 상단 메뉴 고정(Sticky): 스크롤 시에도 메뉴가 상단에 유지되도록 CSS 주입
