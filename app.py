@@ -528,6 +528,24 @@ def _get_supabase_users_list():
         return []
 
 
+def _get_app_user_display_name_map():
+    """
+    이메일/username → 표시명(name 우선, 없으면 username) 매핑. To-Do 작성자 등 표기용.
+    캐시된 _get_supabase_users_list() 활용으로 매번 쿼리하지 않음.
+    """
+    users = _get_supabase_users_list()
+    out = {}
+    for u in users:
+        name = (str(u.get("name") or "").strip() or str(u.get("username") or "").strip()) or ""
+        if name:
+            if u.get("email"):
+                out[str(u["email"]).strip().lower()] = name
+            if u.get("username"):
+                out[str(u["username"]).strip()] = name
+                out[str(u["username"]).strip().lower()] = name
+    return out
+
+
 def _get_supabase_user_store_ids(user_id: int):
     """한 직원의 배정 매장 id 목록 (Supabase app_user_stores)."""
     if not user_id:
@@ -4729,7 +4747,64 @@ def render_employee_management():
     st.dataframe(df_display, use_container_width=True)
 
 
+CONFIRM_DATA_RESET_PHRASE = "데이터를 모두 초기화합니다"
+
+
+def _superadmin_tab_danger_zone_data_reset():
+    """
+    Superadmin 전용 Danger Zone: 매출/주문 테스트 데이터만 초기화.
+    app_orders, app_payments만 삭제. app_users, app_stores 등 마스터 데이터는 절대 삭제하지 않음.
+    이중 잠금: 문구를 정확히 입력해야만 실행 버튼 활성화.
+    """
+    st.warning("테스트 기간이 끝나고 프로덕션 배포 전, **매출/주문 관련 데이터만** 한 번에 비울 수 있습니다. **직원·매장 정보는 삭제되지 않습니다.**")
+    with st.expander("⚠️ 시스템 데이터 초기화 (Danger Zone)", expanded=False):
+        st.caption("아래 문구를 **정확히** 입력한 경우에만 초기화 실행 버튼이 활성화됩니다.")
+        confirm_input = st.text_input(
+            "확인 문구 입력",
+            placeholder=f'"{CONFIRM_DATA_RESET_PHRASE}" 를 그대로 입력하세요',
+            key="danger_zone_confirm_input",
+        )
+        phrase_ok = (confirm_input or "").strip() == CONFIRM_DATA_RESET_PHRASE
+        if st.button("초기화 실행", key="danger_zone_execute_btn", disabled=not phrase_ok, type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error("Supabase 연결에 실패했습니다. 초기화를 수행할 수 없습니다.")
+                return
+            stores_list = _get_supabase_stores_list()
+            if not stores_list:
+                st.info("등록된 매장이 없습니다. 삭제할 매출/결제 데이터가 없을 수 있습니다.")
+                return
+            errors = []
+            for s in stores_list:
+                db_fn = s.get("db_filename")
+                if not db_fn:
+                    continue
+                try:
+                    client.table("app_payments").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_fn).execute()
+                except Exception as e:
+                    errors.append(f"app_payments({db_fn}): {e}")
+                try:
+                    client.table("app_orders").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_fn).execute()
+                except Exception as e:
+                    errors.append(f"app_orders({db_fn}): {e}")
+            if errors:
+                st.error("일부 삭제 실패: " + "; ".join(errors[:5]))
+            clear_data_cache()
+            st.success("초기화 완료되었습니다. 매출/주문 데이터(app_orders, app_payments)만 삭제되었습니다. **app_users, app_stores는 변경되지 않았습니다.**")
+            st.rerun()
+
+
 def render_superadmin():
+    st.markdown(
+        """
+        <style>
+        /* Superadmin: 헤더 + 탭을 상단 고정 */
+        .main .block-container > div:nth-child(-n+3) { position: sticky !important; top: 0 !important; z-index: 999 !important; background: var(--background-color, #ffffff) !important; padding-bottom: 0.5rem !important; box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important; }
+        .main .block-container > div:nth-child(4) { margin-top: 0.75rem !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.header("최고 관리자 메뉴")
     t = st.tabs([
         "① 전 지점 통합 대시보드",
@@ -4740,6 +4815,7 @@ def render_superadmin():
         "⑥ 전 지점 마케팅 분석",
         "⑦ 미수금(잔금) 레포트",
         "⑧ 월별 결제수단 집계표",
+        "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
     ])
     with t[0]:
         _superadmin_tab1_integrated_dashboard()
@@ -4757,6 +4833,8 @@ def render_superadmin():
         _superadmin_tab_unpaid_report()
     with t[7]:
         render_monthly_payment_report(is_superadmin=True)
+    with t[8]:
+        _superadmin_tab_danger_zone_data_reset()
 
 
 # ========== 탭 1: 매장 관리자 메뉴 (Store Admin 전용) — Employees ==========
@@ -6640,12 +6718,15 @@ def render_dashboard():
                 st.rerun()
             else:
                 st.warning("내용을 입력하세요.")
+    author_display_map = _get_app_user_display_name_map()
     if len(todos_df) > 0:
         for _, row in todos_df.iterrows():
             content_preview = (row["content"] or "")[:50]
             if len((row["content"] or "")) > 50:
                 content_preview += "..."
-            with st.expander(f"{'✅' if row['is_completed'] else '⬜'} {content_preview} (by {row['author']})"):
+            raw_author = row.get("author") or ""
+            author_display = author_display_map.get(str(raw_author).strip()) or author_display_map.get(str(raw_author).strip().lower()) or (raw_author or "—")
+            with st.expander(f"{'✅' if row['is_completed'] else '⬜'} {content_preview} (by {author_display})"):
                 st.caption(row["created_date"])
                 st.write(row["content"] or "")
                 if not row["is_completed"] and st.button("완료 처리", key=f"todo_done_{row['id']}"):
@@ -6830,6 +6911,24 @@ def main():
     # Supabase 연결 실패 시 친절한 경고
     if st.session_state.get("supabase_error"):
         st.error("⚠️ **Supabase 연결 실패**: " + st.session_state["supabase_error"] + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
+    # 상단 메뉴 고정(Sticky): 스크롤 시에도 메뉴가 상단에 유지되도록 CSS 주입
+    st.markdown(
+        """
+        <style>
+        /* 상단 네비게이션 고정: 메뉴 선택 + 힌트 + 셀렉트박스 + 구분선 */
+        .main .block-container > div:nth-child(-n+5) {
+            position: sticky !important;
+            top: 0 !important;
+            z-index: 999 !important;
+            background: var(--background-color, #ffffff) !important;
+            padding-bottom: 0.5rem !important;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important;
+        }
+        .main .block-container > div:nth-child(6) { margin-top: 0.75rem !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     # 상단 메뉴 선택 (스마트폰에서 탭이 잘리지 않도록 셀렉트박스로 제공)
     st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
     st.markdown('<p class="mobile-menu-hint" style="margin:0 0 0.35rem 0; font-size:0.8rem; color:#888;">로그아웃·비밀번호는 왼쪽 상단 ☰에서</p>', unsafe_allow_html=True)
