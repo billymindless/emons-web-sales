@@ -4246,7 +4246,7 @@ def render_employee_management():
     """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + 직원/매장은 Supabase app_users·app_stores 우선. superadmin 전용."""
     st.header("👥 직원 계정 관리 및 발령")
 
-    ensure_supabase_app_tables()
+    use_supabase = ensure_supabase_app_tables()
     stores_list = _get_supabase_stores_list()
     all_stores_df = pd.DataFrame(stores_list).sort_values("store_name", ignore_index=True) if stores_list else pd.DataFrame(columns=["id", "store_name", "db_filename"])
     if "store_name" not in all_stores_df.columns and len(all_stores_df) == 0:
