@@ -549,18 +549,26 @@ def _supabase_insert_app_user(username: str, email: str, role: str, store_id, na
         return None, (err or "Supabase 연결 불가")
     try:
         pw_placeholder = hashlib.sha256("supabase_managed".encode()).hexdigest()
+        email_clean = (email or "").strip().lower() or None
         row = {
-            "username": username,
+            "username": (username or "").strip(),
             "password": pw_placeholder,
-            "email": email or None,
-            "role": role,
-            "store_id": store_id,
-            "name": name or None,
+            "email": email_clean,
+            "role": (role or "user").strip(),
+            "store_id": int(store_id) if store_id is not None else None,
+            "name": (name or "").strip() or None,
         }
-        r = client.table("app_users").insert(row).execute()
-        data = (r.data or []) if hasattr(r, "data") else []
-        if data and len(data) > 0 and data[0].get("id") is not None:
-            return data[0]["id"], None
+        r = client.table("app_users").insert(row).select("id").execute()
+        data = (r.data if hasattr(r, "data") else None)
+        if data is not None and len(data) > 0:
+            row_data = data[0] if isinstance(data, list) else data
+            uid = row_data.get("id") if isinstance(row_data, dict) else None
+            if uid is not None:
+                return int(uid), None
+        if email_clean:
+            existing = client.table("app_users").select("id").eq("email", email_clean).maybe_single().execute()
+            if existing.data and existing.data.get("id") is not None:
+                return int(existing.data["id"]), None
         return None, "insert 후 id를 가져오지 못했습니다."
     except Exception as e:
         return None, str(e)
@@ -4309,7 +4317,7 @@ def render_employee_management():
                             st.error(f"Supabase 계정 생성에 실패했습니다: {err_msg}")
                             st.stop()
 
-                    selected_store_ids = all_stores_df[all_stores_df["store_name"].isin(emp_stores or [])]["id"].tolist()
+                    selected_store_ids = [int(x) for x in all_stores_df[all_stores_df["store_name"].isin(emp_stores or [])]["id"].tolist()]
                     first_store_id = selected_store_ids[0] if selected_store_ids else None
                     username = str(emp_email).strip()
                     role = str(emp_role_choice).strip()
@@ -4319,9 +4327,10 @@ def render_employee_management():
                         existing = _supabase_get_app_user_by_email(username)
                         try:
                             if existing:
-                                user_id = existing["id"]
+                                user_id = int(existing["id"])
                                 _supabase_update_app_user(user_id, emp_name_val, role, first_store_id, selected_store_ids)
                                 st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+                                clear_data_cache()
                             else:
                                 user_id, ins_err = _supabase_insert_app_user(username, str(emp_email).strip(), role, first_store_id, emp_name_val)
                                 if ins_err:
@@ -4329,13 +4338,14 @@ def render_employee_management():
                                     st.stop()
                                 for sid in selected_store_ids:
                                     try:
-                                        get_supabase_client()[0].table("app_user_stores").insert({"user_id": user_id, "store_id": sid}).execute()
+                                        get_supabase_client()[0].table("app_user_stores").insert({"user_id": user_id, "store_id": int(sid)}).execute()
                                     except Exception:
                                         pass
                                 if supabase_already_exists:
                                     st.success("이 이메일은 Supabase에 이미 있어 앱 권한만 부여했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
                                 else:
                                     st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
+                                clear_data_cache()
                         except Exception as e:
                             st.error(f"Supabase 직원 정보 반영 실패: {str(e)}")
                             st.stop()
