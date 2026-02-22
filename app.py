@@ -1102,7 +1102,7 @@ def _ensure_tenant_schema(conn: sqlite3.Connection):
 
 
 def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = "", unpaid_balance: float | None = None):
-    """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). id는 지정하지 않음(자동증가). 테넌트 컬럼은 sales_tenant_column 설정에 따름. unpaid_balance(미수금)는 Supabase Sales 테이블에 해당 컬럼이 있을 때만 저장."""
+    """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). order_id, amount, transaction_date, note, created_at 저장. unpaid_balance(미수금)는 Supabase sales.unpaid_balance 컬럼에 저장(해당 컬럼 없으면 제외 후 재시도)."""
     client, err = get_supabase_client()
     if err:
         if "supabase_error" not in st.session_state:
@@ -1119,12 +1119,13 @@ def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date:
         tenant_col = _sales_tenant_column()
         if tenant_col:
             payload[tenant_col] = db_filename
+        # 미수금: Supabase sales.unpaid_balance 컬럼에 저장 (판매가 - 수납액, 0이면 완납)
         if unpaid_balance is not None:
             payload["unpaid_balance"] = round(float(unpaid_balance), 2)
         try:
             client.table("sales").insert(payload).execute()
         except Exception as e1:
-            # Supabase Sales 테이블에 unpaid_balance 컬럼이 없으면 해당 필드 제외하고 재시도
+            # unpaid_balance 컬럼이 없는 구 Supabase 스키마면 해당 필드 제외 후 재시도
             err_str = str(e1).lower()
             if unpaid_balance is not None and ("unpaid_balance" in err_str or "42703" in err_str or "does not exist" in err_str):
                 payload.pop("unpaid_balance", None)
