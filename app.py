@@ -2211,6 +2211,17 @@ def _current_username() -> str:
     return user.get("username") or "unknown"
 
 
+def _get_current_user_display_name() -> str:
+    """현재 로그인한 직원의 표시명(실명). app_users.name 우선, 없으면 username. To-Do 작성자 등에 사용."""
+    user = st.session_state.get("current_user") or {}
+    name = user.get("name")
+    if name and str(name).strip():
+        return str(name).strip()
+    username = user.get("username") or ""
+    display_map = _get_app_user_display_name_map()
+    return display_map.get(str(username).strip()) or display_map.get(str(username).strip().lower()) or username or ""
+
+
 def _insert_audit_log(
     conn: sqlite3.Connection,
     entity_type: str,
@@ -2961,9 +2972,11 @@ def render_login():
                                 allowed_stores = get_user_allowed_stores(user_id) if role != "superadmin" else []
                                 if allowed_stores:
                                     store_id, db_filename = allowed_stores[0][0], allowed_stores[0][1]
+                                display_map = _get_app_user_display_name_map()
+                                display_name = (display_map.get(str(uname).strip()) or display_map.get(str(uname).strip().lower()) or uname or "").strip()
                                 st.session_state.logged_in = True
                                 st.session_state.current_user = {
-                                    "id": user_id, "username": uname, "role": role,
+                                    "id": user_id, "username": uname, "name": display_name or None, "role": role,
                                     "store_id": store_id, "db_filename": db_filename,
                                     "allowed_stores": allowed_stores,
                                 }
@@ -4957,7 +4970,7 @@ def render_superadmin():
         """
         <style>
         /* Superadmin: 헤더 + 탭을 상단 고정 */
-        .main .block-container > div:nth-child(-n+3) { position: sticky !important; top: 0 !important; z-index: 999 !important; background: var(--background-color, #ffffff) !important; padding-bottom: 0.5rem !important; box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important; }
+        .main .block-container > div:nth-child(-n+3) { position: sticky !important; top: 0 !important; z-index: 9999 !important; background-color: #ffffff !important; padding-bottom: 0.5rem !important; box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important; }
         .main .block-container > div:nth-child(4) { margin-top: 0.75rem !important; }
         </style>
         """,
@@ -6989,10 +7002,11 @@ def render_dashboard():
     # ---------- 6. To-Do 리스트 (직원 간 인수인계) ----------
     st.subheader("6. 직원 To-Do 리스트 (인수인계)")
     with st.form("todo_form"):
-        author = st.text_input("작성자", value=st.session_state.get("current_user", {}).get("username", ""))
+        st.text_input("작성자", value=_get_current_user_display_name(), disabled=True, key="todo_author_display")
         content = st.text_area("내용")
         if st.form_submit_button("등록"):
             if content and content.strip():
+                author = _get_current_user_display_name()
                 conn = get_tenant_conn(db_filename)
                 conn.execute(
                     "INSERT INTO Todos (created_date, author, content, is_completed) VALUES (?, ?, ?, 0)",
@@ -7205,7 +7219,7 @@ def main():
                 st.error("⚠️ **Supabase RLS 정책 오류**: " + err_text + " — 해당 테이블에 INSERT를 허용하는 RLS 정책을 추가해 주세요.")
         else:
             st.error("⚠️ **Supabase 연결 실패**: " + err_text + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
-    # 상단 메뉴 고정(Sticky): 스크롤 시에도 메뉴가 상단에 유지되도록 CSS 주입
+    # 상단 메뉴 고정(Sticky): 스크롤 시에도 메뉴가 뷰포트 최상단에 유지, 배경으로 가독성 확보
     st.markdown(
         """
         <style>
@@ -7213,8 +7227,8 @@ def main():
         .main .block-container > div:nth-child(-n+5) {
             position: sticky !important;
             top: 0 !important;
-            z-index: 999 !important;
-            background: var(--background-color, #ffffff) !important;
+            z-index: 9999 !important;
+            background-color: #ffffff !important;
             padding-bottom: 0.5rem !important;
             box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important;
         }
