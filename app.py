@@ -5039,8 +5039,7 @@ def render_new_sales():
             clear_data_cache()
             st.success("입력이 완료되었습니다.")
             # 마진율 이상 시 Superadmin/매장관리자 알림
-            if margin_out_of_r.
-            35\098541dange:
+            if margin_out_of_range:
                 store_name = _get_store_name_by_db(db_filename)
                 _insert_admin_alert(store_name, "margin", f"{store_name}에서 마진율 {margin_pct:.1f}% 건이 등록되었습니다.")
             # 채널톡 PUSH: 백그라운드 스레드로 전송해 UI 블로킹 방지
