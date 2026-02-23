@@ -4966,26 +4966,8 @@ def _superadmin_tab_danger_zone_data_reset():
 
 
 def render_superadmin():
-    st.markdown(
-        """
-        <style>
-        /* Superadmin: 헤더 + 탭 상단 고정 (선택자 범위 상향으로 실제 메뉴 블록 캡처) */
-        .main, .main .block-container { overflow: visible !important; }
-        .main .block-container > div:nth-child(-n+10),
-        div[data-testid="stBlock"] > div:nth-child(-n+10) {
-            position: sticky !important;
-            top: 0 !important;
-            z-index: 9999 !important;
-            background-color: #ffffff !important;
-            background: #ffffff none repeat scroll 0 0 !important;
-            padding-bottom: 0.5rem !important;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important;
-        }
-        .main .block-container > div:nth-child(11) { margin-top: 0.75rem !important; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # 최고 관리자 화면: 헤더 + 탭을 Sticky Header 컨테이너로 감싸 상단 고정
+    st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
     st.header("최고 관리자 메뉴")
     t = st.tabs([
         "① 전 지점 통합 대시보드",
@@ -4998,6 +4980,7 @@ def render_superadmin():
         "⑧ 월별 결제수단 집계표",
         "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
     ])
+    st.markdown("</div>", unsafe_allow_html=True)
     with t[0]:
         _superadmin_tab1_integrated_dashboard()
     with t[1]:
@@ -7064,6 +7047,35 @@ def main():
     _inject_mobile_css()
     _inject_favicon()
 
+    # 전역 Sticky Header 스타일 주입: 상단 메뉴/탭 고정 및 본문 패딩 조정
+    st.markdown(
+        """
+        <style>
+        .sticky-header {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 9999;
+            background-color: white;
+            padding: 1rem 1rem 0 1rem;
+            box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.1);
+        }
+        /* 사이드바(PC)가 열려 있을 때 본문과 정렬 */
+        @media (min-width: 768px) {
+            .sticky-header {
+                left: 21rem; /* 사이드바 너비만큼 밀어줌 */
+            }
+        }
+        /* 본문이 헤더에 가려지지 않도록 상단 패딩 추가 */
+        .block-container {
+            padding-top: 6rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # 로그인 성공 직후: 브라우저 localStorage에 이메일 저장(한 번만 실행 후 플래그 제거)
     _pending = st.session_state.pop("_pending_save_login_email", None)
     if _pending:
@@ -7234,27 +7246,8 @@ def main():
                 st.error("⚠️ **Supabase RLS 정책 오류**: " + err_text + " — 해당 테이블에 INSERT를 허용하는 RLS 정책을 추가해 주세요.")
         else:
             st.error("⚠️ **Supabase 연결 실패**: " + err_text + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
-    # 상단 메뉴 고정(Sticky): 일반 유저/매장관리자 공통, 선택자 범위 상향으로 메뉴 블록 확실히 캡처
-    st.markdown(
-        """
-        <style>
-        .main, .main .block-container { overflow: visible !important; }
-        .main .block-container > div:nth-child(-n+10),
-        div[data-testid="stBlock"] > div:nth-child(-n+10) {
-            position: sticky !important;
-            top: 0 !important;
-            z-index: 9999 !important;
-            background-color: #ffffff !important;
-            background: #ffffff none repeat scroll 0 0 !important;
-            padding-bottom: 0.5rem !important;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06) !important;
-        }
-        .main .block-container > div:nth-child(11) { margin-top: 0.75rem !important; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    # 상단 메뉴 선택 (스마트폰에서 탭이 잘리지 않도록 셀렉트박스로 제공)
+    # 상단 메뉴 선택(Sticky Header 내에 렌더링: 일반 유저/매장관리자 공통)
+    st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
     st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
     st.markdown('<p class="mobile-menu-hint" style="margin:0 0 0.35rem 0; font-size:0.8rem; color:#888;">로그아웃·비밀번호는 왼쪽 상단 ☰에서</p>', unsafe_allow_html=True)
     menu_sel = st.selectbox(
@@ -7264,6 +7257,7 @@ def main():
         key="main_menu_select",
         label_visibility="collapsed",
     )
+    st.markdown("</div>", unsafe_allow_html=True)
     idx = tab_labels.index(menu_sel)
     st.session_state["main_tab_idx"] = idx
     st.divider()
