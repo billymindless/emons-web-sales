@@ -2222,6 +2222,14 @@ def _get_current_user_display_name() -> str:
     return display_map.get(str(username).strip()) or display_map.get(str(username).strip().lower()) or username or ""
 
 
+def _current_display_name_for_todo() -> str:
+    """
+    To-Do 작성자 비교용 현재 로그인 직원 표시명.
+    To-Do 저장 시 사용한 _get_current_user_display_name() 과 동일한 값을 돌려준다.
+    """
+    return _get_current_user_display_name()
+
+
 def _insert_audit_log(
     conn: sqlite3.Connection,
     entity_type: str,
@@ -6102,6 +6110,34 @@ def render_customer_balance():
         # 고객 엑셀 일괄 등록 (기준일 이전 고객용, 채널톡 동기화 없음)
         with st.expander("📤 고객 엑셀 일괄 등록 (기존 고객)"):
             st.caption("엑셀 파일로 고객을 일괄 등록합니다. 채널톡에는 등록되지 않습니다. 컬럼: 이름(또는 name), 전화번호1(또는 phone1), 전화번호2(또는 phone2), 주소(또는 address). UTF-8 인코딩 권장.")
+            # 현재 app_customers 스키마에 맞는 샘플 CSV 다운로드
+            sample_rows = [
+                {
+                    "이름": "홍길동",
+                    "전화번호1": "010-1234-5678",
+                    "전화번호2": "010-9876-5432",
+                    "주소": "서울특별시 강남구 테헤란로 123",
+                },
+                {
+                    "이름": "김이모",
+                    "전화번호1": "010-0000-0000",
+                    "전화번호2": "",
+                    "주소": "부산광역시 해운대구 센텀서로 45",
+                },
+            ]
+            sample_df = pd.DataFrame(sample_rows, columns=["이름", "전화번호1", "전화번호2", "주소"])
+            _sample_csv_str = sample_df.to_csv(index=False)
+            try:
+                _sample_csv_bytes = _sample_csv_str.encode("utf-8-sig")
+            except (UnicodeEncodeError, LookupError):
+                _sample_csv_bytes = _sample_csv_str.encode("utf-8")
+            st.download_button(
+                "📥 고객 일괄등록 샘플 CSV 다운로드",
+                data=_sample_csv_bytes,
+                file_name="고객_일괄등록_샘플.csv",
+                mime="text/csv",
+                key="customer_bulk_sample_csv",
+            )
             excel_upload = st.file_uploader("엑셀 파일 (.xlsx)", type=["xlsx"], key="customer_excel_upload")
             if excel_upload is not None:
                 try:
@@ -7011,6 +7047,7 @@ def render_dashboard():
             else:
                 st.warning("내용을 입력하세요.")
     author_display_map = _get_app_user_display_name_map()
+    current_todo_author = _current_display_name_for_todo()
     if len(todos_df) > 0:
         for _, row in todos_df.iterrows():
             is_done = bool(row.get("is_completed"))
@@ -7025,6 +7062,7 @@ def render_dashboard():
                 if is_done:
                     st.success("✅ **완료된 업무입니다.**")
                 st.write(row["content"] or "")
+                # 완료 처리 버튼: 아직 완료가 아닌 경우에만 노출
                 if not is_done and st.button("완료 처리", key=f"todo_done_{row['id']}"):
                     conn = get_tenant_conn(db_filename)
                     conn.execute("UPDATE Todos SET is_completed = 1 WHERE id = ?", (row["id"],))
@@ -7032,6 +7070,27 @@ def render_dashboard():
                     conn.close()
                     clear_data_cache()
                     st.rerun()
+
+                # 삭제 버튼: 완료된 항목은 누구나 삭제 가능, 미완료 항목은 작성자만 삭제 가능
+                can_delete = False
+                if is_done:
+                    can_delete = True
+                else:
+                    # 작성자 비교: To-Do 작성 시 사용한 표시명 기준
+                    if (raw_author or "").strip() == current_todo_author:
+                        can_delete = True
+
+                if can_delete:
+                    if st.button("삭제", key=f"todo_delete_{row['id']}"):
+                        conn = get_tenant_conn(db_filename)
+                        conn.execute("DELETE FROM Todos WHERE id = ?", (row["id"],))
+                        conn.commit()
+                        conn.close()
+                        clear_data_cache()
+                        st.rerun()
+                else:
+                    if not is_done:
+                        st.caption("✏️ 미완료 항목은 작성자만 삭제할 수 있습니다.")
 
 
 # ========== 메인: 탭 구성 및 라우팅 ==========
