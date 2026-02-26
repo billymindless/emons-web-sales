@@ -7030,29 +7030,19 @@ def render_dashboard():
     with col2:
         stats_end = st.date_input("종료일", key="stats_end")
     if len(orders) > 0:
-        orders["order_date"] = pd.to_datetime(orders["order_date"])
+        orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
         period_orders = orders[(orders["order_date"].dt.date >= stats_start) & (orders["order_date"].dt.date <= stats_end)]
-        total_contract = period_orders["total_amount"].sum()
-        order_ids = period_orders["id"].tolist()
-        if order_ids:
-            if _supabase_orders_payments_available():
-                pay_df = _load_payments_supabase(db_filename)
-                if not pay_df.empty:
-                    pay_per = pay_df[pay_df["order_id"].isin(order_ids)][["order_id", "amount"]]
-                    paid_per = pay_per.groupby("order_id")["amount"].sum()
-                else:
-                    paid_per = pd.Series(dtype=float)
-            else:
-                conn2 = get_tenant_conn(db_filename)
-                pay_per = pd.read_sql("SELECT order_id, amount FROM Payments WHERE order_id IN ({})".format(",".join("?" * len(order_ids))), conn2, params=order_ids)
-                conn2.close()
-                paid_per = pay_per.groupby("order_id")["amount"].sum()
+        total_contract = float(period_orders["total_amount"].fillna(0).sum())
+        if len(period_orders) > 0 and not payments.empty:
+            order_ids = period_orders["id"].tolist()
+            pay_df = payments[payments["order_id"].isin(order_ids)][["order_id", "amount"]].copy()
+            paid_per = pay_df.groupby("order_id")["amount"].sum() if len(pay_df) > 0 else pd.Series(dtype=float)
             period_orders = period_orders.copy()
             period_orders["_paid"] = period_orders["id"].map(paid_per).fillna(0)
             period_orders["_bal"] = period_orders["total_amount"] - period_orders["_paid"]
-            total_unpaid_period = period_orders["_bal"].clip(lower=0).sum()
+            total_unpaid_period = float(period_orders["_bal"].clip(lower=0).sum())
         else:
-            total_unpaid_period = 0
+            total_unpaid_period = 0.0
         st.metric("해당 기간 총 계약 금액", f"{total_contract:,.0f}원")
         st.metric("해당 기간 총 미수금", f"{total_unpaid_period:,.0f}원")
     else:
@@ -7066,15 +7056,8 @@ def render_dashboard():
         content = st.text_area("내용")
         if st.form_submit_button("등록"):
             if content and content.strip():
-                author = _get_current_user_display_name()
-                conn = get_tenant_conn(db_filename)
-                conn.execute(
-                    "INSERT INTO Todos (created_date, author, content, is_completed) VALUES (?, ?, ?, 0)",
-                    (date.today().isoformat(), author or None, content.strip())
-                )
-                conn.commit()
-                conn.close()
-                st.rerun()
+                # 현재 To-Do 테이블은 SQLite 기반이라 Supabase 전면 이관 전까지는 작성 기능을 비활성화합니다.
+                st.warning("To-Do 작성 기능은 Supabase 이관 작업 중입니다. 잠시 후 다시 이용해 주세요.")
             else:
                 st.warning("내용을 입력하세요.")
     author_display_map = _get_app_user_display_name_map()
@@ -7095,12 +7078,7 @@ def render_dashboard():
                 st.write(row["content"] or "")
                 # 완료 처리 버튼: 아직 완료가 아닌 경우에만 노출
                 if not is_done and st.button("완료 처리", key=f"todo_done_{row['id']}"):
-                    conn = get_tenant_conn(db_filename)
-                    conn.execute("UPDATE Todos SET is_completed = 1 WHERE id = ?", (row["id"],))
-                    conn.commit()
-                    conn.close()
-                    clear_data_cache()
-                    st.rerun()
+                    st.warning("To-Do 완료 처리는 Supabase 이관 후 사용할 수 있습니다.")
 
                 # 삭제 버튼: 완료된 항목은 누구나 삭제 가능, 미완료 항목은 작성자만 삭제 가능
                 can_delete = False
@@ -7113,12 +7091,7 @@ def render_dashboard():
 
                 if can_delete:
                     if st.button("삭제", key=f"todo_delete_{row['id']}"):
-                        conn = get_tenant_conn(db_filename)
-                        conn.execute("DELETE FROM Todos WHERE id = ?", (row["id"],))
-                        conn.commit()
-                        conn.close()
-                        clear_data_cache()
-                        st.rerun()
+                        st.warning("To-Do 삭제는 Supabase 이관 후 사용할 수 있습니다.")
                 else:
                     if not is_done:
                         st.caption("✏️ 미완료 항목은 작성자만 삭제할 수 있습니다.")
