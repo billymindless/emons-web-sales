@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 """
 프랜차이즈 가구 매장용 세일즈 및 경영 대시보드
 Database-per-Tenant 아키텍처: Master DB 1개 + 매장별 독립 SQLite 파일
@@ -12,6 +13,7 @@ import os
 import re
 import sqlite3
 import threading
+import traceback
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -2388,6 +2390,11 @@ def render_payment_history_monitor():
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
         return
+    # Supabase 주문/결제 테이블이 활성화된 경우, 이 화면은 2단계(보조 테이블 Supabase 이관)에서 재구현 예정.
+    # 로컬 SQLite 파일 부재로 인한 불필요한 오류를 피하기 위해 일단 기능을 비활성화한다.
+    if _supabase_orders_payments_available():
+        st.info("결제 변경/취소 모니터링은 아직 로컬 DB 기반입니다. Supabase 이관(2단계) 후 다시 사용할 수 있습니다.")
+        return
     conn = get_tenant_conn(db_filename)
     if not conn:
         st.error("매장 DB를 찾을 수 없습니다.")
@@ -2997,6 +3004,8 @@ def render_login():
                                 st.session_state["_pending_save_login_email"] = str(email).strip()
                                 st.rerun()
                     except Exception as e:
+                        # 디버깅용: 어디에서 오류가 나는지 터미널에 전체 스택을 출력
+                        traceback.print_exc()
                         err_msg = str(e).strip() or "로그인에 실패했습니다."
                         if "Invalid login" in err_msg or "invalid" in err_msg.lower():
                             st.error("이메일 또는 비밀번호가 올바르지 않습니다.")
@@ -3514,9 +3523,6 @@ def render_marketing_insights_tenant():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
-        return
-    if not get_tenant_conn(db_filename):
-        st.error("매장 DB를 찾을 수 없습니다.")
         return
     order_cols_mi = "id, customer_id, order_date, delivery_date, total_amount, visit_reason, purchase_reason, category"
     orders = load_orders_cached(db_filename, order_cols_mi, limit=None)
@@ -5336,18 +5342,37 @@ def render_new_sales():
     if "_gamification_ctx" in st.session_state:
         _render_gamification_feedback(st.session_state["_gamification_ctx"])
         del st.session_state["_gamification_ctx"]
-    conn = get_tenant_conn(db_filename)
-    if not conn:
-        st.error("매장 DB를 찾을 수 없습니다.")
-        return
     st.header("새로운 매출 등록")
-    try:
-        employees = pd.read_sql("SELECT id, name FROM Employees WHERE is_active = 1", conn)
-    except Exception as e:
-        employees = pd.DataFrame(columns=["id", "name"])
-        st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
-    finally:
-        conn.close()
+    # 직원 목록: Supabase app_users/app_user_stores 우선 사용, 없으면 레거시 SQLite Employees 사용
+    employees = pd.DataFrame(columns=["id", "name"])
+    if _supabase_app_tables_available():
+        store_id = _get_supabase_store_by_db_filename(db_filename)
+        users = _get_supabase_users_list()
+        rows = []
+        for u in users:
+            uid = u.get("id")
+            role = u.get("role")
+            if role not in ("store_admin", "user"):
+                continue
+            store_ids = _get_supabase_user_store_ids(uid)
+            if store_id and store_id not in store_ids and u.get("store_id") != store_id:
+                continue
+            name = (u.get("name") or u.get("username") or "").strip()
+            if not name:
+                continue
+            rows.append({"id": uid, "name": name})
+        if rows:
+            employees = pd.DataFrame(rows)
+    else:
+        conn = get_tenant_conn(db_filename)
+        if conn:
+            try:
+                employees = pd.read_sql("SELECT id, name FROM Employees WHERE is_active = 1", conn)
+            except Exception:
+                employees = pd.DataFrame(columns=["id", "name"])
+                st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
+            finally:
+                conn.close()
     customers = load_customers_cached(db_filename, limit=50)
 
     # 고객 선택 또는 신규 (Supabase 오류 시 빈 DataFrame 방어)
@@ -6090,11 +6115,6 @@ def render_customer_balance():
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
         return
-    conn = get_tenant_conn(db_filename)
-    if not conn:
-        st.error("매장 DB를 찾을 수 없습니다.")
-        return
-
     st.header("고객 및 잔금 관리")
     current_user = st.session_state.get("current_user") or {}
     role = current_user.get("role", "user")
@@ -6734,23 +6754,32 @@ def render_dashboard():
         st.warning("매장에 로그인한 후 이용하세요.")
         return
     _render_recent_notices_section()
-    conn = get_tenant_conn(db_filename)
-    if not conn:
-        st.error("매장 DB를 찾을 수 없습니다.")
-        return
     st.header("경영 대시보드 및 인수인계")
-    try:
-        cur = conn.execute("PRAGMA table_info(Orders)")
-        order_cols = [row[1] for row in cur.fetchall()]
-        order_col_list = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category"
-        if "display_sales_amount" in order_cols:
-            order_col_list += ", display_sales_amount"
-        if "display_cost_amount" in order_cols:
-            order_col_list += ", display_cost_amount"
-        if "balance_status" in order_cols:
-            order_col_list += ", balance_status"
-    finally:
-        conn.close()
+    if _supabase_orders_payments_available():
+        # Supabase app_orders 스키마 기준으로 고정 컬럼 목록 사용 (로컬 SQLite 필요 없음)
+        order_col_list = (
+            "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+            "actual_margin, employee_names, category, display_sales_amount, "
+            "display_cost_amount, balance_status"
+        )
+    else:
+        # 레거시 SQLite Orders 테이블을 사용하는 경우에만 로컬 DB 검사
+        conn = get_tenant_conn(db_filename)
+        if not conn:
+            st.error("매장 DB를 찾을 수 없습니다.")
+            return
+        try:
+            cur = conn.execute("PRAGMA table_info(Orders)")
+            order_cols = [row[1] for row in cur.fetchall()]
+            order_col_list = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category"
+            if "display_sales_amount" in order_cols:
+                order_col_list += ", display_sales_amount"
+            if "display_cost_amount" in order_cols:
+                order_col_list += ", display_cost_amount"
+            if "balance_status" in order_cols:
+                order_col_list += ", balance_status"
+        finally:
+            conn.close()
     orders = load_orders_cached(db_filename, order_col_list, limit=None)
     customers = load_customers_cached(db_filename, limit=None)
     sales_df = load_sales_cached(db_filename, limit=None)
