@@ -1428,19 +1428,45 @@ def load_payments_cached(db_filename: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=600)
 def load_todos_cached(db_filename: str, limit: int = 100) -> pd.DataFrame:
-    """Todos 캐시 로딩 (ttl=10분)."""
-    conn = get_tenant_conn(db_filename)
-    if not conn:
-        return pd.DataFrame()
+    """
+    To-Do 목록 캐시 로딩 (ttl=10분).
+    Supabase app_todos 테이블에서 tenant_name(매장명) 기준으로 조회한다.
+    반환 컬럼: id, created_date(문자열), author, content, is_completed.
+    """
+    if not db_filename:
+        return pd.DataFrame(columns=["id", "created_date", "author", "content", "is_completed"])
+    tenant_name = _get_store_name_by_db(db_filename) or db_filename
+    client, err = get_supabase_client()
+    if err or not client:
+        return pd.DataFrame(columns=["id", "created_date", "author", "content", "is_completed"])
     try:
-        return pd.read_sql(
-            "SELECT id, created_date, author, content, is_completed FROM Todos ORDER BY id DESC LIMIT ?",
-            conn, params=(limit,)
-        )
+        q = client.table("app_todos").select(
+            "id, tenant_name, author, content, is_completed, created_at"
+        ).eq("tenant_name", tenant_name).order("created_at", desc=True)
+        if limit:
+            q = q.limit(limit)
+        r = q.execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
     except Exception:
-        return pd.DataFrame()
-    finally:
-        conn.close()
+        rows = []
+    if not rows:
+        return pd.DataFrame(columns=["id", "created_date", "author", "content", "is_completed"])
+    df = pd.DataFrame(rows)
+    # created_at → created_date(문자열) 변환
+    if "created_at" in df.columns:
+        try:
+            created_dt = pd.to_datetime(df["created_at"], errors="coerce")
+            df["created_date"] = created_dt.dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            df["created_date"] = ""
+    else:
+        df["created_date"] = ""
+    # 필요한 컬럼만 반환 (부족한 컬럼은 기본값으로 채움)
+    for col in ("author", "content", "is_completed"):
+        if col not in df.columns:
+            df[col] = "" if col in ("author", "content") else False
+    out = df[["id", "created_date", "author", "content", "is_completed"]].copy()
+    return out
 
 
 def clear_data_cache():
@@ -7056,8 +7082,27 @@ def render_dashboard():
         content = st.text_area("내용")
         if st.form_submit_button("등록"):
             if content and content.strip():
-                # 현재 To-Do 테이블은 SQLite 기반이라 Supabase 전면 이관 전까지는 작성 기능을 비활성화합니다.
-                st.warning("To-Do 작성 기능은 Supabase 이관 작업 중입니다. 잠시 후 다시 이용해 주세요.")
+                author = _get_current_user_display_name()
+                tenant_name = _get_store_name_by_db(db_filename) or db_filename
+                client, err = get_supabase_client()
+                if err or not client:
+                    st.error(f"⚠️ To-Do 저장 중 Supabase 연결 실패: {err}")
+                else:
+                    try:
+                        if "supabase" not in st.session_state:
+                            st.session_state["supabase"] = client
+                        st.session_state["supabase"].table("app_todos").insert(
+                            {
+                                "tenant_name": tenant_name,
+                                "author": author or "",
+                                "content": content.strip(),
+                                "is_completed": False,
+                            }
+                        ).execute()
+                        clear_data_cache()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"To-Do 저장 중 오류가 발생했습니다: {e}")
             else:
                 st.warning("내용을 입력하세요.")
     author_display_map = _get_app_user_display_name_map()
@@ -7078,7 +7123,20 @@ def render_dashboard():
                 st.write(row["content"] or "")
                 # 완료 처리 버튼: 아직 완료가 아닌 경우에만 노출
                 if not is_done and st.button("완료 처리", key=f"todo_done_{row['id']}"):
-                    st.warning("To-Do 완료 처리는 Supabase 이관 후 사용할 수 있습니다.")
+                    client, err = get_supabase_client()
+                    if err or not client:
+                        st.error(f"⚠️ To-Do 완료 처리 중 Supabase 연결 실패: {err}")
+                    else:
+                        try:
+                            if "supabase" not in st.session_state:
+                                st.session_state["supabase"] = client
+                            st.session_state["supabase"].table("app_todos").update(
+                                {"is_completed": True}
+                            ).eq("id", row["id"]).execute()
+                            clear_data_cache()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"To-Do 완료 처리 중 오류가 발생했습니다: {e}")
 
                 # 삭제 버튼: 완료된 항목은 누구나 삭제 가능, 미완료 항목은 작성자만 삭제 가능
                 can_delete = False
@@ -7091,7 +7149,20 @@ def render_dashboard():
 
                 if can_delete:
                     if st.button("삭제", key=f"todo_delete_{row['id']}"):
-                        st.warning("To-Do 삭제는 Supabase 이관 후 사용할 수 있습니다.")
+                        client, err = get_supabase_client()
+                        if err or not client:
+                            st.error(f"⚠️ To-Do 삭제 중 Supabase 연결 실패: {err}")
+                        else:
+                            try:
+                                if "supabase" not in st.session_state:
+                                    st.session_state["supabase"] = client
+                                st.session_state["supabase"].table("app_todos").delete().eq(
+                                    "id", row["id"]
+                                ).execute()
+                                clear_data_cache()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"To-Do 삭제 중 오류가 발생했습니다: {e}")
                 else:
                     if not is_done:
                         st.caption("✏️ 미완료 항목은 작성자만 삭제할 수 있습니다.")
