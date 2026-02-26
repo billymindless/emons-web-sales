@@ -6755,35 +6755,54 @@ def render_dashboard():
         return
     _render_recent_notices_section()
     st.header("경영 대시보드 및 인수인계")
-    if _supabase_orders_payments_available():
-        # Supabase app_orders 스키마 기준으로 고정 컬럼 목록 사용 (로컬 SQLite 필요 없음)
-        order_col_list = (
-            "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
-            "actual_margin, employee_names, category, display_sales_amount, "
-            "display_cost_amount, balance_status"
-        )
+    # Supabase 클라이언트 확보
+    client, err = get_supabase_client()
+    if err or not client:
+        st.error(f"⚠️ Supabase 연결 실패: {err}")
+        return
+
+    # 1) 주문(app_orders) 조회 — db_filename(테넌트 컬럼) 기준
+    order_columns = [
+        "id",
+        "customer_id",
+        "order_date",
+        "delivery_date",
+        "total_amount",
+        "cost_price",
+        "actual_margin",
+        "employee_names",
+        "category",
+        "display_sales_amount",
+        "display_cost_amount",
+        "balance_status",
+    ]
+    try:
+        r_orders = client.table("app_orders").select(", ".join(order_columns)).eq(
+            ORDERS_PAYMENTS_TENANT_COL, db_filename
+        ).execute()
+        orders_rows = (r_orders.data or []) if hasattr(r_orders, "data") else []
+    except Exception as e:
+        st.error(f"주문 데이터를 불러오지 못했습니다: {e}")
+        orders_rows = []
+    if orders_rows:
+        orders = pd.DataFrame(orders_rows)
+        for c in order_columns:
+            if c not in orders.columns:
+                orders[c] = None
     else:
-        # 레거시 SQLite Orders 테이블을 사용하는 경우에만 로컬 DB 검사
-        conn = get_tenant_conn(db_filename)
-        if not conn:
-            st.error("매장 DB를 찾을 수 없습니다.")
-            return
-        try:
-            cur = conn.execute("PRAGMA table_info(Orders)")
-            order_cols = [row[1] for row in cur.fetchall()]
-            order_col_list = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category"
-            if "display_sales_amount" in order_cols:
-                order_col_list += ", display_sales_amount"
-            if "display_cost_amount" in order_cols:
-                order_col_list += ", display_cost_amount"
-            if "balance_status" in order_cols:
-                order_col_list += ", balance_status"
-        finally:
-            conn.close()
-    orders = load_orders_cached(db_filename, order_col_list, limit=None)
+        orders = pd.DataFrame(columns=order_columns)
+
+    # 2) 고객(app_customers) / 매출(sales) / 결제(app_payments) / To-Do
     customers = load_customers_cached(db_filename, limit=None)
     sales_df = load_sales_cached(db_filename, limit=None)
-    payments = load_payments_cached(db_filename)
+    payments = _load_payments_supabase(db_filename)
+    if payments.empty:
+        payments = pd.DataFrame(columns=["order_id", "amount"])
+    else:
+        for col in ("order_id", "amount"):
+            if col not in payments.columns:
+                payments[col] = 0
+    todos_df = load_todos_cached(db_filename)
     todos_df = load_todos_cached(db_filename)
     if "display_sales_amount" not in orders.columns:
         orders["display_sales_amount"] = 0
@@ -6811,31 +6830,14 @@ def render_dashboard():
                 st.dataframe(show_df, use_container_width=True)
                 st.caption("결제 금액을 수정하려면 **고객 및 잔금 관리** → 고객 선택 → **결제 내역 조회 및 취소** / **잔금 추가 결제**에서 해당 주문을 수정하세요.")
             if st.button("🔄 잔금 상태 자동 보정 (결제 합계 기준으로 완납/미납 다시 계산)", key="dashboard_balance_fix_btn"):
-                if _supabase_orders_payments_available():
-                    try:
-                        for oid in suspicious["id"].tolist():
-                            _recalc_order_actual_margin_supabase(db_filename, int(oid))
-                        clear_data_cache()
-                        st.toast(f"✅ {len(suspicious)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"보정 중 오류가 발생했습니다: {e}")
-                else:
-                    conn = get_tenant_conn(db_filename)
-                    if conn:
-                        try:
-                            for oid in suspicious["id"].tolist():
-                                _recalc_order_actual_margin(conn, int(oid), db_filename)
-                            conn.commit()
-                            clear_data_cache()
-                            st.toast(f"✅ {len(suspicious)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"보정 중 오류가 발생했습니다: {e}")
-                        finally:
-                            conn.close()
-                    else:
-                        st.error("매장 DB를 찾을 수 없습니다.")
+                try:
+                    for oid in suspicious["id"].tolist():
+                        _recalc_order_actual_margin_supabase(db_filename, int(oid))
+                    clear_data_cache()
+                    st.toast(f"✅ {len(suspicious)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"보정 중 오류가 발생했습니다: {e}")
 
     # ---------- 1. 오늘의 핵심 지표 (일일매출 / 누적매출 / 당일 마진율 / 판매건수) — 맨 위 표 ----------
     # 일일 매출 상계(Netting): 당일 주문의 '현재' 합계로 산출 (금액 수정/취소 시 차액이 실시간 반영되도록 Orders 기준)
