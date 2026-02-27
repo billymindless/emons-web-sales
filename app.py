@@ -5112,275 +5112,113 @@ def render_superadmin():
 # ========== 탭 1: 매장 관리자 메뉴 (Store Admin 전용) — Employees ==========
 
 def render_store_admin_employees():
+    """직원 마스터 및 수정 요청 UI. 100% Supabase app_users/app_user_stores 기반."""
     db_filename = st.session_state.get("current_db")
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
         return
-    conn = get_tenant_conn(db_filename)
-    use_supabase = _supabase_app_tables_available() and not conn
 
-    # Supabase 전용 환경: SQLite tenant 파일이 없어도 메뉴 동작 (직원은 app_users 기준)
-    if not conn and not use_supabase:
-        st.error("매장 DB를 찾을 수 없습니다. (databases/ 폴더에 해당 매장 DB 파일이 있는지 확인하세요.)")
+    if not _supabase_app_tables_available():
+        st.error("Supabase app_users/app_stores 테이블이 필요합니다. 클라우드 환경을 설정해 주세요.")
         return
 
-    # ---------- 관리자 알림 (마진율 이상 등) — Superadmin/매장 관리자 ----------
-    try:
-        conn_m = get_master_conn()
-        store_name = _get_store_name_by_db(db_filename)
-        role = (st.session_state.get("current_user") or {}).get("role", "")
-        if role == "superadmin":
-            alerts = pd.read_sql(
-                "SELECT id, created_at, store_name, alert_type, message, seen FROM AdminAlerts ORDER BY id DESC LIMIT 50",
-                conn_m,
-            )
-        else:
-            alerts = pd.read_sql(
-                "SELECT id, created_at, store_name, alert_type, message, seen FROM AdminAlerts WHERE store_name = ? ORDER BY id DESC LIMIT 50",
-                conn_m,
-                params=(store_name,),
-            )
-        conn_m.close()
-        if len(alerts) > 0:
-            st.subheader("관리자 알림 (마진율 이상 등)")
-            alerts_disp = alerts.rename(columns={"created_at": "발생 시각", "store_name": "매장", "alert_type": "유형", "message": "내용"})
-            st.dataframe(alerts_disp[["발생 시각", "매장", "유형", "내용"]], use_container_width=True)
-        else:
-            st.caption("최근 관리자 알림 없음 (마진율 이상 등록 시 여기에 표시됩니다).")
-    except Exception:
-        pass
+    client, err = get_supabase_client()
+    if err or not client:
+        st.error(f"Supabase 연결이 필요합니다: {err or '연결 실패'}")
+        return
+
+    store_id = _get_supabase_store_by_db_filename(db_filename)
+    if not store_id:
+        st.error("현재 매장 정보를 Supabase에서 찾을 수 없습니다.")
+        return
 
     st.header("직원 마스터 (Employees)")
-    if use_supabase:
-        store_id = _get_supabase_store_by_db_filename(db_filename)
-        users = _get_supabase_users_list()
-        emp_rows = []
-        for u in users:
-            if u.get("role") not in ("store_admin", "user"):
-                continue
-            store_ids = _get_supabase_user_store_ids(u.get("id"))
-            if store_id and store_id not in store_ids and u.get("store_id") != store_id:
-                continue
-            name = (u.get("name") or u.get("username") or "").strip()
-            emp_rows.append({"id": u["id"], "name": name or "-", "is_active": True})
-        df = pd.DataFrame(emp_rows)
-        st.caption("직원은 Supabase app_users에서 관리됩니다. 직원 추가/수정은 **최고 관리자 → 직원 계정 관리**에서 진행하세요.")
-    else:
-        try:
-            df = pd.read_sql("SELECT id, name, is_active FROM Employees ORDER BY id", conn)
-        except Exception:
-            df = pd.DataFrame(columns=["id", "name", "is_active"])
-        finally:
-            conn.close()
+    users = _get_supabase_users_list()
+    emp_rows = []
+    for u in users:
+        if u.get("role") not in ("store_admin", "user"):
+            continue
+        store_ids = _get_supabase_user_store_ids(u.get("id"))
+        if store_id not in store_ids and u.get("store_id") != store_id:
+            continue
+        name = (u.get("name") or u.get("username") or "").strip()
+        emp_rows.append({"id": u["id"], "username": u.get("username", ""), "name": name or "-", "role": u.get("role", "user")})
+    df = pd.DataFrame(emp_rows)
 
-        with st.form("add_employee_form"):
-            name = st.text_input("직원 이름")
-            is_active = st.checkbox("활성", value=True)
-            if st.form_submit_button("추가"):
-                if name and name.strip():
-                    conn = get_tenant_conn(db_filename)
-                    if conn:
-                        conn.execute("INSERT INTO Employees (name, is_active) VALUES (?, ?)", (name.strip(), 1 if is_active else 0))
-                        conn.commit()
-                        conn.close()
-                        clear_data_cache()
-                        st.success("추가되었습니다.")
-                        st.rerun()
-                    else:
-                        st.error("매장 DB를 찾을 수 없습니다.")
-                else:
-                    st.warning("이름을 입력하세요.")
-
-    if len(df) > 0:
-        st.subheader("직원 목록 (수정/비활성화)" if not use_supabase else "직원 목록")
-        for _, row in df.iterrows():
-            with st.expander(f"{row['name']} {'(활성)' if row.get('is_active', True) else '(비활성)'}"):
-                if use_supabase:
-                    st.caption("직원 수정/비활성화는 **최고 관리자 → 직원 계정 관리**에서 진행하세요.")
-                else:
-                    with st.form(f"emp_{row['id']}"):
-                        new_name = st.text_input("이름", value=row["name"], key=f"name_{row['id']}")
-                        new_active = st.checkbox("활성", value=bool(row["is_active"]), key=f"active_{row['id']}")
-                        if st.form_submit_button("저장"):
-                            conn = get_tenant_conn(db_filename)
-                            if conn:
-                                conn.execute("UPDATE Employees SET name = ?, is_active = ? WHERE id = ?", (new_name, 1 if new_active else 0, row["id"]))
-                                conn.commit()
-                                conn.close()
-                                clear_data_cache()
-                                st.rerun()
-                            else:
-                                st.error("매장 DB를 찾을 수 없습니다.")
-                        if st.form_submit_button("삭제(비활성 권장)"):
-                            conn = get_tenant_conn(db_filename)
-                            if conn:
-                                conn.execute("UPDATE Employees SET is_active = 0 WHERE id = ?", (row["id"],))
-                                conn.commit()
-                                conn.close()
-                                clear_data_cache()
-                                st.rerun()
-                            else:
-                                st.error("매장 DB를 찾을 수 없습니다.")
-
-    # ===== 매출/결제 수정 요청 승인 워크플로우 =====
-    st.header("매출·결제 수정 요청 승인")
-    conn_req = get_tenant_conn(db_filename)
-    if conn_req:
-        try:
-            req_df = pd.read_sql(
-                "SELECT id, created_at, requested_by, entity_type, entity_id, payload, reason, status FROM EditRequests WHERE status = 'pending' ORDER BY created_at ASC",
-                conn_req,
-            )
-            conn_req.close()
-        except Exception:
-            req_df = pd.DataFrame(columns=["id", "created_at", "requested_by", "entity_type", "entity_id", "payload", "reason", "status"])
-            try:
-                conn_req.close()
-            except Exception:
-                pass
-    else:
-        req_df = pd.DataFrame(columns=["id", "created_at", "requested_by", "entity_type", "entity_id", "payload", "reason", "status"])
-        if use_supabase:
-            st.caption("수정 요청 승인은 Supabase app_edit_requests 테이블 이관 후 지원됩니다. 현재는 SQLite EditRequests를 사용합니다.")
-    if len(req_df) == 0:
-        st.info("대기 중인 수정 요청이 없습니다.")
-    else:
-        st.error(f"대기 중인 수정 요청 {len(req_df)}건이 있습니다.")
-        for _, r in req_df.iterrows():
-            with st.expander(f"요청 #{r['id']} — {r['requested_by']} / {r['entity_type']} #{r['entity_id']}"):
-                st.caption(f"요청 시각: {r['created_at']}")
-                st.write(f"사유: {r['reason']}")
+    # ---------- 신규 직원 등록 ----------
+    with st.form("add_employee_form"):
+        st.subheader("신규 직원 등록")
+        new_username = st.text_input("사용자명(ID)", key="emp_new_username")
+        new_password = st.text_input("비밀번호", type="password", key="emp_new_password")
+        new_name = st.text_input("이름(표시명)", key="emp_new_name")
+        new_role = st.selectbox("역할", ["store_admin", "user"], key="emp_new_role")
+        if st.form_submit_button("추가"):
+            if new_username and new_username.strip() and new_password:
+                pw_hash = hashlib.sha256(new_password.encode()).hexdigest()
                 try:
-                    payload = json.loads(r["payload"])
-                except Exception:
-                    payload = {}
-                st.json(payload)
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("승인 후 DB 반영", key=f"req_approve_{r['id']}"):
+                    ins = client.table("app_users").insert({
+                        "username": new_username.strip(),
+                        "password": pw_hash,
+                        "role": new_role,
+                        "store_id": int(store_id),
+                        "name": (new_name or "").strip() or None,
+                        "email": None,
+                    }).select("id").execute()
+                    new_id = ins.data[0]["id"] if ins.data else None
+                    if new_id:
                         try:
-                            # 현재 주문/고객 값 조회 (고객은 Supabase, 주문은 SQLite)
-                            oid = int(payload.get("order_id") or r["entity_id"])
-                            cid = int(payload.get("customer_id") or 0)
-                            cur_c = None
-                            if cid:
-                                try:
-                                    sc, _ = get_supabase_client()
-                                    if sc:
-                                        store_name = _get_current_store_name_for_customers(db_filename)
-                                        if store_name:
-                                            qc = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).eq("id", cid)
-                                            rc = qc.maybe_single().execute()
-                                            if rc.data:
-                                                cur_c = rc.data
-                                except Exception:
-                                    pass
-                            cur_o = None
-                            if _supabase_orders_payments_available():
-                                cur_o = _get_order_supabase(db_filename, oid)
-                                if cur_o:
-                                    cur_o = (
-                                        cur_o.get("id"),
-                                        cur_o.get("order_date"),
-                                        cur_o.get("delivery_date"),
-                                        cur_o.get("category"),
-                                        cur_o.get("cost_price"),
-                                        cur_o.get("total_amount"),
-                                        cur_o.get("visit_reason"),
-                                        cur_o.get("purchase_reason"),
-                                    )
-                            else:
-                                cur_o = conn.execute(
-                                    "SELECT id, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason FROM Orders WHERE id = ?",
-                                    (oid,),
-                                ).fetchone()
-                            new_c = payload.get("new_customer") or {}
-                            new_o = payload.get("new_order") or {}
-                            reason = r["reason"]
-                            if cur_o:
-                                old_total = cur_o[5] or 0
-                                new_total = int(new_o.get("total_amount") or old_total)
-                                old_cost = cur_o[4] or 0
-                                new_cost = int(new_o.get("cost_price") or old_cost)
-                                if old_total != new_total:
-                                    _insert_audit_log(conn, "Order", oid, "total_amount", old_total, new_total, reason)
-                                    delta = new_total - old_total
-                                    today_str = datetime.now().strftime("%Y-%m-%d")
-                                    order_date_val = cur_o[1] or today_str
-                                    if isinstance(order_date_val, str) and "-" in order_date_val:
-                                        parts = order_date_val.split("-")
-                                        order_date_label = f"{int(parts[1])}월 {int(parts[2])}일" if len(parts) >= 3 else order_date_val
-                                    else:
-                                        order_date_label = str(order_date_val)
-                                    note = f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
-                                    _insert_sales_transaction(db_filename, oid, today_str, float(delta), note)
-                                if old_cost != new_cost:
-                                    _insert_audit_log(conn, "Order", oid, "cost_price", old_cost, new_cost, reason)
-                                old_visit = cur_o[6] or ""
-                                new_visit = new_o.get("visit_reason")
-                                if (old_visit or "") != (new_visit or ""):
-                                    _insert_audit_log(conn, "Order", oid, "visit_reason", old_visit, new_visit, reason)
-                                old_purchase = cur_o[7] or ""
-                                new_purchase = new_o.get("purchase_reason")
-                                if (old_purchase or "") != (new_purchase or ""):
-                                    _insert_audit_log(conn, "Order", oid, "purchase_reason", old_purchase, new_purchase, reason)
-                                if _supabase_orders_payments_available():
-                                    _update_order_supabase(db_filename, oid, {
-                                        "delivery_date": new_o.get("delivery_date") or cur_o[2],
-                                        "category": new_o.get("category") or cur_o[3],
-                                        "total_amount": new_total,
-                                        "cost_price": new_cost,
-                                        "visit_reason": new_visit or cur_o[6],
-                                        "purchase_reason": new_purchase or cur_o[7],
-                                    })
-                                else:
-                                    conn.execute(
-                                        "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, visit_reason=?, purchase_reason=? WHERE id=?",
-                                        (
-                                            new_o.get("delivery_date") or cur_o[2],
-                                            new_o.get("category") or cur_o[3],
-                                            new_total,
-                                            new_cost,
-                                            new_visit or cur_o[6],
-                                            new_purchase or cur_o[7],
-                                            oid,
-                                        ),
-                                    )
-                            if cur_c and new_c:
-                                try:
-                                    sc, _ = get_supabase_client()
-                                    if sc:
-                                        store_name = _get_current_store_name_for_customers(db_filename)
-                                        if store_name:
-                                            upd = {
-                                                "name": new_c.get("name") or cur_c.get("name"),
-                                                "phone1": new_c.get("phone1") or cur_c.get("phone1"),
-                                                "phone2": new_c.get("phone2") or cur_c.get("phone2"),
-                                                "address": new_c.get("address") or cur_c.get("address"),
-                                            }
-                                            sc.table("app_customers").update(upd).eq("store_name", store_name).eq("id", cur_c["id"]).execute()
-                                except Exception:
-                                    pass
-                            conn.execute(
-                                "UPDATE EditRequests SET status='approved', reviewed_by=?, reviewed_at=? WHERE id=?",
-                                (_current_username(), datetime.now().isoformat(), int(r["id"])),
-                            )
-                            conn.commit()
+                            client.table("app_user_stores").insert({
+                                "user_id": new_id,
+                                "store_id": int(store_id),
+                            }).execute()
+                        except Exception:
+                            pass
+                    clear_data_cache()
+                    st.success("직원이 등록되었습니다.")
+                    st.rerun()
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "unique" in err_str or "duplicate" in err_str:
+                        st.error("이미 존재하는 사용자명입니다.")
+                    else:
+                        st.error(f"등록 실패: {e}")
+            else:
+                st.warning("사용자명과 비밀번호를 입력하세요.")
+
+    # ---------- 직원 목록 (수정/삭제) ----------
+    if len(df) > 0:
+        st.subheader("직원 목록 (수정/삭제)")
+        for _, row in df.iterrows():
+            with st.expander(f"{row['name']} ({row.get('username', '')})"):
+                with st.form(f"emp_{row['id']}"):
+                    new_name = st.text_input("이름", value=row["name"], key=f"name_{row['id']}")
+                    new_role = st.selectbox("역할", ["store_admin", "user"], index=0 if row.get("role") == "store_admin" else 1, key=f"role_{row['id']}")
+                    submitted_save = st.form_submit_button("저장")
+                    submitted_del = st.form_submit_button("매장에서 제거")
+                    if submitted_save:
+                        try:
+                            client.table("app_users").update({
+                                "name": (new_name or "").strip() or None,
+                                "role": new_role,
+                            }).eq("id", int(row["id"])).execute()
                             clear_data_cache()
-                            st.success("요청이 승인되고 DB에 반영되었습니다.")
+                            st.success("수정되었습니다.")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"승인 처리 중 오류: {e}")
-                with c2:
-                    if st.button("거절", key=f"req_reject_{r['id']}"):
-                        conn.execute(
-                            "UPDATE EditRequests SET status='rejected', reviewed_by=?, reviewed_at=? WHERE id=?",
-                            (_current_username(), datetime.now().isoformat(), int(r["id"])),
-                        )
-                        conn.commit()
-                        st.success("요청이 거절되었습니다.")
-                        st.rerun()
-    conn.close()
+                            st.error(f"수정 실패: {e}")
+                    elif submitted_del:
+                        try:
+                            client.table("app_user_stores").delete().eq("user_id", int(row["id"])).eq("store_id", int(store_id)).execute()
+                            client.table("app_users").update({"store_id": None}).eq("id", int(row["id"])).eq("store_id", int(store_id)).execute()
+                            clear_data_cache()
+                            st.success("매장에서 제거되었습니다.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"제거 실패: {e}")
+
+    # ---------- 매출·결제 수정 요청 승인 (이관 후 지원) ----------
+    st.header("매출·결제 수정 요청 승인")
+    st.info("수정 요청 승인은 Supabase app_edit_requests 테이블 이관 후 지원됩니다.")
 
 
 # ========== 성과 축하 (Gamification) — 신규 주문 INSERT 시에만 트리거 ==========
