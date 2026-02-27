@@ -5117,8 +5117,11 @@ def render_store_admin_employees():
         st.warning("매장에 로그인한 후 이용하세요.")
         return
     conn = get_tenant_conn(db_filename)
-    if not conn:
-        st.error("매장 DB를 찾을 수 없습니다.")
+    use_supabase = _supabase_app_tables_available() and not conn
+
+    # Supabase 전용 환경: SQLite tenant 파일이 없어도 메뉴 동작 (직원은 app_users 기준)
+    if not conn and not use_supabase:
+        st.error("매장 DB를 찾을 수 없습니다. (databases/ 폴더에 해당 매장 DB 파일이 있는지 확인하세요.)")
         return
 
     # ---------- 관리자 알림 (마진율 이상 등) — Superadmin/매장 관리자 ----------
@@ -5148,60 +5151,97 @@ def render_store_admin_employees():
         pass
 
     st.header("직원 마스터 (Employees)")
-    try:
-        df = pd.read_sql("SELECT id, name, is_active FROM Employees ORDER BY id", conn)
-    except Exception:
-        df = pd.DataFrame(columns=["id", "name", "is_active"])
-    finally:
-        conn.close()
+    if use_supabase:
+        store_id = _get_supabase_store_by_db_filename(db_filename)
+        users = _get_supabase_users_list()
+        emp_rows = []
+        for u in users:
+            if u.get("role") not in ("store_admin", "user"):
+                continue
+            store_ids = _get_supabase_user_store_ids(u.get("id"))
+            if store_id and store_id not in store_ids and u.get("store_id") != store_id:
+                continue
+            name = (u.get("name") or u.get("username") or "").strip()
+            emp_rows.append({"id": u["id"], "name": name or "-", "is_active": True})
+        df = pd.DataFrame(emp_rows)
+        st.caption("직원은 Supabase app_users에서 관리됩니다. 직원 추가/수정은 **최고 관리자 → 직원 계정 관리**에서 진행하세요.")
+    else:
+        try:
+            df = pd.read_sql("SELECT id, name, is_active FROM Employees ORDER BY id", conn)
+        except Exception:
+            df = pd.DataFrame(columns=["id", "name", "is_active"])
+        finally:
+            conn.close()
 
-    with st.form("add_employee_form"):
-        name = st.text_input("직원 이름")
-        is_active = st.checkbox("활성", value=True)
-        if st.form_submit_button("추가"):
-            if name and name.strip():
-                conn = get_tenant_conn(db_filename)
-                conn.execute("INSERT INTO Employees (name, is_active) VALUES (?, ?)", (name.strip(), 1 if is_active else 0))
-                conn.commit()
-                conn.close()
-                st.success("추가되었습니다.")
-                st.rerun()
-            else:
-                st.warning("이름을 입력하세요.")
+        with st.form("add_employee_form"):
+            name = st.text_input("직원 이름")
+            is_active = st.checkbox("활성", value=True)
+            if st.form_submit_button("추가"):
+                if name and name.strip():
+                    conn = get_tenant_conn(db_filename)
+                    if conn:
+                        conn.execute("INSERT INTO Employees (name, is_active) VALUES (?, ?)", (name.strip(), 1 if is_active else 0))
+                        conn.commit()
+                        conn.close()
+                        clear_data_cache()
+                        st.success("추가되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error("매장 DB를 찾을 수 없습니다.")
+                else:
+                    st.warning("이름을 입력하세요.")
 
     if len(df) > 0:
-        st.subheader("직원 목록 (수정/비활성화)")
+        st.subheader("직원 목록 (수정/비활성화)" if not use_supabase else "직원 목록")
         for _, row in df.iterrows():
-            with st.expander(f"{row['name']} {'(활성)' if row['is_active'] else '(비활성)'}"):
-                with st.form(f"emp_{row['id']}"):
-                    new_name = st.text_input("이름", value=row["name"], key=f"name_{row['id']}")
-                    new_active = st.checkbox("활성", value=bool(row["is_active"]), key=f"active_{row['id']}")
-                    if st.form_submit_button("저장"):
-                        conn = get_tenant_conn(db_filename)
-                        conn.execute("UPDATE Employees SET name = ?, is_active = ? WHERE id = ?", (new_name, 1 if new_active else 0, row["id"]))
-                        conn.commit()
-                        conn.close()
-                        st.rerun()
-                    if st.form_submit_button("삭제(비활성 권장)"):
-                        conn = get_tenant_conn(db_filename)
-                        conn.execute("UPDATE Employees SET is_active = 0 WHERE id = ?", (row["id"],))
-                        conn.commit()
-                        conn.close()
-                        st.rerun()
+            with st.expander(f"{row['name']} {'(활성)' if row.get('is_active', True) else '(비활성)'}"):
+                if use_supabase:
+                    st.caption("직원 수정/비활성화는 **최고 관리자 → 직원 계정 관리**에서 진행하세요.")
+                else:
+                    with st.form(f"emp_{row['id']}"):
+                        new_name = st.text_input("이름", value=row["name"], key=f"name_{row['id']}")
+                        new_active = st.checkbox("활성", value=bool(row["is_active"]), key=f"active_{row['id']}")
+                        if st.form_submit_button("저장"):
+                            conn = get_tenant_conn(db_filename)
+                            if conn:
+                                conn.execute("UPDATE Employees SET name = ?, is_active = ? WHERE id = ?", (new_name, 1 if new_active else 0, row["id"]))
+                                conn.commit()
+                                conn.close()
+                                clear_data_cache()
+                                st.rerun()
+                            else:
+                                st.error("매장 DB를 찾을 수 없습니다.")
+                        if st.form_submit_button("삭제(비활성 권장)"):
+                            conn = get_tenant_conn(db_filename)
+                            if conn:
+                                conn.execute("UPDATE Employees SET is_active = 0 WHERE id = ?", (row["id"],))
+                                conn.commit()
+                                conn.close()
+                                clear_data_cache()
+                                st.rerun()
+                            else:
+                                st.error("매장 DB를 찾을 수 없습니다.")
 
     # ===== 매출/결제 수정 요청 승인 워크플로우 =====
     st.header("매출·결제 수정 요청 승인")
-    conn = get_tenant_conn(db_filename)
-    if not conn:
-        st.error("매장 DB를 찾을 수 없습니다.")
-        return
-    try:
-        req_df = pd.read_sql(
-            "SELECT id, created_at, requested_by, entity_type, entity_id, payload, reason, status FROM EditRequests WHERE status = 'pending' ORDER BY created_at ASC",
-            conn,
-        )
-    except Exception:
+    conn_req = get_tenant_conn(db_filename)
+    if conn_req:
+        try:
+            req_df = pd.read_sql(
+                "SELECT id, created_at, requested_by, entity_type, entity_id, payload, reason, status FROM EditRequests WHERE status = 'pending' ORDER BY created_at ASC",
+                conn_req,
+            )
+            conn_req.close()
+        except Exception:
+            req_df = pd.DataFrame(columns=["id", "created_at", "requested_by", "entity_type", "entity_id", "payload", "reason", "status"])
+            try:
+                conn_req.close()
+            except Exception:
+                pass
+    else:
         req_df = pd.DataFrame(columns=["id", "created_at", "requested_by", "entity_type", "entity_id", "payload", "reason", "status"])
+        if use_supabase:
+            st.caption("수정 요청 승인은 Supabase app_edit_requests 테이블 이관 후 지원됩니다. 현재는 SQLite EditRequests를 사용합니다.")
     if len(req_df) == 0:
         st.info("대기 중인 수정 요청이 없습니다.")
     else:
