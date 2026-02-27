@@ -1345,12 +1345,19 @@ def load_customers_cached(db_filename: str, limit: int | None = 50) -> pd.DataFr
     if not store_name:
         return pd.DataFrame()
     try:
-        q = client.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name)
-        q = q.order("id", desc=True)
-        if limit:
-            q = q.limit(limit)
-        r = q.execute()
-        if r.data and len(r.data) > 0:
+        # latitude, longitude가 app_customers에 있으면 지도 렌더링 시 활용. 없으면 기본 컬럼만 사용.
+        base_cols = "id, name, phone1, phone2, address"
+        r = None
+        for select_cols in (f"{base_cols}, latitude, longitude", base_cols):
+            try:
+                q = client.table("app_customers").select(select_cols).eq("store_name", store_name).order("id", desc=True)
+                if limit:
+                    q = q.limit(limit)
+                r = q.execute()
+                break
+            except Exception:
+                continue
+        if r and r.data and len(r.data) > 0:
             st.session_state.pop("supabase_error", None)
             return pd.DataFrame(r.data)
         return pd.DataFrame()
@@ -3296,7 +3303,8 @@ _MAP_ZOOM = 7
 
 
 def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
-    """merged(orders+customers)에서 주소 지오코딩 후 latitude, longitude, address, building_name, 고객명, 품목, 금액, 배송일자 포함 DataFrame 반환."""
+    """merged(orders+customers)에서 주소 지오코딩 후 latitude, longitude, address, building_name, 고객명, 품목, 금액, 배송일자 포함 DataFrame 반환.
+    app_customers에 latitude, longitude가 있으면 우선 사용(지오코딩 스킵)."""
     if "address" not in merged.columns or "name" not in merged.columns:
         return pd.DataFrame()
     if "geo_cache" not in st.session_state:
@@ -3304,6 +3312,22 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
     cache = st.session_state.geo_cache
     rows = []
     for _, row in merged.iterrows():
+        # app_customers에 latitude, longitude가 있으면 활용 (유효한 숫자일 때만)
+        lat_val, lon_val = row.get("latitude"), row.get("longitude")
+        try:
+            if pd.notna(lat_val) and pd.notna(lon_val) and -90 <= float(lat_val) <= 90 and -180 <= float(lon_val) <= 180:
+                lat, lon = float(lat_val), float(lon_val)
+                addr_display = (row.get("address") or "").strip() or "-"
+                rows.append({
+                    "latitude": lat, "longitude": lon, "address": addr_display,
+                    "building_name": None, "bname": None,
+                    "customer_name": row.get("name") or "-", "category": row.get("category") or "-",
+                    "total_amount": int(row.get("total_amount") or 0),
+                    "delivery_date": str(row.get("delivery_date") or row.get("order_date") or "-")[:10],
+                })
+                continue
+        except (ValueError, TypeError):
+            pass
         addr = (row.get("address") or "").strip()
         if not addr:
             continue
@@ -3333,6 +3357,8 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
             "total_amount": int(row.get("total_amount") or 0),
             "delivery_date": str(row.get("delivery_date") or row.get("order_date") or "-")[:10],
         })
+    if not rows:
+        return pd.DataFrame(columns=["latitude", "longitude", "address", "building_name", "bname", "customer_name", "category", "total_amount", "delivery_date"])
     return pd.DataFrame(rows)
 
 
@@ -3403,6 +3429,9 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
             st.info(f"{sel_year}년 데이터가 없습니다.")
             return
         map_data = _build_map_data_with_geocoding(df_filtered)
+        if map_data.empty or "latitude" not in map_data.columns or "longitude" not in map_data.columns:
+            st.info("지도에 표시할 위치 데이터(위도/경도)가 존재하지 않습니다.")
+            return
         map_data = map_data.dropna(subset=["latitude", "longitude"])
         if map_data.empty:
             st.info("지오코딩 가능한 주소 데이터가 없습니다. (KAKAO_REST_KEY 확인)")
@@ -3425,25 +3454,33 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
             if len(df1) == 0:
                 st.info(f"{y1}년 데이터 없음")
             else:
-                md1 = _build_map_data_with_geocoding(df1).dropna(subset=["latitude", "longitude"])
-                if md1.empty:
-                    st.info("지오코딩 가능한 주소 없음")
+                md1 = _build_map_data_with_geocoding(df1)
+                if md1.empty or "latitude" not in md1.columns or "longitude" not in md1.columns:
+                    st.info("지도에 표시할 위치 데이터(위도/경도)가 존재하지 않습니다.")
                 else:
-                    m1 = _create_folium_map(md1, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_m1")
-                    if m1:
-                        st_folium(m1, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_left")
+                    md1 = md1.dropna(subset=["latitude", "longitude"])
+                    if md1.empty:
+                        st.info("지오코딩 가능한 주소 없음")
+                    else:
+                        m1 = _create_folium_map(md1, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_m1")
+                        if m1:
+                            st_folium(m1, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_left")
         with col2:
             st.caption(f"📅 {y2}년")
             if len(df2) == 0:
                 st.info(f"{y2}년 데이터 없음")
             else:
-                md2 = _build_map_data_with_geocoding(df2).dropna(subset=["latitude", "longitude"])
-                if md2.empty:
-                    st.info("지오코딩 가능한 주소 없음")
+                md2 = _build_map_data_with_geocoding(df2)
+                if md2.empty or "latitude" not in md2.columns or "longitude" not in md2.columns:
+                    st.info("지도에 표시할 위치 데이터(위도/경도)가 존재하지 않습니다.")
                 else:
-                    m2 = _create_folium_map(md2, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_m2")
-                    if m2:
-                        st_folium(m2, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_right")
+                    md2 = md2.dropna(subset=["latitude", "longitude"])
+                    if md2.empty:
+                        st.info("지오코딩 가능한 주소 없음")
+                    else:
+                        m2 = _create_folium_map(md2, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_m2")
+                        if m2:
+                            st_folium(m2, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_right")
 
 
 def _render_marketing_multi_period_comparison(
@@ -3639,6 +3676,9 @@ def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str,
         st.info(f"기간 {period_label}에 데이터가 없습니다.")
         return
     map_data = _build_map_data_with_geocoding(merged_df)
+    if map_data.empty or "latitude" not in map_data.columns or "longitude" not in map_data.columns:
+        st.info("지도에 표시할 위치 데이터(위도/경도)가 존재하지 않습니다.")
+        return
     map_data = map_data.dropna(subset=["latitude", "longitude"])
     if map_data.empty:
         st.info("지오코딩 가능한 주소가 없습니다.")
