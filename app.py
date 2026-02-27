@@ -5216,9 +5216,118 @@ def render_store_admin_employees():
                         except Exception as e:
                             st.error(f"제거 실패: {e}")
 
-    # ---------- 매출·결제 수정 요청 승인 (이관 후 지원) ----------
+    # ---------- 매출·결제 수정 요청 승인 (Supabase app_edit_requests) ----------
     st.header("매출·결제 수정 요청 승인")
-    st.info("수정 요청 승인은 Supabase app_edit_requests 테이블 이관 후 지원됩니다.")
+    try:
+        r = client.table("app_edit_requests").select("*").eq("db_filename", db_filename).eq("status", "pending").order("created_at").execute()
+        req_list = r.data if r.data else []
+    except Exception:
+        req_list = []
+
+    if len(req_list) == 0:
+        st.info("대기 중인 수정 요청이 없습니다.")
+    else:
+        st.warning(f"대기 중인 수정 요청 {len(req_list)}건이 있습니다.")
+        for req in req_list:
+            rid = req.get("id")
+            entity_type = req.get("entity_type") or "Order"
+            entity_id = req.get("entity_id")
+            payload = req.get("payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            elif payload is None:
+                payload = {}
+            reason = req.get("reason") or ""
+            requested_by = req.get("requested_by") or ""
+            created_at = req.get("created_at") or ""
+
+            with st.expander(f"요청 #{rid} — {requested_by} / {entity_type} #{entity_id}"):
+                st.caption(f"요청 시각: {created_at}")
+                st.write(f"사유: {reason}")
+                st.json(payload)
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("승인", key=f"req_approve_{rid}"):
+                        try:
+                            new_order = payload.get("new_order") or {}
+                            new_customer = payload.get("new_customer") or {}
+                            oid = int(payload.get("order_id") or entity_id)
+
+                            if entity_type == "Order" and new_order and _supabase_orders_payments_available():
+                                cur_o = _get_order_supabase(db_filename, oid)
+                                if cur_o:
+                                    old_total = cur_o.get("total_amount") or 0
+                                    new_total = int(new_order.get("total_amount", old_total))
+                                    old_cost = cur_o.get("cost_price") or 0
+                                    new_cost = int(new_order.get("cost_price", old_cost))
+                                    if old_total != new_total:
+                                        delta = new_total - old_total
+                                        today_str = datetime.now().strftime("%Y-%m-%d")
+                                        order_date_val = cur_o.get("order_date") or today_str
+                                        if isinstance(order_date_val, str) and "-" in order_date_val:
+                                            parts = order_date_val.split("-")
+                                            order_date_label = f"{int(parts[1])}월 {int(parts[2])}일" if len(parts) >= 3 else order_date_val
+                                        else:
+                                            order_date_label = str(order_date_val)
+                                        note = f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
+                                        _insert_sales_transaction(db_filename, oid, today_str, float(delta), note)
+                                    _update_order_supabase(db_filename, oid, {
+                                        "delivery_date": new_order.get("delivery_date") or cur_o.get("delivery_date"),
+                                        "category": new_order.get("category") or cur_o.get("category"),
+                                        "total_amount": new_total,
+                                        "cost_price": new_cost,
+                                        "visit_reason": new_order.get("visit_reason") or cur_o.get("visit_reason"),
+                                        "purchase_reason": new_order.get("purchase_reason") or cur_o.get("purchase_reason"),
+                                    })
+                                    _recalc_order_actual_margin_supabase(db_filename, oid)
+                                if new_customer and payload.get("customer_id"):
+                                    cid = int(payload.get("customer_id"))
+                                    store_name = _get_current_store_name_for_customers(db_filename)
+                                    if store_name:
+                                        try:
+                                            sc, _ = get_supabase_client()
+                                            if sc:
+                                                upd = {
+                                                    "name": new_customer.get("name"),
+                                                    "phone1": new_customer.get("phone1"),
+                                                    "phone2": new_customer.get("phone2"),
+                                                    "address": new_customer.get("address"),
+                                                }
+                                                sc.table("app_customers").update(upd).eq("store_name", store_name).eq("id", cid).execute()
+                                        except Exception:
+                                            pass
+                            elif entity_type == "Payment":
+                                new_payment = payload.get("new_payment") or {}
+                                pid = int(payload.get("payment_id") or entity_id)
+                                if new_payment:
+                                    _update_payment_supabase(db_filename, pid, {k: v for k, v in new_payment.items() if v is not None})
+
+                            client.table("app_edit_requests").update({
+                                "status": "approved",
+                                "reviewed_by": _current_username(),
+                                "reviewed_at": datetime.now().isoformat(),
+                            }).eq("id", int(rid)).execute()
+                            clear_data_cache()
+                            st.success("정상적으로 처리되었습니다.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"승인 처리 중 오류: {e}")
+                with c2:
+                    if st.button("반려", key=f"req_reject_{rid}"):
+                        try:
+                            client.table("app_edit_requests").update({
+                                "status": "rejected",
+                                "reviewed_by": _current_username(),
+                                "reviewed_at": datetime.now().isoformat(),
+                            }).eq("id", int(rid)).execute()
+                            clear_data_cache()
+                            st.success("정상적으로 처리되었습니다.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"반려 처리 중 오류: {e}")
 
 
 # ========== 성과 축하 (Gamification) — 신규 주문 INSERT 시에만 트리거 ==========
@@ -6404,25 +6513,27 @@ def render_customer_balance():
                                                 "purchase_reason": st.session_state.get(f"{edit_prefix}_purchase"),
                                             },
                                         }
-                                        conn = get_tenant_conn(db_filename)
-                                        conn.execute(
-                                            """
-                                            INSERT INTO EditRequests (created_at, requested_by, entity_type, entity_id, payload, reason, status)
-                                            VALUES (?, ?, ?, ?, ?, ?, 'pending')
-                                            """,
-                                            (
-                                                datetime.now().isoformat(),
-                                                _current_username(),
-                                                "Order",
-                                                int(sel_oid),
-                                                json.dumps(payload, ensure_ascii=False),
-                                                req_reason.strip(),
-                                            ),
-                                        )
-                                        conn.commit()
-                                        conn.close()
-                                        st.success("수정 요청이 접수되었습니다. 매장 관리자 승인 후 반영됩니다.")
-                                        st.rerun()
+                                        if _supabase_orders_payments_available():
+                                            client_req, err_req = get_supabase_client()
+                                            if client_req and not err_req:
+                                                try:
+                                                    client_req.table("app_edit_requests").insert({
+                                                        "db_filename": db_filename,
+                                                        "requested_by": _current_username(),
+                                                        "entity_type": "Order",
+                                                        "entity_id": int(sel_oid),
+                                                        "payload": payload,
+                                                        "reason": req_reason.strip(),
+                                                        "status": "pending",
+                                                    }).execute()
+                                                    st.success("수정 요청이 접수되었습니다. 매장 관리자 승인 후 반영됩니다.")
+                                                    st.rerun()
+                                                except Exception as e:
+                                                    st.error(f"수정 요청 접수 실패: {e}")
+                                            else:
+                                                st.error("Supabase 연결이 필요합니다.")
+                                        else:
+                                            st.error("수정 요청은 Supabase app_orders 환경에서만 지원됩니다.")
                             else:
                                 edit_reason = st.text_area("변경 사유(필수)", key=f"{edit_prefix}_reason")
                                 if st.button("수정 완료 (Update)", key=f"{edit_prefix}_update_btn"):
