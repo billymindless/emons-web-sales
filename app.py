@@ -2935,9 +2935,11 @@ def address_search(keyword: str):
 
 
 def _address_search_dialog_impl():
-    """주소 검색 모달 본문. 검색 후 선택 시 address_manual에 반영하고 닫힘."""
-    kw = st.text_input("주소 검색어", key="dialog_addr_kw", placeholder="예: 역삼동 123, 테헤란로")
-    if st.button("검색", key="dialog_addr_search_btn"):
+    """주소 검색 모달 본문. 검색 후 선택 시 address_manual에 반영하고 닫힘. st.form으로 엔터키 검색 지원."""
+    with st.form("address_search_form", clear_on_submit=False):
+        kw = st.text_input("주소 검색어", placeholder="예: 역삼동 123, 테헤란로")
+        submitted = st.form_submit_button("검색")
+    if submitted:
         if kw and kw.strip():
             results_addr, err_addr = search_address_kakao(kw.strip())
             results_kw, err_kw = search_keyword_kakao(kw.strip())
@@ -5479,22 +5481,56 @@ def _render_gamification_feedback(ctx: dict):
 
 
 def _customer_search_fragment_impl(db_filename: str):
-    """기존 고객 검색 UI. fragment로 감싸 타이핑/검색 시 전체 스크립트 대신 이 부분만 렌더링."""
+    """기존 고객 검색 UI. fragment로 감싸 타이핑/검색 시 전체 스크립트 대신 이 부분만 렌더링.
+    Supabase: or_ ilike 검색 (PostgREST는 *를 % 와일드카드로 사용). SQLite: LIKE 검색."""
     with st.form("cust_search_form"):
         q = st.text_input("이름 또는 전화번호로 검색 *", key="new_sales_cust_search", placeholder="예: 홍길동, 010-1234")
         search_clicked = st.form_submit_button("검색")
     if search_clicked and q and q.strip():
+        q_clean = q.strip()
+        results_list = []
         try:
-            sc, _ = get_supabase_client()
-            store_name = _get_current_store_name_for_customers(db_filename)
-            if sc and store_name:
-                qcq = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).or_(f"name.ilike.%{q.strip()}%,phone1.ilike.%{q.strip()}%,phone2.ilike.%{q.strip()}%")
-                r = qcq.order("id", desc=True).limit(50).execute()
-                st.session_state["_cust_search_results"] = r.data if r.data else []
+            if _supabase_orders_payments_available():
+                sc, _ = get_supabase_client()
+                store_name = _get_current_store_name_for_customers(db_filename)
+                if sc and store_name:
+                    # PostgREST: *를 % 와일드카드 별칭으로 사용 (URL 인코딩 이슈 회피)
+                    q_safe = re.sub(r"[*,]", "", q_clean)  # or_ 조건 구분자와 충돌하는 문자 제거
+                    if q_safe:
+                        pat = f"*{q_safe}*"
+                        or_filter = f"name.ilike.{pat},phone1.ilike.{pat},phone2.ilike.{pat}"
+                        try:
+                            r = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).or_(or_filter).order("id", desc=True).limit(50).execute()
+                            results_list = r.data if r.data else []
+                        except Exception:
+                            # or_/ilike 실패 시: 전체 로드 후 클라이언트 필터링 (최대 300건)
+                            r = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).order("id", desc=True).limit(300).execute()
+                            rows = r.data or []
+                            q_lower = q_clean.lower()
+                            results_list = [row for row in rows if q_lower in (str(row.get("name") or "").lower()) or q_lower in (str(row.get("phone1") or "").lower()) or q_lower in (str(row.get("phone2") or "").lower())]
             else:
-                st.session_state["_cust_search_results"] = []
+                conn = get_tenant_conn(db_filename)
+                if conn:
+                    try:
+                        pattern = f"%{q_clean}%"
+                        cur = conn.execute(
+                            "SELECT id, name, phone1, phone2, address FROM Customers WHERE name LIKE ? OR phone1 LIKE ? OR phone2 LIKE ? ORDER BY id DESC LIMIT 50",
+                            (pattern, pattern, pattern),
+                        )
+                        results_list = [dict(zip(("id", "name", "phone1", "phone2", "address"), row)) for row in cur.fetchall()]
+                    finally:
+                        conn.close()
+            st.session_state["_cust_search_results"] = results_list
         except Exception:
             st.session_state["_cust_search_results"] = []
+    selected = st.session_state.get("_new_sales_selected_customer")
+    if selected:
+        sel_name = (selected.get("name") or "").strip() or "고객"
+        st.success(f"✓ **{sel_name}**님 선택됨 — 아래 입력란에 이름·전화번호·주소가 자동 입력되었습니다.")
+        if st.button("다른 고객 검색하기", key="cust_search_clear_btn"):
+            for k in ("_new_sales_selected_customer", "_cust_search_results", "new_sales_cust_select"):
+                st.session_state.pop(k, None)
+            st.rerun()
     results = st.session_state.get("_cust_search_results") or []
     if results:
         customers = pd.DataFrame(results)
@@ -5649,12 +5685,13 @@ def render_new_sales():
         emp_names = employees["name"].tolist() if not employees.empty and "name" in employees.columns else []
     if not emp_names:
         st.warning("이 매장에 배정된 직원이 없습니다. **직원 계정 관리**에서 해당 매장을 배정해 주세요. (또는 매장 관리자 메뉴 → 직원 마스터에서 등록)")
-    # key로 선택 값 유지(리런 시 초기화 방지), 복수 선택 가능
+    # key에 폼 리셋 카운터를 붙여 등록 완료 시 새 위젯으로 초기화
+    _form_reset = st.session_state.get("_new_sales_form_reset", 0)
     selected_employees = st.multiselect(
         "담당 직원 (복수 선택, 1/n 실적 분배 대상) *",
         options=emp_names,
         default=[],
-        key="new_sales_employee_multiselect",
+        key=f"new_sales_employee_multiselect_{_form_reset}",
     )
     employee_names_str = ",".join(selected_employees) if selected_employees else ""
     if "order_date" not in st.session_state:
@@ -5664,7 +5701,7 @@ def render_new_sales():
         st.session_state["delivery_date"] = date.today()
     delivery_date = st.date_input("배송일 *", key="delivery_date")
     CATEGORY_OPTIONS = ["옷장", "식탁", "자녀방", "침대", "SSDS침대", "서재_학생", "소파", "소품", "전시품"]
-    selected_categories = st.multiselect("품목/카테고리 (복수 선택) *", options=CATEGORY_OPTIONS, key="category_multiselect")
+    selected_categories = st.multiselect("품목/카테고리 (복수 선택) *", options=CATEGORY_OPTIONS, key=f"category_multiselect_{_form_reset}")
     category = ",".join(selected_categories) if selected_categories else None
     has_display = selected_categories and "전시품" in selected_categories
     # 금액: 세션 초기화 후 text_input + on_change로 천 단위 콤마 표시, DB 저장 시 _parse_comma_to_int 사용
@@ -5945,6 +5982,7 @@ def render_new_sales():
                 "is_today_first": is_today_first,
                 "monthly_max_before": monthly_max_before,
             }
+            st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             for key in list(st.session_state.keys()):
                 if key in (
                     "phone1", "phone2", "address_manual", "address_detail",
@@ -5954,10 +5992,9 @@ def render_new_sales():
                     "_new_sales_selected_customer", "_cust_search_results",
                     "new_sales_cust_name", "new_sales_cust_search", "new_sales_cust_select",
                     "cost_price", "total_amount", "display_sales_amount", "display_cost_amount",
-                    "category_multiselect", "new_sales_employee_multiselect",
                     "visit_reason", "purchase_reason",
                     "payment_rows",
-                ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_")):
+                ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_", "new_sales_employee_multiselect", "category_multiselect")):
                     try:
                         del st.session_state[key]
                     except Exception:
@@ -6060,6 +6097,7 @@ def render_new_sales():
             threading.Thread(target=_channel_talk_sync, daemon=True).start()
             # 입력값 초기화 후 새 등록 모드로 전환 (중복 등록 방지) — toast로 표시해 레이아웃 깜빡임 완화
             st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
+            st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             # 신규 매출 등록 관련 상태 초기화
             for key in list(st.session_state.keys()):
                 if key in (
@@ -6070,10 +6108,9 @@ def render_new_sales():
                     "_new_sales_selected_customer", "_cust_search_results",
                     "new_sales_cust_name", "new_sales_cust_search", "new_sales_cust_select",
                     "cost_price", "total_amount", "display_sales_amount", "display_cost_amount",
-                    "category_multiselect", "new_sales_employee_multiselect",
                     "visit_reason", "purchase_reason",
                     "payment_rows",
-                ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_")):
+                ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_", "new_sales_employee_multiselect", "category_multiselect")):
                     try:
                         del st.session_state[key]
                     except Exception:
@@ -6444,21 +6481,51 @@ def render_customer_balance():
         if search_query and search_query.strip():
             q = search_query.strip()
             try:
-                sc, _ = get_supabase_client()
-                if sc:
-                    store_name = _get_current_store_name_for_customers(db_filename)
-                    if store_name:
-                        qcq = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).or_(f"name.ilike.%{q}%,phone1.ilike.%{q}%,phone2.ilike.%{q}%")
-                        r = qcq.order("id", desc=True).limit(50).execute()
-                        customers = pd.DataFrame(r.data) if r.data else pd.DataFrame()
+                if _supabase_orders_payments_available():
+                    sc, _ = get_supabase_client()
+                    if sc:
+                        store_name = _get_current_store_name_for_customers(db_filename)
+                        if store_name:
+                            q_safe = re.sub(r"[*,]", "", q.strip())
+                            or_filter = f"name.ilike.*{q_safe}*,phone1.ilike.*{q_safe}*,phone2.ilike.*{q_safe}*" if q_safe else "id.eq.-1"
+                            qcq = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).or_(or_filter)
+                            r = qcq.order("id", desc=True).limit(50).execute()
+                            customers = pd.DataFrame(r.data) if r.data else pd.DataFrame()
+                        else:
+                            customers = pd.DataFrame()
                     else:
                         customers = pd.DataFrame()
                 else:
-                    customers = pd.DataFrame()
+                    conn = get_tenant_conn(db_filename)
+                    if conn:
+                        try:
+                            pattern = f"%{q}%"
+                            cur = conn.execute(
+                                "SELECT id, name, phone1, phone2, address FROM Customers WHERE name LIKE ? OR phone1 LIKE ? OR phone2 LIKE ? ORDER BY id DESC LIMIT 50",
+                                (pattern, pattern, pattern),
+                            )
+                            customers = pd.DataFrame(cur.fetchall(), columns=["id", "name", "phone1", "phone2", "address"])
+                        finally:
+                            conn.close()
+                    else:
+                        customers = pd.DataFrame()
             except Exception:
                 customers = pd.DataFrame()
         else:
-            customers = load_customers_cached(db_filename, limit=50)
+            if _supabase_orders_payments_available():
+                customers = load_customers_cached(db_filename, limit=50)
+            else:
+                conn = get_tenant_conn(db_filename)
+                if conn:
+                    try:
+                        cur = conn.execute(
+                            "SELECT id, name, phone1, phone2, address FROM Customers ORDER BY id DESC LIMIT 50"
+                        )
+                        customers = pd.DataFrame(cur.fetchall(), columns=["id", "name", "phone1", "phone2", "address"])
+                    finally:
+                        conn.close()
+                else:
+                    customers = pd.DataFrame()
 
         if len(customers) == 0:
             st.info("검색 결과가 없습니다.")
@@ -7021,18 +7088,6 @@ def render_dashboard():
     _render_recent_notices_section()
     st.header("경영 대시보드 및 인수인계")
 
-    # Lazy Loading: To-Do만 먼저 표시, 전체 통계는 사용자가 요청 시 로드
-    if "_dashboard_full_loaded" not in st.session_state:
-        st.session_state["_dashboard_full_loaded"] = False
-    if not st.session_state["_dashboard_full_loaded"]:
-        todos_df = _get_todos_for_display(db_filename)
-        if st.button("📊 전체 통계 및 차트 불러오기", key="dashboard_load_full_btn"):
-            st.session_state["_dashboard_full_loaded"] = True
-            st.rerun()
-        st.caption("To-Do만 표시 중입니다. 위 버튼을 누르면 일일매출·누적매출·차트 등 전체 통계가 로드됩니다.")
-        _render_dashboard_todos_only(db_filename, todos_df)
-        return
-
     # Supabase 연결 확인
     client, err = get_supabase_client()
     if err or not client:
@@ -7069,12 +7124,10 @@ def render_dashboard():
     today = date.today()
     today_str = today.strftime("%Y-%m-%d")
     month_start = today.replace(day=1)
-    if st.button("⏪ To-Do만 보기 (간단 모드)", key="dashboard_simple_mode_btn"):
-        st.session_state["_dashboard_full_loaded"] = False
-        st.rerun()
     st.divider()
 
-    # ---------- 5대 핵심 KPI 보드 (Supabase app_orders / app_payments 기반) — 최상단 배치 ----------
+    # ---------- 1. 주요 매출 항목 (5대 핵심 KPI) ----------
+    st.subheader("1. 주요 매출 항목")
     daily_sales = 0.0
     cumulative_sales = 0.0
     expected_total_sales = 0.0
@@ -7673,7 +7726,7 @@ def main():
     idx = tab_labels.index(menu_sel)
     st.session_state["main_tab_idx"] = idx
     st.session_state["current_menu"] = idx
-    # 대시보드 상태 유지: 탭 전환 시 _dashboard_full_loaded 초기화하지 않음 (캐시 재사용으로 즉시 표시)
+    # 대시보드 탭 선택 시 캐시 재사용으로 즉시 표시
     st.divider()
     if idx == 0:
         render_dashboard()
