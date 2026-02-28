@@ -7028,9 +7028,65 @@ def render_dashboard():
     orders["display_cost_amount"] = orders["display_cost_amount"].fillna(0).astype(int)
 
     today = date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    month_start = today.replace(day=1)
     if st.button("⏪ To-Do만 보기 (간단 모드)", key="dashboard_simple_mode_btn"):
         st.session_state["_dashboard_full_loaded"] = False
         st.rerun()
+    st.divider()
+
+    # ---------- 5대 핵심 KPI 보드 (Supabase app_orders / app_payments 기반) — 최상단 배치 ----------
+    daily_sales = 0.0
+    cumulative_sales = 0.0
+    expected_total_sales = 0.0
+    margin_pct = 0.0
+    order_count = 0
+    try:
+        if not payments.empty and "payment_date" in payments.columns and "amount" in payments.columns:
+            pmt = payments.copy()
+            pmt["payment_date"] = pd.to_datetime(pmt["payment_date"], errors="coerce")
+            pmt = pmt.dropna(subset=["payment_date"])
+            if not pmt.empty:
+                pmt["_date"] = pmt["payment_date"].dt.date
+                today_pmt = pmt[pmt["_date"] == today]
+                month_pmt = pmt[(pmt["_date"] >= month_start) & (pmt["_date"] <= today)]
+                daily_sales = float(today_pmt["amount"].fillna(0).sum()) if len(today_pmt) > 0 else 0.0
+                cumulative_sales = float(month_pmt["amount"].fillna(0).sum()) if len(month_pmt) > 0 else 0.0
+
+        if not orders.empty and "order_date" in orders.columns:
+            ord_df = orders.copy()
+            ord_df["order_date"] = pd.to_datetime(ord_df["order_date"], errors="coerce")
+            ord_df = ord_df.dropna(subset=["order_date"])
+            if not ord_df.empty:
+                ord_df["_date"] = ord_df["order_date"].dt.date
+                month_ord = ord_df[(ord_df["_date"] >= month_start) & (ord_df["_date"] <= today)]
+                if len(month_ord) > 0:
+                    tot_amt = month_ord["total_amount"].fillna(0)
+                    if "display_sales_amount" in month_ord.columns:
+                        tot_amt = tot_amt + month_ord["display_sales_amount"].fillna(0)
+                    expected_total_sales = float(tot_amt.sum())
+                    tot_cost = month_ord["cost_price"].fillna(0)
+                    if "display_cost_amount" in month_ord.columns:
+                        tot_cost = tot_cost + month_ord["display_cost_amount"].fillna(0)
+                    sum_sales = float(tot_amt.sum())
+                    sum_cost = float(tot_cost.sum())
+                    margin_pct = (sum_sales - sum_cost) / sum_sales * 100 if sum_sales else 0.0
+                    order_count = len(month_ord)
+    except Exception:
+        pass
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("일일 매출", f"{daily_sales:,.0f}원")
+    with c2:
+        st.metric("누적 매출", f"{cumulative_sales:,.0f}원")
+    with c3:
+        st.metric("예상 총매출", f"{expected_total_sales:,.0f}원")
+    with c4:
+        st.metric("마진율", f"{margin_pct:.1f}%")
+    with c5:
+        st.metric("판매건수", f"{order_count}건")
+
     st.divider()
     # 잔금 불일치 경고: balance_status가 '완납'인데 실 계산상 잔금이 0이 아닌 건수
     if len(orders) > 0 and "balance_status" in orders.columns:
@@ -7059,64 +7115,7 @@ def render_dashboard():
                 except Exception as e:
                     st.error(f"보정 중 오류가 발생했습니다: {e}")
 
-    # ---------- 1. 오늘의 핵심 지표 (일일매출 / 누적매출 / 당일 마진율 / 판매건수) — 맨 위 표 ----------
-    # 일일 매출 상계(Netting): 당일 주문의 '현재' 합계로 산출 (금액 수정/취소 시 차액이 실시간 반영되도록 Orders 기준)
-    with st.container():
-        today_str = today.strftime("%Y-%m-%d")
-        month_start = today.replace(day=1)
-        daily_total = 0.0
-        cumulative = 0.0
-        if len(orders) > 0 and "order_date" in orders.columns:
-            orders_dt_calc = orders.copy()
-            orders_dt_calc["order_date"] = pd.to_datetime(orders_dt_calc["order_date"], errors="coerce")
-            orders_today_calc = orders_dt_calc[orders_dt_calc["order_date"].dt.strftime("%Y-%m-%d") == today_str]
-            if len(orders_today_calc) > 0:
-                tot_col = orders_today_calc["total_amount"].fillna(0)
-                if "display_sales_amount" in orders_today_calc.columns:
-                    tot_col = tot_col + orders_today_calc["display_sales_amount"].fillna(0)
-                daily_total = float(tot_col.sum())
-            month_ord = orders_dt_calc[(orders_dt_calc["order_date"].dt.date >= month_start) & (orders_dt_calc["order_date"].dt.date <= today)]
-            if len(month_ord) > 0:
-                tot_m = month_ord["total_amount"].fillna(0)
-                if "display_sales_amount" in month_ord.columns:
-                    tot_m = tot_m + month_ord["display_sales_amount"].fillna(0)
-                cumulative = float(tot_m.sum())
-        if len(sales_df) > 0 and (daily_total == 0.0 or cumulative == 0.0):
-            sales_calc = sales_df.copy()
-            sales_calc["transaction_date"] = pd.to_datetime(sales_calc["transaction_date"], errors="coerce")
-            sales_calc = sales_calc.dropna(subset=["transaction_date"])
-            if daily_total == 0.0:
-                today_mask = sales_calc["transaction_date"].dt.strftime("%Y-%m-%d") == today_str
-                daily_total = float(sales_calc.loc[today_mask, "amount"].fillna(0).sum())
-            if cumulative == 0.0:
-                month_mask = (sales_calc["transaction_date"].dt.date >= month_start) & (sales_calc["transaction_date"].dt.date <= today)
-                cumulative = float(sales_calc.loc[month_mask, "amount"].fillna(0).sum())
-        if len(orders) > 0 and "order_date" in orders.columns:
-            orders_dt = orders.copy()
-            orders_dt["order_date"] = pd.to_datetime(orders_dt["order_date"], errors="coerce")
-            orders_today = orders_dt[orders_dt["order_date"].dt.strftime("%Y-%m-%d") == today_str]
-            count_today = len(orders_today)
-            if len(orders_today) > 0:
-                tot_sales = (orders_today["total_amount"].fillna(0) + orders_today.get("display_sales_amount", 0).fillna(0)).sum()
-                tot_cost = (orders_today["cost_price"].fillna(0) + orders_today.get("display_cost_amount", 0).fillna(0)).sum()
-                margin_pct_today = (tot_sales - tot_cost) / tot_sales * 100 if tot_sales else 0.0
-            else:
-                margin_pct_today = 0.0
-        else:
-            count_today = 0
-            margin_pct_today = 0.0
-        st.subheader("1. 오늘의 핵심 지표")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("오늘 일일매출", f"{daily_total:,.0f}원")
-        with c2:
-            st.metric("누적매출", f"{cumulative:,.0f}원")
-        with c3:
-            st.metric("당일 마진율", f"{margin_pct_today:.1f}%")
-        with c4:
-            st.metric("판매건수", f"{count_today}건")
-
-    # ---------- 2. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
+    # ---------- 1. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
     st.subheader("2. 미수금 고객 현황")
     if len(orders) > 0:
         pay_sum = payments.groupby("order_id")["amount"].sum()
