@@ -5494,20 +5494,11 @@ def _customer_search_fragment_impl(db_filename: str):
                 sc, _ = get_supabase_client()
                 store_name = _get_current_store_name_for_customers(db_filename)
                 if sc and store_name:
-                    # PostgREST: *를 % 와일드카드 별칭으로 사용 (URL 인코딩 이슈 회피)
-                    q_safe = re.sub(r"[*,]", "", q_clean)  # or_ 조건 구분자와 충돌하는 문자 제거
-                    if q_safe:
-                        pat = f"*{q_safe}*"
-                        or_filter = f"name.ilike.{pat},phone1.ilike.{pat},phone2.ilike.{pat}"
-                        try:
-                            r = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).or_(or_filter).order("id", desc=True).limit(50).execute()
-                            results_list = r.data if r.data else []
-                        except Exception:
-                            # or_/ilike 실패 시: 전체 로드 후 클라이언트 필터링 (최대 300건)
-                            r = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).order("id", desc=True).limit(300).execute()
-                            rows = r.data or []
-                            q_lower = q_clean.lower()
-                            results_list = [row for row in rows if q_lower in (str(row.get("name") or "").lower()) or q_lower in (str(row.get("phone1") or "").lower()) or q_lower in (str(row.get("phone2") or "").lower())]
+                    # 속도·안정성: 최근 200건 로드 후 클라이언트 필터링 (or_/ilike 지연·오류 회피)
+                    r = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).order("id", desc=True).limit(200).execute()
+                    rows = r.data or []
+                    q_lower = q_clean.lower()
+                    results_list = [row for row in rows if q_lower in (str(row.get("name") or "").lower()) or q_lower in (str(row.get("phone1") or "").lower()) or q_lower in (str(row.get("phone2") or "").lower())]
             else:
                 conn = get_tenant_conn(db_filename)
                 if conn:
@@ -5523,14 +5514,6 @@ def _customer_search_fragment_impl(db_filename: str):
             st.session_state["_cust_search_results"] = results_list
         except Exception:
             st.session_state["_cust_search_results"] = []
-    selected = st.session_state.get("_new_sales_selected_customer")
-    if selected:
-        sel_name = (selected.get("name") or "").strip() or "고객"
-        st.success(f"✓ **{sel_name}**님 선택됨 — 아래 입력란에 이름·전화번호·주소가 자동 입력되었습니다.")
-        if st.button("다른 고객 검색하기", key="cust_search_clear_btn"):
-            for k in ("_new_sales_selected_customer", "_cust_search_results", "new_sales_cust_select"):
-                st.session_state.pop(k, None)
-            st.rerun()
     results = st.session_state.get("_cust_search_results") or []
     if results:
         customers = pd.DataFrame(results)
@@ -5543,6 +5526,7 @@ def _customer_search_fragment_impl(db_filename: str):
                 return f"{r0['name']} ({r0.get('phone1') or '-'})"
             return str(cid)
 
+        st.caption("고객을 선택하면 아래 입력란에 이름·전화번호·주소가 자동 입력됩니다.")
         sel = st.selectbox("검색 결과에서 고객 선택 *", cust_options, format_func=_fmt, key="new_sales_cust_select")
         if sel:
             row = customers[customers["id"] == sel].iloc[0]
@@ -5556,35 +5540,22 @@ def _customer_search_fragment_impl(db_filename: str):
         st.info("검색 결과가 없습니다. **신규 고객 등록** 탭에서 새로 등록하세요.")
 
 
-if hasattr(st, "fragment"):
+def _customer_search_fragment(db_filename: str):
+    """기존 고객 검색 UI. st.fragment 제거함 — fragment 시 세션/위젯 상호작용으로 입력창 사라짐 이슈 회피."""
+    _customer_search_fragment_impl(db_filename)
 
-    @st.fragment
-    def _customer_search_fragment(db_filename: str):
-        _customer_search_fragment_impl(db_filename)
 
-    def _address_section_impl():
-        if st.button("주소 검색", key="addr_search_btn", type="primary"):
-            st.session_state["_show_address_dialog"] = True
-        if st.session_state.get("_show_address_dialog"):
-            _address_search_dialog()
-        st.text_area("기본 주소 (위 버튼으로 검색하거나 직접 입력) *", key="address_manual")
-        st.text_input("상세 주소 (동/호수 등) *", key="address_detail", placeholder="예: 101동 202호")
+def _address_section_impl():
+    if st.button("주소 검색", key="addr_search_btn", type="primary"):
+        st.session_state["_show_address_dialog"] = True
+    if st.session_state.get("_show_address_dialog"):
+        _address_search_dialog()
+    st.text_area("기본 주소 (위 버튼으로 검색하거나 직접 입력) *", key="address_manual")
+    st.text_input("상세 주소 (동/호수 등) *", key="address_detail", placeholder="예: 101동 202호")
 
-    @st.fragment
-    def _render_address_section_fragment():
-        _address_section_impl()
-else:
 
-    def _customer_search_fragment(db_filename: str):
-        _customer_search_fragment_impl(db_filename)
-
-    def _render_address_section_fragment():
-        if st.button("주소 검색", key="addr_search_btn", type="primary"):
-            st.session_state["_show_address_dialog"] = True
-        if st.session_state.get("_show_address_dialog"):
-            _address_search_dialog()
-        st.text_area("기본 주소 (위 버튼으로 검색하거나 직접 입력) *", key="address_manual")
-        st.text_input("상세 주소 (동/호수 등) *", key="address_detail", placeholder="예: 101동 202호")
+def _render_address_section_fragment():
+    _address_section_impl()
 
 
 def render_new_sales():
