@@ -2934,6 +2934,69 @@ def address_search(keyword: str):
     return results
 
 
+def _address_search_dialog_impl():
+    """주소 검색 모달 본문. 검색 후 선택 시 address_manual에 반영하고 닫힘."""
+    kw = st.text_input("주소 검색어", key="dialog_addr_kw", placeholder="예: 역삼동 123, 테헤란로")
+    if st.button("검색", key="dialog_addr_search_btn"):
+        if kw and kw.strip():
+            results_addr, err_addr = search_address_kakao(kw.strip())
+            results_kw, err_kw = search_keyword_kakao(kw.strip())
+            combined = []
+            seen = set()
+            for r in (results_addr or []):
+                addr = r.get("address_name") or ""
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    r["source"] = "address"
+                    combined.append(r)
+            for r in (results_kw or []):
+                addr = r.get("address_name") or ""
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    combined.append(r)
+            st.session_state._dialog_addr_results = combined
+            st.session_state._dialog_addr_error = err_addr if not combined and err_addr else None
+        else:
+            st.warning("검색어를 입력하세요.")
+    if st.session_state.get("_dialog_addr_error"):
+        st.error(st.session_state._dialog_addr_error)
+    results = st.session_state.get("_dialog_addr_results") or []
+    if results:
+        options = []
+        display_to_address = {}
+        for r in results:
+            addr = r.get("address_name") or ""
+            if r.get("source") == "keyword":
+                place = (r.get("place_name") or "").strip()
+                disp = f"장소: {place} — {addr}" if place else addr
+            else:
+                building_name = (r.get("building_name") or "").strip()
+                bname = (r.get("bname") or "").strip()
+                disp = f"[{building_name}] {addr}" if building_name else (f"[{bname}] {addr}" if bname else addr)
+            options.append(disp)
+            display_to_address[disp] = addr
+        chosen = st.selectbox("검색 결과에서 주소 선택", options, key="dialog_addr_select")
+        if st.button("선택 완료", key="dialog_addr_confirm"):
+            if chosen:
+                st.session_state["address_manual"] = display_to_address.get(chosen, chosen)
+            for k in ("_dialog_addr_results", "_dialog_addr_error", "_show_address_dialog"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+
+# st.dialog 데코레이터 (Streamlit 1.33+). 없으면 expander 폴백
+if hasattr(st, "dialog"):
+
+    @st.dialog("주소 검색", width="medium")
+    def _address_search_dialog():
+        _address_search_dialog_impl()
+else:
+
+    def _address_search_dialog():
+        with st.expander("📍 주소 검색", expanded=True):
+            _address_search_dialog_impl()
+
+
 # ========== 로그인 페이지 ==========
 
 def _inject_js_login_form_attributes():
@@ -5454,27 +5517,63 @@ def render_new_sales():
                 st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
             finally:
                 conn.close()
-    customers = load_customers_cached(db_filename, limit=50)
+    # 고객 선택: [기존 고객 검색] / [신규 고객 등록] 물리적 완전 분리 (st.tabs)
+    cust_tab1, cust_tab2 = st.tabs(["기존 고객 검색", "신규 고객 등록"])
+    is_new_customer = True
+    customers = pd.DataFrame()
+    selected_customer_row = None
+    default_name, default_phone1, default_phone2 = "", "", ""
+    default_addr = st.session_state.get("address_manual", "")
 
-    # 고객 선택 또는 신규 (Supabase 오류 시 빈 DataFrame 방어)
-    customer_options = ["[신규 고객]"]
-    if not customers.empty and "name" in customers.columns:
-        customer_options += customers["name"].astype(str).tolist()
-    selected_customer_label = st.selectbox("고객 선택 *", customer_options)
-    is_new_customer = selected_customer_label == "[신규 고객]"
+    with cust_tab1:
+        cust_search_q = st.text_input("이름 또는 전화번호로 검색 *", key="new_sales_cust_search", placeholder="예: 홍길동, 010-1234")
+        if cust_search_q and cust_search_q.strip():
+            try:
+                sc, _ = get_supabase_client()
+                store_name = _get_current_store_name_for_customers(db_filename)
+                if sc and store_name:
+                    q = cust_search_q.strip()
+                    qcq = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).or_(f"name.ilike.%{q}%,phone1.ilike.%{q}%,phone2.ilike.%{q}%")
+                    r = qcq.order("id", desc=True).limit(50).execute()
+                    customers = pd.DataFrame(r.data) if r.data else pd.DataFrame()
+                else:
+                    customers = load_customers_cached(db_filename, limit=50)
+            except Exception:
+                customers = pd.DataFrame()
 
-    # 기존 고객 선택 시 해당 고객 정보로 폼 기본값 채움 (Phone 1/2 분리 유지)
-    if is_new_customer:
-        default_name, default_phone1, default_phone2 = "", "", ""
-        default_addr = st.session_state.get("address_manual", "")
-    else:
-        row = customers[customers["name"].astype(str) == selected_customer_label].iloc[0]
-        default_name = row["name"] or ""
-        default_phone1 = row["phone1"] or ""
-        default_phone2 = row["phone2"] or ""
-        default_addr = row["address"] or st.session_state.get("address_manual", "")
-        st.session_state["address_manual"] = default_addr
-    cust_name = st.text_input("고객명 *", value=default_name)
+        if not customers.empty and "name" in customers.columns:
+            cust_options = list(customers["id"].tolist())
+
+            def _fmt_cust(cid):
+                row = customers[customers["id"] == cid]
+                if len(row) > 0:
+                    r0 = row.iloc[0]
+                    return f"{r0['name']} ({r0.get('phone1') or '-'})"
+                return str(cid)
+
+            selected_cid = st.selectbox("검색 결과에서 고객 선택 *", cust_options, format_func=_fmt_cust, key="new_sales_cust_select")
+            if selected_cid:
+                selected_customer_row = customers[customers["id"] == selected_cid].iloc[0]
+                is_new_customer = False
+                default_name = selected_customer_row["name"] or ""
+                default_phone1 = selected_customer_row["phone1"] or ""
+                default_phone2 = selected_customer_row["phone2"] or ""
+                default_addr = selected_customer_row["address"] or st.session_state.get("address_manual", "")
+                st.session_state["address_manual"] = default_addr
+                st.session_state["new_sales_cust_name"] = default_name
+                st.session_state["phone1"] = _format_phone_hyphen(default_phone1) if default_phone1 else ""
+                st.session_state["phone2"] = _format_phone_hyphen(default_phone2) if default_phone2 else ""
+        elif cust_search_q and cust_search_q.strip():
+            st.info("검색 결과가 없습니다. **신규 고객 등록** 탭에서 새로 등록하세요.")
+
+    with cust_tab2:
+        st.caption("이름·연락처·주소를 입력하세요. (신규 고객)")
+    cust_name_key = "new_sales_cust_name"
+    if cust_name_key not in st.session_state:
+        st.session_state[cust_name_key] = default_name
+    if selected_customer_row is not None and default_name:
+        st.session_state[cust_name_key] = default_name
+    cust_name = st.text_input("고객명 *", key=cust_name_key)
     # 전화번호: 세션 초기화 후 위젯에서 on_change로 010-1234-5678 형식 하이픈 포맷
     if "phone1" not in st.session_state:
         st.session_state["phone1"] = _format_phone_hyphen(default_phone1) if default_phone1 else ""
@@ -5495,88 +5594,23 @@ def render_new_sales():
     phone1 = st.session_state.get("phone1", "")
     phone2 = st.session_state.get("phone2", "")
 
-    # ----- 주소 검색: 카카오 로컬 API + 검색 버튼 -----
-    if "address_search_results" not in st.session_state:
-        st.session_state.address_search_results = []
-    if "address_search_error" not in st.session_state:
-        st.session_state.address_search_error = None
-    with st.form("address_search_form"):
-        addr_keyword = st.text_input("주소 검색어 (예: 역삼동 123, 테헤란로) *", key="addr_keyword", placeholder="검색어 입력 후 아래 검색 버튼 클릭")
-        search_clicked = st.form_submit_button("검색")
-    if search_clicked:
-        keyword = (st.session_state.get("addr_keyword") or "").strip()
-        st.session_state.address_search_error = None
-        if keyword:
-            # 주소 검색 + 장소(키워드) 검색 병행: 도로명 주소와 건물명/상호명 모두 검색
-            results_addr, err_addr = search_address_kakao(keyword)
-            results_kw, err_kw = search_keyword_kakao(keyword)
-            combined = []
-            seen = set()
-            for r in (results_addr or []):
-                addr = r.get("address_name") or ""
-                if addr and addr not in seen:
-                    seen.add(addr)
-                    r["source"] = "address"
-                    combined.append(r)
-            for r in (results_kw or []):
-                addr = r.get("address_name") or ""
-                if addr and addr not in seen:
-                    seen.add(addr)
-                    combined.append(r)
-            st.session_state.address_search_results = combined
-            if err_addr and err_kw:
-                st.session_state.address_search_error = err_addr
-            elif not combined:
-                st.session_state.address_search_error = err_addr or err_kw or "검색 결과가 없습니다. 검색어를 바꿔 보세요."
-        else:
-            st.warning("검색어를 입력한 뒤 검색 버튼을 눌러 주세요.")
-    if st.session_state.get("address_search_error"):
-        st.error(st.session_state.address_search_error)
-    # 검색 결과를 st.selectbox로 표시 (건물명/장소명 상단 표시), 선택 시 고객 주소로 반영
-    if st.session_state.address_search_results:
-        results = st.session_state.address_search_results
-        options = []
-        display_to_address = {}
-        for r in results:
-            addr = r.get("address_name") or ""
-            if r.get("source") == "keyword":
-                place = (r.get("place_name") or "").strip()
-                disp = f"장소: {place} — {addr}" if place else addr
-            else:
-                building_name = (r.get("building_name") or "").strip()
-                bname = (r.get("bname") or "").strip()
-                if building_name:
-                    disp = f"[{building_name}] {addr}"
-                elif bname:
-                    disp = f"[{bname}] {addr}"
-                else:
-                    disp = addr
-            options.append(disp)
-            display_to_address[disp] = addr
-        st.session_state._address_display_to_value = display_to_address
-
-        def _on_address_select():
-            sel = st.session_state.get("address_selection")
-            if sel and hasattr(st.session_state, "_address_display_to_value"):
-                st.session_state["address_manual"] = st.session_state._address_display_to_value.get(sel, sel)
-
-        chosen = st.selectbox(
-            "검색 결과에서 주소 선택 *",
-            options=options,
-            key="address_selection",
-            on_change=_on_address_select,
-            format_func=lambda x: x,
-        )
-        if chosen:
-            addr_val = getattr(st.session_state, "_address_display_to_value", {}).get(chosen, chosen)
-            st.session_state["address_manual"] = addr_val
-    # 주소: 기본 주소(검색/수동) + 상세 주소(동·호수) 분리 → DB에는 두 값 합쳐서 저장
+    # ----- 주소: [주소 검색] 버튼 → 다이얼로그 팝업, 상세 주소 최우선 배치 -----
     if "address_manual" not in st.session_state:
         st.session_state["address_manual"] = default_addr
     if "address_detail" not in st.session_state:
         st.session_state["address_detail"] = ""
-    st.text_area("기본 주소 (위 검색 선택 또는 직접 입력) *", key="address_manual")
-    st.text_input("상세 주소 (동/호수 등) *", key="address_detail")
+    addr_btn_clicked = st.button("주소 검색", key="addr_search_btn", type="primary")
+    if addr_btn_clicked:
+        st.session_state["_show_address_dialog"] = True
+    if st.session_state.get("_show_address_dialog"):
+        _address_search_dialog()
+    st.text_area("기본 주소 (위 버튼으로 검색하거나 직접 입력) *", key="address_manual")
+    # 상세 주소를 눈에 띄게 배치 — 작업 동선 최적화 (주소 선택 후 곧바로 입력)
+    st.text_input(
+        "상세 주소 (동/호수 등) * — 위 주소 선택 후 여기를 먼저 입력하세요",
+        key="address_detail",
+        placeholder="예: 101동 202호",
+    )
     address_base = st.session_state.get("address_manual", "")
     address_detail = st.session_state.get("address_detail", "")
     address_full = " ".join(filter(None, [address_base.strip(), address_detail.strip()])) or None
@@ -5820,7 +5854,7 @@ def render_new_sales():
                     st.error("고객 등록에 실패했습니다. " + (ins_err or "Supabase app_customers 테이블·스키마(store_name, name, phone1 등)를 확인해 주세요."))
                     st.stop()
             else:
-                customer_id = int(customers[customers["name"].astype(str) == selected_customer_label]["id"].iloc[0])
+                customer_id = int(selected_customer_row["id"])
             order_payload = {
                 "customer_id": customer_id,
                 "employee_names": employee_names_str or None,
@@ -5887,8 +5921,9 @@ def render_new_sales():
             }
             for key in list(st.session_state.keys()):
                 if key in (
-                    "phone1", "phone2", "address_manual", "address_detail", "address_search_results",
-                    "address_search_error", "addr_keyword", "address_selection", "order_date", "delivery_date",
+                    "phone1", "phone2", "address_manual", "address_detail", "order_date", "delivery_date",
+                    "_show_address_dialog", "_dialog_addr_results", "_dialog_addr_error",
+                    "new_sales_cust_name", "new_sales_cust_search", "new_sales_cust_select",
                     "cost_price", "total_amount", "display_sales_amount", "display_cost_amount",
                     "category_multiselect", "new_sales_employee_multiselect",
                 ) or key.startswith(("pay_", "pay_onnuri_")):
@@ -5906,7 +5941,7 @@ def render_new_sales():
                         st.error("고객 등록에 실패했습니다. " + (ins_err or "Supabase app_customers 테이블·스키마(store_name, name, phone1 등)를 확인해 주세요."))
                         st.stop()
                 else:
-                    customer_id = int(customers[customers["name"].astype(str) == selected_customer_label]["id"].iloc[0])
+                    customer_id = int(selected_customer_row["id"])
                 conn.execute("""
                     INSERT INTO Orders (customer_id, employee_names, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, display_sales_amount, display_cost_amount, balance_status)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -7558,6 +7593,7 @@ def main():
     if role == "superadmin":
         if st.sidebar.button("👥 직원 관리", use_container_width=True):
             st.session_state["active_admin_page"] = "employee_management"
+    st.sidebar.markdown("---")
     if st.sidebar.button("🚪 로그아웃", use_container_width=True):
         try:
             client, _ = get_supabase_client()
@@ -7584,11 +7620,23 @@ def main():
         render_superadmin()
         return
 
-    # 일반/매장 관리자: 메뉴를 상단 셀렉트로 노출 (모바일에서도 잘 보이게)
+    # 일반/매장 관리자: 메뉴를 상단 셀렉트로 노출 (모바일에서도 잘 보이게), 넘버링 및 그룹 구분
     if role == "store_admin":
-        tab_labels = ["경영 대시보드", "📊 마케팅 인사이트", "새로운 매출 등록", "고객 및 잔금 관리", "매장 관리자 메뉴", "월별 결제수단 집계표"]
+        tab_labels = [
+            "1. 대시보드",
+            "2. 마케팅 인사이트",
+            "3. 새로운 매출 등록",
+            "4. 고객 및 잔금 관리",
+            "5. 매장 관리자 메뉴",
+            "6. 월별 결제수단 집계표",
+        ]
     else:
-        tab_labels = ["경영 대시보드", "📊 마케팅 인사이트", "새로운 매출 등록", "고객 및 잔금 관리"]
+        tab_labels = [
+            "1. 대시보드",
+            "2. 마케팅 인사이트",
+            "3. 새로운 매출 등록",
+            "4. 고객 및 잔금 관리",
+        ]
     if "main_tab_idx" not in st.session_state:
         st.session_state["main_tab_idx"] = 0
     if st.session_state["main_tab_idx"] >= len(tab_labels):
@@ -7607,6 +7655,7 @@ def main():
             st.error("⚠️ **Supabase 연결 실패**: " + err_text + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
     # 상단 메뉴 선택(Sticky Header 내에 렌더링: 일반 유저/매장관리자 공통)
     st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
+    st.markdown("---")
     st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
     st.markdown('<p class="mobile-menu-hint" style="margin:0 0 0.35rem 0; font-size:0.8rem; color:#888;">로그아웃·비밀번호는 왼쪽 상단 ☰에서</p>', unsafe_allow_html=True)
     menu_sel = st.selectbox(
