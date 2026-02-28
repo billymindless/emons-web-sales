@@ -5477,6 +5477,80 @@ def _render_gamification_feedback(ctx: dict):
 
 # ========== 탭 2: 새로운 매출 등록 ==========
 
+
+def _customer_search_fragment_impl(db_filename: str):
+    """기존 고객 검색 UI. fragment로 감싸 타이핑/검색 시 전체 스크립트 대신 이 부분만 렌더링."""
+    with st.form("cust_search_form"):
+        q = st.text_input("이름 또는 전화번호로 검색 *", key="new_sales_cust_search", placeholder="예: 홍길동, 010-1234")
+        search_clicked = st.form_submit_button("검색")
+    if search_clicked and q and q.strip():
+        try:
+            sc, _ = get_supabase_client()
+            store_name = _get_current_store_name_for_customers(db_filename)
+            if sc and store_name:
+                qcq = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).or_(f"name.ilike.%{q.strip()}%,phone1.ilike.%{q.strip()}%,phone2.ilike.%{q.strip()}%")
+                r = qcq.order("id", desc=True).limit(50).execute()
+                st.session_state["_cust_search_results"] = r.data if r.data else []
+            else:
+                st.session_state["_cust_search_results"] = []
+        except Exception:
+            st.session_state["_cust_search_results"] = []
+    results = st.session_state.get("_cust_search_results") or []
+    if results:
+        customers = pd.DataFrame(results)
+        cust_options = list(customers["id"].tolist())
+
+        def _fmt(cid):
+            row = customers[customers["id"] == cid]
+            if len(row) > 0:
+                r0 = row.iloc[0]
+                return f"{r0['name']} ({r0.get('phone1') or '-'})"
+            return str(cid)
+
+        sel = st.selectbox("검색 결과에서 고객 선택 *", cust_options, format_func=_fmt, key="new_sales_cust_select")
+        if sel:
+            row = customers[customers["id"] == sel].iloc[0]
+            st.session_state["_new_sales_selected_customer"] = dict(row)
+            st.session_state["new_sales_cust_name"] = row.get("name") or ""
+            st.session_state["phone1"] = _format_phone_hyphen(row.get("phone1") or "") or ""
+            st.session_state["phone2"] = _format_phone_hyphen(row.get("phone2") or "") or ""
+            st.session_state["address_manual"] = row.get("address") or st.session_state.get("address_manual", "")
+            st.rerun()
+    elif search_clicked and q and q.strip():
+        st.info("검색 결과가 없습니다. **신규 고객 등록** 탭에서 새로 등록하세요.")
+
+
+if hasattr(st, "fragment"):
+
+    @st.fragment
+    def _customer_search_fragment(db_filename: str):
+        _customer_search_fragment_impl(db_filename)
+
+    def _address_section_impl():
+        if st.button("주소 검색", key="addr_search_btn", type="primary"):
+            st.session_state["_show_address_dialog"] = True
+        if st.session_state.get("_show_address_dialog"):
+            _address_search_dialog()
+        st.text_area("기본 주소 (위 버튼으로 검색하거나 직접 입력) *", key="address_manual")
+        st.text_input("상세 주소 (동/호수 등) *", key="address_detail", placeholder="예: 101동 202호")
+
+    @st.fragment
+    def _render_address_section_fragment():
+        _address_section_impl()
+else:
+
+    def _customer_search_fragment(db_filename: str):
+        _customer_search_fragment_impl(db_filename)
+
+    def _render_address_section_fragment():
+        if st.button("주소 검색", key="addr_search_btn", type="primary"):
+            st.session_state["_show_address_dialog"] = True
+        if st.session_state.get("_show_address_dialog"):
+            _address_search_dialog()
+        st.text_area("기본 주소 (위 버튼으로 검색하거나 직접 입력) *", key="address_manual")
+        st.text_input("상세 주소 (동/호수 등) *", key="address_detail", placeholder="예: 101동 202호")
+
+
 def render_new_sales():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -5517,54 +5591,17 @@ def render_new_sales():
                 st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
             finally:
                 conn.close()
-    # 고객 선택: [기존 고객 검색] / [신규 고객 등록] 물리적 완전 분리 (st.tabs)
+    # 고객 선택: [기존 고객 검색] / [신규 고객 등록] 물리적 완전 분리 (st.tabs), @st.fragment로 검색 부하 경감
     cust_tab1, cust_tab2 = st.tabs(["기존 고객 검색", "신규 고객 등록"])
-    is_new_customer = True
-    customers = pd.DataFrame()
-    selected_customer_row = None
-    default_name, default_phone1, default_phone2 = "", "", ""
-    default_addr = st.session_state.get("address_manual", "")
+    selected_customer_row = st.session_state.get("_new_sales_selected_customer")
+    is_new_customer = selected_customer_row is None
+    default_name = (selected_customer_row.get("name") or "") if selected_customer_row else ""
+    default_phone1 = (selected_customer_row.get("phone1") or "") if selected_customer_row else ""
+    default_phone2 = (selected_customer_row.get("phone2") or "") if selected_customer_row else ""
+    default_addr = (selected_customer_row.get("address") or st.session_state.get("address_manual", "")) if selected_customer_row else st.session_state.get("address_manual", "")
 
     with cust_tab1:
-        cust_search_q = st.text_input("이름 또는 전화번호로 검색 *", key="new_sales_cust_search", placeholder="예: 홍길동, 010-1234")
-        if cust_search_q and cust_search_q.strip():
-            try:
-                sc, _ = get_supabase_client()
-                store_name = _get_current_store_name_for_customers(db_filename)
-                if sc and store_name:
-                    q = cust_search_q.strip()
-                    qcq = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).or_(f"name.ilike.%{q}%,phone1.ilike.%{q}%,phone2.ilike.%{q}%")
-                    r = qcq.order("id", desc=True).limit(50).execute()
-                    customers = pd.DataFrame(r.data) if r.data else pd.DataFrame()
-                else:
-                    customers = load_customers_cached(db_filename, limit=50)
-            except Exception:
-                customers = pd.DataFrame()
-
-        if not customers.empty and "name" in customers.columns:
-            cust_options = list(customers["id"].tolist())
-
-            def _fmt_cust(cid):
-                row = customers[customers["id"] == cid]
-                if len(row) > 0:
-                    r0 = row.iloc[0]
-                    return f"{r0['name']} ({r0.get('phone1') or '-'})"
-                return str(cid)
-
-            selected_cid = st.selectbox("검색 결과에서 고객 선택 *", cust_options, format_func=_fmt_cust, key="new_sales_cust_select")
-            if selected_cid:
-                selected_customer_row = customers[customers["id"] == selected_cid].iloc[0]
-                is_new_customer = False
-                default_name = selected_customer_row["name"] or ""
-                default_phone1 = selected_customer_row["phone1"] or ""
-                default_phone2 = selected_customer_row["phone2"] or ""
-                default_addr = selected_customer_row["address"] or st.session_state.get("address_manual", "")
-                st.session_state["address_manual"] = default_addr
-                st.session_state["new_sales_cust_name"] = default_name
-                st.session_state["phone1"] = _format_phone_hyphen(default_phone1) if default_phone1 else ""
-                st.session_state["phone2"] = _format_phone_hyphen(default_phone2) if default_phone2 else ""
-        elif cust_search_q and cust_search_q.strip():
-            st.info("검색 결과가 없습니다. **신규 고객 등록** 탭에서 새로 등록하세요.")
+        _customer_search_fragment(db_filename)
 
     with cust_tab2:
         st.caption("이름·연락처·주소를 입력하세요. (신규 고객)")
@@ -5594,23 +5631,12 @@ def render_new_sales():
     phone1 = st.session_state.get("phone1", "")
     phone2 = st.session_state.get("phone2", "")
 
-    # ----- 주소: [주소 검색] 버튼 → 다이얼로그 팝업, 상세 주소 최우선 배치 -----
+    # ----- 주소: [주소 검색] 버튼 → 다이얼로그 팝업, @st.fragment로 입력 시 부분만 렌더링 -----
     if "address_manual" not in st.session_state:
         st.session_state["address_manual"] = default_addr
     if "address_detail" not in st.session_state:
         st.session_state["address_detail"] = ""
-    addr_btn_clicked = st.button("주소 검색", key="addr_search_btn", type="primary")
-    if addr_btn_clicked:
-        st.session_state["_show_address_dialog"] = True
-    if st.session_state.get("_show_address_dialog"):
-        _address_search_dialog()
-    st.text_area("기본 주소 (위 버튼으로 검색하거나 직접 입력) *", key="address_manual")
-    # 상세 주소를 눈에 띄게 배치 — 작업 동선 최적화 (주소 선택 후 곧바로 입력)
-    st.text_input(
-        "상세 주소 (동/호수 등) * — 위 주소 선택 후 여기를 먼저 입력하세요",
-        key="address_detail",
-        placeholder="예: 101동 202호",
-    )
+    _render_address_section_fragment()
     address_base = st.session_state.get("address_manual", "")
     address_detail = st.session_state.get("address_detail", "")
     address_full = " ".join(filter(None, [address_base.strip(), address_detail.strip()])) or None
@@ -5686,8 +5712,8 @@ def render_new_sales():
 
     VISIT_REASON_OPTIONS = ["매장외관", "재구매", "소개", "광고(SNS 외)"]
     PURCHASE_REASON_OPTIONS = ["교체(이사없이)", "신혼/혼수", "공동구매(입주, 가구쇼 등)", "이사", "현대임직원할인"]
-    visit_reason = st.selectbox("방문 이유 *", options=VISIT_REASON_OPTIONS)
-    purchase_reason = st.selectbox("구매 이유 *", options=PURCHASE_REASON_OPTIONS)
+    visit_reason = st.selectbox("방문 이유 *", options=VISIT_REASON_OPTIONS, key="visit_reason")
+    purchase_reason = st.selectbox("구매 이유 *", options=PURCHASE_REASON_OPTIONS, key="purchase_reason")
 
     # ----- 다중(복합) 결제 수단: 최대 4개 고정 슬롯 -----
     st.subheader("결제 내역 (복수 결제 가능)")
@@ -5921,12 +5947,17 @@ def render_new_sales():
             }
             for key in list(st.session_state.keys()):
                 if key in (
-                    "phone1", "phone2", "address_manual", "address_detail", "order_date", "delivery_date",
+                    "phone1", "phone2", "address_manual", "address_detail",
+                    "address_search_results", "address_search_error", "addr_keyword", "address_selection",
+                    "order_date", "delivery_date",
                     "_show_address_dialog", "_dialog_addr_results", "_dialog_addr_error",
+                    "_new_sales_selected_customer", "_cust_search_results",
                     "new_sales_cust_name", "new_sales_cust_search", "new_sales_cust_select",
                     "cost_price", "total_amount", "display_sales_amount", "display_cost_amount",
                     "category_multiselect", "new_sales_employee_multiselect",
-                ) or key.startswith(("pay_", "pay_onnuri_")):
+                    "visit_reason", "purchase_reason",
+                    "payment_rows",
+                ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_")):
                     try:
                         del st.session_state[key]
                     except Exception:
@@ -6032,21 +6063,16 @@ def render_new_sales():
             # 신규 매출 등록 관련 상태 초기화
             for key in list(st.session_state.keys()):
                 if key in (
-                    "phone1",
-                    "phone2",
-                    "address_manual",
-                    "address_detail",
-                    "address_search_results",
-                    "address_search_error",
-                    "addr_keyword",
-                    "address_selection",
-                    "order_date",
-                    "delivery_date",
-                    "cost_price",
-                    "total_amount",
-                    "display_sales_amount",
-                    "display_cost_amount",
-                    "category_multiselect",
+                    "phone1", "phone2", "address_manual", "address_detail",
+                    "address_search_results", "address_search_error", "addr_keyword", "address_selection",
+                    "order_date", "delivery_date",
+                    "_show_address_dialog", "_dialog_addr_results", "_dialog_addr_error",
+                    "_new_sales_selected_customer", "_cust_search_results",
+                    "new_sales_cust_name", "new_sales_cust_search", "new_sales_cust_select",
+                    "cost_price", "total_amount", "display_sales_amount", "display_cost_amount",
+                    "category_multiselect", "new_sales_employee_multiselect",
+                    "visit_reason", "purchase_reason",
+                    "payment_rows",
                 ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_")):
                     try:
                         del st.session_state[key]
@@ -7007,47 +7033,25 @@ def render_dashboard():
         _render_dashboard_todos_only(db_filename, todos_df)
         return
 
-    # Supabase 클라이언트 확보
+    # Supabase 연결 확인
     client, err = get_supabase_client()
     if err or not client:
         st.error(f"⚠️ Supabase 연결 실패: {err}")
         return
 
-    # 1) 주문(app_orders) 조회 — db_filename(테넌트 컬럼) 기준
-    order_columns = [
-        "id",
-        "customer_id",
-        "order_date",
-        "delivery_date",
-        "total_amount",
-        "cost_price",
-        "actual_margin",
-        "employee_names",
-        "category",
-        "display_sales_amount",
-        "display_cost_amount",
-        "balance_status",
-    ]
-    try:
-        r_orders = client.table("app_orders").select(", ".join(order_columns)).eq(
-            ORDERS_PAYMENTS_TENANT_COL, db_filename
-        ).execute()
-        orders_rows = (r_orders.data or []) if hasattr(r_orders, "data") else []
-    except Exception as e:
-        st.error(f"주문 데이터를 불러오지 못했습니다: {e}")
-        orders_rows = []
-    if orders_rows:
-        orders = pd.DataFrame(orders_rows)
-        for c in order_columns:
-            if c not in orders.columns:
-                orders[c] = None
-    else:
-        orders = pd.DataFrame(columns=order_columns)
+    # 1) 주문·결제 — @st.cache_data 캐시 활용 (10분 TTL), 로딩 시 스피너로 체감 속도 개선
+    order_cols_str = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, display_sales_amount, display_cost_amount, balance_status"
+    with st.spinner("데이터 불러오는 중..."):
+        orders = load_orders_cached(db_filename, order_cols_str, limit=None)
+        payments = load_payments_cached(db_filename)
+    order_columns = ["id", "customer_id", "order_date", "delivery_date", "total_amount", "cost_price", "actual_margin", "employee_names", "category", "display_sales_amount", "display_cost_amount", "balance_status"]
+    for c in order_columns:
+        if c not in orders.columns:
+            orders[c] = None
 
-    # 2) 고객(app_customers) / 매출(sales) / 결제(app_payments) / To-Do
+    # 2) 고객(app_customers) / 매출(sales) / To-Do
     customers = load_customers_cached(db_filename, limit=None)
     sales_df = load_sales_cached(db_filename, limit=None)
-    payments = _load_payments_supabase(db_filename)
     if payments.empty:
         payments = pd.DataFrame(columns=["order_id", "amount"])
     else:
@@ -7668,9 +7672,8 @@ def main():
     st.markdown("</div>", unsafe_allow_html=True)
     idx = tab_labels.index(menu_sel)
     st.session_state["main_tab_idx"] = idx
-    # Lazy Loading: 대시보드 탭이 아닐 때 전체 통계 플래그 초기화 → 돌아오면 To-Do만 먼저 표시
-    if idx != 0:
-        st.session_state["_dashboard_full_loaded"] = False
+    st.session_state["current_menu"] = idx
+    # 대시보드 상태 유지: 탭 전환 시 _dashboard_full_loaded 초기화하지 않음 (캐시 재사용으로 즉시 표시)
     st.divider()
     if idx == 0:
         render_dashboard()
