@@ -1321,7 +1321,7 @@ def get_store_assigned_employee_names(db_filename: str) -> list[str]:
 def _get_store_tag_key(store_name: str) -> str:
     """
     채널톡 태그용 매장 키 추출. 예: '울산삼산점' -> '삼산', '학성점' -> '학성'.
-    st.secrets에 CHANNEL_TALK_STORE_TAG_KEYS = "삼산,학성,동구" 형태로 매장명 포함 시 사용할 키 목록 지정 가능.
+    st.secrets에 CHANNEL_TALK_STORE_TAG_KEYS = "삼산,학성,평산" 형태로 매장명 포함 시 사용할 키 목록 지정 가능.
     """
     if not store_name or not str(store_name).strip():
         return "기타"
