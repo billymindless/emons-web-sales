@@ -277,14 +277,19 @@ def _supabase_auth_uid_by_email(admin_client, email: str):
 # 아래 매장/직원 목록 등은 @st.cache_data(ttl=600)로 10분 캐시. 매장·직원 추가/수정/삭제 후 반드시 clear_data_cache() 호출하면 즉시 갱신됨.
 
 def _supabase_app_tables_available():
-    """Supabase에 app_users 테이블이 있는지 확인. (있으면 True, 없으면 False)"""
+    """Supabase에 app_users 테이블이 있는지 확인. 세션당 1회만 HTTP 쿼리 후 결과를 세션 캐시."""
+    _cache_key = "_supa_app_tables_avail"
+    if _cache_key in st.session_state:
+        return st.session_state[_cache_key]
     client, err = get_supabase_client()
     if err or not client:
         return False
     try:
         client.table("app_users").select("id").limit(1).execute()
+        st.session_state[_cache_key] = True
         return True
     except Exception:
+        st.session_state[_cache_key] = False
         return False
 
 
@@ -464,8 +469,9 @@ def _get_supabase_user_allowed_stores(user_id: int):
 
 
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)
 def _get_supabase_store_by_db_filename(db_filename: str):
-    """db_filename → store id 조회 캐시 (10분). 매장 정보 변경 시 clear_data_cache()로 갱신."""
+    """db_filename → store id 조회. @st.cache_data 1시간 캐시. 매장 변경 시 clear_data_cache()로 갱신."""
     if not db_filename:
         return None
     client, err = get_supabase_client()
@@ -751,11 +757,15 @@ def sync_channel_talk_customer(
     item_category: str,
     purchase_date,
     store_tag_key: str | None = None,
+    is_returning: bool = False,
+    unpaid_balance: float = 0.0,
 ) -> bool:
     """
-    오프라인 결제 고객 정보를 채널톡에 PUSH (PUSH 전용).
-    전화번호로 유저 조회 후 기존 태그 유지 + 새 태그 추가, 프로필 업데이트.
-    태그 형식: store_tag_key가 있으면 '{매장키}구매/{품목}' (예: 삼산구매/옷장), 없으면 '품목_구매'.
+    오프라인 결제 고객 정보를 채널톡에 PUSH.
+    - 기존 태그 유지 + 새 구매 태그 추가
+    - 재구매 시 '재구매_{매장키}' 태그 추가
+    - 미수금 있으면 '미수금_{매장키}' 태그 추가, 완납이면 제거
+    - 태그 형식: '{매장키}구매/{품목}' (예: 삼산구매/옷장)
     실패 시 False, 성공 시 True. 예외는 호출부에서 처리.
     """
     headers = _channel_talk_headers()
@@ -765,14 +775,15 @@ def sync_channel_talk_customer(
     if not member_id:
         return False
     category_clean = (re.sub(r"\s+", "", (item_category or "").strip()) or "기타")
-    if store_tag_key and str(store_tag_key).strip():
-        tag_new = f"{str(store_tag_key).strip()}구매/{category_clean}"
-    else:
-        tag_new = category_clean + "_구매"
+    sk = str(store_tag_key).strip() if store_tag_key and str(store_tag_key).strip() else ""
+    tag_purchase = f"{sk}구매/{category_clean}" if sk else f"{category_clean}_구매"
+    tag_returning = f"재구매_{sk}" if sk else "재구매"
+    tag_unpaid = f"미수금_{sk}" if sk else "미수금"
     purchase_date_str = purchase_date.isoformat() if hasattr(purchase_date, "isoformat") else str(purchase_date)
 
-    # 1) GET 기존 유저 (태그 병합용)
+    # 1) GET 기존 유저 (태그 병합 + 재구매 여부 판단)
     existing_tags = []
+    is_existing_user = False
     try:
         r_get = requests.get(
             f"{CHANNEL_TALK_BASE_URL}/users/@{member_id}",
@@ -783,23 +794,34 @@ def sync_channel_talk_customer(
             data = r_get.json()
             if isinstance(data, dict):
                 existing_tags = list(data.get("tags") or [])
+                is_existing_user = True
     except Exception:
         pass
 
-    # 2) 새 태그 중복 없이 추가
-    if tag_new not in existing_tags:
-        existing_tags.append(tag_new)
-    tags_final = existing_tags
+    # 2) 태그 로직
+    # 구매 태그 추가
+    if tag_purchase not in existing_tags:
+        existing_tags.append(tag_purchase)
+    # 재구매 태그: 기존 채널톡 사용자이거나 is_returning 플래그가 True인 경우
+    if (is_returning or is_existing_user) and tag_returning not in existing_tags:
+        existing_tags.append(tag_returning)
+    # 미수금 태그: 잔금 있으면 추가, 완납이면 제거
+    if unpaid_balance > 0:
+        if tag_unpaid not in existing_tags:
+            existing_tags.append(tag_unpaid)
+    else:
+        existing_tags = [t for t in existing_tags if t != tag_unpaid]
 
-    # 3) 프로필 + 태그로 PATCH/PUT
+    # 3) 프로필 + 태그로 PUT
     profile = {
         "name": (customer_name or "").strip() or "고객",
         "mobileNumber": (phone_number or "").strip(),
         "오프라인_최근구매액": int(purchase_amount),
         "오프라인_최근구매일": purchase_date_str[:10],
         "오프라인_구매품목": (item_category or "").strip() or "-",
+        "오프라인_누적구매횟수": len([t for t in existing_tags if "구매/" in t or t.endswith("_구매")]),
     }
-    body = {"profile": profile, "tags": tags_final}
+    body = {"profile": profile, "tags": existing_tags}
     try:
         r_put = requests.put(
             f"{CHANNEL_TALK_BASE_URL}/users/@{member_id}",
@@ -812,25 +834,35 @@ def sync_channel_talk_customer(
         return False
 
 
-def fetch_channel_talk_customers() -> list:
+def fetch_channel_talk_customer_by_phone_raw(phone_number: str) -> dict | None:
     """
-    채널톡에서 유저 리스트를 GET으로 가져와 반환.
-    각 항목은 mobileNumber, name 등 프로필 정보 포함.
-    API 미지원 시 빈 리스트 반환.
+    전화번호(memberId) 기준으로 채널톡 사용자 1명을 조회 (내부 헬퍼, UI 출력 없음).
+    성공 시 user dict, 실패/404 시 None.
     """
-    """
-    [현재 미사용] 채널톡 Open API에서는 /users 목록 GET이 405를 반환하므로
-    대량 PULL 용도로는 사용할 수 없습니다. 단건 조회용 별도 헬퍼를 사용하세요.
-    """
-    st.info("채널톡 Open API에서 전체 고객 목록(/users) 조회는 지원되지 않아, 대량 PULL은 사용할 수 없습니다.")
-    return []
+    headers = _channel_talk_headers()
+    if not headers or not phone_number:
+        return None
+    member_id = re.sub(r"\D", "", str(phone_number).strip())
+    if not member_id:
+        return None
+    try:
+        r = requests.get(
+            f"{CHANNEL_TALK_BASE_URL}/users/@{member_id}",
+            headers=headers,
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data if isinstance(data, dict) else None
+        return None
+    except Exception:
+        return None
 
 
 def fetch_channel_talk_customer_by_phone(phone_number: str) -> dict | None:
     """
-    전화번호(=memberId) 기준으로 채널톡 사용자 1명을 조회하는 현실적인 PULL 방식.
-    - GET /open/v5/users/@{memberId} 사용
-    - 성공 시 user dict, 실패/404 시 None 반환
+    전화번호(=memberId) 기준으로 채널톡 사용자 1명을 조회 (UI 메시지 포함).
+    성공 시 user dict, 실패/404 시 None 반환.
     """
     headers = _channel_talk_headers()
     if not headers:
@@ -839,7 +871,7 @@ def fetch_channel_talk_customer_by_phone(phone_number: str) -> dict | None:
     if not phone_number or not str(phone_number).strip():
         st.error("조회할 전화번호를 입력하세요.")
         return None
-    member_id = re.sub(r"\\D", "", str(phone_number).strip())
+    member_id = re.sub(r"\D", "", str(phone_number).strip())
     if not member_id:
         st.error("전화번호 형식이 올바르지 않습니다.")
         return None
@@ -849,10 +881,6 @@ def fetch_channel_talk_customer_by_phone(phone_number: str) -> dict | None:
             headers=headers,
             timeout=10,
         )
-        try:
-            st.toast(f"채널톡 단건 조회 응답 코드: {r.status_code}")
-        except Exception:
-            pass
         if r.status_code == 404:
             st.info("채널톡에 해당 전화번호로 등록된 고객이 없습니다.")
             return None
@@ -1261,8 +1289,9 @@ def _insert_admin_alert(store_name: str, alert_type: str, message: str):
         pass
 
 
+@st.cache_data(ttl=3600)
 def _get_store_name_by_db(db_filename: str) -> str:
-    """db_filename으로 Supabase app_stores에서 store_name 조회. 단일 데이터 소스(Supabase) 전용."""
+    """db_filename으로 Supabase app_stores에서 store_name 조회. @st.cache_data 1시간 캐시."""
     if not db_filename:
         return "알 수 없음"
     client, err = get_supabase_client()
@@ -1502,9 +1531,13 @@ def clear_data_cache():
     """
     전체 데이터 캐시 무효화. 주문/결제/매장/직원 등 저장·수정·삭제 직후 호출하면
     load_orders_cached, get_supabase_stores_dataframe_cached, _get_supabase_stores_list 등이 다음 조회 시 최신값을 가져옴.
+    세션 내 가용성 캐시(_supa_orders_avail, _supa_app_tables_avail)도 함께 초기화하여 최신 상태 반영.
     """
     if "_todos_local" in st.session_state:
         st.session_state["_todos_local"] = {}
+    # 세션 캐시 가용성 플래그 초기화 (테이블 구조 변경 시 재확인)
+    for _k in ("_supa_orders_avail", "_supa_app_tables_avail"):
+        st.session_state.pop(_k, None)
     try:
         st.cache_data.clear()
     except Exception:
@@ -1641,14 +1674,19 @@ ORDERS_PAYMENTS_TENANT_COL = "db_filename"
 
 
 def _supabase_orders_payments_available() -> bool:
-    """Supabase에 app_orders 테이블이 있는지 확인."""
+    """Supabase에 app_orders 테이블이 있는지 확인. 세션당 1회만 HTTP 쿼리 후 결과를 세션 캐시."""
+    _cache_key = "_supa_orders_avail"
+    if _cache_key in st.session_state:
+        return st.session_state[_cache_key]
     client, err = get_supabase_client()
     if err or not client:
         return False
     try:
         client.table("app_orders").select("id").limit(1).execute()
+        st.session_state[_cache_key] = True
         return True
     except Exception:
+        st.session_state[_cache_key] = False
         return False
 
 
@@ -3674,8 +3712,10 @@ def _render_marketing_multi_period_comparison(
         _render_single_period_folium_map(df_period_b, label_b, f"{key_prefix}_map_b")
 
 
+@st.fragment
 def render_marketing_insights_tenant():
-    """매장(Tenant): 해당 매장 데이터로 다중 기간 교차 분석 (기간 A vs 기간 B)."""
+    """매장(Tenant): 해당 매장 데이터로 다중 기간 교차 분석 (기간 A vs 기간 B).
+    @st.fragment: 기간 날짜 선택 시 이 섹션만 재실행 — 전체 페이지 Full Rerun 방지."""
     db_filename = st.session_state.get("current_db")
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
@@ -5953,6 +5993,28 @@ def render_new_sales():
                 "is_today_first": is_today_first,
                 "monthly_max_before": monthly_max_before,
             }
+            # 채널톡 PUSH: 백그라운드 스레드로 전송 (UI 블로킹 방지)
+            def _channel_talk_sync_supa():
+                try:
+                    if not _get_channel_talk_secrets():
+                        return
+                    store_name_ct = _get_store_name_by_db(db_filename)
+                    store_tag_key_ct = _get_store_tag_key(store_name_ct)
+                    unpaid_ct = float(remaining) if remaining > 0 else 0.0
+                    sync_channel_talk_customer(
+                        customer_name=cust_name.strip(),
+                        phone_number=phone1.strip(),
+                        purchase_amount=final_sales_save,
+                        item_category=category or "",
+                        purchase_date=order_date,
+                        store_tag_key=store_tag_key_ct,
+                        is_returning=(not is_new_customer),
+                        unpaid_balance=unpaid_ct,
+                    )
+                except Exception:
+                    pass
+            threading.Thread(target=_channel_talk_sync_supa, daemon=True).start()
+            st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             for key in list(st.session_state.keys()):
                 if key in (
@@ -6049,24 +6111,27 @@ def render_new_sales():
                 store_name = _get_store_name_by_db(db_filename)
                 _insert_admin_alert(store_name, "margin", f"{store_name}에서 실질 마진율 {net_margin_rate_save:.1f}% 건이 등록되었습니다.")
             # 채널톡 PUSH: 백그라운드 스레드로 전송해 UI 블로킹 방지
+            _sqlite_remaining = remaining  # 클로저에서 사용할 변수 캡처
             def _channel_talk_sync():
                 try:
-                    cutoff = _get_channel_talk_sync_cutoff_date()
-                    if _get_channel_talk_secrets() and cutoff is not None and date.today() >= cutoff:
-                        store_name = _get_store_name_by_db(db_filename)
-                        store_tag_key = _get_store_tag_key(store_name)
-                        sync_channel_talk_customer(
-                            customer_name=cust_name.strip(),
-                            phone_number=phone1.strip(),
-                            purchase_amount=final_sales_save,
-                            item_category=category or "",
-                            purchase_date=order_date,
-                            store_tag_key=store_tag_key,
-                        )
+                    if not _get_channel_talk_secrets():
+                        return
+                    store_name_ct = _get_store_name_by_db(db_filename)
+                    store_tag_key_ct = _get_store_tag_key(store_name_ct)
+                    unpaid_ct = float(_sqlite_remaining) if _sqlite_remaining > 0 else 0.0
+                    sync_channel_talk_customer(
+                        customer_name=cust_name.strip(),
+                        phone_number=phone1.strip(),
+                        purchase_amount=final_sales_save,
+                        item_category=category or "",
+                        purchase_date=order_date,
+                        store_tag_key=store_tag_key_ct,
+                        is_returning=(not is_new_customer),
+                        unpaid_balance=unpaid_ct,
+                    )
                 except Exception:
                     pass
             threading.Thread(target=_channel_talk_sync, daemon=True).start()
-            # 입력값 초기화 후 새 등록 모드로 전환 (중복 등록 방지) — toast로 표시해 레이아웃 깜빡임 완화
             st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             # 신규 매출 등록 관련 상태 초기화
@@ -6392,40 +6457,97 @@ def render_customer_balance():
                 except Exception as e:
                     st.error(f"엑셀 파일을 읽을 수 없습니다: {e}")
 
-        # 채널톡 연동: PUSH 전용 (신규 매출 등록 시에만 채널톡으로 자동 전송, 태그 형식: 매장키구매/품목)
-        with st.expander("📤 채널톡 연동 안내 (PUSH 전용)"):
-            st.caption("채널톡 연동은 **PUSH 방식만** 사용합니다. '새로운 매출 등록'에서 매출을 저장하면 해당 고객 정보가 채널톡에 자동으로 전송되며, 고객 태그는 '매장구매/품목' 형식(예: 삼산구매/옷장)으로 저장됩니다. 채널톡에서 고객을 불러오는 PULL 기능은 사용하지 않습니다.")
+        # 채널톡 PUSH + PULL 연동
+        with st.expander("📤 채널톡 연동 (PUSH 자동 / PULL 단건 조회)"):
+            st.caption(
+                "**PUSH**: '새로운 매출 등록' 저장 시 해당 고객 정보가 채널톡에 자동 전송됩니다. "
+                "태그 형식: `매장키구매/품목` (예: 삼산구매/옷장). "
+                "재구매 시 `재구매_매장키`, 미수금 있을 시 `미수금_매장키` 태그도 자동 추가됩니다.\n\n"
+                "**PULL**: 아래에서 전화번호로 채널톡 고객 정보를 단건 조회할 수 있습니다."
+            )
+            ct_secrets_ok = bool(_get_channel_talk_secrets())
+            if not ct_secrets_ok:
+                st.warning("채널톡 API 키가 설정되지 않았습니다. `.streamlit/secrets.toml`의 `[channel_talk]` 항목을 설정해 주세요.")
+            else:
+                st.success("채널톡 API 키가 설정되어 있습니다.")
 
-        # 채널톡 푸시 수신 현황: DB 전송 여부 확인 (우리 쪽에서만 확인)
-        with st.expander("📋 채널톡 푸시 수신 현황 (DB 전송 확인)"):
-            st.caption("채널톡에서 푸시(웹훅)가 들어왔을 때 우리 DB에 등록되었는지 확인합니다. 채널톡 쪽 확인 없이 앱에서만 확인 가능합니다.")
-            conn_m = get_master_conn()
-            try:
-                role = (st.session_state.get("current_user") or {}).get("role", "")
-                if role == "superadmin":
-                    log_df = pd.read_sql(
-                        "SELECT id, created_at, store_key, phone, name, status, message, db_filename, customer_id FROM ChannelTalkWebhookLog ORDER BY id DESC LIMIT 100",
-                        conn_m,
-                    )
+            st.markdown("---")
+            st.markdown("**📥 채널톡 고객 단건 조회 (PULL)**")
+            col_ph, col_btn = st.columns([3, 1])
+            with col_ph:
+                ct_pull_phone = st.text_input(
+                    "조회할 전화번호 입력",
+                    placeholder="01012345678",
+                    key="ct_pull_phone_input",
+                    label_visibility="collapsed",
+                )
+            with col_btn:
+                ct_pull_btn = st.button("채널톡 조회", key="ct_pull_btn", use_container_width=True)
+            if ct_pull_btn and ct_pull_phone and ct_pull_phone.strip():
+                if not ct_secrets_ok:
+                    st.error("채널톡 API 키를 먼저 설정해 주세요.")
                 else:
-                    log_df = pd.read_sql(
-                        "SELECT id, created_at, store_key, phone, name, status, message, db_filename, customer_id FROM ChannelTalkWebhookLog WHERE db_filename = ? ORDER BY id DESC LIMIT 100",
-                        conn_m,
-                        params=(db_filename,),
-                    )
+                    with st.spinner("채널톡에서 고객 정보를 조회 중..."):
+                        ct_user = fetch_channel_talk_customer_by_phone(ct_pull_phone.strip())
+                    if ct_user:
+                        profile = ct_user.get("profile") or {}
+                        tags_ct = ct_user.get("tags") or []
+                        st.success("채널톡에서 고객 정보를 찾았습니다.")
+                        info_cols = st.columns(3)
+                        info_cols[0].metric("이름", profile.get("name") or ct_user.get("name") or "-")
+                        info_cols[1].metric("연락처", profile.get("mobileNumber") or ct_pull_phone.strip())
+                        info_cols[2].metric("최근 구매액", f"{int(profile.get('오프라인_최근구매액') or 0):,}원")
+                        st.write("**태그:**", ", ".join(tags_ct) if tags_ct else "없음")
+                        st.write("**최근 구매일:**", profile.get("오프라인_최근구매일") or "-")
+                        st.write("**최근 구매 품목:**", profile.get("오프라인_구매품목") or "-")
+                        st.write("**누적 구매 횟수:**", profile.get("오프라인_누적구매횟수") or "-")
+
+        # 채널톡 웹훅 수신 로그
+        with st.expander("📋 채널톡 웹훅 수신 로그"):
+            st.caption("채널톡에서 웹훅이 들어왔을 때 우리 DB에 등록된 기록입니다.")
+            log_df = pd.DataFrame()
+            try:
+                sc_log, _ = get_supabase_client()
+                if sc_log:
+                    role = (st.session_state.get("current_user") or {}).get("role", "")
+                    store_name_log = _get_current_store_name_for_customers(db_filename)
+                    q_log = sc_log.table("channel_talk_webhook_log").select(
+                        "id, created_at, store_key, phone, name, status, message, store_name, customer_id"
+                    ).order("id", desc=True).limit(100)
+                    if role != "superadmin" and store_name_log:
+                        q_log = q_log.eq("store_name", store_name_log)
+                    r_log = q_log.execute()
+                    log_df = pd.DataFrame(r_log.data) if r_log.data else pd.DataFrame()
             except Exception:
-                log_df = pd.DataFrame()
-            finally:
-                conn_m.close()
+                pass
+            if log_df.empty:
+                conn_m = get_master_conn()
+                try:
+                    role = (st.session_state.get("current_user") or {}).get("role", "")
+                    if role == "superadmin":
+                        log_df = pd.read_sql(
+                            "SELECT id, created_at, store_key, phone, name, status, message, db_filename, customer_id FROM ChannelTalkWebhookLog ORDER BY id DESC LIMIT 100",
+                            conn_m,
+                        )
+                    else:
+                        log_df = pd.read_sql(
+                            "SELECT id, created_at, store_key, phone, name, status, message, db_filename, customer_id FROM ChannelTalkWebhookLog WHERE db_filename = ? ORDER BY id DESC LIMIT 100",
+                            conn_m,
+                            params=(db_filename,),
+                        )
+                except Exception:
+                    log_df = pd.DataFrame()
+                finally:
+                    conn_m.close()
             if len(log_df) > 0:
                 log_disp = log_df.rename(columns={
                     "created_at": "수신 시각", "store_key": "매장키", "phone": "연락처", "name": "고객명",
-                    "status": "상태", "message": "메시지", "db_filename": "저장DB", "customer_id": "고객ID"
+                    "status": "상태", "message": "메시지", "store_name": "매장명",
+                    "db_filename": "저장DB", "customer_id": "고객ID"
                 })
-                st.write("**최근 푸시 수신 로그**")
                 st.dataframe(log_disp, use_container_width=True)
             else:
-                st.info("아직 채널톡 푸시 수신 로그가 없습니다. 웹훅 수신 서버를 설정하면 여기에 표시됩니다.")
+                st.info("아직 채널톡 웹훅 수신 로그가 없습니다. 웹훅 수신 서버를 설정하면 여기에 표시됩니다.")
             st.write("**채널톡으로 등록된 고객 (본 매장)**")
             try:
                 sc, _ = get_supabase_client()
