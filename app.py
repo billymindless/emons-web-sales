@@ -22,6 +22,11 @@ import time
 import plotly.express as px
 import plotly.graph_objects as go
 try:
+    from crm_automation import render_crm_menu  # type: ignore
+    CRM_MODULE_AVAILABLE = True
+except ImportError:
+    CRM_MODULE_AVAILABLE = False
+try:
     import folium
     from folium.plugins import MarkerCluster
     from streamlit_folium import st_folium
@@ -7779,6 +7784,7 @@ def main():
             "4. 고객 및 잔금 관리",
             "5. 매장 관리자 메뉴",
             "6. 월별 결제수단 집계표",
+            "7. 고객 CRM 자동화",
         ]
     else:
         tab_labels = [
@@ -7833,6 +7839,11 @@ def main():
         render_store_admin_employees()
     elif role == "store_admin" and idx == 5:
         render_monthly_payment_report(is_superadmin=False)
+    elif role == "store_admin" and idx == 6:
+        if CRM_MODULE_AVAILABLE:
+            render_crm_menu()
+        else:
+            st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
 
 
 if __name__ == "__main__":
