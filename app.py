@@ -5571,16 +5571,37 @@ def _customer_search_fragment_impl(db_filename: str):
                 return f"{r0['name']} ({r0.get('phone1') or '-'})"
             return str(cid)
 
+        def _on_customer_select():
+            """selectbox 값이 바뀌거나 이미 선택된 상태에서도 세션 상태를 항상 갱신."""
+            sel_id = st.session_state.get("new_sales_cust_select")
+            if sel_id is None:
+                return
+            _results = st.session_state.get("_cust_search_results") or []
+            if not _results:
+                return
+            _customers = pd.DataFrame(_results)
+            matched = _customers[_customers["id"] == sel_id]
+            if matched.empty:
+                return
+            r0 = matched.iloc[0]
+            st.session_state["_new_sales_selected_customer"] = dict(r0)
+            st.session_state["new_sales_cust_name"] = r0.get("name") or ""
+            st.session_state["phone1"] = _format_phone_hyphen(r0.get("phone1") or "") or ""
+            st.session_state["phone2"] = _format_phone_hyphen(r0.get("phone2") or "") or ""
+            st.session_state["address_manual"] = r0.get("address") or st.session_state.get("address_manual", "")
+
         st.caption("고객을 선택하면 아래 입력란에 이름·전화번호·주소가 자동 입력됩니다.")
-        sel = st.selectbox("검색 결과에서 고객 선택 *", cust_options, format_func=_fmt, key="new_sales_cust_select")
-        if sel:
-            row = customers[customers["id"] == sel].iloc[0]
-            st.session_state["_new_sales_selected_customer"] = dict(row)
-            st.session_state["new_sales_cust_name"] = row.get("name") or ""
-            st.session_state["phone1"] = _format_phone_hyphen(row.get("phone1") or "") or ""
-            st.session_state["phone2"] = _format_phone_hyphen(row.get("phone2") or "") or ""
-            st.session_state["address_manual"] = row.get("address") or st.session_state.get("address_manual", "")
-            st.rerun()
+        st.selectbox(
+            "검색 결과에서 고객 선택 *",
+            cust_options,
+            format_func=_fmt,
+            key="new_sales_cust_select",
+            on_change=_on_customer_select,
+        )
+        # selectbox가 처음 렌더링될 때(검색 직후)도 첫 번째 항목을 자동 반영
+        # on_change는 값이 변경될 때만 실행되므로, 세션에 선택 결과가 없는 경우 직접 세팅
+        if not st.session_state.get("_new_sales_selected_customer"):
+            _on_customer_select()
     elif search_clicked and q and q.strip():
         st.info("검색 결과가 없습니다. **신규 고객 등록** 탭에서 새로 등록하세요.")
 
