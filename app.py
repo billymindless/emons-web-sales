@@ -5564,12 +5564,21 @@ def _customer_search_fragment_impl(db_filename: str):
         customers = pd.DataFrame(results)
         cust_options = list(customers["id"].tolist())
 
+        # 동명이인 판별: 이름이 중복되는 경우 주소 앞 10자도 표시
+        _name_counts = customers["name"].value_counts()
+
         def _fmt(cid):
             row = customers[customers["id"] == cid]
-            if len(row) > 0:
-                r0 = row.iloc[0]
-                return f"{r0['name']} ({r0.get('phone1') or '-'})"
-            return str(cid)
+            if len(row) == 0:
+                return str(cid)
+            r0 = row.iloc[0]
+            name = r0.get("name") or "-"
+            phone = r0.get("phone1") or "-"
+            if _name_counts.get(name, 1) > 1:
+                addr = str(r0.get("address") or "")
+                addr_hint = ("·" + addr[:10]) if addr else ""
+                return f"{name} ({phone}{addr_hint})"
+            return f"{name} ({phone})"
 
         def _on_customer_select():
             """selectbox 값이 바뀌거나 이미 선택된 상태에서도 세션 상태를 항상 갱신."""
@@ -5664,20 +5673,55 @@ def render_new_sales():
                 st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
             finally:
                 conn.close()
-    # 고객 선택: [기존 고객 검색] / [신규 고객 등록] 물리적 완전 분리 (st.tabs), @st.fragment로 검색 부하 경감
-    cust_tab1, cust_tab2 = st.tabs(["기존 고객 검색", "신규 고객 등록"])
+    # 고객 선택: 기본 모드 = 신규 고객 등록, [기존 고객 검색] 버튼으로 검색 패널 열기
+    if "_cust_search_panel_open" not in st.session_state:
+        st.session_state["_cust_search_panel_open"] = False
+
+    _panel_open = st.session_state["_cust_search_panel_open"]
+    _col_new, _col_search = st.columns(2)
+    with _col_new:
+        if st.button(
+            "✏️ 신규 고객으로 등록",
+            key="btn_new_cust_mode",
+            type="secondary" if _panel_open else "primary",
+            use_container_width=True,
+        ):
+            st.session_state["_cust_search_panel_open"] = False
+            for _k in ["_new_sales_selected_customer", "_cust_search_results",
+                       "new_sales_cust_name", "new_sales_cust_search", "new_sales_cust_select"]:
+                st.session_state.pop(_k, None)
+            st.rerun()
+    with _col_search:
+        if st.button(
+            "🔍 기존 고객 검색",
+            key="btn_open_cust_search",
+            type="primary" if _panel_open else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["_cust_search_panel_open"] = True
+            st.rerun()
+
+    if st.session_state.get("_cust_search_panel_open"):
+        _customer_search_fragment(db_filename)
+
     selected_customer_row = st.session_state.get("_new_sales_selected_customer")
     is_new_customer = selected_customer_row is None
+
+    if selected_customer_row and st.session_state.get("_cust_search_panel_open"):
+        _sel_name = selected_customer_row.get("name") or ""
+        _sel_phone = selected_customer_row.get("phone1") or "-"
+        st.success(f"✅ 선택된 고객: **{_sel_name}** ({_sel_phone})")
+        if st.button("❌ 선택 해제 (신규 고객으로 전환)", key="btn_clear_cust_sel"):
+            for _k in ["_new_sales_selected_customer", "_cust_search_results",
+                       "new_sales_cust_name", "new_sales_cust_search", "new_sales_cust_select"]:
+                st.session_state.pop(_k, None)
+            st.session_state["_cust_search_panel_open"] = False
+            st.rerun()
+
     default_name = (selected_customer_row.get("name") or "") if selected_customer_row else ""
     default_phone1 = (selected_customer_row.get("phone1") or "") if selected_customer_row else ""
     default_phone2 = (selected_customer_row.get("phone2") or "") if selected_customer_row else ""
     default_addr = (selected_customer_row.get("address") or st.session_state.get("address_manual", "")) if selected_customer_row else st.session_state.get("address_manual", "")
-
-    with cust_tab1:
-        _customer_search_fragment(db_filename)
-
-    with cust_tab2:
-        st.caption("이름·연락처·주소를 입력하세요. (신규 고객)")
     cust_name_key = "new_sales_cust_name"
     if cust_name_key not in st.session_state:
         st.session_state[cust_name_key] = default_name
@@ -6042,6 +6086,7 @@ def render_new_sales():
             threading.Thread(target=_channel_talk_sync_supa, daemon=True).start()
             st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
+            st.session_state["_cust_search_panel_open"] = False
             for key in list(st.session_state.keys()):
                 if key in (
                     "phone1", "phone2", "address_manual", "address_detail",
@@ -6160,6 +6205,7 @@ def render_new_sales():
             threading.Thread(target=_channel_talk_sync, daemon=True).start()
             st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
+            st.session_state["_cust_search_panel_open"] = False
             # 신규 매출 등록 관련 상태 초기화
             for key in list(st.session_state.keys()):
                 if key in (
