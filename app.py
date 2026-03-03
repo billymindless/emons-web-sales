@@ -2441,7 +2441,42 @@ def _insert_payment_history(
 
 
 def _render_order_audit_trail(db_filename: str, order_id: int):
-    """주문(Order) 기준 변경 이력(AuditLogs) + 관련 결제 영수증 표시 공통 UI."""
+    """주문(Order) 기준 변경 이력(AuditLogs) + 관련 결제 영수증 표시 공통 UI.
+    Supabase 환경: app_edit_requests 테이블에서 이력 조회. SQLite 환경: AuditLogs 테이블 사용."""
+    logs = pd.DataFrame()
+    # ── Supabase 경로 ──
+    if _supabase_orders_payments_available():
+        try:
+            sc, err = get_supabase_client()
+            if sc and not err:
+                r = sc.table("app_edit_requests").select(
+                    "created_at, requested_by, payload, reason, status, reviewed_by, reviewed_at"
+                ).eq("db_filename", db_filename).eq("entity_id", int(order_id)).eq("entity_type", "Order").order("created_at", desc=True).execute()
+                rows = r.data or []
+                if rows:
+                    logs = pd.DataFrame([{
+                        "created_at": x.get("created_at", "")[:16],
+                        "actor_username": x.get("requested_by", "-"),
+                        "field_name": "수정 요청",
+                        "old_value": "-",
+                        "new_value": str(x.get("payload") or ""),
+                        "reason": x.get("reason", "-"),
+                        "status": x.get("status", "-"),
+                        "reviewed_by": x.get("reviewed_by") or "-",
+                    } for x in rows])
+        except Exception:
+            logs = pd.DataFrame()
+        if logs.empty:
+            st.info("변경 이력이 없습니다. (수정 요청 이력만 표시됩니다)")
+        else:
+            for _, row in logs.iterrows():
+                _status_icon = "✅" if row.get("status") == "approved" else ("❌" if row.get("status") == "rejected" else "⏳")
+                with st.expander(f"{row['created_at']} — {row['actor_username']} [{_status_icon} {row.get('status', '-')}]"):
+                    st.write(f"**사유:** {row['reason']}")
+                    st.write(f"**검토자:** {row.get('reviewed_by', '-')}")
+                    st.caption(f"변경 내용(payload): {row['new_value']}")
+        return
+    # ── SQLite 경로 ──
     conn = get_tenant_conn(db_filename)
     if not conn:
         st.info("이력 정보를 불러올 수 없습니다.")
@@ -2468,7 +2503,7 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
                 st.write(f"변경 전: `{row['old_value']}`")
                 st.write(f"변경 후: `{row['new_value']}`")
                 st.write(f"사유: {row['reason']}")
-    # 관련 결제 영수증 조회
+    # 관련 결제 영수증 조회 (SQLite 전용)
     try:
         receipts = pd.read_sql(
             """
@@ -6870,12 +6905,19 @@ def render_customer_balance():
                     with st.expander("📝 데이터 수정하기"):
                         cust_row = customers[customers["id"] == cid].iloc[0]
                         edit_prefix = f"edit_c{cid}"
-                        if f"{edit_prefix}_loaded" not in st.session_state:
-                            st.session_state[f"{edit_prefix}_loaded"] = True
-                            st.session_state[f"{edit_prefix}_name"] = cust_row["name"] or ""
-                            st.session_state[f"{edit_prefix}_phone1"] = cust_row["phone1"] or ""
-                            st.session_state[f"{edit_prefix}_phone2"] = cust_row["phone2"] or ""
-                            st.session_state[f"{edit_prefix}_address"] = cust_row["address"] or ""
+                        _db_name = str(cust_row.get("name") or "")
+                        _db_phone1 = str(cust_row.get("phone1") or "")
+                        _db_phone2 = str(cust_row.get("phone2") or "")
+                        _db_addr = str(cust_row.get("address") or "")
+                        # 값이 없을 때마다 DB에서 재로딩 (한 번 로드 후 빈값이면 다시 채움)
+                        if not st.session_state.get(f"{edit_prefix}_name"):
+                            st.session_state[f"{edit_prefix}_name"] = _db_name
+                        if not st.session_state.get(f"{edit_prefix}_phone1"):
+                            st.session_state[f"{edit_prefix}_phone1"] = _db_phone1
+                        if f"{edit_prefix}_phone2" not in st.session_state:
+                            st.session_state[f"{edit_prefix}_phone2"] = _db_phone2
+                        if f"{edit_prefix}_address" not in st.session_state:
+                            st.session_state[f"{edit_prefix}_address"] = _db_addr
                         order_options = orders["id"].tolist()
                         sel_oid = st.selectbox("수정할 주문 선택", order_options, key=f"{edit_prefix}_order_sel")
                         if sel_oid:
