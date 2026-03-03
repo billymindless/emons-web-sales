@@ -7547,6 +7547,9 @@ def render_dashboard():
     expected_total_sales = 0.0
     margin_pct = 0.0
     order_count = 0
+    # 당일 sales 테이블 기반 계약 신규/조정 분리
+    today_sales_new = 0.0    # 오늘 신규 계약 (양수)
+    today_sales_adj = 0.0    # 오늘 금액 수정 조정 (음수 or 양수)
     try:
         if not payments.empty and "payment_date" in payments.columns and "amount" in payments.columns:
             pmt = payments.copy()
@@ -7578,14 +7581,43 @@ def render_dashboard():
                     sum_cost = float(tot_cost.sum())
                     margin_pct = (sum_sales - sum_cost) / sum_sales * 100 if sum_sales else 0.0
                     order_count = len(month_ord)
+
+        # sales 테이블에서 오늘 신규 계약 vs 금액 수정 조정 분리
+        if not sales_df.empty and "transaction_date" in sales_df.columns:
+            _sd = sales_df.copy()
+            _sd["transaction_date"] = pd.to_datetime(_sd["transaction_date"], errors="coerce")
+            _sd = _sd.dropna(subset=["transaction_date"])
+            _sd["_date"] = _sd["transaction_date"].dt.date
+            _today_sd = _sd[_sd["_date"] == today]
+            if not _today_sd.empty:
+                today_sales_new = float(_today_sd[_today_sd["amount"] > 0]["amount"].sum())
+                today_sales_adj = float(_today_sd[_today_sd["amount"] < 0]["amount"].sum())
     except Exception:
         pass
 
+    today_sales_net = today_sales_new + today_sales_adj
+
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        st.metric("일일 매출", f"{daily_sales:,.0f}원")
+        if today_sales_adj < 0:
+            st.metric(
+                "일일 계약 순매출",
+                f"{today_sales_net:,.0f}원",
+                delta=f"{today_sales_adj:,.0f}원 조정",
+                delta_color="normal",
+            )
+            st.caption(f"신규 계약 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원")
+        elif today_sales_adj > 0:
+            st.metric(
+                "일일 계약 순매출",
+                f"{today_sales_net:,.0f}원",
+                delta=f"+{today_sales_adj:,.0f}원 조정",
+            )
+            st.caption(f"신규 계약 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원")
+        else:
+            st.metric("일일 매출", f"{daily_sales:,.0f}원")
     with c2:
-        st.metric("누적 매출", f"{cumulative_sales:,.0f}원")
+        st.metric("누적 수납액", f"{cumulative_sales:,.0f}원")
     with c3:
         st.metric("예상 총매출", f"{expected_total_sales:,.0f}원")
     with c4:
