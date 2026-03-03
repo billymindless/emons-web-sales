@@ -4246,16 +4246,12 @@ def _superadmin_tab4_backup_csv():
         st.warning("선택 기간에 해당하는 데이터가 없습니다.")
         return
     out_df = pd.DataFrame(rows)
-    csv_str = out_df.to_csv(index=False)
-    try:
-        csv_content = csv_str.encode("cp949")
-    except (UnicodeEncodeError, LookupError):
-        csv_content = csv_str.encode("utf-8-sig")
+    csv_content = out_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "CSV 다운로드",
         data=csv_content,
         file_name=f"매출백업_{backup_start}_{backup_end}.csv",
-        mime="text/csv",
+        mime="text/csv; charset=utf-8",
         key="backup_dl"
     )
 
@@ -4333,16 +4329,12 @@ def _superadmin_tab_unpaid_report():
     out_df = pd.DataFrame(rows)
     display_df = _format_df_display(out_df, ["총판매금액", "미수금액(잔금)"])
     st.dataframe(display_df, use_container_width=True)
-    csv_str = out_df.to_csv(index=False)
-    try:
-        csv_content = csv_str.encode("cp949")
-    except (UnicodeEncodeError, LookupError):
-        csv_content = csv_str.encode("utf-8-sig")
+    csv_content = out_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "미수금 레포트 CSV 다운로드",
         data=csv_content,
         file_name=f"미수금레포트_{report_start}_{report_end}.csv",
-        mime="text/csv",
+        mime="text/csv; charset=utf-8",
         key="unpaid_report_dl",
     )
 
@@ -6488,16 +6480,12 @@ def render_customer_balance():
                 },
             ]
             sample_df = pd.DataFrame(sample_rows, columns=["이름", "전화번호1", "전화번호2", "주소"])
-            _sample_csv_str = sample_df.to_csv(index=False)
-            try:
-                _sample_csv_bytes = _sample_csv_str.encode("utf-8-sig")
-            except (UnicodeEncodeError, LookupError):
-                _sample_csv_bytes = _sample_csv_str.encode("utf-8")
+            _sample_csv_bytes = sample_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button(
                 "📥 고객 일괄등록 샘플 CSV 다운로드",
                 data=_sample_csv_bytes,
                 file_name="고객_일괄등록_샘플.csv",
-                mime="text/csv",
+                mime="text/csv; charset=utf-8",
                 key="customer_bulk_sample_csv",
             )
             excel_upload = st.file_uploader("엑셀 파일 (.xlsx)", type=["xlsx"], key="customer_excel_upload")
