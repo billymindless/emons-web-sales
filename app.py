@@ -3889,7 +3889,10 @@ def _superadmin_tab1_integrated_dashboard():
     month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
     start_str = month_start.isoformat()
     end_str = month_end.isoformat()
-
+    all_orders = []
+    all_payments = []
+    store_orders = {}
+    store_payments = {}
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
         if _supabase_orders_payments_available():
