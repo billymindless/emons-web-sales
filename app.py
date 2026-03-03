@@ -4466,9 +4466,13 @@ def _superadmin_tab5_store_accounts():
 
 
 def render_monthly_payment_report(is_superadmin: bool):
-    """월별 결제수단 집계표. Superadmin: 매장 선택 가능 / Store_admin: 소속 매장 고정.
-    조회 방식: 월별/연도별 | 직접 날짜 지정"""
+    """월별 결제수단 집계표 및 직원별 판매 실적 조회 모듈."""
     today = date.today()
+    
+    st.subheader("📊 통계 및 집계 리포트")
+    report_type = st.radio("보고서 종류 선택", ["💳 결제수단 집계표", "👤 직원별 판매 실적"], horizontal=True, key="report_type_radio")
+    st.divider()
+
     query_mode = st.radio(
         "조회 방식",
         ["월별/연도별 조회", "직접 날짜 지정"],
@@ -4476,11 +4480,7 @@ def render_monthly_payment_report(is_superadmin: bool):
         key="payment_report_mode",
     )
     if query_mode == "월별/연도별 조회":
-        report_year = st.selectbox(
-            "조회 연도",
-            list(range(today.year, today.year - 6, -1)),
-            key="payment_report_year",
-        )
+        report_year = st.selectbox("조회 연도", list(range(today.year, today.year - 6, -1)), key="payment_report_year")
         date_range_start = date(report_year, 1, 1)
         date_range_end = date(report_year, 12, 31)
     else:
@@ -4509,144 +4509,278 @@ def render_monthly_payment_report(is_superadmin: bool):
         match = stores[stores["db_filename"] == db_filename]
         selected_store = match["store_name"].iloc[0] if len(match) > 0 else "매장"
 
-    all_payments = []
-    if is_superadmin and selected_store == "전체 매장 통합":
-        for _, s in stores.iterrows():
-            db_fn = s["db_filename"]
+    # ==========================================
+    # 모드 1: 결제수단 집계표
+    # ==========================================
+    if report_type == "💳 결제수단 집계표":
+        all_payments = []
+        if is_superadmin and selected_store == "전체 매장 통합":
+            for _, s in stores.iterrows():
+                db_fn = s["db_filename"]
+                if _supabase_orders_payments_available():
+                    df = _load_payments_supabase(db_fn)
+                    if not df.empty and "payment_date" in df.columns:
+                        df = df[df["payment_date"].notna() & (df["payment_date"] != "")]
+                        df = df[["payment_date", "payment_method", "card_company", "amount"]]
+                        df["_store"] = s["store_name"]
+                        all_payments.append(df)
+                else:
+                    conn = get_tenant_conn(db_fn)
+                    if not conn:
+                        continue
+                    try:
+                        df = pd.read_sql("SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
+                        df["_store"] = s["store_name"]
+                        all_payments.append(df)
+                    except Exception:
+                        pass
+                    finally:
+                        conn.close()
+            if not all_payments:
+                st.info("선택 기간/매장에 결제 데이터가 없습니다.")
+                return
+            all_payments_nonempty = [df for df in all_payments if df is not None and len(df) > 0]
+            if not all_payments_nonempty:
+                st.info("선택 기간/매장에 결제 데이터가 없습니다.")
+                return
+            pay_df = pd.concat(all_payments_nonempty, ignore_index=True)
+        else:
+            db_fn = db_filename if not is_superadmin else stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
             if _supabase_orders_payments_available():
-                df = _load_payments_supabase(db_fn)
-                if not df.empty and "payment_date" in df.columns:
-                    df = df[df["payment_date"].notna() & (df["payment_date"] != "")]
-                    df = df[["payment_date", "payment_method", "card_company", "amount"]]
-                    df["_store"] = s["store_name"]
-                    all_payments.append(df)
+                pay_df = _load_payments_supabase(db_fn)
+                if pay_df.empty or "payment_date" not in pay_df.columns:
+                    pay_df = pd.DataFrame(columns=["payment_date", "payment_method", "card_company", "amount"])
+                else:
+                    pay_df = pay_df[pay_df["payment_date"].notna() & (pay_df["payment_date"] != "")]
+                    pay_df = pay_df[["payment_date", "payment_method", "card_company", "amount"]]
             else:
                 conn = get_tenant_conn(db_fn)
                 if not conn:
-                    continue
+                    st.error("매장 DB를 찾을 수 없습니다.")
+                    return
                 try:
-                    df = pd.read_sql(
-                        "SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''",
-                        conn,
-                    )
-                    df["_store"] = s["store_name"]
-                    all_payments.append(df)
+                    pay_df = pd.read_sql("SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
                 except Exception:
-                    pass
-                finally:
+                    st.error("결제 데이터를 불러올 수 없습니다.")
                     conn.close()
-        if not all_payments:
-            st.info("선택 기간/매장에 결제 데이터가 없습니다.")
-            return
-        all_payments_nonempty = [df for df in all_payments if df is not None and len(df) > 0]
-        if not all_payments_nonempty:
-            st.info("선택 기간/매장에 결제 데이터가 없습니다.")
-            return
-        pay_df = pd.concat(all_payments_nonempty, ignore_index=True)
-    else:
-        db_fn = db_filename if not is_superadmin else stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
-        if _supabase_orders_payments_available():
-            pay_df = _load_payments_supabase(db_fn)
-            if pay_df.empty or "payment_date" not in pay_df.columns:
-                pay_df = pd.DataFrame(columns=["payment_date", "payment_method", "card_company", "amount"])
-            else:
-                pay_df = pay_df[pay_df["payment_date"].notna() & (pay_df["payment_date"] != "")]
-                pay_df = pay_df[["payment_date", "payment_method", "card_company", "amount"]]
-        else:
-            conn = get_tenant_conn(db_fn)
-            if not conn:
-                st.error("매장 DB를 찾을 수 없습니다.")
-                return
-            try:
-                pay_df = pd.read_sql(
-                    "SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''",
-                    conn,
-                )
-            except Exception:
-                st.error("결제 데이터를 불러올 수 없습니다.")
+                    return
                 conn.close()
-                return
-            conn.close()
 
-    pay_df["payment_date"] = pd.to_datetime(pay_df["payment_date"], errors="coerce")
-    pay_df = pay_df[pay_df["payment_date"].notna()]
-    pay_df["결제일자"] = pay_df["payment_date"].dt.strftime("%Y-%m-%d")
-    pay_df["결제월"] = pay_df["payment_date"].dt.strftime("%Y-%m")
-    pay_df["_pd"] = pay_df["payment_date"].dt.date
-    pay_df = pay_df[(pay_df["_pd"] >= date_range_start) & (pay_df["_pd"] <= date_range_end)]
-    pay_df["payment_method"] = pay_df["payment_method"].fillna("미지정")
-    if "card_company" not in pay_df.columns:
-        pay_df["card_company"] = None
-    pay_df["amount"] = pd.to_numeric(pay_df["amount"], errors="coerce").fillna(0)
+        pay_df["payment_date"] = pd.to_datetime(pay_df["payment_date"], errors="coerce")
+        pay_df = pay_df[pay_df["payment_date"].notna()]
+        pay_df["결제일자"] = pay_df["payment_date"].dt.strftime("%Y-%m-%d")
+        pay_df["결제월"] = pay_df["payment_date"].dt.strftime("%Y-%m")
+        pay_df["_pd"] = pay_df["payment_date"].dt.date
+        pay_df = pay_df[(pay_df["_pd"] >= date_range_start) & (pay_df["_pd"] <= date_range_end)]
+        pay_df["payment_method"] = pay_df["payment_method"].fillna("미지정")
+        if "card_company" not in pay_df.columns:
+            pay_df["card_company"] = None
+        pay_df["amount"] = pd.to_numeric(pay_df["amount"], errors="coerce").fillna(0)
 
-    # 상세 결제수단(파생 컬럼): 신용/체크/메인페이 → 카드사별 분리 (신용_신한, 메인페이_국민 등)
-    _card_short = {"신한카드": "신한", "삼성카드": "삼성", "KB국민카드": "국민", "현대카드": "현대",
-                   "롯데카드": "롯데", "우리카드": "우리", "하나카드": "하나", "BC카드": "BC", "NH농협카드": "농협", "기타": "기타"}
-    def _to_detailed(row):
-        meth = row["payment_method"] or "미지정"
-        if meth in ("신용카드", "체크카드", "메인페이"):
-            cc = row.get("card_company") or ""
-            short = _card_short.get(cc, cc or "미지정")
-            if meth == "신용카드":
-                prefix = "신용"
-            elif meth == "체크카드":
-                prefix = "체크"
+        _card_short = {"신한카드": "신한", "삼성카드": "삼성", "KB국민카드": "국민", "현대카드": "현대", "롯데카드": "롯데", "우리카드": "우리", "하나카드": "하나", "BC카드": "BC", "NH농협카드": "농협", "기타": "기타"}
+        def _to_detailed(row):
+            meth = row["payment_method"] or "미지정"
+            if meth in ("신용카드", "체크카드", "메인페이"):
+                cc = row.get("card_company") or ""
+                short = _card_short.get(cc, cc or "미지정")
+                if meth == "신용카드": prefix = "신용"
+                elif meth == "체크카드": prefix = "체크"
+                else: prefix = "메인페이"
+                return f"{prefix}_{short}" if cc else meth
+            return meth
+        pay_df["detailed_payment"] = pay_df.apply(_to_detailed, axis=1)
+
+        if len(pay_df) == 0:
+            st.info("선택한 기간에 결제 데이터가 없습니다.")
+            return
+
+        index_col = "결제월" if query_mode == "월별/연도별 조회" else "결제일자"
+        total_label = "월별 총 결제액(Total)" if query_mode == "월별/연도별 조회" else "일별 총 결제액(Total)"
+        pivot = pay_df.pivot_table(index=index_col, columns="detailed_payment", values="amount", aggfunc="sum", fill_value=0, margins=False)
+        pivot = pivot.fillna(0)
+        
+        def _col_sort_key(c):
+            if str(c).startswith("신용_"): return (0, str(c))
+            if str(c).startswith("체크_"): return (1, str(c))
+            order = {"이체": 2, "계좌이체": 2, "지역화폐": 3, "온누리": 4, "현금": 5}
+            return (order.get(c, 6), str(c))
+        pivot = pivot.reindex(columns=sorted(pivot.columns, key=_col_sort_key))
+        pivot[total_label] = pivot.sum(axis=1)
+        total_row = pd.DataFrame(pivot.sum(axis=0)).T
+        total_row.index = ["총합계"]
+        if pivot.empty:
+            pivot = total_row.copy()
+        else:
+            pivot = pd.concat([pivot, total_row], ignore_index=False)
+        pivot = pivot.astype(int)
+
+        display_df = pivot.map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
+        st.dataframe(display_df, use_container_width=True)
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            pivot.to_excel(writer, sheet_name="결제수단집계")
+        buf.seek(0)
+        store_label = "전체매장" if (is_superadmin and selected_store == "전체 매장 통합") else selected_store.replace(" ", "_")
+        if query_mode == "월별/연도별 조회":
+            file_name = f"결제수단집계_{store_label}_{date_range_start.year}년.xlsx"
+        else:
+            file_name = f"결제수단집계_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx"
+        st.download_button("엑셀 다운로드", data=buf.getvalue(), file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="monthly_payment_report_dl")
+
+    # ==========================================
+    # 모드 2: 직원별 판매 실적 추적 (상세 데이터 추가)
+    # ==========================================
+    else:
+        all_orders = []
+        if is_superadmin and selected_store == "전체 매장 통합":
+            for _, s in stores.iterrows():
+                db_fn = s["db_filename"]
+                if _supabase_orders_payments_available():
+                    df = _load_orders_supabase(db_fn, "id, order_date, total_amount, actual_margin, employee_names, display_sales_amount, category", limit=None)
+                else:
+                    conn = get_tenant_conn(db_fn)
+                    if not conn: continue
+                    try:
+                        cur = conn.execute("PRAGMA table_info(Orders)")
+                        cols = [r[1] for r in cur.fetchall()]
+                        q_cols = "id, order_date, total_amount, actual_margin, employee_names, category"
+                        if "display_sales_amount" in cols: q_cols += ", display_sales_amount"
+                        df = pd.read_sql(f"SELECT {q_cols} FROM Orders", conn)
+                    except Exception:
+                        df = pd.DataFrame()
+                    finally:
+                        conn.close()
+                if not df.empty:
+                    df["_store"] = s["store_name"]
+                    all_orders.append(df)
+        else:
+            db_fn = db_filename if not is_superadmin else stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
+            if _supabase_orders_payments_available():
+                df = _load_orders_supabase(db_fn, "id, order_date, total_amount, actual_margin, employee_names, display_sales_amount, category", limit=None)
             else:
-                prefix = "메인페이"
-            return f"{prefix}_{short}" if cc else meth
-        return meth
-    pay_df["detailed_payment"] = pay_df.apply(_to_detailed, axis=1)
-
-    if len(pay_df) == 0:
-        st.info("선택한 기간에 결제 데이터가 없습니다.")
-        return
-
-    index_col = "결제월" if query_mode == "월별/연도별 조회" else "결제일자"
-    total_label = "월별 총 결제액(Total)" if query_mode == "월별/연도별 조회" else "일별 총 결제액(Total)"
-    pivot = pay_df.pivot_table(
-        index=index_col,
-        columns="detailed_payment",
-        values="amount",
-        aggfunc="sum",
-        fill_value=0,
-        margins=False,
-    )
-    pivot = pivot.fillna(0)
-    # 컬럼 정렬: 신용 그룹 → 체크 그룹 → 이체/계좌이체 → 지역화폐 → 온누리 → 현금 → 기타
-    def _col_sort_key(c):
-        if str(c).startswith("신용_"): return (0, str(c))
-        if str(c).startswith("체크_"): return (1, str(c))
-        order = {"이체": 2, "계좌이체": 2, "지역화폐": 3, "온누리": 4, "현금": 5}
-        return (order.get(c, 6), str(c))
-    pivot = pivot.reindex(columns=sorted(pivot.columns, key=_col_sort_key))
-    pivot[total_label] = pivot.sum(axis=1)
-    total_row = pd.DataFrame(pivot.sum(axis=0)).T
-    total_row.index = ["총합계"]
-    if pivot.empty:
-        pivot = total_row.copy()
-    else:
-        pivot = pd.concat([pivot, total_row], ignore_index=False)
-    pivot = pivot.astype(int)
-
-    display_df = pivot.map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
-    st.dataframe(display_df, use_container_width=True)
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pivot.to_excel(writer, sheet_name="결제수단집계")
-    buf.seek(0)
-    store_label = "전체매장" if (is_superadmin and selected_store == "전체 매장 통합") else selected_store.replace(" ", "_")
-    if query_mode == "월별/연도별 조회":
-        file_name = f"결제수단집계_{store_label}_{date_range_start.year}년.xlsx"
-    else:
-        file_name = f"결제수단집계_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx"
-    st.download_button(
-        "엑셀 다운로드",
-        data=buf.getvalue(),
-        file_name=file_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="monthly_payment_report_dl",
-    )
+                conn = get_tenant_conn(db_fn)
+                if conn:
+                    try:
+                        cur = conn.execute("PRAGMA table_info(Orders)")
+                        cols = [r[1] for r in cur.fetchall()]
+                        q_cols = "id, order_date, total_amount, actual_margin, employee_names, category"
+                        if "display_sales_amount" in cols: q_cols += ", display_sales_amount"
+                        df = pd.read_sql(f"SELECT {q_cols} FROM Orders", conn)
+                    except Exception:
+                        df = pd.DataFrame()
+                    finally:
+                        conn.close()
+                else:
+                    df = pd.DataFrame()
+            if not df.empty:
+                df["_store"] = selected_store
+                all_orders.append(df)
+        
+        if not all_orders:
+            st.info("선택 기간/매장에 주문 데이터가 없습니다.")
+            return
+            
+        ord_df = pd.concat(all_orders, ignore_index=True)
+        ord_df["order_date"] = pd.to_datetime(ord_df["order_date"], errors="coerce")
+        ord_df = ord_df[ord_df["order_date"].notna()]
+        ord_df["_pd"] = ord_df["order_date"].dt.date
+        ord_df = ord_df[(ord_df["_pd"] >= date_range_start) & (ord_df["_pd"] <= date_range_end)]
+        
+        if ord_df.empty:
+            st.info("해당 기간에 주문 데이터가 없습니다.")
+            return
+            
+        # 1. 고유 직원 목록 추출
+        unique_emps = set()
+        for emps in ord_df["employee_names"].dropna():
+            for e in str(emps).split(","):
+                if e.strip():
+                    unique_emps.add(e.strip())
+        
+        emp_opts = ["전체 직원"] + sorted(list(unique_emps))
+        selected_emp = st.selectbox("직원 선택 (실적 조회)", emp_opts, key="emp_perf_sel")
+        
+        # 2. 1/n 분배 로직 적용 및 상세 데이터 조립
+        rows = []
+        for _, r in ord_df.iterrows():
+            emps = [e.strip() for e in str(r.get("employee_names") or "").split(",") if e.strip()]
+            n = len(emps) if emps else 1
+            if not emps: continue
+            
+            amt = float(r.get("total_amount") or 0)
+            disp = float(r.get("display_sales_amount") or 0) if "display_sales_amount" in r else 0
+            margin = float(r.get("actual_margin") or 0)
+            
+            per_amt = (amt + disp) / n
+            per_margin = margin / n
+            per_cnt = 1.0 / n
+            
+            d_val = r["order_date"]
+            d_str = d_val.strftime("%Y-%m-%d")
+            m_str = d_val.strftime("%Y-%m")
+            store_nm = r.get("_store", "")
+            cat_str = r.get("category") or "-"
+            
+            for e in emps:
+                if selected_emp == "전체 직원" or selected_emp == e:
+                    rows.append({
+                        "매장명": store_nm,
+                        "일자": d_str,
+                        "월": m_str,
+                        "직원명": e,
+                        "품목": cat_str,
+                        "판매금액": per_amt,
+                        "마진": per_margin,
+                        "판매건수": per_cnt,
+                        "원본주문ID": r["id"]
+                    })
+        
+        if not rows:
+            st.info("선택한 직원의 판매 데이터가 없습니다.")
+            return
+            
+        df_emp = pd.DataFrame(rows)
+        group_col = "월" if query_mode == "월별/연도별 조회" else "일자"
+        
+        # 3. 화면 표시용 그룹핑(요약) 집계
+        if selected_emp == "전체 직원":
+            summary = df_emp.groupby(["매장명", group_col, "직원명"], as_index=False)[["판매금액", "마진", "판매건수"]].sum()
+        else:
+            summary = df_emp.groupby(["매장명", group_col], as_index=False)[["판매금액", "마진", "판매건수"]].sum()
+            summary.insert(2, "직원명", selected_emp)
+            
+        summary = summary.sort_values(by=["매장명", group_col, "판매금액"], ascending=[True, True, False]).reset_index(drop=True)
+        
+        summary["판매금액"] = summary["판매금액"].round(0).astype(int)
+        summary["마진"] = summary["마진"].round(0).astype(int)
+        summary["판매건수"] = summary["판매건수"].round(2)
+        
+        disp_df = summary.copy()
+        disp_df["판매금액"] = disp_df["판매금액"].apply(lambda x: f"{x:,}원")
+        disp_df["마진"] = disp_df["마진"].apply(lambda x: f"{x:,}원")
+        disp_df["판매건수"] = disp_df["판매건수"].apply(lambda x: f"{x:g}건")
+        
+        st.write("📌 **실적 요약 (화면용)**")
+        st.dataframe(disp_df, use_container_width=True)
+        st.caption("엑셀을 다운로드하시면 '집계요약' 시트와 개별 판매 건이 기록된 '상세내역' 시트를 모두 확인하실 수 있습니다.")
+        
+        # 4. 엑셀 다운로드 (다중 시트: 요약 + 상세 분리)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            summary.to_excel(writer, sheet_name="집계요약", index=False)
+            
+            detail_df = df_emp.copy()
+            detail_df["판매금액"] = detail_df["판매금액"].round(0).astype(int)
+            detail_df["마진"] = detail_df["마진"].round(0).astype(int)
+            detail_df["판매건수"] = detail_df["판매건수"].round(2)
+            detail_df = detail_df.sort_values(by=["일자", "매장명", "직원명"], ascending=[False, True, True])
+            detail_df.to_excel(writer, sheet_name="상세내역", index=False)
+            
+        buf.seek(0)
+        store_label = "전체매장" if (is_superadmin and selected_store == "전체 매장 통합") else selected_store.replace(" ", "_")
+        dl_name = f"직원판매실적_상세포함_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx"
+        st.download_button("📊 요약 및 상세내역 엑셀 다운로드", data=buf.getvalue(), file_name=dl_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="emp_perf_detail_dl")
 
 
 # ---------- 직원 계정 관리 및 발령 (superadmin 전용) ----------
@@ -6421,10 +6555,11 @@ def render_customer_balance():
     st.header("고객 및 잔금 관리")
     current_user = st.session_state.get("current_user") or {}
     role = current_user.get("role", "user")
-    tab_gen, tab_d10, tab_overdue = st.tabs([
+    tab_gen, tab_d10, tab_overdue, tab_anomaly = st.tabs([
         "1. 일반 고객 및 데이터 수정 (General)",
         "2. 다가오는 미수금 (배송일 D-10 이내)",
-        "3. 🚨 경고! 미결 금액 (배송일 지남 + 미수금)"
+        "3. 🚨 경고! 미결 금액 (배송일 지남 + 미수금)",
+        "4. ⚠️ 결제 이상 항목"
     ])
     today = date.today()
 
@@ -6832,7 +6967,8 @@ def render_customer_balance():
                                     if not edit_reason or not edit_reason.strip():
                                         st.warning("변경 사유를 입력하세요.")
                                     else:
-                                        conn = get_tenant_conn(db_filename)
+                                        _use_supa = _supabase_orders_payments_available()
+                                        conn = None if _use_supa else get_tenant_conn(db_filename)
                                         # 기존 값
                                         old_total = orow["total_amount"] or 0
                                         old_cost = orow.get("cost_price") or 0
@@ -6845,15 +6981,22 @@ def render_customer_balance():
                                         new_visit = st.session_state.get(f"{edit_prefix}_visit") or None
                                         new_purchase = st.session_state.get(f"{edit_prefix}_purchase") or None
                                         # 잔금 불일치 검증: 총 판매액 vs 결제 합계
-                                        if _supabase_orders_payments_available():
+                                        if _use_supa:
                                             payment_total, _ = _sum_payments_by_order_supabase(db_filename, sel_oid)
                                         else:
                                             pay_sum_row = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM Payments WHERE order_id = ?", (sel_oid,)).fetchone()
                                             payment_total = float(pay_sum_row[0]) if pay_sum_row else 0
                                         balance_check = new_total - payment_total
-                                        if balance_check != 0:
-                                            st.error("⛔ 결제 금액 불일치: 총 판매액과 결제 내역의 합계가 다릅니다. 확인 후 저장하세요.")
-                                            conn.close()
+                                        if balance_check > 0:
+                                            st.warning(f"⚠️ 미수금 {balance_check:,}원 발생: 구매 금액({new_total:,}원)이 결제 금액({int(payment_total):,}원)보다 큽니다. 저장 후 미수금 탭에서 확인·관리하세요.")
+                                            _sn_alert = _get_store_name_by_db(db_filename)
+                                            _insert_admin_alert(_sn_alert, "underpaid", f"[{_sn_alert}] 주문#{sel_oid} 미수금 {balance_check:,}원 (수정 후 잔금)")
+                                        elif balance_check < 0:
+                                            st.error(f"⛔ 초과결제 감지: 결제 금액({int(payment_total):,}원)이 구매 금액({new_total:,}원)보다 {abs(balance_check):,}원 많습니다. 결제 내역을 먼저 수정하세요.")
+                                            _sn_alert = _get_store_name_by_db(db_filename)
+                                            _insert_admin_alert(_sn_alert, "overpaid", f"[{_sn_alert}] 주문#{sel_oid} 초과결제 {abs(balance_check):,}원 감지 (수정 시도)")
+                                            if conn:
+                                                conn.close()
                                             st.stop()
                                         # 마진율 검증 (경고만, 저장 가능)
                                         margin_pct = (new_total - new_cost) / new_total * 100 if new_total else 0
@@ -6861,7 +7004,8 @@ def render_customer_balance():
                                             st.warning(f"⚠️ 주의: 마진율이 {margin_pct:.1f}%입니다. 적정 범위(15%~25%)를 벗어났습니다.")
                                         # 감사 로그: 판매 금액/원가/방문·구매 이유 변경
                                         if old_total != new_total:
-                                            _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
+                                            if conn:
+                                                _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
                                             # 회계 원칙: 차액을 오늘 날짜로 Sales 신규 Row INSERT (과거 Row는 UPDATE 하지 않음)
                                             delta = new_total - old_total
                                             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -6879,11 +7023,11 @@ def render_customer_balance():
                                             if margin_pct < 15 or margin_pct > 25:
                                                 store_name = _get_store_name_by_db(db_filename)
                                                 _insert_admin_alert(store_name, "margin", f"{store_name}에서 마진율 {margin_pct:.1f}% 건이 수정되었습니다.")
-                                        if old_cost != new_cost:
+                                        if old_cost != new_cost and conn:
                                             _insert_audit_log(conn, "Order", sel_oid, "cost_price", old_cost, new_cost, edit_reason)
-                                        if (old_visit or "") != (new_visit or ""):
+                                        if (old_visit or "") != (new_visit or "") and conn:
                                             _insert_audit_log(conn, "Order", sel_oid, "visit_reason", old_visit, new_visit, edit_reason)
-                                        if (old_purchase or "") != (new_purchase or ""):
+                                        if (old_purchase or "") != (new_purchase or "") and conn:
                                             _insert_audit_log(conn, "Order", sel_oid, "purchase_reason", old_purchase, new_purchase, edit_reason)
                                         # 고객 정보 업데이트 (Supabase, id 기준)
                                         try:
@@ -6901,7 +7045,7 @@ def render_customer_balance():
                                         except Exception:
                                             pass
                                         # 주문 정보 업데이트
-                                        if _supabase_orders_payments_available():
+                                        if _use_supa:
                                             _update_order_supabase(db_filename, sel_oid, {
                                                 "delivery_date": delivery_str,
                                                 "category": category_edit_val,
@@ -6910,7 +7054,6 @@ def render_customer_balance():
                                                 "visit_reason": new_visit,
                                                 "purchase_reason": new_purchase,
                                             })
-                                            conn.commit()
                                         else:
                                             conn.execute(
                                                 "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, visit_reason=?, purchase_reason=? WHERE id=?",
@@ -6925,7 +7068,8 @@ def render_customer_balance():
                                                 ),
                                             )
                                             conn.commit()
-                                        conn.close()
+                                        if conn:
+                                            conn.close()
                                         clear_data_cache()
                                         st.toast("수정되었습니다.", icon="✅")
                                         st.rerun()
@@ -7151,6 +7295,70 @@ def render_customer_balance():
                         _customer_balance_payment_ui(db_filename, row["id"], row["balance"], key_prefix=f"over_{row['id']}")
             else:
                 st.success("✅ 배송일 지난 미수금 고객이 없습니다.")
+
+    # ---------- 탭 4: ⚠️ 결제 이상 항목 ----------
+    with tab_anomaly:
+        st.subheader("⚠️ 결제 이상 항목 (매장 관리자 확인 필요)")
+        if role not in ("store_admin", "superadmin"):
+            st.info("매장 관리자 또는 최고 관리자만 조회할 수 있습니다.")
+        else:
+            _a_orders = load_orders_cached(db_filename, order_cols_d10, limit=None)
+            _a_payments = load_payments_cached(db_filename)
+            _a_customers = load_customers_cached(db_filename, limit=None)
+            if _a_orders.empty or "id" not in _a_orders.columns:
+                st.info("주문 데이터가 없습니다.")
+            else:
+                _a_pay_sum = _a_payments.groupby("order_id")["amount"].sum() if not _a_payments.empty and "order_id" in _a_payments.columns else pd.Series(dtype=float)
+                _a_orders = _a_orders.copy()
+                _a_orders["paid"] = _a_orders["id"].map(_a_pay_sum).fillna(0)
+                _a_orders["balance"] = _a_orders["total_amount"] - _a_orders["paid"]
+                _a_orders["delivery_date"] = pd.to_datetime(_a_orders["delivery_date"], errors="coerce")
+                _a_orders = _a_orders.merge(_a_customers[["id", "name", "phone1"]], left_on="customer_id", right_on="id", suffixes=("", "_c"), how="left")
+
+                # ── 섹션 A: 미수금 (결제 < 구매) ──
+                st.markdown("#### 💸 미수금 항목 (결제금액 < 구매금액)")
+                _underpaid = _a_orders[_a_orders["balance"] > 0].copy()
+                if _underpaid.empty:
+                    st.success("✅ 미수금 이상 항목이 없습니다.")
+                else:
+                    _underpaid_disp = _underpaid.copy()
+                    _underpaid_disp["배송일"] = _underpaid_disp["delivery_date"].dt.strftime("%Y-%m-%d").where(_underpaid_disp["delivery_date"].notna(), "-")
+                    _underpaid_disp = _underpaid_disp[["name", "phone1", "배송일", "category", "employee_names", "total_amount", "paid", "balance"]].rename(columns={
+                        "name": "고객명", "phone1": "전화번호", "category": "품목",
+                        "employee_names": "담당자", "total_amount": "구매금액", "paid": "결제금액", "balance": "미수금"
+                    })
+                    st.warning(f"총 {len(_underpaid_disp)}건, 미수금 합계 {int(_underpaid_disp['미수금'].sum()):,}원")
+                    st.dataframe(_format_df_display(_underpaid_disp, ["구매금액", "결제금액", "미수금"]), use_container_width=True)
+                    # 알림 자동 기록 (세션당 1회)
+                    _alert_key = f"_anomaly_alert_underpaid_{db_filename}"
+                    if _alert_key not in st.session_state:
+                        st.session_state[_alert_key] = True
+                        _sn_a = _get_store_name_by_db(db_filename)
+                        _insert_admin_alert(_sn_a, "underpaid_summary", f"[{_sn_a}] 미수금 이상 항목 {len(_underpaid_disp)}건 / 합계 {int(_underpaid_disp['미수금'].sum()):,}원 확인 필요")
+
+                st.divider()
+
+                # ── 섹션 B: 초과결제 (결제 > 구매) ──
+                st.markdown("#### 🔴 초과결제 항목 (결제금액 > 구매금액)")
+                _overpaid = _a_orders[_a_orders["balance"] < 0].copy()
+                if _overpaid.empty:
+                    st.success("✅ 초과결제 이상 항목이 없습니다.")
+                else:
+                    _overpaid["초과금액"] = (_overpaid["balance"] * -1)
+                    _overpaid_disp = _overpaid.copy()
+                    _overpaid_disp["배송일"] = _overpaid_disp["delivery_date"].dt.strftime("%Y-%m-%d").where(_overpaid_disp["delivery_date"].notna(), "-")
+                    _overpaid_disp = _overpaid_disp[["name", "phone1", "배송일", "category", "employee_names", "total_amount", "paid", "초과금액"]].rename(columns={
+                        "name": "고객명", "phone1": "전화번호", "category": "품목",
+                        "employee_names": "담당자", "total_amount": "구매금액", "paid": "결제금액"
+                    })
+                    st.error(f"⛔ 총 {len(_overpaid_disp)}건, 초과결제 합계 {int(_overpaid_disp['초과금액'].sum()):,}원 — 즉시 확인 필요!")
+                    st.dataframe(_format_df_display(_overpaid_disp, ["구매금액", "결제금액", "초과금액"]), use_container_width=True)
+                    # 알림 자동 기록 (세션당 1회)
+                    _alert_key2 = f"_anomaly_alert_overpaid_{db_filename}"
+                    if _alert_key2 not in st.session_state:
+                        st.session_state[_alert_key2] = True
+                        _sn_b = _get_store_name_by_db(db_filename)
+                        _insert_admin_alert(_sn_b, "overpaid_summary", f"[{_sn_b}] 초과결제 이상 항목 {len(_overpaid_disp)}건 / 합계 {int(_overpaid_disp['초과금액'].sum()):,}원 즉시 확인 필요")
 
 
 # ========== 탭 0: 경영 대시보드 (로그인 후 첫 화면) ==========
