@@ -502,7 +502,7 @@ def _ensure_supabase_superadmin_email(email_clean: str):
 
 @st.cache_data(ttl=3600)
 def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
-    """매장별 배정 직원 표시명 목록 캐시 (10분). 직원/매장 배정 변경 시 clear_data_cache()로 갱신."""
+    """매장별 배정 직원 표시명 목록. in_() 단일 쿼리로 N+1 제거."""
     store_id = _get_supabase_store_by_db_filename(db_filename)
     if not store_id:
         return []
@@ -515,13 +515,15 @@ def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
         if not user_ids:
             u = client.table("app_users").select("id").eq("store_id", store_id).execute()
             user_ids = [x["id"] for x in (u.data or [])]
+        if not user_ids:
+            return []
+        # 단일 IN 쿼리로 N+1 제거
+        r = client.table("app_users").select("name, username").in_("id", user_ids).execute()
         out = []
-        for uid in user_ids:
-            r = client.table("app_users").select("name, username").eq("id", uid).maybe_single().execute()
-            if r.data:
-                display = (str(r.data.get("name") or "").strip() or str(r.data.get("username") or "").strip()) or None
-                if display and display not in out:
-                    out.append(display)
+        for row in (r.data or []):
+            display = (str(row.get("name") or "").strip() or str(row.get("username") or "").strip()) or None
+            if display and display not in out:
+                out.append(display)
         return out
     except Exception:
         return []
@@ -1430,20 +1432,42 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
 
 
 @st.cache_data(ttl=600)
-def load_orders_cached(db_filename: str, order_col_list: str, limit: int | None = 50) -> pd.DataFrame:
-    """주문(Orders) 목록 캐시 로딩 (10분). Supabase app_orders 우선, 없으면 로컬 SQLite. 저장 후 clear_data_cache() 호출 시 갱신."""
+def load_orders_cached(
+    db_filename: str,
+    order_col_list: str,
+    limit: int | None = 50,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """주문(Orders) 목록 캐시 로딩. start_date/end_date로 DB 레벨 날짜 필터링 지원."""
     if _supabase_orders_payments_available():
-        return _load_orders_supabase(db_filename, columns=order_col_list, limit=limit)
+        return _load_orders_supabase(
+            db_filename, columns=order_col_list, limit=limit,
+            start_date=start_date, end_date=end_date,
+        )
     conn = get_tenant_conn(db_filename)
     if not conn:
         return pd.DataFrame()
     try:
+        where_clauses = []
+        params: list = []
+        if start_date:
+            where_clauses.append("order_date >= ?")
+            params.append(start_date)
+        if end_date:
+            where_clauses.append("order_date <= ?")
+            params.append(end_date)
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
         if limit:
+            params.append(limit)
             return pd.read_sql(
-                f"SELECT {order_col_list} FROM Orders ORDER BY id DESC LIMIT ?",
-                conn, params=(limit,)
+                f"SELECT {order_col_list} FROM Orders {where_sql} ORDER BY id DESC LIMIT ?",
+                conn, params=params,
             )
-        return pd.read_sql(f"SELECT {order_col_list} FROM Orders", conn)
+        return pd.read_sql(
+            f"SELECT {order_col_list} FROM Orders {where_sql} ORDER BY id DESC",
+            conn, params=params,
+        )
     except Exception:
         return pd.DataFrame()
     finally:
@@ -1695,16 +1719,25 @@ def _supabase_orders_payments_available() -> bool:
         return False
 
 
-def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | None = None) -> pd.DataFrame:
-    """app_orders 조회. db_filename으로 매장 필터 필수. 빈 결과 시 요청한 컬럼 구조의 빈 DataFrame 반환."""
+def _load_orders_supabase(
+    db_filename: str,
+    columns: str = "*",
+    limit: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """app_orders 조회. db_filename으로 매장 필터 필수. start_date/end_date로 DB 레벨 날짜 필터링."""
     if not db_filename:
         return pd.DataFrame()
     client, err = get_supabase_client()
     if err or not client:
         return pd.DataFrame()
-    # select에 id가 없으면 연산 시 KeyError 가능하므로 항상 id 포함 권장(호출부에서 id 포함 여부 확인)
     try:
         sel = client.table("app_orders").select(columns).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).order("id", desc=True)
+        if start_date:
+            sel = sel.gte("order_date", start_date)
+        if end_date:
+            sel = sel.lte("order_date", end_date)
         if limit:
             sel = sel.limit(limit)
         r = sel.execute()
@@ -3880,6 +3913,8 @@ def _superadmin_tab1_integrated_dashboard():
     month_start = today.replace(day=1)
     from calendar import monthrange
     month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
+    start_str = month_start.isoformat()
+    end_str = month_end.isoformat()
     all_orders = []
     all_payments = []
     store_orders = {}
@@ -3887,7 +3922,10 @@ def _superadmin_tab1_integrated_dashboard():
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
         if _supabase_orders_payments_available():
-            orders = _load_orders_supabase(db_fn, "id, order_date, total_amount, actual_margin", limit=None)
+            orders = _load_orders_supabase(
+                db_fn, "id, order_date, total_amount, actual_margin",
+                limit=None, start_date=start_str, end_date=end_str,
+            )
             payments = _load_payments_supabase(db_fn)
         else:
             conn = get_tenant_conn(db_fn)
@@ -3895,7 +3933,11 @@ def _superadmin_tab1_integrated_dashboard():
                 continue
             try:
                 try:
-                    orders = pd.read_sql("SELECT id, order_date, total_amount, actual_margin FROM Orders", conn)
+                    orders = pd.read_sql(
+                        "SELECT id, order_date, total_amount, actual_margin FROM Orders"
+                        " WHERE order_date >= ? AND order_date <= ?",
+                        conn, params=(start_str, end_str),
+                    )
                 except Exception:
                     orders = pd.DataFrame()
                 try:
