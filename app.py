@@ -501,8 +501,8 @@ def _ensure_supabase_superadmin_email(email_clean: str):
 
 
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=600)
 def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
-    """매장별 배정 직원 표시명 목록. in_() 단일 쿼리로 N+1 제거."""
     store_id = _get_supabase_store_by_db_filename(db_filename)
     if not store_id:
         return []
@@ -517,11 +517,11 @@ def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
             user_ids = [x["id"] for x in (u.data or [])]
         if not user_ids:
             return []
-        # 단일 IN 쿼리로 N+1 제거
+
         r = client.table("app_users").select("name, username").in_("id", user_ids).execute()
         out = []
-        for row in (r.data or []):
-            display = (str(row.get("name") or "").strip() or str(row.get("username") or "").strip()) or None
+        for user_data in (r.data or []):
+            display = (str(user_data.get("name") or "").strip() or str(user_data.get("username") or "").strip()) or None
             if display and display not in out:
                 out.append(display)
         return out
@@ -1432,42 +1432,26 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
 
 
 @st.cache_data(ttl=600)
-def load_orders_cached(
-    db_filename: str,
-    order_col_list: str,
-    limit: int | None = 50,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> pd.DataFrame:
-    """주문(Orders) 목록 캐시 로딩. start_date/end_date로 DB 레벨 날짜 필터링 지원."""
+def load_orders_cached(db_filename: str, order_col_list: str, limit: int | None = 50, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
     if _supabase_orders_payments_available():
-        return _load_orders_supabase(
-            db_filename, columns=order_col_list, limit=limit,
-            start_date=start_date, end_date=end_date,
-        )
+        return _load_orders_supabase(db_filename, columns=order_col_list, limit=limit, start_date=start_date, end_date=end_date)
     conn = get_tenant_conn(db_filename)
     if not conn:
         return pd.DataFrame()
     try:
-        where_clauses = []
-        params: list = []
+        query = f"SELECT {order_col_list} FROM Orders WHERE 1=1"
+        params = []
         if start_date:
-            where_clauses.append("order_date >= ?")
+            query += " AND order_date >= ?"
             params.append(start_date)
         if end_date:
-            where_clauses.append("order_date <= ?")
+            query += " AND order_date <= ?"
             params.append(end_date)
-        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        query += " ORDER BY id DESC"
         if limit:
+            query += " LIMIT ?"
             params.append(limit)
-            return pd.read_sql(
-                f"SELECT {order_col_list} FROM Orders {where_sql} ORDER BY id DESC LIMIT ?",
-                conn, params=params,
-            )
-        return pd.read_sql(
-            f"SELECT {order_col_list} FROM Orders {where_sql} ORDER BY id DESC",
-            conn, params=params,
-        )
+        return pd.read_sql(query, conn, params=params)
     except Exception:
         return pd.DataFrame()
     finally:
@@ -1719,14 +1703,7 @@ def _supabase_orders_payments_available() -> bool:
         return False
 
 
-def _load_orders_supabase(
-    db_filename: str,
-    columns: str = "*",
-    limit: int | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> pd.DataFrame:
-    """app_orders 조회. db_filename으로 매장 필터 필수. start_date/end_date로 DB 레벨 날짜 필터링."""
+def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | None = None, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
     if not db_filename:
         return pd.DataFrame()
     client, err = get_supabase_client()
@@ -1742,10 +1719,7 @@ def _load_orders_supabase(
             sel = sel.limit(limit)
         r = sel.execute()
         rows = (r.data or []) if hasattr(r, "data") else []
-        if rows:
-            return pd.DataFrame(rows)
-        col_list = [c.strip() for c in columns.split(",") if c.strip()]
-        return pd.DataFrame(columns=col_list if col_list else ["id"])
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
@@ -3915,17 +3889,11 @@ def _superadmin_tab1_integrated_dashboard():
     month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
     start_str = month_start.isoformat()
     end_str = month_end.isoformat()
-    all_orders = []
-    all_payments = []
-    store_orders = {}
-    store_payments = {}
+
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
         if _supabase_orders_payments_available():
-            orders = _load_orders_supabase(
-                db_fn, "id, order_date, total_amount, actual_margin",
-                limit=None, start_date=start_str, end_date=end_str,
-            )
+            orders = _load_orders_supabase(db_fn, "id, order_date, total_amount, actual_margin", limit=None, start_date=start_str, end_date=end_str)
             payments = _load_payments_supabase(db_fn)
         else:
             conn = get_tenant_conn(db_fn)
@@ -3933,11 +3901,7 @@ def _superadmin_tab1_integrated_dashboard():
                 continue
             try:
                 try:
-                    orders = pd.read_sql(
-                        "SELECT id, order_date, total_amount, actual_margin FROM Orders"
-                        " WHERE order_date >= ? AND order_date <= ?",
-                        conn, params=(start_str, end_str),
-                    )
+                    orders = pd.read_sql("SELECT id, order_date, total_amount, actual_margin FROM Orders WHERE order_date >= ? AND order_date <= ?", conn, params=(start_str, end_str))
                 except Exception:
                     orders = pd.DataFrame()
                 try:
@@ -3946,10 +3910,12 @@ def _superadmin_tab1_integrated_dashboard():
                     payments = pd.DataFrame()
             finally:
                 conn.close()
+
         if len(orders) == 0:
             store_orders[s["store_name"]] = pd.DataFrame()
             store_payments[s["store_name"]] = pd.DataFrame()
             continue
+
         orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
         orders["_store"] = s["store_name"]
         pay_sum = payments.groupby("order_id")["amount"].sum() if len(payments) > 0 else pd.Series(dtype=float)
