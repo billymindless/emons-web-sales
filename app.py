@@ -5991,14 +5991,22 @@ def render_new_sales():
     final_sales = general_sales + display_sales_val
     final_cost = general_cost + display_cost_val
     basic_margin = final_sales - final_cost
+    basic_margin_rate = (basic_margin / final_sales * 100) if final_sales else 0.0
     st.subheader("합산 금액 (실시간)")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("최종 총 판매금액", f"{final_sales:,}원", help="일반제품 판매가 + 전시품 판매가")
     with c2:
         st.metric("최종 총 원가", f"{final_cost:,}원", help="일반제품 원가 + 전시품 원가")
     with c3:
         st.metric("기본 총 마진", f"{basic_margin:,}원", help="최종 총 판매금액 - 최종 총 원가")
+    with c4:
+        _rate_icon = "🟢" if basic_margin_rate >= 20 else ("🟡" if basic_margin_rate >= 15 else "🔴")
+        st.metric(
+            f"1차 마진율 {_rate_icon}",
+            f"{basic_margin_rate:.1f}%",
+            help="(판매가 − 원가) / 판매가 × 100 (카드 수수료 미반영 기본 마진율)",
+        )
 
     VISIT_REASON_OPTIONS = ["매장외관", "재구매", "소개", "광고(SNS 외)"]
     PURCHASE_REASON_OPTIONS = ["교체(이사없이)", "신혼/혼수", "공동구매(입주, 가구쇼 등)", "이사", "현대임직원할인"]
@@ -6065,11 +6073,19 @@ def render_new_sales():
         for i in range(4)
     )
     net_margin_rate_est = _compute_net_margin_rate(float(final_sales), float(final_cost), total_fee_est)
+    fee_delta = net_margin_rate_est - basic_margin_rate
     fee_col, margin_col = st.columns(2)
     with fee_col:
         st.metric("예상 수수료", f"{int(total_fee_est):,}원", help="신용카드·메인페이 2.5%, 체크카드 1.5%, 그 외 0%")
     with margin_col:
-        st.metric("최종 실질 마진율", f"{net_margin_rate_est:.1f}%", help="(판매가 - 원가 - 수수료) / 판매가 × 100")
+        _net_icon = "🟢" if net_margin_rate_est >= 20 else ("🟡" if net_margin_rate_est >= 15 else "🔴")
+        st.metric(
+            f"최종 실질 마진율 {_net_icon}",
+            f"{net_margin_rate_est:.1f}%",
+            delta=f"{fee_delta:+.1f}%",
+            delta_color="normal",
+            help="(판매가 − 원가 − 수수료) / 판매가 × 100 (카드·메인페이 등 수수료 반영 후 최종 마진율)",
+        )
 
     if st.button("매출 등록"):
         cust_name_ok = cust_name and cust_name.strip()
