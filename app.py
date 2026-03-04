@@ -962,7 +962,7 @@ def _format_phone_hyphen(s):
 
 
 # 결제 수단·카드사·수수료율 (가구 매장 결제 로직)
-PAYMENT_METHOD_OPTIONS = ["신용카드", "메인페이", "체크카드", "지역화폐", "이체", "온누리"]
+PAYMENT_METHOD_OPTIONS = ["신용카드", "메인페이", "체크카드", "지역화폐", "계좌이체", "온누리", "현금(수금)", "온누리지류"]
 CARD_COMPANY_OPTIONS = ["신한카드", "삼성카드", "KB국민카드", "현대카드", "롯데카드", "우리카드", "하나카드", "BC카드", "NH농협카드", "기타"]
 
 
@@ -6030,8 +6030,11 @@ def render_new_sales():
         with c1:
             method = st.selectbox(f"결제 수단 #{i+1} *", options=PAYMENT_METHOD_OPTIONS, key=row_key, index=0 if i == 0 else 0)
         with c2:
-            if method in ("신용카드", "메인페이"):
+            if method == "신용카드":
                 card_company = st.selectbox(f"카드사 #{i+1} *", options=CARD_COMPANY_OPTIONS, key=card_key)
+            elif method == "메인페이":
+                st.text_input(f"메인페이 승인번호 4자리 #{i+1}", key=card_key, max_chars=4)
+                card_company = st.session_state.get(card_key)
             else:
                 card_company = None
         with c3:
