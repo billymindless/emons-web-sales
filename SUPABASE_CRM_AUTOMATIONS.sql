@@ -37,6 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_crm_created_at   ON public.crm_automations (creat
 ALTER TABLE public.crm_automations ENABLE ROW LEVEL SECURITY;
 
 -- 4) RLS 정책: service_role (API 서버 / 웹훅) 은 전체 접근 허용
+DROP POLICY IF EXISTS "service_role: all" ON public.crm_automations;
 CREATE POLICY "service_role: all" ON public.crm_automations
     FOR ALL
     TO service_role
@@ -44,6 +45,7 @@ CREATE POLICY "service_role: all" ON public.crm_automations
     WITH CHECK (true);
 
 -- 5) RLS 정책: 인증된 앱 사용자는 SELECT / INSERT / UPDATE 허용
+DROP POLICY IF EXISTS "authenticated: read_write" ON public.crm_automations;
 CREATE POLICY "authenticated: read_write" ON public.crm_automations
     FOR ALL
     TO authenticated

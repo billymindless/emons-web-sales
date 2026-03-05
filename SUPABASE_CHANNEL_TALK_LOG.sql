@@ -26,6 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_ctwl_status      ON public.channel_talk_webhook_l
 ALTER TABLE public.channel_talk_webhook_log ENABLE ROW LEVEL SECURITY;
 
 -- 4) RLS 정책: service_role(웹훅 서버)은 INSERT/UPDATE 가능
+DROP POLICY IF EXISTS "service_role: all" ON public.channel_talk_webhook_log;
 CREATE POLICY "service_role: all" ON public.channel_talk_webhook_log
     FOR ALL
     TO service_role
@@ -33,6 +34,7 @@ CREATE POLICY "service_role: all" ON public.channel_talk_webhook_log
     WITH CHECK (true);
 
 -- 5) RLS 정책: 인증된 앱 사용자는 SELECT만 허용
+DROP POLICY IF EXISTS "authenticated: select" ON public.channel_talk_webhook_log;
 CREATE POLICY "authenticated: select" ON public.channel_talk_webhook_log
     FOR SELECT
     TO authenticated
