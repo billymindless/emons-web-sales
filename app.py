@@ -2407,7 +2407,7 @@ def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_fi
 
 
 def _insert_payment_history(
-    conn: sqlite3.Connection,
+    conn,
     sale_id: int,
     customer_name: str,
     action_type: str,
@@ -2415,29 +2415,53 @@ def _insert_payment_history(
     new_payment_data,
     reason: str,
     receipt_image_path: str | None = None,
+    db_filename: str | None = None,
 ) -> None:
-    """결제 변경 이력(PaymentHistory) 1건 기록. 영수증 이미지 경로는 선택 저장."""
-    conn.execute(
-        """
-        INSERT INTO PaymentHistory (
-            sale_id, customer_name, action_type,
-            old_payment_data, new_payment_data,
-            reason, changed_by, changed_at, receipt_image_path
+    """결제 변경 이력 1건 기록. Supabase(app_payment_history) 우선, SQLite conn 있으면 병행 저장."""
+    now_iso = datetime.now().isoformat()
+    changed_by = _current_username()
+    # ── Supabase 저장 ──
+    if _supabase_orders_payments_available() and db_filename:
+        try:
+            sc, err = get_supabase_client()
+            if sc and not err:
+                sc.table("app_payment_history").insert({
+                    "db_filename": db_filename,
+                    "sale_id": int(sale_id),
+                    "customer_name": customer_name or "",
+                    "action_type": action_type,
+                    "old_payment_data": old_payment_data or {},
+                    "new_payment_data": new_payment_data or {},
+                    "reason": reason.strip(),
+                    "changed_by": changed_by,
+                    "changed_at": now_iso,
+                    "receipt_image_path": receipt_image_path or None,
+                }).execute()
+        except Exception:
+            pass
+    # ── SQLite 저장 (로컬 환경 또는 병행) ──
+    if conn:
+        conn.execute(
+            """
+            INSERT INTO PaymentHistory (
+                sale_id, customer_name, action_type,
+                old_payment_data, new_payment_data,
+                reason, changed_by, changed_at, receipt_image_path
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(sale_id),
+                customer_name or "",
+                action_type,
+                json.dumps(old_payment_data or {}, ensure_ascii=False),
+                json.dumps(new_payment_data or {}, ensure_ascii=False),
+                reason.strip(),
+                changed_by,
+                now_iso,
+                receipt_image_path or None,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            int(sale_id),
-            customer_name or "",
-            action_type,
-            json.dumps(old_payment_data or {}, ensure_ascii=False),
-            json.dumps(new_payment_data or {}, ensure_ascii=False),
-            reason.strip(),
-            _current_username(),
-            datetime.now().isoformat(),
-            receipt_image_path or None,
-        ),
-    )
 
 
 def _render_order_audit_trail(db_filename: str, order_id: int):
@@ -2531,26 +2555,17 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
 
 
 def render_payment_history_monitor():
-    """매장 관리자/최고 관리자용 결제 변경/취소 모니터링 화면."""
+    """매장 관리자/최고 관리자용 결제 변경/취소 모니터링 화면. Supabase app_payment_history 우선."""
     db_filename = st.session_state.get("current_db")
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
-        return
-    # Supabase 주문/결제 테이블이 활성화된 경우, 이 화면은 2단계(보조 테이블 Supabase 이관)에서 재구현 예정.
-    # 로컬 SQLite 파일 부재로 인한 불필요한 오류를 피하기 위해 일단 기능을 비활성화한다.
-    if _supabase_orders_payments_available():
-        st.info("결제 변경/취소 모니터링은 아직 로컬 DB 기반입니다. Supabase 이관(2단계) 후 다시 사용할 수 있습니다.")
-        return
-    conn = get_tenant_conn(db_filename)
-    if not conn:
-        st.error("매장 DB를 찾을 수 없습니다.")
         return
 
     st.header("🚨 결제 변경/취소 모니터링")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        search_name = st.text_input("고객명 검색")
+        search_name = st.text_input("고객명 검색", key="ph_search_name")
     with col2:
         start_date = st.date_input("시작일", value=date.today() - timedelta(days=7), key="ph_start")
     with col3:
@@ -2559,33 +2574,44 @@ def render_payment_history_monitor():
         action_filter = st.multiselect("작업 유형", ["잔금결제", "결제취소", "재결제", "금액변경"], default=[])
     user_filter = st.text_input("작업자(직원 ID) 필터", key="ph_user_filter")
 
-    try:
-        # sale_id(주문 id)로 Orders만 조인해 customer_id 확보. 고객명은 ph.customer_name 또는 Supabase에서 id 기준 조회
-        df = pd.read_sql(
-            """
-            SELECT ph.log_id, ph.sale_id, ph.customer_name,
-                   o.customer_id,
-                   ph.action_type, ph.old_payment_data, ph.new_payment_data,
-                   ph.reason, ph.changed_by, ph.changed_at, ph.receipt_image_path
-            FROM PaymentHistory ph
-            LEFT JOIN Orders o ON o.id = ph.sale_id
-            ORDER BY ph.changed_at DESC
-            """,
-            conn,
-        )
-    except Exception:
-        df = pd.DataFrame()
-    finally:
-        conn.close()
+    df = pd.DataFrame()
 
-    if not df.empty and "customer_id" in df.columns:
-        # 비어 있는 customer_name은 Supabase에서 id 기준으로 채움
-        need_name = df["customer_name"].fillna("").str.strip() == ""
-        for idx in df.index[need_name]:
-            cid = df.at[idx, "customer_id"]
-            if pd.notna(cid) and int(cid):
-                df.at[idx, "customer_name"] = _get_customer_name_supabase(db_filename, int(cid))
-        df["customer_name"] = df["customer_name"].fillna("")
+    # ── Supabase 조회 ──
+    if _supabase_orders_payments_available():
+        try:
+            sc, err = get_supabase_client()
+            if sc and not err:
+                q = sc.table("app_payment_history").select(
+                    "id, sale_id, customer_name, action_type, old_payment_data, new_payment_data, reason, changed_by, changed_at"
+                ).eq("db_filename", db_filename).order("changed_at", desc=True).limit(500)
+                r = q.execute()
+                rows = r.data or []
+                if rows:
+                    df = pd.DataFrame(rows)
+                    df = df.rename(columns={"id": "log_id"})
+        except Exception as e:
+            st.error(f"Supabase 조회 오류: {e}")
+    else:
+        # ── SQLite 조회 (로컬) ──
+        conn = get_tenant_conn(db_filename)
+        if not conn:
+            st.error("매장 DB를 찾을 수 없습니다.")
+            return
+        try:
+            df = pd.read_sql(
+                """
+                SELECT ph.log_id, ph.sale_id, ph.customer_name,
+                       ph.action_type, ph.old_payment_data, ph.new_payment_data,
+                       ph.reason, ph.changed_by, ph.changed_at
+                FROM PaymentHistory ph
+                ORDER BY ph.changed_at DESC
+                """,
+                conn,
+            )
+        except Exception:
+            df = pd.DataFrame()
+        finally:
+            conn.close()
 
     if df.empty:
         st.info("결제 변경/취소 이력이 없습니다.")
@@ -2606,33 +2632,44 @@ def render_payment_history_monitor():
         mask &= df["changed_by"].fillna("").str.contains(user_filter.strip(), case=False)
 
     df_f = df.loc[mask].copy()
+    df_f["changed_at"] = df_f["changed_at_dt"].dt.strftime("%Y-%m-%d %H:%M").fillna(df_f["changed_at"].astype(str))
     df_f = df_f.drop(columns=["changed_at_dt"])
 
+    st.caption(f"총 {len(df_f):,}건 조회됨")
+
     def _highlight_cancel(row):
-        if row["action_type"] == "결제취소":
+        if row.get("action_type") == "결제취소":
             return ["background-color: #ffe6e6; color: #b30000;"] * len(row)
         return ["" for _ in row]
 
-    # 표시용 DataFrame에서는 receipt_image_path 제외 (테이블에는 경로만 보이면 됨)
-    display_cols = [c for c in df_f.columns if c != "receipt_image_path"]
+    display_cols = [c for c in ["log_id", "changed_at", "customer_name", "action_type", "reason", "changed_by", "sale_id"] if c in df_f.columns]
     st.dataframe(df_f[display_cols].style.apply(_highlight_cancel, axis=1), use_container_width=True)
 
-    # 영수증 이미지가 있는 이력만 아코디언으로 표시
-    has_receipts = "receipt_image_path" in df_f.columns and (df_f["receipt_image_path"].notna() & (df_f["receipt_image_path"].astype(str).str.strip() != "")).any()
-    if has_receipts:
-        with st.expander("📷 결제 변경 이력 상세 (영수증 이미지)"):
-            for _, row in df_f.iterrows():
-                receipt_path = row.get("receipt_image_path") if isinstance(row.get("receipt_image_path"), str) and (row.get("receipt_image_path") or "").strip() else None
-                if not receipt_path:
-                    continue
-                if os.path.exists(receipt_path):
-                    with st.expander(f"{row.get('customer_name', '-')} | {row.get('changed_at', '')} | {row.get('action_type', '')}"):
-                        st.caption(row.get("reason", ""))
-                        st.image(receipt_path, caption="첨부 영수증", use_column_width=True)
-                else:
-                    with st.expander(f"{row.get('customer_name', '-')} | {row.get('changed_at', '')} | {row.get('action_type', '')}"):
-                        st.caption(row.get("reason", ""))
-                        st.warning("영수증 파일을 찾을 수 없습니다.")
+    # 상세 내역 (old/new payment data) expander
+    with st.expander("📋 결제 변경 상세 내역"):
+        for _, row in df_f.head(50).iterrows():
+            label = f"{row.get('changed_at', '')} | {row.get('customer_name', '-')} | {row.get('action_type', '')}"
+            with st.expander(label):
+                c_l, c_r = st.columns(2)
+                with c_l:
+                    st.markdown("**변경 전**")
+                    old_data = row.get("old_payment_data") or {}
+                    if isinstance(old_data, str):
+                        try:
+                            old_data = json.loads(old_data)
+                        except Exception:
+                            pass
+                    st.json(old_data)
+                with c_r:
+                    st.markdown("**변경 후**")
+                    new_data = row.get("new_payment_data") or {}
+                    if isinstance(new_data, str):
+                        try:
+                            new_data = json.loads(new_data)
+                        except Exception:
+                            pass
+                    st.json(new_data)
+                st.caption(f"사유: {row.get('reason', '-')} | 작업자: {row.get('changed_by', '-')}")
 
 
 def _create_auth_token(user_info: dict) -> str:
@@ -3956,7 +3993,7 @@ def _superadmin_tab1_integrated_dashboard():
 
         orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
         orders["_store"] = s["store_name"]
-        pay_sum = payments.groupby("order_id")["amount"].sum() if len(payments) > 0 else pd.Series(dtype=float)
+        pay_sum = payments.groupby("order_id")["amount"].sum() if not payments.empty and "order_id" in payments.columns else pd.Series(dtype=float)
         orders["_paid"] = orders["id"].map(pay_sum).fillna(0)
         orders["_balance"] = orders["total_amount"] - orders["_paid"]
         month_ord = orders[(orders["order_date"].dt.date >= month_start) & (orders["order_date"].dt.date <= month_end)]
@@ -6561,7 +6598,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                         _insert_payment_history(conn, order_id, customer_name, "잔금결제",
                             {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
                             {"order_id": order_id, "added_amount": add_amt_int, "method": add_method, "card_company": add_card, "balance_after": new_balance, "paid_total_after": new_paid_total},
-                            edit_reason)
+                            edit_reason, db_filename=db_filename)
                         conn.commit()
                     finally:
                         conn.close()
@@ -6591,7 +6628,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                     "balance_after": new_balance,
                     "paid_total_after": new_paid_total,
                 }
-                _insert_payment_history(conn, order_id, customer_name, "잔금결제", old_payment_data, new_payment_data, edit_reason)
+                _insert_payment_history(conn, order_id, customer_name, "잔금결제", old_payment_data, new_payment_data, edit_reason, db_filename=db_filename)
                 conn.commit()
                 conn.close()
             clear_data_cache()
@@ -7286,7 +7323,7 @@ def render_customer_balance():
                                                                         customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
                                                                         old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
                                                                         new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
-                                                                        _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved)
+                                                                        _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved, db_filename=db_filename)
                                                                         conn.commit()
                                                                     finally:
                                                                         conn.close()
@@ -7313,7 +7350,7 @@ def render_customer_balance():
                                                                 customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
                                                                 old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
                                                                 new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
-                                                                _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved)
+                                                                _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved, db_filename=db_filename)
                                                                 conn.commit()
                                                                 conn.close()
                                                             st.success("변경이 완료되었습니다.")
@@ -7343,7 +7380,7 @@ def render_customer_balance():
         if orders.empty or "id" not in orders.columns:
             st.info("아직 등록된 주문 데이터가 없습니다.")
         else:
-            pay_sum = payments.groupby("order_id")["amount"].sum()
+            pay_sum = payments.groupby("order_id")["amount"].sum() if not payments.empty and "order_id" in payments.columns else pd.Series(dtype=float)
             orders["paid"] = orders["id"].map(pay_sum).fillna(0)
             orders["balance"] = orders["total_amount"] - orders["paid"]
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
@@ -7375,7 +7412,7 @@ def render_customer_balance():
         if orders.empty or "id" not in orders.columns:
             st.info("아직 등록된 주문 데이터가 없습니다.")
         else:
-            pay_sum = payments.groupby("order_id")["amount"].sum()
+            pay_sum = payments.groupby("order_id")["amount"].sum() if not payments.empty and "order_id" in payments.columns else pd.Series(dtype=float)
             orders["paid"] = orders["id"].map(pay_sum).fillna(0)
             orders["balance"] = orders["total_amount"] - orders["paid"]
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
@@ -7711,7 +7748,7 @@ def render_dashboard():
     # ---------- 1. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
     st.subheader("2. 미수금 고객 현황")
     if len(orders) > 0:
-        pay_sum = payments.groupby("order_id")["amount"].sum()
+        pay_sum = payments.groupby("order_id")["amount"].sum() if not payments.empty and "order_id" in payments.columns else pd.Series(dtype=float)
         orders = orders.copy()
         orders["paid"] = orders["id"].map(pay_sum).fillna(0)
         orders["balance"] = orders["total_amount"] - orders["paid"]
