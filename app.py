@@ -298,27 +298,12 @@ def _supabase_app_tables_available():
         return False
 
 
-def _supabase_run_app_tables_sql():
-    """
-    Supabase DB에 app_stores, app_users, app_user_stores 테이블이 없으면 생성.
-    st.secrets의 supabase.database_url (Postgres 연결 문자열)이 있으면 psycopg2로 DDL 실행.
-    성공 시 True, 실패 또는 URL 없음 시 False.
-    """
+def _supabase_run_sql_file(db_url: str, sql_path: str) -> bool:
+    """psycopg2로 SQL 파일을 Supabase에 실행. 성공 시 True."""
     try:
         import psycopg2
     except ImportError:
         return False
-    secrets = (st.secrets.get("supabase") or {}) if "secrets" in dir(st) else {}
-    if not secrets:
-        try:
-            import streamlit as _st
-            secrets = _st.secrets.get("supabase") or {}
-        except Exception:
-            pass
-    db_url = (secrets.get("database_url") or secrets.get("db_url") or "").strip()
-    if not db_url:
-        return False
-    sql_path = os.path.join(BASE_DIR, "SUPABASE_APP_TABLES.sql")
     if not os.path.isfile(sql_path):
         return False
     try:
@@ -326,7 +311,6 @@ def _supabase_run_app_tables_sql():
             raw = f.read()
     except Exception:
         return False
-    # 줄 단위 주석 제거 후, 문장 단위로 분리
     lines = []
     for line in raw.splitlines():
         s = line.strip()
@@ -353,7 +337,8 @@ def _supabase_run_app_tables_sql():
             try:
                 cur.execute(stmt)
             except Exception as e:
-                if "already exists" not in str(e).lower() and "duplicate" not in str(e).lower():
+                err_msg = str(e).lower()
+                if "already exists" not in err_msg and "duplicate" not in err_msg:
                     try:
                         cur.close()
                         conn.close()
@@ -370,6 +355,35 @@ def _supabase_run_app_tables_sql():
                 conn.close()
             except Exception:
                 pass
+
+
+def _supabase_run_app_tables_sql():
+    """
+    Supabase DB에 app_stores, app_users, app_user_stores, app_edit_requests 테이블이 없으면 생성.
+    st.secrets의 supabase.database_url (Postgres 연결 문자열)이 있으면 psycopg2로 DDL 실행.
+    성공 시 True, 실패 또는 URL 없음 시 False.
+    """
+    secrets = (st.secrets.get("supabase") or {}) if "secrets" in dir(st) else {}
+    if not secrets:
+        try:
+            import streamlit as _st
+            secrets = _st.secrets.get("supabase") or {}
+        except Exception:
+            pass
+    db_url = (secrets.get("database_url") or secrets.get("db_url") or "").strip()
+    if not db_url:
+        return False
+    sql_files = [
+        "SUPABASE_APP_TABLES.sql",
+        "SUPABASE_APP_EDIT_REQUESTS.sql",
+    ]
+    ok = False
+    for fname in sql_files:
+        fpath = os.path.join(BASE_DIR, fname)
+        if os.path.isfile(fpath):
+            _supabase_run_sql_file(db_url, fpath)
+            ok = True
+    return ok
 
 
 def ensure_supabase_app_tables():
@@ -5500,13 +5514,18 @@ def render_store_admin_employees():
 
     # ---------- 매출·결제 수정 요청 승인 (Supabase app_edit_requests) ----------
     st.header("매출·결제 수정 요청 승인")
+    _edit_req_error = None
     try:
         r = client.table("app_edit_requests").select("*").eq("db_filename", db_filename).eq("status", "pending").order("created_at").execute()
         req_list = r.data if r.data else []
-    except Exception:
+    except Exception as _e:
         req_list = []
+        _edit_req_error = str(_e)
 
-    if len(req_list) == 0:
+    if _edit_req_error:
+        st.error(f"⚠️ 수정 요청 조회 실패: {_edit_req_error}")
+        st.info("Supabase 대시보드 → SQL Editor에서 **SUPABASE_APP_EDIT_REQUESTS.sql** 내용을 실행해 주세요.")
+    elif len(req_list) == 0:
         st.info("대기 중인 수정 요청이 없습니다.")
     else:
         st.warning(f"대기 중인 수정 요청 {len(req_list)}건이 있습니다.")
@@ -7058,27 +7077,26 @@ def render_customer_balance():
                                                 "purchase_reason": st.session_state.get(f"{edit_prefix}_purchase"),
                                             },
                                         }
-                                        if _supabase_orders_payments_available():
-                                            client_req, err_req = get_supabase_client()
-                                            if client_req and not err_req:
-                                                try:
-                                                    client_req.table("app_edit_requests").insert({
-                                                        "db_filename": db_filename,
-                                                        "requested_by": _current_username(),
-                                                        "entity_type": "Order",
-                                                        "entity_id": int(sel_oid),
-                                                        "payload": payload,
-                                                        "reason": req_reason.strip(),
-                                                        "status": "pending",
-                                                    }).execute()
-                                                    st.success("수정 요청이 접수되었습니다. 매장 관리자 승인 후 반영됩니다.")
-                                                    st.rerun()
-                                                except Exception as e:
-                                                    st.error(f"수정 요청 접수 실패: {e}")
-                                            else:
-                                                st.error("Supabase 연결이 필요합니다.")
+                                        client_req, err_req = get_supabase_client()
+                                        if client_req and not err_req:
+                                            try:
+                                                import json as _json
+                                                client_req.table("app_edit_requests").insert({
+                                                    "db_filename": db_filename,
+                                                    "requested_by": _current_username(),
+                                                    "entity_type": "Order",
+                                                    "entity_id": int(sel_oid),
+                                                    "payload": _json.dumps(payload, ensure_ascii=False),
+                                                    "reason": req_reason.strip(),
+                                                    "status": "pending",
+                                                }).execute()
+                                                st.success("수정 요청이 접수되었습니다. 매장 관리자 승인 후 반영됩니다.")
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"수정 요청 접수 실패: {e}")
+                                                st.info("Supabase 대시보드 → SQL Editor에서 SUPABASE_APP_EDIT_REQUESTS.sql 내용을 실행해 주세요.")
                                         else:
-                                            st.error("수정 요청은 Supabase app_orders 환경에서만 지원됩니다.")
+                                            st.error(f"Supabase 연결이 필요합니다: {err_req or '연결 실패'}")
                             else:
                                 edit_reason = st.text_area("변경 사유(필수)", key=f"{edit_prefix}_reason")
                                 if st.button("수정 완료 (Update)", key=f"{edit_prefix}_update_btn"):
