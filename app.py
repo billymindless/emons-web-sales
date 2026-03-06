@@ -2439,7 +2439,7 @@ def _insert_payment_history(
         try:
             sc, err = get_supabase_client()
             if sc and not err:
-                sc.table("app_payment_history").insert({
+                result = sc.table("app_payment_history").insert({
                     "db_filename": db_filename,
                     "sale_id": int(sale_id),
                     "customer_name": customer_name or "",
@@ -2451,8 +2451,15 @@ def _insert_payment_history(
                     "changed_at": now_iso,
                     "receipt_image_path": receipt_image_path or None,
                 }).execute()
-        except Exception:
-            pass
+                # 오류 응답이 내려오면 세션에 기록
+                if hasattr(result, "error") and result.error:
+                    _ph_errors = st.session_state.get("_ph_insert_errors", [])
+                    _ph_errors.append(str(result.error))
+                    st.session_state["_ph_insert_errors"] = _ph_errors
+        except Exception as _e:
+            _ph_errors = st.session_state.get("_ph_insert_errors", [])
+            _ph_errors.append(str(_e))
+            st.session_state["_ph_insert_errors"] = _ph_errors
     # ── SQLite 저장 (로컬 환경 또는 병행) ──
     if conn:
         conn.execute(
@@ -2577,6 +2584,11 @@ def render_payment_history_monitor():
 
     st.header("🚨 결제 변경/취소 모니터링")
 
+    # Supabase 저장 오류가 있으면 화면에 표시 후 초기화
+    _ph_errors = st.session_state.pop("_ph_insert_errors", [])
+    for _err_msg in _ph_errors:
+        st.error(f"⚠️ 결제 이력 저장 오류 (Supabase): {_err_msg}")
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         search_name = st.text_input("고객명 검색", key="ph_search_name")
@@ -2585,7 +2597,11 @@ def render_payment_history_monitor():
     with col3:
         end_date = st.date_input("종료일", value=date.today(), key="ph_end")
     with col4:
-        action_filter = st.multiselect("작업 유형", ["잔금결제", "결제취소", "재결제", "금액변경"], default=[])
+        action_filter = st.multiselect(
+            "작업 유형",
+            ["잔금결제", "결제취소", "재결제", "결제변경", "금액변경"],
+            default=[],
+        )
     user_filter = st.text_input("작업자(직원 ID) 필터", key="ph_user_filter")
 
     df = pd.DataFrame()
@@ -6013,37 +6029,26 @@ def render_new_sales():
     selected_categories = st.multiselect("품목/카테고리 (복수 선택) *", options=CATEGORY_OPTIONS, key=f"category_multiselect_{_form_reset}")
     category = ",".join(selected_categories) if selected_categories else None
     has_display = selected_categories and "전시품" in selected_categories
-    # 금액: 세션 초기화 후 text_input + on_change로 천 단위 콤마 표시, DB 저장 시 _parse_comma_to_int 사용
+    # 금액: number_input으로 직접 입력 (on_change 불필요, 서버 재실행 없음)
     if "cost_price" not in st.session_state:
-        st.session_state["cost_price"] = "0"
+        st.session_state["cost_price"] = 0
     if "total_amount" not in st.session_state:
-        st.session_state["total_amount"] = "0"
+        st.session_state["total_amount"] = 0
 
-    def _on_cost_price():
-        st.session_state["cost_price"] = _format_number_comma(st.session_state.get("cost_price", ""))
-
-    def _on_total_amount():
-        st.session_state["total_amount"] = _format_number_comma(st.session_state.get("total_amount", ""))
-
-    st.text_input("일반제품 판매가(Selling Price) *", key="total_amount", on_change=_on_total_amount)
-    st.text_input("일반제품 원가(Cost) *", key="cost_price", on_change=_on_cost_price)
+    st.number_input("일반제품 판매가(Selling Price) *", min_value=0, step=10000, key="total_amount")
+    st.number_input("일반제품 원가(Cost) *", min_value=0, step=10000, key="cost_price")
     if has_display:
         if "display_sales_amount" not in st.session_state:
-            st.session_state["display_sales_amount"] = "0"
+            st.session_state["display_sales_amount"] = 0
         if "display_cost_amount" not in st.session_state:
-            st.session_state["display_cost_amount"] = "0"
-        st.caption("전시품 선택 시 입력 (1000단위 콤마 적용)")
-        def _on_display_sales():
-            st.session_state["display_sales_amount"] = _format_number_comma(st.session_state.get("display_sales_amount", ""))
-        def _on_display_cost():
-            st.session_state["display_cost_amount"] = _format_number_comma(st.session_state.get("display_cost_amount", ""))
-        st.text_input("전시품 판매가 *", key="display_sales_amount", on_change=_on_display_sales)
-        st.text_input("전시품 원가 *", key="display_cost_amount", on_change=_on_display_cost)
+            st.session_state["display_cost_amount"] = 0
+        st.number_input("전시품 판매가 *", min_value=0, step=10000, key="display_sales_amount")
+        st.number_input("전시품 원가 *", min_value=0, step=10000, key="display_cost_amount")
     # 실시간 합산: 최종 총 판매금액, 최종 총 원가, 기본 총 마진
-    general_sales = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
-    general_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
-    display_sales_val = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
-    display_cost_val = _parse_comma_to_int(st.session_state.get("display_cost_amount", "0")) if has_display else 0
+    general_sales = int(st.session_state.get("total_amount", 0) or 0)
+    general_cost = int(st.session_state.get("cost_price", 0) or 0)
+    display_sales_val = int(st.session_state.get("display_sales_amount", 0) or 0) if has_display else 0
+    display_cost_val = int(st.session_state.get("display_cost_amount", 0) or 0) if has_display else 0
     final_sales = general_sales + display_sales_val
     final_cost = general_cost + display_cost_val
     basic_margin = final_sales - final_cost
@@ -6081,7 +6086,7 @@ def render_new_sales():
         card_key = f"pay_card_{i}"
         amt_key = f"pay_amt_{i}"
         if amt_key not in st.session_state:
-            st.session_state[amt_key] = "0"
+            st.session_state[amt_key] = 0
         c1, c2, c3 = st.columns([2, 2, 2])
         with c1:
             method = st.selectbox(f"결제 수단 #{i+1} *", options=PAYMENT_METHOD_OPTIONS, key=row_key, index=0 if i == 0 else 0)
@@ -6094,13 +6099,8 @@ def render_new_sales():
             else:
                 card_company = None
         with c3:
-            def _on_amt(j):
-                def _():
-                    k = f"pay_amt_{j}"
-                    st.session_state[k] = _format_number_comma(st.session_state.get(k, ""))
-                return _
-            st.text_input(f"금액 #{i+1} *", key=amt_key, on_change=_on_amt(i))
-        total_payment_int += _parse_comma_to_int(st.session_state.get(amt_key, "0"))
+            st.number_input(f"금액 #{i+1} *", min_value=0, step=10000, key=amt_key)
+        total_payment_int += int(st.session_state.get(amt_key, 0) or 0)
         # 온누리상품권 전용 승인번호/영수증 입력 UI (결제 수단에 '온누리'가 포함될 때만)
         is_onnuri = method and ("온누리" in str(method))
         onnuri_stage_key = f"pay_onnuri_stage_{i}"
@@ -6128,7 +6128,7 @@ def render_new_sales():
 
     # 예상 수수료·최종 실질 마진율 (결제 수단별 수수료 반영, 실시간)
     total_fee_est = sum(
-        _payment_fee_amount(st.session_state.get(f"pay_method_{i}", ""), _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")))
+        _payment_fee_amount(st.session_state.get(f"pay_method_{i}", ""), int(st.session_state.get(f"pay_amt_{i}", 0) or 0))
         for i in range(4)
     )
     net_margin_rate_est = _compute_net_margin_rate(float(final_sales), float(final_cost), total_fee_est)
@@ -6159,20 +6159,20 @@ def render_new_sales():
         if not delivery_ok:
             st.error("배송일(필수)을 선택하세요.")
             st.stop()
-        cost_price_int = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
-        general_sales_int = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
-        display_sales_int = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
-        display_cost_int = _parse_comma_to_int(st.session_state.get("display_cost_amount", "0")) if has_display else 0
+        cost_price_int = int(st.session_state.get("cost_price", 0) or 0)
+        general_sales_int = int(st.session_state.get("total_amount", 0) or 0)
+        display_sales_int = int(st.session_state.get("display_sales_amount", 0) or 0) if has_display else 0
+        display_cost_int = int(st.session_state.get("display_cost_amount", 0) or 0) if has_display else 0
         final_sales_save = general_sales_int + display_sales_int
         final_cost_save = cost_price_int + display_cost_int
         basic_margin_save = final_sales_save - final_cost_save
         # 결제 합계 및 미수금(잔금) 계산 — 완불이 아니어도 저장 가능(계약금만 받고 저장 가능)
-        total_payment_slots = sum(_parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")) for i in range(4))
+        total_payment_slots = sum(int(st.session_state.get(f"pay_amt_{i}", 0) or 0) for i in range(4))
         unpaid_balance = final_sales_save - total_payment_slots  # 판매가 - 수납액 = 미수금
         # 수수료 합계 및 실질 마진율 (신용카드·메인페이 2.5% 반영)
         total_fees_save = 0.0
         for i in range(4):
-            amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
+            amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
             method = st.session_state.get(f"pay_method_{i}", "")
             total_fees_save += _payment_fee_amount(method, amt)
         net_margin_rate_save = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees_save)
@@ -6184,7 +6184,7 @@ def render_new_sales():
         # 중복 발견 시 해당 슬롯은 전체 승인번호(8자리 이상) 입력 단계로 전환
         for i in range(4):
             method = st.session_state.get(f"pay_method_{i}", "")
-            amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
+            amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
             if amt <= 0:
                 continue
             if not method or "온누리" not in str(method):
@@ -6267,7 +6267,7 @@ def render_new_sales():
             total_fees = 0.0
             total_paid_initial = 0
             for i in range(4):
-                amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
+                amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
                 if amt <= 0:
                     continue
                 method = st.session_state.get(f"pay_method_{i}", "")
@@ -6382,7 +6382,7 @@ def render_new_sales():
                 total_fees = 0.0
                 total_paid_initial = 0
                 for i in range(4):
-                    amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
+                    amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
                     if amt <= 0:
                         continue
                     method = st.session_state.get(f"pay_method_{i}", "")
@@ -7286,6 +7286,37 @@ def render_customer_balance():
                                                     st.write(f"**결제금액:** {float(prow['amount'] or 0):,.0f}원")
                                                     st.write(f"**미수금:** {current_balance:,.0f}원")
                                                 with col_right:
+                                                    # 결제 수단 변경
+                                                    _cur_method = prow.get("payment_method") or PAYMENT_METHOD_OPTIONS[0]
+                                                    _method_idx = PAYMENT_METHOD_OPTIONS.index(_cur_method) if _cur_method in PAYMENT_METHOD_OPTIONS else 0
+                                                    new_method = st.selectbox(
+                                                        "결제 수단 변경",
+                                                        options=PAYMENT_METHOD_OPTIONS,
+                                                        index=_method_idx,
+                                                        key=f"pay_edit_method_{prow['id']}",
+                                                    )
+                                                    # 카드사/승인번호 (수단에 따라)
+                                                    if new_method == "신용카드":
+                                                        _cur_card = prow.get("card_company") or CARD_COMPANY_OPTIONS[0]
+                                                        _card_idx = CARD_COMPANY_OPTIONS.index(_cur_card) if _cur_card in CARD_COMPANY_OPTIONS else 0
+                                                        new_card_company = st.selectbox(
+                                                            "카드사 변경",
+                                                            options=CARD_COMPANY_OPTIONS,
+                                                            index=_card_idx,
+                                                            key=f"pay_edit_card_{prow['id']}",
+                                                        )
+                                                    elif new_method == "메인페이":
+                                                        _cur_appr = prow.get("card_company") or ""
+                                                        new_card_company = st.text_input(
+                                                            "메인페이 승인번호 4자리",
+                                                            value=_cur_appr,
+                                                            max_chars=4,
+                                                            key=f"pay_edit_card_{prow['id']}",
+                                                        )
+                                                    else:
+                                                        new_card_company = None
+                                                        # 위젯 키 충돌 방지용 빈 placeholder
+                                                        st.empty()
                                                     new_amount = st.number_input(
                                                         "변경할 새 금액 (0이면 결제 취소)", min_value=0.0,
                                                         value=float(prow["amount"] or 0), step=1000.0,
@@ -7319,6 +7350,8 @@ def render_customer_balance():
                                                                 "method": prow["payment_method"],
                                                                 "card_company": prow["card_company"],
                                                             }
+                                                            # 새 수수료 계산 (수단 변경 반영)
+                                                            new_fee = _payment_fee_amount(new_method, float(new_amount)) if new_amount > 0 else 0.0
                                                             if _supabase_orders_payments_available():
                                                                 old_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
                                                                 if new_amount == 0:
@@ -7326,9 +7359,19 @@ def render_customer_balance():
                                                                     action = "결제취소"
                                                                     new_payment = {}
                                                                 else:
-                                                                    _update_payment_supabase(db_filename, int(prow["id"]), {"amount": new_amount})
-                                                                    action = "금액변경"
-                                                                    new_payment = {"payment_id": int(prow["id"]), "amount": float(new_amount)}
+                                                                    _update_payment_supabase(db_filename, int(prow["id"]), {
+                                                                        "amount": new_amount,
+                                                                        "payment_method": new_method,
+                                                                        "card_company": new_card_company,
+                                                                        "fee_amount": new_fee,
+                                                                    })
+                                                                    action = "결제변경"
+                                                                    new_payment = {
+                                                                        "payment_id": int(prow["id"]),
+                                                                        "amount": float(new_amount),
+                                                                        "method": new_method,
+                                                                        "card_company": new_card_company,
+                                                                    }
                                                                 _recalc_order_actual_margin_supabase(db_filename, _order_id_pay)
                                                                 new_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
                                                                 new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
@@ -7354,9 +7397,17 @@ def render_customer_balance():
                                                                     action = "결제취소"
                                                                     new_payment = {}
                                                                 else:
-                                                                    conn.execute("UPDATE Payments SET amount = ? WHERE id = ?", (new_amount, int(prow["id"])))
-                                                                    action = "금액변경"
-                                                                    new_payment = {"payment_id": int(prow["id"]), "amount": float(new_amount)}
+                                                                    conn.execute(
+                                                                        "UPDATE Payments SET amount = ?, payment_method = ?, card_company = ?, fee_amount = ? WHERE id = ?",
+                                                                        (new_amount, new_method, new_card_company, new_fee, int(prow["id"]))
+                                                                    )
+                                                                    action = "결제변경"
+                                                                    new_payment = {
+                                                                        "payment_id": int(prow["id"]),
+                                                                        "amount": float(new_amount),
+                                                                        "method": new_method,
+                                                                        "card_company": new_card_company,
+                                                                    }
                                                                 _recalc_order_actual_margin(conn, _order_id_pay, db_filename)
                                                                 cur2 = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
                                                                 new_paid_total = cur2.fetchone()[0] or 0
@@ -7371,7 +7422,14 @@ def render_customer_balance():
                                                                 _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved, db_filename=db_filename)
                                                                 conn.commit()
                                                                 conn.close()
-                                                            st.success("변경이 완료되었습니다.")
+                                                            # Supabase 이력 저장 오류 즉시 표시
+                                                            _errs = st.session_state.get("_ph_insert_errors", [])
+                                                            if _errs:
+                                                                for _em in _errs:
+                                                                    st.error(f"⚠️ 이력 저장 오류: {_em}")
+                                                                st.session_state["_ph_insert_errors"] = []
+                                                            else:
+                                                                st.success("변경이 완료되었습니다. (이력 저장 성공)")
                                                             clear_data_cache()
                                                             st.rerun()
 
