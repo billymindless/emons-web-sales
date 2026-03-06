@@ -2599,7 +2599,7 @@ def render_payment_history_monitor():
     with col4:
         action_filter = st.multiselect(
             "작업 유형",
-            ["잔금결제", "결제취소", "재결제", "결제변경", "금액변경"],
+            ["잔금결제", "결제취소", "재결제", "결제변경", "계약변경", "금액변경"],
             default=[],
         )
     user_filter = st.text_input("작업자(직원 ID) 필터", key="ph_user_filter")
@@ -6607,17 +6607,21 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                     "onnuri_approval_code": onnuri_code,
                 })
                 _recalc_order_actual_margin_supabase(db_filename, order_id)
+                customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
+                customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
+                # Supabase 이력 저장 (conn 없이도 동작)
+                _insert_payment_history(
+                    None, order_id, customer_name, "잔금결제",
+                    {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
+                    {"order_id": order_id, "added_amount": add_amt_int, "method": add_method, "card_company": add_card, "balance_after": new_balance, "paid_total_after": new_paid_total},
+                    edit_reason, db_filename=db_filename,
+                )
+                # SQLite 감사 로그 (파일이 있을 때만)
                 conn = get_tenant_conn(db_filename)
                 if conn:
                     try:
                         _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
                         _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
-                        customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
-                        customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
-                        _insert_payment_history(conn, order_id, customer_name, "잔금결제",
-                            {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
-                            {"order_id": order_id, "added_amount": add_amt_int, "method": add_method, "card_company": add_card, "balance_after": new_balance, "paid_total_after": new_paid_total},
-                            edit_reason, db_filename=db_filename)
                         conn.commit()
                     finally:
                         conn.close()
@@ -7222,6 +7226,19 @@ def render_customer_balance():
                                                 "visit_reason": new_visit,
                                                 "purchase_reason": new_purchase,
                                             })
+                                            # 계약금액/원가 변경 시 Supabase 이력 저장
+                                            if old_total != new_total or old_cost != new_cost:
+                                                _ph_cid = _get_order_customer_id_supabase(db_filename, sel_oid)
+                                                _ph_cname = _get_customer_name_supabase(db_filename, _ph_cid) if _ph_cid else ""
+                                                _insert_payment_history(
+                                                    None, sel_oid, _ph_cname, "계약변경",
+                                                    {"order_id": sel_oid, "old_total": old_total, "old_cost": old_cost,
+                                                     "old_display_sales": float(orow.get("display_sales_amount") or 0),
+                                                     "old_display_cost": float(orow.get("display_cost_amount") or 0)},
+                                                    {"order_id": sel_oid, "new_total": new_total, "new_cost": new_cost,
+                                                     "new_display_sales": new_display_sales, "new_display_cost": new_display_cost},
+                                                    edit_reason, db_filename=db_filename,
+                                                )
                                         else:
                                             conn.execute(
                                                 "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, visit_reason=?, purchase_reason=? WHERE id=?",
@@ -7375,16 +7392,23 @@ def render_customer_balance():
                                                                 _recalc_order_actual_margin_supabase(db_filename, _order_id_pay)
                                                                 new_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
                                                                 new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
+                                                                cid_ph = _get_order_customer_id_supabase(db_filename, _order_id_pay)
+                                                                customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
+                                                                old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
+                                                                new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
+                                                                # Supabase 이력 저장 (conn 없이도 동작)
+                                                                _insert_payment_history(
+                                                                    None, _order_id_pay, customer_name_ph, action,
+                                                                    old_data, new_data, del_reason,
+                                                                    receipt_image_path=receipt_path_saved,
+                                                                    db_filename=db_filename,
+                                                                )
+                                                                # SQLite 감사 로그 (파일이 있을 때만)
                                                                 conn = get_tenant_conn(db_filename)
                                                                 if conn:
                                                                     try:
                                                                         _insert_audit_log(conn, "Order", _order_id_pay, "payment_total", old_paid_total, new_paid_total, del_reason)
                                                                         _insert_audit_log(conn, "Order", _order_id_pay, "balance_amount", old_balance, new_balance, del_reason)
-                                                                        cid_ph = _get_order_customer_id_supabase(db_filename, _order_id_pay)
-                                                                        customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
-                                                                        old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
-                                                                        new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
-                                                                        _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved, db_filename=db_filename)
                                                                         conn.commit()
                                                                     finally:
                                                                         conn.close()
