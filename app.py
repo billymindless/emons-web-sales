@@ -2431,14 +2431,18 @@ def _insert_payment_history(
     receipt_image_path: str | None = None,
     db_filename: str | None = None,
 ) -> None:
-    """결제 변경 이력 1건 기록. Supabase(app_payment_history) 우선, SQLite conn 있으면 병행 저장."""
+    """결제 변경 이력 1건 기록. Supabase(app_payment_history) 우선, SQLite conn 있으면 병행 저장.
+    반환값: 오류 문자열(실패) 또는 None(성공)"""
     now_iso = datetime.now().isoformat()
     changed_by = _current_username()
+    supa_error: str | None = None
     # ── Supabase 저장 ──
     if _supabase_orders_payments_available() and db_filename:
         try:
             sc, err = get_supabase_client()
-            if sc and not err:
+            if err or not sc:
+                supa_error = f"Supabase 클라이언트 오류: {err}"
+            else:
                 result = sc.table("app_payment_history").insert({
                     "db_filename": db_filename,
                     "sale_id": int(sale_id),
@@ -2451,38 +2455,39 @@ def _insert_payment_history(
                     "changed_at": now_iso,
                     "receipt_image_path": receipt_image_path or None,
                 }).execute()
-                # 오류 응답이 내려오면 세션에 기록
                 if hasattr(result, "error") and result.error:
-                    _ph_errors = st.session_state.get("_ph_insert_errors", [])
-                    _ph_errors.append(str(result.error))
-                    st.session_state["_ph_insert_errors"] = _ph_errors
+                    supa_error = str(result.error)
         except Exception as _e:
-            _ph_errors = st.session_state.get("_ph_insert_errors", [])
-            _ph_errors.append(str(_e))
-            st.session_state["_ph_insert_errors"] = _ph_errors
+            supa_error = str(_e)
     # ── SQLite 저장 (로컬 환경 또는 병행) ──
     if conn:
-        conn.execute(
-            """
-            INSERT INTO PaymentHistory (
-                sale_id, customer_name, action_type,
-                old_payment_data, new_payment_data,
-                reason, changed_by, changed_at, receipt_image_path
+        try:
+            conn.execute(
+                """
+                INSERT INTO PaymentHistory (
+                    sale_id, customer_name, action_type,
+                    old_payment_data, new_payment_data,
+                    reason, changed_by, changed_at, receipt_image_path
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(sale_id),
+                    customer_name or "",
+                    action_type,
+                    json.dumps(old_payment_data or {}, ensure_ascii=False),
+                    json.dumps(new_payment_data or {}, ensure_ascii=False),
+                    reason.strip(),
+                    changed_by,
+                    now_iso,
+                    receipt_image_path or None,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(sale_id),
-                customer_name or "",
-                action_type,
-                json.dumps(old_payment_data or {}, ensure_ascii=False),
-                json.dumps(new_payment_data or {}, ensure_ascii=False),
-                reason.strip(),
-                changed_by,
-                now_iso,
-                receipt_image_path or None,
-            ),
-        )
+        except Exception as _sqlite_e:
+            # SQLite 오류는 Supabase 환경에서는 무시 (PaymentHistory 테이블 없을 수 있음)
+            if supa_error is None and not _supabase_orders_payments_available():
+                supa_error = f"SQLite 저장 오류: {_sqlite_e}"
+    return supa_error
 
 
 def _render_order_audit_trail(db_filename: str, order_id: int):
@@ -2584,7 +2589,50 @@ def render_payment_history_monitor():
 
     st.header("🚨 결제 변경/취소 모니터링")
 
-    # Supabase 저장 오류가 있으면 화면에 표시 후 초기화
+    # ── 진단 패널 (접기 가능) ──
+    with st.expander("🔧 Supabase 테이블 진단 (문제 발생 시 확인)", expanded=False):
+        _diag_supa = _supabase_orders_payments_available()
+        st.write(f"**Supabase 연결 상태:** {'✅ 정상' if _diag_supa else '❌ 연결 실패'}")
+        st.write(f"**현재 매장 DB:** `{db_filename}`")
+        if _diag_supa:
+            try:
+                _sc, _ = get_supabase_client()
+                _test_r = _sc.table("app_payment_history").select("id").eq("db_filename", db_filename).limit(1).execute()
+                st.success(f"✅ app_payment_history 테이블 정상 접근 가능 (전체 행 확인 중...)")
+                _cnt_r = _sc.table("app_payment_history").select("id", count="exact").eq("db_filename", db_filename).execute()
+                _total = _cnt_r.count if hasattr(_cnt_r, "count") else len(_cnt_r.data or [])
+                st.info(f"현재 매장 이력 총 {_total}건 저장됨")
+            except Exception as _diag_e:
+                st.error(f"❌ app_payment_history 접근 오류: {_diag_e}")
+                st.warning("Supabase 대시보드 → SQL Editor에서 아래 SQL을 실행해 테이블을 재생성하세요.")
+                st.code("""DROP TABLE IF EXISTS app_payment_history;
+CREATE TABLE app_payment_history (
+    id                  BIGSERIAL PRIMARY KEY,
+    db_filename         TEXT NOT NULL,
+    sale_id             BIGINT NOT NULL,
+    customer_name       TEXT,
+    action_type         TEXT NOT NULL,
+    old_payment_data    JSONB,
+    new_payment_data    JSONB,
+    reason              TEXT NOT NULL,
+    changed_by          TEXT NOT NULL,
+    changed_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    receipt_image_path  TEXT
+);
+CREATE INDEX idx_aph_db ON app_payment_history (db_filename);
+CREATE INDEX idx_aph_sale ON app_payment_history (sale_id);
+ALTER TABLE app_payment_history ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "allow_all_app_payment_history" ON app_payment_history;
+CREATE POLICY "allow_all_app_payment_history" ON app_payment_history FOR ALL USING (true) WITH CHECK (true);""", language="sql")
+        # 저장된 오류 메시지 표시
+        _ph_errors_diag = st.session_state.get("_ph_insert_errors", [])
+        if _ph_errors_diag:
+            st.error(f"마지막 저장 오류: {_ph_errors_diag}")
+            if st.button("오류 기록 초기화"):
+                st.session_state["_ph_insert_errors"] = []
+                st.rerun()
+
+    # 저장 오류 팝업 (최근 저장 시 오류가 있었으면 상단에 표시)
     _ph_errors = st.session_state.pop("_ph_insert_errors", [])
     for _err_msg in _ph_errors:
         st.error(f"⚠️ 결제 이력 저장 오류 (Supabase): {_err_msg}")
@@ -2599,7 +2647,15 @@ def render_payment_history_monitor():
     with col4:
         action_filter = st.multiselect(
             "작업 유형",
-            ["잔금결제", "결제취소", "재결제", "결제변경", "계약변경", "금액변경"],
+            [
+                "잔금결제",
+                "결제취소",
+                "재결제",
+                "결제변경",
+                "판매금액변경",  # 계약(판매) 금액 변경
+                "계약변경",      # 기존 기록 호환용
+                "금액변경",      # 구 버전 호환용
+            ],
             default=[],
         )
     user_filter = st.text_input("작업자(직원 ID) 필터", key="ph_user_filter")
@@ -5565,123 +5621,7 @@ def render_store_admin_employees():
                         except Exception as e:
                             st.error(f"제거 실패: {e}")
 
-    # ---------- 매출·결제 수정 요청 승인 (Supabase app_edit_requests) ----------
-    st.header("매출·결제 수정 요청 승인")
-    _edit_req_error = None
-    try:
-        r = client.table("app_edit_requests").select("*").eq("db_filename", db_filename).eq("status", "pending").order("created_at").execute()
-        req_list = r.data if r.data else []
-    except Exception as _e:
-        req_list = []
-        _edit_req_error = str(_e)
-
-    if _edit_req_error:
-        st.error(f"⚠️ 수정 요청 조회 실패: {_edit_req_error}")
-        st.info("Supabase 대시보드 → SQL Editor에서 **SUPABASE_APP_EDIT_REQUESTS.sql** 내용을 실행해 주세요.")
-    elif len(req_list) == 0:
-        st.info("대기 중인 수정 요청이 없습니다.")
-    else:
-        st.warning(f"대기 중인 수정 요청 {len(req_list)}건이 있습니다.")
-        for req in req_list:
-            rid = req.get("id")
-            entity_type = req.get("entity_type") or "Order"
-            entity_id = req.get("entity_id")
-            payload = req.get("payload")
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except Exception:
-                    payload = {}
-            elif payload is None:
-                payload = {}
-            reason = req.get("reason") or ""
-            requested_by = req.get("requested_by") or ""
-            created_at = req.get("created_at") or ""
-
-            with st.expander(f"요청 #{rid} — {requested_by} / {entity_type} #{entity_id}"):
-                st.caption(f"요청 시각: {created_at}")
-                st.write(f"사유: {reason}")
-                st.json(payload)
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("승인", key=f"req_approve_{rid}"):
-                        try:
-                            new_order = payload.get("new_order") or {}
-                            new_customer = payload.get("new_customer") or {}
-                            oid = int(payload.get("order_id") or entity_id)
-
-                            if entity_type == "Order" and new_order and _supabase_orders_payments_available():
-                                cur_o = _get_order_supabase(db_filename, oid)
-                                if cur_o:
-                                    old_total = cur_o.get("total_amount") or 0
-                                    new_total = int(new_order.get("total_amount", old_total))
-                                    old_cost = cur_o.get("cost_price") or 0
-                                    new_cost = int(new_order.get("cost_price", old_cost))
-                                    if old_total != new_total:
-                                        delta = new_total - old_total
-                                        today_str = datetime.now().strftime("%Y-%m-%d")
-                                        order_date_val = cur_o.get("order_date") or today_str
-                                        if isinstance(order_date_val, str) and "-" in order_date_val:
-                                            parts = order_date_val.split("-")
-                                            order_date_label = f"{int(parts[1])}월 {int(parts[2])}일" if len(parts) >= 3 else order_date_val
-                                        else:
-                                            order_date_label = str(order_date_val)
-                                        note = f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
-                                        _insert_sales_transaction(db_filename, oid, today_str, float(delta), note)
-                                    _update_order_supabase(db_filename, oid, {
-                                        "delivery_date": new_order.get("delivery_date") or cur_o.get("delivery_date"),
-                                        "category": new_order.get("category") or cur_o.get("category"),
-                                        "total_amount": new_total,
-                                        "cost_price": new_cost,
-                                        "visit_reason": new_order.get("visit_reason") or cur_o.get("visit_reason"),
-                                        "purchase_reason": new_order.get("purchase_reason") or cur_o.get("purchase_reason"),
-                                    })
-                                    _recalc_order_actual_margin_supabase(db_filename, oid)
-                                if new_customer and payload.get("customer_id"):
-                                    cid = int(payload.get("customer_id"))
-                                    store_name = _get_current_store_name_for_customers(db_filename)
-                                    if store_name:
-                                        try:
-                                            sc, _ = get_supabase_client()
-                                            if sc:
-                                                upd = {
-                                                    "name": new_customer.get("name"),
-                                                    "phone1": new_customer.get("phone1"),
-                                                    "phone2": new_customer.get("phone2"),
-                                                    "address": new_customer.get("address"),
-                                                }
-                                                sc.table("app_customers").update(upd).eq("store_name", store_name).eq("id", cid).execute()
-                                        except Exception:
-                                            pass
-                            elif entity_type == "Payment":
-                                new_payment = payload.get("new_payment") or {}
-                                pid = int(payload.get("payment_id") or entity_id)
-                                if new_payment:
-                                    _update_payment_supabase(db_filename, pid, {k: v for k, v in new_payment.items() if v is not None})
-
-                            client.table("app_edit_requests").update({
-                                "status": "approved",
-                                "reviewed_by": _current_username(),
-                                "reviewed_at": datetime.now().isoformat(),
-                            }).eq("id", int(rid)).execute()
-                            clear_data_cache()
-                            st.success("정상적으로 처리되었습니다.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"승인 처리 중 오류: {e}")
-                with c2:
-                    if st.button("반려", key=f"req_reject_{rid}"):
-                        try:
-                            client.table("app_edit_requests").update({
-                                "status": "rejected",
-                                "reviewed_by": _current_username(),
-                                "reviewed_at": datetime.now().isoformat(),
-                            }).eq("id", int(rid)).execute()
-                            clear_data_cache()
-                            st.success("정상적으로 처리되었습니다.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"반려 처리 중 오류: {e}")
+    # (결제 수정 승인 워크플로우 제거됨 - 직접 수정 방식으로 전환)
 
 
 # ========== 성과 축하 (Gamification) — 신규 주문 INSERT 시에만 트리거 ==========
@@ -6074,14 +6014,15 @@ def render_new_sales():
     visit_reason = st.selectbox("방문 이유 *", options=VISIT_REASON_OPTIONS, key="visit_reason")
     purchase_reason = st.selectbox("구매 이유 *", options=PURCHASE_REASON_OPTIONS, key="purchase_reason")
 
-    # ----- 다중(복합) 결제 수단: 최대 4개 고정 슬롯 -----
+    # ----- 다중(복합) 결제 수단: 최대 10개 고정 슬롯 -----
+    MAX_PAYMENT_SLOTS = 10
     st.subheader("결제 내역 (복수 결제 가능)")
     if "payment_rows" not in st.session_state:
         st.session_state["payment_rows"] = [
-            {"method": "", "card_company": "", "amount": "0"} for _ in range(4)
+            {"method": "", "card_company": "", "amount": "0"} for _ in range(MAX_PAYMENT_SLOTS)
         ]
     total_payment_int = 0
-    for i in range(4):
+    for i in range(MAX_PAYMENT_SLOTS):
         row_key = f"pay_method_{i}"
         card_key = f"pay_card_{i}"
         amt_key = f"pay_amt_{i}"
@@ -6129,7 +6070,7 @@ def render_new_sales():
     # 예상 수수료·최종 실질 마진율 (결제 수단별 수수료 반영, 실시간)
     total_fee_est = sum(
         _payment_fee_amount(st.session_state.get(f"pay_method_{i}", ""), int(st.session_state.get(f"pay_amt_{i}", 0) or 0))
-        for i in range(4)
+        for i in range(MAX_PAYMENT_SLOTS)
     )
     net_margin_rate_est = _compute_net_margin_rate(float(final_sales), float(final_cost), total_fee_est)
     fee_delta = net_margin_rate_est - basic_margin_rate
@@ -6167,11 +6108,11 @@ def render_new_sales():
         final_cost_save = cost_price_int + display_cost_int
         basic_margin_save = final_sales_save - final_cost_save
         # 결제 합계 및 미수금(잔금) 계산 — 완불이 아니어도 저장 가능(계약금만 받고 저장 가능)
-        total_payment_slots = sum(int(st.session_state.get(f"pay_amt_{i}", 0) or 0) for i in range(4))
+        total_payment_slots = sum(int(st.session_state.get(f"pay_amt_{i}", 0) or 0) for i in range(MAX_PAYMENT_SLOTS))
         unpaid_balance = final_sales_save - total_payment_slots  # 판매가 - 수납액 = 미수금
         # 수수료 합계 및 실질 마진율 (신용카드·메인페이 2.5% 반영)
         total_fees_save = 0.0
-        for i in range(4):
+        for i in range(MAX_PAYMENT_SLOTS):
             amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
             method = st.session_state.get(f"pay_method_{i}", "")
             total_fees_save += _payment_fee_amount(method, amt)
@@ -6182,7 +6123,7 @@ def render_new_sales():
         # 온누리상품권 결제에 대한 부정 사용 방지 검증
         # 1차: 승인번호 뒤 4자리 + 결제일 기준 중복 여부 확인 (금액 제외)
         # 중복 발견 시 해당 슬롯은 전체 승인번호(8자리 이상) 입력 단계로 전환
-        for i in range(4):
+        for i in range(MAX_PAYMENT_SLOTS):
             method = st.session_state.get(f"pay_method_{i}", "")
             amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
             if amt <= 0:
@@ -6266,7 +6207,7 @@ def render_new_sales():
                 st.stop()
             total_fees = 0.0
             total_paid_initial = 0
-            for i in range(4):
+            for i in range(MAX_PAYMENT_SLOTS):
                 amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
                 if amt <= 0:
                     continue
@@ -6381,7 +6322,7 @@ def render_new_sales():
                 order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 total_fees = 0.0
                 total_paid_initial = 0
-                for i in range(4):
+                for i in range(MAX_PAYMENT_SLOTS):
                     amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
                     if amt <= 0:
                         continue
@@ -6610,12 +6551,14 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                 customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
                 customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
                 # Supabase 이력 저장 (conn 없이도 동작)
-                _insert_payment_history(
+                _ph_err = _insert_payment_history(
                     None, order_id, customer_name, "잔금결제",
                     {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
                     {"order_id": order_id, "added_amount": add_amt_int, "method": add_method, "card_company": add_card, "balance_after": new_balance, "paid_total_after": new_paid_total},
                     edit_reason, db_filename=db_filename,
                 )
+                if _ph_err:
+                    st.warning(f"⚠️ 이력 저장 오류 (기능은 정상): {_ph_err}")
                 # SQLite 감사 로그 (파일이 있을 때만)
                 conn = get_tenant_conn(db_filename)
                 if conn:
@@ -7091,165 +7034,159 @@ def render_customer_balance():
                             st.text_input("방문 이유", key=f"{edit_prefix}_visit")
                             st.text_input("구매 이유", key=f"{edit_prefix}_purchase")
 
-                            # 매출 수정: user → 수정 요청만, store_admin 이상 → 즉시 수정
-                            if role == "user":
-                                req_reason = st.text_area("수정 요청 사유(필수)", key=f"{edit_prefix}_req_reason")
-                                if st.button("수정 요청", key=f"{edit_prefix}_request_btn"):
-                                    if not req_reason or not req_reason.strip():
-                                        st.warning("수정 요청 사유를 입력하세요.")
-                                    else:
-                                        payload = {
-                                            "customer_id": int(cid),
-                                            "order_id": int(sel_oid),
-                                            "new_customer": {
-                                                "name": st.session_state[f"{edit_prefix}_name"],
-                                                "phone1": st.session_state[f"{edit_prefix}_phone1"],
-                                                "phone2": st.session_state.get(f"{edit_prefix}_phone2"),
-                                                "address": st.session_state.get(f"{edit_prefix}_address"),
-                                            },
-                                            "new_order": {
-                                                "delivery_date": str(st.session_state.get(f"{edit_prefix}_delivery")),
-                                                "category": category_edit_val,
-                                                "total_amount": _edit_total,
-                                                "cost_price": _edit_cost,
-                                                "display_sales_amount": _edit_display_sales,
-                                                "display_cost_amount": _edit_display_cost,
-                                                "visit_reason": st.session_state.get(f"{edit_prefix}_visit"),
-                                                "purchase_reason": st.session_state.get(f"{edit_prefix}_purchase"),
-                                            },
-                                        }
-                                        client_req, err_req = get_supabase_client()
-                                        if client_req and not err_req:
-                                            try:
-                                                import json as _json
-                                                client_req.table("app_edit_requests").insert({
-                                                    "db_filename": db_filename,
-                                                    "requested_by": _current_username(),
-                                                    "entity_type": "Order",
-                                                    "entity_id": int(sel_oid),
-                                                    "payload": _json.dumps(payload, ensure_ascii=False),
-                                                    "reason": req_reason.strip(),
-                                                    "status": "pending",
-                                                }).execute()
-                                                st.success("수정 요청이 접수되었습니다. 매장 관리자 승인 후 반영됩니다.")
-                                                st.rerun()
-                                            except Exception as e:
-                                                st.error(f"수정 요청 접수 실패: {e}")
-                                                st.info("Supabase 대시보드 → SQL Editor에서 SUPABASE_APP_EDIT_REQUESTS.sql 내용을 실행해 주세요.")
-                                        else:
-                                            st.error(f"Supabase 연결이 필요합니다: {err_req or '연결 실패'}")
+                            # ── ⚖️ 실시간 잔금 검증 및 안내 로직 ──
+                            _old_paid_total = float(orow["paid"])
+                            _new_balance_preview = _edit_total - _old_paid_total
+                            
+                            st.markdown("#### ⚖️ 결제 및 잔금 검증")
+                            st.metric("현재까지 결제된 총 금액", f"{int(_old_paid_total):,}원")
+                            
+                            _block_update = False
+                            if _new_balance_preview < 0:
+                                _block_update = True
+                                st.error(f"⛔ 감액 오류: 수정하려는 총 계약 금액({_edit_total:,}원)이 이미 결제된 금액({int(_old_paid_total):,}원)보다 작습니다.\\n\\n"
+                                         f"👉 **해결 방법:** 먼저 하단의 **[결제 내역 조회 및 취소]** 메뉴에서 기존 결제건을 취소하거나 감액한 뒤에, 여기서 계약 금액을 다시 수정해 주세요.")
+                            elif _edit_total != float(orow["total_amount"] or 0) and _new_balance_preview > 0:
+                                st.warning(f"⚠️ 증액 안내: 총 계약 금액이 늘어나서 **{int(_new_balance_preview):,}원**의 추가 잔금이 발생합니다.\\n\\n"
+                                           f"👉 **다음 단계:** 아래 [수정 완료] 버튼을 누른 후, 화면 하단의 **[잔금 추가 결제]** 탭을 열어 증액된 금액만큼 추가 결제를 진행해 주세요.")
                             else:
-                                edit_reason = st.text_area("변경 사유(필수)", key=f"{edit_prefix}_reason")
-                                if st.button("수정 완료 (Update)", key=f"{edit_prefix}_update_btn"):
-                                    if not edit_reason or not edit_reason.strip():
-                                        st.warning("변경 사유를 입력하세요.")
+                                st.info(f"✅ 변경 후 예상 잔금: {int(_new_balance_preview):,}원")
+
+                            # 승인 절차 없이 전 직원 직접 수정 (단, 마이너스 잔금 발생 시 버튼 잠금)
+                            edit_reason = st.text_area("변경 사유(필수, 예: 단가 할인, 옵션 추가 등)", key=f"{edit_prefix}_reason")
+                            
+                            if st.button("수정 완료 (Update)", key=f"{edit_prefix}_update_btn", disabled=_block_update, type="primary"):
+                                if not edit_reason or not edit_reason.strip():
+                                    st.warning("변경 사유를 반드시 입력하세요.")
+                                else:
+                                    _use_supa = _supabase_orders_payments_available()
+                                    conn = None if _use_supa else get_tenant_conn(db_filename)
+                                    old_total = float(orow["total_amount"] or 0)
+                                    old_cost = float(orow.get("cost_price") or 0)
+                                    old_visit = orow.get("visit_reason") or ""
+                                    old_purchase = orow.get("purchase_reason") or ""
+                                    d_new = st.session_state.get(f"{edit_prefix}_delivery")
+                                    delivery_str = d_new.isoformat() if hasattr(d_new, "isoformat") else str(d_new)
+                                    new_total = _edit_total
+                                    new_cost = _edit_cost
+                                    new_display_sales = _edit_display_sales
+                                    new_display_cost = _edit_display_cost
+                                    new_visit = st.session_state.get(f"{edit_prefix}_visit") or None
+                                    new_purchase = st.session_state.get(f"{edit_prefix}_purchase") or None
+                                    
+                                    # 2차 서버단 방어 로직
+                                    if _use_supa:
+                                        payment_total, _ = _sum_payments_by_order_supabase(db_filename, sel_oid)
                                     else:
-                                        _use_supa = _supabase_orders_payments_available()
-                                        conn = None if _use_supa else get_tenant_conn(db_filename)
-                                        old_total = orow["total_amount"] or 0
-                                        old_cost = orow.get("cost_price") or 0
-                                        old_visit = orow.get("visit_reason") or ""
-                                        old_purchase = orow.get("purchase_reason") or ""
-                                        d_new = st.session_state.get(f"{edit_prefix}_delivery")
-                                        delivery_str = d_new.isoformat() if hasattr(d_new, "isoformat") else str(d_new)
-                                        new_total = _edit_total
-                                        new_cost = _edit_cost
-                                        new_display_sales = _edit_display_sales
-                                        new_display_cost = _edit_display_cost
-                                        new_visit = st.session_state.get(f"{edit_prefix}_visit") or None
-                                        new_purchase = st.session_state.get(f"{edit_prefix}_purchase") or None
-                                        if _use_supa:
-                                            payment_total, _ = _sum_payments_by_order_supabase(db_filename, sel_oid)
+                                        pay_sum_row = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM Payments WHERE order_id = ?", (sel_oid,)).fetchone()
+                                        payment_total = float(pay_sum_row[0]) if pay_sum_row else 0
+                                        
+                                    balance_check = new_total - payment_total
+                                    if balance_check < 0:
+                                        st.error(f"⛔ 초과결제 감지: 결제 금액이 구매 금액보다 큽니다. 결제 내역을 먼저 수정하세요.")
+                                        if conn: conn.close()
+                                        st.stop()
+                                        
+                                    margin_pct = (new_total - new_cost - new_display_cost) / new_total * 100 if new_total else 0
+                                    if margin_pct < 15 or margin_pct > 25:
+                                        st.warning(f"⚠️ 주의: 마진율이 {margin_pct:.1f}%입니다. 적정 범위(15%~25%)를 벗어났습니다.")
+                                        
+                                    # 감사 로그 및 매출 차액 반영
+                                    if old_total != new_total:
+                                        if conn: _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
+                                        delta = new_total - old_total
+                                        today_str = datetime.now().strftime("%Y-%m-%d")
+                                        order_date_val = orow.get("order_date") or today_str
+                                        if isinstance(order_date_val, str) and "-" in order_date_val:
+                                            parts = order_date_val.split("-")
+                                            order_date_label = f"{int(parts[1])}월 {int(parts[2])}일" if len(parts) >= 3 else str(order_date_val)
                                         else:
-                                            pay_sum_row = conn.execute("SELECT COALESCE(SUM(amount), 0) FROM Payments WHERE order_id = ?", (sel_oid,)).fetchone()
-                                            payment_total = float(pay_sum_row[0]) if pay_sum_row else 0
-                                        balance_check = new_total - payment_total
-                                        if balance_check > 0:
-                                            st.warning(f"⚠️ 미수금 {balance_check:,}원 발생: 구매 금액({new_total:,}원)이 결제 금액({int(payment_total):,}원)보다 큽니다. 저장 후 미수금 탭에서 확인·관리하세요.")
-                                            _sn_alert = _get_store_name_by_db(db_filename)
-                                            _insert_admin_alert(_sn_alert, "underpaid", f"[{_sn_alert}] 주문#{sel_oid} 미수금 {balance_check:,}원 (수정 후 잔금)")
-                                        elif balance_check < 0:
-                                            st.error(f"⛔ 초과결제 감지: 결제 금액({int(payment_total):,}원)이 구매 금액({new_total:,}원)보다 {abs(balance_check):,}원 많습니다. 결제 내역을 먼저 수정하세요.")
-                                            _sn_alert = _get_store_name_by_db(db_filename)
-                                            _insert_admin_alert(_sn_alert, "overpaid", f"[{_sn_alert}] 주문#{sel_oid} 초과결제 {abs(balance_check):,}원 감지 (수정 시도)")
-                                            if conn:
-                                                conn.close()
-                                            st.stop()
-                                        margin_pct = (new_total - new_cost - new_display_cost) / new_total * 100 if new_total else 0
+                                            order_date_label = str(order_date_val)
+                                        note = f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
+                                        _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(delta), note)
                                         if margin_pct < 15 or margin_pct > 25:
-                                            st.warning(f"⚠️ 주의: 마진율이 {margin_pct:.1f}%입니다. 적정 범위(15%~25%)를 벗어났습니다.")
-                                        # 회계 원칙: total_amount 변경 시 차액을 당일 sales에 INSERT
-                                        if old_total != new_total:
-                                            if conn:
-                                                _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
-                                            delta = new_total - old_total
-                                            today_str = datetime.now().strftime("%Y-%m-%d")
-                                            order_date_val = orow.get("order_date") or today_str
-                                            if isinstance(order_date_val, str) and "-" in order_date_val:
-                                                parts = order_date_val.split("-")
-                                                order_date_label = f"{int(parts[1])}월 {int(parts[2])}일" if len(parts) >= 3 else str(order_date_val)
-                                            else:
-                                                order_date_label = str(order_date_val)
-                                            note = f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
-                                            _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(delta), note)
-                                            if margin_pct < 15 or margin_pct > 25:
-                                                store_name = _get_store_name_by_db(db_filename)
-                                                _insert_admin_alert(store_name, "margin", f"{store_name}에서 마진율 {margin_pct:.1f}% 건이 수정되었습니다.")
-                                        if old_cost != new_cost and conn:
-                                            _insert_audit_log(conn, "Order", sel_oid, "cost_price", old_cost, new_cost, edit_reason)
-                                        if (old_visit or "") != (new_visit or "") and conn:
-                                            _insert_audit_log(conn, "Order", sel_oid, "visit_reason", old_visit, new_visit, edit_reason)
-                                        if (old_purchase or "") != (new_purchase or "") and conn:
-                                            _insert_audit_log(conn, "Order", sel_oid, "purchase_reason", old_purchase, new_purchase, edit_reason)
-                                        try:
-                                            sc, _ = get_supabase_client()
-                                            if sc:
-                                                store_name = _get_current_store_name_for_customers(db_filename)
-                                                if store_name:
-                                                    upd_cust = {
-                                                        "name": st.session_state[f"{edit_prefix}_name"].strip(),
-                                                        "phone1": st.session_state[f"{edit_prefix}_phone1"].strip(),
-                                                        "phone2": st.session_state.get(f"{edit_prefix}_phone2") or None,
-                                                        "address": st.session_state.get(f"{edit_prefix}_address") or None,
-                                                    }
-                                                    sc.table("app_customers").update(upd_cust).eq("store_name", store_name).eq("id", cid).execute()
-                                        except Exception:
-                                            pass
-                                        if _use_supa:
-                                            _update_order_supabase(db_filename, sel_oid, {
-                                                "delivery_date": delivery_str,
-                                                "category": category_edit_val,
-                                                "total_amount": new_total,
-                                                "cost_price": new_cost,
-                                                "display_sales_amount": new_display_sales,
-                                                "display_cost_amount": new_display_cost,
-                                                "visit_reason": new_visit,
-                                                "purchase_reason": new_purchase,
-                                            })
-                                            # 계약금액/원가 변경 시 Supabase 이력 저장
-                                            if old_total != new_total or old_cost != new_cost:
-                                                _ph_cid = _get_order_customer_id_supabase(db_filename, sel_oid)
-                                                _ph_cname = _get_customer_name_supabase(db_filename, _ph_cid) if _ph_cid else ""
-                                                _insert_payment_history(
-                                                    None, sel_oid, _ph_cname, "계약변경",
-                                                    {"order_id": sel_oid, "old_total": old_total, "old_cost": old_cost,
-                                                     "old_display_sales": float(orow.get("display_sales_amount") or 0),
-                                                     "old_display_cost": float(orow.get("display_cost_amount") or 0)},
-                                                    {"order_id": sel_oid, "new_total": new_total, "new_cost": new_cost,
-                                                     "new_display_sales": new_display_sales, "new_display_cost": new_display_cost},
-                                                    edit_reason, db_filename=db_filename,
-                                                )
-                                        else:
-                                            conn.execute(
-                                                "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, visit_reason=?, purchase_reason=? WHERE id=?",
-                                                (delivery_str, category_edit_val, new_total, new_cost, new_visit, new_purchase, sel_oid),
+                                            store_name = _get_store_name_by_db(db_filename)
+                                            _insert_admin_alert(store_name, "margin", f"[{store_name}] 마진율 {margin_pct:.1f}% 건이 수정되었습니다.")
+                                            
+                                    if old_cost != new_cost and conn:
+                                        _insert_audit_log(conn, "Order", sel_oid, "cost_price", old_cost, new_cost, edit_reason)
+                                    if (old_visit or "") != (new_visit or "") and conn:
+                                        _insert_audit_log(conn, "Order", sel_oid, "visit_reason", old_visit, new_visit, edit_reason)
+                                    if (old_purchase or "") != (new_purchase or "") and conn:
+                                        _insert_audit_log(conn, "Order", sel_oid, "purchase_reason", old_purchase, new_purchase, edit_reason)
+                                        
+                                    try:
+                                        sc, _ = get_supabase_client()
+                                        if sc:
+                                            store_name = _get_current_store_name_for_customers(db_filename)
+                                            if store_name:
+                                                upd_cust = {
+                                                    "name": st.session_state[f"{edit_prefix}_name"].strip(),
+                                                    "phone1": st.session_state[f"{edit_prefix}_phone1"].strip(),
+                                                    "phone2": st.session_state.get(f"{edit_prefix}_phone2") or None,
+                                                    "address": st.session_state.get(f"{edit_prefix}_address") or None,
+                                                }
+                                                sc.table("app_customers").update(upd_cust).eq("store_name", store_name).eq("id", cid).execute()
+                                    except Exception:
+                                        pass
+                                        
+                                    # DB 업데이트 실행
+                                    if _use_supa:
+                                        _update_order_supabase(db_filename, sel_oid, {
+                                            "delivery_date": delivery_str,
+                                            "category": category_edit_val,
+                                            "total_amount": new_total,
+                                            "cost_price": new_cost,
+                                            "display_sales_amount": new_display_sales,
+                                            "display_cost_amount": new_display_cost,
+                                            "visit_reason": new_visit,
+                                            "purchase_reason": new_purchase,
+                                        })
+                                        _recalc_order_actual_margin_supabase(db_filename, sel_oid)
+                                    else:
+                                        conn.execute(
+                                            "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, display_sales_amount=?, display_cost_amount=?, visit_reason=?, purchase_reason=? WHERE id=?",
+                                            (delivery_str, category_edit_val, new_total, new_cost, new_display_sales, new_display_cost, new_visit, new_purchase, sel_oid),
+                                        )
+                                        # 계약금액/원가 변경 시 SQLite PaymentHistory에도 이력 기록
+                                        if old_total != new_total or old_cost != new_cost:
+                                            _old_disp_sales = float(orow.get("display_sales_amount") or 0)
+                                            _old_disp_cost = float(orow.get("display_cost_amount") or 0)
+                                            _cust_name_ph = (st.session_state.get(f"{edit_prefix}_name") or "").strip()
+                                            _old_data_sql = {
+                                                "order_id": int(sel_oid),
+                                                "old_total": old_total,
+                                                "old_cost": old_cost,
+                                                "old_display_sales": _old_disp_sales,
+                                                "old_display_cost": _old_disp_cost,
+                                            }
+                                            _new_data_sql = {
+                                                "order_id": int(sel_oid),
+                                                "new_total": new_total,
+                                                "new_cost": new_cost,
+                                                "new_display_sales": new_display_sales,
+                                                "new_display_cost": new_display_cost,
+                                            }
+                                            _ph_err_sql = _insert_payment_history(
+                                                conn,
+                                                sel_oid,
+                                                _cust_name_ph,
+                                                "판매금액변경",
+                                                _old_data_sql,
+                                                _new_data_sql,
+                                                edit_reason,
+                                                db_filename=db_filename,
                                             )
-                                            conn.commit()
-                                        if conn:
-                                            conn.close()
-                                        clear_data_cache()
-                                        st.toast("수정되었습니다.", icon="✅")
-                                        st.rerun()
+                                            if _ph_err_sql:
+                                                st.warning(f"⚠️ 계약 변경 이력(SQLite) 저장 오류: {_ph_err_sql}")
+                                        _recalc_order_actual_margin(conn, sel_oid, db_filename)
+                                        conn.commit()
+                                        
+                                    if conn:
+                                        conn.close()
+                                    clear_data_cache()
+                                    st.toast("✅ 수정 내용이 즉시 반영되었습니다.", icon="✅")
+                                    st.rerun()
 
                             # ── 섹션 2: 결제 내역 조회 및 수정 ──
                             st.divider()
@@ -7397,12 +7334,14 @@ def render_customer_balance():
                                                                 old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
                                                                 new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
                                                                 # Supabase 이력 저장 (conn 없이도 동작)
-                                                                _insert_payment_history(
+                                                                _ph_err = _insert_payment_history(
                                                                     None, _order_id_pay, customer_name_ph, action,
                                                                     old_data, new_data, del_reason,
                                                                     receipt_image_path=receipt_path_saved,
                                                                     db_filename=db_filename,
                                                                 )
+                                                                if _ph_err:
+                                                                    st.warning(f"⚠️ 이력 저장 오류: {_ph_err}")
                                                                 # SQLite 감사 로그 (파일이 있을 때만)
                                                                 conn = get_tenant_conn(db_filename)
                                                                 if conn:
@@ -7446,14 +7385,7 @@ def render_customer_balance():
                                                                 _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved, db_filename=db_filename)
                                                                 conn.commit()
                                                                 conn.close()
-                                                            # Supabase 이력 저장 오류 즉시 표시
-                                                            _errs = st.session_state.get("_ph_insert_errors", [])
-                                                            if _errs:
-                                                                for _em in _errs:
-                                                                    st.error(f"⚠️ 이력 저장 오류: {_em}")
-                                                                st.session_state["_ph_insert_errors"] = []
-                                                            else:
-                                                                st.success("변경이 완료되었습니다. (이력 저장 성공)")
+                                                            st.success("변경이 완료되었습니다.")
                                                             clear_data_cache()
                                                             st.rerun()
 
