@@ -6014,15 +6014,29 @@ def render_new_sales():
     visit_reason = st.selectbox("방문 이유 *", options=VISIT_REASON_OPTIONS, key="visit_reason")
     purchase_reason = st.selectbox("구매 이유 *", options=PURCHASE_REASON_OPTIONS, key="purchase_reason")
 
-    # ----- 다중(복합) 결제 수단: 최대 10개 고정 슬롯 -----
+    # ----- 다중(복합) 결제 수단: 기본 4개, 최대 10개 (플러스 버튼으로 추가) -----
     MAX_PAYMENT_SLOTS = 10
+    DEFAULT_PAYMENT_SLOTS = 4
     st.subheader("결제 내역 (복수 결제 가능)")
+    # 현재 사용 중인 슬롯 개수 (세션에 저장)
+    if "payment_slot_count" not in st.session_state:
+        st.session_state["payment_slot_count"] = DEFAULT_PAYMENT_SLOTS
+    slot_count = st.session_state["payment_slot_count"]
+    # 내부적으로는 최대 슬롯 수만큼 키를 준비해 둠
     if "payment_rows" not in st.session_state:
         st.session_state["payment_rows"] = [
             {"method": "", "card_company": "", "amount": "0"} for _ in range(MAX_PAYMENT_SLOTS)
         ]
+    # 슬롯 추가 버튼
+    add_col1, add_col2 = st.columns([3, 1])
+    with add_col2:
+        disabled_add = slot_count >= MAX_PAYMENT_SLOTS
+        if st.button("➕ 결제 수단 추가", disabled=disabled_add, key="add_payment_slot"):
+            if slot_count < MAX_PAYMENT_SLOTS:
+                st.session_state["payment_slot_count"] = slot_count + 1
+                st.experimental_rerun()
     total_payment_int = 0
-    for i in range(MAX_PAYMENT_SLOTS):
+    for i in range(slot_count):
         row_key = f"pay_method_{i}"
         card_key = f"pay_card_{i}"
         amt_key = f"pay_amt_{i}"
@@ -6070,7 +6084,7 @@ def render_new_sales():
     # 예상 수수료·최종 실질 마진율 (결제 수단별 수수료 반영, 실시간)
     total_fee_est = sum(
         _payment_fee_amount(st.session_state.get(f"pay_method_{i}", ""), int(st.session_state.get(f"pay_amt_{i}", 0) or 0))
-        for i in range(MAX_PAYMENT_SLOTS)
+        for i in range(slot_count)
     )
     net_margin_rate_est = _compute_net_margin_rate(float(final_sales), float(final_cost), total_fee_est)
     fee_delta = net_margin_rate_est - basic_margin_rate
@@ -6108,11 +6122,11 @@ def render_new_sales():
         final_cost_save = cost_price_int + display_cost_int
         basic_margin_save = final_sales_save - final_cost_save
         # 결제 합계 및 미수금(잔금) 계산 — 완불이 아니어도 저장 가능(계약금만 받고 저장 가능)
-        total_payment_slots = sum(int(st.session_state.get(f"pay_amt_{i}", 0) or 0) for i in range(MAX_PAYMENT_SLOTS))
+        total_payment_slots = sum(int(st.session_state.get(f"pay_amt_{i}", 0) or 0) for i in range(slot_count))
         unpaid_balance = final_sales_save - total_payment_slots  # 판매가 - 수납액 = 미수금
         # 수수료 합계 및 실질 마진율 (신용카드·메인페이 2.5% 반영)
         total_fees_save = 0.0
-        for i in range(MAX_PAYMENT_SLOTS):
+        for i in range(slot_count):
             amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
             method = st.session_state.get(f"pay_method_{i}", "")
             total_fees_save += _payment_fee_amount(method, amt)
@@ -6123,7 +6137,7 @@ def render_new_sales():
         # 온누리상품권 결제에 대한 부정 사용 방지 검증
         # 1차: 승인번호 뒤 4자리 + 결제일 기준 중복 여부 확인 (금액 제외)
         # 중복 발견 시 해당 슬롯은 전체 승인번호(8자리 이상) 입력 단계로 전환
-        for i in range(MAX_PAYMENT_SLOTS):
+        for i in range(slot_count):
             method = st.session_state.get(f"pay_method_{i}", "")
             amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
             if amt <= 0:
@@ -6207,7 +6221,7 @@ def render_new_sales():
                 st.stop()
             total_fees = 0.0
             total_paid_initial = 0
-            for i in range(MAX_PAYMENT_SLOTS):
+            for i in range(slot_count):
                 amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
                 if amt <= 0:
                     continue
@@ -6322,7 +6336,7 @@ def render_new_sales():
                 order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 total_fees = 0.0
                 total_paid_initial = 0
-                for i in range(MAX_PAYMENT_SLOTS):
+                for i in range(slot_count):
                     amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
                     if amt <= 0:
                         continue
