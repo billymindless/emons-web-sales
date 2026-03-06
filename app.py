@@ -1365,10 +1365,7 @@ def _get_store_tag_key(store_name: str) -> str:
 def get_tenant_conn(db_filename: str):
     """
     [Connection Management] 매장(테넌트) 전용 DB 파일에 연결.
-    db_filename은 예: store_1.db (Master DB의 Stores.db_filename 값).
-    로그인 성공 시 st.session_state['current_db']에 저장되며, 이후 모든 탭(매출 등록, 대시보드 등)의
-    DB 쿼리는 master_system.db가 아닌 이 tenant DB 파일에만 연결되도록 매개변수화되어 있음.
-    기존 DB 파일은 _ensure_tenant_schema로 card_company, fee_amount, actual_margin 컬럼을 안전하게 추가.
+    디스크 I/O 병목을 막기 위해 _ensure_tenant_schema는 세션당 최초 1회만 실행하도록 캐싱 처리함.
     """
     if not db_filename:
         return None
@@ -1376,10 +1373,15 @@ def get_tenant_conn(db_filename: str):
     if not os.path.exists(path):
         return None
     conn = sqlite3.connect(path)
-    try:
-        _ensure_tenant_schema(conn)
-    except Exception:
-        pass
+
+    # 세션 상태를 이용한 스키마 검사 캐싱 (반복 DDL 실행 원천 차단)
+    cache_key = f"_schema_checked_{db_filename}"
+    if cache_key not in st.session_state:
+        try:
+            _ensure_tenant_schema(conn)
+            st.session_state[cache_key] = True
+        except Exception:
+            pass
     return conn
 
 
@@ -8071,13 +8073,20 @@ def render_dashboard():
 
 # ========== 메인: 탭 구성 및 라우팅 ==========
 
-def main():
+@st.cache_resource
+def _init_system_once():
+    """서버 기동 시 최초 1회만 마스터 DB 스키마 검사를 수행하여 Rerun 병목 제거"""
     init_master_db()
     conn_m = get_master_conn()
     try:
         ensure_master_schema(conn_m)
     finally:
         conn_m.close()
+    return True
+
+
+def main():
+    _init_system_once()
     ensure_session()
     _inject_mobile_css()
     _inject_favicon()
