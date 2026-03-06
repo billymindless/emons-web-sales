@@ -6034,7 +6034,7 @@ def render_new_sales():
         if st.button("➕ 결제 수단 추가", disabled=disabled_add, key="add_payment_slot"):
             if slot_count < MAX_PAYMENT_SLOTS:
                 st.session_state["payment_slot_count"] = slot_count + 1
-                st.experimental_rerun()
+                st.rerun()
     total_payment_int = 0
     for i in range(slot_count):
         row_key = f"pay_method_{i}"
