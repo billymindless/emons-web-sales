@@ -6597,8 +6597,8 @@ def render_new_sales():
     visit_reason = st.selectbox("방문 이유 *", options=VISIT_REASON_OPTIONS, key="visit_reason")
     purchase_reason = st.selectbox("구매 이유 *", options=PURCHASE_REASON_OPTIONS, key="purchase_reason")
 
-    # ----- 다중(복합) 결제 수단: 기본 4개, 최대 10개 (플러스 버튼으로 추가) -----
-    MAX_PAYMENT_SLOTS = 10
+    # ----- 다중(복합) 결제 수단: 기본 4개, 최대 20개 (플러스 버튼으로 추가) -----
+    MAX_PAYMENT_SLOTS = 20
     DEFAULT_PAYMENT_SLOTS = 4
     st.subheader("결제 내역 (복수 결제 가능)")
     # 현재 사용 중인 슬롯 개수 (세션에 저장)
@@ -6624,7 +6624,7 @@ def render_new_sales():
         card_key = f"pay_card_{i}"
         amt_key = f"pay_amt_{i}"
         if amt_key not in st.session_state:
-            st.session_state[amt_key] = 0
+            st.session_state[amt_key] = "0"
         c1, c2, c3 = st.columns([2, 2, 2])
         with c1:
             method = st.selectbox(f"결제 수단 #{i+1} *", options=PAYMENT_METHOD_OPTIONS, key=row_key, index=0 if i == 0 else 0)
@@ -6637,8 +6637,9 @@ def render_new_sales():
             else:
                 card_company = None
         with c3:
-            st.number_input(f"금액 #{i+1} *", min_value=0, step=10000, key=amt_key)
-        total_payment_int += int(st.session_state.get(amt_key, 0) or 0)
+            _ak = amt_key
+            st.text_input(f"금액 #{i+1} *", key=_ak, on_change=lambda k=_ak: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))))
+        total_payment_int += _parse_comma_to_int(st.session_state.get(amt_key, "0"))
         # 온누리상품권 전용 승인번호/영수증 입력 UI (결제 수단에 '온누리'가 포함될 때만)
         is_onnuri = method and ("온누리" in str(method))
         onnuri_stage_key = f"pay_onnuri_stage_{i}"
@@ -6666,7 +6667,7 @@ def render_new_sales():
 
     # 예상 수수료·최종 실질 마진율 (결제 수단별 수수료 반영, 실시간)
     total_fee_est = sum(
-        _payment_fee_amount(st.session_state.get(f"pay_method_{i}", ""), int(st.session_state.get(f"pay_amt_{i}", 0) or 0))
+        _payment_fee_amount(st.session_state.get(f"pay_method_{i}", ""), _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")))
         for i in range(slot_count)
     )
     net_margin_rate_est = _compute_net_margin_rate(float(final_sales), float(final_cost), total_fee_est)
@@ -6705,12 +6706,12 @@ def render_new_sales():
         final_cost_save = cost_price_int + display_cost_int
         basic_margin_save = final_sales_save - final_cost_save
         # 결제 합계 및 미수금(잔금) 계산 — 완불이 아니어도 저장 가능(계약금만 받고 저장 가능)
-        total_payment_slots = sum(int(st.session_state.get(f"pay_amt_{i}", 0) or 0) for i in range(slot_count))
+        total_payment_slots = sum(_parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")) for i in range(slot_count))
         unpaid_balance = final_sales_save - total_payment_slots  # 판매가 - 수납액 = 미수금
         # 수수료 합계 및 실질 마진율 (신용카드·메인페이 2.5% 반영)
         total_fees_save = 0.0
         for i in range(slot_count):
-            amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
+            amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
             method = st.session_state.get(f"pay_method_{i}", "")
             total_fees_save += _payment_fee_amount(method, amt)
         net_margin_rate_save = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees_save)
@@ -6722,7 +6723,7 @@ def render_new_sales():
         # 중복 발견 시 해당 슬롯은 전체 승인번호(8자리 이상) 입력 단계로 전환
         for i in range(slot_count):
             method = st.session_state.get(f"pay_method_{i}", "")
-            amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
+            amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
             if amt <= 0:
                 continue
             if not method or "온누리" not in str(method):
@@ -6805,7 +6806,7 @@ def render_new_sales():
             total_fees = 0.0
             total_paid_initial = 0
             for i in range(slot_count):
-                amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
+                amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
                 if amt <= 0:
                     continue
                 method = st.session_state.get(f"pay_method_{i}", "")
@@ -6879,7 +6880,7 @@ def render_new_sales():
             st.session_state["payment_slot_count"] = DEFAULT_PAYMENT_SLOTS
             st.session_state["payment_rows"] = [{"method": "", "card_company": "", "amount": "0"} for _ in range(MAX_PAYMENT_SLOTS)]
             for i in range(MAX_PAYMENT_SLOTS):
-                st.session_state[f"pay_amt_{i}"] = 0
+                st.session_state[f"pay_amt_{i}"] = "0"
             for key in list(st.session_state.keys()):
                 if key in (
                     "phone1", "phone2", "address_manual", "address_detail",
@@ -6928,7 +6929,7 @@ def render_new_sales():
                 total_fees = 0.0
                 total_paid_initial = 0
                 for i in range(slot_count):
-                    amt = int(st.session_state.get(f"pay_amt_{i}", 0) or 0)
+                    amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
                     if amt <= 0:
                         continue
                     method = st.session_state.get(f"pay_method_{i}", "")
@@ -7005,7 +7006,7 @@ def render_new_sales():
             st.session_state["payment_slot_count"] = DEFAULT_PAYMENT_SLOTS
             st.session_state["payment_rows"] = [{"method": "", "card_company": "", "amount": "0"} for _ in range(MAX_PAYMENT_SLOTS)]
             for i in range(MAX_PAYMENT_SLOTS):
-                st.session_state[f"pay_amt_{i}"] = 0
+                st.session_state[f"pay_amt_{i}"] = "0"
             # 신규 매출 등록 관련 상태 초기화
             for key in list(st.session_state.keys()):
                 if key in (
