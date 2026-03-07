@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-에몬스 프랜차이즈 가구 매장 · 세일즈 및 경영 대시보드
+momo - 가구 매장 세일즈 및 경영 대시보드
 """
 import base64
 import io
@@ -51,7 +51,7 @@ _supabase_admin_client_cache = None
 #         권장: 180x180 또는 192x192 PNG, 에몬스 'e' 로고 또는 가구 아이콘.
 _ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "apple-touch-icon.png")
 st.set_page_config(
-    page_title="에몬스판매관리 프로그램",
+    page_title="momo",
     layout="wide",
     initial_sidebar_state="collapsed",
     page_icon=_ICON_PATH if os.path.exists(_ICON_PATH) else "🪑",
@@ -1019,7 +1019,7 @@ os.makedirs(RECEIPT_DIR, exist_ok=True)
 RECEIPTS_UPLOAD_DIR = os.path.join(BASE_DIR, "uploads", "receipts")
 os.makedirs(RECEIPTS_UPLOAD_DIR, exist_ok=True)
 
-LOGO_FALLBACK_MSG = "에몬스 로고를 불러올 수 없습니다. (경로 확인 필요)"
+LOGO_FALLBACK_MSG = "momo 로고를 불러올 수 없습니다. (경로 확인 필요)"
 
 # [DB 규칙] Customers, Sales, Orders 등 PK가 id(자동증가)인 테이블:
 # - INSERT 시 id 컬럼은 절대 지정하지 않음 (DB 자동 생성).
@@ -3757,7 +3757,7 @@ def render_login():
         + "</div>"
     )
     st.markdown(logo_html, unsafe_allow_html=True)
-    st.title("에몬스판매관리 프로그램")
+    st.title("momo")
     st.subheader("로그인")
     with st.form("login_form"):
         email = st.text_input("이메일", value=default_email, key="login_email", type="default", placeholder="예: you@example.com")
