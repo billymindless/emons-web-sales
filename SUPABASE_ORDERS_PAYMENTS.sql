@@ -48,6 +48,9 @@ CREATE INDEX IF NOT EXISTS idx_app_payments_onnuri ON app_payments(db_filename, 
 
 COMMENT ON COLUMN app_payments.db_filename IS '매장 구분자. app_orders와 동일 값으로 필터. NOT NULL.';
 
+-- created_by 컬럼 추가 (입력자 추적용) — 이미 적용된 경우 무시됨
+ALTER TABLE app_payments ADD COLUMN IF NOT EXISTS created_by TEXT;
+
 -- RLS (앱에서 service_role/anon으로 접근 시 정책)
 ALTER TABLE app_orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app_payments ENABLE ROW LEVEL SECURITY;

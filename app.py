@@ -1593,8 +1593,10 @@ def _ensure_tenant_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE Payments ADD COLUMN fee_amount REAL")
     if "onnuri_approval_code" not in cols:
         conn.execute("ALTER TABLE Payments ADD COLUMN onnuri_approval_code TEXT")
-    if "onnuri_approval_code" not in cols:
-        conn.execute("ALTER TABLE Payments ADD COLUMN onnuri_approval_code TEXT")
+    if "created_at" not in cols:
+        conn.execute("ALTER TABLE Payments ADD COLUMN created_at TEXT DEFAULT (datetime('now'))")
+    if "created_by" not in cols:
+        conn.execute("ALTER TABLE Payments ADD COLUMN created_by TEXT")
     cur = conn.execute("PRAGMA table_info(Orders)")
     cols = [row[1] for row in cur.fetchall()]
     if "actual_margin" not in cols:
@@ -5092,7 +5094,8 @@ def render_monthly_payment_report(is_superadmin: bool):
                     df = _load_payments_supabase(db_fn)
                     if not df.empty and "payment_date" in df.columns:
                         df = df[df["payment_date"].notna() & (df["payment_date"] != "")]
-                        df = df[["payment_date", "payment_method", "card_company", "amount"]]
+                        _keep = [c for c in ["payment_date", "payment_method", "card_company", "amount", "created_at", "created_by"] if c in df.columns]
+                        df = df[_keep]
                         df["_store"] = s["store_name"]
                         all_payments.append(df)
                 else:
@@ -5100,7 +5103,10 @@ def render_monthly_payment_report(is_superadmin: bool):
                     if not conn:
                         continue
                     try:
-                        df = pd.read_sql("SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
+                        _pcols = [r[1] for r in conn.execute("PRAGMA table_info(Payments)").fetchall()]
+                        _extra = ", ".join(c for c in ["created_at", "created_by"] if c in _pcols)
+                        _sel = f"payment_date, payment_method, card_company, amount{', ' + _extra if _extra else ''}"
+                        df = pd.read_sql(f"SELECT {_sel} FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
                         df["_store"] = s["store_name"]
                         all_payments.append(df)
                     except Exception:
@@ -5123,14 +5129,18 @@ def render_monthly_payment_report(is_superadmin: bool):
                     pay_df = pd.DataFrame(columns=["payment_date", "payment_method", "card_company", "amount"])
                 else:
                     pay_df = pay_df[pay_df["payment_date"].notna() & (pay_df["payment_date"] != "")]
-                    pay_df = pay_df[["payment_date", "payment_method", "card_company", "amount"]]
+                    _keep = [c for c in ["payment_date", "payment_method", "card_company", "amount", "created_at", "created_by"] if c in pay_df.columns]
+                    pay_df = pay_df[_keep]
             else:
                 conn = get_tenant_conn(db_fn)
                 if not conn:
                     st.error("매장 DB를 찾을 수 없습니다.")
                     return
                 try:
-                    pay_df = pd.read_sql("SELECT payment_date, payment_method, card_company, amount FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
+                    _pcols = [r[1] for r in conn.execute("PRAGMA table_info(Payments)").fetchall()]
+                    _extra = ", ".join(c for c in ["created_at", "created_by"] if c in _pcols)
+                    _sel = f"payment_date, payment_method, card_company, amount{', ' + _extra if _extra else ''}"
+                    pay_df = pd.read_sql(f"SELECT {_sel} FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
                 except Exception:
                     st.error("결제 데이터를 불러올 수 없습니다.")
                     conn.close()
@@ -5198,6 +5208,57 @@ def render_monthly_payment_report(is_superadmin: bool):
         else:
             file_name = f"결제수단집계_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx"
         st.download_button("엑셀 다운로드", data=buf.getvalue(), file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="monthly_payment_report_dl")
+
+        # ── 관리자 전용: 입력 감사 내역 ──────────────────────────────
+        _cur_role = (st.session_state.get("current_user") or {}).get("role", "user")
+        if _cur_role in ("store_admin", "superadmin"):
+            with st.expander("🔍 결제 입력 감사 내역 (관리자 전용)", expanded=False):
+                st.caption("결제일자 · 입력일자 · 입력자 정보를 확인할 수 있습니다. 입력 오류 발생 시 책임 소재를 특정하는 데 활용하세요.")
+                _audit_df = pay_df.copy()
+                # 결제일자 컬럼은 이미 pay_df에 파생된 상태
+                _display_cols = {}
+                if "결제일자" in _audit_df.columns:
+                    _display_cols["결제일자"] = "결제일자"
+                elif "payment_date" in _audit_df.columns:
+                    _audit_df["결제일자"] = pd.to_datetime(_audit_df["payment_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                    _display_cols["결제일자"] = "결제일자"
+                if "created_at" in _audit_df.columns:
+                    _audit_df["입력일자"] = pd.to_datetime(_audit_df["created_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+                    _display_cols["입력일자"] = "입력일자"
+                else:
+                    st.info("입력일자 데이터가 없습니다. (이전에 등록된 결제 내역은 입력일자가 표시되지 않을 수 있습니다.)")
+                if "created_by" in _audit_df.columns:
+                    _display_cols["created_by"] = "입력자"
+                else:
+                    st.info("입력자 데이터가 없습니다. (이전에 등록된 결제 내역은 입력자가 표시되지 않을 수 있습니다.)")
+                _audit_df["결제수단"] = _audit_df.apply(_to_detailed, axis=1) if "detailed_payment" not in _audit_df.columns else _audit_df["detailed_payment"]
+                _display_cols["결제수단"] = "결제수단"
+                _audit_df["금액"] = pd.to_numeric(_audit_df.get("amount", 0), errors="coerce").fillna(0).astype(int)
+                _display_cols["금액"] = "금액"
+                if "_store" in _audit_df.columns:
+                    _display_cols["_store"] = "매장"
+                _sel_cols = [c for c in _display_cols.keys() if c in _audit_df.columns]
+                _audit_show = _audit_df[_sel_cols].rename(columns=_display_cols)
+                # 결제일자 내림차순 정렬
+                _sort_col = "결제일자" if "결제일자" in _audit_show.columns else None
+                if _sort_col:
+                    _audit_show = _audit_show.sort_values(_sort_col, ascending=False)
+                # 금액 포맷
+                if "금액" in _audit_show.columns:
+                    _audit_show["금액"] = _audit_show["금액"].map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
+                st.dataframe(_audit_show, use_container_width=True, hide_index=True)
+                # 엑셀 다운로드 (감사 내역)
+                _abuf = io.BytesIO()
+                with pd.ExcelWriter(_abuf, engine="openpyxl") as _wr:
+                    _audit_show.to_excel(_wr, sheet_name="결제감사내역", index=False)
+                _abuf.seek(0)
+                st.download_button(
+                    "📥 감사 내역 엑셀 다운로드",
+                    data=_abuf.getvalue(),
+                    file_name=f"결제감사내역_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="audit_report_dl",
+                )
 
     # ==========================================
     # 모드 2: 직원별 판매 실적 추적 (상세 데이터 추가)
@@ -6659,6 +6720,7 @@ def render_new_sales():
                     "card_company": card_company,
                     "fee_amount": fee,
                     "onnuri_approval_code": onnuri_code,
+                    "created_by": _current_username(),
                 })
             actual_margin = basic_margin_save - total_fees  # 실질 마진 = 판매가 - 원가 - 수수료
             remaining = final_sales_save - total_paid_initial
@@ -6774,9 +6836,9 @@ def render_new_sales():
                             raw = (st.session_state.get(f"pay_onnuri_full_{i}", "") or "").strip()
                         onnuri_code = re.sub(r"\\D", "", raw) or None
                     conn.execute("""
-                        INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (order_id, order_date.isoformat(), amt, method or None, card_company, fee, onnuri_code))
+                        INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    """, (order_id, order_date.isoformat(), amt, method or None, card_company, fee, onnuri_code, _current_username()))
                 actual_margin = basic_margin_save - total_fees
                 conn.execute("UPDATE Orders SET actual_margin = ? WHERE id = ?", (actual_margin, order_id))
                 remaining = final_sales_save - total_paid_initial
@@ -6990,6 +7052,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                     "card_company": add_card,
                     "fee_amount": fee,
                     "onnuri_approval_code": onnuri_code,
+                    "created_by": _current_username(),
                 })
                 _recalc_order_actual_margin_supabase(db_filename, order_id)
                 customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
@@ -7020,9 +7083,9 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                 old_balance = balance
                 new_balance = balance - add_amt_int
                 conn.execute("""
-                    INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (order_id, pay_date_str, add_amt_int, add_method or None, add_card, fee, onnuri_code))
+                    INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                """, (order_id, pay_date_str, add_amt_int, add_method or None, add_card, fee, onnuri_code, _current_username()))
                 _recalc_order_actual_margin(conn, order_id, db_filename)
                 _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
                 _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
