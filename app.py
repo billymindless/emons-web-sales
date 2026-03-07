@@ -6399,6 +6399,7 @@ def _render_address_section_fragment():
     _address_section_impl()
 
 
+@st.fragment
 def render_new_sales():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -7060,6 +7061,7 @@ def _recalc_order_actual_margin(conn, order_id: int, db_filename: str | None = N
     )
 
 
+@st.fragment
 def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float, key_prefix: str = "pay"):
     """잔금 완납 처리(결제 추가) 공통 UI. 직원도 사용 가능하되, 모든 변경은 PaymentHistory에 기록."""
     amt_key = f"{key_prefix}_amt"
