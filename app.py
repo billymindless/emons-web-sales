@@ -7444,7 +7444,10 @@ def render_customer_balance():
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")
-        if search_query and search_query.strip():
+        if not search_query or not search_query.strip():
+            st.info("고객 이름 또는 전화번호를 입력하여 검색하세요.")
+            customers = pd.DataFrame()
+        else:
             q = search_query.strip()
             try:
                 if _supabase_orders_payments_available():
@@ -7477,23 +7480,8 @@ def render_customer_balance():
                         customers = pd.DataFrame()
             except Exception:
                 customers = pd.DataFrame()
-        else:
-            if _supabase_orders_payments_available():
-                customers = load_customers_cached(db_filename, limit=50)
-            else:
-                conn = get_tenant_conn(db_filename)
-                if conn:
-                    try:
-                        cur = conn.execute(
-                            "SELECT id, name, phone1, phone2, address FROM Customers ORDER BY id DESC LIMIT 50"
-                        )
-                        customers = pd.DataFrame(cur.fetchall(), columns=["id", "name", "phone1", "phone2", "address"])
-                    finally:
-                        conn.close()
-                else:
-                    customers = pd.DataFrame()
 
-        if len(customers) == 0:
+        if len(customers) == 0 and search_query and search_query.strip():
             st.info("검색 결과가 없습니다.")
         else:
             # 동일 고객(이름+전화번호) 중복 제거 → 한 명만 표시
