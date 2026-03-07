@@ -6874,13 +6874,9 @@ def render_new_sales():
             st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             st.session_state["_cust_search_panel_open"] = False
-            # 반복 등록 시 금액이 이전 건과 동일하게 남는 현상 방지: 삭제 전에 금액·결제 키를 명시적으로 0으로 초기화
-            for _k in ("cost_price", "total_amount", "display_sales_amount", "display_cost_amount"):
-                st.session_state[_k] = 0
+            # 반복 등록 시 금액이 이전 건과 동일하게 남는 현상 방지: 비위젯 상태 초기화 후 위젯 키는 삭제
             st.session_state["payment_slot_count"] = DEFAULT_PAYMENT_SLOTS
             st.session_state["payment_rows"] = [{"method": "", "card_company": "", "amount": "0"} for _ in range(MAX_PAYMENT_SLOTS)]
-            for i in range(MAX_PAYMENT_SLOTS):
-                st.session_state[f"pay_amt_{i}"] = "0"
             for key in list(st.session_state.keys()):
                 if key in (
                     "phone1", "phone2", "address_manual", "address_detail",
@@ -7000,13 +6996,9 @@ def render_new_sales():
             st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             st.session_state["_cust_search_panel_open"] = False
-            # 반복 등록 시 금액이 이전 건과 동일하게 남는 현상 방지: 삭제 전에 금액·결제 키를 명시적으로 0으로 초기화
-            for _k in ("cost_price", "total_amount", "display_sales_amount", "display_cost_amount"):
-                st.session_state[_k] = 0
+            # 반복 등록 시 금액이 이전 건과 동일하게 남는 현상 방지: 비위젯 상태 초기화 후 위젯 키는 삭제
             st.session_state["payment_slot_count"] = DEFAULT_PAYMENT_SLOTS
             st.session_state["payment_rows"] = [{"method": "", "card_company": "", "amount": "0"} for _ in range(MAX_PAYMENT_SLOTS)]
-            for i in range(MAX_PAYMENT_SLOTS):
-                st.session_state[f"pay_amt_{i}"] = "0"
             # 신규 매출 등록 관련 상태 초기화
             for key in list(st.session_state.keys()):
                 if key in (
