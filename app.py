@@ -2448,6 +2448,166 @@ def _insert_order_notification(
         pass
 
 
+def _get_admin_usernames_for_store(db_filename: str) -> list[str]:
+    """해당 매장의 store_admin + superadmin username 목록 반환.
+    캐시된 _get_supabase_users_list() / _get_supabase_stores_list() 활용.
+    """
+    if not _supabase_orders_payments_available() or not db_filename:
+        return []
+    try:
+        users = _get_supabase_users_list()
+        stores = _get_supabase_stores_list()
+        # db_filename → store id 변환
+        store_id = None
+        for s in stores:
+            if s.get("db_filename") == db_filename:
+                store_id = s.get("id")
+                break
+        result = []
+        for u in users:
+            uname = (u.get("username") or "").strip()
+            role = u.get("role", "")
+            if not uname:
+                continue
+            if role == "superadmin":
+                result.append(uname)
+            elif role == "store_admin" and store_id is not None and u.get("store_id") == store_id:
+                result.append(uname)
+        return list(dict.fromkeys(result))  # 중복 제거 (순서 유지)
+    except Exception:
+        return []
+
+
+def _insert_fraud_alert_to_admins(
+    db_filename: str,
+    order_id: int,
+    actor_username: str,
+    alert_level: str,
+    alert_type: str,
+    payload: str,
+    reason: str = "",
+):
+    """부정행위 의심 신호를 app_edit_requests에 삽입 — 수신자: 매장관리자·통합관리자 전원.
+    alert_level: 'info' | 'warning' | 'critical'
+    alert_type : 'high_amount_change' | 'negative_margin' | 'payment_cancel' |
+                 'off_hours_edit' | 'self_sales_assign'
+    """
+    if not _supabase_orders_payments_available() or not db_filename:
+        return
+    admin_usernames = _get_admin_usernames_for_store(db_filename)
+    if not admin_usernames:
+        return
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return
+        for admin_uname in admin_usernames:
+            try:
+                sc.table("app_edit_requests").insert({
+                    "db_filename": db_filename,
+                    "entity_type": "Order",
+                    "entity_id": int(order_id) if order_id else 0,
+                    "requested_by": actor_username or "unknown",
+                    "target_username": admin_uname,
+                    "notif_type": "admin_alert",
+                    "payload": f"[{alert_level.upper()}][{alert_type}] {payload}",
+                    "reason": reason or "",
+                    "status": "pending_notif",
+                }).execute()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _check_and_send_fraud_signals(
+    db_filename: str,
+    order_id: int,
+    actor_username: str,
+    old_total: float = 0.0,
+    new_total: float = 0.0,
+    old_cost: float = 0.0,
+    new_cost: float = 0.0,
+    new_display_cost: float = 0.0,
+    old_employee_names: str = "",
+    new_employee_names: str = "",
+    reason: str = "",
+    action_type: str = "order_modified",
+):
+    """주문 수정·결제 변경 완료 직후 호출 — 부정행위 의심 패턴 탐지 후 관리자 알림 삽입.
+    코어 로직과 완전히 분리된 읽기전용 탐지 레이어.
+    """
+    if not db_filename:
+        return
+    try:
+        current_hour = datetime.now().hour
+
+        # ── 규칙 1: 결제 취소 ──
+        if action_type == "payment_cancel":
+            _insert_fraud_alert_to_admins(
+                db_filename, order_id, actor_username,
+                "warning", "payment_cancel",
+                f"주문 #{order_id} 결제 취소 처리 — 담당: {actor_username}",
+                reason,
+            )
+            return  # 결제 취소는 단일 규칙만 적용
+
+        # ── 규칙 2: 금액 변경률 ≥ 15% ──
+        if old_total > 0 and action_type in ("order_modified", "amount_change"):
+            change_pct = abs(new_total - old_total) / old_total * 100
+            if change_pct >= 30:
+                _insert_fraud_alert_to_admins(
+                    db_filename, order_id, actor_username,
+                    "critical", "high_amount_change",
+                    f"판매금액 {change_pct:.1f}% 변경: {int(old_total):,}원 → {int(new_total):,}원 (담당: {actor_username})",
+                    reason,
+                )
+            elif change_pct >= 15:
+                _insert_fraud_alert_to_admins(
+                    db_filename, order_id, actor_username,
+                    "warning", "high_amount_change",
+                    f"판매금액 {change_pct:.1f}% 변경: {int(old_total):,}원 → {int(new_total):,}원 (담당: {actor_username})",
+                    reason,
+                )
+
+        # ── 규칙 3: 마진율 음수 (원가 ≥ 판매가) ──
+        if new_total > 0:
+            total_cost = new_cost + new_display_cost
+            if total_cost >= new_total:
+                _insert_fraud_alert_to_admins(
+                    db_filename, order_id, actor_username,
+                    "critical", "negative_margin",
+                    f"원가({int(total_cost):,}원) ≥ 판매가({int(new_total):,}원) — 마진율 0% 이하 감지 (담당: {actor_username})",
+                    reason,
+                )
+
+        # ── 규칙 4: 영업 외 시간 수정 (22시~07시) ──
+        if current_hour >= 22 or current_hour < 7:
+            _insert_fraud_alert_to_admins(
+                db_filename, order_id, actor_username,
+                "info", "off_hours_edit",
+                f"주문 #{order_id} 영업 외 시간({current_hour}시) 수정 — 담당: {actor_username}",
+                reason,
+            )
+
+        # ── 규칙 5: 본인이 자신을 담당 직원에 추가 ──
+        if old_employee_names != new_employee_names and actor_username and actor_username != "unknown":
+            actor_display = (_get_app_user_display_name_map().get(actor_username) or actor_username)
+            _old_set = {e.strip() for e in old_employee_names.split(",") if e.strip()}
+            _new_set = {e.strip() for e in new_employee_names.split(",") if e.strip()}
+            _newly_added = _new_set - _old_set
+            if actor_display in _newly_added:
+                _insert_fraud_alert_to_admins(
+                    db_filename, order_id, actor_username,
+                    "warning", "self_sales_assign",
+                    f"{actor_username}이(가) 타인 주문({order_id})에 본인을 담당자로 추가: {old_employee_names or '(없음)'} → {new_employee_names}",
+                    reason,
+                )
+
+    except Exception:
+        pass  # 탐지 오류가 코어 로직에 영향을 주지 않도록 silently 무시
+
+
 def _fetch_my_notifications(db_filename: str, username: str) -> list:
     """현재 직원(username)에게 발송된 미확인 알림 목록 조회."""
     if not _supabase_orders_payments_available() or not username or username == "unknown":
@@ -2523,6 +2683,112 @@ def _render_login_notifications(db_filename: str):
                 f"사유: {reason_text or '(없음)'}  \n"
                 f"내용: {payload}"
             )
+        st.divider()
+
+
+def _fetch_admin_fraud_alerts(db_filename: str, username: str) -> list:
+    """관리자(username)에게 발송된 미확인 부정행위 경보 목록 조회."""
+    if not _supabase_orders_payments_available() or not username or username == "unknown":
+        return []
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return []
+        r = (
+            sc.table("app_edit_requests")
+            .select("id, created_at, entity_id, payload, reason, requested_by")
+            .eq("target_username", username)
+            .eq("notif_type", "admin_alert")
+            .eq("status", "pending_notif")
+            .eq("db_filename", db_filename)
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _render_admin_fraud_alerts(db_filename: str):
+    """로그인 직후 1회만 호출: 관리자(store_admin·superadmin)에게 부정행위 의심 경보 표시.
+    일반 직원 알림(_render_login_notifications)과 완전히 분리된 독립 레이어.
+    """
+    if st.session_state.get("_admin_fraud_alert_shown"):
+        return
+    st.session_state["_admin_fraud_alert_shown"] = True
+
+    username = _current_username()
+    if not username or username == "unknown":
+        return
+
+    alerts = _fetch_admin_fraud_alerts(db_filename, username)
+    if not alerts:
+        return
+
+    alert_ids = [a["id"] for a in alerts if "id" in a]
+    _mark_notifications_read(alert_ids)
+
+    level_icon = {
+        "CRITICAL": "🚨",
+        "WARNING":  "⚠️",
+        "INFO":     "ℹ️",
+    }
+    type_label = {
+        "high_amount_change": "판매금액 대폭 변경",
+        "negative_margin":    "마진율 음수 감지",
+        "payment_cancel":     "결제 취소",
+        "off_hours_edit":     "영업 외 시간 수정",
+        "self_sales_assign":  "본인 직접 배분 의심",
+    }
+
+    with st.container(border=True):
+        st.markdown(f"### 🔍 관리자 경보 {len(alerts)}건")
+        st.caption("아래 항목은 부정행위 의심 패턴이 감지된 주문입니다. 페이지를 이동하면 사라집니다.")
+        for a in alerts:
+            created = str(a.get("created_at", ""))[:16].replace("T", " ")
+            actor = a.get("requested_by", "알 수 없음")
+            payload_raw = a.get("payload", "")
+            order_id = a.get("entity_id", "-")
+            reason_text = a.get("reason", "")
+            # payload 파싱: "[CRITICAL][high_amount_change] 내용"
+            level_str = "WARNING"
+            type_str = ""
+            content_str = payload_raw
+            try:
+                if payload_raw.startswith("[") and "][" in payload_raw:
+                    end1 = payload_raw.index("]")
+                    level_str = payload_raw[1:end1]
+                    rest = payload_raw[end1 + 1:]
+                    if rest.startswith("["):
+                        end2 = rest.index("]")
+                        type_str = rest[1:end2]
+                        content_str = rest[end2 + 2:]
+            except Exception:
+                pass
+            icon = level_icon.get(level_str, "⚠️")
+            type_display = type_label.get(type_str, type_str)
+            if level_str == "CRITICAL":
+                st.error(
+                    f"{icon} **[{type_display}]** — 주문 #{order_id}  \n"
+                    f"담당자: `{actor}` | 일시: {created}  \n"
+                    f"사유: {reason_text or '(없음)'}  \n"
+                    f"{content_str}"
+                )
+            elif level_str == "WARNING":
+                st.warning(
+                    f"{icon} **[{type_display}]** — 주문 #{order_id}  \n"
+                    f"담당자: `{actor}` | 일시: {created}  \n"
+                    f"사유: {reason_text or '(없음)'}  \n"
+                    f"{content_str}"
+                )
+            else:
+                st.info(
+                    f"{icon} **[{type_display}]** — 주문 #{order_id}  \n"
+                    f"담당자: `{actor}` | 일시: {created}  \n"
+                    f"사유: {reason_text or '(없음)'}  \n"
+                    f"{content_str}"
+                )
         st.divider()
 
 
@@ -6623,6 +6889,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
     if amt_key not in st.session_state:
         st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
     st.caption("잔금 완납 처리 (결제 추가)")
+    add_pay_date = st.date_input("결제 날짜 *", value=date.today(), key=f"{key_prefix}_pay_date")
     add_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
     if add_method in ("신용카드", "메인페이"):
         add_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
@@ -6660,9 +6927,9 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                 return
             # 온누리상품권 중복 검증: 오늘 날짜 + 승인번호 4자리 조합 (금액 제외)
             onnuri_code = None
+            pay_date_str = add_pay_date.isoformat() if hasattr(add_pay_date, "isoformat") else date.today().isoformat()
             if is_onnuri:
                 stage = st.session_state.get(stage_key, "last4")
-                pay_date_str = date.today().isoformat()
                 if stage == "last4":
                     last4_raw = (st.session_state.get(last4_key, "") or "").strip()
                     last4_digits = re.sub(r"\\D", "", last4_raw)
@@ -6708,7 +6975,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                 new_balance = balance - add_amt_int
                 _insert_payment_supabase(db_filename, {
                     "order_id": order_id,
-                    "payment_date": date.today().isoformat(),
+                    "payment_date": pay_date_str,
                     "amount": add_amt_int,
                     "payment_method": add_method or None,
                     "card_company": add_card,
@@ -6746,7 +7013,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                 conn.execute("""
                     INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (order_id, date.today().isoformat(), add_amt_int, add_method or None, add_card, fee, onnuri_code))
+                """, (order_id, pay_date_str, add_amt_int, add_method or None, add_card, fee, onnuri_code))
                 _recalc_order_actual_margin(conn, order_id, db_filename)
                 _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
                 _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
@@ -7163,26 +7430,45 @@ def render_customer_balance():
                         sel_oid = st.selectbox("수정할 주문 선택", order_options, format_func=_fmt_order_sel, key=f"{edit_prefix}_order_sel")
                         if sel_oid:
                             orow = orders[orders["id"] == sel_oid].iloc[0]
-                            if f"{edit_prefix}_oid" not in st.session_state or st.session_state[f"{edit_prefix}_oid"] != sel_oid:
-                                st.session_state[f"{edit_prefix}_oid"] = sel_oid
+                            # _oid가 변경됐거나, 금액 키가 아직 세션에 없을 때 재초기화
+                            _need_order_init = (
+                                st.session_state.get(f"{edit_prefix}_oid") != sel_oid
+                                or f"{edit_prefix}_general_sales" not in st.session_state
+                            )
+                            if _need_order_init:
+                                # NaN/None/pd.NA 안전 변환 헬퍼
+                                def _safe_float(v):
+                                    try:
+                                        f = float(v)
+                                        return f if (f == f) else 0.0  # NaN 체크 (NaN != NaN)
+                                    except Exception:
+                                        return 0.0
+
                                 dval = orow["delivery_date"]
                                 if pd.notna(dval) and hasattr(dval, "date"):
                                     st.session_state[f"{edit_prefix}_delivery"] = dval.date()
                                 else:
                                     st.session_state[f"{edit_prefix}_delivery"] = today
-                                _disp_sales_val = float(orow.get("display_sales_amount") or 0)
-                                _disp_cost_val = float(orow.get("display_cost_amount") or 0)
-                                _total_val = float(orow["total_amount"] or 0)
+                                _disp_sales_val = _safe_float(orow.get("display_sales_amount"))
+                                _disp_cost_val = _safe_float(orow.get("display_cost_amount"))
+                                _total_val = _safe_float(orow.get("total_amount"))
+                                _cost_val = _safe_float(orow.get("cost_price"))
                                 _general_sales_val = max(0.0, _total_val - _disp_sales_val)
                                 st.session_state[f"{edit_prefix}_general_sales"] = _format_number_comma(str(int(_general_sales_val)))
-                                st.session_state[f"{edit_prefix}_cost"] = _format_number_comma(str(int(orow["cost_price"]))) if pd.notna(orow.get("cost_price")) and orow.get("cost_price") else "0"
+                                st.session_state[f"{edit_prefix}_cost"] = _format_number_comma(str(int(_cost_val)))
                                 st.session_state[f"{edit_prefix}_display_sales"] = _format_number_comma(str(int(_disp_sales_val)))
                                 st.session_state[f"{edit_prefix}_display_cost"] = _format_number_comma(str(int(_disp_cost_val)))
                                 st.session_state[f"{edit_prefix}_has_display"] = _disp_sales_val > 0
-                                st.session_state[f"{edit_prefix}_visit"] = orow["visit_reason"] or ""
-                                st.session_state[f"{edit_prefix}_purchase"] = orow["purchase_reason"] or ""
+                                st.session_state[f"{edit_prefix}_visit"] = str(orow.get("visit_reason") or "")
+                                st.session_state[f"{edit_prefix}_purchase"] = str(orow.get("purchase_reason") or "")
                                 _existing_emps = [e.strip() for e in str(orow.get("employee_names") or "").split(",") if e.strip()]
                                 st.session_state[f"{edit_prefix}_employees"] = _existing_emps
+                                # 카테고리 multiselect도 선택 주문 기준으로 초기화
+                                CATEGORY_OPTIONS_EDIT_INIT = ["옷장", "식탁", "자녀방", "침대", "SSDS침대", "서재_학생", "소파", "소품", "전시품"]
+                                _init_cats = [x.strip() for x in str(orow.get("category") or "").split(",") if x.strip() and x.strip() in CATEGORY_OPTIONS_EDIT_INIT]
+                                st.session_state[f"{edit_prefix}_category_multiselect"] = _init_cats
+                                # 초기화 완료 후 _oid 설정 (중간 실패 시 다음 렌더에서 재시도되도록)
+                                st.session_state[f"{edit_prefix}_oid"] = sel_oid
 
                             # ── 섹션 1: 주문 정보 수정 ──
                             st.markdown("#### 📋 주문 정보 수정")
@@ -7192,7 +7478,7 @@ def render_customer_balance():
                             st.text_area("주소", key=f"{edit_prefix}_address")
                             st.date_input("배송일 *", key=f"{edit_prefix}_delivery")
                             CATEGORY_OPTIONS_EDIT = ["옷장", "식탁", "자녀방", "침대", "SSDS침대", "서재_학생", "소파", "소품", "전시품"]
-                            existing_cats = [x.strip() for x in (orow["category"] or "").split(",") if x.strip()]
+                            existing_cats = [x.strip() for x in str(orow.get("category") or "").split(",") if x.strip()]
                             default_cats = [c for c in existing_cats if c in CATEGORY_OPTIONS_EDIT]
                             selected_categories_edit = st.multiselect(
                                 "품목/카테고리 (복수 선택)",
@@ -7475,6 +7761,25 @@ def render_customer_balance():
                                             _actor_uname, edit_reason,
                                         )
 
+                                    # ── 부정행위 탐지 (코어 로직 무관 — 항상 try/except 격리) ──
+                                    try:
+                                        _check_and_send_fraud_signals(
+                                            db_filename=db_filename,
+                                            order_id=int(sel_oid),
+                                            actor_username=_actor_uname or "unknown",
+                                            old_total=old_total,
+                                            new_total=new_total,
+                                            old_cost=old_cost,
+                                            new_cost=new_cost,
+                                            new_display_cost=new_display_cost,
+                                            old_employee_names=old_employee_names,
+                                            new_employee_names=new_employee_names,
+                                            reason=edit_reason,
+                                            action_type="order_modified",
+                                        )
+                                    except Exception:
+                                        pass
+
                                     _toast_parts = ["수정 내용이 즉시 반영되었습니다."]
                                     if old_employee_names != new_employee_names:
                                         _toast_parts.append(f"담당 직원: {old_employee_names or '(없음)'} → {new_employee_names or '(없음)'}")
@@ -7564,6 +7869,17 @@ def render_customer_balance():
                                                         new_card_company = None
                                                         # 위젯 키 충돌 방지용 빈 placeholder
                                                         st.empty()
+                                                    # 결제 날짜 변경 (기존 날짜 기본값)
+                                                    _cur_pay_date = prow.get("payment_date")
+                                                    try:
+                                                        _cur_pay_date_val = pd.to_datetime(_cur_pay_date).date() if _cur_pay_date else date.today()
+                                                    except Exception:
+                                                        _cur_pay_date_val = date.today()
+                                                    new_pay_date = st.date_input(
+                                                        "결제 날짜 *",
+                                                        value=_cur_pay_date_val,
+                                                        key=f"pay_edit_date_{prow['id']}",
+                                                    )
                                                     new_amount = st.number_input(
                                                         "변경할 새 금액 (0이면 결제 취소)", min_value=0.0,
                                                         value=float(prow["amount"] or 0), step=1000.0,
@@ -7606,11 +7922,13 @@ def render_customer_balance():
                                                                     action = "결제취소"
                                                                     new_payment = {}
                                                                 else:
+                                                                    _new_pay_date_str = new_pay_date.isoformat() if hasattr(new_pay_date, "isoformat") else date.today().isoformat()
                                                                     _update_payment_supabase(db_filename, int(prow["id"]), {
                                                                         "amount": new_amount,
                                                                         "payment_method": new_method,
                                                                         "card_company": new_card_company,
                                                                         "fee_amount": new_fee,
+                                                                        "payment_date": _new_pay_date_str,
                                                                     })
                                                                     action = "결제변경"
                                                                     new_payment = {
@@ -7654,8 +7972,8 @@ def render_customer_balance():
                                                                     new_payment = {}
                                                                 else:
                                                                     conn.execute(
-                                                                        "UPDATE Payments SET amount = ?, payment_method = ?, card_company = ?, fee_amount = ? WHERE id = ?",
-                                                                        (new_amount, new_method, new_card_company, new_fee, int(prow["id"]))
+                                                                        "UPDATE Payments SET amount = ?, payment_method = ?, card_company = ?, fee_amount = ?, payment_date = ? WHERE id = ?",
+                                                                        (new_amount, new_method, new_card_company, new_fee, new_pay_date.isoformat() if hasattr(new_pay_date, "isoformat") else date.today().isoformat(), int(prow["id"]))
                                                                     )
                                                                     action = "결제변경"
                                                                     new_payment = {
@@ -7679,6 +7997,18 @@ def render_customer_balance():
                                                                 conn.commit()
                                                                 conn.close()
                                                             st.success("변경이 완료되었습니다.")
+                                                            # ── 부정행위 탐지: 결제 취소 시 관리자 경보 (코어 로직 무관) ──
+                                                            try:
+                                                                if action == "결제취소":
+                                                                    _check_and_send_fraud_signals(
+                                                                        db_filename=db_filename,
+                                                                        order_id=int(_order_id_pay),
+                                                                        actor_username=_current_username(),
+                                                                        reason=del_reason,
+                                                                        action_type="payment_cancel",
+                                                                    )
+                                                            except Exception:
+                                                                pass
                                                             clear_data_cache()
                                                             st.rerun()
 
@@ -8598,10 +8928,13 @@ def main():
     idx = tab_labels.index(menu_sel)
     st.session_state["main_tab_idx"] = idx
     st.session_state["current_menu"] = idx
-    # 로그인 직후 1회: 내 알림 배너 (주문 수정 / 매출 배분 알림)
+    # 로그인 직후 1회: 내 알림 배너 (주문 수정 / 매출 배분 알림) — 일반 직원용
     _db_fn_for_notif = st.session_state.get("current_db") or (user.get("db_filename") if role != "superadmin" else None)
     if _db_fn_for_notif and role != "superadmin":
         _render_login_notifications(_db_fn_for_notif)
+    # 로그인 직후 1회: 부정행위 의심 경보 배너 — 매장관리자·통합관리자 전용
+    if _db_fn_for_notif and role in ("store_admin", "superadmin"):
+        _render_admin_fraud_alerts(_db_fn_for_notif)
 
     # 대시보드 탭 선택 시 캐시 재사용으로 즉시 표시
     st.divider()
