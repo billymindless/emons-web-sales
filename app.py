@@ -2388,6 +2388,144 @@ def _insert_audit_log(
     )
 
 
+def _get_username_by_display_name(display_name: str) -> str | None:
+    """표시명(실명)으로 app_users.username 역방향 조회. 없으면 None."""
+    if not display_name or not display_name.strip():
+        return None
+    display_map = _get_app_user_display_name_map()
+    for uname, dname in display_map.items():
+        if (dname or "").strip() == display_name.strip():
+            return uname
+    return None
+
+
+def _insert_order_notification(
+    db_filename: str,
+    order_id: int,
+    employee_names_str: str,
+    notif_type: str,
+    payload_msg: str,
+    triggered_by_username: str,
+    reason: str,
+):
+    """담당 직원들에게 알림 레코드 삽입 (app_edit_requests.target_username 활용).
+    notif_type: 'order_modified' | 'sales_assigned'
+    employee_names_str: 쉼표 구분 표시명(예: '홍길동,김철수')
+    triggered_by_username: 변경자 username (자기 자신은 알림 제외)
+    """
+    if not _supabase_orders_payments_available():
+        return
+    if not employee_names_str or not employee_names_str.strip():
+        return
+    target_names = [n.strip() for n in employee_names_str.split(",") if n.strip()]
+    if not target_names:
+        return
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return
+        for display_name in target_names:
+            target_uname = _get_username_by_display_name(display_name)
+            if not target_uname:
+                continue
+            if target_uname == triggered_by_username:
+                continue
+            try:
+                sc.table("app_edit_requests").insert({
+                    "db_filename": db_filename,
+                    "entity_type": "Order",
+                    "entity_id": int(order_id),
+                    "requested_by": triggered_by_username or "",
+                    "target_username": target_uname,
+                    "notif_type": notif_type,
+                    "payload": payload_msg,
+                    "reason": reason,
+                    "status": "pending_notif",
+                }).execute()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _fetch_my_notifications(db_filename: str, username: str) -> list:
+    """현재 직원(username)에게 발송된 미확인 알림 목록 조회."""
+    if not _supabase_orders_payments_available() or not username or username == "unknown":
+        return []
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return []
+        r = (
+            sc.table("app_edit_requests")
+            .select("id, created_at, db_filename, entity_id, notif_type, payload, reason, requested_by")
+            .eq("target_username", username)
+            .eq("status", "pending_notif")
+            .eq("db_filename", db_filename)
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _mark_notifications_read(notification_ids: list):
+    """알림 ID 목록을 읽음(notif_seen) 처리."""
+    if not notification_ids:
+        return
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return
+        sc.table("app_edit_requests").update({"status": "notif_seen"}).in_("id", notification_ids).execute()
+    except Exception:
+        pass
+
+
+def _render_login_notifications(db_filename: str):
+    """로그인 직후 1회만 호출: 미확인 알림을 배너로 표시 후 읽음 처리."""
+    if st.session_state.get("_login_notif_shown"):
+        return
+    st.session_state["_login_notif_shown"] = True
+
+    username = _current_username()
+    if not username or username == "unknown":
+        return
+
+    notifs = _fetch_my_notifications(db_filename, username)
+    if not notifs:
+        return
+
+    notif_ids = [n["id"] for n in notifs if "id" in n]
+    _mark_notifications_read(notif_ids)
+
+    notif_type_label = {
+        "order_modified": ("📝", "주문 정보가 수정되었습니다"),
+        "sales_assigned": ("💰", "매출이 새로 배분되었습니다"),
+    }
+
+    with st.container(border=True):
+        st.markdown(f"### 🔔 새 알림 {len(notifs)}건")
+        st.caption("아래 알림은 최근 주문 수정 또는 매출 배분 내역입니다. 페이지를 이동하면 사라집니다.")
+        for n in notifs:
+            created = str(n.get("created_at", ""))[:16].replace("T", " ")
+            triggered = n.get("requested_by", "누군가")
+            payload = n.get("payload", "")
+            ntype = n.get("notif_type", "")
+            order_id = n.get("entity_id", "")
+            icon, label = notif_type_label.get(ntype, ("ℹ️", "알림"))
+            reason_text = n.get("reason", "")
+            st.info(
+                f"{icon} **{label}** — 주문 #{order_id}  \n"
+                f"변경자: `{triggered}` | 일시: {created}  \n"
+                f"사유: {reason_text or '(없음)'}  \n"
+                f"내용: {payload}"
+            )
+        st.divider()
+
+
 def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_file):
     """온누리 등 결제 영수증 파일을 RECEIPT_DIR에 저장하고 PaymentReceipts에 경로 기록."""
     if uploaded_file is None:
@@ -7043,6 +7181,8 @@ def render_customer_balance():
                                 st.session_state[f"{edit_prefix}_has_display"] = _disp_sales_val > 0
                                 st.session_state[f"{edit_prefix}_visit"] = orow["visit_reason"] or ""
                                 st.session_state[f"{edit_prefix}_purchase"] = orow["purchase_reason"] or ""
+                                _existing_emps = [e.strip() for e in str(orow.get("employee_names") or "").split(",") if e.strip()]
+                                st.session_state[f"{edit_prefix}_employees"] = _existing_emps
 
                             # ── 섹션 1: 주문 정보 수정 ──
                             st.markdown("#### 📋 주문 정보 수정")
@@ -7107,6 +7247,30 @@ def render_customer_balance():
                             st.text_input("방문 이유", key=f"{edit_prefix}_visit")
                             st.text_input("구매 이유", key=f"{edit_prefix}_purchase")
 
+                            # ── 담당 직원 변경 ──
+                            st.markdown("#### 👤 담당 직원 변경")
+                            _store_emp_names_edit = get_store_assigned_employee_names(db_filename)
+                            if not _store_emp_names_edit:
+                                try:
+                                    _emp_conn = get_tenant_conn(db_filename)
+                                    if _emp_conn:
+                                        _emp_df = pd.read_sql("SELECT name FROM Employees WHERE is_active = 1", _emp_conn)
+                                        _emp_conn.close()
+                                        _store_emp_names_edit = _emp_df["name"].tolist() if not _emp_df.empty else []
+                                except Exception:
+                                    _store_emp_names_edit = []
+                            _cur_emp_str = str(orow.get("employee_names") or "")
+                            st.caption(f"현재 담당 직원: **{_cur_emp_str or '(없음)'}**")
+                            if _store_emp_names_edit:
+                                selected_employees_edit = st.multiselect(
+                                    "담당 직원 선택 (변경 시 선택, 1/n 실적 분배 대상)",
+                                    options=_store_emp_names_edit,
+                                    key=f"{edit_prefix}_employees",
+                                )
+                            else:
+                                st.warning("이 매장에 배정된 직원이 없어 직원 변경이 불가능합니다.")
+                                selected_employees_edit = [e for e in (st.session_state.get(f"{edit_prefix}_employees") or []) if e]
+
                             # ── ⚖️ 실시간 잔금 검증 및 안내 로직 ──
                             _old_paid_total = float(orow["paid"])
                             _new_balance_preview = _edit_total - _old_paid_total
@@ -7146,7 +7310,10 @@ def render_customer_balance():
                                     new_display_cost = _edit_display_cost
                                     new_visit = st.session_state.get(f"{edit_prefix}_visit") or None
                                     new_purchase = st.session_state.get(f"{edit_prefix}_purchase") or None
-                                    
+                                    old_employee_names = str(orow.get("employee_names") or "")
+                                    _new_emp_list = st.session_state.get(f"{edit_prefix}_employees") or []
+                                    new_employee_names = ",".join(e.strip() for e in _new_emp_list if e.strip())
+
                                     # 2차 서버단 방어 로직
                                     if _use_supa:
                                         payment_total, _ = _sum_payments_by_order_supabase(db_filename, sel_oid)
@@ -7187,7 +7354,9 @@ def render_customer_balance():
                                         _insert_audit_log(conn, "Order", sel_oid, "visit_reason", old_visit, new_visit, edit_reason)
                                     if (old_purchase or "") != (new_purchase or "") and conn:
                                         _insert_audit_log(conn, "Order", sel_oid, "purchase_reason", old_purchase, new_purchase, edit_reason)
-                                        
+                                    if old_employee_names != new_employee_names and conn:
+                                        _insert_audit_log(conn, "Order", sel_oid, "employee_names", old_employee_names, new_employee_names, edit_reason)
+
                                     try:
                                         sc, _ = get_supabase_client()
                                         if sc:
@@ -7200,6 +7369,21 @@ def render_customer_balance():
                                                     "address": st.session_state.get(f"{edit_prefix}_address") or None,
                                                 }
                                                 sc.table("app_customers").update(upd_cust).eq("store_name", store_name).eq("id", cid).execute()
+                                            # Supabase 직원명 변경 이력 기록 (app_edit_requests)
+                                            if old_employee_names != new_employee_names:
+                                                try:
+                                                    _actor = _current_username()
+                                                    sc.table("app_edit_requests").insert({
+                                                        "db_filename": db_filename,
+                                                        "entity_type": "Order",
+                                                        "entity_id": int(sel_oid),
+                                                        "requested_by": _actor or "",
+                                                        "payload": f"employee_names: {old_employee_names!r} → {new_employee_names!r}",
+                                                        "reason": edit_reason,
+                                                        "status": "approved",
+                                                    }).execute()
+                                                except Exception:
+                                                    pass
                                     except Exception:
                                         pass
                                         
@@ -7214,12 +7398,13 @@ def render_customer_balance():
                                             "display_cost_amount": new_display_cost,
                                             "visit_reason": new_visit,
                                             "purchase_reason": new_purchase,
+                                            "employee_names": new_employee_names or None,
                                         })
                                         _recalc_order_actual_margin_supabase(db_filename, sel_oid)
                                     else:
                                         conn.execute(
-                                            "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, display_sales_amount=?, display_cost_amount=?, visit_reason=?, purchase_reason=? WHERE id=?",
-                                            (delivery_str, category_edit_val, new_total, new_cost, new_display_sales, new_display_cost, new_visit, new_purchase, sel_oid),
+                                            "UPDATE Orders SET delivery_date=?, category=?, total_amount=?, cost_price=?, display_sales_amount=?, display_cost_amount=?, visit_reason=?, purchase_reason=?, employee_names=? WHERE id=?",
+                                            (delivery_str, category_edit_val, new_total, new_cost, new_display_sales, new_display_cost, new_visit, new_purchase, new_employee_names or None, sel_oid),
                                         )
                                         # 계약금액/원가 변경 시 SQLite PaymentHistory에도 이력 기록
                                         if old_total != new_total or old_cost != new_cost:
@@ -7258,7 +7443,42 @@ def render_customer_balance():
                                     if conn:
                                         conn.close()
                                     clear_data_cache()
-                                    st.toast("✅ 수정 내용이 즉시 반영되었습니다.", icon="✅")
+
+                                    # ── 알림 발송 ──
+                                    _actor_uname = _current_username()
+                                    if old_employee_names != new_employee_names:
+                                        # 새로 배분된 직원에게만 'sales_assigned' 알림
+                                        _old_emp_set = set(e.strip() for e in old_employee_names.split(",") if e.strip())
+                                        _new_emp_set = set(e.strip() for e in new_employee_names.split(",") if e.strip())
+                                        _newly_added = ",".join(_new_emp_set - _old_emp_set)
+                                        if _newly_added:
+                                            _insert_order_notification(
+                                                db_filename, int(sel_oid), _newly_added,
+                                                "sales_assigned",
+                                                f"담당 직원 변경: {old_employee_names or '(없음)'} → {new_employee_names}",
+                                                _actor_uname, edit_reason,
+                                            )
+                                        # 기존 담당자에게도 '수정' 알림
+                                        _notif_target = ",".join(_old_emp_set | _new_emp_set)
+                                        _insert_order_notification(
+                                            db_filename, int(sel_oid), _notif_target,
+                                            "order_modified",
+                                            f"담당 직원이 변경되었습니다: {old_employee_names or '(없음)'} → {new_employee_names}",
+                                            _actor_uname, edit_reason,
+                                        )
+                                    else:
+                                        # 금액/날짜 등 수정: 현재 담당 직원 전원에게 알림
+                                        _insert_order_notification(
+                                            db_filename, int(sel_oid), new_employee_names,
+                                            "order_modified",
+                                            f"주문 정보가 수정되었습니다 (판매가: {int(old_total):,}→{int(new_total):,}원)",
+                                            _actor_uname, edit_reason,
+                                        )
+
+                                    _toast_parts = ["수정 내용이 즉시 반영되었습니다."]
+                                    if old_employee_names != new_employee_names:
+                                        _toast_parts.append(f"담당 직원: {old_employee_names or '(없음)'} → {new_employee_names or '(없음)'}")
+                                    st.toast("✅ " + " | ".join(_toast_parts), icon="✅")
                                     st.rerun()
 
                             # ── 섹션 2: 결제 내역 조회 및 수정 ──
@@ -8378,6 +8598,11 @@ def main():
     idx = tab_labels.index(menu_sel)
     st.session_state["main_tab_idx"] = idx
     st.session_state["current_menu"] = idx
+    # 로그인 직후 1회: 내 알림 배너 (주문 수정 / 매출 배분 알림)
+    _db_fn_for_notif = st.session_state.get("current_db") or (user.get("db_filename") if role != "superadmin" else None)
+    if _db_fn_for_notif and role != "superadmin":
+        _render_login_notifications(_db_fn_for_notif)
+
     # 대시보드 탭 선택 시 캐시 재사용으로 즉시 표시
     st.divider()
     if idx == 0:

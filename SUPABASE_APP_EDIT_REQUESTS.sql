@@ -21,6 +21,13 @@ CREATE TABLE IF NOT EXISTS app_edit_requests (
 -- 2. 기존 테이블에 db_filename 컬럼이 없는 경우 추가 (마이그레이션)
 ALTER TABLE app_edit_requests ADD COLUMN IF NOT EXISTS db_filename TEXT;
 
+-- 5. 직원 알림 컬럼 (없을 경우 추가)
+-- target_username: 알림 받을 직원의 username (NULL이면 일반 수정요청 이력)
+-- notif_type: 'order_modified' | 'sales_assigned'
+ALTER TABLE app_edit_requests ADD COLUMN IF NOT EXISTS target_username TEXT;
+ALTER TABLE app_edit_requests ADD COLUMN IF NOT EXISTS notif_type TEXT;
+CREATE INDEX IF NOT EXISTS idx_app_edit_requests_notif ON app_edit_requests(target_username, status);
+
 -- 3. 인덱스 생성
 CREATE INDEX IF NOT EXISTS idx_app_edit_requests_status ON app_edit_requests(db_filename, status);
 CREATE INDEX IF NOT EXISTS idx_app_edit_requests_created ON app_edit_requests(db_filename, created_at);
