@@ -7478,12 +7478,10 @@ def render_customer_balance():
                             st.text_area("주소", key=f"{edit_prefix}_address")
                             st.date_input("배송일 *", key=f"{edit_prefix}_delivery")
                             CATEGORY_OPTIONS_EDIT = ["옷장", "식탁", "자녀방", "침대", "SSDS침대", "서재_학생", "소파", "소품", "전시품"]
-                            existing_cats = [x.strip() for x in str(orow.get("category") or "").split(",") if x.strip()]
-                            default_cats = [c for c in existing_cats if c in CATEGORY_OPTIONS_EDIT]
+                            # 세션 상태(_need_order_init 블록)에서 이미 초기화되므로 default= 사용 안 함
                             selected_categories_edit = st.multiselect(
                                 "품목/카테고리 (복수 선택)",
                                 options=CATEGORY_OPTIONS_EDIT,
-                                default=default_cats,
                                 key=f"{edit_prefix}_category_multiselect",
                             )
                             category_edit_val = ",".join(selected_categories_edit) if selected_categories_edit else None
