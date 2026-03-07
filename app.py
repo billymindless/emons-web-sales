@@ -977,7 +977,14 @@ def _format_phone_hyphen(s):
 
 # 결제 수단·카드사·수수료율 (가구 매장 결제 로직)
 PAYMENT_METHOD_OPTIONS = ["신용카드", "메인페이", "체크카드", "지역화폐", "계좌이체", "온누리", "현금(수금)", "온누리지류"]
-CARD_COMPANY_OPTIONS = ["신한카드", "삼성카드", "KB국민카드", "현대카드", "롯데카드", "우리카드", "하나카드", "BC카드", "NH농협카드", "기타"]
+# 신용카드·체크카드 공용 카드사 목록
+CARD_COMPANY_OPTIONS = [
+    "신한카드", "KB국민카드", "우리카드", "NH농협카드", "하나카드",
+    "카카오뱅크", "토스뱅크", "케이뱅크",
+    "삼성카드", "현대카드", "롯데카드", "BC카드", "기타",
+]
+# 체크카드 선택 시 카드사 표시 대상 수단 (신용카드·체크카드 동일 목록 사용)
+_CARD_WITH_COMPANY = ("신용카드", "체크카드")
 
 
 def _payment_fee_amount(payment_method: str, amount: int) -> float:
@@ -6452,7 +6459,7 @@ def render_new_sales():
         with c1:
             method = st.selectbox(f"결제 수단 #{i+1} *", options=PAYMENT_METHOD_OPTIONS, key=row_key, index=0 if i == 0 else 0)
         with c2:
-            if method == "신용카드":
+            if method in _CARD_WITH_COMPANY:
                 card_company = st.selectbox(f"카드사 #{i+1} *", options=CARD_COMPANY_OPTIONS, key=card_key)
             elif method == "메인페이":
                 st.text_input(f"메인페이 승인번호 4자리 #{i+1}", key=card_key, max_chars=4)
@@ -6891,8 +6898,10 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
     st.caption("잔금 완납 처리 (결제 추가)")
     add_pay_date = st.date_input("결제 날짜 *", value=date.today(), key=f"{key_prefix}_pay_date")
     add_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
-    if add_method in ("신용카드", "메인페이"):
+    if add_method in _CARD_WITH_COMPANY:
         add_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
+    elif add_method == "메인페이":
+        add_card = st.text_input("메인페이 승인번호 4자리", key=f"{key_prefix}_card", max_chars=4)
     else:
         add_card = None
     st.text_input("결제 금액", key=amt_key, on_change=lambda: st.session_state.__setitem__(amt_key, _format_number_comma(st.session_state.get(amt_key, ""))))
@@ -7846,7 +7855,7 @@ def render_customer_balance():
                                                         key=f"pay_edit_method_{prow['id']}",
                                                     )
                                                     # 카드사/승인번호 (수단에 따라)
-                                                    if new_method == "신용카드":
+                                                    if new_method in _CARD_WITH_COMPANY:
                                                         _cur_card = prow.get("card_company") or CARD_COMPANY_OPTIONS[0]
                                                         _card_idx = CARD_COMPANY_OPTIONS.index(_cur_card) if _cur_card in CARD_COMPANY_OPTIONS else 0
                                                         new_card_company = st.selectbox(
