@@ -7481,8 +7481,9 @@ def render_customer_balance():
             except Exception:
                 customers = pd.DataFrame()
 
-        if len(customers) == 0 and search_query and search_query.strip():
-            st.info("검색 결과가 없습니다.")
+        if len(customers) == 0:
+            if search_query and search_query.strip():
+                st.info("검색 결과가 없습니다.")
         else:
             # 동일 고객(이름+전화번호) 중복 제거 → 한 명만 표시
             customers_unique = customers.drop_duplicates(subset=["name", "phone1"], keep="first").reset_index(drop=True)
