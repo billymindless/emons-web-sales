@@ -2848,9 +2848,31 @@ def _insert_payment_history(
 ) -> None:
     """결제 변경 이력 1건 기록. Supabase(app_payment_history) 우선, SQLite conn 있으면 병행 저장.
     반환값: 오류 문자열(실패) 또는 None(성공)"""
+    import math
+
+    def _safe_json(obj):
+        """NaN/Inf/pd.NA 등 JSON 직렬화 불가 값을 None으로 치환하는 재귀 변환."""
+        if obj is None:
+            return None
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+            return None
+        try:
+            import pandas as _pd
+            if obj is _pd.NA or obj is _pd.NaT:
+                return None
+        except Exception:
+            pass
+        if isinstance(obj, dict):
+            return {k: _safe_json(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_safe_json(v) for v in obj]
+        return obj
+
     now_iso = datetime.now().isoformat()
-    changed_by = _current_username()
+    changed_by = _current_username() or "unknown"
     supa_error: str | None = None
+    safe_old = _safe_json(old_payment_data or {})
+    safe_new = _safe_json(new_payment_data or {})
     # ── Supabase 저장 ──
     if _supabase_orders_payments_available() and db_filename:
         try:
@@ -2863,8 +2885,8 @@ def _insert_payment_history(
                     "sale_id": int(sale_id),
                     "customer_name": customer_name or "",
                     "action_type": action_type,
-                    "old_payment_data": old_payment_data or {},
-                    "new_payment_data": new_payment_data or {},
+                    "old_payment_data": safe_old,
+                    "new_payment_data": safe_new,
                     "reason": reason.strip(),
                     "changed_by": changed_by,
                     "changed_at": now_iso,
@@ -2874,6 +2896,11 @@ def _insert_payment_history(
                     supa_error = str(result.error)
         except Exception as _e:
             supa_error = str(_e)
+    # ── 오류를 session_state에 누적 저장 (모니터링 페이지에서 표시) ──
+    if supa_error:
+        _errs = st.session_state.get("_ph_insert_errors", [])
+        _errs.append(f"[{action_type}] {supa_error}")
+        st.session_state["_ph_insert_errors"] = _errs[-5:]  # 최대 5건 보관
     # ── SQLite 저장 (로컬 환경 또는 병행) ──
     if conn:
         try:
@@ -2890,8 +2917,8 @@ def _insert_payment_history(
                     int(sale_id),
                     customer_name or "",
                     action_type,
-                    json.dumps(old_payment_data or {}, ensure_ascii=False),
-                    json.dumps(new_payment_data or {}, ensure_ascii=False),
+                    json.dumps(safe_old, ensure_ascii=False),
+                    json.dumps(safe_new, ensure_ascii=False),
                     reason.strip(),
                     changed_by,
                     now_iso,
@@ -2899,7 +2926,6 @@ def _insert_payment_history(
                 ),
             )
         except Exception as _sqlite_e:
-            # SQLite 오류는 Supabase 환경에서는 무시 (PaymentHistory 테이블 없을 수 있음)
             if supa_error is None and not _supabase_orders_payments_available():
                 supa_error = f"SQLite 저장 오류: {_sqlite_e}"
     return supa_error
@@ -3004,8 +3030,9 @@ def render_payment_history_monitor():
 
     st.header("🚨 결제 변경/취소 모니터링")
 
-    # ── 진단 패널 (접기 가능) ──
-    with st.expander("🔧 Supabase 테이블 진단 (문제 발생 시 확인)", expanded=False):
+    # ── 진단 패널 ──
+    _has_ph_errors = bool(st.session_state.get("_ph_insert_errors"))
+    with st.expander("🔧 Supabase 테이블 진단 (문제 발생 시 확인)", expanded=_has_ph_errors):
         _diag_supa = _supabase_orders_payments_available()
         st.write(f"**Supabase 연결 상태:** {'✅ 정상' if _diag_supa else '❌ 연결 실패'}")
         st.write(f"**현재 매장 DB:** `{db_filename}`")
@@ -3047,10 +3074,12 @@ CREATE POLICY "allow_all_app_payment_history" ON app_payment_history FOR ALL USI
                 st.session_state["_ph_insert_errors"] = []
                 st.rerun()
 
-    # 저장 오류 팝업 (최근 저장 시 오류가 있었으면 상단에 표시)
-    _ph_errors = st.session_state.pop("_ph_insert_errors", [])
-    for _err_msg in _ph_errors:
-        st.error(f"⚠️ 결제 이력 저장 오류 (Supabase): {_err_msg}")
+    # 저장 오류 팝업 (최근 저장 시 오류가 있었으면 상단에 표시 — pop하지 않고 유지하여 재진입 시에도 보임)
+    _ph_errors = st.session_state.get("_ph_insert_errors", [])
+    if _ph_errors:
+        st.error(f"🚨 결제 이력 Supabase 저장 오류 {len(_ph_errors)}건 발생! 아래 '진단' 패널을 확인하세요.")
+        for _err_msg in _ph_errors:
+            st.warning(f"저장 실패: {_err_msg}")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -3077,21 +3106,40 @@ CREATE POLICY "allow_all_app_payment_history" ON app_payment_history FOR ALL USI
 
     df = pd.DataFrame()
 
-    # ── Supabase 조회 ──
+    # ── Supabase 조회 (DB 레벨에서 날짜 범위 필터링) ──
     if _supabase_orders_payments_available():
         try:
             sc, err = get_supabase_client()
             if sc and not err:
-                q = sc.table("app_payment_history").select(
-                    "id, sale_id, customer_name, action_type, old_payment_data, new_payment_data, reason, changed_by, changed_at"
-                ).eq("db_filename", db_filename).order("changed_at", desc=True).limit(500)
+                # Supabase TIMESTAMPTZ는 UTC 기준 — KST(UTC+9) 기준으로 하루 여유를 둬서 조회
+                _start_iso = start_date.isoformat() + "T00:00:00"
+                _end_iso   = end_date.isoformat()   + "T23:59:59"
+                q = (
+                    sc.table("app_payment_history")
+                    .select("id, sale_id, customer_name, action_type, old_payment_data, new_payment_data, reason, changed_by, changed_at")
+                    .eq("db_filename", db_filename)
+                    .gte("changed_at", _start_iso)
+                    .lte("changed_at", _end_iso)
+                    .order("changed_at", desc=True)
+                    .limit(2000)
+                )
                 r = q.execute()
                 rows = r.data or []
                 if rows:
                     df = pd.DataFrame(rows)
                     df = df.rename(columns={"id": "log_id"})
+                    st.caption(f"📋 Supabase에서 {len(df):,}건 조회됨")
+                else:
+                    # 날짜 범위 내 데이터 없음 — 전체 건수도 확인
+                    _total_r = sc.table("app_payment_history").select("id", count="exact").eq("db_filename", db_filename).execute()
+                    _total = _total_r.count if hasattr(_total_r, "count") else len(_total_r.data or [])
+                    if _total == 0:
+                        st.warning("⚠️ app_payment_history 테이블에 데이터가 없습니다. 결제 변경/취소 작업이 발생하면 자동으로 기록됩니다.")
+                    else:
+                        st.info(f"선택한 날짜 범위({start_date} ~ {end_date})에 해당하는 이력이 없습니다. (전체 {_total:,}건 존재)")
         except Exception as e:
             st.error(f"Supabase 조회 오류: {e}")
+            st.info("Supabase 연결에 문제가 있습니다. 아래 진단 패널을 확인하세요.")
     else:
         # ── SQLite 조회 (로컬) ──
         conn = get_tenant_conn(db_filename)
@@ -3115,35 +3163,44 @@ CREATE POLICY "allow_all_app_payment_history" ON app_payment_history FOR ALL USI
             conn.close()
 
     if df.empty:
-        st.info("결제 변경/취소 이력이 없습니다.")
         return
 
-    df["changed_at_dt"] = pd.to_datetime(df["changed_at"], errors="coerce")
+    df["changed_at_dt"] = pd.to_datetime(df["changed_at"], errors="coerce", utc=True)
     mask = pd.Series(True, index=df.index)
 
     if search_name:
         mask &= df["customer_name"].fillna("").str.contains(search_name.strip(), case=False)
-    if start_date:
-        mask &= df["changed_at_dt"].dt.date >= start_date
-    if end_date:
-        mask &= df["changed_at_dt"].dt.date <= end_date
     if action_filter:
         mask &= df["action_type"].isin(action_filter)
     if user_filter:
         mask &= df["changed_by"].fillna("").str.contains(user_filter.strip(), case=False)
 
     df_f = df.loc[mask].copy()
-    df_f["changed_at"] = df_f["changed_at_dt"].dt.strftime("%Y-%m-%d %H:%M").fillna(df_f["changed_at"].astype(str))
+    # UTC → KST(+9) 변환 후 표시
+    df_f["changed_at"] = (
+        df_f["changed_at_dt"]
+        .dt.tz_convert("Asia/Seoul")
+        .dt.strftime("%Y-%m-%d %H:%M")
+        .fillna(df_f["changed_at"].astype(str))
+    )
     df_f = df_f.drop(columns=["changed_at_dt"])
 
-    st.caption(f"총 {len(df_f):,}건 조회됨")
+    # username → 실명 변환
+    _umap = {}
+    try:
+        _umap = _get_app_user_display_name_map()
+    except Exception:
+        pass
+    df_f["입력자"] = df_f["changed_by"].apply(lambda v: _umap.get(str(v or "").strip()) or _umap.get(str(v or "").strip().lower()) or str(v or "-"))
+
+    st.caption(f"총 {len(df_f):,}건 조회됨 (날짜 범위: {start_date} ~ {end_date})")
 
     def _highlight_cancel(row):
         if row.get("action_type") == "결제취소":
             return ["background-color: #ffe6e6; color: #b30000;"] * len(row)
         return ["" for _ in row]
 
-    display_cols = [c for c in ["log_id", "changed_at", "customer_name", "action_type", "reason", "changed_by", "sale_id"] if c in df_f.columns]
+    display_cols = [c for c in ["log_id", "changed_at", "customer_name", "action_type", "reason", "입력자", "sale_id"] if c in df_f.columns]
     st.dataframe(df_f[display_cols].style.apply(_highlight_cancel, axis=1), use_container_width=True)
 
     # 상세 내역 (old/new payment data) expander
@@ -5094,9 +5151,10 @@ def render_monthly_payment_report(is_superadmin: bool):
                     df = _load_payments_supabase(db_fn)
                     if not df.empty and "payment_date" in df.columns:
                         df = df[df["payment_date"].notna() & (df["payment_date"] != "")]
-                        _keep = [c for c in ["payment_date", "payment_method", "card_company", "amount", "created_at", "created_by"] if c in df.columns]
+                        _keep = [c for c in ["order_id", "payment_date", "payment_method", "card_company", "amount", "created_at", "created_by"] if c in df.columns]
                         df = df[_keep]
                         df["_store"] = s["store_name"]
+                        df["_db_fn"] = db_fn
                         all_payments.append(df)
                 else:
                     conn = get_tenant_conn(db_fn)
@@ -5105,9 +5163,10 @@ def render_monthly_payment_report(is_superadmin: bool):
                     try:
                         _pcols = [r[1] for r in conn.execute("PRAGMA table_info(Payments)").fetchall()]
                         _extra = ", ".join(c for c in ["created_at", "created_by"] if c in _pcols)
-                        _sel = f"payment_date, payment_method, card_company, amount{', ' + _extra if _extra else ''}"
+                        _sel = f"order_id, payment_date, payment_method, card_company, amount{', ' + _extra if _extra else ''}"
                         df = pd.read_sql(f"SELECT {_sel} FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
                         df["_store"] = s["store_name"]
+                        df["_db_fn"] = db_fn
                         all_payments.append(df)
                     except Exception:
                         pass
@@ -5126,11 +5185,12 @@ def render_monthly_payment_report(is_superadmin: bool):
             if _supabase_orders_payments_available():
                 pay_df = _load_payments_supabase(db_fn)
                 if pay_df.empty or "payment_date" not in pay_df.columns:
-                    pay_df = pd.DataFrame(columns=["payment_date", "payment_method", "card_company", "amount"])
+                    pay_df = pd.DataFrame(columns=["order_id", "payment_date", "payment_method", "card_company", "amount"])
                 else:
                     pay_df = pay_df[pay_df["payment_date"].notna() & (pay_df["payment_date"] != "")]
-                    _keep = [c for c in ["payment_date", "payment_method", "card_company", "amount", "created_at", "created_by"] if c in pay_df.columns]
+                    _keep = [c for c in ["order_id", "payment_date", "payment_method", "card_company", "amount", "created_at", "created_by"] if c in pay_df.columns]
                     pay_df = pay_df[_keep]
+                pay_df["_db_fn"] = db_fn
             else:
                 conn = get_tenant_conn(db_fn)
                 if not conn:
@@ -5139,13 +5199,14 @@ def render_monthly_payment_report(is_superadmin: bool):
                 try:
                     _pcols = [r[1] for r in conn.execute("PRAGMA table_info(Payments)").fetchall()]
                     _extra = ", ".join(c for c in ["created_at", "created_by"] if c in _pcols)
-                    _sel = f"payment_date, payment_method, card_company, amount{', ' + _extra if _extra else ''}"
+                    _sel = f"order_id, payment_date, payment_method, card_company, amount{', ' + _extra if _extra else ''}"
                     pay_df = pd.read_sql(f"SELECT {_sel} FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
                 except Exception:
                     st.error("결제 데이터를 불러올 수 없습니다.")
                     conn.close()
                     return
                 conn.close()
+                pay_df["_db_fn"] = db_fn
 
         pay_df["payment_date"] = pd.to_datetime(pay_df["payment_date"], errors="coerce")
         pay_df = pay_df[pay_df["payment_date"].notna()]
@@ -5215,42 +5276,89 @@ def render_monthly_payment_report(is_superadmin: bool):
             with st.expander("🔍 결제 입력 감사 내역 (관리자 전용)", expanded=False):
                 st.caption("결제일자 · 입력일자 · 입력자 정보를 확인할 수 있습니다. 입력 오류 발생 시 책임 소재를 특정하는 데 활용하세요.")
                 _audit_df = pay_df.copy()
-                # 결제일자 컬럼은 이미 pay_df에 파생된 상태
-                _display_cols = {}
-                if "결제일자" in _audit_df.columns:
-                    _display_cols["결제일자"] = "결제일자"
-                elif "payment_date" in _audit_df.columns:
-                    _audit_df["결제일자"] = pd.to_datetime(_audit_df["payment_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-                    _display_cols["결제일자"] = "결제일자"
+
+                # ── username → 실명 매핑 ──
+                _uname_map = {}
+                try:
+                    _uname_map = _get_app_user_display_name_map()
+                except Exception:
+                    pass
+
+                # ── created_by가 없는 행에 대해 app_payment_history에서 역조회 ──
+                if "created_by" not in _audit_df.columns:
+                    _audit_df["created_by"] = None
+                if "order_id" in _audit_df.columns:
+                    _null_mask = _audit_df["created_by"].isna() | (_audit_df["created_by"] == "")
+                    if _null_mask.any() and _supabase_orders_payments_available():
+                        try:
+                            _null_oids = _audit_df.loc[_null_mask, "order_id"].dropna().astype(int).unique().tolist()
+                            if _null_oids:
+                                _ph_db_fn = db_fn if not is_superadmin else (stores[stores["store_name"] == selected_store].iloc[0]["db_filename"] if selected_store != "전체 매장 통합" else None)
+                                _ph_q_base = get_supabase_client()[0].table("app_payment_history").select("sale_id, changed_by").in_("sale_id", _null_oids).order("changed_at", desc=False)
+                                if _ph_db_fn:
+                                    _ph_q_base = _ph_q_base.eq("db_filename", _ph_db_fn)
+                                _ph_rows = (_ph_q_base.execute().data or [])
+                                # sale_id별 마지막 changed_by (최초 입력자 = 첫 번째)
+                                _oid_to_changer: dict = {}
+                                for _ph in _ph_rows:
+                                    _sid = str(_ph.get("sale_id", ""))
+                                    if _sid not in _oid_to_changer:
+                                        _oid_to_changer[_sid] = _ph.get("changed_by") or ""
+                                def _fill_creator(row):
+                                    if row.get("created_by"):
+                                        return row["created_by"]
+                                    return _oid_to_changer.get(str(int(row["order_id"])) if pd.notna(row.get("order_id")) else "", "") or None
+                                _audit_df["created_by"] = _audit_df.apply(_fill_creator, axis=1)
+                        except Exception:
+                            pass
+
+                # ── username → 실명 변환 ──
+                def _resolve_name(val):
+                    if not val or str(val).strip() in ("", "None", "nan"):
+                        return "미상"
+                    resolved = _uname_map.get(str(val).strip()) or _uname_map.get(str(val).strip().lower())
+                    return resolved if resolved else str(val)
+                _audit_df["입력자"] = _audit_df["created_by"].apply(_resolve_name)
+
+                # ── 입력일자 ──
                 if "created_at" in _audit_df.columns:
                     _audit_df["입력일자"] = pd.to_datetime(_audit_df["created_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-                    _display_cols["입력일자"] = "입력일자"
+                    _audit_df["입력일자"] = _audit_df["입력일자"].fillna("미상")
                 else:
-                    st.info("입력일자 데이터가 없습니다. (이전에 등록된 결제 내역은 입력일자가 표시되지 않을 수 있습니다.)")
-                if "created_by" in _audit_df.columns:
-                    _display_cols["created_by"] = "입력자"
-                else:
-                    st.info("입력자 데이터가 없습니다. (이전에 등록된 결제 내역은 입력자가 표시되지 않을 수 있습니다.)")
-                _audit_df["결제수단"] = _audit_df.apply(_to_detailed, axis=1) if "detailed_payment" not in _audit_df.columns else _audit_df["detailed_payment"]
-                _display_cols["결제수단"] = "결제수단"
+                    _audit_df["입력일자"] = "미상"
+
+                # ── 결제일자 ──
+                if "결제일자" not in _audit_df.columns:
+                    _audit_df["결제일자"] = pd.to_datetime(_audit_df.get("payment_date"), errors="coerce").dt.strftime("%Y-%m-%d")
+
+                # ── 결제수단 ──
+                _audit_df["결제수단"] = _audit_df["detailed_payment"] if "detailed_payment" in _audit_df.columns else _audit_df.apply(_to_detailed, axis=1)
+
+                # ── 금액 ──
                 _audit_df["금액"] = pd.to_numeric(_audit_df.get("amount", 0), errors="coerce").fillna(0).astype(int)
-                _display_cols["금액"] = "금액"
+
+                # ── 표시 컬럼 선택 ──
+                _show_cols = ["결제일자", "입력일자", "입력자", "결제수단", "금액"]
                 if "_store" in _audit_df.columns:
-                    _display_cols["_store"] = "매장"
-                _sel_cols = [c for c in _display_cols.keys() if c in _audit_df.columns]
-                _audit_show = _audit_df[_sel_cols].rename(columns=_display_cols)
+                    _show_cols = ["매장"] + _show_cols
+                    _audit_df["매장"] = _audit_df["_store"]
+                _audit_show = _audit_df[[c for c in _show_cols if c in _audit_df.columns]].copy()
+
                 # 결제일자 내림차순 정렬
-                _sort_col = "결제일자" if "결제일자" in _audit_show.columns else None
-                if _sort_col:
-                    _audit_show = _audit_show.sort_values(_sort_col, ascending=False)
+                if "결제일자" in _audit_show.columns:
+                    _audit_show = _audit_show.sort_values("결제일자", ascending=False)
+
                 # 금액 포맷
-                if "금액" in _audit_show.columns:
-                    _audit_show["금액"] = _audit_show["금액"].map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
+                _audit_show["금액"] = _audit_show["금액"].map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
+
                 st.dataframe(_audit_show, use_container_width=True, hide_index=True)
+
                 # 엑셀 다운로드 (감사 내역)
                 _abuf = io.BytesIO()
+                _audit_excel = _audit_show.copy()
+                _audit_excel["금액"] = _audit_excel["금액"].str.replace(",", "", regex=False)
                 with pd.ExcelWriter(_abuf, engine="openpyxl") as _wr:
-                    _audit_show.to_excel(_wr, sheet_name="결제감사내역", index=False)
+                    _audit_excel.to_excel(_wr, sheet_name="결제감사내역", index=False)
                 _abuf.seek(0)
                 st.download_button(
                     "📥 감사 내역 엑셀 다운로드",
