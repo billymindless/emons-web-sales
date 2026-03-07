@@ -6916,24 +6916,47 @@ def render_customer_balance():
         if len(customers) == 0:
             st.info("검색 결과가 없습니다.")
         else:
+            # 동일 고객(이름+전화번호) 중복 제거 → 한 명만 표시
+            customers_unique = customers.drop_duplicates(subset=["name", "phone1"], keep="first").reset_index(drop=True)
+            cust_options = customers_unique["id"].tolist()
+
+            def _fmt_cust(cid):
+                row = customers_unique[customers_unique["id"] == cid]
+                if len(row) == 0:
+                    return str(cid)
+                r0 = row.iloc[0]
+                return f"{r0.get('name') or '-'} ({r0.get('phone1') or '-'})"
+
             selected_cid = st.selectbox(
                 "고객 선택",
-                customers["id"].tolist(),
-                format_func=lambda cid: f"{customers[customers['id']==cid].iloc[0]['name']} ({customers[customers['id']==cid].iloc[0]['phone1'] or '-'})",
+                cust_options,
+                format_func=_fmt_cust,
                 key="gen_customer_select"
             )
             if selected_cid:
                 cid = selected_cid
+                # 선택된 고객과 동일한 이름+전화번호를 가진 모든 customer_id 수집 (중복 등록 시 모든 주문 조회)
+                sel_row = customers_unique[customers_unique["id"] == cid].iloc[0]
+                _sel_name = str(sel_row.get("name") or "")
+                _sel_phone = str(sel_row.get("phone1") or "")
+                all_cids = customers[
+                    (customers["name"].fillna("") == _sel_name) &
+                    (customers["phone1"].fillna("") == _sel_phone)
+                ]["id"].tolist()
+                if not all_cids:
+                    all_cids = [cid]
+
                 if _supabase_orders_payments_available():
                     all_orders = _load_orders_supabase(db_filename, "id, customer_id, order_date, delivery_date, category, cost_price, total_amount, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names", limit=None)
-                    orders = all_orders[all_orders["customer_id"] == cid].copy() if not all_orders.empty and "customer_id" in all_orders.columns else pd.DataFrame()
+                    orders = all_orders[all_orders["customer_id"].isin(all_cids)].copy() if not all_orders.empty and "customer_id" in all_orders.columns else pd.DataFrame()
                     payments = _load_payments_supabase(db_filename)
                 else:
                     conn = get_tenant_conn(db_filename)
                     try:
+                        placeholders = ",".join("?" * len(all_cids))
                         orders = pd.read_sql(
-                            "SELECT id, order_date, delivery_date, category, cost_price, total_amount, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names FROM Orders WHERE customer_id = ?",
-                            conn, params=(cid,)
+                            f"SELECT id, order_date, delivery_date, category, cost_price, total_amount, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names FROM Orders WHERE customer_id IN ({placeholders})",
+                            conn, params=tuple(all_cids)
                         )
                         payments = pd.read_sql("SELECT order_id, amount, fee_amount FROM Payments", conn)
                     finally:
@@ -6953,18 +6976,28 @@ def render_customer_balance():
                         disp_cols = ["id", "order_date", "delivery_date", "category", "일반판매가", "전시판매가", "total_amount", "cost_price", "paid", "balance"]
                         show_cols = [c for c in disp_cols if c in orders.columns]
                         num_cols = [c for c in ["일반판매가", "전시판매가", "total_amount", "cost_price", "paid", "balance"] if c in orders.columns]
-                        st.dataframe(_format_df_display(orders[show_cols], num_cols), use_container_width=True)
+                        disp_df = orders[show_cols].copy()
+                        disp_df = disp_df.rename(columns={"id": "주문ID", "order_date": "계약일", "delivery_date": "배송일"})
+                        st.dataframe(_format_df_display(disp_df, num_cols), use_container_width=True)
                     else:
                         num_cols = [c for c in ["cost_price", "total_amount", "paid", "balance"] if c in orders.columns]
-                        st.dataframe(_format_df_display(orders, num_cols), use_container_width=True)
+                        disp_df = orders.copy().rename(columns={"id": "주문ID", "order_date": "계약일", "delivery_date": "배송일"})
+                        st.dataframe(_format_df_display(disp_df, num_cols), use_container_width=True)
                     # 선택된 주문의 변경 이력 보기
                     with st.expander("선택 주문 변경 이력 보기"):
-                        hist_oid = st.selectbox("주문 선택 (변경 이력 조회용)", orders["id"].tolist(), key="gen_order_history_sel")
+                        def _fmt_order_hist(oid):
+                            r = orders[orders["id"] == oid].iloc[0]
+                            od = r.get("order_date") or ""
+                            dlv = r.get("delivery_date") or ""
+                            od_str = od.strftime("%Y-%m-%d") if hasattr(od, "strftime") else str(od)[:10]
+                            dlv_str = dlv.strftime("%Y-%m-%d") if hasattr(dlv, "strftime") else str(dlv)[:10]
+                            return f"주문 #{oid} | 계약일 {od_str} | 배송일 {dlv_str}"
+                        hist_oid = st.selectbox("주문 선택 (변경 이력 조회용)", orders["id"].tolist(), format_func=_fmt_order_hist, key="gen_order_history_sel")
                         if hist_oid:
                             _render_order_audit_trail(db_filename, int(hist_oid))
 
                     with st.expander("📝 주문 수정 & 결제 관리", expanded=False):
-                        cust_row = customers[customers["id"] == cid].iloc[0]
+                        cust_row = customers_unique[customers_unique["id"] == cid].iloc[0]
                         edit_prefix = f"edit_c{cid}"
                         _db_name = str(cust_row.get("name") or "")
                         _db_phone1 = str(cust_row.get("phone1") or "")
@@ -6978,8 +7011,18 @@ def render_customer_balance():
                             st.session_state[f"{edit_prefix}_phone2"] = _db_phone2
                         if f"{edit_prefix}_address" not in st.session_state:
                             st.session_state[f"{edit_prefix}_address"] = _db_addr
+                        def _fmt_order_sel(oid):
+                            r = orders[orders["id"] == oid]
+                            if r.empty:
+                                return f"주문 #{oid}"
+                            row = r.iloc[0]
+                            od = row.get("order_date", "")
+                            dlv = row.get("delivery_date", "")
+                            od_str = od.strftime("%Y-%m-%d") if hasattr(od, "strftime") else str(od or "-")[:10]
+                            dlv_str = dlv.strftime("%Y-%m-%d") if hasattr(dlv, "strftime") else str(dlv or "-")[:10]
+                            return f"주문 #{oid} | 계약일 {od_str} | 배송일 {dlv_str}"
                         order_options = orders["id"].tolist()
-                        sel_oid = st.selectbox("수정할 주문 선택", order_options, key=f"{edit_prefix}_order_sel")
+                        sel_oid = st.selectbox("수정할 주문 선택", order_options, format_func=_fmt_order_sel, key=f"{edit_prefix}_order_sel")
                         if sel_oid:
                             orow = orders[orders["id"] == sel_oid].iloc[0]
                             if f"{edit_prefix}_oid" not in st.session_state or st.session_state[f"{edit_prefix}_oid"] != sel_oid:
@@ -7007,7 +7050,7 @@ def render_customer_balance():
                             st.text_input("Phone 1", key=f"{edit_prefix}_phone1")
                             st.text_input("Phone 2", key=f"{edit_prefix}_phone2")
                             st.text_area("주소", key=f"{edit_prefix}_address")
-                            st.date_input("배송일", key=f"{edit_prefix}_delivery")
+                            st.date_input("배송일 *", key=f"{edit_prefix}_delivery")
                             CATEGORY_OPTIONS_EDIT = ["옷장", "식탁", "자녀방", "침대", "SSDS침대", "서재_학생", "소파", "소품", "전시품"]
                             existing_cats = [x.strip() for x in (orow["category"] or "").split(",") if x.strip()]
                             default_cats = [c for c in existing_cats if c in CATEGORY_OPTIONS_EDIT]
