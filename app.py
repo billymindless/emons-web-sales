@@ -5280,12 +5280,12 @@ def render_monthly_payment_report(is_superadmin: bool):
         _card_short = {"신한카드": "신한", "삼성카드": "삼성", "KB국민카드": "국민", "현대카드": "현대", "롯데카드": "롯데", "우리카드": "우리", "하나카드": "하나", "BC카드": "BC", "NH농협카드": "농협", "기타": "기타"}
         def _to_detailed(row):
             meth = row["payment_method"] or "미지정"
-            if meth in ("신용카드", "체크카드", "메인페이"):
+            if meth == "메인페이":
+                return "메인페이"
+            if meth in ("신용카드", "체크카드"):
                 cc = row.get("card_company") or ""
                 short = _card_short.get(cc, cc or "미지정")
-                if meth == "신용카드": prefix = "신용"
-                elif meth == "체크카드": prefix = "체크"
-                else: prefix = "메인페이"
+                prefix = "신용" if meth == "신용카드" else "체크"
                 return f"{prefix}_{short}" if cc else meth
             return meth
         pay_df["detailed_payment"] = pay_df.apply(_to_detailed, axis=1)
