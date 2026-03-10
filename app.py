@@ -6582,26 +6582,46 @@ def render_new_sales():
     selected_categories = st.multiselect("품목/카테고리 (복수 선택) *", options=CATEGORY_OPTIONS, key=f"category_multiselect_{_form_reset}")
     category = ",".join(selected_categories) if selected_categories else None
     has_display = selected_categories and "전시품" in selected_categories
-    # 금액: number_input으로 직접 입력 (on_change 불필요, 서버 재실행 없음)
+    # 금액: text_input + on_change 콤마 포맷 (포커스 아웃 시에만 rerun → number_input 대비 가볍거나 동일)
     if "cost_price" not in st.session_state:
-        st.session_state["cost_price"] = 0
+        st.session_state["cost_price"] = "0"
     if "total_amount" not in st.session_state:
-        st.session_state["total_amount"] = 0
+        st.session_state["total_amount"] = "0"
 
-    st.number_input("일반제품 판매가(Selling Price) *", min_value=0, step=10000, key="total_amount")
-    st.number_input("일반제품 원가(Cost) *", min_value=0, step=10000, key="cost_price")
+    st.text_input(
+        "일반제품 판매가(Selling Price) *", key="total_amount",
+        on_change=lambda: st.session_state.__setitem__(
+            "total_amount", _format_number_comma(st.session_state.get("total_amount", ""))
+        ),
+    )
+    st.text_input(
+        "일반제품 원가(Cost) *", key="cost_price",
+        on_change=lambda: st.session_state.__setitem__(
+            "cost_price", _format_number_comma(st.session_state.get("cost_price", ""))
+        ),
+    )
     if has_display:
         if "display_sales_amount" not in st.session_state:
-            st.session_state["display_sales_amount"] = 0
+            st.session_state["display_sales_amount"] = "0"
         if "display_cost_amount" not in st.session_state:
-            st.session_state["display_cost_amount"] = 0
-        st.number_input("전시품 판매가 *", min_value=0, step=10000, key="display_sales_amount")
-        st.number_input("전시품 원가 *", min_value=0, step=10000, key="display_cost_amount")
+            st.session_state["display_cost_amount"] = "0"
+        st.text_input(
+            "전시품 판매가 *", key="display_sales_amount",
+            on_change=lambda: st.session_state.__setitem__(
+                "display_sales_amount", _format_number_comma(st.session_state.get("display_sales_amount", ""))
+            ),
+        )
+        st.text_input(
+            "전시품 원가 *", key="display_cost_amount",
+            on_change=lambda: st.session_state.__setitem__(
+                "display_cost_amount", _format_number_comma(st.session_state.get("display_cost_amount", ""))
+            ),
+        )
     # 실시간 합산: 최종 총 판매금액, 최종 총 원가, 기본 총 마진
-    general_sales = int(st.session_state.get("total_amount", 0) or 0)
-    general_cost = int(st.session_state.get("cost_price", 0) or 0)
-    display_sales_val = int(st.session_state.get("display_sales_amount", 0) or 0) if has_display else 0
-    display_cost_val = int(st.session_state.get("display_cost_amount", 0) or 0) if has_display else 0
+    general_sales = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
+    general_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
+    display_sales_val = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
+    display_cost_val = _parse_comma_to_int(st.session_state.get("display_cost_amount", "0")) if has_display else 0
     final_sales = general_sales + display_sales_val
     final_cost = general_cost + display_cost_val
     basic_margin = final_sales - final_cost
@@ -6728,10 +6748,10 @@ def render_new_sales():
         if not delivery_ok:
             st.error("배송일(필수)을 선택하세요.")
             st.stop()
-        cost_price_int = int(st.session_state.get("cost_price", 0) or 0)
-        general_sales_int = int(st.session_state.get("total_amount", 0) or 0)
-        display_sales_int = int(st.session_state.get("display_sales_amount", 0) or 0) if has_display else 0
-        display_cost_int = int(st.session_state.get("display_cost_amount", 0) or 0) if has_display else 0
+        cost_price_int = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
+        general_sales_int = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
+        display_sales_int = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
+        display_cost_int = _parse_comma_to_int(st.session_state.get("display_cost_amount", "0")) if has_display else 0
         final_sales_save = general_sales_int + display_sales_int
         final_cost_save = cost_price_int + display_cost_int
         basic_margin_save = final_sales_save - final_cost_save
