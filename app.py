@@ -5392,13 +5392,15 @@ def render_monthly_payment_report(is_superadmin: bool):
                 # ── 결제수단 ──
                 _audit_df["결제수단"] = _audit_df["detailed_payment"] if "detailed_payment" in _audit_df.columns else _audit_df.apply(_to_detailed, axis=1)
 
-                # ── 승인번호 (메인페이·온누리 전용, 감사 내역에만 표시) ──
+                # ── 승인번호 (메인페이·온누리·지역화폐 전용, 감사 내역에만 표시) ──
                 def _get_approval(r):
                     meth = str(r.get("payment_method") or "")
                     if meth == "메인페이":
                         return str(r.get("card_company") or "")
                     if "온누리" in meth:
                         return str(r.get("onnuri_approval_code") or "")
+                    if meth == "지역화폐":
+                        return str(r.get("card_company") or "")
                     return ""
                 _audit_df["승인번호"] = _audit_df.apply(_get_approval, axis=1)
 
@@ -6749,6 +6751,9 @@ def render_new_sales():
             elif method == "메인페이":
                 st.text_input(f"메인페이 승인번호 4자리 #{i+1}", key=card_key, max_chars=4)
                 card_company = st.session_state.get(card_key)
+            elif method == "지역화폐":
+                st.text_input(f"지역화폐 승인번호 #{i+1}", key=card_key)
+                card_company = st.session_state.get(card_key)
             else:
                 card_company = None
         with c3:
@@ -7196,6 +7201,8 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         split_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
     elif split_method == "메인페이":
         split_card = st.text_input("메인페이 승인번호 4자리", key=f"{key_prefix}_card", max_chars=4)
+    elif split_method == "지역화폐":
+        split_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card")
     else:
         split_card = None
         st.session_state.pop(f"{key_prefix}_card", None)
@@ -7321,6 +7328,8 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
         add_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
     elif add_method == "메인페이":
         add_card = st.text_input("메인페이 승인번호 4자리", key=f"{key_prefix}_card", max_chars=4)
+    elif add_method == "지역화폐":
+        add_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card")
     else:
         add_card = None
     st.text_input("결제 금액", key=amt_key, on_change=lambda: st.session_state.__setitem__(amt_key, _format_number_comma(st.session_state.get(amt_key, ""))))
@@ -8425,6 +8434,13 @@ def render_customer_balance():
                                                                 "메인페이 승인번호 4자리",
                                                                 value=_cur_appr,
                                                                 max_chars=4,
+                                                                key=f"pay_edit_card_{prow['id']}",
+                                                            )
+                                                        elif new_method == "지역화폐":
+                                                            _cur_appr = prow.get("card_company") or ""
+                                                            new_card_company = st.text_input(
+                                                                "지역화폐 승인번호",
+                                                                value=_cur_appr,
                                                                 key=f"pay_edit_card_{prow['id']}",
                                                             )
                                                         else:
