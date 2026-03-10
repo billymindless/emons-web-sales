@@ -8050,179 +8050,204 @@ def render_customer_balance():
                                                     st.write(f"**결제금액:** {float(prow['amount'] or 0):,.0f}원")
                                                     st.write(f"**미수금:** {current_balance:,.0f}원")
                                                 with col_right:
-                                                    # 결제 수단 변경
-                                                    _cur_method = prow.get("payment_method") or PAYMENT_METHOD_OPTIONS[0]
-                                                    _method_idx = PAYMENT_METHOD_OPTIONS.index(_cur_method) if _cur_method in PAYMENT_METHOD_OPTIONS else 0
-                                                    new_method = st.selectbox(
-                                                        "결제 수단 변경",
-                                                        options=PAYMENT_METHOD_OPTIONS,
-                                                        index=_method_idx,
-                                                        key=f"pay_edit_method_{prow['id']}",
-                                                    )
-                                                    # 카드사/승인번호 (수단에 따라)
-                                                    if new_method in _CARD_WITH_COMPANY:
-                                                        _cur_card = prow.get("card_company") or CARD_COMPANY_OPTIONS[0]
-                                                        _card_idx = CARD_COMPANY_OPTIONS.index(_cur_card) if _cur_card in CARD_COMPANY_OPTIONS else 0
-                                                        new_card_company = st.selectbox(
-                                                            "카드사 변경",
-                                                            options=CARD_COMPANY_OPTIONS,
-                                                            index=_card_idx,
-                                                            key=f"pay_edit_card_{prow['id']}",
-                                                        )
-                                                    elif new_method == "메인페이":
-                                                        _cur_appr = prow.get("card_company") or ""
-                                                        new_card_company = st.text_input(
-                                                            "메인페이 승인번호 4자리",
-                                                            value=_cur_appr,
-                                                            max_chars=4,
-                                                            key=f"pay_edit_card_{prow['id']}",
-                                                        )
+                                                    if float(prow["amount"] or 0) < 0:
+                                                        st.warning("⚠️ 회계 상계(취소) 처리를 위해 자동 생성된 마이너스 전표는 수정할 수 없습니다.")
                                                     else:
-                                                        new_card_company = None
-                                                        # 위젯 키 충돌 방지용 빈 placeholder
-                                                        st.empty()
-                                                    # 결제 날짜 변경 (기존 날짜 기본값)
-                                                    _cur_pay_date = prow.get("payment_date")
-                                                    try:
-                                                        _cur_pay_date_val = pd.to_datetime(_cur_pay_date).date() if _cur_pay_date else date.today()
-                                                    except Exception:
-                                                        _cur_pay_date_val = date.today()
-                                                    new_pay_date = st.date_input(
-                                                        "결제 날짜 *",
-                                                        value=_cur_pay_date_val,
-                                                        key=f"pay_edit_date_{prow['id']}",
-                                                    )
-                                                    new_amount = st.number_input(
-                                                        "변경할 새 금액 (0이면 결제 취소)", min_value=0.0,
-                                                        value=float(prow["amount"] or 0), step=1000.0,
-                                                        key=f"pay_edit_amt_{prow['id']}",
-                                                    )
-                                                    del_reason = st.text_input("결제 변경 사유 (필수, 5자 이상)", key=f"pay_del_reason_{prow['id']}", placeholder="예: 카드 취소 후 현금 결제")
-                                                    receipt_upload = st.file_uploader(
-                                                        "📷 취소/재결제 영수증 사진 업로드",
-                                                        type=["png", "jpg", "jpeg"],
-                                                        key=f"pay_receipt_{prow['id']}",
-                                                    )
-                                                    if st.button("수정 완료", key=f"pay_edit_{prow['id']}"):
-                                                        if not del_reason or len(del_reason.strip()) < 5:
-                                                            st.warning("사유를 5자 이상 입력하세요.")
+                                                        # 결제 수단 변경
+                                                        _cur_method = prow.get("payment_method") or PAYMENT_METHOD_OPTIONS[0]
+                                                        _method_idx = PAYMENT_METHOD_OPTIONS.index(_cur_method) if _cur_method in PAYMENT_METHOD_OPTIONS else 0
+                                                        new_method = st.selectbox(
+                                                            "결제 수단 변경",
+                                                            options=PAYMENT_METHOD_OPTIONS,
+                                                            index=_method_idx,
+                                                            key=f"pay_edit_method_{prow['id']}",
+                                                        )
+                                                        # 카드사/승인번호 (수단에 따라)
+                                                        if new_method in _CARD_WITH_COMPANY:
+                                                            _cur_card = prow.get("card_company") or CARD_COMPANY_OPTIONS[0]
+                                                            _card_idx = CARD_COMPANY_OPTIONS.index(_cur_card) if _cur_card in CARD_COMPANY_OPTIONS else 0
+                                                            new_card_company = st.selectbox(
+                                                                "카드사 변경",
+                                                                options=CARD_COMPANY_OPTIONS,
+                                                                index=_card_idx,
+                                                                key=f"pay_edit_card_{prow['id']}",
+                                                            )
+                                                        elif new_method == "메인페이":
+                                                            _cur_appr = prow.get("card_company") or ""
+                                                            new_card_company = st.text_input(
+                                                                "메인페이 승인번호 4자리",
+                                                                value=_cur_appr,
+                                                                max_chars=4,
+                                                                key=f"pay_edit_card_{prow['id']}",
+                                                            )
                                                         else:
-                                                            receipt_path_saved = None
-                                                            if receipt_upload:
-                                                                safe_name = re.sub(r"[^\w\u3130-\u318f\uac00-\ud7af]", "_", customer_name_for_receipt)[:30]
-                                                                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                                                ext = (receipt_upload.name or "").split(".")[-1].lower() or "jpg"
-                                                                if ext not in ("png", "jpg", "jpeg"):
-                                                                    ext = "jpg"
-                                                                fname = f"receipt_{safe_name}_{ts}.{ext}"
-                                                                receipt_path_saved = os.path.join(RECEIPTS_UPLOAD_DIR, fname)
-                                                                with open(receipt_path_saved, "wb") as f:
-                                                                    f.write(receipt_upload.getvalue())
-                                                            old_balance = float(orders[orders["id"] == _order_id_pay]["balance"].iloc[0])
-                                                            old_payment = {
-                                                                "payment_id": int(prow["id"]),
-                                                                "amount": float(prow["amount"] or 0),
-                                                                "method": prow["payment_method"],
-                                                                "card_company": prow["card_company"],
-                                                            }
-                                                            # 새 수수료 계산 (수단 변경 반영)
-                                                            new_fee = _payment_fee_amount(new_method, float(new_amount)) if new_amount > 0 else 0.0
-                                                            if _supabase_orders_payments_available():
-                                                                old_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
-                                                                if new_amount == 0:
-                                                                    _delete_payment_supabase(db_filename, int(prow["id"]))
-                                                                    action = "결제취소"
-                                                                    new_payment = {}
-                                                                else:
-                                                                    _new_pay_date_str = new_pay_date.isoformat() if hasattr(new_pay_date, "isoformat") else date.today().isoformat()
-                                                                    _update_payment_supabase(db_filename, int(prow["id"]), {
-                                                                        "amount": new_amount,
-                                                                        "payment_method": new_method,
-                                                                        "card_company": new_card_company,
-                                                                        "fee_amount": new_fee,
-                                                                        "payment_date": _new_pay_date_str,
-                                                                    })
-                                                                    action = "결제변경"
-                                                                    new_payment = {
-                                                                        "payment_id": int(prow["id"]),
-                                                                        "amount": float(new_amount),
-                                                                        "method": new_method,
-                                                                        "card_company": new_card_company,
-                                                                    }
-                                                                _recalc_order_actual_margin_supabase(db_filename, _order_id_pay)
-                                                                new_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
-                                                                new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
-                                                                cid_ph = _get_order_customer_id_supabase(db_filename, _order_id_pay)
-                                                                customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
-                                                                old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
-                                                                new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
-                                                                # Supabase 이력 저장 (conn 없이도 동작)
-                                                                _ph_err = _insert_payment_history(
-                                                                    None, _order_id_pay, customer_name_ph, action,
-                                                                    old_data, new_data, del_reason,
-                                                                    receipt_image_path=receipt_path_saved,
-                                                                    db_filename=db_filename,
-                                                                )
-                                                                if _ph_err:
-                                                                    st.warning(f"⚠️ 이력 저장 오류: {_ph_err}")
-                                                                # SQLite 감사 로그 (파일이 있을 때만)
-                                                                conn = get_tenant_conn(db_filename)
-                                                                if conn:
-                                                                    try:
-                                                                        _insert_audit_log(conn, "Order", _order_id_pay, "payment_total", old_paid_total, new_paid_total, del_reason)
-                                                                        _insert_audit_log(conn, "Order", _order_id_pay, "balance_amount", old_balance, new_balance, del_reason)
-                                                                        conn.commit()
-                                                                    finally:
-                                                                        conn.close()
+                                                            new_card_company = None
+                                                            # 위젯 키 충돌 방지용 빈 placeholder
+                                                            st.empty()
+                                                        # 결제 날짜 변경 (기존 날짜 기본값)
+                                                        _cur_pay_date = prow.get("payment_date")
+                                                        try:
+                                                            _cur_pay_date_val = pd.to_datetime(_cur_pay_date).date() if _cur_pay_date else date.today()
+                                                        except Exception:
+                                                            _cur_pay_date_val = date.today()
+                                                        new_pay_date = st.date_input(
+                                                            "결제 날짜 *",
+                                                            value=_cur_pay_date_val,
+                                                            key=f"pay_edit_date_{prow['id']}",
+                                                        )
+                                                        new_amount = st.number_input(
+                                                            "변경할 새 금액 (0이면 결제 취소)", min_value=0.0,
+                                                            value=float(prow["amount"] or 0), step=1000.0,
+                                                            key=f"pay_edit_amt_{prow['id']}",
+                                                        )
+                                                        del_reason = st.text_input("결제 변경 사유 (필수, 5자 이상)", key=f"pay_del_reason_{prow['id']}", placeholder="예: 카드 취소 후 현금 결제")
+                                                        receipt_upload = st.file_uploader(
+                                                            "📷 취소/재결제 영수증 사진 업로드",
+                                                            type=["png", "jpg", "jpeg"],
+                                                            key=f"pay_receipt_{prow['id']}",
+                                                        )
+                                                        if st.button("수정 완료", key=f"pay_edit_{prow['id']}"):
+                                                            if not del_reason or len(del_reason.strip()) < 5:
+                                                                st.warning("사유를 5자 이상 입력하세요.")
                                                             else:
-                                                                conn = get_tenant_conn(db_filename)
-                                                                cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
-                                                                old_paid_total = cur.fetchone()[0] or 0
-                                                                if new_amount == 0:
-                                                                    conn.execute("DELETE FROM Payments WHERE id = ?", (prow["id"],))
-                                                                    action = "결제취소"
-                                                                    new_payment = {}
-                                                                else:
-                                                                    conn.execute(
-                                                                        "UPDATE Payments SET amount = ?, payment_method = ?, card_company = ?, fee_amount = ?, payment_date = ? WHERE id = ?",
-                                                                        (new_amount, new_method, new_card_company, new_fee, new_pay_date.isoformat() if hasattr(new_pay_date, "isoformat") else date.today().isoformat(), int(prow["id"]))
-                                                                    )
-                                                                    action = "결제변경"
-                                                                    new_payment = {
-                                                                        "payment_id": int(prow["id"]),
-                                                                        "amount": float(new_amount),
-                                                                        "method": new_method,
-                                                                        "card_company": new_card_company,
-                                                                    }
-                                                                _recalc_order_actual_margin(conn, _order_id_pay, db_filename)
-                                                                cur2 = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
-                                                                new_paid_total = cur2.fetchone()[0] or 0
-                                                                new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
-                                                                _insert_audit_log(conn, "Order", _order_id_pay, "payment_total", old_paid_total, new_paid_total, del_reason)
-                                                                _insert_audit_log(conn, "Order", _order_id_pay, "balance_amount", old_balance, new_balance, del_reason)
-                                                                cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (_order_id_pay,)).fetchone()
-                                                                cid_ph = cur_cid[0] if cur_cid else None
-                                                                customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
-                                                                old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
-                                                                new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
-                                                                _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved, db_filename=db_filename)
-                                                                conn.commit()
-                                                                conn.close()
-                                                            st.success("변경이 완료되었습니다.")
-                                                            # ── 부정행위 탐지: 결제 취소 시 관리자 경보 (코어 로직 무관) ──
-                                                            try:
-                                                                if action == "결제취소":
-                                                                    _check_and_send_fraud_signals(
+                                                                receipt_path_saved = None
+                                                                if receipt_upload:
+                                                                    safe_name = re.sub(r"[^\w\u3130-\u318f\uac00-\ud7af]", "_", customer_name_for_receipt)[:30]
+                                                                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                                                    ext = (receipt_upload.name or "").split(".")[-1].lower() or "jpg"
+                                                                    if ext not in ("png", "jpg", "jpeg"):
+                                                                        ext = "jpg"
+                                                                    fname = f"receipt_{safe_name}_{ts}.{ext}"
+                                                                    receipt_path_saved = os.path.join(RECEIPTS_UPLOAD_DIR, fname)
+                                                                    with open(receipt_path_saved, "wb") as f:
+                                                                        f.write(receipt_upload.getvalue())
+                                                                old_balance = float(orders[orders["id"] == _order_id_pay]["balance"].iloc[0])
+                                                                old_payment = {
+                                                                    "payment_id": int(prow["id"]),
+                                                                    "amount": float(prow["amount"] or 0),
+                                                                    "method": prow["payment_method"],
+                                                                    "card_company": prow["card_company"],
+                                                                }
+                                                                # 새 수수료 계산 (수단 변경 반영)
+                                                                new_fee = _payment_fee_amount(new_method, float(new_amount)) if new_amount > 0 else 0.0
+                                                                today_str = date.today().isoformat()
+                                                                old_amt_val = float(prow["amount"] or 0)
+                                                                old_fee_val = float(prow["fee_amount"] or 0)
+    
+                                                                if _supabase_orders_payments_available():
+                                                                    old_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
+    
+                                                                    # 1. 마이너스(-) 상계 전표 INSERT
+                                                                    _insert_payment_supabase(db_filename, {
+                                                                        "order_id": _order_id_pay,
+                                                                        "payment_date": today_str,
+                                                                        "amount": -old_amt_val,
+                                                                        "payment_method": prow["payment_method"],
+                                                                        "card_company": prow["card_company"],
+                                                                        "fee_amount": -old_fee_val,
+                                                                    })
+    
+                                                                    if new_amount == 0:
+                                                                        action = "결제취소"
+                                                                        new_payment = {}
+                                                                    else:
+                                                                        # 2. 새로운 결제(+) 전표 INSERT
+                                                                        _insert_payment_supabase(db_filename, {
+                                                                            "order_id": _order_id_pay,
+                                                                            "payment_date": today_str,
+                                                                            "amount": float(new_amount),
+                                                                            "payment_method": new_method,
+                                                                            "card_company": new_card_company,
+                                                                            "fee_amount": float(new_fee),
+                                                                        })
+                                                                        action = "결제변경"
+                                                                        new_payment = {
+                                                                            "payment_id": "신규생성(상계처리)",
+                                                                            "amount": float(new_amount),
+                                                                            "method": new_method,
+                                                                            "card_company": new_card_company,
+                                                                        }
+                                                                    _recalc_order_actual_margin_supabase(db_filename, _order_id_pay)
+                                                                    new_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
+                                                                    new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
+                                                                    cid_ph = _get_order_customer_id_supabase(db_filename, _order_id_pay)
+                                                                    customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
+                                                                    old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
+                                                                    new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
+                                                                    # Supabase 이력 저장 (conn 없이도 동작)
+                                                                    _ph_err = _insert_payment_history(
+                                                                        None, _order_id_pay, customer_name_ph, action,
+                                                                        old_data, new_data, del_reason,
+                                                                        receipt_image_path=receipt_path_saved,
                                                                         db_filename=db_filename,
-                                                                        order_id=int(_order_id_pay),
-                                                                        actor_username=_current_username(),
-                                                                        reason=del_reason,
-                                                                        action_type="payment_cancel",
                                                                     )
-                                                            except Exception:
-                                                                pass
-                                                            clear_data_cache()
-                                                            st.rerun()
+                                                                    if _ph_err:
+                                                                        st.warning(f"⚠️ 이력 저장 오류: {_ph_err}")
+                                                                    # SQLite 감사 로그 (파일이 있을 때만)
+                                                                    conn = get_tenant_conn(db_filename)
+                                                                    if conn:
+                                                                        try:
+                                                                            _insert_audit_log(conn, "Order", _order_id_pay, "payment_total", old_paid_total, new_paid_total, del_reason)
+                                                                            _insert_audit_log(conn, "Order", _order_id_pay, "balance_amount", old_balance, new_balance, del_reason)
+                                                                            conn.commit()
+                                                                        finally:
+                                                                            conn.close()
+                                                                else:
+                                                                    conn = get_tenant_conn(db_filename)
+                                                                    cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
+                                                                    old_paid_total = cur.fetchone()[0] or 0
+    
+                                                                    # 1. 마이너스(-) 상계 전표 INSERT
+                                                                    conn.execute(
+                                                                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)",
+                                                                        (_order_id_pay, today_str, -old_amt_val, prow["payment_method"], prow["card_company"], -old_fee_val)
+                                                                    )
+    
+                                                                    if new_amount == 0:
+                                                                        action = "결제취소"
+                                                                        new_payment = {}
+                                                                    else:
+                                                                        # 2. 새로운 결제(+) 전표 INSERT
+                                                                        conn.execute(
+                                                                            "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)",
+                                                                            (_order_id_pay, today_str, float(new_amount), new_method, new_card_company, float(new_fee))
+                                                                        )
+                                                                        action = "결제변경"
+                                                                        new_payment = {
+                                                                            "payment_id": "신규생성(상계처리)",
+                                                                            "amount": float(new_amount),
+                                                                            "method": new_method,
+                                                                            "card_company": new_card_company,
+                                                                        }
+                                                                    _recalc_order_actual_margin(conn, _order_id_pay, db_filename)
+                                                                    cur2 = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
+                                                                    new_paid_total = cur2.fetchone()[0] or 0
+                                                                    new_balance = (old_balance + float(prow["amount"]) - float(new_amount)) if new_amount > 0 else old_balance + float(prow["amount"])
+                                                                    _insert_audit_log(conn, "Order", _order_id_pay, "payment_total", old_paid_total, new_paid_total, del_reason)
+                                                                    _insert_audit_log(conn, "Order", _order_id_pay, "balance_amount", old_balance, new_balance, del_reason)
+                                                                    cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (_order_id_pay,)).fetchone()
+                                                                    cid_ph = cur_cid[0] if cur_cid else None
+                                                                    customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
+                                                                    old_data = {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment}
+                                                                    new_data = {"order_id": int(_order_id_pay), "paid_total_after": new_paid_total, "balance_after": new_balance, "payment": new_payment}
+                                                                    _insert_payment_history(conn, _order_id_pay, customer_name_ph, action, old_data, new_data, del_reason, receipt_image_path=receipt_path_saved, db_filename=db_filename)
+                                                                    conn.commit()
+                                                                    conn.close()
+                                                                st.success("변경이 완료되었습니다.")
+                                                                # ── 부정행위 탐지: 결제 취소 시 관리자 경보 (코어 로직 무관) ──
+                                                                try:
+                                                                    if action == "결제취소":
+                                                                        _check_and_send_fraud_signals(
+                                                                            db_filename=db_filename,
+                                                                            order_id=int(_order_id_pay),
+                                                                            actor_username=_current_username(),
+                                                                            reason=del_reason,
+                                                                            action_type="payment_cancel",
+                                                                        )
+                                                                except Exception:
+                                                                    pass
+                                                                clear_data_cache()
+                                                                st.rerun()
 
                     st.subheader("잔금 추가 결제")
                     orders_with_balance = orders[orders["balance"] > 0]
