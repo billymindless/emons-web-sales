@@ -8155,11 +8155,17 @@ def render_customer_balance():
                                                             value=_cur_pay_date_val,
                                                             key=f"pay_edit_date_{prow['id']}",
                                                         )
-                                                        new_amount = st.number_input(
-                                                            "변경할 새 금액 (0이면 결제 취소)", min_value=0.0,
-                                                            value=float(prow["amount"] or 0), step=1000.0,
-                                                            key=f"pay_edit_amt_{prow['id']}",
+                                                        _pay_amt_key = f"pay_edit_amt_{prow['id']}"
+                                                        if _pay_amt_key not in st.session_state:
+                                                            st.session_state[_pay_amt_key] = _format_number_comma(str(int(float(prow["amount"] or 0))))
+                                                        def _fmt_pay_edit_amt(_k=_pay_amt_key):
+                                                            st.session_state[_k] = _format_number_comma(st.session_state.get(_k, ""))
+                                                        st.text_input(
+                                                            "변경할 새 금액 (0이면 결제 취소)",
+                                                            key=_pay_amt_key,
+                                                            on_change=_fmt_pay_edit_amt,
                                                         )
+                                                        new_amount = _parse_comma_to_int(st.session_state.get(_pay_amt_key, "0"))
                                                         del_reason = st.text_input("결제 변경 사유 (필수, 5자 이상)", key=f"pay_del_reason_{prow['id']}", placeholder="예: 카드 취소 후 현금 결제")
                                                         receipt_upload = st.file_uploader(
                                                             "📷 취소/재결제 영수증 사진 업로드",
