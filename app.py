@@ -5459,25 +5459,29 @@ def render_monthly_payment_report(is_superadmin: bool):
         sal_df["_pd"] = sal_df["transaction_date"].dt.date
         sal_df = sal_df[(sal_df["_pd"] >= date_range_start) & (sal_df["_pd"] <= date_range_end)]
 
-        # employee_names가 없는 레코드(구 데이터): Orders 테이블에서 employee_names를 보완
+        # employee_names가 없는 레코드(구 데이터): app_orders 테이블에서 employee_names를 보완
         _no_emp_mask = sal_df["employee_names"].isna() | (sal_df["employee_names"].astype(str).str.strip() == "")
         if _no_emp_mask.any():
-            _order_ids_no_emp = sal_df.loc[_no_emp_mask, "order_id"].dropna().astype(int).unique().tolist()
-            if _order_ids_no_emp:
-                try:
-                    _sc, _ = get_supabase_client()
-                    if _sc:
+            try:
+                _sc, _ = get_supabase_client()
+                if _sc:
+                    # db_filename별로 나눠서 tenant 필터 적용
+                    for _db_fn_emp in sal_df.loc[_no_emp_mask, "_db_fn"].dropna().unique():
+                        _emp_fn_mask = _no_emp_mask & (sal_df["_db_fn"] == _db_fn_emp)
+                        _order_ids_no_emp = sal_df.loc[_emp_fn_mask, "order_id"].dropna().astype(int).unique().tolist()
+                        if not _order_ids_no_emp:
+                            continue
                         _chunks = [_order_ids_no_emp[i:i+100] for i in range(0, len(_order_ids_no_emp), 100)]
                         _emp_map = {}
                         for _chunk in _chunks:
-                            _r = _sc.table("Orders").select("id, employee_names").in_("id", _chunk).execute()
+                            _r = _sc.table("app_orders").select("id, employee_names").eq("db_filename", _db_fn_emp).in_("id", _chunk).execute()
                             for _row in (_r.data or []):
                                 _emp_map[_row["id"]] = _row.get("employee_names") or ""
-                        sal_df.loc[_no_emp_mask, "employee_names"] = sal_df.loc[_no_emp_mask, "order_id"].apply(
+                        sal_df.loc[_emp_fn_mask, "employee_names"] = sal_df.loc[_emp_fn_mask, "order_id"].apply(
                             lambda oid: _emp_map.get(int(oid), "") if pd.notna(oid) else ""
                         )
-                except Exception:
-                    pass
+            except Exception as _e:
+                st.caption(f"⚠️ 직원명 보완 조회 오류: {_e}")
 
         if sal_df.empty:
             st.info("해당 기간에 판매 데이터가 없습니다.")
@@ -5533,33 +5537,34 @@ def render_monthly_payment_report(is_superadmin: bool):
 
         df_emp = pd.DataFrame(rows)
 
-        # order_id로 고객정보 조회 (db_filename별 배치)
+        # order_id로 고객정보 조회 (db_filename별 배치, app_orders + tenant 필터 적용)
         df_emp["고객명"] = ""
         df_emp["전화번호"] = ""
         try:
-            for _fn in df_emp["_db_fn"].dropna().unique():
-                _mask = df_emp["_db_fn"] == _fn
-                _oids = df_emp.loc[_mask, "원본주문ID"].dropna().astype(int).unique().tolist()
-                if _oids:
-                    _sc, _ = get_supabase_client()
-                    if _sc:
-                        _chunks = [_oids[i:i+100] for i in range(0, len(_oids), 100)]
-                        _cid_map = {}
-                        for _chunk in _chunks:
-                            _r = _sc.table("Orders").select("id, customer_id").in_("id", _chunk).execute()
-                            for _row in (_r.data or []):
-                                _cid_map[_row["id"]] = _row.get("customer_id")
-                        _cids = [v for v in _cid_map.values() if v is not None]
-                        if _cids:
-                            _cust_map = _get_customers_by_ids_supabase(str(_fn), list(set(int(c) for c in _cids)))
-                            df_emp.loc[_mask, "고객명"] = df_emp.loc[_mask, "원본주문ID"].apply(
-                                lambda oid: (_cust_map.get(int(_cid_map.get(int(oid), -1) or -1)) or {}).get("name", "") if pd.notna(oid) and int(oid) in _cid_map else ""
-                            )
-                            df_emp.loc[_mask, "전화번호"] = df_emp.loc[_mask, "원본주문ID"].apply(
-                                lambda oid: (_cust_map.get(int(_cid_map.get(int(oid), -1) or -1)) or {}).get("phone1", "") if pd.notna(oid) and int(oid) in _cid_map else ""
-                            )
-        except Exception:
-            pass
+            _sc, _ = get_supabase_client()
+            if _sc:
+                for _fn in df_emp["_db_fn"].dropna().unique():
+                    _mask = df_emp["_db_fn"] == _fn
+                    _oids = df_emp.loc[_mask, "원본주문ID"].dropna().astype(int).unique().tolist()
+                    if not _oids:
+                        continue
+                    _chunks = [_oids[i:i+100] for i in range(0, len(_oids), 100)]
+                    _cid_map = {}
+                    for _chunk in _chunks:
+                        _r = _sc.table("app_orders").select("id, customer_id").eq("db_filename", _fn).in_("id", _chunk).execute()
+                        for _row in (_r.data or []):
+                            _cid_map[_row["id"]] = _row.get("customer_id")
+                    _cids = [v for v in _cid_map.values() if v is not None]
+                    if _cids:
+                        _cust_map = _get_customers_by_ids_supabase(str(_fn), list(set(int(c) for c in _cids)))
+                        df_emp.loc[_mask, "고객명"] = df_emp.loc[_mask, "원본주문ID"].apply(
+                            lambda oid, cm=_cid_map, cu=_cust_map: (cu.get(int(cm.get(int(oid), -1) or -1)) or {}).get("name", "") if pd.notna(oid) and int(oid) in cm else ""
+                        )
+                        df_emp.loc[_mask, "전화번호"] = df_emp.loc[_mask, "원본주문ID"].apply(
+                            lambda oid, cm=_cid_map, cu=_cust_map: (cu.get(int(cm.get(int(oid), -1) or -1)) or {}).get("phone1", "") if pd.notna(oid) and int(oid) in cm else ""
+                        )
+        except Exception as _e:
+            st.caption(f"⚠️ 고객정보 조회 오류: {_e}")
 
         group_col = "월" if query_mode == "월별/연도별 조회" else "일자"
 
