@@ -1429,14 +1429,15 @@ def load_customers_cached(db_filename: str, limit: int | None = 50) -> pd.DataFr
 
 @st.cache_data(ttl=600)
 def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFrame:
-    """Sales 테이블 캐시 로딩 (ttl=10분). Supabase sales 테이블, id 기준. limit=None이면 전체(대시보드 집계용)."""
+    """Sales 테이블 캐시 로딩 (ttl=10분). Supabase sales 테이블, id 기준. limit=None이면 전체(대시보드 집계용).
+    employee_names, order_id 포함 조회 - 대시보드 직원별 집계에 활용."""
     client, err = get_supabase_client()
     if err:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = err
-        return pd.DataFrame(columns=["transaction_date", "amount"])
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names"])
     try:
-        q = client.table("sales").select("transaction_date, amount")
+        q = client.table("sales").select("transaction_date, amount, order_id, employee_names")
         tenant_col = _sales_tenant_column()
         if tenant_col:
             q = q.eq(tenant_col, db_filename)
@@ -1447,11 +1448,53 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
         if r.data and len(r.data) > 0:
             st.session_state.pop("supabase_error", None)
             return pd.DataFrame(r.data)
-        return pd.DataFrame(columns=["transaction_date", "amount"])
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names"])
+    except Exception as e:
+        # employee_names 컬럼이 없는 구 스키마면 기본 컬럼만 조회
+        try:
+            q2 = client.table("sales").select("transaction_date, amount, order_id")
+            tenant_col = _sales_tenant_column()
+            if tenant_col:
+                q2 = q2.eq(tenant_col, db_filename)
+            q2 = q2.order("id", desc=True)
+            if limit:
+                q2 = q2.limit(limit)
+            r2 = q2.execute()
+            if r2.data and len(r2.data) > 0:
+                df2 = pd.DataFrame(r2.data)
+                df2["employee_names"] = None
+                return df2
+        except Exception:
+            pass
+        if "supabase_error" not in st.session_state:
+            st.session_state["supabase_error"] = str(e)
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names"])
+
+
+@st.cache_data(ttl=600)
+def load_sales_with_employees_cached(db_filename: str, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
+    """sales 테이블에서 employee_names 포함 조회 (직원별 판매 실적 보고서용). transaction_date 기준 필터."""
+    client, err = get_supabase_client()
+    if err:
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "note", "employee_names"])
+    try:
+        q = client.table("sales").select("transaction_date, amount, order_id, note, employee_names")
+        tenant_col = _sales_tenant_column()
+        if tenant_col:
+            q = q.eq(tenant_col, db_filename)
+        if start_date:
+            q = q.gte("transaction_date", start_date)
+        if end_date:
+            q = q.lte("transaction_date", end_date)
+        q = q.order("transaction_date", desc=False)
+        r = q.execute()
+        if r.data:
+            return pd.DataFrame(r.data)
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "note", "employee_names"])
     except Exception as e:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
-        return pd.DataFrame(columns=["transaction_date", "amount"])
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "note", "employee_names"])
 
 
 @st.cache_data(ttl=600)
@@ -2053,8 +2096,10 @@ def _count_payments_onnuri_dup_supabase(db_filename: str, payment_date: str, onn
         return 0
 
 
-def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = "", unpaid_balance: float | None = None):
-    """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). order_id, amount, transaction_date, note, created_at 저장. unpaid_balance(미수금)는 Supabase sales.unpaid_balance 컬럼에 저장(해당 컬럼 없으면 제외 후 재시도)."""
+def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = "", unpaid_balance: float | None = None, employee_names: str | None = None):
+    """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). order_id, amount, transaction_date, note, employee_names, created_at 저장.
+    employee_names: 쉼표 구분 직원명 (1/n 분배 기준). unpaid_balance(미수금)는 sales.unpaid_balance 컬럼에 저장(없으면 제외 후 재시도).
+    employee_names는 sales.employee_names 컬럼에 저장(없으면 제외 후 재시도)."""
     client, err = get_supabase_client()
     if err:
         if "supabase_error" not in st.session_state:
@@ -2071,15 +2116,28 @@ def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date:
         tenant_col = _sales_tenant_column()
         if tenant_col:
             payload[tenant_col] = db_filename
-        # 미수금: Supabase sales.unpaid_balance 컬럼에 저장 (판매가 - 수납액, 0이면 완납)
         if unpaid_balance is not None:
             payload["unpaid_balance"] = round(float(unpaid_balance), 2)
+        if employee_names is not None:
+            payload["employee_names"] = employee_names or ""
         try:
             client.table("sales").insert(payload).execute()
         except Exception as e1:
-            # unpaid_balance 컬럼이 없는 구 Supabase 스키마면 해당 필드 제외 후 재시도
             err_str = str(e1).lower()
-            if unpaid_balance is not None and ("unpaid_balance" in err_str or "42703" in err_str or "does not exist" in err_str):
+            # employee_names 컬럼이 없는 구 스키마면 해당 필드 제외 후 재시도
+            if employee_names is not None and ("employee_names" in err_str or "42703" in err_str or "does not exist" in err_str):
+                payload.pop("employee_names", None)
+                try:
+                    client.table("sales").insert(payload).execute()
+                except Exception as e2:
+                    err_str2 = str(e2).lower()
+                    if unpaid_balance is not None and ("unpaid_balance" in err_str2 or "42703" in err_str2 or "does not exist" in err_str2):
+                        payload.pop("unpaid_balance", None)
+                        client.table("sales").insert(payload).execute()
+                    else:
+                        raise
+            # unpaid_balance 컬럼이 없는 구 Supabase 스키마면 해당 필드 제외 후 재시도
+            elif unpaid_balance is not None and ("unpaid_balance" in err_str or "42703" in err_str or "does not exist" in err_str):
                 payload.pop("unpaid_balance", None)
                 client.table("sales").insert(payload).execute()
             else:
@@ -5369,103 +5427,92 @@ def render_monthly_payment_report(is_superadmin: bool):
                 )
 
     # ==========================================
-    # 모드 2: 직원별 판매 실적 추적 (상세 데이터 추가)
+    # 모드 2: 직원별 판매 실적 (sales 테이블 기반 - transaction_date 기준)
     # ==========================================
     else:
-        all_orders = []
+        st.info("ℹ️ 직원별 판매 실적은 **sales 테이블(transaction_date 기준)**으로 집계됩니다. 주문 변경(증액/감액)도 변경 시점 월로 반영됩니다.")
+
+        all_sales = []
         if is_superadmin and selected_store == "전체 매장 통합":
             for _, s in stores.iterrows():
                 db_fn = s["db_filename"]
-                if _supabase_orders_payments_available():
-                    df = _load_orders_supabase(db_fn, "id, customer_id, order_date, total_amount, actual_margin, employee_names, display_sales_amount, category", limit=None)
-                else:
-                    conn = get_tenant_conn(db_fn)
-                    if not conn: continue
-                    try:
-                        cur = conn.execute("PRAGMA table_info(Orders)")
-                        cols = [r[1] for r in cur.fetchall()]
-                        q_cols = "id, customer_id, order_date, total_amount, actual_margin, employee_names, category"
-                        if "display_sales_amount" in cols: q_cols += ", display_sales_amount"
-                        df = pd.read_sql(f"SELECT {q_cols} FROM Orders", conn)
-                    except Exception:
-                        df = pd.DataFrame()
-                    finally:
-                        conn.close()
+                df = load_sales_with_employees_cached(db_fn, start_date=date_range_start.isoformat(), end_date=date_range_end.isoformat())
                 if not df.empty:
                     df["_store"] = s["store_name"]
                     df["_db_fn"] = db_fn
-                    all_orders.append(df)
+                    all_sales.append(df)
         else:
             db_fn = db_filename if not is_superadmin else stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
-            if _supabase_orders_payments_available():
-                df = _load_orders_supabase(db_fn, "id, customer_id, order_date, total_amount, actual_margin, employee_names, display_sales_amount, category", limit=None)
-            else:
-                conn = get_tenant_conn(db_fn)
-                if conn:
-                    try:
-                        cur = conn.execute("PRAGMA table_info(Orders)")
-                        cols = [r[1] for r in cur.fetchall()]
-                        q_cols = "id, customer_id, order_date, total_amount, actual_margin, employee_names, category"
-                        if "display_sales_amount" in cols: q_cols += ", display_sales_amount"
-                        df = pd.read_sql(f"SELECT {q_cols} FROM Orders", conn)
-                    except Exception:
-                        df = pd.DataFrame()
-                    finally:
-                        conn.close()
-                else:
-                    df = pd.DataFrame()
+            df = load_sales_with_employees_cached(db_fn, start_date=date_range_start.isoformat(), end_date=date_range_end.isoformat())
             if not df.empty:
                 df["_store"] = selected_store
                 df["_db_fn"] = db_fn
-                all_orders.append(df)
-        
-        if not all_orders:
-            st.info("선택 기간/매장에 주문 데이터가 없습니다.")
+                all_sales.append(df)
+
+        if not all_sales:
+            st.info("선택 기간/매장에 판매 데이터가 없습니다.")
             return
-            
-        ord_df = pd.concat(all_orders, ignore_index=True)
-        ord_df["order_date"] = pd.to_datetime(ord_df["order_date"], errors="coerce")
-        ord_df = ord_df[ord_df["order_date"].notna()]
-        ord_df["_pd"] = ord_df["order_date"].dt.date
-        ord_df = ord_df[(ord_df["_pd"] >= date_range_start) & (ord_df["_pd"] <= date_range_end)]
-        
-        if ord_df.empty:
-            st.info("해당 기간에 주문 데이터가 없습니다.")
+
+        sal_df = pd.concat(all_sales, ignore_index=True)
+        sal_df["transaction_date"] = pd.to_datetime(sal_df["transaction_date"], errors="coerce")
+        sal_df = sal_df[sal_df["transaction_date"].notna()]
+        sal_df["_pd"] = sal_df["transaction_date"].dt.date
+        sal_df = sal_df[(sal_df["_pd"] >= date_range_start) & (sal_df["_pd"] <= date_range_end)]
+
+        # employee_names가 없는 레코드(구 데이터): Orders 테이블에서 employee_names를 보완
+        _no_emp_mask = sal_df["employee_names"].isna() | (sal_df["employee_names"].astype(str).str.strip() == "")
+        if _no_emp_mask.any():
+            _order_ids_no_emp = sal_df.loc[_no_emp_mask, "order_id"].dropna().astype(int).unique().tolist()
+            if _order_ids_no_emp:
+                try:
+                    _sc, _ = get_supabase_client()
+                    if _sc:
+                        _chunks = [_order_ids_no_emp[i:i+100] for i in range(0, len(_order_ids_no_emp), 100)]
+                        _emp_map = {}
+                        for _chunk in _chunks:
+                            _r = _sc.table("Orders").select("id, employee_names").in_("id", _chunk).execute()
+                            for _row in (_r.data or []):
+                                _emp_map[_row["id"]] = _row.get("employee_names") or ""
+                        sal_df.loc[_no_emp_mask, "employee_names"] = sal_df.loc[_no_emp_mask, "order_id"].apply(
+                            lambda oid: _emp_map.get(int(oid), "") if pd.notna(oid) else ""
+                        )
+                except Exception:
+                    pass
+
+        if sal_df.empty:
+            st.info("해당 기간에 판매 데이터가 없습니다.")
             return
-            
+
         # 1. 고유 직원 목록 추출
         unique_emps = set()
-        for emps in ord_df["employee_names"].dropna():
+        for emps in sal_df["employee_names"].dropna():
             for e in str(emps).split(","):
                 if e.strip():
                     unique_emps.add(e.strip())
-        
+
         emp_opts = ["전체 직원"] + sorted(list(unique_emps))
         selected_emp = st.selectbox("직원 선택 (실적 조회)", emp_opts, key="emp_perf_sel")
-        
+
         # 2. 1/n 분배 로직 적용 및 상세 데이터 조립
         rows = []
-        for _, r in ord_df.iterrows():
+        for _, r in sal_df.iterrows():
             emps = [e.strip() for e in str(r.get("employee_names") or "").split(",") if e.strip()]
             n = len(emps) if emps else 1
-            if not emps: continue
-            
-            amt = float(r.get("total_amount") or 0)
-            margin = float(r.get("actual_margin") or 0)
-            
-            # total_amount에 이미 전시품 판매가가 합산되어 있으므로 별도 가산하지 않음
+            if not emps:
+                continue
+
+            amt = float(r.get("amount") or 0)
             per_amt = amt / n
-            per_margin = margin / n
             per_cnt = 1.0 / n
-            
-            d_val = r["order_date"]
+
+            d_val = r["transaction_date"]
             d_str = d_val.strftime("%Y-%m-%d")
             m_str = d_val.strftime("%Y-%m")
             store_nm = r.get("_store", "")
-            cat_str = r.get("category") or "-"
-            
-            cid = r.get("customer_id")
+            note_str = r.get("note") or "-"
             db_fn_val = r.get("_db_fn", "")
+            oid = r.get("order_id")
+
             for e in emps:
                 if selected_emp == "전체 직원" or selected_emp == e:
                     rows.append({
@@ -5473,80 +5520,83 @@ def render_monthly_payment_report(is_superadmin: bool):
                         "일자": d_str,
                         "월": m_str,
                         "직원명": e,
-                        "품목": cat_str,
+                        "비고": note_str,
                         "판매금액": per_amt,
-                        "마진": per_margin,
                         "판매건수": per_cnt,
-                        "원본주문ID": r["id"],
-                        "_customer_id": cid,
+                        "원본주문ID": oid,
                         "_db_fn": db_fn_val,
                     })
-        
+
         if not rows:
             st.info("선택한 직원의 판매 데이터가 없습니다.")
             return
-            
+
         df_emp = pd.DataFrame(rows)
 
-        # 고객 이름/전화번호 조회 (db_filename별로 배치 조회)
+        # order_id로 고객정보 조회 (db_filename별 배치)
         df_emp["고객명"] = ""
         df_emp["전화번호"] = ""
         try:
             for _fn in df_emp["_db_fn"].dropna().unique():
                 _mask = df_emp["_db_fn"] == _fn
-                _cids = df_emp.loc[_mask, "_customer_id"].dropna().astype(int).unique().tolist()
-                if _cids:
-                    _cust_map = _get_customers_by_ids_supabase(str(_fn), _cids)
-                    df_emp.loc[_mask, "고객명"] = df_emp.loc[_mask, "_customer_id"].apply(
-                        lambda cid: (_cust_map.get(int(cid)) or {}).get("name", "") if pd.notna(cid) else ""
-                    )
-                    df_emp.loc[_mask, "전화번호"] = df_emp.loc[_mask, "_customer_id"].apply(
-                        lambda cid: (_cust_map.get(int(cid)) or {}).get("phone1", "") if pd.notna(cid) else ""
-                    )
+                _oids = df_emp.loc[_mask, "원본주문ID"].dropna().astype(int).unique().tolist()
+                if _oids:
+                    _sc, _ = get_supabase_client()
+                    if _sc:
+                        _chunks = [_oids[i:i+100] for i in range(0, len(_oids), 100)]
+                        _cid_map = {}
+                        for _chunk in _chunks:
+                            _r = _sc.table("Orders").select("id, customer_id").in_("id", _chunk).execute()
+                            for _row in (_r.data or []):
+                                _cid_map[_row["id"]] = _row.get("customer_id")
+                        _cids = [v for v in _cid_map.values() if v is not None]
+                        if _cids:
+                            _cust_map = _get_customers_by_ids_supabase(str(_fn), list(set(int(c) for c in _cids)))
+                            df_emp.loc[_mask, "고객명"] = df_emp.loc[_mask, "원본주문ID"].apply(
+                                lambda oid: (_cust_map.get(int(_cid_map.get(int(oid), -1) or -1)) or {}).get("name", "") if pd.notna(oid) and int(oid) in _cid_map else ""
+                            )
+                            df_emp.loc[_mask, "전화번호"] = df_emp.loc[_mask, "원본주문ID"].apply(
+                                lambda oid: (_cust_map.get(int(_cid_map.get(int(oid), -1) or -1)) or {}).get("phone1", "") if pd.notna(oid) and int(oid) in _cid_map else ""
+                            )
         except Exception:
             pass
 
         group_col = "월" if query_mode == "월별/연도별 조회" else "일자"
-        
+
         # 3. 화면 표시용 그룹핑(요약) 집계
         if selected_emp == "전체 직원":
-            summary = df_emp.groupby(["매장명", group_col, "직원명"], as_index=False)[["판매금액", "마진", "판매건수"]].sum()
+            summary = df_emp.groupby(["매장명", group_col, "직원명"], as_index=False)[["판매금액", "판매건수"]].sum()
         else:
-            summary = df_emp.groupby(["매장명", group_col], as_index=False)[["판매금액", "마진", "판매건수"]].sum()
+            summary = df_emp.groupby(["매장명", group_col], as_index=False)[["판매금액", "판매건수"]].sum()
             summary.insert(2, "직원명", selected_emp)
-            
+
         summary = summary.sort_values(by=["매장명", group_col, "판매금액"], ascending=[True, True, False]).reset_index(drop=True)
-        
         summary["판매금액"] = summary["판매금액"].round(0).astype(int)
-        summary["마진"] = summary["마진"].round(0).astype(int)
         summary["판매건수"] = summary["판매건수"].round(2)
-        
+
         disp_df = summary.copy()
         disp_df["판매금액"] = disp_df["판매금액"].apply(lambda x: f"{x:,}원")
-        disp_df["마진"] = disp_df["마진"].apply(lambda x: f"{x:,}원")
         disp_df["판매건수"] = disp_df["판매건수"].apply(lambda x: f"{x:g}건")
-        
+
         st.write("📌 **실적 요약 (화면용)**")
         st.dataframe(disp_df, use_container_width=True)
+        st.caption("※ transaction_date(판매/변경 시점) 기준 집계. 증액/감액 delta도 포함됩니다.")
         st.caption("엑셀을 다운로드하시면 '집계요약' 시트와 개별 판매 건이 기록된 '상세내역' 시트를 모두 확인하실 수 있습니다.")
-        
+
         # 4. 엑셀 다운로드 (다중 시트: 요약 + 상세 분리)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             summary.to_excel(writer, sheet_name="집계요약", index=False)
-            
+
             detail_df = df_emp.copy()
             detail_df["판매금액"] = detail_df["판매금액"].round(0).astype(int)
-            detail_df["마진"] = detail_df["마진"].round(0).astype(int)
             detail_df["판매건수"] = detail_df["판매건수"].round(2)
             detail_df = detail_df.sort_values(by=["일자", "매장명", "직원명"], ascending=[False, True, True])
-            # 내부 컬럼 제거 후 고객명/전화번호를 앞쪽에 배치
-            detail_df = detail_df.drop(columns=[c for c in ["_customer_id", "_db_fn"] if c in detail_df.columns])
-            # 컬럼 순서 재정렬: 매장명, 일자, 직원명, 고객명, 전화번호, 품목, 판매금액, 마진, 판매건수, 원본주문ID
-            ordered_cols = ["매장명", "일자", "월", "직원명", "고객명", "전화번호", "품목", "판매금액", "마진", "판매건수", "원본주문ID"]
+            detail_df = detail_df.drop(columns=[c for c in ["_db_fn"] if c in detail_df.columns])
+            ordered_cols = ["매장명", "일자", "월", "직원명", "고객명", "전화번호", "비고", "판매금액", "판매건수", "원본주문ID"]
             detail_df = detail_df[[c for c in ordered_cols if c in detail_df.columns]]
             detail_df.to_excel(writer, sheet_name="상세내역", index=False)
-            
+
         buf.seek(0)
         store_label = "전체매장" if (is_superadmin and selected_store == "전체 매장 통합") else selected_store.replace(" ", "_")
         dl_name = f"직원판매실적_상세포함_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx"
@@ -6886,7 +6936,7 @@ def render_new_sales():
             remaining = final_sales_save - total_paid_initial
             balance_status = "완납" if remaining == 0 else "미납"
             _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
-            _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance)
+            _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
             clear_data_cache()
             st.success("매출등록이 완료되었습니다.")
             net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
@@ -7000,7 +7050,7 @@ def render_new_sales():
                 remaining = final_sales_save - total_paid_initial
                 balance_status = "완납" if remaining == 0 else "미납"
                 conn.execute("UPDATE Orders SET balance_status = ? WHERE id = ?", (balance_status, order_id))
-                _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance)
+                _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
                 conn.commit()
                 clear_data_cache()
                 net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
@@ -7841,7 +7891,9 @@ def render_customer_balance():
                                         else:
                                             order_date_label = str(order_date_val)
                                         note = f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
-                                        _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(delta), note)
+                                        # 담당 직원: 수정 후 직원명 우선, 없으면 기존 직원명 사용 (delta도 같은 직원에게 귀속)
+                                        _delta_emp = new_employee_names if new_employee_names else old_employee_names
+                                        _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(delta), note, employee_names=_delta_emp or None)
                                         if margin_pct < 15 or margin_pct > 25:
                                             store_name = _get_store_name_by_db(db_filename)
                                             _insert_admin_alert(store_name, "margin", f"[{store_name}] 마진율 {margin_pct:.1f}% 건이 수정되었습니다.")
@@ -8706,17 +8758,19 @@ def render_dashboard():
     else:
         st.metric("이번 달 누적 매출 (Net Sales)", "0원")
 
-    # ---------- 4. 월별 직원 판매 현황 및 평가 (1/n 실적 분배 + KPI) ----------
+    # ---------- 4. 월별 직원 판매 현황 및 평가 (sales 테이블 기반 - transaction_date 기준) ----------
     st.subheader("4. 월별 직원 판매 현황 및 평가")
-    if len(orders) > 0 and "order_date" in orders.columns:
-        orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
-        order_dates = orders["order_date"].dropna()
-        if len(order_dates) > 0:
-            min_d = order_dates.min().to_pydatetime()
-            max_d = order_dates.max().to_pydatetime()
+    if not sales_df.empty and "transaction_date" in sales_df.columns:
+        _kpi_sales = sales_df.copy()
+        _kpi_sales["transaction_date"] = pd.to_datetime(_kpi_sales["transaction_date"], errors="coerce")
+        _kpi_sales = _kpi_sales.dropna(subset=["transaction_date"])
+        _kpi_dates = _kpi_sales["transaction_date"].dropna()
+        if len(_kpi_dates) > 0:
+            _kpi_min = _kpi_dates.min().to_pydatetime()
+            _kpi_max = _kpi_dates.max().to_pydatetime()
             months_options = []
-            y, m = min_d.year, min_d.month
-            end_y, end_m = max_d.year, max_d.month
+            y, m = _kpi_min.year, _kpi_min.month
+            end_y, end_m = _kpi_max.year, _kpi_max.month
             while (y, m) <= (end_y, end_m):
                 months_options.append((y, m))
                 m += 1
@@ -8729,34 +8783,49 @@ def render_dashboard():
                 st.session_state["kpi_month_idx"] = 0
             sel_idx = st.selectbox("연/월 선택", range(len(month_labels)), format_func=lambda i: month_labels[i], key="kpi_month_sel")
             sel_y, sel_m = months_options[sel_idx]
-            month_start = date(sel_y, sel_m, 1)
-            from calendar import monthrange
-            month_end = date(sel_y, sel_m, monthrange(sel_y, sel_m)[1])
-            orders_m = orders[(orders["order_date"].dt.date >= month_start) & (orders["order_date"].dt.date <= month_end)].copy()
-            if "display_sales_amount" not in orders_m.columns:
-                orders_m["display_sales_amount"] = 0
-            orders_m["display_sales_amount"] = orders_m["display_sales_amount"].fillna(0).astype(int)
-            orders_m["actual_margin"] = orders_m["actual_margin"].fillna(0)
+            from calendar import monthrange as _mrange
+            _kpi_start = date(sel_y, sel_m, 1)
+            _kpi_end = date(sel_y, sel_m, _mrange(sel_y, sel_m)[1])
+            _kpi_m = _kpi_sales[
+                (_kpi_sales["transaction_date"].dt.date >= _kpi_start) &
+                (_kpi_sales["transaction_date"].dt.date <= _kpi_end)
+            ].copy()
+
+            # employee_names가 없는 구 레코드는 orders에서 보완
+            _no_emp = _kpi_m["employee_names"].isna() | (_kpi_m["employee_names"].astype(str).str.strip() == "")
+            if _no_emp.any() and not orders.empty and "id" in orders.columns and "employee_names" in orders.columns:
+                _oid_emp_map = orders.set_index("id")["employee_names"].to_dict()
+                _kpi_m.loc[_no_emp, "employee_names"] = _kpi_m.loc[_no_emp, "order_id"].apply(
+                    lambda oid: _oid_emp_map.get(int(oid), "") if pd.notna(oid) else ""
+                )
+
+            # orders에서 order_id → actual_margin, display_sales_amount 매핑 (KPI 점수용)
+            _margin_map = {}
+            _display_map = {}
+            if not orders.empty and "id" in orders.columns:
+                if "actual_margin" in orders.columns:
+                    _margin_map = orders.set_index("id")["actual_margin"].fillna(0).to_dict()
+                if "display_sales_amount" in orders.columns:
+                    _display_map = orders.set_index("id")["display_sales_amount"].fillna(0).to_dict()
+
             rows = []
-            for _, r in orders_m.iterrows():
-                emps = [e.strip() for e in (r.get("employee_names") or "").split(",") if e.strip()]
+            for _, r in _kpi_m.iterrows():
+                emps = [e.strip() for e in str(r.get("employee_names") or "").split(",") if e.strip()]
                 n = len(emps) if emps else 1
                 if not emps:
                     continue
-                amt = float(r.get("total_amount") or 0)
-                margin = float(r.get("actual_margin") or 0)
-                display_amt = float(r.get("display_sales_amount") or 0)
+                amt = float(r.get("amount") or 0)
+                oid = r.get("order_id")
+                margin = float(_margin_map.get(int(oid), 0)) / n if oid and pd.notna(oid) else 0
+                display_amt = float(_display_map.get(int(oid), 0)) / n if oid and pd.notna(oid) else 0
                 per_amt = amt / n
-                per_margin = margin / n
-                per_display = (display_amt / n) if n else 0
                 for e in emps:
-                    rows.append({"employee": e, "sales": per_amt, "margin": per_margin, "display_sales": per_display})
+                    rows.append({"employee": e, "sales": per_amt, "margin": margin, "display_sales": display_amt})
             if rows:
                 emp_df = pd.DataFrame(rows).groupby("employee", as_index=False).agg({"sales": "sum", "margin": "sum", "display_sales": "sum"})
                 total_sales = emp_df["sales"].sum() or 0
                 total_margin = emp_df["margin"].sum() or 0
                 total_display = emp_df["display_sales"].sum() or 0
-                # ① 매출 80점, ② 마진 10점, ③ 전시품 10점, ④ 종합 (ZeroDivisionError 방지)
                 emp_df["매출 점수(80)"] = (emp_df["sales"] / total_sales * 80).round(1) if total_sales else 0.0
                 emp_df["마진 점수(10)"] = (emp_df["margin"] / total_margin * 10).round(1) if total_margin else 0.0
                 emp_df["전시품 점수(10)"] = (emp_df["display_sales"] / total_display * 10).round(1) if total_display else 0.0
@@ -8768,13 +8837,13 @@ def render_dashboard():
                 display_df = emp_df[["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]].rename(columns={"employee": "직원명"})
                 display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
                 st.dataframe(display_fmt, use_container_width=True)
-                st.caption("※ 총 판매액에는 전시품 판매액이 포함되어 있습니다. 전시품 판매액은 점수 산정을 위해 별도 표시됩니다.")
+                st.caption("※ 판매금액은 sales 테이블(transaction_date 기준) 집계. 증액/감액 delta 포함. 마진/전시품은 주문 기준 참조.")
             else:
-                st.info("선택한 월에 직원이 배정된 주문이 없습니다.")
+                st.info("선택한 월에 직원이 배정된 판매 데이터가 없습니다.")
         else:
-            st.info("주문 일자가 없어 월별 집계를 할 수 없습니다.")
+            st.info("판매 데이터가 없어 월별 집계를 할 수 없습니다.")
     else:
-        st.info("주문 데이터가 없어 직원 평가를 할 수 없습니다.")
+        st.info("판매 데이터가 없어 직원 평가를 할 수 없습니다.")
 
     # ---------- 5. 관리자 통계: 기간별 총 계약 금액 / 총 미수금 ----------
     st.subheader("5. 기간별 통계 (총 계약 금액 / 총 미수금)")
