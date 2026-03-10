@@ -7694,10 +7694,16 @@ def render_customer_balance():
                         sel_oid = st.selectbox("수정할 주문 선택", order_options, format_func=_fmt_order_sel, key=f"{edit_prefix}_order_sel")
                         if sel_oid:
                             orow = orders[orders["id"] == sel_oid].iloc[0]
-                            # _oid가 변경됐거나, 금액 키가 아직 세션에 없을 때 재초기화
+                            # 재초기화 조건: OID 변경, 키 미존재, 또는 DB에 금액이 있는데 세션 상태가 0/빈값인 경우
+                            _db_total_check = float(orow.get("total_amount") or 0)
+                            _ss_total_check = _parse_comma_to_int(st.session_state.get(f"{edit_prefix}_general_sales", "0"))
+                            _db_cost_check = float(orow.get("cost_price") or 0)
+                            _ss_cost_check = _parse_comma_to_int(st.session_state.get(f"{edit_prefix}_cost", "0"))
                             _need_order_init = (
                                 st.session_state.get(f"{edit_prefix}_oid") != sel_oid
                                 or f"{edit_prefix}_general_sales" not in st.session_state
+                                or (_ss_total_check == 0 and _db_total_check > 0)
+                                or (_ss_cost_check == 0 and _db_cost_check > 0)
                             )
                             if _need_order_init:
                                 # NaN/None/pd.NA 안전 변환 헬퍼
@@ -7993,6 +7999,8 @@ def render_customer_balance():
                                     if conn:
                                         conn.close()
                                     clear_data_cache()
+                                    # 수정 후 재초기화 강제: 다음 렌더에서 DB 최신값으로 재로드
+                                    st.session_state.pop(f"{edit_prefix}_oid", None)
 
                                     # ── 알림 발송 ──
                                     _actor_uname = _current_username()
