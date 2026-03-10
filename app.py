@@ -5377,14 +5377,14 @@ def render_monthly_payment_report(is_superadmin: bool):
             for _, s in stores.iterrows():
                 db_fn = s["db_filename"]
                 if _supabase_orders_payments_available():
-                    df = _load_orders_supabase(db_fn, "id, order_date, total_amount, actual_margin, employee_names, display_sales_amount, category", limit=None)
+                    df = _load_orders_supabase(db_fn, "id, customer_id, order_date, total_amount, actual_margin, employee_names, display_sales_amount, category", limit=None)
                 else:
                     conn = get_tenant_conn(db_fn)
                     if not conn: continue
                     try:
                         cur = conn.execute("PRAGMA table_info(Orders)")
                         cols = [r[1] for r in cur.fetchall()]
-                        q_cols = "id, order_date, total_amount, actual_margin, employee_names, category"
+                        q_cols = "id, customer_id, order_date, total_amount, actual_margin, employee_names, category"
                         if "display_sales_amount" in cols: q_cols += ", display_sales_amount"
                         df = pd.read_sql(f"SELECT {q_cols} FROM Orders", conn)
                     except Exception:
@@ -5393,18 +5393,19 @@ def render_monthly_payment_report(is_superadmin: bool):
                         conn.close()
                 if not df.empty:
                     df["_store"] = s["store_name"]
+                    df["_db_fn"] = db_fn
                     all_orders.append(df)
         else:
             db_fn = db_filename if not is_superadmin else stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
             if _supabase_orders_payments_available():
-                df = _load_orders_supabase(db_fn, "id, order_date, total_amount, actual_margin, employee_names, display_sales_amount, category", limit=None)
+                df = _load_orders_supabase(db_fn, "id, customer_id, order_date, total_amount, actual_margin, employee_names, display_sales_amount, category", limit=None)
             else:
                 conn = get_tenant_conn(db_fn)
                 if conn:
                     try:
                         cur = conn.execute("PRAGMA table_info(Orders)")
                         cols = [r[1] for r in cur.fetchall()]
-                        q_cols = "id, order_date, total_amount, actual_margin, employee_names, category"
+                        q_cols = "id, customer_id, order_date, total_amount, actual_margin, employee_names, category"
                         if "display_sales_amount" in cols: q_cols += ", display_sales_amount"
                         df = pd.read_sql(f"SELECT {q_cols} FROM Orders", conn)
                     except Exception:
@@ -5415,6 +5416,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                     df = pd.DataFrame()
             if not df.empty:
                 df["_store"] = selected_store
+                df["_db_fn"] = db_fn
                 all_orders.append(df)
         
         if not all_orders:
@@ -5462,6 +5464,8 @@ def render_monthly_payment_report(is_superadmin: bool):
             store_nm = r.get("_store", "")
             cat_str = r.get("category") or "-"
             
+            cid = r.get("customer_id")
+            db_fn_val = r.get("_db_fn", "")
             for e in emps:
                 if selected_emp == "전체 직원" or selected_emp == e:
                     rows.append({
@@ -5473,7 +5477,9 @@ def render_monthly_payment_report(is_superadmin: bool):
                         "판매금액": per_amt,
                         "마진": per_margin,
                         "판매건수": per_cnt,
-                        "원본주문ID": r["id"]
+                        "원본주문ID": r["id"],
+                        "_customer_id": cid,
+                        "_db_fn": db_fn_val,
                     })
         
         if not rows:
@@ -5481,6 +5487,25 @@ def render_monthly_payment_report(is_superadmin: bool):
             return
             
         df_emp = pd.DataFrame(rows)
+
+        # 고객 이름/전화번호 조회 (db_filename별로 배치 조회)
+        df_emp["고객명"] = ""
+        df_emp["전화번호"] = ""
+        try:
+            for _fn in df_emp["_db_fn"].dropna().unique():
+                _mask = df_emp["_db_fn"] == _fn
+                _cids = df_emp.loc[_mask, "_customer_id"].dropna().astype(int).unique().tolist()
+                if _cids:
+                    _cust_map = _get_customers_by_ids_supabase(str(_fn), _cids)
+                    df_emp.loc[_mask, "고객명"] = df_emp.loc[_mask, "_customer_id"].apply(
+                        lambda cid: (_cust_map.get(int(cid)) or {}).get("name", "") if pd.notna(cid) else ""
+                    )
+                    df_emp.loc[_mask, "전화번호"] = df_emp.loc[_mask, "_customer_id"].apply(
+                        lambda cid: (_cust_map.get(int(cid)) or {}).get("phone1", "") if pd.notna(cid) else ""
+                    )
+        except Exception:
+            pass
+
         group_col = "월" if query_mode == "월별/연도별 조회" else "일자"
         
         # 3. 화면 표시용 그룹핑(요약) 집계
@@ -5515,6 +5540,11 @@ def render_monthly_payment_report(is_superadmin: bool):
             detail_df["마진"] = detail_df["마진"].round(0).astype(int)
             detail_df["판매건수"] = detail_df["판매건수"].round(2)
             detail_df = detail_df.sort_values(by=["일자", "매장명", "직원명"], ascending=[False, True, True])
+            # 내부 컬럼 제거 후 고객명/전화번호를 앞쪽에 배치
+            detail_df = detail_df.drop(columns=[c for c in ["_customer_id", "_db_fn"] if c in detail_df.columns])
+            # 컬럼 순서 재정렬: 매장명, 일자, 직원명, 고객명, 전화번호, 품목, 판매금액, 마진, 판매건수, 원본주문ID
+            ordered_cols = ["매장명", "일자", "월", "직원명", "고객명", "전화번호", "품목", "판매금액", "마진", "판매건수", "원본주문ID"]
+            detail_df = detail_df[[c for c in ordered_cols if c in detail_df.columns]]
             detail_df.to_excel(writer, sheet_name="상세내역", index=False)
             
         buf.seek(0)
