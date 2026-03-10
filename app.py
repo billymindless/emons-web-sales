@@ -8479,9 +8479,8 @@ def render_dashboard():
                 ord_df["_date"] = ord_df["order_date"].dt.date
                 month_ord = ord_df[(ord_df["_date"] >= month_start) & (ord_df["_date"] <= today)]
                 if len(month_ord) > 0:
+                    # total_amount에는 이미 전시품 판매가가 합산되어 있으므로 별도 가산하지 않음
                     tot_amt = month_ord["total_amount"].fillna(0)
-                    if "display_sales_amount" in month_ord.columns:
-                        tot_amt = tot_amt + month_ord["display_sales_amount"].fillna(0)
                     expected_total_sales = float(tot_amt.sum())
                     tot_cost = month_ord["cost_price"].fillna(0)
                     if "display_cost_amount" in month_ord.columns:
@@ -8609,6 +8608,23 @@ def render_dashboard():
             days_left = days_in_month - days_elapsed
             projected = cumulative + avg_daily * days_left if days_left > 0 else cumulative
             st.metric("이번 달 누적 매출 (Net Sales)", f"{cumulative:,.0f}원")
+            # 이번 달 주문 기준 전시품 판매액 별도 표시 (total_amount에 이미 포함된 금액)
+            try:
+                if not orders.empty and "order_date" in orders.columns and "display_sales_amount" in orders.columns:
+                    _ord_disp = orders.copy()
+                    _ord_disp["order_date"] = pd.to_datetime(_ord_disp["order_date"], errors="coerce")
+                    _ord_disp = _ord_disp.dropna(subset=["order_date"])
+                    _month_ord_disp = _ord_disp[
+                        (_ord_disp["order_date"].dt.date >= month_start) &
+                        (_ord_disp["order_date"].dt.date <= today)
+                    ]
+                    _display_total_month = float(_month_ord_disp["display_sales_amount"].fillna(0).sum())
+                    if _display_total_month > 0:
+                        st.caption(f"※ 이번 달 누적 매출에는 전시품 판매액 {_display_total_month:,.0f}원이 포함되어 있습니다. (주문일 기준)")
+                    else:
+                        st.caption("※ 이번 달 전시품 판매 없음")
+            except Exception:
+                pass
             st.metric("이번 달 예상 매출 (일평균 기반)", f"{projected:,.0f}원")
         else:
             st.metric("이번 달 누적 매출 (Net Sales)", "0원")
@@ -8677,6 +8693,7 @@ def render_dashboard():
                 display_df = emp_df[["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]].rename(columns={"employee": "직원명"})
                 display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
                 st.dataframe(display_fmt, use_container_width=True)
+                st.caption("※ 총 판매액에는 전시품 판매액이 포함되어 있습니다. 전시품 판매액은 점수 산정을 위해 별도 표시됩니다.")
             else:
                 st.info("선택한 월에 직원이 배정된 주문이 없습니다.")
         else:
