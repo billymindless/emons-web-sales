@@ -5449,10 +5449,10 @@ def render_monthly_payment_report(is_superadmin: bool):
             if not emps: continue
             
             amt = float(r.get("total_amount") or 0)
-            disp = float(r.get("display_sales_amount") or 0) if "display_sales_amount" in r else 0
             margin = float(r.get("actual_margin") or 0)
             
-            per_amt = (amt + disp) / n
+            # total_amount에 이미 전시품 판매가가 합산되어 있으므로 별도 가산하지 않음
+            per_amt = amt / n
             per_margin = margin / n
             per_cnt = 1.0 / n
             
