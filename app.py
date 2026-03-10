@@ -5209,7 +5209,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                     df = _load_payments_supabase(db_fn)
                     if not df.empty and "payment_date" in df.columns:
                         df = df[df["payment_date"].notna() & (df["payment_date"] != "")]
-                        _keep = [c for c in ["order_id", "payment_date", "payment_method", "card_company", "amount", "created_at", "created_by"] if c in df.columns]
+                        _keep = [c for c in ["order_id", "payment_date", "payment_method", "card_company", "onnuri_approval_code", "amount", "created_at", "created_by"] if c in df.columns]
                         df = df[_keep]
                         df["_store"] = s["store_name"]
                         df["_db_fn"] = db_fn
@@ -5220,7 +5220,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                         continue
                     try:
                         _pcols = [r[1] for r in conn.execute("PRAGMA table_info(Payments)").fetchall()]
-                        _extra = ", ".join(c for c in ["created_at", "created_by"] if c in _pcols)
+                        _extra = ", ".join(c for c in ["onnuri_approval_code", "created_at", "created_by"] if c in _pcols)
                         _sel = f"order_id, payment_date, payment_method, card_company, amount{', ' + _extra if _extra else ''}"
                         df = pd.read_sql(f"SELECT {_sel} FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
                         df["_store"] = s["store_name"]
@@ -5246,7 +5246,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                     pay_df = pd.DataFrame(columns=["order_id", "payment_date", "payment_method", "card_company", "amount"])
                 else:
                     pay_df = pay_df[pay_df["payment_date"].notna() & (pay_df["payment_date"] != "")]
-                    _keep = [c for c in ["order_id", "payment_date", "payment_method", "card_company", "amount", "created_at", "created_by"] if c in pay_df.columns]
+                    _keep = [c for c in ["order_id", "payment_date", "payment_method", "card_company", "onnuri_approval_code", "amount", "created_at", "created_by"] if c in pay_df.columns]
                     pay_df = pay_df[_keep]
                 pay_df["_db_fn"] = db_fn
             else:
@@ -5256,7 +5256,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                     return
                 try:
                     _pcols = [r[1] for r in conn.execute("PRAGMA table_info(Payments)").fetchall()]
-                    _extra = ", ".join(c for c in ["created_at", "created_by"] if c in _pcols)
+                    _extra = ", ".join(c for c in ["onnuri_approval_code", "created_at", "created_by"] if c in _pcols)
                     _sel = f"order_id, payment_date, payment_method, card_company, amount{', ' + _extra if _extra else ''}"
                     pay_df = pd.read_sql(f"SELECT {_sel} FROM Payments WHERE payment_date IS NOT NULL AND payment_date != ''", conn)
                 except Exception:
@@ -5392,11 +5392,21 @@ def render_monthly_payment_report(is_superadmin: bool):
                 # ── 결제수단 ──
                 _audit_df["결제수단"] = _audit_df["detailed_payment"] if "detailed_payment" in _audit_df.columns else _audit_df.apply(_to_detailed, axis=1)
 
+                # ── 승인번호 (메인페이·온누리 전용, 감사 내역에만 표시) ──
+                def _get_approval(r):
+                    meth = str(r.get("payment_method") or "")
+                    if meth == "메인페이":
+                        return str(r.get("card_company") or "")
+                    if "온누리" in meth:
+                        return str(r.get("onnuri_approval_code") or "")
+                    return ""
+                _audit_df["승인번호"] = _audit_df.apply(_get_approval, axis=1)
+
                 # ── 금액 ──
                 _audit_df["금액"] = pd.to_numeric(_audit_df.get("amount", 0), errors="coerce").fillna(0).astype(int)
 
                 # ── 표시 컬럼 선택 ──
-                _show_cols = ["결제일자", "입력일자", "입력자", "결제수단", "금액"]
+                _show_cols = ["결제일자", "입력일자", "입력자", "결제수단", "승인번호", "금액"]
                 if "_store" in _audit_df.columns:
                     _show_cols = ["매장"] + _show_cols
                     _audit_df["매장"] = _audit_df["_store"]
