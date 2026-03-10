@@ -7154,6 +7154,145 @@ def _recalc_order_actual_margin(conn, order_id: int, db_filename: str | None = N
     )
 
 
+def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key_prefix: str = "split"):
+    """동일 고객의 복수 주문에 단일 결제 금액을 분배 등록하는 UI.
+    orders_df: 잔금이 있는 주문들의 DataFrame (columns: id, balance, order_date, category, total_amount).
+    한 번의 결제 수단/금액 입력으로 여러 주문에 자동 분배 저장."""
+    if orders_df is None or len(orders_df) < 2:
+        return
+
+    st.markdown("#### 💳 복수 주문 분배 결제")
+    st.caption("한 번의 결제(카드·온누리 등)로 여러 주문에 금액을 나누어 등록합니다.")
+
+    # 총 잔금 표시
+    total_balance = float(orders_df["balance"].sum())
+    st.metric("전체 주문 합산 잔금", f"{total_balance:,.0f}원")
+
+    # 결제 수단 / 날짜
+    col_m, col_d = st.columns(2)
+    with col_m:
+        split_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
+    with col_d:
+        split_date = st.date_input("결제 날짜 *", value=date.today(), key=f"{key_prefix}_date")
+
+    # 카드사 / 메인페이
+    _CARD_WITH_COMPANY_SPLIT = ("신용카드", "체크카드")
+    if split_method in _CARD_WITH_COMPANY_SPLIT:
+        split_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
+    elif split_method == "메인페이":
+        split_card = st.text_input("메인페이 승인번호 4자리", key=f"{key_prefix}_card", max_chars=4)
+    else:
+        split_card = None
+        st.session_state.pop(f"{key_prefix}_card", None)
+
+    # 온누리상품권 승인번호
+    is_onnuri_split = split_method and "온누리" in str(split_method)
+    if is_onnuri_split:
+        split_onnuri = st.text_input("온누리 승인번호 뒤 4자리 (대표 1건)", key=f"{key_prefix}_onnuri", max_chars=4)
+    else:
+        split_onnuri = None
+        st.session_state.pop(f"{key_prefix}_onnuri", None)
+
+    st.markdown("**주문별 배분 금액 입력**")
+    st.caption("각 주문에 배분할 금액을 입력하세요. 합계가 실제 수령 금액과 일치해야 합니다.")
+
+    alloc_keys = {}
+    for _, orow in orders_df.iterrows():
+        oid = int(orow["id"])
+        bal = float(orow.get("balance") or 0)
+        cat = str(orow.get("category") or "-")
+        od = orow.get("order_date", "")
+        od_str = str(od)[:10] if od else "-"
+        ak = f"{key_prefix}_alloc_{oid}"
+        if ak not in st.session_state:
+            st.session_state[ak] = _format_number_comma(str(int(bal)))
+        alloc_keys[oid] = ak
+        col_info, col_input = st.columns([2, 1])
+        with col_info:
+            st.write(f"주문 #{oid} | {cat} | {od_str} | 잔금 **{bal:,.0f}원**")
+        with col_input:
+            st.text_input(
+                f"배분 금액",
+                key=ak,
+                label_visibility="collapsed",
+                on_change=lambda k=ak: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))),
+            )
+
+    # 합계 검증
+    alloc_total = sum(_parse_comma_to_int(st.session_state.get(ak, "0")) for ak in alloc_keys.values())
+    if alloc_total > 0:
+        st.info(f"배분 합계: **{alloc_total:,.0f}원**")
+
+    split_reason = st.text_area("처리 사유 (필수, 5자 이상)", key=f"{key_prefix}_reason", placeholder="예: 온누리상품권 100만원 단일 결제 — 70만/30만 분배")
+
+    if st.button("분배 결제 일괄 등록", key=f"{key_prefix}_btn", type="primary"):
+        if not split_reason or len(split_reason.strip()) < 5:
+            st.warning("사유를 5자 이상 입력하세요.")
+            return
+        if alloc_total <= 0:
+            st.warning("배분 금액을 1원 이상 입력하세요.")
+            return
+
+        errors = []
+        success_count = 0
+        pay_date_str = split_date.isoformat() if hasattr(split_date, "isoformat") else date.today().isoformat()
+
+        for oid, ak in alloc_keys.items():
+            alloc_amt = _parse_comma_to_int(st.session_state.get(ak, "0"))
+            if alloc_amt <= 0:
+                continue
+            orow_match = orders_df[orders_df["id"] == oid]
+            if orow_match.empty:
+                continue
+            bal = float(orow_match.iloc[0].get("balance") or 0)
+            fee = _payment_fee_amount(split_method, alloc_amt)
+            onnuri_code = split_onnuri if is_onnuri_split else None
+            try:
+                if _supabase_orders_payments_available():
+                    old_paid, _ = _sum_payments_by_order_supabase(db_filename, oid)
+                    _insert_payment_supabase(db_filename, {
+                        "order_id": oid,
+                        "payment_date": pay_date_str,
+                        "amount": alloc_amt,
+                        "payment_method": split_method or None,
+                        "card_company": split_card,
+                        "fee_amount": fee,
+                        "onnuri_approval_code": onnuri_code,
+                        "created_by": _current_username(),
+                    })
+                    _recalc_order_actual_margin_supabase(db_filename, oid)
+                    new_paid = old_paid + alloc_amt
+                    cid_ph = _get_order_customer_id_supabase(db_filename, oid)
+                    cname_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
+                    _insert_payment_history(
+                        None, oid, cname_ph, "분배결제(복수주문)",
+                        {"order_id": oid, "balance_before": bal, "paid_total_before": old_paid},
+                        {"order_id": oid, "added_amount": alloc_amt, "method": split_method, "balance_after": bal - alloc_amt, "paid_total_after": new_paid},
+                        split_reason, db_filename=db_filename,
+                    )
+                else:
+                    conn = get_tenant_conn(db_filename)
+                    old_paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id=?", (oid,)).fetchone()[0] or 0
+                    conn.execute(
+                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,datetime('now'))",
+                        (oid, pay_date_str, alloc_amt, split_method or None, split_card, fee, onnuri_code, _current_username()),
+                    )
+                    _recalc_order_actual_margin(conn, oid, db_filename)
+                    conn.commit()
+                    conn.close()
+                success_count += 1
+            except Exception as e:
+                errors.append(f"주문 #{oid}: {e}")
+
+        clear_data_cache()
+        if errors:
+            for err in errors:
+                st.error(err)
+        if success_count > 0:
+            st.toast(f"✅ {success_count}건 분배 결제 등록 완료!", icon="✅")
+            st.rerun()
+
+
 @st.fragment
 def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float, key_prefix: str = "pay"):
     """잔금 완납 처리(결제 추가) 공통 UI. 직원도 사용 가능하되, 모든 변경은 PaymentHistory에 기록."""
@@ -8320,6 +8459,13 @@ def render_customer_balance():
                     if len(orders_with_balance) == 0:
                         st.info("잔금이 있는 주문이 없습니다.")
                     else:
+                        # 복수 주문 분배 결제 UI (잔금 있는 주문 2건 이상일 때)
+                        if len(orders_with_balance) >= 2:
+                            with st.expander("💳 복수 주문 분배 결제 (한 번의 결제로 여러 주문에 배분)", expanded=False):
+                                _multi_order_split_payment_ui(db_filename, orders_with_balance.reset_index(drop=True), key_prefix=f"split_{selected_cid}")
+
+                        st.markdown("---")
+                        st.caption("개별 주문 단건 결제")
                         for _, orow in orders_with_balance.iterrows():
                             oid = orow["id"]
                             bal = float(orow["balance"] or 0)
