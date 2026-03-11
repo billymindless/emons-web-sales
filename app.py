@@ -5423,10 +5423,49 @@ def render_monthly_payment_report(is_superadmin: bool):
 
                 st.dataframe(_audit_show, use_container_width=True, hide_index=True)
 
-                # 엑셀 다운로드 (감사 내역)
+                # 엑셀 다운로드 (감사 내역) — 고객명 포함
                 _abuf = io.BytesIO()
                 _audit_excel = _audit_show.copy()
                 _audit_excel["금액"] = _audit_excel["금액"].str.replace(",", "", regex=False)
+
+                # order_id → 고객명 매핑 (엑셀 전용, 화면 표시 로직 무관)
+                # _audit_df에 order_id와 _db_fn이 있으므로, 인덱스로 정렬해 고객명 조회
+                _oid_to_cname: dict = {}
+                try:
+                    _sc_a, _ = get_supabase_client()
+                    if _sc_a and "order_id" in _audit_df.columns:
+                        _db_fn_col = "_db_fn" if "_db_fn" in _audit_df.columns else None
+                        _db_fn_groups = _audit_df[_db_fn_col].dropna().unique().tolist() if _db_fn_col else [db_fn]
+                        for _a_fn in _db_fn_groups:
+                            if _db_fn_col:
+                                _a_oids = _audit_df.loc[_audit_df[_db_fn_col] == _a_fn, "order_id"].dropna().astype(int).unique().tolist()
+                            else:
+                                _a_oids = _audit_df["order_id"].dropna().astype(int).unique().tolist()
+                            if not _a_oids:
+                                continue
+                            _a_cid_map: dict = {}
+                            for _a_chunk in [_a_oids[i:i+100] for i in range(0, len(_a_oids), 100)]:
+                                _a_r = _sc_a.table("app_orders").select("id, customer_id").eq("db_filename", _a_fn).in_("id", _a_chunk).execute()
+                                for _a_row in (_a_r.data or []):
+                                    _a_cid_map[_a_row["id"]] = _a_row.get("customer_id")
+                            _a_cids = [v for v in _a_cid_map.values() if v is not None]
+                            if not _a_cids:
+                                continue
+                            _a_cust_map = _get_customers_by_ids_supabase(str(_a_fn), list(set(int(c) for c in _a_cids)))
+                            for _a_oid in _a_oids:
+                                _a_cid = _a_cid_map.get(_a_oid)
+                                if _a_cid is not None:
+                                    _oid_to_cname[_a_oid] = (_a_cust_map.get(int(_a_cid)) or {}).get("name", "")
+                except Exception:
+                    pass  # 고객명 조회 실패 시 빈 칸 유지 (다운로드는 정상 동작)
+
+                # _audit_df 인덱스 기준으로 고객명 컬럼 생성 후 _audit_excel에 병합
+                if "order_id" in _audit_df.columns and _oid_to_cname:
+                    _cname_series = _audit_df["order_id"].apply(
+                        lambda oid: _oid_to_cname.get(int(oid), "") if pd.notna(oid) else ""
+                    ).reindex(_audit_excel.index, fill_value="")
+                    _audit_excel.insert(0, "고객명", _cname_series.values)
+
                 with pd.ExcelWriter(_abuf, engine="openpyxl") as _wr:
                     _audit_excel.to_excel(_wr, sheet_name="결제감사내역", index=False)
                 _abuf.seek(0)
