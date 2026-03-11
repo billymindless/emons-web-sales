@@ -7228,11 +7228,14 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
     st.metric("전체 주문 합산 잔금", f"{total_balance:,.0f}원")
 
     # 결제 수단 / 날짜
+    _split_date_key = f"{key_prefix}_date"
+    if _split_date_key not in st.session_state:
+        st.session_state[_split_date_key] = date.today()
     col_m, col_d = st.columns(2)
     with col_m:
         split_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
     with col_d:
-        split_date = st.date_input("결제 날짜 *", value=date.today(), key=f"{key_prefix}_date")
+        split_date = st.date_input("결제 날짜 *", key=_split_date_key)
 
     # 카드사 / 메인페이
     _CARD_WITH_COMPANY_SPLIT = ("신용카드", "체크카드")
@@ -7360,8 +7363,11 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
     amt_key = f"{key_prefix}_amt"
     if amt_key not in st.session_state:
         st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
+    _pay_date_key = f"{key_prefix}_pay_date"
+    if _pay_date_key not in st.session_state:
+        st.session_state[_pay_date_key] = date.today()
     st.caption("잔금 완납 처리 (결제 추가)")
-    add_pay_date = st.date_input("결제 날짜 *", value=date.today(), key=f"{key_prefix}_pay_date")
+    add_pay_date = st.date_input("결제 날짜 *", key=_pay_date_key)
     add_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
     if add_method in _CARD_WITH_COMPANY:
         add_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
@@ -8492,10 +8498,12 @@ def render_customer_balance():
                                                             _cur_pay_date_val = pd.to_datetime(_cur_pay_date).date() if _cur_pay_date else date.today()
                                                         except Exception:
                                                             _cur_pay_date_val = date.today()
+                                                        _edit_date_key = f"pay_edit_date_{prow['id']}"
+                                                        if _edit_date_key not in st.session_state:
+                                                            st.session_state[_edit_date_key] = _cur_pay_date_val
                                                         new_pay_date = st.date_input(
                                                             "결제 날짜 *",
-                                                            value=_cur_pay_date_val,
-                                                            key=f"pay_edit_date_{prow['id']}",
+                                                            key=_edit_date_key,
                                                         )
                                                         _pay_amt_key = f"pay_edit_amt_{prow['id']}"
                                                         if _pay_amt_key not in st.session_state:
