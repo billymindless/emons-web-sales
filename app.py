@@ -8920,6 +8920,11 @@ def render_dashboard():
     # 2) 고객(app_customers) / 매출(sales) / To-Do
     customers = load_customers_cached(db_filename, limit=None)
     sales_df = load_sales_cached(db_filename, limit=None)
+    # ── 매장 격리 방어 필터: sales_tenant_column 미설정 시 order_id로 2차 필터 ──
+    # (sales 테이블에 db_filename 컬럼이 없거나 secrets 미설정일 때 전 매장 데이터가 섞이는 것을 방지)
+    if not sales_df.empty and not orders.empty and "order_id" in sales_df.columns and _sales_tenant_column() is None:
+        _valid_oids = set(orders["id"].dropna().astype(int).tolist())
+        sales_df = sales_df[sales_df["order_id"].isin(_valid_oids)].copy()
     if payments.empty:
         payments = pd.DataFrame(columns=["order_id", "amount"])
     else:
