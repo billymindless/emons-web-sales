@@ -2927,9 +2927,35 @@ def _fetch_pending_delete_requests(db_filename: str) -> list:
         return []
 
 
-def _resolve_delete_request(request_id: int, action: str, reviewed_by: str, reject_reason: str = ""):
+def _fetch_recent_resolved_delete_requests(db_filename: str) -> list:
+    """최근 처리 완료된 삭제 요청 목록 조회 (승인·반려 포함, 최근 20건)."""
+    if not _supabase_orders_payments_available() or not db_filename:
+        return []
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return []
+        username = _current_username()
+        r = (
+            sc.table("app_edit_requests")
+            .select("id, created_at, reviewed_at, entity_id, requested_by, reason, status, reviewed_by")
+            .eq("db_filename", db_filename)
+            .eq("notif_type", "delete_request")
+            .eq("target_username", username)
+            .in_("status", ["approved", "rejected"])
+            .order("reviewed_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _resolve_delete_request(request_id: int, action: str, reviewed_by: str, reject_reason: str = "", order_id: int | None = None, db_filename: str | None = None):
     """삭제 요청을 승인(approved) 또는 반려(rejected) 처리.
     action: 'approved' | 'rejected'
+    order_id + db_filename 을 함께 넘기면 동일 주문의 다른 관리자 레코드도 일괄 처리.
     """
     try:
         sc, err = get_supabase_client()
@@ -2942,7 +2968,14 @@ def _resolve_delete_request(request_id: int, action: str, reviewed_by: str, reje
         }
         if action == "rejected" and reject_reason:
             update_payload["reason"] = reject_reason
+        # 1) 특정 레코드 업데이트
         sc.table("app_edit_requests").update(update_payload).eq("id", request_id).execute()
+        # 2) 같은 주문의 다른 관리자 레코드도 일괄 처리 (중복 표시 방지)
+        if order_id is not None and db_filename:
+            try:
+                sc.table("app_edit_requests").update(update_payload).eq("db_filename", db_filename).eq("entity_id", int(order_id)).eq("notif_type", "delete_request").eq("status", "pending").execute()
+            except Exception:
+                pass
         return True, None
     except Exception as e:
         return False, str(e)
@@ -2978,50 +3011,85 @@ def _render_admin_delete_requests(db_filename: str):
     st.header("🗑️ 주문 삭제 요청 관리")
     st.caption("직원이 보낸 주문 삭제 요청을 검토하고 승인 또는 반려합니다. 승인 시 주문과 결제 데이터가 영구 삭제됩니다.")
 
+    reviewed_by = _current_username()
+
+    # ── 대기 중인 요청 ──
     requests_list = _fetch_pending_delete_requests(db_filename)
 
     if not requests_list:
         st.info("현재 처리 대기 중인 삭제 요청이 없습니다.")
-        return
+    else:
+        st.markdown(f"**⏳ 대기 중인 삭제 요청: {len(requests_list)}건**")
+        for req in requests_list:
+            req_id = req.get("id")
+            order_id = req.get("entity_id")
+            requester = req.get("requested_by", "알 수 없음")
+            reason = req.get("reason", "")
+            created = str(req.get("created_at", ""))[:16].replace("T", " ")
 
-    st.markdown(f"**대기 중인 삭제 요청: {len(requests_list)}건**")
-    reviewed_by = _current_username()
+            with st.container(border=True):
+                col_info, col_btns = st.columns([3, 2])
+                with col_info:
+                    st.markdown(f"**주문 #{order_id}** 삭제 요청")
+                    st.caption(f"요청자: `{requester}` | 요청일시: {created}")
+                    st.write(f"삭제 사유: {reason or '(사유 없음)'}")
+                with col_btns:
+                    approve_key = f"del_approve_{req_id}"
+                    reject_key = f"del_reject_{req_id}"
+                    reject_reason_key = f"del_reject_reason_{req_id}"
 
-    for req in requests_list:
-        req_id = req.get("id")
-        order_id = req.get("entity_id")
-        requester = req.get("requested_by", "알 수 없음")
-        reason = req.get("reason", "")
-        created = str(req.get("created_at", ""))[:16].replace("T", " ")
+                    if st.button("✅ 승인 (삭제 실행)", key=approve_key, type="primary"):
+                        ok, del_err = _approve_delete_order(db_filename, order_id)
+                        if ok:
+                            _resolve_delete_request(req_id, "approved", reviewed_by, order_id=order_id, db_filename=db_filename)
+                            st.success(f"✅ 주문 #{order_id} 삭제가 완료되었습니다.")
+                            st.session_state[f"_del_done_{req_id}"] = order_id
+                        else:
+                            st.error(f"삭제 실패: {del_err}")
+                            st.stop()
 
-        with st.container(border=True):
-            col_info, col_btns = st.columns([3, 2])
-            with col_info:
-                st.markdown(f"**주문 #{order_id}** 삭제 요청")
-                st.caption(f"요청자: `{requester}` | 요청일시: {created}")
-                st.write(f"삭제 사유: {reason or '(사유 없음)'}")
-            with col_btns:
-                approve_key = f"del_approve_{req_id}"
-                reject_key = f"del_reject_{req_id}"
-                reject_reason_key = f"del_reject_reason_{req_id}"
+                    reject_reason_val = st.text_input("반려 사유 (선택)", key=reject_reason_key, placeholder="반려 이유를 입력하세요")
+                    if st.button("❌ 반려", key=reject_key):
+                        ok, rej_err = _resolve_delete_request(req_id, "rejected", reviewed_by, reject_reason_val, order_id=order_id, db_filename=db_filename)
+                        if ok:
+                            st.warning(f"주문 #{order_id} 삭제 요청이 반려되었습니다.")
+                            st.session_state[f"_del_rejected_{req_id}"] = order_id
+                        else:
+                            st.error(f"반려 처리 실패: {rej_err}")
 
-                if st.button("✅ 승인 (삭제 실행)", key=approve_key, type="primary"):
-                    ok, del_err = _approve_delete_order(db_filename, order_id)
-                    if ok:
-                        _resolve_delete_request(req_id, "approved", reviewed_by)
-                        st.success(f"주문 #{order_id}이(가) 삭제되었습니다.")
-                        st.rerun()
-                    else:
-                        st.error(f"삭제 실패: {del_err}")
+    st.divider()
 
-                reject_reason_val = st.text_input("반려 사유 (선택)", key=reject_reason_key, placeholder="반려 이유를 입력하세요")
-                if st.button("❌ 반려", key=reject_key):
-                    ok, rej_err = _resolve_delete_request(req_id, "rejected", reviewed_by, reject_reason_val)
-                    if ok:
-                        st.warning(f"주문 #{order_id} 삭제 요청이 반려되었습니다.")
-                        st.rerun()
-                    else:
-                        st.error(f"반려 처리 실패: {rej_err}")
+    # ── 최근 처리 완료 내역 ──
+    st.markdown("#### 📋 최근 처리 완료 내역")
+    resolved_list = _fetch_recent_resolved_delete_requests(db_filename)
+    if not resolved_list:
+        st.caption("최근 처리된 삭제 요청이 없습니다.")
+    else:
+        for res in resolved_list:
+            r_order_id = res.get("entity_id")
+            r_requester = res.get("requested_by", "알 수 없음")
+            r_reason = res.get("reason", "")
+            r_status = res.get("status", "")
+            r_reviewed_by = res.get("reviewed_by", "")
+            r_reviewed_at = str(res.get("reviewed_at") or "")[:16].replace("T", " ")
+            r_created = str(res.get("created_at", ""))[:16].replace("T", " ")
+
+            if r_status == "approved":
+                badge = "✅ 삭제 완료"
+                render_fn = st.success
+            else:
+                badge = "❌ 반려됨"
+                render_fn = st.warning
+
+            render_fn(
+                f"**{badge}** — 주문 #{r_order_id}  \n"
+                f"요청자: `{r_requester}` | 요청일시: {r_created}  \n"
+                f"처리자: `{r_reviewed_by}` | 처리일시: {r_reviewed_at}  \n"
+                f"사유: {r_reason or '(없음)'}"
+            )
+
+    if st.button("🔄 새로고침", key="del_req_refresh_btn"):
+        st.rerun()
 
 
 def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_file):
