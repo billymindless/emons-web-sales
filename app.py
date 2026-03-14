@@ -2862,6 +2862,162 @@ def _render_admin_fraud_alerts(db_filename: str):
         st.divider()
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 주문 삭제 요청 시스템 (직원 → 관리자 2단계 승인)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _insert_delete_request(db_filename: str, order_id: int, reason: str, requested_by_username: str):
+    """직원이 요청한 주문 삭제를 app_edit_requests에 기록 (notif_type='delete_request').
+    해당 매장의 store_admin + superadmin 모두에게 알림을 보낸다.
+    """
+    if not _supabase_orders_payments_available() or not db_filename:
+        return False, "Supabase 연결 오류"
+    admin_usernames = _get_admin_usernames_for_store(db_filename)
+    if not admin_usernames:
+        return False, "관리자를 찾을 수 없습니다"
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return False, str(err)
+        for admin_uname in admin_usernames:
+            sc.table("app_edit_requests").insert({
+                "db_filename": db_filename,
+                "entity_type": "Order",
+                "entity_id": int(order_id),
+                "requested_by": requested_by_username or "",
+                "target_username": admin_uname,
+                "notif_type": "delete_request",
+                "payload": f"주문 #{order_id} 삭제 요청",
+                "reason": reason.strip(),
+                "status": "pending",
+            }).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _fetch_pending_delete_requests(db_filename: str) -> list:
+    """해당 매장의 미처리 삭제 요청 목록 조회 (관리자용)."""
+    if not _supabase_orders_payments_available() or not db_filename:
+        return []
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return []
+        username = _current_username()
+        r = (
+            sc.table("app_edit_requests")
+            .select("id, created_at, entity_id, requested_by, reason, status")
+            .eq("db_filename", db_filename)
+            .eq("notif_type", "delete_request")
+            .eq("target_username", username)
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _resolve_delete_request(request_id: int, action: str, reviewed_by: str, reject_reason: str = ""):
+    """삭제 요청을 승인(approved) 또는 반려(rejected) 처리.
+    action: 'approved' | 'rejected'
+    """
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return False, str(err)
+        update_payload = {
+            "status": action,
+            "reviewed_by": reviewed_by,
+            "reviewed_at": datetime.now(tz=KST).isoformat(),
+        }
+        if action == "rejected" and reject_reason:
+            update_payload["reason"] = reject_reason
+        sc.table("app_edit_requests").update(update_payload).eq("id", request_id).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
+    """주문 및 연관 결제 데이터를 실제로 삭제한다 (관리자 승인 후 호출).
+    반환: (성공여부: bool, 오류메시지: str | None)
+    """
+    try:
+        if _supabase_orders_payments_available():
+            sc, err = get_supabase_client()
+            if err or not sc:
+                return False, str(err)
+            sc.table("app_payments").delete().eq("order_id", int(order_id)).eq("db_filename", db_filename).execute()
+            sc.table("app_orders").delete().eq("id", int(order_id)).eq("db_filename", db_filename).execute()
+        else:
+            conn = get_tenant_conn(db_filename)
+            try:
+                conn.execute("DELETE FROM Payments WHERE order_id = ?", (int(order_id),))
+                conn.execute("DELETE FROM Orders WHERE id = ?", (int(order_id),))
+                conn.commit()
+            finally:
+                conn.close()
+        clear_data_cache()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _render_admin_delete_requests(db_filename: str):
+    """관리자 전용: 직원이 보낸 주문 삭제 요청 목록을 표시하고 승인/반려 처리."""
+    st.header("🗑️ 주문 삭제 요청 관리")
+    st.caption("직원이 보낸 주문 삭제 요청을 검토하고 승인 또는 반려합니다. 승인 시 주문과 결제 데이터가 영구 삭제됩니다.")
+
+    requests_list = _fetch_pending_delete_requests(db_filename)
+
+    if not requests_list:
+        st.info("현재 처리 대기 중인 삭제 요청이 없습니다.")
+        return
+
+    st.markdown(f"**대기 중인 삭제 요청: {len(requests_list)}건**")
+    reviewed_by = _current_username()
+
+    for req in requests_list:
+        req_id = req.get("id")
+        order_id = req.get("entity_id")
+        requester = req.get("requested_by", "알 수 없음")
+        reason = req.get("reason", "")
+        created = str(req.get("created_at", ""))[:16].replace("T", " ")
+
+        with st.container(border=True):
+            col_info, col_btns = st.columns([3, 2])
+            with col_info:
+                st.markdown(f"**주문 #{order_id}** 삭제 요청")
+                st.caption(f"요청자: `{requester}` | 요청일시: {created}")
+                st.write(f"삭제 사유: {reason or '(사유 없음)'}")
+            with col_btns:
+                approve_key = f"del_approve_{req_id}"
+                reject_key = f"del_reject_{req_id}"
+                reject_reason_key = f"del_reject_reason_{req_id}"
+
+                if st.button("✅ 승인 (삭제 실행)", key=approve_key, type="primary"):
+                    ok, del_err = _approve_delete_order(db_filename, order_id)
+                    if ok:
+                        _resolve_delete_request(req_id, "approved", reviewed_by)
+                        st.success(f"주문 #{order_id}이(가) 삭제되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"삭제 실패: {del_err}")
+
+                reject_reason_val = st.text_input("반려 사유 (선택)", key=reject_reason_key, placeholder="반려 이유를 입력하세요")
+                if st.button("❌ 반려", key=reject_key):
+                    ok, rej_err = _resolve_delete_request(req_id, "rejected", reviewed_by, reject_reason_val)
+                    if ok:
+                        st.warning(f"주문 #{order_id} 삭제 요청이 반려되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"반려 처리 실패: {rej_err}")
+
+
 def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_file):
     """온누리 등 결제 영수증 파일을 RECEIPT_DIR에 저장하고 PaymentReceipts에 경로 기록."""
     if uploaded_file is None:
@@ -6538,6 +6694,219 @@ def _render_address_section_fragment():
     _address_section_impl()
 
 
+def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
+    """위약금 / 직원구매 전용 간편 등록 폼."""
+    tab_penalty, tab_emp = st.tabs(["💸 위약금 등록", "🛒 직원 구매 등록"])
+
+    # ── 위약금 등록 ──
+    with tab_penalty:
+        st.caption("계약 취소 시 수령한 위약금을 별도 주문으로 등록합니다. 원가는 0원으로 처리됩니다.")
+        p_col1, p_col2 = st.columns(2)
+        with p_col1:
+            p_cust_name = st.text_input("고객 이름 *", key="sp_penalty_name")
+            p_cust_phone = st.text_input("연락처", key="sp_penalty_phone", placeholder="010-0000-0000")
+        with p_col2:
+            p_date = st.date_input("계약일 *", value=date.today(), key="sp_penalty_date")
+            p_amount = st.text_input(
+                "위약금 금액 *", key="sp_penalty_amount",
+                on_change=lambda: st.session_state.__setitem__(
+                    "sp_penalty_amount",
+                    _format_number_comma(st.session_state.get("sp_penalty_amount", ""))
+                )
+            )
+        p_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key="sp_penalty_method")
+        if p_method in _CARD_WITH_COMPANY:
+            p_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key="sp_penalty_card")
+        elif p_method == "메인페이":
+            p_card = st.text_input("메인페이 승인번호 4자리", key="sp_penalty_card", max_chars=4)
+        elif p_method == "지역화폐":
+            p_card = st.text_input("지역화폐 승인번호", key="sp_penalty_card")
+        else:
+            p_card = None
+        p_reason = st.text_area("위약금 사유 *", key="sp_penalty_reason", placeholder="예) 계약 취소 위약금, 고객 변심으로 인한 계약 철회")
+        p_emp_names = []
+        if not employees.empty:
+            p_emp_sel = st.multiselect("담당 직원", options=employees["name"].tolist(), key="sp_penalty_emp")
+            p_emp_names = p_emp_sel
+        if st.button("💸 위약금 등록", key="sp_penalty_btn", type="primary"):
+            p_amt_int = _parse_comma_to_int(st.session_state.get("sp_penalty_amount", "0"))
+            if not p_cust_name.strip():
+                st.error("고객 이름을 입력해 주세요.")
+            elif p_amt_int <= 0:
+                st.error("위약금 금액을 입력해 주세요.")
+            elif not p_reason.strip():
+                st.error("위약금 사유를 입력해 주세요.")
+            else:
+                try:
+                    emp_str = ",".join(p_emp_names) if p_emp_names else None
+                    fee = _payment_fee_amount(p_method, p_amt_int)
+                    p_date_str = p_date.isoformat()
+                    if _supabase_orders_payments_available():
+                        cid, cid_err = _supabase_insert_customer(db_filename, p_cust_name.strip(), p_cust_phone.strip() or "", None, None)
+                        if cid is None:
+                            st.error(f"고객 등록 실패: {cid_err}")
+                        else:
+                            oid = _insert_order_supabase(db_filename, {
+                                "customer_id": cid,
+                                "employee_names": emp_str,
+                                "order_date": p_date_str,
+                                "delivery_date": p_date_str,
+                                "category": "위약금",
+                                "cost_price": 0,
+                                "total_amount": p_amt_int,
+                                "balance_status": "미납",
+                                "visit_reason": p_reason.strip(),
+                                "purchase_reason": "위약금",
+                            })
+                            if oid:
+                                _insert_payment_supabase(db_filename, {
+                                    "order_id": oid,
+                                    "payment_date": p_date_str,
+                                    "amount": p_amt_int,
+                                    "payment_method": p_method or None,
+                                    "card_company": p_card,
+                                    "fee_amount": fee,
+                                    "created_by": _current_username(),
+                                })
+                                _recalc_order_actual_margin_supabase(db_filename, oid)
+                                clear_data_cache()
+                                st.success(f"✅ 위약금 {p_amt_int:,}원 등록 완료! (주문 #{oid})")
+                                for k in ["sp_penalty_name", "sp_penalty_phone", "sp_penalty_amount", "sp_penalty_reason", "sp_penalty_card"]:
+                                    st.session_state.pop(k, None)
+                                st.rerun()
+                            else:
+                                st.error("주문 등록에 실패했습니다.")
+                    else:
+                        conn = get_tenant_conn(db_filename)
+                        try:
+                            conn.execute(
+                                "INSERT INTO Customers (name, phone1) VALUES (?, ?)",
+                                (p_cust_name.strip(), p_cust_phone.strip() or ""),
+                            )
+                            cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                            conn.execute(
+                                "INSERT INTO Orders (customer_id, employee_names, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, balance_status) VALUES (?,?,?,?,?,0,?,?,?,?)",
+                                (cid, emp_str, p_date_str, p_date_str, "위약금", p_amt_int, p_reason.strip(), "위약금", "미납"),
+                            )
+                            oid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                            conn.execute(
+                                "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, created_by, created_at) VALUES (?,?,?,?,?,?,?,datetime('now', '+9 hours'))",
+                                (oid, p_date_str, p_amt_int, p_method or None, p_card, fee, _current_username()),
+                            )
+                            _recalc_order_actual_margin(conn, oid, db_filename)
+                            conn.commit()
+                            clear_data_cache()
+                            st.success(f"✅ 위약금 {p_amt_int:,}원 등록 완료!")
+                            for k in ["sp_penalty_name", "sp_penalty_phone", "sp_penalty_amount", "sp_penalty_reason", "sp_penalty_card"]:
+                                st.session_state.pop(k, None)
+                            st.rerun()
+                        finally:
+                            conn.close()
+                except Exception as e:
+                    st.error(f"등록 오류: {e}")
+
+    # ── 직원 구매 등록 ──
+    with tab_emp:
+        st.caption("직원 구매는 매출로 계상되지 않습니다. 판매가 = 원가로 등록되어 마진 0원으로 기록됩니다.")
+        e_col1, e_col2 = st.columns(2)
+        with e_col1:
+            e_emp_sel = None
+            if not employees.empty:
+                e_emp_sel = st.selectbox("구매 직원 *", options=employees["name"].tolist(), key="sp_emp_buyer")
+            e_date = st.date_input("구매일 *", value=date.today(), key="sp_emp_date")
+        with e_col2:
+            e_category = st.selectbox("품목", options=["옷장", "식탁", "자녀방", "침대", "SSDS침대", "서재_학생", "소파", "소품", "전시품", "기타"], key="sp_emp_category")
+            e_cost = st.text_input(
+                "원가(구매가) *", key="sp_emp_cost",
+                on_change=lambda: st.session_state.__setitem__(
+                    "sp_emp_cost",
+                    _format_number_comma(st.session_state.get("sp_emp_cost", ""))
+                )
+            )
+        e_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key="sp_emp_method")
+        if e_method in _CARD_WITH_COMPANY:
+            e_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key="sp_emp_card")
+        elif e_method == "메인페이":
+            e_card = st.text_input("메인페이 승인번호 4자리", key="sp_emp_card", max_chars=4)
+        elif e_method == "지역화폐":
+            e_card = st.text_input("지역화폐 승인번호", key="sp_emp_card")
+        else:
+            e_card = None
+        if st.button("🛒 직원 구매 등록", key="sp_emp_btn", type="primary"):
+            e_cost_int = _parse_comma_to_int(st.session_state.get("sp_emp_cost", "0"))
+            if not e_emp_sel:
+                st.error("구매 직원을 선택해 주세요.")
+            elif e_cost_int <= 0:
+                st.error("원가(구매가)를 입력해 주세요.")
+            else:
+                try:
+                    e_date_str = e_date.isoformat()
+                    fee = _payment_fee_amount(e_method, e_cost_int)
+                    if _supabase_orders_payments_available():
+                        cid, cid_err = _supabase_insert_customer(db_filename, f"[직원]{e_emp_sel}", "", None, None)
+                        if cid is None:
+                            st.error(f"등록 실패: {cid_err}")
+                        else:
+                            oid = _insert_order_supabase(db_filename, {
+                                "customer_id": cid,
+                                "employee_names": e_emp_sel,
+                                "order_date": e_date_str,
+                                "delivery_date": e_date_str,
+                                "category": f"직원구매_{e_category}",
+                                "cost_price": e_cost_int,
+                                "total_amount": e_cost_int,
+                                "balance_status": "미납",
+                                "visit_reason": "직원구매",
+                                "purchase_reason": "직원구매",
+                            })
+                            if oid:
+                                _insert_payment_supabase(db_filename, {
+                                    "order_id": oid,
+                                    "payment_date": e_date_str,
+                                    "amount": e_cost_int,
+                                    "payment_method": e_method or None,
+                                    "card_company": e_card,
+                                    "fee_amount": fee,
+                                    "created_by": _current_username(),
+                                })
+                                _recalc_order_actual_margin_supabase(db_filename, oid)
+                                clear_data_cache()
+                                st.success(f"✅ 직원 구매 {e_cost_int:,}원 등록 완료! (주문 #{oid})")
+                                for k in ["sp_emp_cost", "sp_emp_card"]:
+                                    st.session_state.pop(k, None)
+                                st.rerun()
+                            else:
+                                st.error("주문 등록에 실패했습니다.")
+                    else:
+                        conn = get_tenant_conn(db_filename)
+                        try:
+                            conn.execute(
+                                "INSERT INTO Customers (name, phone1) VALUES (?, ?)",
+                                (f"[직원]{e_emp_sel}", ""),
+                            )
+                            cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                            conn.execute(
+                                "INSERT INTO Orders (customer_id, employee_names, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, balance_status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                (cid, e_emp_sel, e_date_str, e_date_str, f"직원구매_{e_category}", e_cost_int, e_cost_int, "직원구매", "직원구매", "미납"),
+                            )
+                            oid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                            conn.execute(
+                                "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, created_by, created_at) VALUES (?,?,?,?,?,?,?,datetime('now', '+9 hours'))",
+                                (oid, e_date_str, e_cost_int, e_method or None, e_card, fee, _current_username()),
+                            )
+                            _recalc_order_actual_margin(conn, oid, db_filename)
+                            conn.commit()
+                            clear_data_cache()
+                            st.success(f"✅ 직원 구매 {e_cost_int:,}원 등록 완료!")
+                            for k in ["sp_emp_cost", "sp_emp_card"]:
+                                st.session_state.pop(k, None)
+                            st.rerun()
+                        finally:
+                            conn.close()
+                except Exception as e:
+                    st.error(f"등록 오류: {e}")
+
+
 @st.fragment
 def render_new_sales():
     db_filename = st.session_state.get("current_db")
@@ -6579,6 +6948,12 @@ def render_new_sales():
                 st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
             finally:
                 conn.close()
+    # ── 특수 등록 (위약금 / 직원구매) ──
+    with st.expander("⚡ 특수 등록 (위약금 / 직원 구매)", expanded=False):
+        _render_special_order_form(db_filename, employees)
+
+    st.divider()
+
     # 고객 선택: 기본 모드 = 신규 고객 등록, [기존 고객 검색] 버튼으로 검색 패널 열기
     if "_cust_search_panel_open" not in st.session_state:
         st.session_state["_cust_search_panel_open"] = False
@@ -7382,6 +7757,10 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
         add_card = None
     st.text_input("결제 금액", key=amt_key, on_change=lambda: st.session_state.__setitem__(amt_key, _format_number_comma(st.session_state.get(amt_key, ""))))
     add_amt_int = _parse_comma_to_int(st.session_state.get(amt_key, "0"))
+    # 초과 결제 경고 (입력 차단 없음 — 결변·카드취소 처리 지원)
+    if add_amt_int > 0 and add_amt_int > balance:
+        _over = add_amt_int - max(balance, 0)
+        st.warning(f"⚠️ 입력 금액({add_amt_int:,}원)이 잔금({max(balance,0):,.0f}원)보다 **{_over:,}원 초과**합니다. 결변·카드취소 처리 목적이면 그대로 등록하세요. 초과 금액은 '결제 이상 항목' 탭에 표시됩니다.")
     # 온누리상품권일 때 승인번호/영수증 입력
     is_onnuri = add_method and ("온누리" in str(add_method))
     stage_key = f"{key_prefix}_onnuri_stage"
@@ -8669,9 +9048,12 @@ def render_customer_balance():
                                                                 st.rerun()
 
                     st.subheader("잔금 추가 결제")
+                    st.caption("⚠️ 초과 결제(결제액 > 구매액)도 입력 가능합니다. 초과 건은 '결제 이상 항목' 탭에 자동 표시됩니다.")
                     orders_with_balance = orders[orders["balance"] > 0]
-                    if len(orders_with_balance) == 0:
-                        st.info("잔금이 있는 주문이 없습니다.")
+                    # 초과 결제 입력용: balance ≤ 0인 주문도 선택적으로 결제 추가 가능
+                    orders_overpaid = orders[orders["balance"] <= 0]
+                    if len(orders_with_balance) == 0 and len(orders_overpaid) == 0:
+                        st.info("등록된 주문이 없습니다.")
                     else:
                         # 복수 주문 분배 결제 UI (잔금 있는 주문 2건 이상일 때)
                         if len(orders_with_balance) >= 2:
@@ -8687,6 +9069,56 @@ def render_customer_balance():
                             dlv_str = dlv.strftime("%Y-%m-%d") if hasattr(dlv, "strftime") else str(dlv) if dlv else "-"
                             with st.expander(f"주문 #{oid} | 배송일 {dlv_str} | 잔금 {bal:,.0f}원", expanded=True):
                                 _customer_balance_payment_ui(db_filename, oid, bal, key_prefix=f"gen_pay_{oid}")
+
+                        # 완납/초과 주문에 추가 결제 입력 허용 (결변·취소·위약금 처리용)
+                        if len(orders_overpaid) > 0:
+                            with st.expander(f"🔄 완납·초과 주문 추가 결제 입력 ({len(orders_overpaid)}건) — 결변·취소 처리용", expanded=False):
+                                st.warning("아래 주문은 이미 완납 또는 초과 결제된 상태입니다. 결제 수단 변경(결변)이나 카드 취소 처리 목적으로만 사용하세요. 초과 금액은 '결제 이상 항목' 탭에 자동 표시됩니다.")
+                                for _, orow in orders_overpaid.iterrows():
+                                    oid = orow["id"]
+                                    bal = float(orow["balance"] or 0)
+                                    dlv = orow.get("delivery_date", "")
+                                    dlv_str = dlv.strftime("%Y-%m-%d") if hasattr(dlv, "strftime") else str(dlv) if dlv else "-"
+                                    bal_label = f"초과 {abs(bal):,.0f}원" if bal < 0 else "완납"
+                                    with st.expander(f"주문 #{oid} | 배송일 {dlv_str} | {bal_label}", expanded=False):
+                                        _customer_balance_payment_ui(db_filename, oid, 0, key_prefix=f"gen_pay_over_{oid}")
+
+                    # ── 주문 삭제 요청 (직원 → 관리자 승인) ──
+                    with st.expander("🗑️ 주문 삭제 요청 (관리자 승인 필요)", expanded=False):
+                        st.caption("삭제가 필요한 주문을 선택하고 사유를 입력하면, 매장 관리자에게 승인 요청이 전송됩니다. 관리자 승인 후 실제 삭제가 이루어집니다.")
+                        def _fmt_del_order(oid):
+                            r = orders[orders["id"] == oid]
+                            if r.empty:
+                                return f"주문 #{oid}"
+                            row = r.iloc[0]
+                            od = row.get("order_date", "")
+                            od_str = od.strftime("%Y-%m-%d") if hasattr(od, "strftime") else str(od or "-")[:10]
+                            amt = int(row.get("total_amount") or 0)
+                            return f"주문 #{oid} | 계약일 {od_str} | 금액 {amt:,}원"
+                        del_oid = st.selectbox(
+                            "삭제 요청할 주문",
+                            orders["id"].tolist(),
+                            format_func=_fmt_del_order,
+                            key=f"del_req_oid_{cid}",
+                        )
+                        del_reason = st.text_area(
+                            "삭제 사유 *",
+                            key=f"del_req_reason_{cid}",
+                            placeholder="예) 중복 입력, 고객 취소, 계약 철회 등 구체적인 사유를 입력해 주세요.",
+                            max_chars=300,
+                        )
+                        if st.button("📨 삭제 요청 전송", key=f"del_req_btn_{cid}", type="primary"):
+                            if not del_reason or not del_reason.strip():
+                                st.error("삭제 사유를 입력해 주세요.")
+                            elif not _supabase_orders_payments_available():
+                                st.error("Supabase 환경에서만 삭제 요청을 사용할 수 있습니다.")
+                            else:
+                                _req_by = _current_username()
+                                ok, req_err = _insert_delete_request(db_filename, int(del_oid), del_reason.strip(), _req_by)
+                                if ok:
+                                    st.success(f"주문 #{del_oid} 삭제 요청이 관리자에게 전송되었습니다. 승인 후 삭제됩니다.")
+                                else:
+                                    st.error(f"요청 전송 실패: {req_err}")
 
     # ---------- 탭 2: 다가오는 미수금 (D-10 이내) ----------
     order_cols_d10 = "id, customer_id, order_date, delivery_date, total_amount, cost_price, category, employee_names"
@@ -9548,6 +9980,11 @@ def main():
     if role in ("store_admin", "superadmin"):
         if st.sidebar.button("🚨 결제 변경/취소 모니터링", use_container_width=True):
             st.session_state["active_admin_page"] = "payment_monitor"
+        _del_db = st.session_state.get("current_db")
+        _pending_del_count = len(_fetch_pending_delete_requests(_del_db)) if _del_db else 0
+        _del_btn_label = f"🗑️ 주문 삭제 요청 관리 ({_pending_del_count}건)" if _pending_del_count > 0 else "🗑️ 주문 삭제 요청 관리"
+        if st.sidebar.button(_del_btn_label, use_container_width=True):
+            st.session_state["active_admin_page"] = "delete_requests"
     # 최고 관리자 전용: 직원 계정 관리 및 발령
     if role == "superadmin":
         if st.sidebar.button("👥 직원 관리", use_container_width=True):
@@ -9567,6 +10004,15 @@ def main():
     # 관리자 전용 모니터링 화면 라우팅
     if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "payment_monitor":
         render_payment_history_monitor()
+        return
+
+    # 관리자 전용: 주문 삭제 요청 관리 화면 라우팅
+    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "delete_requests":
+        _del_db = st.session_state.get("current_db")
+        if _del_db:
+            _render_admin_delete_requests(_del_db)
+        else:
+            st.warning("매장 DB 정보를 찾을 수 없습니다.")
         return
 
     # 최고 관리자 전용: 직원 계정 관리 및 발령
