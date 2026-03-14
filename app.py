@@ -16,6 +16,9 @@ import traceback
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+
+KST = ZoneInfo("Asia/Seoul")
 import requests
 import hashlib
 import time
@@ -1309,7 +1312,7 @@ def _insert_admin_alert(store_name: str, alert_type: str, message: str):
         conn = get_master_conn()
         conn.execute(
             "INSERT INTO AdminAlerts (created_at, store_name, alert_type, message, seen) VALUES (?, ?, ?, ?, 0)",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), store_name, alert_type, message)
+            (datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S"), store_name, alert_type, message)
         )
         conn.commit()
         conn.close()
@@ -1637,7 +1640,7 @@ def _ensure_tenant_schema(conn: sqlite3.Connection):
     if "onnuri_approval_code" not in cols:
         conn.execute("ALTER TABLE Payments ADD COLUMN onnuri_approval_code TEXT")
     if "created_at" not in cols:
-        conn.execute("ALTER TABLE Payments ADD COLUMN created_at TEXT DEFAULT (datetime('now'))")
+        conn.execute("ALTER TABLE Payments ADD COLUMN created_at TEXT DEFAULT (datetime('now', '+9 hours'))")
     if "created_by" not in cols:
         conn.execute("ALTER TABLE Payments ADD COLUMN created_by TEXT")
     cur = conn.execute("PRAGMA table_info(Orders)")
@@ -2111,7 +2114,7 @@ def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date:
             "transaction_date": transaction_date,
             "amount": amount,
             "note": note or "",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S"),
         }
         tenant_col = _sales_tenant_column()
         if tenant_col:
@@ -2443,7 +2446,7 @@ def _insert_audit_log(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            datetime.now().isoformat(),
+            datetime.now(tz=KST).isoformat(),
             actor,
             entity_type,
             int(entity_id),
@@ -2607,7 +2610,7 @@ def _check_and_send_fraud_signals(
     if not db_filename:
         return
     try:
-        current_hour = datetime.now().hour
+        current_hour = datetime.now(tz=KST).hour
 
         # ── 규칙 1: 결제 취소 ──
         if action_type == "payment_cancel":
@@ -2888,7 +2891,7 @@ def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_fi
             file_path,
             raw_name,
             _current_username(),
-            datetime.now().isoformat(),
+            datetime.now(tz=KST).isoformat(),
         ),
     )
 
@@ -2926,7 +2929,7 @@ def _insert_payment_history(
             return [_safe_json(v) for v in obj]
         return obj
 
-    now_iso = datetime.now().isoformat()
+    now_iso = datetime.now(tz=KST).isoformat()
     changed_by = _current_username() or "unknown"
     supa_error: str | None = None
     safe_old = _safe_json(old_payment_data or {})
@@ -4759,7 +4762,7 @@ def _superadmin_tab3_notices():
                 conn = get_master_conn()
                 conn.execute(
                     "INSERT INTO Notices (title, content, external_link, message, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
-                    (title.strip(), content.strip(), (external_link.strip() or None), content.strip(), datetime.now().isoformat())
+                    (title.strip(), content.strip(), (external_link.strip() or None), content.strip(), datetime.now(tz=KST).isoformat())
                 )
                 conn.commit()
                 conn.close()
@@ -7102,7 +7105,7 @@ def render_new_sales():
                         onnuri_code = re.sub(r"\\D", "", raw) or None
                     conn.execute("""
                         INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
                     """, (order_id, order_date.isoformat(), amt, method or None, card_company, fee, onnuri_code, _current_username()))
                 actual_margin = basic_margin_save - total_fees
                 conn.execute("UPDATE Orders SET actual_margin = ? WHERE id = ?", (actual_margin, order_id))
@@ -7338,7 +7341,7 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                     conn = get_tenant_conn(db_filename)
                     old_paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id=?", (oid,)).fetchone()[0] or 0
                     conn.execute(
-                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,datetime('now'))",
+                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,datetime('now', '+9 hours'))",
                         (oid, pay_date_str, alloc_amt, split_method or None, split_card, fee, onnuri_code, _current_username()),
                     )
                     _recalc_order_actual_margin(conn, oid, db_filename)
@@ -7495,7 +7498,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
                 new_balance = balance - add_amt_int
                 conn.execute("""
                     INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
                 """, (order_id, pay_date_str, add_amt_int, add_method or None, add_card, fee, onnuri_code, _current_username()))
                 _recalc_order_actual_margin(conn, order_id, db_filename)
                 _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
@@ -8165,7 +8168,7 @@ def render_customer_balance():
                                     if balance_check < 0:
                                         # 감액 동시 처리: _overdue_reduction_plan에 감액 계획이 있으면 실행
                                         if _overdue_reduction_plan:
-                                            today_str_reduce = datetime.now().strftime("%Y-%m-%d")
+                                            today_str_reduce = datetime.now(tz=KST).strftime("%Y-%m-%d")
                                             _reduce_err = None
                                             for _rpid, _new_ramt in _overdue_reduction_plan.items():
                                                 try:
@@ -8199,7 +8202,7 @@ def render_customer_balance():
                                                                 if int(_old_amt_sql) != _new_ramt:
                                                                     _diff_sql = _new_ramt - int(_old_amt_sql)
                                                                     conn.execute(
-                                                                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, fee_amount, created_by, created_at) VALUES (?,?,?,?,0,?,datetime('now'))",
+                                                                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, fee_amount, created_by, created_at) VALUES (?,?,?,?,0,?,datetime('now', '+9 hours'))",
                                                                         (sel_oid, today_str_reduce, _diff_sql, _old_method_sql or None, _current_username()),
                                                                     )
                                                 except Exception as _re:
@@ -8230,7 +8233,7 @@ def render_customer_balance():
                                     if old_total != new_total:
                                         if conn: _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
                                         delta = new_total - old_total
-                                        today_str = datetime.now().strftime("%Y-%m-%d")
+                                        today_str = datetime.now(tz=KST).strftime("%Y-%m-%d")
                                         order_date_val = orow.get("order_date") or today_str
                                         if isinstance(order_date_val, str) and "-" in order_date_val:
                                             parts = order_date_val.split("-")
@@ -8529,7 +8532,7 @@ def render_customer_balance():
                                                                 receipt_path_saved = None
                                                                 if receipt_upload:
                                                                     safe_name = re.sub(r"[^\w\u3130-\u318f\uac00-\ud7af]", "_", customer_name_for_receipt)[:30]
-                                                                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                                                    ts = datetime.now(tz=KST).strftime("%Y%m%d_%H%M%S")
                                                                     ext = (receipt_upload.name or "").split(".")[-1].lower() or "jpg"
                                                                     if ext not in ("png", "jpg", "jpeg"):
                                                                         ext = "jpg"
