@@ -2494,6 +2494,7 @@ def _insert_order_notification(
         sc, err = get_supabase_client()
         if err or not sc:
             return
+        _tenant_name = _get_store_name_by_db(db_filename) or db_filename
         for display_name in target_names:
             target_uname = _get_username_by_display_name(display_name)
             if not target_uname:
@@ -2503,6 +2504,7 @@ def _insert_order_notification(
             try:
                 sc.table("app_edit_requests").insert({
                     "db_filename": db_filename,
+                    "tenant_name": _tenant_name,
                     "entity_type": "Order",
                     "entity_id": int(order_id),
                     "requested_by": triggered_by_username or "",
@@ -2571,10 +2573,12 @@ def _insert_fraud_alert_to_admins(
         sc, err = get_supabase_client()
         if err or not sc:
             return
+        _fraud_tenant = _get_store_name_by_db(db_filename) or db_filename
         for admin_uname in admin_usernames:
             try:
                 sc.table("app_edit_requests").insert({
                     "db_filename": db_filename,
+                    "tenant_name": _fraud_tenant,
                     "entity_type": "Order",
                     "entity_id": int(order_id) if order_id else 0,
                     "requested_by": actor_username or "unknown",
@@ -2879,9 +2883,11 @@ def _insert_delete_request(db_filename: str, order_id: int, reason: str, request
         sc, err = get_supabase_client()
         if err or not sc:
             return False, str(err)
+        tenant_name = _get_store_name_by_db(db_filename) or db_filename
         for admin_uname in admin_usernames:
             sc.table("app_edit_requests").insert({
                 "db_filename": db_filename,
+                "tenant_name": tenant_name,
                 "entity_type": "Order",
                 "entity_id": int(order_id),
                 "requested_by": requested_by_username or "",
@@ -8654,6 +8660,7 @@ def render_customer_balance():
                                                     _actor = _current_username()
                                                     sc.table("app_edit_requests").insert({
                                                         "db_filename": db_filename,
+                                                        "tenant_name": _get_store_name_by_db(db_filename) or db_filename,
                                                         "entity_type": "Order",
                                                         "entity_id": int(sel_oid),
                                                         "requested_by": _actor or "",
