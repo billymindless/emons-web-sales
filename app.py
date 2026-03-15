@@ -3046,6 +3046,54 @@ def _resolve_delete_request(request_id: int, action: str, reviewed_by: str, reje
         return False, str(e)
 
 
+def _snapshot_order_for_delete(db_filename: str, order_id: int) -> dict:
+    """삭제 전 주문 상세 정보를 dict로 수집하여 반환. 삭제 후 payload에 보관용."""
+    snap = {"order_id": order_id}
+    try:
+        if not _supabase_orders_payments_available() or not order_id:
+            return snap
+        order_detail = _get_order_supabase(db_filename, int(order_id))
+        if not order_detail:
+            return snap
+        cid = order_detail.get("customer_id")
+        cust_name = _get_customer_name_supabase(db_filename, int(cid)) if cid else "-"
+        paid, _ = _sum_payments_by_order_supabase(db_filename, int(order_id))
+        total_amount = float(order_detail.get("total_amount") or 0)
+        snap.update({
+            "customer_name": cust_name or "-",
+            "order_date": str(order_detail.get("order_date") or "-")[:10],
+            "delivery_date": str(order_detail.get("delivery_date") or "-")[:10],
+            "category": str(order_detail.get("category") or "-"),
+            "total_amount": int(total_amount),
+            "paid_amount": int(paid),
+            "balance": int(total_amount - paid),
+            "employee_names": str(order_detail.get("employee_names") or "-"),
+        })
+    except Exception:
+        pass
+    return snap
+
+
+def _save_order_snapshot_to_payload(db_filename: str, order_id: int, snapshot: dict):
+    """app_edit_requests의 payload 컬럼에 스냅샷 JSON 저장 (삭제 승인 이후 상세 조회용)."""
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return
+        import json as _json
+        payload_json = _json.dumps(snapshot, ensure_ascii=False)
+        (
+            sc.table("app_edit_requests")
+            .update({"payload": payload_json})
+            .eq("db_filename", db_filename)
+            .eq("entity_id", int(order_id))
+            .eq("notif_type", "delete_request")
+            .execute()
+        )
+    except Exception:
+        pass
+
+
 def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
     """주문 및 연관 결제 데이터를 실제로 삭제한다 (관리자 승인 후 호출).
     반환: (성공여부: bool, 오류메시지: str | None)
@@ -3149,6 +3197,9 @@ def _render_admin_delete_requests(db_filename: str):
                     reject_reason_key = f"del_reject_reason_{req_id}"
 
                     if st.button("✅ 승인 (삭제 실행)", key=approve_key, type="primary"):
+                        # 삭제 전 주문 스냅샷 저장 (삭제 후 내역 조회용)
+                        _snap = _snapshot_order_for_delete(db_filename, order_id)
+                        _save_order_snapshot_to_payload(db_filename, order_id, _snap)
                         ok, del_err = _approve_delete_order(db_filename, order_id)
                         if ok:
                             res_ok, res_err = _resolve_delete_request(req_id, "approved", reviewed_by, order_id=order_id, db_filename=db_filename)
@@ -3179,6 +3230,11 @@ def _render_admin_delete_requests(db_filename: str):
     if not resolved_list:
         st.caption("최근 처리된 삭제 요청이 없습니다.")
     else:
+        import json as _json
+
+        # Excel 다운로드용 데이터 수집
+        _dl_rows = []
+
         for res in resolved_list:
             r_order_id = res.get("entity_id")
             r_requester = res.get("requested_by", "알 수 없음")
@@ -3188,19 +3244,86 @@ def _render_admin_delete_requests(db_filename: str):
             r_reviewed_at = str(res.get("reviewed_at") or "")[:16].replace("T", " ")
             r_created = str(res.get("created_at", ""))[:16].replace("T", " ")
 
-            if r_status == "approved":
-                badge = "✅ 삭제 완료"
-                render_fn = st.success
-            else:
-                badge = "❌ 반려됨"
-                render_fn = st.warning
+            # payload에서 스냅샷 파싱
+            snap = {}
+            try:
+                raw_payload = res.get("payload") or ""
+                if raw_payload and raw_payload.strip().startswith("{"):
+                    snap = _json.loads(raw_payload)
+            except Exception:
+                snap = {}
 
-            render_fn(
-                f"**{badge}** — 주문 #{r_order_id}  \n"
-                f"요청자: `{r_requester}` | 요청일시: {r_created}  \n"
-                f"처리자: `{r_reviewed_by}` | 처리일시: {r_reviewed_at}  \n"
-                f"사유: {r_reason or '(없음)'}"
-            )
+            r_cust    = snap.get("customer_name", "-")
+            r_date    = snap.get("order_date", "-")
+            r_del     = snap.get("delivery_date", "-")
+            r_cat     = snap.get("category", "-")
+            r_total   = snap.get("total_amount")
+            r_paid    = snap.get("paid_amount")
+            r_bal     = snap.get("balance")
+            r_emp     = snap.get("employee_names", "-")
+
+            r_total_str = f"{int(r_total):,}원" if r_total is not None else "-"
+            r_paid_str  = f"{int(r_paid):,}원"  if r_paid  is not None else "-"
+            r_bal_str   = f"{int(r_bal):,}원"   if r_bal   is not None else "-"
+
+            badge_icon = "✅" if r_status == "approved" else "❌"
+            badge_label = "삭제 완료" if r_status == "approved" else "반려됨"
+
+            with st.expander(
+                f"{badge_icon} **주문 #{r_order_id}** [{badge_label}]  "
+                f"ㅤ고객: {r_cust}ㅤ|ㅤ계약금액: {r_total_str}ㅤ|ㅤ처리일: {r_reviewed_at}",
+                expanded=False,
+            ):
+                d_col1, d_col2 = st.columns(2)
+                with d_col1:
+                    st.write(f"👤 **고객명:** {r_cust}")
+                    st.write(f"📅 **계약일:** {r_date}")
+                    st.write(f"🚚 **배송일:** {r_del}")
+                    st.write(f"🛋️ **품목:** {r_cat}")
+                with d_col2:
+                    st.write(f"💰 **계약금액:** {r_total_str}")
+                    st.write(f"💳 **결제액:** {r_paid_str}  /  잔금: {r_bal_str}")
+                    st.write(f"👥 **담당직원:** {r_emp}")
+                st.divider()
+                st.write(f"🗑️ **삭제 사유:** {r_reason or '(없음)'}")
+                st.write(f"📋 **요청자:** `{r_requester}` | 요청일시: {r_created}")
+                st.write(f"✍️ **처리자:** `{r_reviewed_by}` | 처리일시: {r_reviewed_at}")
+
+            _dl_rows.append({
+                "주문번호":    r_order_id,
+                "처리결과":    badge_label,
+                "고객명":      r_cust,
+                "계약일":      r_date,
+                "배송일":      r_del,
+                "품목":        r_cat,
+                "계약금액(원)": r_total if r_total is not None else "",
+                "결제액(원)":   r_paid  if r_paid  is not None else "",
+                "잔금(원)":     r_bal   if r_bal   is not None else "",
+                "담당직원":    r_emp,
+                "삭제사유":    r_reason or "",
+                "요청자":      r_requester,
+                "요청일시":    r_created,
+                "처리자":      r_reviewed_by,
+                "처리일시":    r_reviewed_at,
+            })
+
+        # ── Excel 다운로드 버튼 ──
+        if _dl_rows:
+            try:
+                import io as _io
+                _df_dl = pd.DataFrame(_dl_rows)
+                _buf = _io.BytesIO()
+                with pd.ExcelWriter(_buf, engine="openpyxl") as _ew:
+                    _df_dl.to_excel(_ew, index=False, sheet_name="삭제처리내역")
+                st.download_button(
+                    label="📥 삭제 처리 내역 Excel 다운로드",
+                    data=_buf.getvalue(),
+                    file_name=f"삭제처리내역_{datetime.now(tz=KST).strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="del_history_download_btn",
+                )
+            except Exception as _ex:
+                st.caption(f"다운로드 준비 실패: {_ex}")
 
     if st.button("🔄 새로고침", key="del_req_refresh_btn"):
         st.rerun()
