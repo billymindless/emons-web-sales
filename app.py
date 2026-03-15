@@ -2421,7 +2421,7 @@ def _get_auth_secret() -> str:
         pass
     return os.environ.get("EMONS_AUTH_SECRET", _AUTH_SECRET_FALLBACK)
 AUTH_EXPIRY_DAYS = 7
-AUTH_SESSION_SECONDS = 3600  # 로그인 후 1시간 동안만 세션 유지, 연속 새로고침 시에도 복구
+AUTH_SESSION_SECONDS = 14400  # 로그인 후 4시간 동안 세션 유지, 연속 새로고침 시에도 복구
 
 
 def _current_username() -> str:
