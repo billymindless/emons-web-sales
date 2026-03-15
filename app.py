@@ -3761,7 +3761,18 @@ def _maybe_clear_localStorage_on_logout():
 
 # ========== 주소 검색 API 연동 (한국 주소) ==========
 # 공공데이터 도로명주소 API / Vworld / 카카오 중 API 키 설정 시 사용 가능.
-# ADDRESS_API_KEY(공공) 또는 KAKAO_REST_KEY(카카오) 환경변수로 지정. 없으면 수동 입력만 가능.
+# KAKAO_REST_KEY: st.secrets["KAKAO_REST_KEY"] 또는 환경변수로 설정. 코드 내 하드코딩 금지.
+
+
+def _get_kakao_rest_key() -> str:
+    """카카오 REST API 키를 st.secrets → os.environ 순으로 조회. 없으면 빈 문자열 반환."""
+    try:
+        val = st.secrets.get("KAKAO_REST_KEY") or ""
+        if val and str(val).strip():
+            return str(val).strip()
+    except Exception:
+        pass
+    return os.environ.get("KAKAO_REST_KEY", "")
 
 def search_address_public(keyword: str, api_key: str = ""):
     """
@@ -3823,11 +3834,9 @@ def search_address_kakao(keyword: str, api_key: str = ""):
     """
     if not keyword or not keyword.strip():
         return [], None
-    # 환경변수 미설정 시 아래 REST 키 사용 (카카오 개발자 콘솔 REST API 키)
-    KAKAO_REST_KEY_DEFAULT = "19911112315a182013d5ac8592852019"
-    key = api_key or os.environ.get("KAKAO_REST_KEY", KAKAO_REST_KEY_DEFAULT)
+    key = api_key or _get_kakao_rest_key()
     if not key:
-        return [], "KAKAO_REST_KEY를 설정해 주세요."
+        return [], "KAKAO_REST_KEY가 설정되지 않았습니다. st.secrets 또는 환경변수에 KAKAO_REST_KEY를 추가해 주세요."
     url = "https://dapi.kakao.com/v2/local/search/address.json"
     headers = {"Authorization": f"KakaoAK {key}"}
     params = {"query": keyword.strip()}
@@ -3875,10 +3884,9 @@ def search_keyword_kakao(keyword: str, api_key: str = ""):
     """
     if not keyword or not str(keyword).strip():
         return [], None
-    KAKAO_REST_KEY_DEFAULT = "19911112315a182013d5ac8592852019"
-    key = api_key or os.environ.get("KAKAO_REST_KEY", KAKAO_REST_KEY_DEFAULT)
+    key = api_key or _get_kakao_rest_key()
     if not key:
-        return [], "KAKAO_REST_KEY를 설정해 주세요."
+        return [], "KAKAO_REST_KEY가 설정되지 않았습니다. st.secrets 또는 환경변수에 KAKAO_REST_KEY를 추가해 주세요."
     url = "https://dapi.kakao.com/v2/local/search/keyword.json"
     headers = {"Authorization": f"KakaoAK {key}"}
     params = {"query": keyword.strip(), "size": 15}
@@ -3931,8 +3939,7 @@ def geocode_address_kakao_extended(address: str) -> dict | None:
     if not address or not str(address).strip():
         return None
     q = str(address).strip()
-    KAKAO_REST_KEY_DEFAULT = "19911112315a182013d5ac8592852019"
-    key = os.environ.get("KAKAO_REST_KEY", KAKAO_REST_KEY_DEFAULT)
+    key = _get_kakao_rest_key()
     if not key:
         return None
     url = "https://dapi.kakao.com/v2/local/search/address.json"
@@ -10043,7 +10050,8 @@ def main():
     # 로그인 성공 직후: 브라우저 localStorage에 이메일 저장(한 번만 실행 후 플래그 제거)
     _pending = st.session_state.pop("_pending_save_login_email", None)
     if _pending:
-        _val_js = json.dumps(str(_pending))
+        # json.dumps로 JS 문자열 이스케이프 후 </script> 시퀀스 추가 방어 (XSS 차단)
+        _val_js = json.dumps(str(_pending)).replace("</", r"<\/").replace("<!--", r"<\!--")
         st.markdown(
             f'<script>(function(){{ try {{ localStorage.setItem("emons_login_email", {_val_js}); }} catch(e) {{}} }})();</script>',
             unsafe_allow_html=True,
