@@ -7839,7 +7839,7 @@ def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float
     # 초과 결제 경고 (입력 차단 없음 — 결변·카드취소 처리 지원)
     if add_amt_int > 0 and add_amt_int > balance:
         _over = add_amt_int - max(balance, 0)
-        st.warning(f"⚠️ 입력 금액({add_amt_int:,}원)이 잔금({max(balance,0):,.0f}원)보다 **{_over:,}원 초과**합니다. 결변·카드취소 처리 목적이면 그대로 등록하세요. 초과 금액은 '결제 이상 항목' 탭에 표시됩니다.")
+        st.warning(f"⚠️ 입력 금액({add_amt_int:,}원)이 잔금({max(balance,0):,.0f}원)보다 **{_over:,}원 초과**합니다. 결변·카드취소 처리 목적이면 그대로 등록하세요. 초과 금액은 '초과결제 항목' 탭에 표시됩니다.")
     # 온누리상품권일 때 승인번호/영수증 입력
     is_onnuri = add_method and ("온누리" in str(add_method))
     stage_key = f"{key_prefix}_onnuri_stage"
@@ -7993,9 +7993,9 @@ def render_customer_balance():
     role = current_user.get("role", "user")
     tab_gen, tab_d10, tab_overdue, tab_anomaly = st.tabs([
         "1. 일반 고객 및 데이터 수정 (General)",
-        "2. 다가오는 미수금 (배송일 D-10 이내)",
-        "3. 🚨 경고! 미결 금액 (배송일 지남 + 미수금)",
-        "4. ⚠️ 결제 이상 항목"
+        "2. 미수금 (배송일 D-10 이내)",
+        "3. 🚨 배송일 후 미결금액",
+        "4. 🔴 초과결제 항목"
     ])
     today = date.today()
 
@@ -8212,11 +8212,6 @@ def render_customer_balance():
                 st.info("채널톡(또는 푸시)으로 등록된 고객이 없습니다.")
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
-        # 결제 이상 항목 탭에서 "이동" 버튼으로 넘어온 경우 검색어 자동 입력
-        if "_gen_search_prefill" in st.session_state:
-            _prefill_val = st.session_state.pop("_gen_search_prefill")
-            if "gen_search" not in st.session_state or not st.session_state.get("gen_search"):
-                st.session_state["gen_search"] = _prefill_val
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")
         if not search_query or not search_query.strip():
             st.info("고객 이름 또는 전화번호를 입력하여 검색하세요.")
@@ -9133,7 +9128,7 @@ def render_customer_balance():
                                                                 st.rerun()
 
                     st.subheader("잔금 추가 결제")
-                    st.caption("⚠️ 초과 결제(결제액 > 구매액)도 입력 가능합니다. 초과 건은 '결제 이상 항목' 탭에 자동 표시됩니다.")
+                    st.caption("⚠️ 초과 결제(결제액 > 구매액)도 입력 가능합니다. 초과 건은 '초과결제 항목' 탭에 자동 표시됩니다.")
                     orders_with_balance = orders[orders["balance"] > 0]
                     # 초과 결제 입력용: balance ≤ 0인 주문도 선택적으로 결제 추가 가능
                     orders_overpaid = orders[orders["balance"] <= 0]
@@ -9158,7 +9153,7 @@ def render_customer_balance():
                         # 완납/초과 주문에 추가 결제 입력 허용 (결변·취소·위약금 처리용)
                         if len(orders_overpaid) > 0:
                             with st.expander(f"🔄 완납·초과 주문 추가 결제 입력 ({len(orders_overpaid)}건) — 결변·취소 처리용", expanded=False):
-                                st.warning("아래 주문은 이미 완납 또는 초과 결제된 상태입니다. 결제 수단 변경(결변)이나 카드 취소 처리 목적으로만 사용하세요. 초과 금액은 '결제 이상 항목' 탭에 자동 표시됩니다.")
+                                st.warning("아래 주문은 이미 완납 또는 초과 결제된 상태입니다. 결제 수단 변경(결변)이나 카드 취소 처리 목적으로만 사용하세요. 초과 금액은 '초과결제 항목' 탭에 자동 표시됩니다.")
                                 for _, orow in orders_overpaid.iterrows():
                                     oid = orow["id"]
                                     bal = float(orow["balance"] or 0)
@@ -9265,9 +9260,10 @@ def render_customer_balance():
             else:
                 st.success("✅ 배송일 지난 미수금 고객이 없습니다.")
 
-    # ---------- 탭 4: ⚠️ 결제 이상 항목 ----------
+    # ---------- 탭 4: 🔴 초과결제 항목 ----------
     with tab_anomaly:
-        st.subheader("⚠️ 결제 이상 항목 (매장 관리자 확인 필요)")
+        st.subheader("🔴 초과결제 항목 (결제금액 > 구매금액)")
+        st.caption("결제 금액이 구매 금액을 초과한 건입니다. 결제 수단 변경(결변) 또는 카드 취소 처리로 정리해 주세요.")
         if role not in ("store_admin", "superadmin"):
             st.info("매장 관리자 또는 최고 관리자만 조회할 수 있습니다.")
         else:
@@ -9284,52 +9280,9 @@ def render_customer_balance():
                 _a_orders["delivery_date"] = pd.to_datetime(_a_orders["delivery_date"], errors="coerce")
                 _a_orders = _a_orders.merge(_a_customers[["id", "name", "phone1"]], left_on="customer_id", right_on="id", suffixes=("", "_c"), how="left")
 
-                # ── 섹션 A: 미수금 (결제 < 구매) ──
-                st.markdown("#### 💸 미수금 항목 (결제금액 < 구매금액)")
-                _underpaid = _a_orders[_a_orders["balance"] > 0].copy()
-                if _underpaid.empty:
-                    st.success("✅ 미수금 이상 항목이 없습니다.")
-                else:
-                    _underpaid_disp = _underpaid.copy()
-                    _underpaid_disp["배송일"] = _underpaid_disp["delivery_date"].dt.strftime("%Y-%m-%d").where(_underpaid_disp["delivery_date"].notna(), "-")
-                    _underpaid_disp = _underpaid_disp[["name", "phone1", "배송일", "category", "employee_names", "total_amount", "paid", "balance"]].rename(columns={
-                        "name": "고객명", "phone1": "전화번호", "category": "품목",
-                        "employee_names": "담당자", "total_amount": "구매금액", "paid": "결제금액", "balance": "미수금"
-                    })
-                    st.warning(f"총 {len(_underpaid_disp)}건, 미수금 합계 {int(_underpaid_disp['미수금'].sum()):,}원")
-                    st.caption("💡 행을 클릭하면 해당 고객의 잔금 관리 화면으로 바로 이동할 수 있습니다.")
-                    _underpaid_sel = st.dataframe(
-                        _format_df_display(_underpaid_disp, ["구매금액", "결제금액", "미수금"]),
-                        use_container_width=True,
-                        selection_mode="single-row",
-                        on_select="rerun",
-                        key="anomaly_underpaid_sel",
-                    )
-                    _underpaid_sel_rows = _underpaid_sel.selection.rows if hasattr(_underpaid_sel, "selection") else []
-                    if _underpaid_sel_rows:
-                        _sel_idx = _underpaid_sel_rows[0]
-                        _sel_row = _underpaid.iloc[_sel_idx]
-                        _sel_name = str(_sel_row.get("name") or "")
-                        _sel_phone = str(_sel_row.get("phone1") or "")
-                        st.info(f"선택: **{_sel_name}** / 미수금 {int(_sel_row.get('balance', 0)):,}원")
-                        if st.button("📋 이 고객 잔금 관리로 이동", key="goto_balance_from_underpaid"):
-                            st.session_state["_gen_search_prefill"] = _sel_phone or _sel_name
-                            st.session_state["main_tab_idx"] = 3
-                            st.rerun()
-                    # 알림 자동 기록 (세션당 1회)
-                    _alert_key = f"_anomaly_alert_underpaid_{db_filename}"
-                    if _alert_key not in st.session_state:
-                        st.session_state[_alert_key] = True
-                        _sn_a = _get_store_name_by_db(db_filename)
-                        _insert_admin_alert(_sn_a, "underpaid_summary", f"[{_sn_a}] 미수금 이상 항목 {len(_underpaid_disp)}건 / 합계 {int(_underpaid_disp['미수금'].sum()):,}원 확인 필요")
-
-                st.divider()
-
-                # ── 섹션 B: 초과결제 (결제 > 구매) ──
-                st.markdown("#### 🔴 초과결제 항목 (결제금액 > 구매금액)")
                 _overpaid = _a_orders[_a_orders["balance"] < 0].copy()
                 if _overpaid.empty:
-                    st.success("✅ 초과결제 이상 항목이 없습니다.")
+                    st.success("✅ 초과결제 항목이 없습니다.")
                 else:
                     _overpaid["초과금액"] = (_overpaid["balance"] * -1)
                     _overpaid_disp = _overpaid.copy()
@@ -9339,25 +9292,16 @@ def render_customer_balance():
                         "employee_names": "담당자", "total_amount": "구매금액", "paid": "결제금액"
                     })
                     st.error(f"⛔ 총 {len(_overpaid_disp)}건, 초과결제 합계 {int(_overpaid_disp['초과금액'].sum()):,}원 — 즉시 확인 필요!")
-                    st.caption("💡 행을 클릭하면 해당 고객의 잔금 관리 화면으로 바로 이동할 수 있습니다.")
-                    _overpaid_sel = st.dataframe(
-                        _format_df_display(_overpaid_disp, ["구매금액", "결제금액", "초과금액"]),
-                        use_container_width=True,
-                        selection_mode="single-row",
-                        on_select="rerun",
-                        key="anomaly_overpaid_sel",
-                    )
-                    _overpaid_sel_rows = _overpaid_sel.selection.rows if hasattr(_overpaid_sel, "selection") else []
-                    if _overpaid_sel_rows:
-                        _sel_idx2 = _overpaid_sel_rows[0]
-                        _sel_row2 = _overpaid.iloc[_sel_idx2]
-                        _sel_name2 = str(_sel_row2.get("name") or "")
-                        _sel_phone2 = str(_sel_row2.get("phone1") or "")
-                        st.info(f"선택: **{_sel_name2}** / 초과결제 {int(abs(_sel_row2.get('balance', 0))):,}원")
-                        if st.button("📋 이 고객 잔금 관리로 이동", key="goto_balance_from_overpaid"):
-                            st.session_state["_gen_search_prefill"] = _sel_phone2 or _sel_name2
-                            st.session_state["main_tab_idx"] = 3
-                            st.rerun()
+                    st.dataframe(_format_df_display(_overpaid_disp, ["구매금액", "결제금액", "초과금액"]), use_container_width=True)
+                    st.markdown("---")
+                    for _, _op_row in _overpaid.iterrows():
+                        _op_oid = _op_row["id"]
+                        _op_name = str(_op_row.get("name") or "-")
+                        _op_excess = float(_op_row.get("초과금액", 0))
+                        _op_dlv = _op_row.get("delivery_date", "")
+                        _op_dlv_str = _op_dlv.strftime("%Y-%m-%d") if hasattr(_op_dlv, "strftime") else str(_op_dlv or "-")[:10]
+                        with st.expander(f"🔴 {_op_name} — 주문 #{_op_oid} | 배송일 {_op_dlv_str} | 초과 {_op_excess:,.0f}원", expanded=False):
+                            _customer_balance_payment_ui(db_filename, _op_oid, 0, key_prefix=f"overpaid_{_op_oid}")
                     # 알림 자동 기록 (세션당 1회)
                     _alert_key2 = f"_anomaly_alert_overpaid_{db_filename}"
                     if _alert_key2 not in st.session_state:
