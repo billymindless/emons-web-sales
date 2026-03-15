@@ -2976,7 +2976,7 @@ def _fetch_recent_resolved_delete_requests(db_filename: str) -> list:
         try:
             r = (
                 sc.table("app_edit_requests")
-                .select("id, created_at, reviewed_at, entity_id, requested_by, reason, status, reviewed_by")
+                .select("id, created_at, reviewed_at, entity_id, requested_by, reason, status, reviewed_by, payload")
                 .eq("db_filename", db_filename)
                 .eq("notif_type", "delete_request")
                 .eq("target_username", username)
@@ -2989,7 +2989,7 @@ def _fetch_recent_resolved_delete_requests(db_filename: str) -> list:
             # reviewed_at / reviewed_by 컬럼 없는 경우 created_at 기준 fallback
             r = (
                 sc.table("app_edit_requests")
-                .select("id, created_at, entity_id, requested_by, reason, status")
+                .select("id, created_at, entity_id, requested_by, reason, status, payload")
                 .eq("db_filename", db_filename)
                 .eq("notif_type", "delete_request")
                 .eq("target_username", username)
@@ -3258,11 +3258,13 @@ def _render_admin_delete_requests(db_filename: str):
             r_reviewed_at = str(res.get("reviewed_at") or "")[:16].replace("T", " ")
             r_created = str(res.get("created_at", ""))[:16].replace("T", " ")
 
-            # payload에서 스냅샷 파싱
+            # payload에서 스냅샷 파싱 (jsonb→dict 또는 text→str 모두 처리)
             snap = {}
             try:
-                raw_payload = res.get("payload") or ""
-                if raw_payload and raw_payload.strip().startswith("{"):
+                raw_payload = res.get("payload")
+                if isinstance(raw_payload, dict):
+                    snap = raw_payload  # Supabase jsonb 타입: 이미 dict로 반환됨
+                elif isinstance(raw_payload, str) and raw_payload.strip().startswith("{"):
                     snap = _json.loads(raw_payload)
             except Exception:
                 snap = {}
