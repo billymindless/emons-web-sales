@@ -2961,10 +2961,10 @@ def _fetch_recent_resolved_delete_requests(db_filename: str) -> list:
                 .execute()
             )
         except Exception:
-            # reviewed_at 컬럼 없는 경우 created_at 기준 fallback
+            # reviewed_at / reviewed_by 컬럼 없는 경우 created_at 기준 fallback
             r = (
                 sc.table("app_edit_requests")
-                .select("id, created_at, entity_id, requested_by, reason, status, reviewed_by")
+                .select("id, created_at, entity_id, requested_by, reason, status")
                 .eq("db_filename", db_filename)
                 .eq("notif_type", "delete_request")
                 .eq("target_username", username)
@@ -2982,39 +2982,52 @@ def _resolve_delete_request(request_id: int, action: str, reviewed_by: str, reje
     """삭제 요청을 승인(approved) 또는 반려(rejected) 처리.
     action: 'approved' | 'rejected'
     order_id + db_filename 을 함께 넘기면 동일 주문의 다른 관리자 레코드도 일괄 처리.
-    reviewed_at 컬럼이 없는 환경에서도 동작하도록 fallback 처리 포함.
+    테이블 스키마에 없는 컬럼은 자동으로 제외하며 최소한 status만 업데이트.
     """
+    def _try_update_with_fallback(sc, base_filter_fn, reject_reason: str):
+        """reviewed_at → reviewed_by → status+reason → status 순으로 단계별 fallback."""
+        base = {"status": action}
+        if reject_reason:
+            base["reason"] = reject_reason
+
+        candidates = [
+            {**base, "reviewed_by": reviewed_by, "reviewed_at": datetime.now(tz=KST).isoformat()},
+            {**base, "reviewed_by": reviewed_by},
+            base,
+            {"status": action},
+        ]
+        last_err = None
+        for payload in candidates:
+            try:
+                base_filter_fn(sc.table("app_edit_requests").update(payload)).execute()
+                return True, None
+            except Exception as e:
+                last_err = e
+                continue
+        return False, str(last_err)
+
     try:
         sc, err = get_supabase_client()
         if err or not sc:
             return False, str(err)
-        # reviewed_at 포함 payload (컬럼이 없으면 fallback)
-        update_payload_full = {
-            "status": action,
-            "reviewed_by": reviewed_by,
-            "reviewed_at": datetime.now(tz=KST).isoformat(),
-        }
-        update_payload_min = {
-            "status": action,
-            "reviewed_by": reviewed_by,
-        }
-        if action == "rejected" and reject_reason:
-            update_payload_full["reason"] = reject_reason
-            update_payload_min["reason"] = reject_reason
 
-        # 1) 특정 레코드 업데이트: reviewed_at 포함 먼저 시도, 실패 시 최소 payload로 재시도
-        try:
-            sc.table("app_edit_requests").update(update_payload_full).eq("id", request_id).execute()
-        except Exception:
-            sc.table("app_edit_requests").update(update_payload_min).eq("id", request_id).execute()
+        # 1) 특정 레코드 업데이트
+        ok, upd_err = _try_update_with_fallback(
+            sc,
+            lambda q: q.eq("id", request_id),
+            reject_reason,
+        )
+        if not ok:
+            return False, upd_err
 
         # 2) 같은 주문의 다른 관리자 레코드도 일괄 처리 (중복 표시 방지)
         if order_id is not None and db_filename:
             try:
-                try:
-                    sc.table("app_edit_requests").update(update_payload_full).eq("db_filename", db_filename).eq("entity_id", int(order_id)).eq("notif_type", "delete_request").eq("status", "pending").execute()
-                except Exception:
-                    sc.table("app_edit_requests").update(update_payload_min).eq("db_filename", db_filename).eq("entity_id", int(order_id)).eq("notif_type", "delete_request").eq("status", "pending").execute()
+                _try_update_with_fallback(
+                    sc,
+                    lambda q: q.eq("db_filename", db_filename).eq("entity_id", int(order_id)).eq("notif_type", "delete_request").eq("status", "pending"),
+                    reject_reason,
+                )
             except Exception:
                 pass
         return True, None
