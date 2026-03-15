@@ -2937,7 +2937,9 @@ def _fetch_pending_delete_requests(db_filename: str) -> list:
 
 
 def _fetch_recent_resolved_delete_requests(db_filename: str) -> list:
-    """최근 처리 완료된 삭제 요청 목록 조회 (승인·반려 포함, 최근 20건)."""
+    """최근 처리 완료된 삭제 요청 목록 조회 (승인·반려 포함, 최근 20건).
+    reviewed_at 컬럼이 없는 환경에서는 created_at 기준으로 정렬 fallback.
+    """
     if not _supabase_orders_payments_available() or not db_filename:
         return []
     try:
@@ -2945,17 +2947,32 @@ def _fetch_recent_resolved_delete_requests(db_filename: str) -> list:
         if err or not sc:
             return []
         username = _current_username()
-        r = (
-            sc.table("app_edit_requests")
-            .select("id, created_at, reviewed_at, entity_id, requested_by, reason, status, reviewed_by")
-            .eq("db_filename", db_filename)
-            .eq("notif_type", "delete_request")
-            .eq("target_username", username)
-            .in_("status", ["approved", "rejected"])
-            .order("reviewed_at", desc=True)
-            .limit(20)
-            .execute()
-        )
+        # reviewed_at 포함 시도
+        try:
+            r = (
+                sc.table("app_edit_requests")
+                .select("id, created_at, reviewed_at, entity_id, requested_by, reason, status, reviewed_by")
+                .eq("db_filename", db_filename)
+                .eq("notif_type", "delete_request")
+                .eq("target_username", username)
+                .in_("status", ["approved", "rejected"])
+                .order("reviewed_at", desc=True)
+                .limit(20)
+                .execute()
+            )
+        except Exception:
+            # reviewed_at 컬럼 없는 경우 created_at 기준 fallback
+            r = (
+                sc.table("app_edit_requests")
+                .select("id, created_at, entity_id, requested_by, reason, status, reviewed_by")
+                .eq("db_filename", db_filename)
+                .eq("notif_type", "delete_request")
+                .eq("target_username", username)
+                .in_("status", ["approved", "rejected"])
+                .order("created_at", desc=True)
+                .limit(20)
+                .execute()
+            )
         return r.data or []
     except Exception:
         return []
@@ -2965,24 +2982,39 @@ def _resolve_delete_request(request_id: int, action: str, reviewed_by: str, reje
     """삭제 요청을 승인(approved) 또는 반려(rejected) 처리.
     action: 'approved' | 'rejected'
     order_id + db_filename 을 함께 넘기면 동일 주문의 다른 관리자 레코드도 일괄 처리.
+    reviewed_at 컬럼이 없는 환경에서도 동작하도록 fallback 처리 포함.
     """
     try:
         sc, err = get_supabase_client()
         if err or not sc:
             return False, str(err)
-        update_payload = {
+        # reviewed_at 포함 payload (컬럼이 없으면 fallback)
+        update_payload_full = {
             "status": action,
             "reviewed_by": reviewed_by,
             "reviewed_at": datetime.now(tz=KST).isoformat(),
         }
+        update_payload_min = {
+            "status": action,
+            "reviewed_by": reviewed_by,
+        }
         if action == "rejected" and reject_reason:
-            update_payload["reason"] = reject_reason
-        # 1) 특정 레코드 업데이트
-        sc.table("app_edit_requests").update(update_payload).eq("id", request_id).execute()
+            update_payload_full["reason"] = reject_reason
+            update_payload_min["reason"] = reject_reason
+
+        # 1) 특정 레코드 업데이트: reviewed_at 포함 먼저 시도, 실패 시 최소 payload로 재시도
+        try:
+            sc.table("app_edit_requests").update(update_payload_full).eq("id", request_id).execute()
+        except Exception:
+            sc.table("app_edit_requests").update(update_payload_min).eq("id", request_id).execute()
+
         # 2) 같은 주문의 다른 관리자 레코드도 일괄 처리 (중복 표시 방지)
         if order_id is not None and db_filename:
             try:
-                sc.table("app_edit_requests").update(update_payload).eq("db_filename", db_filename).eq("entity_id", int(order_id)).eq("notif_type", "delete_request").eq("status", "pending").execute()
+                try:
+                    sc.table("app_edit_requests").update(update_payload_full).eq("db_filename", db_filename).eq("entity_id", int(order_id)).eq("notif_type", "delete_request").eq("status", "pending").execute()
+                except Exception:
+                    sc.table("app_edit_requests").update(update_payload_min).eq("db_filename", db_filename).eq("entity_id", int(order_id)).eq("notif_type", "delete_request").eq("status", "pending").execute()
             except Exception:
                 pass
         return True, None
