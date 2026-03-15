@@ -2408,7 +2408,18 @@ def ensure_session():
 #  - Network: 새로고침 시 요청 URL에 ?auth= 가 붙는 요청이 한 번이라도 가는지 확인
 #  - URL이 2083자 제한으로 잘리면 검증 실패 → auth 길이 < 80이면 삭제 스크립트를 주입하지 않도록 함
 AUTH_STORAGE_KEY = "emons_auth"
-AUTH_SECRET = os.environ.get("EMONS_AUTH_SECRET", "emons-default-secret-change-in-production")
+_AUTH_SECRET_FALLBACK = "emons-default-secret-change-in-production"
+
+
+def _get_auth_secret() -> str:
+    """st.secrets → os.environ → fallback 순으로 HMAC 서명 키를 반환."""
+    try:
+        val = st.secrets.get("EMONS_AUTH_SECRET") or ""
+        if val and str(val).strip():
+            return str(val).strip()
+    except Exception:
+        pass
+    return os.environ.get("EMONS_AUTH_SECRET", _AUTH_SECRET_FALLBACK)
 AUTH_EXPIRY_DAYS = 7
 AUTH_SESSION_SECONDS = 3600  # 로그인 후 1시간 동안만 세션 유지, 연속 새로고침 시에도 복구
 
@@ -3596,7 +3607,7 @@ def _create_auth_token(user_info: dict) -> str:
         "exp": now + AUTH_EXPIRY_DAYS * 24 * 3600,
     }
     payload_b64 = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True).encode()).decode()
-    sig = hmac.new(AUTH_SECRET.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(_get_auth_secret().encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{sig}"
 
 
@@ -3606,7 +3617,7 @@ def _verify_auth_token(token: str) -> dict | None:
         return None
     try:
         payload_b64, sig = token.rsplit(".", 1)
-        expected = hmac.new(AUTH_SECRET.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+        expected = hmac.new(_get_auth_secret().encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, sig):
             return None
         pad = 4 - len(payload_b64) % 4
