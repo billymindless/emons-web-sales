@@ -463,9 +463,9 @@ def _get_supabase_app_user_by_email(email: str):
         return None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=1800)
 def _get_supabase_user_allowed_stores(user_id: int):
-    """접근 가능 매장 목록 캐시 (5분). 로그인 사용자별로 캐시되며, 배정 변경 시 clear_data_cache()로 갱신."""
+    """접근 가능 매장 목록 캐시 (30분). 로그인 사용자별로 캐시되며, 배정 변경 시 clear_data_cache()로 갱신."""
     if not user_id:
         return []
     client, err = get_supabase_client()
@@ -1428,9 +1428,9 @@ def load_customers_cached(db_filename: str, limit: int | None = 50) -> pd.DataFr
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1800)
 def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFrame:
-    """Sales 테이블 캐시 로딩 (ttl=10분). Supabase sales 테이블, id 기준. limit=None이면 전체(대시보드 집계용).
+    """Sales 테이블 캐시 로딩 (ttl=30분). Supabase sales 테이블, id 기준. limit=None이면 전체(대시보드 집계용).
     employee_names, order_id 포함 조회 - 대시보드 직원별 집계에 활용."""
     client, err = get_supabase_client()
     if err:
@@ -1498,7 +1498,7 @@ def load_sales_with_employees_cached(db_filename: str, start_date: str | None = 
         return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "note", "employee_names"])
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1800)
 def load_orders_cached(db_filename: str, order_col_list: str, limit: int | None = 50, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
     if _supabase_orders_payments_available():
         return _load_orders_supabase(db_filename, columns=order_col_list, limit=limit, start_date=start_date, end_date=end_date)
@@ -1525,9 +1525,9 @@ def load_orders_cached(db_filename: str, order_col_list: str, limit: int | None 
         conn.close()
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1800)
 def load_payments_cached(db_filename: str) -> pd.DataFrame:
-    """결제(Payments) 목록 캐시 로딩 (10분). Supabase app_payments 우선. 저장 후 clear_data_cache() 호출 시 갱신."""
+    """결제(Payments) 목록 캐시 로딩 (30분). Supabase app_payments 우선. 저장 후 clear_data_cache() 호출 시 갱신."""
     if _supabase_orders_payments_available():
         return _load_payments_supabase(db_filename)
     conn = get_tenant_conn(db_filename)
@@ -9205,13 +9205,18 @@ def render_customer_balance():
                                 else:
                                     st.error(f"요청 전송 실패: {req_err}")
 
-    # ---------- 탭 2: 다가오는 미수금 (D-10 이내) ----------
+    # ---------- 탭 2·3·4 공통 데이터: 1회만 로드 후 각 탭에서 재사용 ----------
     order_cols_d10 = "id, customer_id, order_date, delivery_date, total_amount, cost_price, category, employee_names"
+    _shared_orders_d10 = load_orders_cached(db_filename, order_cols_d10, limit=None)
+    _shared_payments_d10 = load_payments_cached(db_filename)
+    _shared_customers_d10 = load_customers_cached(db_filename, limit=None)
+
+    # ---------- 탭 2: 다가오는 미수금 (D-10 이내) ----------
     with tab_d10:
         st.subheader("다가오는 미수금 (배송일 0~10일 이내)")
-        orders = load_orders_cached(db_filename, order_cols_d10, limit=None)
-        payments = load_payments_cached(db_filename)
-        customers = load_customers_cached(db_filename, limit=None)
+        orders = _shared_orders_d10
+        payments = _shared_payments_d10
+        customers = _shared_customers_d10
         if orders.empty or "id" not in orders.columns:
             st.info("아직 등록된 주문 데이터가 없습니다.")
         else:
@@ -9241,9 +9246,9 @@ def render_customer_balance():
     # ---------- 탭 3: 🚨 경고! 미결 금액 (배송일 지남 + 미수금) ----------
     with tab_overdue:
         st.error("🚨 배송일이 이미 지났는데 잔금이 남아 있는 고객 목록입니다. 우선 완납 유도가 필요합니다.")
-        orders = load_orders_cached(db_filename, order_cols_d10, limit=None)
-        payments = load_payments_cached(db_filename)
-        customers = load_customers_cached(db_filename, limit=None)
+        orders = _shared_orders_d10
+        payments = _shared_payments_d10
+        customers = _shared_customers_d10
         if orders.empty or "id" not in orders.columns:
             st.info("아직 등록된 주문 데이터가 없습니다.")
         else:
@@ -9272,9 +9277,9 @@ def render_customer_balance():
         if role not in ("store_admin", "superadmin"):
             st.info("매장 관리자 또는 최고 관리자만 조회할 수 있습니다.")
         else:
-            _a_orders = load_orders_cached(db_filename, order_cols_d10, limit=None)
-            _a_payments = load_payments_cached(db_filename)
-            _a_customers = load_customers_cached(db_filename, limit=None)
+            _a_orders = _shared_orders_d10
+            _a_payments = _shared_payments_d10
+            _a_customers = _shared_customers_d10
             if _a_orders.empty or "id" not in _a_orders.columns:
                 st.info("주문 데이터가 없습니다.")
             else:
@@ -9451,8 +9456,10 @@ def render_customer_balance():
 
 # ========== 탭 0: 경영 대시보드 (로그인 후 첫 화면) ==========
 
-def _render_dashboard_todos_only(db_filename: str, todos_df: pd.DataFrame):
-    """To-Do 섹션만 렌더 (Lazy Loading용. 전체 통계 로드 전 빠른 To-Do 조회/등록)."""
+@st.fragment
+def _render_dashboard_todos_only(db_filename: str):
+    """To-Do 섹션 fragment: 등록·완료·삭제 시 이 섹션만 rerun (전체 대시보드 재로딩 없음)."""
+    todos_df = _get_todos_for_display(db_filename)
     st.subheader("6. 직원 To-Do 리스트 (인수인계)")
     if st.button("🔄 서버에서 새로고침", key="todo_refresh_btn_simple"):
         _invalidate_todos_local(db_filename)
@@ -9892,128 +9899,8 @@ def render_dashboard():
         st.metric("해당 기간 총 미수금", "0원")
 
     # ---------- 6. To-Do 리스트 (직원 간 인수인계) ----------
-    st.subheader("6. 직원 To-Do 리스트 (인수인계)")
-    if st.button("🔄 서버에서 새로고침", key="todo_refresh_btn"):
-        _invalidate_todos_local(db_filename)
-        st.rerun()
-    with st.form("todo_form"):
-        st.text_input("작성자", value=_get_current_user_display_name(), disabled=True, key="todo_author_display")
-        content = st.text_area("내용")
-        if st.form_submit_button("등록"):
-            if content and content.strip():
-                author = _get_current_user_display_name()
-                tenant_name = _get_store_name_by_db(db_filename) or db_filename
-                client, err = get_supabase_client()
-                if err or not client:
-                    st.error(f"⚠️ To-Do 저장 중 Supabase 연결 실패: {err}")
-                else:
-                    try:
-                        if "supabase" not in st.session_state:
-                            st.session_state["supabase"] = client
-                        r = st.session_state["supabase"].table("app_todos").insert(
-                            {
-                                "tenant_name": tenant_name,
-                                "author": author or "",
-                                "content": content.strip(),
-                                "is_completed": False,
-                            }
-                        ).execute()
-                        if r.data and len(r.data) > 0:
-                            new_row = r.data[0]
-                            created_at = new_row.get("created_at", "")
-                            created_date = ""
-                            if created_at:
-                                try:
-                                    created_date = pd.to_datetime(created_at).strftime("%Y-%m-%d %H:%M")
-                                except Exception:
-                                    created_date = str(created_at)[:16]
-                            new_df_row = pd.DataFrame([{
-                                "id": new_row.get("id"),
-                                "created_date": created_date,
-                                "author": author or "",
-                                "content": content.strip(),
-                                "is_completed": False,
-                            }])
-                            if "_todos_local" not in st.session_state:
-                                st.session_state["_todos_local"] = {}
-                            if db_filename not in st.session_state["_todos_local"]:
-                                st.session_state["_todos_local"][db_filename] = load_todos_cached(db_filename)
-                            st.session_state["_todos_local"][db_filename] = pd.concat([
-                                new_df_row, st.session_state["_todos_local"][db_filename]
-                            ], ignore_index=True)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"To-Do 저장 중 오류가 발생했습니다: {e}")
-            else:
-                st.warning("내용을 입력하세요.")
-    author_display_map = _get_app_user_display_name_map()
-    current_todo_author = _current_display_name_for_todo()
-    if len(todos_df) > 0:
-        for _, row in todos_df.iterrows():
-            is_done = bool(row.get("is_completed"))
-            content_preview = (row["content"] or "")[:50]
-            if len((row["content"] or "")) > 50:
-                content_preview += "..."
-            raw_author = row.get("author") or ""
-            author_display = author_display_map.get(str(raw_author).strip()) or author_display_map.get(str(raw_author).strip().lower()) or (raw_author or "—")
-            expander_label = f"{'✅ 완료' if is_done else '⬜'} {content_preview} (by {author_display})"
-            with st.expander(expander_label, expanded=not is_done):
-                st.caption(row["created_date"])
-                if is_done:
-                    st.success("✅ **완료된 업무입니다.**")
-                st.write(row["content"] or "")
-                # 완료 처리 버튼: 아직 완료가 아닌 경우에만 노출
-                if not is_done and st.button("완료 처리", key=f"todo_done_{row['id']}"):
-                    client, err = get_supabase_client()
-                    if err or not client:
-                        st.error(f"⚠️ To-Do 완료 처리 중 Supabase 연결 실패: {err}")
-                    else:
-                        try:
-                            if "supabase" not in st.session_state:
-                                st.session_state["supabase"] = client
-                            st.session_state["supabase"].table("app_todos").update(
-                                {"is_completed": True}
-                            ).eq("id", row["id"]).execute()
-                            if "_todos_local" in st.session_state and db_filename in st.session_state["_todos_local"]:
-                                tdf = st.session_state["_todos_local"][db_filename]
-                                mask = tdf["id"] == row["id"]
-                                if mask.any():
-                                    st.session_state["_todos_local"][db_filename] = tdf.copy()
-                                    st.session_state["_todos_local"][db_filename].loc[mask, "is_completed"] = True
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"To-Do 완료 처리 중 오류가 발생했습니다: {e}")
-
-                # 삭제 버튼: 완료된 항목은 누구나 삭제 가능, 미완료 항목은 작성자만 삭제 가능
-                can_delete = False
-                if is_done:
-                    can_delete = True
-                else:
-                    # 작성자 비교: To-Do 작성 시 사용한 표시명 기준
-                    if (raw_author or "").strip() == current_todo_author:
-                        can_delete = True
-
-                if can_delete:
-                    if st.button("삭제", key=f"todo_delete_{row['id']}"):
-                        client, err = get_supabase_client()
-                        if err or not client:
-                            st.error(f"⚠️ To-Do 삭제 중 Supabase 연결 실패: {err}")
-                        else:
-                            try:
-                                if "supabase" not in st.session_state:
-                                    st.session_state["supabase"] = client
-                                st.session_state["supabase"].table("app_todos").delete().eq(
-                                    "id", row["id"]
-                                ).execute()
-                                if "_todos_local" in st.session_state and db_filename in st.session_state["_todos_local"]:
-                                    tdf = st.session_state["_todos_local"][db_filename]
-                                    st.session_state["_todos_local"][db_filename] = tdf[tdf["id"] != row["id"]].reset_index(drop=True)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"To-Do 삭제 중 오류가 발생했습니다: {e}")
-                else:
-                    if not is_done:
-                        st.caption("✏️ 미완료 항목은 작성자만 삭제할 수 있습니다.")
+    # @st.fragment로 분리: To-Do 등록·완료·삭제 시 이 섹션만 rerun (전체 대시보드 재로딩 없음)
+    _render_dashboard_todos_only(db_filename)
 
 
 # ========== 메인: 탭 구성 및 라우팅 ==========
