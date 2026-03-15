@@ -491,7 +491,6 @@ def _get_supabase_user_allowed_stores(user_id: int):
 
 
 @st.cache_data(ttl=3600)
-@st.cache_data(ttl=3600)
 def _get_supabase_store_by_db_filename(db_filename: str):
     """db_filename → store id 조회. @st.cache_data 1시간 캐시. 매장 변경 시 clear_data_cache()로 갱신."""
     if not db_filename:
@@ -517,7 +516,6 @@ def _ensure_supabase_superadmin_email(email_clean: str):
         pass
 
 
-@st.cache_data(ttl=3600)
 @st.cache_data(ttl=600)
 def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
     store_id = _get_supabase_store_by_db_filename(db_filename)
@@ -1803,7 +1801,9 @@ def _load_payments_supabase(db_filename: str, order_id: int | None = None) -> pd
     if err or not client:
         return pd.DataFrame()
     try:
-        q = client.table("app_payments").select("*").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+        q = client.table("app_payments").select(
+            "id, order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by"
+        ).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
         if order_id is not None:
             q = q.eq("order_id", order_id)
         q = q.order("id")
@@ -8065,6 +8065,7 @@ def render_customer_balance():
                                             if row.get("phone1") and str(row["phone1"]).strip():
                                                 existing_phones.add(re.sub(r"\D", "", str(row["phone1"])))
                                         inserted, skipped = 0, 0
+                                        _batch_rows = []
                                         for _, row in df.iterrows():
                                             name_val = (row.get(col_map["name"]) or "").strip() if "name" in col_map else ""
                                             phone1_val = (row.get(col_map["phone1"]) or "").strip() if "phone1" in col_map else ""
@@ -8079,17 +8080,21 @@ def render_customer_balance():
                                             if phone1_digits in existing_phones:
                                                 skipped += 1
                                                 continue
-                                            excel_payload = {
+                                            _batch_rows.append({
                                                 "store_name": store_name,
                                                 "name": name_val or "미입력",
                                                 "phone1": phone1_val,
                                                 "phone2": phone2_val,
                                                 "address": address_val,
                                                 "source": "엑셀",
-                                            }
-                                            client.table("app_customers").insert(excel_payload).execute()
+                                            })
                                             existing_phones.add(phone1_digits)
-                                            inserted += 1
+                                        # 100건 단위 배치 INSERT (1건씩 → HTTP 요청 수 대폭 감소)
+                                        _batch_size = 100
+                                        for _bi in range(0, len(_batch_rows), _batch_size):
+                                            _chunk = _batch_rows[_bi:_bi + _batch_size]
+                                            client.table("app_customers").insert(_chunk).execute()
+                                            inserted += len(_chunk)
                                         clear_data_cache()
                                         st.toast(f"엑셀 고객 일괄 등록 완료: {inserted}건 등록, {skipped}건 중복/스킵.", icon="✅")
                                         st.rerun()
@@ -9147,7 +9152,7 @@ def render_customer_balance():
                             bal = float(orow["balance"] or 0)
                             dlv = orow.get("delivery_date", "")
                             dlv_str = dlv.strftime("%Y-%m-%d") if hasattr(dlv, "strftime") else str(dlv) if dlv else "-"
-                            with st.expander(f"주문 #{oid} | 배송일 {dlv_str} | 잔금 {bal:,.0f}원", expanded=True):
+                            with st.expander(f"주문 #{oid} | 배송일 {dlv_str} | 잔금 {bal:,.0f}원", expanded=False):
                                 _customer_balance_payment_ui(db_filename, oid, bal, key_prefix=f"gen_pay_{oid}")
 
                         # 완납/초과 주문에 추가 결제 입력 허용 (결변·취소·위약금 처리용)
@@ -9303,7 +9308,7 @@ def render_customer_balance():
                         _op_balance = float(_op_row.get("balance") or 0)
                         _op_dlv = _op_row.get("delivery_date", "")
                         _op_dlv_str = _op_dlv.strftime("%Y-%m-%d") if hasattr(_op_dlv, "strftime") else str(_op_dlv or "-")[:10]
-                        with st.expander(f"🔴 {_op_name} ({_op_phone}) — 주문 #{_op_oid} | 배송일 {_op_dlv_str} | 초과 {_op_excess:,.0f}원", expanded=True):
+                        with st.expander(f"🔴 {_op_name} ({_op_phone}) — 주문 #{_op_oid} | 배송일 {_op_dlv_str} | 초과 {_op_excess:,.0f}원", expanded=False):
                             if not _a_payments.empty and "order_id" in _a_payments.columns:
                                 _op_pays = _a_payments[_a_payments["order_id"] == _op_oid].copy()
                             else:
