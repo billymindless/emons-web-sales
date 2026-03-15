@@ -9299,38 +9299,143 @@ def render_customer_balance():
                         _op_name = str(_op_row.get("name") or "-")
                         _op_phone = str(_op_row.get("phone1") or "-")
                         _op_excess = float(_op_row.get("초과금액", 0))
+                        _op_total = float(_op_row.get("total_amount") or 0)
+                        _op_balance = float(_op_row.get("balance") or 0)
                         _op_dlv = _op_row.get("delivery_date", "")
                         _op_dlv_str = _op_dlv.strftime("%Y-%m-%d") if hasattr(_op_dlv, "strftime") else str(_op_dlv or "-")[:10]
                         with st.expander(f"🔴 {_op_name} ({_op_phone}) — 주문 #{_op_oid} | 배송일 {_op_dlv_str} | 초과 {_op_excess:,.0f}원", expanded=True):
-                            # 해당 주문의 결제 내역 상세 표시
                             if not _a_payments.empty and "order_id" in _a_payments.columns:
                                 _op_pays = _a_payments[_a_payments["order_id"] == _op_oid].copy()
-                                if not _op_pays.empty:
-                                    # 표시할 컬럼 구성 (있는 것만)
-                                    _pay_detail_cols = []
-                                    _pay_col_rename = {}
-                                    for _c, _label in [
-                                        ("id", "결제ID"),
-                                        ("payment_date", "결제일"),
-                                        ("payment_method", "결제수단"),
-                                        ("card_company", "카드사/승인번호"),
-                                        ("onnuri_approval_code", "온누리승인번호"),
-                                        ("amount", "금액"),
-                                        ("fee_amount", "수수료"),
-                                        ("created_by", "등록자"),
-                                    ]:
-                                        if _c in _op_pays.columns:
-                                            _pay_detail_cols.append(_c)
-                                            _pay_col_rename[_c] = _label
-                                    _op_pays_disp = _op_pays[_pay_detail_cols].rename(columns=_pay_col_rename).copy()
-                                    # 금액 컬럼 포맷
-                                    _fmt_money_cols = [_pay_col_rename.get(c) for c in ("amount", "fee_amount") if _pay_col_rename.get(c) in _op_pays_disp.columns]
-                                    st.caption("📋 현재 결제 내역 (어떤 결제를 취소/수정할지 확인 후 아래에서 처리하세요)")
-                                    st.dataframe(_format_df_display(_op_pays_disp, _fmt_money_cols), use_container_width=True)
-                                else:
-                                    st.info("이 주문의 결제 내역이 없습니다.")
-                            st.markdown("---")
-                            _customer_balance_payment_ui(db_filename, _op_oid, 0, key_prefix=f"overpaid_{_op_oid}")
+                            else:
+                                _op_pays = pd.DataFrame()
+                            if _op_pays.empty:
+                                st.info("이 주문의 결제 내역이 없습니다.")
+                            else:
+                                # ── 결제 내역 요약 테이블 ──
+                                _pay_detail_cols = []
+                                _pay_col_rename = {}
+                                for _c, _label in [
+                                    ("id", "결제ID"),
+                                    ("payment_date", "결제일"),
+                                    ("payment_method", "결제수단"),
+                                    ("card_company", "카드사/승인번호"),
+                                    ("onnuri_approval_code", "온누리승인번호"),
+                                    ("amount", "금액"),
+                                    ("fee_amount", "수수료"),
+                                    ("created_by", "등록자"),
+                                ]:
+                                    if _c in _op_pays.columns:
+                                        _pay_detail_cols.append(_c)
+                                        _pay_col_rename[_c] = _label
+                                _op_pays_disp = _op_pays[_pay_detail_cols].rename(columns=_pay_col_rename).copy()
+                                _fmt_money_cols = [_pay_col_rename.get(c) for c in ("amount", "fee_amount") if _pay_col_rename.get(c) in _op_pays_disp.columns]
+                                st.caption("📋 현재 결제 내역 — 취소/감액할 건을 아래 수정 패널에서 선택하세요")
+                                st.dataframe(_format_df_display(_op_pays_disp, _fmt_money_cols), use_container_width=True)
+                                st.markdown("---")
+                                # ── 각 결제건 수정 패널 (탭1과 동일 방식) ──
+                                for _, prow in _op_pays.iterrows():
+                                    _prow_amt = float(prow["amount"] or 0)
+                                    _prow_method = prow.get("payment_method") or "-"
+                                    with st.expander(f"✏️ 결제 ID {prow['id']} — {_prow_method} {_prow_amt:,.0f}원 수정/취소", expanded=False):
+                                        col_left, col_right = st.columns(2)
+                                        with col_left:
+                                            st.info("**기존 결제 내역 (비교용)**")
+                                            st.write(f"**총 구매금액:** {_op_total:,.0f}원")
+                                            st.write(f"**결제수단:** {_prow_method}")
+                                            st.write(f"**결제금액:** {_prow_amt:,.0f}원")
+                                            st.write(f"**초과금액:** {_op_excess:,.0f}원")
+                                            if "card_company" in prow and prow["card_company"] and str(prow["card_company"]) not in ("None", "nan", ""):
+                                                st.write(f"**카드사/승인번호:** {prow['card_company']}")
+                                            if "onnuri_approval_code" in prow and prow["onnuri_approval_code"] and str(prow["onnuri_approval_code"]) not in ("None", "nan", ""):
+                                                st.write(f"**온누리승인번호:** {prow['onnuri_approval_code']}")
+                                        with col_right:
+                                            if _prow_amt < 0:
+                                                st.warning("⚠️ 자동 생성된 마이너스 상계 전표는 수정할 수 없습니다.")
+                                            else:
+                                                _cur_method_op = prow.get("payment_method") or PAYMENT_METHOD_OPTIONS[0]
+                                                _method_idx_op = PAYMENT_METHOD_OPTIONS.index(_cur_method_op) if _cur_method_op in PAYMENT_METHOD_OPTIONS else 0
+                                                new_method_op = st.selectbox(
+                                                    "결제 수단 변경",
+                                                    options=PAYMENT_METHOD_OPTIONS,
+                                                    index=_method_idx_op,
+                                                    key=f"op_edit_method_{prow['id']}",
+                                                )
+                                                if new_method_op in _CARD_WITH_COMPANY:
+                                                    _cur_card_op = prow.get("card_company") or CARD_COMPANY_OPTIONS[0]
+                                                    _card_idx_op = CARD_COMPANY_OPTIONS.index(_cur_card_op) if _cur_card_op in CARD_COMPANY_OPTIONS else 0
+                                                    new_card_op = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, index=_card_idx_op, key=f"op_edit_card_{prow['id']}")
+                                                elif new_method_op == "메인페이":
+                                                    new_card_op = st.text_input("메인페이 승인번호 4자리", value=prow.get("card_company") or "", max_chars=4, key=f"op_edit_card_{prow['id']}")
+                                                elif new_method_op == "지역화폐":
+                                                    new_card_op = st.text_input("지역화폐 승인번호", value=prow.get("card_company") or "", key=f"op_edit_card_{prow['id']}")
+                                                else:
+                                                    new_card_op = None
+                                                    st.empty()
+                                                _op_edit_date_key = f"op_edit_date_{prow['id']}"
+                                                try:
+                                                    _op_cur_date_val = pd.to_datetime(prow.get("payment_date")).date() if prow.get("payment_date") else date.today()
+                                                except Exception:
+                                                    _op_cur_date_val = date.today()
+                                                if _op_edit_date_key not in st.session_state:
+                                                    st.session_state[_op_edit_date_key] = _op_cur_date_val
+                                                new_pay_date_op = st.date_input("결제 날짜 *", key=_op_edit_date_key)
+                                                _op_amt_key = f"op_edit_amt_{prow['id']}"
+                                                if _op_amt_key not in st.session_state:
+                                                    st.session_state[_op_amt_key] = _format_number_comma(str(int(_prow_amt)))
+                                                def _fmt_op_amt(_k=_op_amt_key):
+                                                    st.session_state[_k] = _format_number_comma(st.session_state.get(_k, ""))
+                                                st.text_input("변경할 새 금액 (0이면 결제 취소)", key=_op_amt_key, on_change=_fmt_op_amt)
+                                                new_amount_op = _parse_comma_to_int(st.session_state.get(_op_amt_key, "0"))
+                                                del_reason_op = st.text_input("결제 변경 사유 (필수, 5자 이상)", key=f"op_del_reason_{prow['id']}", placeholder="예: 온누리 취소 후 카드 결제")
+                                                if st.button("수정 완료", key=f"op_pay_edit_{prow['id']}", type="primary"):
+                                                    if not del_reason_op or len(del_reason_op.strip()) < 5:
+                                                        st.warning("사유를 5자 이상 입력하세요.")
+                                                    else:
+                                                        _old_amt_op = _prow_amt
+                                                        _old_fee_op = float(prow.get("fee_amount") or 0)
+                                                        _new_fee_op = _payment_fee_amount(new_method_op, new_amount_op) if new_amount_op > 0 else 0.0
+                                                        _today_op = date.today().isoformat()
+                                                        _old_payment_op = {"payment_id": int(prow["id"]), "amount": _old_amt_op, "method": _prow_method, "card_company": prow.get("card_company")}
+                                                        if _supabase_orders_payments_available():
+                                                            _old_paid_op, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
+                                                            _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _today_op, "amount": -_old_amt_op, "payment_method": _prow_method, "card_company": prow.get("card_company"), "fee_amount": -_old_fee_op})
+                                                            if new_amount_op == 0:
+                                                                _action_op = "결제취소"
+                                                                _new_payment_op = {}
+                                                            else:
+                                                                _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _today_op, "amount": float(new_amount_op), "payment_method": new_method_op, "card_company": new_card_op, "fee_amount": float(_new_fee_op)})
+                                                                _action_op = "결제변경"
+                                                                _new_payment_op = {"payment_id": "신규생성(상계처리)", "amount": float(new_amount_op), "method": new_method_op, "card_company": new_card_op}
+                                                            _recalc_order_actual_margin_supabase(db_filename, _op_oid)
+                                                            _new_paid_op, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
+                                                            _new_bal_op = (_op_balance + _old_amt_op - float(new_amount_op)) if new_amount_op > 0 else _op_balance + _old_amt_op
+                                                            _cid_op = _get_order_customer_id_supabase(db_filename, _op_oid)
+                                                            _cname_op = _get_customer_name_supabase(db_filename, _cid_op) if _cid_op else ""
+                                                            _insert_payment_history(None, _op_oid, _cname_op, _action_op, {"order_id": int(_op_oid), "paid_total_before": _old_paid_op, "balance_before": _op_balance, "payment": _old_payment_op}, {"order_id": int(_op_oid), "paid_total_after": _new_paid_op, "balance_after": _new_bal_op, "payment": _new_payment_op}, del_reason_op, db_filename=db_filename)
+                                                        else:
+                                                            _conn_op = get_tenant_conn(db_filename)
+                                                            if _conn_op:
+                                                                try:
+                                                                    _old_paid_op = _conn_op.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_op_oid,)).fetchone()[0] or 0
+                                                                    _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)", (_op_oid, _today_op, -_old_amt_op, _prow_method, prow.get("card_company"), -_old_fee_op))
+                                                                    if new_amount_op == 0:
+                                                                        _action_op = "결제취소"
+                                                                        _new_payment_op = {}
+                                                                    else:
+                                                                        _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)", (_op_oid, _today_op, float(new_amount_op), new_method_op, new_card_op, float(_new_fee_op)))
+                                                                        _action_op = "결제변경"
+                                                                        _new_payment_op = {}
+                                                                    _conn_op.commit()
+                                                                finally:
+                                                                    _conn_op.close()
+                                                        try:
+                                                            if _action_op == "결제취소":
+                                                                _check_and_send_fraud_signals(db_filename=db_filename, order_id=int(_op_oid), actor_username=_current_username(), reason=del_reason_op, action_type="payment_cancel")
+                                                        except Exception:
+                                                            pass
+                                                        st.toast(f"✅ 결제 ID {prow['id']} {_action_op} 완료", icon="✅")
+                                                        clear_data_cache()
+                                                        st.rerun()
                     # 알림 자동 기록 (세션당 1회)
                     _alert_key2 = f"_anomaly_alert_overpaid_{db_filename}"
                     if _alert_key2 not in st.session_state:
