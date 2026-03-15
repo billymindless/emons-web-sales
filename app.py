@@ -8212,6 +8212,11 @@ def render_customer_balance():
                 st.info("채널톡(또는 푸시)으로 등록된 고객이 없습니다.")
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
+        # 결제 이상 항목 탭에서 "이동" 버튼으로 넘어온 경우 검색어 자동 입력
+        if "_gen_search_prefill" in st.session_state:
+            _prefill_val = st.session_state.pop("_gen_search_prefill")
+            if "gen_search" not in st.session_state or not st.session_state.get("gen_search"):
+                st.session_state["gen_search"] = _prefill_val
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")
         if not search_query or not search_query.strip():
             st.info("고객 이름 또는 전화번호를 입력하여 검색하세요.")
@@ -9308,7 +9313,7 @@ def render_customer_balance():
                         _sel_phone = str(_sel_row.get("phone1") or "")
                         st.info(f"선택: **{_sel_name}** / 미수금 {int(_sel_row.get('balance', 0)):,}원")
                         if st.button("📋 이 고객 잔금 관리로 이동", key="goto_balance_from_underpaid"):
-                            st.session_state["gen_search"] = _sel_phone or _sel_name
+                            st.session_state["_gen_search_prefill"] = _sel_phone or _sel_name
                             st.session_state["main_tab_idx"] = 3
                             st.rerun()
                     # 알림 자동 기록 (세션당 1회)
@@ -9350,7 +9355,7 @@ def render_customer_balance():
                         _sel_phone2 = str(_sel_row2.get("phone1") or "")
                         st.info(f"선택: **{_sel_name2}** / 초과결제 {int(abs(_sel_row2.get('balance', 0))):,}원")
                         if st.button("📋 이 고객 잔금 관리로 이동", key="goto_balance_from_overpaid"):
-                            st.session_state["gen_search"] = _sel_phone2 or _sel_name2
+                            st.session_state["_gen_search_prefill"] = _sel_phone2 or _sel_name2
                             st.session_state["main_tab_idx"] = 3
                             st.rerun()
                     # 알림 자동 기록 (세션당 1회)
