@@ -3096,12 +3096,53 @@ def _render_admin_delete_requests(db_filename: str):
             reason = req.get("reason", "")
             created = str(req.get("created_at", ""))[:16].replace("T", " ")
 
+            # ── 주문 상세 정보 조회 ──
+            order_detail = None
+            cust_name = "-"
+            order_date_str = "-"
+            delivery_date_str = "-"
+            category_str = "-"
+            total_amount_str = "-"
+            paid_str = "-"
+            balance_str = "-"
+            employee_str = "-"
+            try:
+                if _supabase_orders_payments_available() and order_id:
+                    order_detail = _get_order_supabase(db_filename, int(order_id))
+                    if order_detail:
+                        cid = order_detail.get("customer_id")
+                        if cid:
+                            cust_name = _get_customer_name_supabase(db_filename, int(cid)) or "-"
+                        order_date_str = str(order_detail.get("order_date") or "-")[:10]
+                        delivery_date_str = str(order_detail.get("delivery_date") or "-")[:10]
+                        category_str = str(order_detail.get("category") or "-")
+                        total_amount = float(order_detail.get("total_amount") or 0)
+                        total_amount_str = f"{int(total_amount):,}원"
+                        employee_str = str(order_detail.get("employee_names") or "-")
+                        paid, _ = _sum_payments_by_order_supabase(db_filename, int(order_id))
+                        balance = total_amount - paid
+                        paid_str = f"{int(paid):,}원"
+                        balance_str = f"{int(balance):,}원"
+            except Exception:
+                pass
+
             with st.container(border=True):
                 col_info, col_btns = st.columns([3, 2])
                 with col_info:
                     st.markdown(f"**주문 #{order_id}** 삭제 요청")
                     st.caption(f"요청자: `{requester}` | 요청일시: {created}")
-                    st.write(f"삭제 사유: {reason or '(사유 없음)'}")
+                    # 주문 상세 정보
+                    info_col1, info_col2 = st.columns(2)
+                    with info_col1:
+                        st.write(f"👤 **고객명:** {cust_name}")
+                        st.write(f"📅 **계약일:** {order_date_str}")
+                        st.write(f"🚚 **배송일:** {delivery_date_str}")
+                    with info_col2:
+                        st.write(f"🛋️ **품목:** {category_str}")
+                        st.write(f"💰 **계약금액:** {total_amount_str}")
+                        st.write(f"💳 **결제액:** {paid_str} | 잔금: {balance_str}")
+                    st.write(f"👥 **담당직원:** {employee_str}")
+                    st.error(f"🗑️ **삭제 사유:** {reason or '(사유 없음)'}")
                 with col_btns:
                     approve_key = f"del_approve_{req_id}"
                     reject_key = f"del_reject_{req_id}"
