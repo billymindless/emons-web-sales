@@ -9297,10 +9297,39 @@ def render_customer_balance():
                     for _, _op_row in _overpaid.iterrows():
                         _op_oid = _op_row["id"]
                         _op_name = str(_op_row.get("name") or "-")
+                        _op_phone = str(_op_row.get("phone1") or "-")
                         _op_excess = float(_op_row.get("초과금액", 0))
                         _op_dlv = _op_row.get("delivery_date", "")
                         _op_dlv_str = _op_dlv.strftime("%Y-%m-%d") if hasattr(_op_dlv, "strftime") else str(_op_dlv or "-")[:10]
-                        with st.expander(f"🔴 {_op_name} — 주문 #{_op_oid} | 배송일 {_op_dlv_str} | 초과 {_op_excess:,.0f}원", expanded=False):
+                        with st.expander(f"🔴 {_op_name} ({_op_phone}) — 주문 #{_op_oid} | 배송일 {_op_dlv_str} | 초과 {_op_excess:,.0f}원", expanded=True):
+                            # 해당 주문의 결제 내역 상세 표시
+                            if not _a_payments.empty and "order_id" in _a_payments.columns:
+                                _op_pays = _a_payments[_a_payments["order_id"] == _op_oid].copy()
+                                if not _op_pays.empty:
+                                    # 표시할 컬럼 구성 (있는 것만)
+                                    _pay_detail_cols = []
+                                    _pay_col_rename = {}
+                                    for _c, _label in [
+                                        ("id", "결제ID"),
+                                        ("payment_date", "결제일"),
+                                        ("payment_method", "결제수단"),
+                                        ("card_company", "카드사/승인번호"),
+                                        ("onnuri_approval_code", "온누리승인번호"),
+                                        ("amount", "금액"),
+                                        ("fee_amount", "수수료"),
+                                        ("created_by", "등록자"),
+                                    ]:
+                                        if _c in _op_pays.columns:
+                                            _pay_detail_cols.append(_c)
+                                            _pay_col_rename[_c] = _label
+                                    _op_pays_disp = _op_pays[_pay_detail_cols].rename(columns=_pay_col_rename).copy()
+                                    # 금액 컬럼 포맷
+                                    _fmt_money_cols = [_pay_col_rename.get(c) for c in ("amount", "fee_amount") if _pay_col_rename.get(c) in _op_pays_disp.columns]
+                                    st.caption("📋 현재 결제 내역 (어떤 결제를 취소/수정할지 확인 후 아래에서 처리하세요)")
+                                    st.dataframe(_format_df_display(_op_pays_disp, _fmt_money_cols), use_container_width=True)
+                                else:
+                                    st.info("이 주문의 결제 내역이 없습니다.")
+                            st.markdown("---")
                             _customer_balance_payment_ui(db_filename, _op_oid, 0, key_prefix=f"overpaid_{_op_oid}")
                     # 알림 자동 기록 (세션당 1회)
                     _alert_key2 = f"_anomaly_alert_overpaid_{db_filename}"
