@@ -2991,6 +2991,10 @@ def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
             if err or not sc:
                 return False, str(err)
             sc.table("app_payments").delete().eq("order_id", int(order_id)).eq("db_filename", db_filename).execute()
+            try:
+                sc.table("sales").delete().eq("order_id", int(order_id)).execute()
+            except Exception:
+                pass
             sc.table("app_orders").delete().eq("id", int(order_id)).eq("db_filename", db_filename).execute()
         else:
             conn = get_tenant_conn(db_filename)
@@ -3042,8 +3046,9 @@ def _render_admin_delete_requests(db_filename: str):
                         ok, del_err = _approve_delete_order(db_filename, order_id)
                         if ok:
                             _resolve_delete_request(req_id, "approved", reviewed_by, order_id=order_id, db_filename=db_filename)
-                            st.success(f"✅ 주문 #{order_id} 삭제가 완료되었습니다.")
                             st.session_state[f"_del_done_{req_id}"] = order_id
+                            st.toast(f"✅ 주문 #{order_id} 삭제 완료", icon="✅")
+                            st.rerun()
                         else:
                             st.error(f"삭제 실패: {del_err}")
                             st.stop()
