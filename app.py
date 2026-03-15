@@ -2542,7 +2542,7 @@ def _insert_order_notification(
 
 def _get_admin_usernames_for_store(db_filename: str) -> list[str]:
     """해당 매장의 store_admin + superadmin username 목록 반환.
-    캐시된 _get_supabase_users_list() / _get_supabase_stores_list() 활용.
+    app_users.store_id (단일 매장) 와 app_user_stores (다중 매장 배정) 모두 체크.
     """
     if not _supabase_orders_payments_available() or not db_filename:
         return []
@@ -2555,6 +2555,18 @@ def _get_admin_usernames_for_store(db_filename: str) -> list[str]:
             if s.get("db_filename") == db_filename:
                 store_id = s.get("id")
                 break
+
+        # app_user_stores 에서 해당 매장에 배정된 user_id 집합 조회 (다중 매장 배정 지원)
+        user_ids_in_store: set = set()
+        if store_id is not None:
+            try:
+                sc, _err = get_supabase_client()
+                if sc and not _err:
+                    _r = sc.table("app_user_stores").select("user_id").eq("store_id", store_id).execute()
+                    user_ids_in_store = {x["user_id"] for x in (_r.data or [])}
+            except Exception:
+                pass
+
         result = []
         for u in users:
             uname = (u.get("username") or "").strip()
@@ -2563,8 +2575,10 @@ def _get_admin_usernames_for_store(db_filename: str) -> list[str]:
                 continue
             if role == "superadmin":
                 result.append(uname)
-            elif role == "store_admin" and store_id is not None and u.get("store_id") == store_id:
-                result.append(uname)
+            elif role == "store_admin" and store_id is not None:
+                # app_users.store_id 또는 app_user_stores 둘 중 하나라도 매칭되면 포함
+                if u.get("store_id") == store_id or u.get("id") in user_ids_in_store:
+                    result.append(uname)
         return list(dict.fromkeys(result))  # 중복 제거 (순서 유지)
     except Exception:
         return []
