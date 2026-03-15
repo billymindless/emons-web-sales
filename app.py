@@ -9287,7 +9287,25 @@ def render_customer_balance():
                         "employee_names": "담당자", "total_amount": "구매금액", "paid": "결제금액", "balance": "미수금"
                     })
                     st.warning(f"총 {len(_underpaid_disp)}건, 미수금 합계 {int(_underpaid_disp['미수금'].sum()):,}원")
-                    st.dataframe(_format_df_display(_underpaid_disp, ["구매금액", "결제금액", "미수금"]), use_container_width=True)
+                    st.caption("💡 행을 클릭하면 해당 고객의 잔금 관리 화면으로 바로 이동할 수 있습니다.")
+                    _underpaid_sel = st.dataframe(
+                        _format_df_display(_underpaid_disp, ["구매금액", "결제금액", "미수금"]),
+                        use_container_width=True,
+                        selection_mode="single-row",
+                        on_select="rerun",
+                        key="anomaly_underpaid_sel",
+                    )
+                    _underpaid_sel_rows = _underpaid_sel.selection.rows if hasattr(_underpaid_sel, "selection") else []
+                    if _underpaid_sel_rows:
+                        _sel_idx = _underpaid_sel_rows[0]
+                        _sel_row = _underpaid.iloc[_sel_idx]
+                        _sel_name = str(_sel_row.get("name") or "")
+                        _sel_phone = str(_sel_row.get("phone1") or "")
+                        st.info(f"선택: **{_sel_name}** / 미수금 {int(_sel_row.get('balance', 0)):,}원")
+                        if st.button("📋 이 고객 잔금 관리로 이동", key="goto_balance_from_underpaid"):
+                            st.session_state["gen_search"] = _sel_phone or _sel_name
+                            st.session_state["main_tab_idx"] = 3
+                            st.rerun()
                     # 알림 자동 기록 (세션당 1회)
                     _alert_key = f"_anomaly_alert_underpaid_{db_filename}"
                     if _alert_key not in st.session_state:
@@ -9311,7 +9329,25 @@ def render_customer_balance():
                         "employee_names": "담당자", "total_amount": "구매금액", "paid": "결제금액"
                     })
                     st.error(f"⛔ 총 {len(_overpaid_disp)}건, 초과결제 합계 {int(_overpaid_disp['초과금액'].sum()):,}원 — 즉시 확인 필요!")
-                    st.dataframe(_format_df_display(_overpaid_disp, ["구매금액", "결제금액", "초과금액"]), use_container_width=True)
+                    st.caption("💡 행을 클릭하면 해당 고객의 잔금 관리 화면으로 바로 이동할 수 있습니다.")
+                    _overpaid_sel = st.dataframe(
+                        _format_df_display(_overpaid_disp, ["구매금액", "결제금액", "초과금액"]),
+                        use_container_width=True,
+                        selection_mode="single-row",
+                        on_select="rerun",
+                        key="anomaly_overpaid_sel",
+                    )
+                    _overpaid_sel_rows = _overpaid_sel.selection.rows if hasattr(_overpaid_sel, "selection") else []
+                    if _overpaid_sel_rows:
+                        _sel_idx2 = _overpaid_sel_rows[0]
+                        _sel_row2 = _overpaid.iloc[_sel_idx2]
+                        _sel_name2 = str(_sel_row2.get("name") or "")
+                        _sel_phone2 = str(_sel_row2.get("phone1") or "")
+                        st.info(f"선택: **{_sel_name2}** / 초과결제 {int(abs(_sel_row2.get('balance', 0))):,}원")
+                        if st.button("📋 이 고객 잔금 관리로 이동", key="goto_balance_from_overpaid"):
+                            st.session_state["gen_search"] = _sel_phone2 or _sel_name2
+                            st.session_state["main_tab_idx"] = 3
+                            st.rerun()
                     # 알림 자동 기록 (세션당 1회)
                     _alert_key2 = f"_anomaly_alert_overpaid_{db_filename}"
                     if _alert_key2 not in st.session_state:
