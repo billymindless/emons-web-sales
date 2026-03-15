@@ -3054,7 +3054,9 @@ def _render_admin_delete_requests(db_filename: str):
                     if st.button("✅ 승인 (삭제 실행)", key=approve_key, type="primary"):
                         ok, del_err = _approve_delete_order(db_filename, order_id)
                         if ok:
-                            _resolve_delete_request(req_id, "approved", reviewed_by, order_id=order_id, db_filename=db_filename)
+                            res_ok, res_err = _resolve_delete_request(req_id, "approved", reviewed_by, order_id=order_id, db_filename=db_filename)
+                            if not res_ok:
+                                st.warning(f"주문은 삭제되었으나 요청 상태 갱신 실패: {res_err}")
                             st.session_state[f"_del_done_{req_id}"] = order_id
                             st.toast(f"✅ 주문 #{order_id} 삭제 완료", icon="✅")
                             st.rerun()
@@ -3066,8 +3068,9 @@ def _render_admin_delete_requests(db_filename: str):
                     if st.button("❌ 반려", key=reject_key):
                         ok, rej_err = _resolve_delete_request(req_id, "rejected", reviewed_by, reject_reason_val, order_id=order_id, db_filename=db_filename)
                         if ok:
-                            st.warning(f"주문 #{order_id} 삭제 요청이 반려되었습니다.")
+                            st.toast(f"주문 #{order_id} 삭제 요청이 반려되었습니다.", icon="❌")
                             st.session_state[f"_del_rejected_{req_id}"] = order_id
+                            st.rerun()
                         else:
                             st.error(f"반려 처리 실패: {rej_err}")
 
