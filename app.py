@@ -6779,7 +6779,7 @@ def render_store_admin_employees():
                         "store_id": int(store_id),
                         "name": (new_name or "").strip() or None,
                         "email": None,
-                    }).select("id").execute()
+                    }).execute()
                     new_id = ins.data[0]["id"] if ins.data else None
                     if new_id:
                         try:
