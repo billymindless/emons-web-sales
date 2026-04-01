@@ -10403,27 +10403,89 @@ def render_dashboard():
 
     today_sales_net = today_sales_new + today_sales_adj
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1:
-        st.metric("일일 수납액", f"{daily_sales:,.0f}원")
-    with c2:
-        st.markdown("일일 계약매출")
-        st.markdown(
-            f"<p style='margin:0; color:#d32f2f; font-size:2rem; font-weight:700;'>{today_sales_net:,.0f}원</p>",
-            unsafe_allow_html=True,
-        )
-        if today_sales_adj < 0:
-            st.caption(f"신규 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원")
-        elif today_sales_adj > 0:
-            st.caption(f"신규 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원")
-    with c3:
-        st.metric("누적 수납액", f"{cumulative_sales:,.0f}원")
-    with c4:
-        st.metric("예상 총매출", f"{expected_total_sales:,.0f}원")
-    with c5:
-        st.metric("마진율", f"{margin_pct:.1f}%")
-    with c6:
-        st.metric("판매건수", f"{order_count}건")
+    # 일일 계약매출 보조 설명
+    _contract_sub = ""
+    if today_sales_adj < 0:
+        _contract_sub = f"신규 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원"
+    elif today_sales_adj > 0:
+        _contract_sub = f"신규 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원"
+
+    st.markdown(
+        f"""
+        <style>
+        .kpi-table {{
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 8px 0;
+            margin-bottom: 0.5rem;
+        }}
+        .kpi-table td {{
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 14px 16px;
+            text-align: center;
+            vertical-align: top;
+            width: 16.6%;
+        }}
+        .kpi-table td.highlight {{
+            background: linear-gradient(135deg, #fff3e0, #ffe0b2);
+            border: 2px solid #ff6f00;
+        }}
+        .kpi-label {{
+            font-size: 0.78rem;
+            color: #666;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            margin-bottom: 6px;
+        }}
+        .kpi-value {{
+            font-size: 1.45rem;
+            font-weight: 800;
+            color: #1a1a2e;
+            line-height: 1.2;
+        }}
+        .kpi-value.contract {{
+            color: #e65100;
+            font-size: 1.6rem;
+        }}
+        .kpi-sub {{
+            font-size: 0.7rem;
+            color: #888;
+            margin-top: 4px;
+        }}
+        </style>
+        <table class="kpi-table">
+          <tr>
+            <td>
+              <div class="kpi-label">📥 일일 수납액</div>
+              <div class="kpi-value">{daily_sales:,.0f}원</div>
+            </td>
+            <td class="highlight">
+              <div class="kpi-label">🔴 일일 계약매출</div>
+              <div class="kpi-value contract">{today_sales_net:,.0f}원</div>
+              <div class="kpi-sub">{_contract_sub}</div>
+            </td>
+            <td>
+              <div class="kpi-label">📊 누적 수납액 (월)</div>
+              <div class="kpi-value">{cumulative_sales:,.0f}원</div>
+            </td>
+            <td>
+              <div class="kpi-label">🎯 예상 월매출</div>
+              <div class="kpi-value">{expected_total_sales:,.0f}원</div>
+            </td>
+            <td>
+              <div class="kpi-label">💹 마진율</div>
+              <div class="kpi-value">{margin_pct:.1f}%</div>
+            </td>
+            <td>
+              <div class="kpi-label">🛒 판매건수</div>
+              <div class="kpi-value">{order_count}건</div>
+            </td>
+          </tr>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.divider()
     # 주문별 결제합계 - 이하 "잔금 불일치 경고" + "미수금 현황" 두 곳에서 공유
