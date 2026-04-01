@@ -4384,7 +4384,13 @@ def render_login():
                                 user_id, uname, role, store_id, db_filename = app_user
                                 allowed_stores = get_user_allowed_stores(user_id) if role != "superadmin" else []
                                 if allowed_stores:
-                                    store_id, db_filename = allowed_stores[0][0], allowed_stores[0][1]
+                                    # 기본 매장(app_users.store_id)이 allowed_stores에 있으면 우선 적용
+                                    _matched_store = next((s for s in allowed_stores if s[0] == store_id), None)
+                                    if _matched_store:
+                                        store_id, db_filename = _matched_store[0], _matched_store[1]
+                                    else:
+                                        # 기본 매장이 없거나 배정 목록과 불일치하면 첫 매장으로 fallback
+                                        store_id, db_filename = allowed_stores[0][0], allowed_stores[0][1]
                                 display_map = _get_app_user_display_name_map()
                                 display_name = (display_map.get(str(uname).strip()) or display_map.get(str(uname).strip().lower()) or uname or "").strip()
                                 st.session_state.logged_in = True
