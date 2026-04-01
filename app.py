@@ -10456,14 +10456,14 @@ def render_dashboard():
         </style>
         <table class="kpi-table">
           <tr>
-            <td>
-              <div class="kpi-label">📥 일일 수납액</div>
-              <div class="kpi-value">{daily_sales:,.0f}원</div>
-            </td>
             <td class="highlight">
               <div class="kpi-label">🔴 일일 계약매출</div>
               <div class="kpi-value contract">{today_sales_net:,.0f}원</div>
               <div class="kpi-sub">{_contract_sub}</div>
+            </td>
+            <td>
+              <div class="kpi-label">📥 일일 수납액</div>
+              <div class="kpi-value">{daily_sales:,.0f}원</div>
             </td>
             <td>
               <div class="kpi-label">📊 누적 수납액 (월)</div>
