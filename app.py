@@ -28,7 +28,7 @@ import plotly.graph_objects as go
 try:
     from crm_automation import render_crm_menu  # type: ignore
     CRM_MODULE_AVAILABLE = True
-except ImportError:
+except Exception:
     CRM_MODULE_AVAILABLE = False
 try:
     import folium
