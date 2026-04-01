@@ -10492,7 +10492,7 @@ def render_dashboard():
             padding: 14px 16px;
             text-align: center;
             vertical-align: top;
-            width: 16.6%;
+            width: 14.2%;
         }}
         .kpi-table td.highlight {{
             background: linear-gradient(135deg, #fff3e0, #ffe0b2);
@@ -10529,6 +10529,11 @@ def render_dashboard():
               <div class="kpi-sub">{_contract_sub}</div>
             </td>
             <td>
+              <div class="kpi-label">📈 누적매출 (월)</div>
+              <div class="kpi-value">{expected_total_sales:,.0f}원</div>
+              <div class="kpi-sub">{month_start.strftime("%m/%d")} ~ 오늘</div>
+            </td>
+            <td>
               <div class="kpi-label">📥 일일 수납액</div>
               <div class="kpi-value">{daily_sales:,.0f}원</div>
             </td>
@@ -10542,7 +10547,7 @@ def render_dashboard():
               <div class="kpi-sub">{_proj_sub}</div>
             </td>
             <td>
-              <div class="kpi-label">💹 마진율</div>
+              <div class="kpi-label">💹 누적 마진율 (월)</div>
               <div class="kpi-value">{margin_pct:.1f}%</div>
             </td>
             <td>
