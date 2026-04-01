@@ -6643,49 +6643,193 @@ def render_employee_management():
 
 
 CONFIRM_DATA_RESET_PHRASE = "데이터를 모두 초기화합니다"
+CONFIRM_DATA_RESET_STORE_PREFIX = "매장 초기화:"
+
+
+def _danger_zone_delete_store_data(client, db_fn: str, store_name: str, scope: str) -> list[str]:
+    """단일 매장의 데이터를 scope에 따라 삭제. 반환: 오류 메시지 목록."""
+    errors = []
+    sales_col = _sales_tenant_column()
+
+    # 1) 결제 내역 (app_payments) — 반드시 orders 전에 삭제
+    try:
+        client.table("app_payments").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_fn).execute()
+    except Exception as e:
+        errors.append(f"app_payments({db_fn}): {e}")
+
+    # 2) 매출 통계 (sales) — order_id 기반 또는 tenant 컬럼 기반
+    try:
+        if sales_col:
+            client.table("sales").delete().eq(sales_col, db_fn).execute()
+        else:
+            # tenant 컬럼 없으면 order_id 목록을 먼저 조회 후 삭제
+            try:
+                oids_r = client.table("app_orders").select("id").eq(ORDERS_PAYMENTS_TENANT_COL, db_fn).execute()
+                oids = [x["id"] for x in (oids_r.data or [])]
+                if oids:
+                    client.table("sales").delete().in_("order_id", oids).execute()
+            except Exception as e2:
+                errors.append(f"sales(order_id 방식)({db_fn}): {e2}")
+    except Exception as e:
+        errors.append(f"sales({db_fn}): {e}")
+
+    # 3) 주문 (app_orders)
+    try:
+        client.table("app_orders").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_fn).execute()
+    except Exception as e:
+        errors.append(f"app_orders({db_fn}): {e}")
+
+    # 4) 고객 정보 (app_customers) — scope에 포함된 경우만
+    if scope in ("customers", "full"):
+        try:
+            client.table("app_customers").delete().eq("store_name", store_name).execute()
+        except Exception as e:
+            errors.append(f"app_customers({store_name}): {e}")
+
+    # 5) 알림·삭제요청 기록 (app_edit_requests) — full scope만
+    if scope == "full":
+        try:
+            client.table("app_edit_requests").delete().eq("db_filename", db_fn).execute()
+        except Exception as e:
+            errors.append(f"app_edit_requests({db_fn}): {e}")
+
+    return errors
 
 
 def _superadmin_tab_danger_zone_data_reset():
     """
-    Superadmin 전용 Danger Zone: 매출/주문 테스트 데이터만 초기화.
-    app_orders, app_payments만 삭제. app_users, app_stores 등 마스터 데이터는 절대 삭제하지 않음.
-    이중 잠금: 문구를 정확히 입력해야만 실행 버튼 활성화.
+    Superadmin 전용 Danger Zone: 매장별 또는 전체 영업 데이터 초기화.
+    삭제 대상: app_payments → sales → app_orders → (app_customers) → (app_edit_requests)
+    app_users, app_stores 등 마스터 데이터는 절대 삭제하지 않음.
     """
-    st.warning("테스트 기간이 끝나고 프로덕션 배포 전, **매출/주문 관련 데이터만** 한 번에 비울 수 있습니다. **직원·매장 정보는 삭제되지 않습니다.**")
-    with st.expander("⚠️ 시스템 데이터 초기화 (Danger Zone)", expanded=False):
-        st.caption("아래 문구를 **정확히** 입력한 경우에만 초기화 실행 버튼이 활성화됩니다.")
+    # superadmin 이중 확인
+    if st.session_state.get("role") != "superadmin":
+        st.error("이 기능은 최고 관리자(superadmin)만 사용할 수 있습니다.")
+        return
+
+    st.warning(
+        "**⚠️ Danger Zone** — 이 화면의 모든 작업은 **되돌릴 수 없습니다.**  \n"
+        "직원·매장 계정 정보는 삭제되지 않습니다."
+    )
+
+    stores_list = _get_supabase_stores_list()
+    if not stores_list:
+        st.info("등록된 매장이 없습니다.")
+        return
+
+    # ── 모드 선택 ──
+    reset_mode = st.radio(
+        "초기화 범위",
+        ["전체 매장 초기화", "특정 매장만 초기화"],
+        key="dz_mode_radio",
+        horizontal=True,
+    )
+
+    # ── 매장 선택 (매장별 모드) ──
+    selected_store = None
+    if reset_mode == "특정 매장만 초기화":
+        store_options = {s["store_name"]: s for s in stores_list if s.get("store_name")}
+        selected_store_name = st.selectbox(
+            "초기화할 매장 선택",
+            list(store_options.keys()),
+            key="dz_store_select",
+        )
+        selected_store = store_options.get(selected_store_name)
+
+    # ── 삭제 범위 선택 ──
+    st.markdown("**삭제 범위 선택**")
+    scope_label = st.radio(
+        "삭제 범위",
+        [
+            "주문·결제·통계만 삭제 (고객 정보 유지)",
+            "고객 정보도 함께 삭제",
+            "알림·요청 기록까지 완전 초기화",
+        ],
+        key="dz_scope_radio",
+        label_visibility="collapsed",
+    )
+    scope_map = {
+        "주문·결제·통계만 삭제 (고객 정보 유지)": "orders",
+        "고객 정보도 함께 삭제": "customers",
+        "알림·요청 기록까지 완전 초기화": "full",
+    }
+    scope = scope_map[scope_label]
+
+    # ── 삭제 대상 요약 ──
+    deleted_tables = ["app_payments", "sales", "app_orders"]
+    if scope in ("customers", "full"):
+        deleted_tables.append("app_customers")
+    if scope == "full":
+        deleted_tables.append("app_edit_requests")
+
+    target_store_label = "전체 매장" if reset_mode == "전체 매장 초기화" else f"**{selected_store['store_name'] if selected_store else '-'}**"
+    st.info(
+        f"삭제 대상: {target_store_label}  \n"
+        f"삭제 테이블: `{'`, `'.join(deleted_tables)}`  \n"
+        f"유지 테이블: `app_users`, `app_stores` (직원·매장 계정)"
+    )
+
+    # ── 확인 문구 입력 ──
+    with st.expander("🔐 초기화 실행 (확인 문구 입력 필요)", expanded=False):
+        st.caption(f'아래 문구를 **정확히** 입력해야만 실행 버튼이 활성화됩니다.')
+
+        if reset_mode == "전체 매장 초기화":
+            required_phrase = CONFIRM_DATA_RESET_PHRASE
+            st.code(required_phrase)
+        else:
+            sname = selected_store["store_name"] if selected_store else ""
+            required_phrase = f"{CONFIRM_DATA_RESET_STORE_PREFIX} {sname}"
+            st.code(required_phrase)
+
         confirm_input = st.text_input(
             "확인 문구 입력",
-            placeholder=f'"{CONFIRM_DATA_RESET_PHRASE}" 를 그대로 입력하세요',
+            placeholder="위 문구를 그대로 입력하세요",
             key="danger_zone_confirm_input",
         )
-        phrase_ok = (confirm_input or "").strip() == CONFIRM_DATA_RESET_PHRASE
-        if st.button("초기화 실행", key="danger_zone_execute_btn", disabled=not phrase_ok, type="primary"):
+        phrase_ok = (confirm_input or "").strip() == required_phrase
+
+        if st.button(
+            "🗑️ 초기화 실행",
+            key="danger_zone_execute_btn",
+            disabled=not phrase_ok,
+            type="primary",
+        ):
             client, err = get_supabase_client()
             if err or not client:
-                st.error("Supabase 연결에 실패했습니다. 초기화를 수행할 수 없습니다.")
+                st.error("Supabase 연결에 실패했습니다.")
                 return
-            stores_list = _get_supabase_stores_list()
-            if not stores_list:
-                st.info("등록된 매장이 없습니다. 삭제할 매출/결제 데이터가 없을 수 있습니다.")
-                return
-            errors = []
-            for s in stores_list:
+
+            all_errors = []
+            deleted_stores = []
+
+            if reset_mode == "전체 매장 초기화":
+                target_stores = stores_list
+            else:
+                target_stores = [selected_store] if selected_store else []
+
+            progress = st.progress(0, text="초기화 중...")
+            for i, s in enumerate(target_stores):
                 db_fn = s.get("db_filename")
+                sname = s.get("store_name") or db_fn
                 if not db_fn:
                     continue
-                try:
-                    client.table("app_payments").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_fn).execute()
-                except Exception as e:
-                    errors.append(f"app_payments({db_fn}): {e}")
-                try:
-                    client.table("app_orders").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_fn).execute()
-                except Exception as e:
-                    errors.append(f"app_orders({db_fn}): {e}")
-            if errors:
-                st.error("일부 삭제 실패: " + "; ".join(errors[:5]))
+                store_name_val = _get_store_name_by_db(db_fn) or sname
+                errs = _danger_zone_delete_store_data(client, db_fn, store_name_val, scope)
+                all_errors.extend(errs)
+                deleted_stores.append(sname)
+                progress.progress((i + 1) / len(target_stores), text=f"{sname} 처리 완료")
+
             clear_data_cache()
-            st.success("초기화 완료되었습니다. 매출/주문 데이터(app_orders, app_payments)만 삭제되었습니다. **app_users, app_stores는 변경되지 않았습니다.**")
+            progress.empty()
+
+            if all_errors:
+                st.warning("일부 삭제 실패:\n" + "\n".join(all_errors[:10]))
+            else:
+                st.success(
+                    f"✅ 초기화 완료!  \n"
+                    f"처리 매장: {', '.join(deleted_stores)}  \n"
+                    f"삭제 테이블: {', '.join(deleted_tables)}"
+                )
             st.rerun()
 
 
