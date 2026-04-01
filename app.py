@@ -613,6 +613,9 @@ def _get_supabase_employee_list_with_stores():
         배정매장 = ", ".join(n for n in names if n)
         if not 배정매장 and u.get("store_id"):
             배정매장 = store_names_by_id.get(u["store_id"], "") or ""
+        # 기본 매장: app_users.store_id 기준
+        primary_sid = u.get("store_id")
+        기본매장 = store_names_by_id.get(primary_sid, "") if primary_sid else ""
         out.append({
             "id": uid,
             "email": u.get("email"),
@@ -620,6 +623,7 @@ def _get_supabase_employee_list_with_stores():
             "name": u.get("name"),
             "role": u.get("role"),
             "배정매장": 배정매장,
+            "기본매장": 기본매장,
         })
     return out
 
@@ -6675,7 +6679,7 @@ def render_employee_management():
     st.subheader("직원 명부")
     if use_supabase:
         emp_list = _get_supabase_employee_list_with_stores()
-        df = pd.DataFrame(emp_list) if emp_list else pd.DataFrame(columns=["id", "email", "username", "name", "role", "배정매장"])
+        df = pd.DataFrame(emp_list) if emp_list else pd.DataFrame(columns=["id", "email", "username", "name", "role", "배정매장", "기본매장"])
     else:
         conn = get_master_conn()
         try:
@@ -6717,8 +6721,13 @@ def render_employee_management():
     else:
         df_display["사용자명"] = df_display["username"]
     df_display["배정매장"] = df_display["배정매장"].fillna("")
-    df_display = df_display[["id", "email", "사용자명", "권한", "배정매장"]]
-    df_display.columns = ["ID", "이메일", "사용자명", "권한", "배정 매장"]
+    if "기본매장" in df_display.columns:
+        df_display["기본매장"] = df_display["기본매장"].fillna("")
+        df_display = df_display[["id", "email", "사용자명", "권한", "기본매장", "배정매장"]]
+        df_display.columns = ["ID", "이메일", "사용자명", "권한", "기본 매장 (로그인 시)", "배정 매장 (전체)"]
+    else:
+        df_display = df_display[["id", "email", "사용자명", "권한", "배정매장"]]
+        df_display.columns = ["ID", "이메일", "사용자명", "권한", "배정 매장"]
     st.dataframe(df_display, use_container_width=True)
 
 
