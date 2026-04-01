@@ -10279,23 +10279,11 @@ def render_dashboard():
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
+        st.metric("일일 수납액", f"{daily_sales:,.0f}원")
         if today_sales_adj < 0:
-            st.metric(
-                "일일 계약 순매출",
-                f"{today_sales_net:,.0f}원",
-                delta=f"{today_sales_adj:,.0f}원 조정",
-                delta_color="normal",
-            )
-            st.caption(f"신규 계약 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원")
+            st.caption(f"계약 조정(판매기록): 신규 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원 / 순매출 {today_sales_net:,.0f}원")
         elif today_sales_adj > 0:
-            st.metric(
-                "일일 계약 순매출",
-                f"{today_sales_net:,.0f}원",
-                delta=f"+{today_sales_adj:,.0f}원 조정",
-            )
-            st.caption(f"신규 계약 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원")
-        else:
-            st.metric("일일 매출", f"{daily_sales:,.0f}원")
+            st.caption(f"계약 조정(판매기록): 신규 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원 / 순매출 {today_sales_net:,.0f}원")
     with c2:
         st.metric("누적 수납액", f"{cumulative_sales:,.0f}원")
     with c3:
