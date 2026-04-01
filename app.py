@@ -6160,7 +6160,48 @@ def render_monthly_payment_report(is_superadmin: bool):
 
         group_col = "월" if query_mode == "월별/연도별 조회" else "일자"
 
-        # 3. 화면 표시용 그룹핑(요약) 집계
+        # 날짜 범위 계산 (직접 날짜 지정 모드에서만 주간 상세 표시 적용)
+        _date_diff = (date_range_end - date_range_start).days
+        _show_inline_detail = (query_mode == "직접 날짜 지정") and (_date_diff <= 7)
+
+        # 결제수단 조회 (1주일 이하 직접 날짜 지정 모드에서만)
+        df_emp["결제수단"] = ""
+        if _show_inline_detail:
+            try:
+                _sc, _ = get_supabase_client()
+                if _sc:
+                    for _fn in df_emp["_db_fn"].dropna().unique():
+                        _mask = df_emp["_db_fn"] == _fn
+                        _oids = df_emp.loc[_mask, "원본주문ID"].dropna().astype(int).unique().tolist()
+                        if not _oids:
+                            continue
+                        _pay_method_map: dict = {}
+                        _chunks = [_oids[i:i+100] for i in range(0, len(_oids), 100)]
+                        for _chunk in _chunks:
+                            _pr = _sc.table("app_payments").select(
+                                "order_id, payment_method, card_company"
+                            ).eq(ORDERS_PAYMENTS_TENANT_COL, _fn).in_("order_id", _chunk).execute()
+                            for _prow in (_pr.data or []):
+                                _oid_key = _prow.get("order_id")
+                                if _oid_key is None:
+                                    continue
+                                _pm = str(_prow.get("payment_method") or "").strip()
+                                _cc = str(_prow.get("card_company") or "").strip()
+                                if _cc and _cc not in ("-", ""):
+                                    _pm = f"{_pm}({_cc})" if _pm else _cc
+                                if _pm:
+                                    existing = _pay_method_map.get(int(_oid_key), [])
+                                    if _pm not in existing:
+                                        existing.append(_pm)
+                                    _pay_method_map[int(_oid_key)] = existing
+                        df_emp.loc[_mask, "결제수단"] = df_emp.loc[_mask, "원본주문ID"].apply(
+                            lambda oid, pm=_pay_method_map: ", ".join(pm.get(int(oid), [])) if pd.notna(oid) else ""
+                        )
+            except Exception as _pe:
+                st.caption(f"⚠️ 결제수단 조회 오류: {_pe}")
+
+        # 3. 화면 표시
+        # 3-a. 요약 집계 (항상 표시)
         if selected_emp == "전체 직원":
             summary = df_emp.groupby(["매장명", group_col, "직원명"], as_index=False)[["판매금액", "판매건수"]].sum()
         else:
@@ -6175,12 +6216,28 @@ def render_monthly_payment_report(is_superadmin: bool):
         disp_df["판매금액"] = disp_df["판매금액"].apply(lambda x: f"{x:,}원")
         disp_df["판매건수"] = disp_df["판매건수"].apply(lambda x: f"{x:g}건")
 
-        st.write("📌 **실적 요약 (화면용)**")
+        st.write("📌 **실적 요약**")
         st.dataframe(disp_df, use_container_width=True)
         st.caption("※ transaction_date(판매/변경 시점) 기준 집계. 증액/감액 delta도 포함됩니다.")
-        st.caption("엑셀을 다운로드하시면 '집계요약' 시트와 개별 판매 건이 기록된 '상세내역' 시트를 모두 확인하실 수 있습니다.")
 
-        # 4. 엑셀 다운로드 (다중 시트: 요약 + 상세 분리)
+        # 3-b. 1주일 이하 직접 날짜 지정: 상세내역 화면에 바로 표시 (결제수단 포함)
+        if _show_inline_detail:
+            st.write("📋 **전체 상세 내역 (결제수단 포함)**")
+            detail_inline = df_emp.copy()
+            detail_inline["판매금액"] = detail_inline["판매금액"].round(0).astype(int)
+            detail_inline["판매건수"] = detail_inline["판매건수"].round(2)
+            detail_inline = detail_inline.sort_values(by=["일자", "매장명", "직원명"], ascending=[True, True, True])
+            detail_inline = detail_inline.drop(columns=[c for c in ["_db_fn", "월"] if c in detail_inline.columns])
+            inline_cols = ["매장명", "일자", "직원명", "고객명", "전화번호", "결제수단", "비고", "판매금액", "판매건수", "원본주문ID"]
+            detail_inline = detail_inline[[c for c in inline_cols if c in detail_inline.columns]]
+            disp_inline = detail_inline.copy()
+            disp_inline["판매금액"] = disp_inline["판매금액"].apply(lambda x: f"{x:,}원")
+            disp_inline["판매건수"] = disp_inline["판매건수"].apply(lambda x: f"{x:g}건")
+            st.dataframe(disp_inline, use_container_width=True)
+        else:
+            st.caption("📥 상세 내역(결제수단 포함)은 아래 엑셀 다운로드에서 확인하세요. (8일 이상 조회 시 다운로드 전용)")
+
+        # 4. 엑셀 다운로드 (다중 시트: 요약 + 상세 분리, 결제수단 포함)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             summary.to_excel(writer, sheet_name="집계요약", index=False)
@@ -6190,7 +6247,7 @@ def render_monthly_payment_report(is_superadmin: bool):
             detail_df["판매건수"] = detail_df["판매건수"].round(2)
             detail_df = detail_df.sort_values(by=["일자", "매장명", "직원명"], ascending=[False, True, True])
             detail_df = detail_df.drop(columns=[c for c in ["_db_fn"] if c in detail_df.columns])
-            ordered_cols = ["매장명", "일자", "월", "직원명", "고객명", "전화번호", "비고", "판매금액", "판매건수", "원본주문ID"]
+            ordered_cols = ["매장명", "일자", "월", "직원명", "고객명", "전화번호", "결제수단", "비고", "판매금액", "판매건수", "원본주문ID"]
             detail_df = detail_df[[c for c in ordered_cols if c in detail_df.columns]]
             detail_df.to_excel(writer, sheet_name="상세내역", index=False)
 
