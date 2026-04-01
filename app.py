@@ -6422,14 +6422,31 @@ def render_employee_management():
                             default=current_names,
                             key="emp_update_stores",
                         )
+                        # 기본 매장 지정 (로그인 시 자동 선택될 매장)
+                        _cur_primary_sid = urow.get("store_id") if urow else None
+                        _cur_primary_name = all_stores_df[all_stores_df["id"] == _cur_primary_sid]["store_name"].iloc[0] if (_cur_primary_sid is not None and not all_stores_df[all_stores_df["id"] == _cur_primary_sid].empty) else (current_names[0] if current_names else None)
+                        _all_store_names = all_stores_df["store_name"].tolist()
+                        _primary_idx = _all_store_names.index(_cur_primary_name) if _cur_primary_name in _all_store_names else 0
+                        edit_primary_store = st.selectbox(
+                            "🏠 기본 매장 (로그인 시 자동 선택)",
+                            _all_store_names,
+                            index=_primary_idx,
+                            key="emp_update_primary_store",
+                            help="여러 매장에 배정된 경우 로그인할 때 기본으로 선택될 매장을 지정합니다.",
+                        )
                         if st.form_submit_button("저장"):
                             store_ids = all_stores_df[all_stores_df["store_name"].isin(edit_stores)]["id"].tolist()
-                            first_sid = store_ids[0] if store_ids else None
+                            # 기본 매장 store_id를 first_sid로 사용
+                            _primary_rows = all_stores_df[all_stores_df["store_name"] == edit_primary_store]
+                            first_sid = int(_primary_rows.iloc[0]["id"]) if not _primary_rows.empty else (store_ids[0] if store_ids else None)
+                            # 기본 매장이 배정 매장에 없으면 자동으로 포함
+                            if first_sid and first_sid not in store_ids:
+                                store_ids = [first_sid] + store_ids
                             try:
                                 if use_supabase:
                                     _supabase_update_app_user(edit_user_id, (edit_name or "").strip() or None, edit_role, first_sid, store_ids)
                                     clear_data_cache()
-                                    st.success("직원 정보가 저장되었습니다.")
+                                    st.success(f"직원 정보가 저장되었습니다. 기본 매장: {edit_primary_store}")
                                 else:
                                     conn = get_master_conn()
                                     try:
@@ -6442,7 +6459,7 @@ def render_employee_management():
                                             conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (edit_user_id, sid))
                                         conn.commit()
                                         clear_data_cache()
-                                        st.success("직원 정보가 저장되었습니다.")
+                                        st.success(f"직원 정보가 저장되었습니다. 기본 매장: {edit_primary_store}")
                                     finally:
                                         conn.close()
                                 st.rerun()
@@ -6560,9 +6577,25 @@ def render_employee_management():
                         default=current_names,
                         key="emp_edit_stores",
                     )
+                    # 기본 매장 지정
+                    _su = next((x for x in _get_supabase_users_list() if x.get("id") == store_edit_user_id), None) if use_supabase else None
+                    _cur_primary_sid2 = _su.get("store_id") if _su else (current_ids[0] if current_ids else None)
+                    _cur_primary_name2 = all_stores_df[all_stores_df["id"] == _cur_primary_sid2]["store_name"].iloc[0] if (_cur_primary_sid2 is not None and not all_stores_df[all_stores_df["id"] == _cur_primary_sid2].empty) else (current_names[0] if current_names else None)
+                    _all_store_names2 = all_stores_df["store_name"].tolist()
+                    _primary_idx2 = _all_store_names2.index(_cur_primary_name2) if _cur_primary_name2 in _all_store_names2 else 0
+                    edit_primary_store2 = st.selectbox(
+                        "🏠 기본 매장 (로그인 시 자동 선택)",
+                        _all_store_names2,
+                        index=_primary_idx2,
+                        key="emp_edit_primary_store",
+                        help="로그인할 때 기본으로 선택될 매장입니다.",
+                    )
                     if st.button("배정 매장 저장", key="emp_edit_save_btn"):
                         store_ids = all_stores_df[all_stores_df["store_name"].isin(edited_stores)]["id"].tolist()
-                        first_sid = store_ids[0] if store_ids else None
+                        _prows2 = all_stores_df[all_stores_df["store_name"] == edit_primary_store2]
+                        first_sid = int(_prows2.iloc[0]["id"]) if not _prows2.empty else (store_ids[0] if store_ids else None)
+                        if first_sid and first_sid not in store_ids:
+                            store_ids = [first_sid] + store_ids
                         try:
                             if use_supabase:
                                 u = next((x for x in _get_supabase_users_list() if x.get("id") == store_edit_user_id), None)
@@ -6570,7 +6603,7 @@ def render_employee_management():
                                 cur_role = u.get("role") if u else "user"
                                 _supabase_update_app_user(store_edit_user_id, cur_name, cur_role, first_sid, store_ids)
                                 clear_data_cache()
-                                st.success("배정 매장이 저장되었습니다.")
+                                st.success(f"배정 매장이 저장되었습니다. 기본 매장: {edit_primary_store2}")
                             else:
                                 conn = get_master_conn()
                                 try:
