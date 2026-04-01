@@ -1461,7 +1461,7 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
         r = q.execute()
         if r.data and len(r.data) > 0:
             st.session_state.pop("supabase_error", None)
-            return pd.DataFrame(r.data)
+            return _filter_sales_to_store_orders(db_filename, pd.DataFrame(r.data))
         return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names"])
     except Exception as e:
         # employee_names 컬럼이 없는 구 스키마면 기본 컬럼만 조회
@@ -1477,12 +1477,49 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
             if r2.data and len(r2.data) > 0:
                 df2 = pd.DataFrame(r2.data)
                 df2["employee_names"] = None
-                return df2
+                return _filter_sales_to_store_orders(db_filename, df2)
         except Exception:
             pass
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
         return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names"])
+
+
+@st.cache_data(ttl=600)
+def _get_store_order_ids_cached(db_filename: str) -> list[int]:
+    """매장별 app_orders id 목록 캐시. sales 테넌트 컬럼 미설정 시 2차 격리 필터에 사용."""
+    if not db_filename or not _supabase_orders_payments_available():
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_orders").select("id").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).execute()
+        return [int(x["id"]) for x in (r.data or []) if x.get("id") is not None]
+    except Exception:
+        return []
+
+
+def _filter_sales_to_store_orders(db_filename: str, sales_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    sales 테이블 매장 격리 보정.
+    - sales_tenant_column이 있으면 테넌트 필터가 이미 적용되므로 그대로 반환.
+    - 없으면 app_orders(db_filename) 기준 order_id 교집합만 유지.
+    """
+    if sales_df.empty:
+        return sales_df
+    if _sales_tenant_column():
+        return sales_df
+    if "order_id" not in sales_df.columns:
+        return sales_df.iloc[0:0].copy()
+
+    valid_order_ids = _get_store_order_ids_cached(db_filename)
+    if not valid_order_ids:
+        return sales_df.iloc[0:0].copy()
+
+    _oid = pd.to_numeric(sales_df["order_id"], errors="coerce")
+    filtered = sales_df[_oid.isin(valid_order_ids)].copy()
+    return filtered
 
 
 @st.cache_data(ttl=600)
@@ -1503,7 +1540,7 @@ def load_sales_with_employees_cached(db_filename: str, start_date: str | None = 
         q = q.order("transaction_date", desc=False)
         r = q.execute()
         if r.data:
-            return pd.DataFrame(r.data)
+            return _filter_sales_to_store_orders(db_filename, pd.DataFrame(r.data))
         return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "note", "employee_names"])
     except Exception as e:
         if "supabase_error" not in st.session_state:
