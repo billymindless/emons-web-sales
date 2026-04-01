@@ -6406,7 +6406,7 @@ def render_employee_management():
                         conn.close()
                 if row and len(all_stores_df) > 0:
                     with st.form("employee_update_form"):
-                        st.text_input("이메일 (로그인 ID)", value=row[1] or "", disabled=True, help="이메일 변경은 불가합니다.")
+                        st.markdown("**기본 정보 수정**")
                         edit_name = st.text_input("직원 이름", value=(row[3] or "").strip() or (row[0] or ""), key="emp_update_name")
                         edit_role = st.selectbox(
                             "권한",
@@ -6428,6 +6428,7 @@ def render_employee_management():
                             try:
                                 if use_supabase:
                                     _supabase_update_app_user(edit_user_id, (edit_name or "").strip() or None, edit_role, first_sid, store_ids)
+                                    clear_data_cache()
                                     st.success("직원 정보가 저장되었습니다.")
                                 else:
                                     conn = get_master_conn()
@@ -6440,12 +6441,54 @@ def render_employee_management():
                                         for sid in store_ids:
                                             conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (edit_user_id, sid))
                                         conn.commit()
+                                        clear_data_cache()
                                         st.success("직원 정보가 저장되었습니다.")
                                     finally:
                                         conn.close()
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"저장 실패: {str(e)}")
+
+                    # ----- 이메일(로그인 ID) 변경 -----
+                    with st.form("emp_email_update_form"):
+                        st.markdown("**이메일(로그인 ID) 변경**")
+                        st.caption("현재 이메일 → 새 이메일로 변경합니다. Supabase Auth + app_users 양쪽 모두 반영됩니다.")
+                        st.text_input("현재 이메일", value=(row[1] or row[0] or "").strip(), disabled=True, key="emp_cur_email_display")
+                        new_email_input = st.text_input("새 이메일", placeholder="새 이메일 주소를 입력하세요", key="emp_new_email_input")
+                        if st.form_submit_button("이메일 변경"):
+                            new_email_clean = (new_email_input or "").strip()
+                            if not new_email_clean or "@" not in new_email_clean:
+                                st.error("올바른 이메일 주소를 입력해 주세요.")
+                            else:
+                                cur_email = (row[1] or row[0] or "").strip()
+                                email_errs = []
+                                # Supabase Auth 이메일 변경
+                                if use_supabase and admin_client and not admin_err and cur_email:
+                                    try:
+                                        auth_uid = _supabase_auth_uid_by_email(admin_client, cur_email)
+                                        if auth_uid:
+                                            admin_client.auth.admin.update_user_by_id(auth_uid, {"email": new_email_clean})
+                                        else:
+                                            email_errs.append("Supabase Auth 계정 없음(app_users만 변경)")
+                                    except Exception as e:
+                                        email_errs.append(f"Auth 변경 실패: {e}")
+                                # app_users 이메일·username 변경
+                                if use_supabase:
+                                    try:
+                                        client, _ce = get_supabase_client()
+                                        if client:
+                                            client.table("app_users").update({
+                                                "email": new_email_clean,
+                                                "username": new_email_clean,
+                                            }).eq("id", edit_user_id).execute()
+                                    except Exception as e:
+                                        email_errs.append(f"app_users 변경 실패: {e}")
+                                if email_errs:
+                                    st.warning("일부 변경 실패: " + " / ".join(email_errs))
+                                else:
+                                    clear_data_cache()
+                                    st.success(f"이메일이 {new_email_clean} 으로 변경되었습니다.")
+                                    st.rerun()
 
                     # ----- 비밀번호 리셋 (동일 직원 대상) -----
                     with st.form("emp_password_reset_form"):
@@ -6560,7 +6603,7 @@ def render_employee_management():
                 del_email = users_list[users_list["id"] == del_user_id].iloc[0].get("email") or ""
                 st.warning(f"**{_user_label(del_user_id)}** 직원을 삭제하면 로그인할 수 없습니다. Supabase 계정도 삭제됩니다.")
                 del_confirm = st.checkbox("위 직원을 삭제하는 것에 동의합니다.", key="emp_del_confirm")
-                if st.button("직원 삭제", key="emp_del_btn", type="primary"):
+                        if st.button("직원 삭제", key="emp_del_btn", type="primary"):
                     if not del_confirm:
                         st.error("삭제하려면 동의 체크박스를 선택해 주세요.")
                     else:
@@ -6575,6 +6618,7 @@ def render_employee_management():
                                         pass
                                 if use_supabase:
                                     _supabase_delete_app_user(del_user_id)
+                                    clear_data_cache()
                                     st.success("직원이 삭제되었습니다.")
                                 else:
                                     conn = get_master_conn()
@@ -6582,6 +6626,7 @@ def render_employee_management():
                                     conn.execute("DELETE FROM Users WHERE id = ?", (del_user_id,))
                                     conn.commit()
                                     conn.close()
+                                    clear_data_cache()
                                     st.success("직원이 삭제되었습니다.")
                                 st.rerun()
                             except Exception as e:
