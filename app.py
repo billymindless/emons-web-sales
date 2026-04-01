@@ -4,6 +4,7 @@ from __future__ import annotations
 momo - 가구 매장 세일즈 및 경영 대시보드
 """
 import base64
+import calendar
 import io
 import hmac
 import html
@@ -10403,6 +10404,17 @@ def render_dashboard():
 
     today_sales_net = today_sales_new + today_sales_adj
 
+    # 일평균 기반 예상 월매출 계산
+    # (이번 달 누적 계약매출 ÷ 경과일수) × 이번 달 총일수
+    _days_elapsed = (today - month_start).days + 1  # 1일 ~ 오늘 포함
+    _days_in_month = calendar.monthrange(today.year, today.month)[1]
+    projected_monthly_sales = (
+        (expected_total_sales / _days_elapsed * _days_in_month)
+        if _days_elapsed > 0 and expected_total_sales > 0
+        else 0.0
+    )
+    _proj_sub = f"일평균 {expected_total_sales/_days_elapsed:,.0f}원 × {_days_in_month}일" if _days_elapsed > 0 and expected_total_sales > 0 else ""
+
     # 일일 계약매출 보조 설명
     _contract_sub = ""
     if today_sales_adj < 0:
@@ -10471,7 +10483,8 @@ def render_dashboard():
             </td>
             <td>
               <div class="kpi-label">🎯 예상 월매출</div>
-              <div class="kpi-value">{expected_total_sales:,.0f}원</div>
+              <div class="kpi-value">{projected_monthly_sales:,.0f}원</div>
+              <div class="kpi-sub">{_proj_sub}</div>
             </td>
             <td>
               <div class="kpi-label">💹 마진율</div>
