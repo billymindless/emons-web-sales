@@ -5715,7 +5715,7 @@ def render_monthly_payment_report(is_superadmin: bool):
     else:
         col_s, col_e = st.columns(2)
         with col_s:
-            date_range_start = st.date_input("시작일", value=today - timedelta(days=30), key="payment_report_start")
+            date_range_start = st.date_input("시작일", value=today - timedelta(days=7), key="payment_report_start")
         with col_e:
             date_range_end = st.date_input("종료일", value=today, key="payment_report_end")
         if date_range_start and date_range_end and date_range_start > date_range_end:
@@ -6200,8 +6200,7 @@ def render_monthly_payment_report(is_superadmin: bool):
             except Exception as _pe:
                 st.caption(f"⚠️ 결제수단 조회 오류: {_pe}")
 
-        # 3. 화면 표시
-        # 3-a. 요약 집계 (항상 표시)
+        # 3. 요약 집계 (Excel 및 >7일 화면용으로 항상 계산)
         if selected_emp == "전체 직원":
             summary = df_emp.groupby(["매장명", group_col, "직원명"], as_index=False)[["판매금액", "판매건수"]].sum()
         else:
@@ -6212,17 +6211,9 @@ def render_monthly_payment_report(is_superadmin: bool):
         summary["판매금액"] = summary["판매금액"].round(0).astype(int)
         summary["판매건수"] = summary["판매건수"].round(2)
 
-        disp_df = summary.copy()
-        disp_df["판매금액"] = disp_df["판매금액"].apply(lambda x: f"{x:,}원")
-        disp_df["판매건수"] = disp_df["판매건수"].apply(lambda x: f"{x:g}건")
-
-        st.write("📌 **실적 요약**")
-        st.dataframe(disp_df, use_container_width=True)
-        st.caption("※ transaction_date(판매/변경 시점) 기준 집계. 증액/감액 delta도 포함됩니다.")
-
-        # 3-b. 1주일 이하 직접 날짜 지정: 상세내역 화면에 바로 표시 (결제수단 포함)
+        # 3-a. 7일 이하 직접 날짜 지정: 상세내역 단일 테이블만 표시 (고객명·전화번호·결제수단·원본주문ID 포함)
         if _show_inline_detail:
-            st.write("📋 **전체 상세 내역 (결제수단 포함)**")
+            st.write("📋 **판매 상세 내역 (결제수단 포함)**")
             detail_inline = df_emp.copy()
             detail_inline["판매금액"] = detail_inline["판매금액"].round(0).astype(int)
             detail_inline["판매건수"] = detail_inline["판매건수"].round(2)
@@ -6234,8 +6225,16 @@ def render_monthly_payment_report(is_superadmin: bool):
             disp_inline["판매금액"] = disp_inline["판매금액"].apply(lambda x: f"{x:,}원")
             disp_inline["판매건수"] = disp_inline["판매건수"].apply(lambda x: f"{x:g}건")
             st.dataframe(disp_inline, use_container_width=True)
+            st.caption("※ transaction_date(판매/변경 시점) 기준. 증액/감액 delta도 포함됩니다.")
         else:
-            st.caption("📥 상세 내역(결제수단 포함)은 아래 엑셀 다운로드에서 확인하세요. (8일 이상 조회 시 다운로드 전용)")
+            # 3-b. 8일 이상: 요약 테이블 표시 + 상세는 다운로드 안내
+            disp_df = summary.copy()
+            disp_df["판매금액"] = disp_df["판매금액"].apply(lambda x: f"{x:,}원")
+            disp_df["판매건수"] = disp_df["판매건수"].apply(lambda x: f"{x:g}건")
+            st.write("📌 **실적 요약**")
+            st.dataframe(disp_df, use_container_width=True)
+            st.caption("※ transaction_date(판매/변경 시점) 기준. 증액/감액 delta도 포함됩니다.")
+            st.info("📥 이 이상의 데이터는 다운로드 시 상세내역에서 확인가능 (고객명·전화번호·결제수단 포함)")
 
         # 4. 엑셀 다운로드 (다중 시트: 요약 + 상세 분리, 결제수단 포함)
         buf = io.BytesIO()
