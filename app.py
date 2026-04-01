@@ -5869,10 +5869,9 @@ def render_monthly_payment_report(is_superadmin: bool):
             file_name = f"결제수단집계_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx"
         st.download_button("엑셀 다운로드", data=buf.getvalue(), file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="monthly_payment_report_dl")
 
-        # ── 관리자 전용: 입력 감사 내역 ──────────────────────────────
-        _cur_role = (st.session_state.get("current_user") or {}).get("role", "user")
-        if _cur_role in ("store_admin", "superadmin"):
-            with st.expander("🔍 결제 입력 감사 내역 (관리자 전용)", expanded=False):
+        # ── 결제 입력 감사 내역 ──────────────────────────────
+        if True:
+            with st.expander("🔍 결제 입력 감사 내역", expanded=False):
                 st.caption("결제일자 · 입력일자 · 입력자 정보를 확인할 수 있습니다. 입력 오류 발생 시 책임 소재를 특정하는 데 활용하세요.")
                 _audit_df = pay_df.copy()
 
