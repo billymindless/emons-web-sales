@@ -10403,20 +10403,26 @@ def render_dashboard():
 
     today_sales_net = today_sales_new + today_sales_adj
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         st.metric("일일 수납액", f"{daily_sales:,.0f}원")
-        if today_sales_adj < 0:
-            st.caption(f"계약 조정(판매기록): 신규 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원 / 순매출 {today_sales_net:,.0f}원")
-        elif today_sales_adj > 0:
-            st.caption(f"계약 조정(판매기록): 신규 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원 / 순매출 {today_sales_net:,.0f}원")
     with c2:
-        st.metric("누적 수납액", f"{cumulative_sales:,.0f}원")
+        st.markdown("일일 계약매출")
+        st.markdown(
+            f"<p style='margin:0; color:#d32f2f; font-size:2rem; font-weight:700;'>{today_sales_net:,.0f}원</p>",
+            unsafe_allow_html=True,
+        )
+        if today_sales_adj < 0:
+            st.caption(f"신규 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원")
+        elif today_sales_adj > 0:
+            st.caption(f"신규 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원")
     with c3:
-        st.metric("예상 총매출", f"{expected_total_sales:,.0f}원")
+        st.metric("누적 수납액", f"{cumulative_sales:,.0f}원")
     with c4:
-        st.metric("마진율", f"{margin_pct:.1f}%")
+        st.metric("예상 총매출", f"{expected_total_sales:,.0f}원")
     with c5:
+        st.metric("마진율", f"{margin_pct:.1f}%")
+    with c6:
         st.metric("판매건수", f"{order_count}건")
 
     st.divider()
