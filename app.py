@@ -7556,6 +7556,120 @@ def render_new_sales():
     with st.expander("⚡ 특수 등록 (위약금 / 직원 구매)", expanded=False):
         _render_special_order_form(db_filename, employees)
 
+    with st.expander("💳 기존 주문 잔금 빠른 등록", expanded=False):
+        st.caption("기존 주문의 잔금을 이 화면에서 바로 등록합니다. 결제 날짜 기본값은 계약일이며, 필요 시 변경할 수 있습니다.")
+        quick_q = st.text_input(
+            "고객 검색 (이름/전화번호)",
+            key="new_sales_quick_balance_query",
+            placeholder="예: 홍길동 또는 01012345678",
+        )
+        quick_customers = pd.DataFrame()
+        if quick_q and quick_q.strip():
+            try:
+                if _supabase_orders_payments_available():
+                    sc_q, _ = get_supabase_client()
+                    store_name_q = _get_current_store_name_for_customers(db_filename)
+                    if sc_q and store_name_q:
+                        q_safe = re.sub(r"[*,]", "", quick_q.strip())
+                        or_filter = f"name.ilike.*{q_safe}*,phone1.ilike.*{q_safe}*,phone2.ilike.*{q_safe}*"
+                        r_q = sc_q.table("app_customers").select("id, name, phone1, phone2").eq("store_name", store_name_q).or_(or_filter).order("id", desc=True).limit(50).execute()
+                        quick_customers = pd.DataFrame(r_q.data) if r_q.data else pd.DataFrame()
+                else:
+                    conn_q = get_tenant_conn(db_filename)
+                    if conn_q:
+                        try:
+                            pattern = f"%{quick_q.strip()}%"
+                            quick_customers = pd.read_sql(
+                                "SELECT id, name, phone1, phone2 FROM Customers WHERE name LIKE ? OR phone1 LIKE ? OR phone2 LIKE ? ORDER BY id DESC LIMIT 50",
+                                conn_q,
+                                params=(pattern, pattern, pattern),
+                            )
+                        finally:
+                            conn_q.close()
+            except Exception:
+                quick_customers = pd.DataFrame()
+
+        if quick_q and quick_q.strip() and quick_customers.empty:
+            st.info("검색된 고객이 없습니다.")
+
+        if not quick_customers.empty:
+            quick_customers = quick_customers.drop_duplicates(subset=["name", "phone1"], keep="first").reset_index(drop=True)
+            quick_cids = quick_customers["id"].tolist()
+
+            def _fmt_quick_cust(cid):
+                row = quick_customers[quick_customers["id"] == cid]
+                if row.empty:
+                    return str(cid)
+                r0 = row.iloc[0]
+                return f"{r0.get('name') or '-'} ({r0.get('phone1') or '-'})"
+
+            quick_cid = st.selectbox("고객 선택", quick_cids, format_func=_fmt_quick_cust, key="new_sales_quick_balance_customer")
+            if quick_cid:
+                qrow = quick_customers[quick_customers["id"] == quick_cid].iloc[0]
+                q_name = str(qrow.get("name") or "")
+                q_phone = str(qrow.get("phone1") or "")
+                all_cids = quick_customers[
+                    (quick_customers["name"].fillna("") == q_name) &
+                    (quick_customers["phone1"].fillna("") == q_phone)
+                ]["id"].tolist() or [quick_cid]
+
+                if _supabase_orders_payments_available():
+                    all_orders_q = _load_orders_supabase(db_filename, "id, customer_id, order_date, total_amount", limit=None)
+                    q_orders = all_orders_q[all_orders_q["customer_id"].isin(all_cids)].copy() if (not all_orders_q.empty and "customer_id" in all_orders_q.columns) else pd.DataFrame()
+                    q_payments = _load_payments_supabase(db_filename)
+                else:
+                    conn_qo = get_tenant_conn(db_filename)
+                    if conn_qo:
+                        try:
+                            placeholders = ",".join("?" * len(all_cids))
+                            q_orders = pd.read_sql(
+                                f"SELECT id, customer_id, order_date, total_amount FROM Orders WHERE customer_id IN ({placeholders})",
+                                conn_qo,
+                                params=tuple(all_cids),
+                            )
+                            q_payments = pd.read_sql("SELECT order_id, amount FROM Payments", conn_qo)
+                        finally:
+                            conn_qo.close()
+                    else:
+                        q_orders = pd.DataFrame()
+                        q_payments = pd.DataFrame()
+
+                if not q_orders.empty and "id" in q_orders.columns:
+                    pay_sum_q = q_payments.groupby("order_id")["amount"].sum() if (not q_payments.empty and "order_id" in q_payments.columns and "amount" in q_payments.columns) else pd.Series(dtype=float)
+                    q_orders["paid"] = q_orders["id"].map(pay_sum_q).fillna(0)
+                    q_orders["balance"] = q_orders["total_amount"].fillna(0) - q_orders["paid"]
+                    q_orders = q_orders[q_orders["balance"] > 0].copy()
+                    q_orders["order_date"] = pd.to_datetime(q_orders["order_date"], errors="coerce")
+                    q_orders = q_orders.sort_values(["order_date", "id"], ascending=[False, False]).reset_index(drop=True)
+
+                    if q_orders.empty:
+                        st.info("선택한 고객의 미수 주문이 없습니다.")
+                    else:
+                        q_oids = q_orders["id"].tolist()
+
+                        def _fmt_quick_order(oid):
+                            orow = q_orders[q_orders["id"] == oid].iloc[0]
+                            od = orow.get("order_date")
+                            od_str = od.strftime("%Y-%m-%d") if hasattr(od, "strftime") else str(od or "-")[:10]
+                            bal = float(orow.get("balance") or 0)
+                            return f"주문 #{oid} | 계약일 {od_str} | 잔금 {bal:,.0f}원"
+
+                        quick_oid = st.selectbox("잔금 등록 주문 선택", q_oids, format_func=_fmt_quick_order, key="new_sales_quick_balance_order")
+                        if quick_oid:
+                            sel = q_orders[q_orders["id"] == quick_oid].iloc[0]
+                            sel_balance = float(sel.get("balance") or 0)
+                            sel_order_date = sel.get("order_date")
+                            default_pay_date = sel_order_date.date() if hasattr(sel_order_date, "date") else date.today()
+                            _customer_balance_payment_ui(
+                                db_filename,
+                                int(quick_oid),
+                                sel_balance,
+                                key_prefix=f"quick_bal_{int(quick_oid)}",
+                                default_payment_date=default_pay_date,
+                            )
+                else:
+                    st.info("선택한 고객의 주문 데이터가 없습니다.")
+
     st.divider()
 
     # 고객 선택: 기본 모드 = 신규 고객 등록, [기존 고객 검색] 버튼으로 검색 패널 열기
@@ -8340,14 +8454,20 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
 
 
 @st.fragment
-def _customer_balance_payment_ui(db_filename: str, order_id: int, balance: float, key_prefix: str = "pay"):
+def _customer_balance_payment_ui(
+    db_filename: str,
+    order_id: int,
+    balance: float,
+    key_prefix: str = "pay",
+    default_payment_date: date | None = None,
+):
     """잔금 완납 처리(결제 추가) 공통 UI. 직원도 사용 가능하되, 모든 변경은 PaymentHistory에 기록."""
     amt_key = f"{key_prefix}_amt"
     if amt_key not in st.session_state:
         st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
     _pay_date_key = f"{key_prefix}_pay_date"
     if _pay_date_key not in st.session_state:
-        st.session_state[_pay_date_key] = date.today()
+        st.session_state[_pay_date_key] = default_payment_date or date.today()
     st.caption("잔금 완납 처리 (결제 추가)")
     add_pay_date = st.date_input("결제 날짜 *", key=_pay_date_key)
     add_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
