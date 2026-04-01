@@ -6569,6 +6569,7 @@ def render_employee_management():
                                 cur_name = (u.get("name") or "").strip() if u else None
                                 cur_role = u.get("role") if u else "user"
                                 _supabase_update_app_user(store_edit_user_id, cur_name, cur_role, first_sid, store_ids)
+                                clear_data_cache()
                                 st.success("배정 매장이 저장되었습니다.")
                             else:
                                 conn = get_master_conn()
@@ -6578,6 +6579,7 @@ def render_employee_management():
                                         conn.execute("INSERT OR IGNORE INTO UserStores (user_id, store_id) VALUES (?, ?)", (store_edit_user_id, sid))
                                     conn.execute("UPDATE Users SET store_id = ? WHERE id = ?", (first_sid, store_edit_user_id))
                                     conn.commit()
+                                    clear_data_cache()
                                     st.success("배정 매장이 저장되었습니다.")
                                 finally:
                                     conn.close()
