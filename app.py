@@ -6603,7 +6603,7 @@ def render_employee_management():
                 del_email = users_list[users_list["id"] == del_user_id].iloc[0].get("email") or ""
                 st.warning(f"**{_user_label(del_user_id)}** 직원을 삭제하면 로그인할 수 없습니다. Supabase 계정도 삭제됩니다.")
                 del_confirm = st.checkbox("위 직원을 삭제하는 것에 동의합니다.", key="emp_del_confirm")
-                        if st.button("직원 삭제", key="emp_del_btn", type="primary"):
+                if st.button("직원 삭제", key="emp_del_btn", type="primary"):
                     if not del_confirm:
                         st.error("삭제하려면 동의 체크박스를 선택해 주세요.")
                     else:
