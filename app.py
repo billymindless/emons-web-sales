@@ -6516,22 +6516,26 @@ def render_employee_management():
                     finally:
                         conn.close()
                 if row and len(all_stores_df) > 0:
-                    with st.form("employee_update_form"):
+                    with st.form(f"employee_update_form_{edit_user_id}"):
                         st.markdown("**기본 정보 수정**")
-                        edit_name = st.text_input("직원 이름", value=(row[3] or "").strip() or (row[0] or ""), key="emp_update_name")
+                        edit_name = st.text_input(
+                            "직원 이름",
+                            value=(row[3] or "").strip() or (row[0] or ""),
+                            key=f"emp_update_name_{edit_user_id}",
+                        )
                         edit_role = st.selectbox(
                             "권한",
                             options=[r[0] for r in EMPLOYEE_ROLE_OPTIONS],
                             format_func=lambda x: next((r[1] for r in EMPLOYEE_ROLE_OPTIONS if r[0] == x), x),
                             index=next((i for i, r in enumerate(EMPLOYEE_ROLE_OPTIONS) if r[0] == row[2]), 0),
-                            key="emp_update_role",
+                            key=f"emp_update_role_{edit_user_id}",
                         )
                         current_names = all_stores_df[all_stores_df["id"].isin(current_store_ids)]["store_name"].tolist()
                         edit_stores = st.multiselect(
                             "배정 매장 (여러 개 선택 가능)",
                             all_stores_df["store_name"].tolist(),
                             default=current_names,
-                            key="emp_update_stores",
+                            key=f"emp_update_stores_{edit_user_id}",
                         )
                         # 기본 매장 지정 (로그인 시 자동 선택될 매장)
                         _cur_primary_sid = urow.get("store_id") if urow else None
@@ -6542,7 +6546,7 @@ def render_employee_management():
                             "🏠 기본 매장 (로그인 시 자동 선택)",
                             _all_store_names,
                             index=_primary_idx,
-                            key="emp_update_primary_store",
+                            key=f"emp_update_primary_store_{edit_user_id}",
                             help="여러 매장에 배정된 경우 로그인할 때 기본으로 선택될 매장을 지정합니다.",
                         )
                         if st.form_submit_button("저장"):
