@@ -9917,6 +9917,59 @@ def render_customer_balance():
                                                                     pass
                                                                 clear_data_cache()
                                                                 st.rerun()
+                                                        # ── 잘못 입력 직접 삭제 ──────────────────────────
+                                                        st.divider()
+                                                        st.markdown("##### 🗑️ 잘못 입력한 결제 직접 삭제")
+                                                        st.caption("중복 입력 등 실수로 잘못 입력된 결제를 상계 전표 없이 완전 삭제합니다.")
+                                                        _dd_confirm_key = f"pay_direct_del_confirm_{prow['id']}"
+                                                        st.checkbox(
+                                                            f"결제 ID {int(prow['id'])} ({prow.get('payment_method', '-')} / {float(prow.get('amount') or 0):,.0f}원) 완전 삭제 동의",
+                                                            key=_dd_confirm_key,
+                                                        )
+                                                        if st.button("🗑️ 삭제 실행", key=f"pay_direct_del_btn_{prow['id']}", type="secondary"):
+                                                            if not st.session_state.get(_dd_confirm_key):
+                                                                st.warning("삭제하려면 확인 체크박스를 먼저 선택해 주세요.")
+                                                            else:
+                                                                try:
+                                                                    _dd_amt = float(prow.get("amount") or 0)
+                                                                    _dd_pid = int(prow["id"])
+                                                                    _dd_paid_before, _dd_paid_after = 0.0, 0.0
+                                                                    _dd_cname = ""
+                                                                    if _supabase_orders_payments_available():
+                                                                        _dd_paid_before, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
+                                                                        _dd_cid = _get_order_customer_id_supabase(db_filename, _order_id_pay)
+                                                                        _dd_cname = _get_customer_name_supabase(db_filename, _dd_cid) if _dd_cid else ""
+                                                                        _dd_ok = _delete_payment_supabase(db_filename, _dd_pid)
+                                                                    else:
+                                                                        _dd_conn = get_tenant_conn(db_filename)
+                                                                        try:
+                                                                            _dd_conn.execute("DELETE FROM Payments WHERE id = ?", (_dd_pid,))
+                                                                            _dd_conn.commit()
+                                                                            _dd_ok = True
+                                                                        except Exception:
+                                                                            _dd_ok = False
+                                                                        finally:
+                                                                            _dd_conn.close()
+                                                                    if _dd_ok:
+                                                                        if _supabase_orders_payments_available():
+                                                                            _dd_paid_after, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
+                                                                            _recalc_order_actual_margin_supabase(db_filename, _order_id_pay)
+                                                                        _dd_old_bal = float(orders[orders["id"] == _order_id_pay]["balance"].iloc[0]) if not orders[orders["id"] == _order_id_pay].empty else 0.0
+                                                                        _dd_new_bal = _dd_old_bal + _dd_amt
+                                                                        _insert_payment_history(
+                                                                            None, _order_id_pay, _dd_cname, "결제직접삭제",
+                                                                            {"order_id": int(_order_id_pay), "paid_total_before": _dd_paid_before, "payment": {"payment_id": _dd_pid, "amount": _dd_amt, "method": prow.get("payment_method")}},
+                                                                            {"order_id": int(_order_id_pay), "paid_total_after": _dd_paid_after, "balance_after": _dd_new_bal},
+                                                                            "잘못 입력 직접 삭제",
+                                                                            db_filename=db_filename,
+                                                                        )
+                                                                        clear_data_cache()
+                                                                        st.success(f"✅ 결제 ID {_dd_pid} 삭제 완료")
+                                                                        st.rerun()
+                                                                    else:
+                                                                        st.error("삭제 실패. 잠시 후 다시 시도해 주세요.")
+                                                                except Exception as _dd_e:
+                                                                    st.error(f"삭제 오류: {_dd_e}")
 
                     st.subheader("잔금 추가 결제")
                     st.caption("⚠️ 초과 결제(결제액 > 구매액)도 입력 가능합니다. 초과 건은 '초과결제 항목' 탭에 자동 표시됩니다.")
