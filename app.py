@@ -6570,11 +6570,11 @@ def render_employee_management():
                                 st.error(f"저장 실패: {str(e)}")
 
                     # ----- 이메일(로그인 ID) 변경 -----
-                    with st.form("emp_email_update_form"):
+                    with st.form(f"emp_email_update_form_{edit_user_id}"):
                         st.markdown("**이메일(로그인 ID) 변경**")
                         st.caption("현재 이메일 → 새 이메일로 변경합니다. Supabase Auth + app_users 양쪽 모두 반영됩니다.")
-                        st.text_input("현재 이메일", value=(row[1] or row[0] or "").strip(), disabled=True, key="emp_cur_email_display")
-                        new_email_input = st.text_input("새 이메일", placeholder="새 이메일 주소를 입력하세요", key="emp_new_email_input")
+                        st.text_input("현재 이메일", value=(row[1] or row[0] or "").strip(), disabled=True, key=f"emp_cur_email_display_{edit_user_id}")
+                        new_email_input = st.text_input("새 이메일", placeholder="새 이메일 주소를 입력하세요", key=f"emp_new_email_input_{edit_user_id}")
                         if st.form_submit_button("이메일 변경"):
                             new_email_clean = (new_email_input or "").strip()
                             if not new_email_clean or "@" not in new_email_clean:
@@ -6611,11 +6611,11 @@ def render_employee_management():
                                     st.rerun()
 
                     # ----- 비밀번호 리셋 (동일 직원 대상) -----
-                    with st.form("emp_password_reset_form"):
+                    with st.form(f"emp_password_reset_form_{edit_user_id}"):
                         st.caption("🔐 비밀번호 리셋 · 위에서 선택한 직원의 로그인 비밀번호를 변경합니다.")
-                        st.text_input("대상 (이메일)", value=(row[1] or row[0] or "").strip(), disabled=True, key="emp_pw_target_display")
-                        emp_reset_pw = st.text_input("새 비밀번호", type="password", key="emp_reset_pw")
-                        emp_reset_pw_confirm = st.text_input("새 비밀번호 확인", type="password", key="emp_reset_pw_confirm")
+                        st.text_input("대상 (이메일)", value=(row[1] or row[0] or "").strip(), disabled=True, key=f"emp_pw_target_display_{edit_user_id}")
+                        emp_reset_pw = st.text_input("새 비밀번호", type="password", key=f"emp_reset_pw_{edit_user_id}")
+                        emp_reset_pw_confirm = st.text_input("새 비밀번호 확인", type="password", key=f"emp_reset_pw_confirm_{edit_user_id}")
                         if st.form_submit_button("비밀번호 변경"):
                             if not emp_reset_pw or len(emp_reset_pw) < 6:
                                 st.error("비밀번호는 6자 이상 입력해 주세요.")
