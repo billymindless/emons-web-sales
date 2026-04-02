@@ -265,10 +265,22 @@ def _supabase_auth_uid_by_email(admin_client, email: str):
                 r = admin_client.auth.admin.list_users({"per_page": per_page, "page": page})
             except Exception:
                 r = admin_client.auth.admin.list_users()
-        users = getattr(r, "users", None) or getattr(r, "data", None)
-        if users is None and hasattr(r, "model_dump"):
-            d = r.model_dump()
-            users = d.get("users", d.get("data", []))
+        users_raw = getattr(r, "users", None)
+        if users_raw is None:
+            users_raw = getattr(r, "data", None)
+        if users_raw is None and hasattr(r, "model_dump"):
+            users_raw = r.model_dump()
+        # SDK/버전별 응답 형태를 모두 흡수해 users(list)로 정규화
+        users = []
+        if isinstance(users_raw, list):
+            users = users_raw
+        elif isinstance(users_raw, dict):
+            if isinstance(users_raw.get("users"), list):
+                users = users_raw.get("users") or []
+            elif isinstance(users_raw.get("data"), list):
+                users = users_raw.get("data") or []
+            elif isinstance(users_raw.get("data"), dict) and isinstance((users_raw.get("data") or {}).get("users"), list):
+                users = (users_raw.get("data") or {}).get("users") or []
         for u in (users or []):
             em = getattr(u, "email", None) if hasattr(u, "email") else (u.get("email") if isinstance(u, dict) else None)
             if em and str(em).strip().lower() == target:
@@ -6663,7 +6675,22 @@ def render_employee_management():
                                                 else:
                                                     st.warning("Supabase Auth 계정 조회/생성에 실패했습니다. 관리자에게 문의해 주세요.")
                                             except Exception as ce:
-                                                st.error(f"Supabase Auth 계정 생성 실패: {str(ce)}")
+                                                ce_msg = str(ce)
+                                                # "이미 등록된 이메일"이면 조회 누락 가능성이 높으므로 재조회 후 비밀번호 변경 재시도
+                                                if "already been registered" in ce_msg.lower() or "already registered" in ce_msg.lower():
+                                                    try:
+                                                        auth_uid_retry = _supabase_auth_uid_by_email(admin_client, target_email)
+                                                        if auth_uid_retry:
+                                                            admin_client.auth.admin.update_user_by_id(auth_uid_retry, {"password": emp_reset_pw})
+                                                            st.success("기존 Supabase Auth 계정을 찾아 비밀번호를 변경했습니다.")
+                                                            clear_data_cache()
+                                                            st.rerun()
+                                                        else:
+                                                            st.error("Supabase Auth에는 이메일이 이미 등록되어 있지만 사용자 조회에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+                                                    except Exception as re:
+                                                        st.error(f"Supabase Auth 재조회/비밀번호 변경 실패: {str(re)}")
+                                                else:
+                                                    st.error(f"Supabase Auth 계정 생성 실패: {ce_msg}")
                                     except Exception as e:
                                         st.error(f"비밀번호 변경 실패: {str(e)}")
                                 elif not use_supabase:
