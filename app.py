@@ -9799,7 +9799,12 @@ def render_customer_balance():
                                                                 }
                                                                 # 새 수수료 계산 (수단 변경 반영)
                                                                 new_fee = _payment_fee_amount(new_method, float(new_amount)) if new_amount > 0 else 0.0
-                                                                today_str = date.today().isoformat()
+                                                                # 상계(-) / 재결제(+) 모두 화면의「결제 날짜」반영 (오늘 고정 사용 안 함)
+                                                                _pay_edit_date_str = (
+                                                                    new_pay_date.isoformat()
+                                                                    if isinstance(new_pay_date, date)
+                                                                    else date.today().isoformat()
+                                                                )
                                                                 old_amt_val = float(prow["amount"] or 0)
                                                                 old_fee_val = float(prow["fee_amount"] or 0)
     
@@ -9809,7 +9814,7 @@ def render_customer_balance():
                                                                     # 1. 마이너스(-) 상계 전표 INSERT
                                                                     _insert_payment_supabase(db_filename, {
                                                                         "order_id": _order_id_pay,
-                                                                        "payment_date": today_str,
+                                                                        "payment_date": _pay_edit_date_str,
                                                                         "amount": -old_amt_val,
                                                                         "payment_method": prow["payment_method"],
                                                                         "card_company": prow["card_company"],
@@ -9823,7 +9828,7 @@ def render_customer_balance():
                                                                         # 2. 새로운 결제(+) 전표 INSERT
                                                                         _insert_payment_supabase(db_filename, {
                                                                             "order_id": _order_id_pay,
-                                                                            "payment_date": today_str,
+                                                                            "payment_date": _pay_edit_date_str,
                                                                             "amount": float(new_amount),
                                                                             "payment_method": new_method,
                                                                             "card_company": new_card_company,
@@ -9869,7 +9874,7 @@ def render_customer_balance():
                                                                     # 1. 마이너스(-) 상계 전표 INSERT
                                                                     conn.execute(
                                                                         "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)",
-                                                                        (_order_id_pay, today_str, -old_amt_val, prow["payment_method"], prow["card_company"], -old_fee_val)
+                                                                        (_order_id_pay, _pay_edit_date_str, -old_amt_val, prow["payment_method"], prow["card_company"], -old_fee_val)
                                                                     )
     
                                                                     if new_amount == 0:
@@ -9879,7 +9884,7 @@ def render_customer_balance():
                                                                         # 2. 새로운 결제(+) 전표 INSERT
                                                                         conn.execute(
                                                                             "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)",
-                                                                            (_order_id_pay, today_str, float(new_amount), new_method, new_card_company, float(new_fee))
+                                                                            (_order_id_pay, _pay_edit_date_str, float(new_amount), new_method, new_card_company, float(new_fee))
                                                                         )
                                                                         action = "결제변경"
                                                                         new_payment = {
@@ -10252,16 +10257,20 @@ def render_customer_balance():
                                                         _old_amt_op = _prow_amt
                                                         _old_fee_op = float(prow.get("fee_amount") or 0)
                                                         _new_fee_op = _payment_fee_amount(new_method_op, new_amount_op) if new_amount_op > 0 else 0.0
-                                                        _today_op = date.today().isoformat()
+                                                        _pay_op_date_str = (
+                                                            new_pay_date_op.isoformat()
+                                                            if isinstance(new_pay_date_op, date)
+                                                            else date.today().isoformat()
+                                                        )
                                                         _old_payment_op = {"payment_id": int(prow["id"]), "amount": _old_amt_op, "method": _prow_method, "card_company": prow.get("card_company")}
                                                         if _supabase_orders_payments_available():
                                                             _old_paid_op, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
-                                                            _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _today_op, "amount": -_old_amt_op, "payment_method": _prow_method, "card_company": prow.get("card_company"), "fee_amount": -_old_fee_op})
+                                                            _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _pay_op_date_str, "amount": -_old_amt_op, "payment_method": _prow_method, "card_company": prow.get("card_company"), "fee_amount": -_old_fee_op})
                                                             if new_amount_op == 0:
                                                                 _action_op = "결제취소"
                                                                 _new_payment_op = {}
                                                             else:
-                                                                _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _today_op, "amount": float(new_amount_op), "payment_method": new_method_op, "card_company": new_card_op, "fee_amount": float(_new_fee_op)})
+                                                                _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _pay_op_date_str, "amount": float(new_amount_op), "payment_method": new_method_op, "card_company": new_card_op, "fee_amount": float(_new_fee_op)})
                                                                 _action_op = "결제변경"
                                                                 _new_payment_op = {"payment_id": "신규생성(상계처리)", "amount": float(new_amount_op), "method": new_method_op, "card_company": new_card_op}
                                                             _recalc_order_actual_margin_supabase(db_filename, _op_oid)
@@ -10275,12 +10284,12 @@ def render_customer_balance():
                                                             if _conn_op:
                                                                 try:
                                                                     _old_paid_op = _conn_op.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_op_oid,)).fetchone()[0] or 0
-                                                                    _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)", (_op_oid, _today_op, -_old_amt_op, _prow_method, prow.get("card_company"), -_old_fee_op))
+                                                                    _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)", (_op_oid, _pay_op_date_str, -_old_amt_op, _prow_method, prow.get("card_company"), -_old_fee_op))
                                                                     if new_amount_op == 0:
                                                                         _action_op = "결제취소"
                                                                         _new_payment_op = {}
                                                                     else:
-                                                                        _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)", (_op_oid, _today_op, float(new_amount_op), new_method_op, new_card_op, float(_new_fee_op)))
+                                                                        _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)", (_op_oid, _pay_op_date_str, float(new_amount_op), new_method_op, new_card_op, float(_new_fee_op)))
                                                                         _action_op = "결제변경"
                                                                         _new_payment_op = {}
                                                                     _conn_op.commit()
