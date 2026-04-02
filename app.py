@@ -268,8 +268,17 @@ def _supabase_auth_uid_by_email(admin_client, email: str):
         users_raw = getattr(r, "users", None)
         if users_raw is None:
             users_raw = getattr(r, "data", None)
+        # SDK 버전에 따라 data가 모델 객체일 수 있으므로 model_dump를 폭넓게 시도
         if users_raw is None and hasattr(r, "model_dump"):
-            users_raw = r.model_dump()
+            try:
+                users_raw = r.model_dump()
+            except Exception:
+                users_raw = None
+        if users_raw is not None and hasattr(users_raw, "model_dump"):
+            try:
+                users_raw = users_raw.model_dump()
+            except Exception:
+                pass
         # SDK/버전별 응답 형태를 모두 흡수해 users(list)로 정규화
         users = []
         if isinstance(users_raw, list):
@@ -281,6 +290,16 @@ def _supabase_auth_uid_by_email(admin_client, email: str):
                 users = users_raw.get("data") or []
             elif isinstance(users_raw.get("data"), dict) and isinstance((users_raw.get("data") or {}).get("users"), list):
                 users = (users_raw.get("data") or {}).get("users") or []
+        elif hasattr(users_raw, "users"):
+            maybe_users = getattr(users_raw, "users", None)
+            if isinstance(maybe_users, list):
+                users = maybe_users
+        elif hasattr(users_raw, "data"):
+            maybe_data = getattr(users_raw, "data", None)
+            if isinstance(maybe_data, list):
+                users = maybe_data
+            elif hasattr(maybe_data, "users") and isinstance(getattr(maybe_data, "users", None), list):
+                users = getattr(maybe_data, "users")
         for u in (users or []):
             em = getattr(u, "email", None) if hasattr(u, "email") else (u.get("email") if isinstance(u, dict) else None)
             if em and str(em).strip().lower() == target:
