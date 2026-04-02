@@ -6489,6 +6489,13 @@ def render_employee_management():
                 key="emp_edit_user_id",
             )
             if edit_user_id:
+                # 선택 직원이 바뀌면 기본 정보 수정 폼 위젯 상태를 초기화해
+                # 해당 직원의 현재 DB 값이 자동으로 다시 채워지도록 한다.
+                if st.session_state.get("_emp_update_loaded_user_id") != edit_user_id:
+                    for _k in ("emp_update_name", "emp_update_role", "emp_update_stores", "emp_update_primary_store"):
+                        st.session_state.pop(_k, None)
+                    st.session_state["_emp_update_loaded_user_id"] = edit_user_id
+
                 if use_supabase:
                     urow = next((u for u in _get_supabase_users_list() if u.get("id") == edit_user_id), None)
                     row = (urow.get("username"), urow.get("email"), urow.get("role"), urow.get("name")) if urow else None
