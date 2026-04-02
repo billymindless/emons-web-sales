@@ -255,7 +255,8 @@ def _supabase_auth_uid_by_email(admin_client, email: str):
         return None
     target = str(email).strip().lower()
     page = 1
-    per_page = 1000
+    # Supabase Auth list_users 기본/안정 페이지 크기(환경별 인자 무시 대비)
+    per_page = 50
     while True:
         try:
             r = admin_client.auth.admin.list_users(per_page=per_page, page=page)
@@ -6641,7 +6642,24 @@ def render_employee_management():
                                             clear_data_cache()
                                             st.rerun()
                                         else:
-                                            st.warning("Supabase Auth에 해당 이메일 계정이 없습니다. 로그인은 Supabase Auth를 사용하는 경우에만 비밀번호 변경이 적용됩니다.")
+                                            # app_users에는 있으나 Supabase Auth에 없는 레거시 계정 복구:
+                                            # 관리자 권한으로 Auth 계정을 생성하고 입력한 비밀번호를 즉시 적용한다.
+                                            try:
+                                                created = admin_client.auth.admin.create_user({
+                                                    "email": target_email,
+                                                    "password": emp_reset_pw,
+                                                    "email_confirm": True,
+                                                })
+                                                created_user = getattr(created, "user", None) or (created.get("user") if isinstance(created, dict) else None)
+                                                created_uid = getattr(created_user, "id", None) if created_user is not None and hasattr(created_user, "id") else (created_user.get("id") if isinstance(created_user, dict) else None)
+                                                if created_uid:
+                                                    st.success("Supabase Auth 계정이 없어 새로 생성한 뒤 비밀번호를 설정했습니다. 해당 직원은 즉시 로그인할 수 있습니다.")
+                                                    clear_data_cache()
+                                                    st.rerun()
+                                                else:
+                                                    st.warning("Supabase Auth 계정 조회/생성에 실패했습니다. 관리자에게 문의해 주세요.")
+                                            except Exception as ce:
+                                                st.error(f"Supabase Auth 계정 생성 실패: {str(ce)}")
                                     except Exception as e:
                                         st.error(f"비밀번호 변경 실패: {str(e)}")
                                 elif not use_supabase:
