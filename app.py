@@ -2079,21 +2079,60 @@ def _update_order_supabase(db_filename: str, order_id: int, updates: dict) -> bo
         return False
 
 
-def _insert_payment_supabase(db_filename: str, payload: dict) -> int | None:
+def _clean_value_for_supabase_json(val):
+    """pandas NaN / float nan 등 JSON으로 보낼 수 없는 값은 None으로 정규화."""
+    if val is None:
+        return None
+    if isinstance(val, float) and val != val:  # NaN
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except (ValueError, TypeError):
+        pass
+    return val
+
+
+def _insert_payment_supabase(
+    db_filename: str,
+    payload: dict,
+    *,
+    _error_detail: list | None = None,
+) -> int | None:
     """app_payments에 1건 INSERT. payload에 db_filename 없으면 자동 설정. 반환: 새 id 또는 None."""
     if not db_filename:
+        if _error_detail is not None:
+            _error_detail.append("db_filename 없음")
         return None
     client, err = get_supabase_client()
     if err or not client:
+        if _error_detail is not None:
+            _error_detail.append(err or "Supabase 클라이언트를 만들 수 없습니다.")
         return None
     payload = dict(payload)
+    for _k, _v in list(payload.items()):
+        payload[_k] = _clean_value_for_supabase_json(_v)
+    for _tk in ("card_company", "payment_method", "onnuri_approval_code", "created_by"):
+        if _tk in payload and payload[_tk] == "":
+            payload[_tk] = None
+    if payload.get("order_id") is not None:
+        try:
+            payload["order_id"] = int(payload["order_id"])
+        except (TypeError, ValueError):
+            if _error_detail is not None:
+                _error_detail.append(f"order_id 변환 실패: {payload.get('order_id')!r}")
+            return None
     payload[ORDERS_PAYMENTS_TENANT_COL] = db_filename
     try:
         r = client.table("app_payments").insert(payload).execute()
         if r.data and len(r.data) > 0 and "id" in r.data[0]:
             return int(r.data[0]["id"])
+        if _error_detail is not None:
+            _error_detail.append("INSERT 응답에 id가 없습니다. RLS·스키마·트리거를 확인하세요.")
         return None
-    except Exception:
+    except Exception as e:
+        if _error_detail is not None:
+            _error_detail.append(str(e) or repr(e))
         return None
 
 
@@ -9812,33 +9851,64 @@ def render_customer_balance():
                                                                 if _supabase_orders_payments_available():
                                                                     old_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
 
-                                                                    # 1. 마이너스(-) 상계 전표 INSERT (_insert_payment_supabase 실패 시 예외를 삼키므로 반드시 반환값 확인)
-                                                                    _rev_pay_id = _insert_payment_supabase(db_filename, {
-                                                                        "order_id": _order_id_pay,
-                                                                        "payment_date": _pay_edit_date_str,
-                                                                        "amount": -old_amt_val,
-                                                                        "payment_method": prow["payment_method"],
-                                                                        "card_company": prow["card_company"],
-                                                                        "fee_amount": -old_fee_val,
-                                                                    })
+                                                                    # 1. 마이너스(-) 상계 전표 INSERT (계좌이체 등 card_company가 pandas NaN이면 JSON 오류 → _insert_payment_supabase에서 None 처리)
+                                                                    _rev_err: list[str] = []
+                                                                    _rev_pay_id = _insert_payment_supabase(
+                                                                        db_filename,
+                                                                        {
+                                                                            "order_id": _order_id_pay,
+                                                                            "payment_date": _pay_edit_date_str,
+                                                                            "amount": -old_amt_val,
+                                                                            "payment_method": prow["payment_method"],
+                                                                            "card_company": prow["card_company"],
+                                                                            "fee_amount": -old_fee_val,
+                                                                            "created_by": _current_username(),
+                                                                        },
+                                                                        _error_detail=_rev_err,
+                                                                    )
                                                                     if _rev_pay_id is None:
-                                                                        st.error("상계(마이너스) 전표를 Supabase에 저장하지 못했습니다. 네트워크·DB 권한을 확인한 뒤 다시 시도해 주세요.")
+                                                                        if _rev_err:
+                                                                            st.error(
+                                                                                "상계(마이너스) 전표를 Supabase에 저장하지 못했습니다. 상세: "
+                                                                                + _rev_err[0]
+                                                                            )
+                                                                        else:
+                                                                            st.error(
+                                                                                "상계(마이너스) 전표를 Supabase에 저장하지 못했습니다. "
+                                                                                "네트워크·DB 권한을 확인한 뒤 다시 시도해 주세요."
+                                                                            )
                                                                     elif new_amount == 0:
                                                                         action = "결제취소"
                                                                         new_payment = {}
                                                                         _pay_edit_committed = True
                                                                     else:
                                                                         # 2. 새로운 결제(+) 전표 INSERT
-                                                                        _new_pay_id = _insert_payment_supabase(db_filename, {
-                                                                            "order_id": _order_id_pay,
-                                                                            "payment_date": _pay_edit_date_str,
-                                                                            "amount": float(new_amount),
-                                                                            "payment_method": new_method,
-                                                                            "card_company": new_card_company,
-                                                                            "fee_amount": float(new_fee),
-                                                                        })
+                                                                        _new_err: list[str] = []
+                                                                        _new_pay_id = _insert_payment_supabase(
+                                                                            db_filename,
+                                                                            {
+                                                                                "order_id": _order_id_pay,
+                                                                                "payment_date": _pay_edit_date_str,
+                                                                                "amount": float(new_amount),
+                                                                                "payment_method": new_method,
+                                                                                "card_company": new_card_company,
+                                                                                "fee_amount": float(new_fee),
+                                                                                "created_by": _current_username(),
+                                                                            },
+                                                                            _error_detail=_new_err,
+                                                                        )
                                                                         if _new_pay_id is None:
-                                                                            st.error("새 결제(+) 전표 저장에 실패했습니다. 상계 전표는 이미 반영되었을 수 있으니 관리자에게 문의해 주세요.")
+                                                                            if _new_err:
+                                                                                st.error(
+                                                                                    "새 결제(+) 전표 저장에 실패했습니다. 상세: "
+                                                                                    + _new_err[0]
+                                                                                    + " (상계 전표는 이미 반영되었을 수 있습니다.)"
+                                                                                )
+                                                                            else:
+                                                                                st.error(
+                                                                                    "새 결제(+) 전표 저장에 실패했습니다. "
+                                                                                    "상계 전표는 이미 반영되었을 수 있으니 관리자에게 문의해 주세요."
+                                                                                )
                                                                         else:
                                                                             action = "결제변경"
                                                                             new_payment = {
