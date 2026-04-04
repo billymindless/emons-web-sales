@@ -1841,6 +1841,20 @@ def _ensure_tenant_schema(conn: sqlite3.Connection):
 # ========== Supabase 주문/결제 (app_orders, app_payments) — 매장별 db_filename 필수 ==========
 ORDERS_PAYMENTS_TENANT_COL = "db_filename"
 
+# 잔금 상태(balance_status): 완납 / 미납 / 이상결제(결제 합계 > 계약금액, 초과결제 탭과 동일 기준)
+BALANCE_STATUS_COMPLETE = "완납"
+BALANCE_STATUS_UNPAID = "미납"
+BALANCE_STATUS_OVERPAID = "이상결제"
+
+
+def _balance_status_from_remaining(remaining: float) -> str:
+    """remaining = 계약금액 - 결제합계. 0이면 완납, 음수면 초과(이상결제)."""
+    if remaining == 0:
+        return BALANCE_STATUS_COMPLETE
+    if remaining < 0:
+        return BALANCE_STATUS_OVERPAID
+    return BALANCE_STATUS_UNPAID
+
 
 def _supabase_orders_payments_available() -> bool:
     """Supabase에 app_orders 테이블이 있는지 확인. 세션당 1회만 HTTP 쿼리 후 결과를 세션 캐시."""
@@ -2206,7 +2220,7 @@ def _recalc_order_actual_margin_supabase(db_filename: str, order_id: int) -> boo
     basic_m = total_amt - (cost_general + cost_display)
     actual_margin = basic_m - total_fees
     remaining = total_amt - paid
-    balance_status = "완납" if remaining == 0 else "미납"
+    balance_status = _balance_status_from_remaining(remaining)
     return _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
 
 
@@ -8269,7 +8283,7 @@ def render_new_sales():
                 })
             actual_margin = basic_margin_save - total_fees  # 실질 마진 = 판매가 - 원가 - 수수료
             remaining = final_sales_save - total_paid_initial
-            balance_status = "완납" if remaining == 0 else "미납"
+            balance_status = _balance_status_from_remaining(remaining)
             _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
             _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
             clear_data_cache()
@@ -8383,7 +8397,7 @@ def render_new_sales():
                 actual_margin = basic_margin_save - total_fees
                 conn.execute("UPDATE Orders SET actual_margin = ? WHERE id = ?", (actual_margin, order_id))
                 remaining = final_sales_save - total_paid_initial
-                balance_status = "완납" if remaining == 0 else "미납"
+                balance_status = _balance_status_from_remaining(remaining)
                 conn.execute("UPDATE Orders SET balance_status = ? WHERE id = ?", (balance_status, order_id))
                 _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
                 conn.commit()
@@ -8482,7 +8496,7 @@ def _recalc_order_actual_margin(conn, order_id: int, db_filename: str | None = N
         (order_id,),
     ).fetchone()[0]
     remaining = (total_amt or 0) - (paid or 0)
-    balance_status = "완납" if remaining == 0 else "미납"
+    balance_status = _balance_status_from_remaining(remaining)
     conn.execute(
         "UPDATE Orders SET balance_status = ? WHERE id = ?",
         (balance_status, order_id),
@@ -9327,6 +9341,8 @@ def render_customer_balance():
                             # ── ⚖️ 실시간 잔금 검증 및 안내 로직 ──
                             _old_paid_total = float(orow["paid"])
                             _new_balance_preview = _edit_total - _old_paid_total
+                            if _new_balance_preview >= 0:
+                                st.session_state.pop(f"{edit_prefix}_allow_overpay", None)
 
                             st.markdown("#### ⚖️ 결제 및 잔금 검증")
                             st.metric("현재까지 결제된 총 금액", f"{int(_old_paid_total):,}원")
@@ -9341,6 +9357,10 @@ def render_customer_balance():
                                     f"⚠️ **계약 감액 처리 필요**: 새 계약금액({_edit_total:,}원)이 결제 합계({int(_old_paid_total):,}원)보다 "
                                     f"**{_need_reduce:,}원** 적습니다.\n\n"
                                     f"아래에서 감액할 결제 건을 선택하면 **계약금액 + 결제 감액이 동시에 저장**됩니다."
+                                )
+                                _allow_overpay_edit = st.checkbox(
+                                    "✅ 초과 허용: 결제 합계가 새 계약금액보다 커도 저장합니다. (잔금 상태는 이상결제로 저장되며, 초과결제 항목 탭에서도 동일 기준으로 표시됩니다.)",
+                                    key=f"{edit_prefix}_allow_overpay",
                                 )
                                 # 이 주문의 결제 목록 로드
                                 if _supabase_orders_payments_available():
@@ -9364,8 +9384,9 @@ def render_customer_balance():
                                     _reduce_pays_pos = pd.DataFrame()
 
                                 if _reduce_pays_pos.empty:
-                                    _block_update = True
-                                    st.error("⛔ 조정 가능한 결제 내역이 없습니다. 결제 섹션에서 직접 처리해 주세요.")
+                                    if not _allow_overpay_edit:
+                                        _block_update = True
+                                        st.error("⛔ 조정 가능한 결제 내역이 없습니다. 결제 섹션에서 직접 처리하거나, 위 「초과 허용」을 선택해 주세요.")
                                 else:
                                     st.markdown("**감액할 결제 건 선택 (새 금액 입력)**")
                                     _running_need = _need_reduce
@@ -9408,8 +9429,9 @@ def render_customer_balance():
                                     )
                                     _planned_balance = _edit_total - _planned_new_paid
                                     if _planned_balance < 0:
-                                        _block_update = True
-                                        st.error(f"⛔ 조정 후에도 결제 합계({_planned_new_paid:,}원)가 새 계약금액({_edit_total:,}원)을 초과합니다. 감액 금액을 더 늘려주세요.")
+                                        if not _allow_overpay_edit:
+                                            _block_update = True
+                                            st.error(f"⛔ 조정 후에도 결제 합계({_planned_new_paid:,}원)가 새 계약금액({_edit_total:,}원)을 초과합니다. 감액을 더 늘리거나 「초과 허용」을 선택해 주세요.")
                                     elif _planned_balance == 0:
                                         st.success(f"✅ 조정 후 잔금: {_planned_balance:,}원 (완납)")
                                     else:
@@ -9420,7 +9442,7 @@ def render_customer_balance():
                             else:
                                 st.info(f"✅ 변경 후 예상 잔금: {int(_new_balance_preview):,}원")
 
-                            # 승인 절차 없이 전 직원 직접 수정 (단, 마이너스 잔금 발생 시 버튼 잠금)
+                            # 승인 절차 없이 전 직원 직접 수정 (결제 초과 시 기본은 버튼 잠금, 「초과 허용」 시 저장 가능)
                             edit_reason = st.text_area("변경 사유(필수, 예: 단가 할인, 옵션 추가 등)", key=f"{edit_prefix}_reason")
                             
                             if st.button("수정 완료 (Update)", key=f"{edit_prefix}_update_btn", disabled=_block_update, type="primary"):
@@ -9453,9 +9475,12 @@ def render_customer_balance():
                                         payment_total = float(pay_sum_row[0]) if pay_sum_row else 0
                                         
                                     balance_check = new_total - payment_total
+                                    _allow_overpay_save = bool(st.session_state.get(f"{edit_prefix}_allow_overpay"))
                                     if balance_check < 0:
-                                        # 감액 동시 처리: _overdue_reduction_plan에 감액 계획이 있으면 실행
-                                        if _overdue_reduction_plan:
+                                        # 초과 허용: 결제는 그대로 두고 계약만 반영 → 재계산 시 balance_status=이상결제, 초과결제 탭은 balance<0 동일
+                                        if _allow_overpay_save:
+                                            pass
+                                        elif _overdue_reduction_plan:
                                             today_str_reduce = datetime.now(tz=KST).strftime("%Y-%m-%d")
                                             _reduce_err = None
                                             for _rpid, _new_ramt in _overdue_reduction_plan.items():
@@ -9505,11 +9530,11 @@ def render_customer_balance():
                                                     payment_total = float(conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id=?", (sel_oid,)).fetchone()[0] or 0)
                                             balance_check = new_total - payment_total
                                             if balance_check < 0:
-                                                st.error(f"⛔ 감액 처리 후에도 결제 합계({payment_total:,.0f}원)가 새 계약금액({new_total:,.0f}원)을 초과합니다.")
+                                                st.error(f"⛔ 감액 처리 후에도 결제 합계({payment_total:,.0f}원)가 새 계약금액({new_total:,.0f}원)을 초과합니다. 「초과 허용」으로 저장하려면 해당 옵션을 켠 뒤 다시 시도해 주세요.")
                                                 if conn: conn.close()
                                                 st.stop()
                                         else:
-                                            st.error(f"⛔ 초과결제 감지: 결제 금액이 구매 금액보다 큽니다. 결제 내역을 먼저 수정하세요.")
+                                            st.error(f"⛔ 초과결제 감지: 결제 금액이 구매 금액보다 큽니다. 결제 내역을 조정하거나 「초과 허용」을 선택해 주세요.")
                                             if conn: conn.close()
                                             st.stop()
 
