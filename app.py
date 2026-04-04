@@ -16,7 +16,7 @@ import threading
 import traceback
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
@@ -1631,29 +1631,59 @@ def load_payments_cached(db_filename: str) -> pd.DataFrame:
         conn.close()
 
 
+def _utc_z_bounds_for_kst_range(month_start: date, today: date) -> tuple[str, str]:
+    """Supabase timestamptz 비교용 UTC 'Z' 문자열 (KST 자정~말)."""
+    start_kst = datetime.combine(month_start, dt_time.min, tzinfo=KST)
+    end_kst = datetime.combine(today, dt_time.max, tzinfo=KST)
+    su = start_kst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    eu = end_kst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return su, eu
+
+
 @st.cache_data(ttl=300)
 def load_payment_history_dashboard_cached(
-    db_filename: str, range_start_iso: str, range_end_iso: str
+    db_filename: str, month_start: date, today: date
 ) -> pd.DataFrame:
-    """대시보드 집계용 app_payment_history(또는 SQLite PaymentHistory). changed_at 구간."""
+    """대시보드 집계용 app_payment_history(또는 SQLite PaymentHistory). changed_at은 KST 당월~오늘."""
     if not db_filename:
         return pd.DataFrame()
+    range_start_iso = datetime.combine(month_start, dt_time.min, tzinfo=KST).isoformat()
+    range_end_iso = datetime.combine(today, dt_time.max, tzinfo=KST).isoformat()
     if _supabase_orders_payments_available():
         try:
             sc, err = get_supabase_client()
             if err or not sc:
                 return pd.DataFrame()
+            zu, zv = _utc_z_bounds_for_kst_range(month_start, today)
             r = (
                 sc.table("app_payment_history")
                 .select("action_type, old_payment_data, new_payment_data, changed_at")
                 .eq("db_filename", db_filename)
-                .gte("changed_at", range_start_iso)
-                .lte("changed_at", range_end_iso)
+                .gte("changed_at", zu)
+                .lte("changed_at", zv)
+                .order("changed_at", desc=True)
                 .limit(5000)
                 .execute()
             )
             rows = r.data or []
-            return pd.DataFrame(rows) if rows else pd.DataFrame()
+            df = pd.DataFrame(rows) if rows else pd.DataFrame()
+            if df.empty:
+                # 1차(UTC 경계) 무결과 시: 최근 행만 불러와 KST 날짜로 당월 필터 (API/타임존 이슈 완화)
+                r2 = (
+                    sc.table("app_payment_history")
+                    .select("action_type, old_payment_data, new_payment_data, changed_at")
+                    .eq("db_filename", db_filename)
+                    .order("changed_at", desc=True)
+                    .limit(4000)
+                    .execute()
+                )
+                rows2 = r2.data or []
+                df = pd.DataFrame(rows2) if rows2 else pd.DataFrame()
+            if df.empty:
+                return df
+            _ts = pd.to_datetime(df["changed_at"], errors="coerce", utc=True)
+            _d = _ts.dt.tz_convert(KST).dt.date
+            return df.loc[(_d >= month_start) & (_d <= today)].copy()
         except Exception:
             return pd.DataFrame()
     conn = get_tenant_conn(db_filename)
@@ -1682,10 +1712,31 @@ def _dashboard_parse_ph_payload(val) -> dict:
         return val
     if isinstance(val, str):
         try:
-            return json.loads(val)
+            inner = json.loads(val)
+            if isinstance(inner, str):
+                inner = json.loads(inner)
+            return inner if isinstance(inner, dict) else {}
         except Exception:
             return {}
     return {}
+
+
+def _ph_blob_amount(blob: dict) -> float:
+    """이력 JSON에서 결제 금액 추출 (payment.amount 또는 최상위 amount)."""
+    if not isinstance(blob, dict):
+        return 0.0
+    pay = blob.get("payment")
+    if isinstance(pay, dict) and pay.get("amount") is not None:
+        try:
+            return float(pay["amount"])
+        except (TypeError, ValueError):
+            pass
+    if blob.get("amount") is not None:
+        try:
+            return float(blob["amount"])
+        except (TypeError, ValueError):
+            pass
+    return 0.0
 
 
 def _dashboard_cancel_reduce_totals_from_ph(
@@ -1709,21 +1760,19 @@ def _dashboard_cancel_reduce_totals_from_ph(
         d = row["_evt_date"]
         if pd.isna(d):
             continue
-        at = str(row.get("action_type") or "")
+        at = str(row.get("action_type") or "").strip()
         old = _dashboard_parse_ph_payload(row.get("old_payment_data"))
         new = _dashboard_parse_ph_payload(row.get("new_payment_data"))
-        pay_old = old.get("payment") if isinstance(old.get("payment"), dict) else {}
-        pay_new = new.get("payment") if isinstance(new.get("payment"), dict) else {}
         if at in ("결제취소", "결제직접삭제"):
-            amt = float((pay_old or {}).get("amount") or 0)
+            amt = _ph_blob_amount(old)
             if amt > 0:
                 if d == today:
                     out["today_cancel"] += amt
                 if month_start <= d <= month_end:
                     out["month_cancel"] += amt
         elif at == "결제변경":
-            oa = float((pay_old or {}).get("amount") or 0)
-            na = float((pay_new or {}).get("amount") or 0)
+            oa = _ph_blob_amount(old)
+            na = _ph_blob_amount(new)
             red = max(0.0, oa - na)
             if red > 0:
                 if d == today:
@@ -10767,10 +10816,8 @@ def render_dashboard():
     # 당일 sales 테이블 기반 계약 신규/조정 분리
     today_sales_new = 0.0    # 오늘 신규 계약 (양수)
     today_sales_adj = 0.0    # 오늘 금액 수정 조정 (음수 or 양수)
-    _ph_range_start = datetime.combine(month_start, datetime.min.time(), tzinfo=KST).isoformat()
-    _ph_range_end = datetime.combine(today, datetime.max.time(), tzinfo=KST).isoformat()
     try:
-        _ph_df_dash = load_payment_history_dashboard_cached(db_filename, _ph_range_start, _ph_range_end)
+        _ph_df_dash = load_payment_history_dashboard_cached(db_filename, month_start, today)
         ph_totals = _dashboard_cancel_reduce_totals_from_ph(_ph_df_dash, today, month_start, today)
     except Exception:
         ph_totals = {
@@ -10848,25 +10895,45 @@ def render_dashboard():
         _contract_sub = f"신규 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원"
     _contract_extra = ""
     if today_sales_adj < 0:
-        _contract_extra = '<div class="kpi-sub2">※ sales 원장 순액: 취소·계약감액 등 음수 트랜잭션 반영</div>'
+        _contract_extra = (
+            '<div class="kpi-detail-stack">'
+            '<span class="kpi-sub2">※ sales 원장 순액: 취소·계약감액 등 음수 트랜잭션 반영</span></div>'
+        )
 
     if payments.empty or "payment_date" not in payments.columns:
-        _recv_daily_extra = '<div class="kpi-sub2">⚠️ 결제일(payment_date) 없음 — 수납·상계 표시 불가</div>'
+        _recv_daily_extra = '<div class="kpi-detail-stack"><div class="kpi-sub2">⚠️ 결제일(payment_date) 없음 — 수납·상계 표시 불가</div></div>'
         _recv_month_extra = _recv_daily_extra
     else:
+        _recv_zero_hint_day = (
+            '<div class="kpi-sub2 kpi-sub-muted">당일 음수 결제·이력이 없으면 0입니다.</div>'
+            if (today_pay_neg_sum == 0 and ph_totals["today_cancel"] == 0 and ph_totals["today_reduce"] == 0)
+            else ""
+        )
+        _recv_zero_hint_month = (
+            '<div class="kpi-sub2 kpi-sub-muted">당월 음수 결제·이력이 없으면 0입니다.</div>'
+            if (month_pay_neg_sum == 0 and ph_totals["month_cancel"] == 0 and ph_totals["month_reduce"] == 0)
+            else ""
+        )
         _recv_daily_extra = (
-            f'<div class="kpi-sub">취소·감액(상계)이 반영된 순액입니다.</div>'
-            f'<div class="kpi-sub2">당일 상계(음수 결제) 합: {today_pay_neg_sum:,.0f}원</div>'
-            f'<div class="kpi-sub2">이력·취소/삭제 {ph_totals["today_cancel"]:,.0f}원 · '
-            f'이력·감액(결제변경) {ph_totals["today_reduce"]:,.0f}원</div>'
+            f'<div class="kpi-detail-stack">'
+            f'<span class="kpi-sub">취소·감액(상계)이 반영된 순액입니다.</span>'
+            f'<span class="kpi-sub2">당일 상계(음수 결제) 합: {today_pay_neg_sum:,.0f}원</span>'
+            f'<span class="kpi-sub2">이력·취소/삭제 {ph_totals["today_cancel"]:,.0f}원 · '
+            f'이력·감액(결제변경) {ph_totals["today_reduce"]:,.0f}원</span>'
+            f"{_recv_zero_hint_day}</div>"
         )
         _recv_month_extra = (
-            f'<div class="kpi-sub">당월 결제 순액에 상계(음수) 반영됨</div>'
-            f'<div class="kpi-sub2">당월 상계(음수 결제) 합: {month_pay_neg_sum:,.0f}원</div>'
-            f'<div class="kpi-sub2">이력·취소/삭제 {ph_totals["month_cancel"]:,.0f}원 · '
-            f'이력·감액(결제변경) {ph_totals["month_reduce"]:,.0f}원</div>'
+            f'<div class="kpi-detail-stack">'
+            f'<span class="kpi-sub">당월 결제 순액에 상계(음수) 반영됨</span>'
+            f'<span class="kpi-sub2">당월 상계(음수 결제) 합: {month_pay_neg_sum:,.0f}원</span>'
+            f'<span class="kpi-sub2">이력·취소/삭제 {ph_totals["month_cancel"]:,.0f}원 · '
+            f'이력·감액(결제변경) {ph_totals["month_reduce"]:,.0f}원</span>'
+            f"{_recv_zero_hint_month}</div>"
         )
-    _expected_contract_note = '<div class="kpi-sub2">주문일 기준 계약 합계(결제 취소와 별개)</div>'
+    _expected_contract_note = (
+        '<div class="kpi-detail-stack">'
+        '<span class="kpi-sub2">주문일 기준 계약 합계(결제 취소와 별개)</span></div>'
+    )
 
     st.markdown(
         f"""
@@ -10916,6 +10983,23 @@ def render_dashboard():
             color: #777;
             margin-top: 3px;
             line-height: 1.35;
+        }}
+        .kpi-sub-muted {{
+            color: #999;
+            font-size: 0.58rem;
+        }}
+        .kpi-detail-stack {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+            margin-top: 8px;
+            width: 100%;
+        }}
+        .kpi-detail-stack .kpi-sub,
+        .kpi-detail-stack .kpi-sub2 {{
+            display: block;
+            margin-top: 0;
         }}
         </style>
         <table class="kpi-table">
