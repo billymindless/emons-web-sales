@@ -10849,9 +10849,8 @@ def render_dashboard():
                 ord_df["_date"] = ord_df["order_date"].dt.date
                 month_ord = ord_df[(ord_df["_date"] >= month_start) & (ord_df["_date"] <= today)]
                 if len(month_ord) > 0:
-                    # total_amount에는 이미 전시품 판매가가 합산되어 있으므로 별도 가산하지 않음
+                    # 마진율은 주문 기준으로 계산 (누적매출 지표 기준과 분리)
                     tot_amt = month_ord["total_amount"].fillna(0)
-                    expected_total_sales = float(tot_amt.sum())
                     tot_cost = month_ord["cost_price"].fillna(0)
                     if "display_cost_amount" in month_ord.columns:
                         tot_cost = tot_cost + month_ord["display_cost_amount"].fillna(0)
@@ -10866,6 +10865,10 @@ def render_dashboard():
             _sd["transaction_date"] = pd.to_datetime(_sd["transaction_date"], errors="coerce")
             _sd = _sd.dropna(subset=["transaction_date"])
             _sd["_date"] = _sd["transaction_date"].dt.date
+            _month_sd = _sd[(_sd["_date"] >= month_start) & (_sd["_date"] <= today)]
+            if not _month_sd.empty:
+                # 상단 KPI "누적매출(월)"과 하단 Net Sales를 동일 기준(sales.amount 순액)으로 통일
+                expected_total_sales = float(_month_sd["amount"].sum())
             _today_sd = _sd[_sd["_date"] == today]
             if not _today_sd.empty:
                 today_sales_new = float(_today_sd[_today_sd["amount"] > 0]["amount"].sum())
@@ -10895,7 +10898,7 @@ def render_dashboard():
     _contract_extra_text = "※ sales 원장 순액: 취소·계약감액 등 음수 트랜잭션 반영" if today_sales_adj < 0 else ""
     _contract_extra_style = "" if _contract_extra_text else "display:none;"
 
-    _expected_contract_note_text = "주문일 기준 계약 합계(결제 취소와 별개)"
+    _expected_contract_note_text = "sales 순액 기준(취소·감액·계약조정 반영)"
 
     if payments.empty or "payment_date" not in payments.columns:
         _recv_daily_line1 = "⚠️ 결제일(payment_date) 없음 — 수납·상계 표시 불가"
