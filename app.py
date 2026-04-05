@@ -9363,15 +9363,13 @@ def render_customer_balance():
                         if sel_oid:
                             orow = orders[orders["id"] == sel_oid].iloc[0]
                             # 재초기화 조건: OID 변경, 키 미존재, 또는 DB에 금액이 있는데 세션 상태가 0/빈값인 경우
-                            _db_total_check = float(orow.get("total_amount") or 0)
-                            _ss_total_check = _parse_comma_to_int(st.session_state.get(f"{edit_prefix}_general_sales", "0"))
-                            _db_cost_check = float(orow.get("cost_price") or 0)
-                            _ss_cost_check = _parse_comma_to_int(st.session_state.get(f"{edit_prefix}_cost", "0"))
+                            # 0원 입력(주문 취소 정리)을 허용하기 위해 값이 0인지로 초기화 여부를 판단하지 않는다.
                             _need_order_init = (
                                 st.session_state.get(f"{edit_prefix}_oid") != sel_oid
                                 or f"{edit_prefix}_general_sales" not in st.session_state
-                                or (_ss_total_check == 0 and _db_total_check > 0)
-                                or (_ss_cost_check == 0 and _db_cost_check > 0)
+                                or f"{edit_prefix}_cost" not in st.session_state
+                                or f"{edit_prefix}_display_sales" not in st.session_state
+                                or f"{edit_prefix}_display_cost" not in st.session_state
                             )
                             if _need_order_init:
                                 # NaN/None/pd.NA 안전 변환 헬퍼
