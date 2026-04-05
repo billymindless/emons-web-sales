@@ -4893,6 +4893,15 @@ _MAP_ZOOM = 7
 def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
     """merged(orders+customers)에서 주소 지오코딩 후 latitude, longitude, address, building_name, 고객명, 품목, 금액, 배송일자 포함 DataFrame 반환.
     app_customers에 latitude, longitude가 있으면 우선 사용(지오코딩 스킵)."""
+    def _safe_strip_text(v) -> str:
+        try:
+            if v is None or pd.isna(v):
+                return ""
+        except Exception:
+            if v is None:
+                return ""
+        return str(v).strip()
+
     if "address" not in merged.columns or "name" not in merged.columns:
         return pd.DataFrame()
     if "geo_cache" not in st.session_state:
@@ -4905,7 +4914,7 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
         try:
             if pd.notna(lat_val) and pd.notna(lon_val) and -90 <= float(lat_val) <= 90 and -180 <= float(lon_val) <= 180:
                 lat, lon = float(lat_val), float(lon_val)
-                addr_display = (row.get("address") or "").strip() or "-"
+                addr_display = _safe_strip_text(row.get("address")) or "-"
                 rows.append({
                     "latitude": lat, "longitude": lon, "address": addr_display,
                     "building_name": None, "bname": None,
@@ -4916,7 +4925,7 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
                 continue
         except (ValueError, TypeError):
             pass
-        addr = (row.get("address") or "").strip()
+        addr = _safe_strip_text(row.get("address"))
         if not addr:
             continue
         if addr in cache:
@@ -4968,7 +4977,10 @@ def _create_folium_map(df: pd.DataFrame, center: tuple, zoom_start: int, key: st
         if pd.isna(lat) or pd.isna(lon):
             continue
         building_name = r.get("building_name") or r.get("bname")
-        addr = (r.get("address") or "").strip()
+        try:
+            addr = "" if (r.get("address") is None or pd.isna(r.get("address"))) else str(r.get("address")).strip()
+        except Exception:
+            addr = str(r.get("address") or "").strip()
         line1 = ""
         if building_name:
             line1 = f"<strong>[{html.escape(str(building_name))}]</strong><br>"
