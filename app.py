@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import threading
+import textwrap
 import traceback
 import streamlit as st
 import pandas as pd
@@ -10893,50 +10894,46 @@ def render_dashboard():
         _contract_sub = f"신규 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원"
     elif today_sales_adj > 0:
         _contract_sub = f"신규 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원"
-    _contract_extra = ""
-    if today_sales_adj < 0:
-        _contract_extra = (
-            '<div class="kpi-detail-stack">'
-            '<span class="kpi-sub2">※ sales 원장 순액: 취소·계약감액 등 음수 트랜잭션 반영</span></div>'
-        )
+    _contract_extra_text = "※ sales 원장 순액: 취소·계약감액 등 음수 트랜잭션 반영" if today_sales_adj < 0 else ""
+    _contract_extra_style = "" if _contract_extra_text else "display:none;"
+
+    _expected_contract_note_text = "주문일 기준 계약 합계(결제 취소와 별개)"
 
     if payments.empty or "payment_date" not in payments.columns:
-        _recv_daily_extra = '<div class="kpi-detail-stack"><div class="kpi-sub2">⚠️ 결제일(payment_date) 없음 — 수납·상계 표시 불가</div></div>'
-        _recv_month_extra = _recv_daily_extra
+        _recv_daily_line1 = "⚠️ 결제일(payment_date) 없음 — 수납·상계 표시 불가"
+        _recv_daily_line2 = ""
+        _recv_daily_line3 = ""
+        _recv_daily_hint = ""
+        _recv_month_line1 = "⚠️ 결제일(payment_date) 없음 — 수납·상계 표시 불가"
+        _recv_month_line2 = ""
+        _recv_month_line3 = ""
+        _recv_month_hint = ""
     else:
-        _recv_zero_hint_day = (
-            '<div class="kpi-sub2 kpi-sub-muted">당일 음수 결제·이력이 없으면 0입니다.</div>'
+        _recv_daily_line1 = "취소·감액(상계)이 반영된 순액입니다."
+        _recv_daily_line2 = f"당일 상계(음수 결제) 합: {today_pay_neg_sum:,.0f}원"
+        _recv_daily_line3 = (
+            f"이력·취소/삭제 {ph_totals['today_cancel']:,.0f}원 · "
+            f"이력·감액(결제변경) {ph_totals['today_reduce']:,.0f}원"
+        )
+        _recv_daily_hint = (
+            "당일 음수 결제·이력이 없으면 0입니다."
             if (today_pay_neg_sum == 0 and ph_totals["today_cancel"] == 0 and ph_totals["today_reduce"] == 0)
             else ""
         )
-        _recv_zero_hint_month = (
-            '<div class="kpi-sub2 kpi-sub-muted">당월 음수 결제·이력이 없으면 0입니다.</div>'
+        _recv_month_line1 = "당월 결제 순액에 상계(음수) 반영됨"
+        _recv_month_line2 = f"당월 상계(음수 결제) 합: {month_pay_neg_sum:,.0f}원"
+        _recv_month_line3 = (
+            f"이력·취소/삭제 {ph_totals['month_cancel']:,.0f}원 · "
+            f"이력·감액(결제변경) {ph_totals['month_reduce']:,.0f}원"
+        )
+        _recv_month_hint = (
+            "당월 음수 결제·이력이 없으면 0입니다."
             if (month_pay_neg_sum == 0 and ph_totals["month_cancel"] == 0 and ph_totals["month_reduce"] == 0)
             else ""
         )
-        _recv_daily_extra = (
-            f'<div class="kpi-detail-stack">'
-            f'<span class="kpi-sub">취소·감액(상계)이 반영된 순액입니다.</span>'
-            f'<span class="kpi-sub2">당일 상계(음수 결제) 합: {today_pay_neg_sum:,.0f}원</span>'
-            f'<span class="kpi-sub2">이력·취소/삭제 {ph_totals["today_cancel"]:,.0f}원 · '
-            f'이력·감액(결제변경) {ph_totals["today_reduce"]:,.0f}원</span>'
-            f"{_recv_zero_hint_day}</div>"
-        )
-        _recv_month_extra = (
-            f'<div class="kpi-detail-stack">'
-            f'<span class="kpi-sub">당월 결제 순액에 상계(음수) 반영됨</span>'
-            f'<span class="kpi-sub2">당월 상계(음수 결제) 합: {month_pay_neg_sum:,.0f}원</span>'
-            f'<span class="kpi-sub2">이력·취소/삭제 {ph_totals["month_cancel"]:,.0f}원 · '
-            f'이력·감액(결제변경) {ph_totals["month_reduce"]:,.0f}원</span>'
-            f"{_recv_zero_hint_month}</div>"
-        )
-    _expected_contract_note = (
-        '<div class="kpi-detail-stack">'
-        '<span class="kpi-sub2">주문일 기준 계약 합계(결제 취소와 별개)</span></div>'
-    )
 
     st.markdown(
-        f"""
+        textwrap.dedent(f"""
         <style>
         .kpi-table {{
             width: 100%;
@@ -11007,24 +11004,38 @@ def render_dashboard():
             <td class="highlight">
               <div class="kpi-label">🔴 일일 계약매출</div>
               <div class="kpi-value contract">{today_sales_net:,.0f}원</div>
-              <div class="kpi-sub">{_contract_sub}</div>
-              {_contract_extra}
+              <div class="kpi-sub">{html.escape(_contract_sub)}</div>
+              <div class="kpi-detail-stack" style="{_contract_extra_style}">
+                <span class="kpi-sub2">{html.escape(_contract_extra_text)}</span>
+              </div>
             </td>
             <td>
               <div class="kpi-label">📈 누적매출 (월)</div>
               <div class="kpi-value">{expected_total_sales:,.0f}원</div>
               <div class="kpi-sub">{month_start.strftime("%m/%d")} ~ 오늘</div>
-              {_expected_contract_note}
+              <div class="kpi-detail-stack">
+                <span class="kpi-sub2">{html.escape(_expected_contract_note_text)}</span>
+              </div>
             </td>
             <td>
               <div class="kpi-label">📥 일일 수납액</div>
               <div class="kpi-value">{daily_sales:,.0f}원</div>
-              {_recv_daily_extra}
+              <div class="kpi-detail-stack">
+                <span class="kpi-sub">{html.escape(_recv_daily_line1)}</span>
+                <span class="kpi-sub2" style="{'display:none;' if not _recv_daily_line2 else ''}">{html.escape(_recv_daily_line2)}</span>
+                <span class="kpi-sub2" style="{'display:none;' if not _recv_daily_line3 else ''}">{html.escape(_recv_daily_line3)}</span>
+                <span class="kpi-sub2 kpi-sub-muted" style="{'display:none;' if not _recv_daily_hint else ''}">{html.escape(_recv_daily_hint)}</span>
+              </div>
             </td>
             <td>
               <div class="kpi-label">📊 누적 수납액 (월)</div>
               <div class="kpi-value">{cumulative_sales:,.0f}원</div>
-              {_recv_month_extra}
+              <div class="kpi-detail-stack">
+                <span class="kpi-sub">{html.escape(_recv_month_line1)}</span>
+                <span class="kpi-sub2" style="{'display:none;' if not _recv_month_line2 else ''}">{html.escape(_recv_month_line2)}</span>
+                <span class="kpi-sub2" style="{'display:none;' if not _recv_month_line3 else ''}">{html.escape(_recv_month_line3)}</span>
+                <span class="kpi-sub2 kpi-sub-muted" style="{'display:none;' if not _recv_month_hint else ''}">{html.escape(_recv_month_hint)}</span>
+              </div>
             </td>
             <td>
               <div class="kpi-label">🎯 예상 월매출</div>
@@ -11041,7 +11052,7 @@ def render_dashboard():
             </td>
           </tr>
         </table>
-        """,
+        """),
         unsafe_allow_html=True,
     )
 
