@@ -5453,36 +5453,59 @@ def _superadmin_tab1_integrated_dashboard():
 
 
 def _superadmin_tab2_hr_store_employees():
-    """② 매장별 직원 평가 현황 (HR): 매장·연월 선택 후 100점 만점 KPI 표."""
+    """② 매장별 직원 평가 현황 (HR): 매장/전체 + 단일월/연월범위 집계."""
     stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
-    store_options = stores["store_name"].tolist()
+
+    store_options = ["전체 매장 통합"] + stores["store_name"].tolist()
     selected_store = st.selectbox("매장 선택", store_options, key="sa_hr_store")
-    if not selected_store:
-        return
-    db_fn = stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
-    if _supabase_orders_payments_available():
-        order_list = "id, order_date, total_amount, actual_margin, employee_names, display_sales_amount"
-        orders = _load_orders_supabase(db_fn, order_list, limit=None)
+    period_mode = st.radio(
+        "조회 방식",
+        ["단일 월", "연월 범위"],
+        horizontal=True,
+        key="sa_hr_period_mode",
+    )
+
+    # 1) 선택 범위의 주문 데이터 로드 (DB 스키마/코어 로직 변경 없이 조회만 수행)
+    orders_all = []
+    if selected_store == "전체 매장 통합":
+        target_rows = stores[["store_name", "db_filename"]].to_dict("records")
     else:
-        conn = get_tenant_conn(db_fn)
-        if not conn:
-            st.error("해당 매장 DB를 열 수 없습니다.")
-            return
-        try:
-            cur = conn.execute("PRAGMA table_info(Orders)")
-            cols = [r[1] for r in cur.fetchall()]
-            order_list = "id, order_date, total_amount, actual_margin, employee_names"
-            if "display_sales_amount" in cols:
-                order_list += ", display_sales_amount"
-            orders = pd.read_sql(f"SELECT {order_list} FROM Orders", conn)
-        finally:
-            conn.close()
-    if orders.empty:
-        st.info("해당 매장에 주문 데이터가 없습니다.")
+        target_rows = stores[stores["store_name"] == selected_store][["store_name", "db_filename"]].to_dict("records")
+    for s in target_rows:
+        db_fn = s["db_filename"]
+        store_nm = s["store_name"]
+        if _supabase_orders_payments_available():
+            order_list = "id, order_date, total_amount, actual_margin, employee_names, display_sales_amount"
+            odf = _load_orders_supabase(db_fn, order_list, limit=None)
+        else:
+            conn = get_tenant_conn(db_fn)
+            if not conn:
+                continue
+            try:
+                cur = conn.execute("PRAGMA table_info(Orders)")
+                cols = [r[1] for r in cur.fetchall()]
+                order_list = "id, order_date, total_amount, actual_margin, employee_names"
+                if "display_sales_amount" in cols:
+                    order_list += ", display_sales_amount"
+                odf = pd.read_sql(f"SELECT {order_list} FROM Orders", conn)
+            except Exception:
+                odf = pd.DataFrame()
+            finally:
+                conn.close()
+        if odf is None or odf.empty:
+            continue
+        odf = odf.copy()
+        odf["_store"] = store_nm
+        orders_all.append(odf)
+
+    if not orders_all:
+        st.info("선택한 매장 범위에 주문 데이터가 없습니다.")
         return
+    orders = pd.concat(orders_all, ignore_index=True)
+
     if "display_sales_amount" not in orders.columns:
         orders["display_sales_amount"] = 0
     orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0).astype(int)
@@ -5490,8 +5513,10 @@ def _superadmin_tab2_hr_store_employees():
     orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
     order_dates = orders["order_date"].dropna()
     if len(order_dates) == 0:
-        st.info("해당 매장에 주문 데이터가 없습니다.")
+        st.info("주문 날짜 데이터가 없습니다.")
         return
+
+    # 2) 월 옵션 생성
     min_d = order_dates.min().to_pydatetime()
     max_d = order_dates.max().to_pydatetime()
     months_options = []
@@ -5502,14 +5527,50 @@ def _superadmin_tab2_hr_store_employees():
         m += 1
         if m > 12:
             m, y = 1, y + 1
-    months_options = months_options[::-1]
-    month_labels = [f"{y}년 {m}월" for y, m in months_options]
-    sel_idx = st.selectbox("연/월 선택", range(len(month_labels)), format_func=lambda i: month_labels[i], key="sa_hr_month")
-    sel_y, sel_m = months_options[sel_idx]
-    month_start = date(sel_y, sel_m, 1)
+    months_options = months_options[::-1]  # 최신월 우선
+    month_labels = [f"{yy}년 {mm}월" for yy, mm in months_options]
+
     from calendar import monthrange
-    month_end = date(sel_y, sel_m, monthrange(sel_y, sel_m)[1])
-    orders_m = orders[(orders["order_date"].dt.date >= month_start) & (orders["order_date"].dt.date <= month_end)].copy()
+    if period_mode == "단일 월":
+        sel_idx = st.selectbox(
+            "연/월 선택",
+            range(len(month_labels)),
+            format_func=lambda i: month_labels[i],
+            key="sa_hr_month_single",
+        )
+        sel_y, sel_m = months_options[sel_idx]
+        range_start = date(sel_y, sel_m, 1)
+        range_end = date(sel_y, sel_m, monthrange(sel_y, sel_m)[1])
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            s_idx = st.selectbox(
+                "시작 연/월",
+                range(len(month_labels)),
+                format_func=lambda i: month_labels[i],
+                index=min(len(month_labels) - 1, 3),
+                key="sa_hr_month_start",
+            )
+        with c2:
+            e_idx = st.selectbox(
+                "종료 연/월",
+                range(len(month_labels)),
+                format_func=lambda i: month_labels[i],
+                index=0,
+                key="sa_hr_month_end",
+            )
+        # 최신순 배열이므로 index가 작을수록 최신월
+        _start_idx = max(s_idx, e_idx)
+        _end_idx = min(s_idx, e_idx)
+        sy, sm = months_options[_start_idx]
+        ey, em = months_options[_end_idx]
+        range_start = date(sy, sm, 1)
+        range_end = date(ey, em, monthrange(ey, em)[1])
+
+    st.caption(f"조회 기간: {range_start.isoformat()} ~ {range_end.isoformat()}")
+
+    # 3) 기간 필터 후 직원 1/n 분배 집계
+    orders_m = orders[(orders["order_date"].dt.date >= range_start) & (orders["order_date"].dt.date <= range_end)].copy()
     rows = []
     for _, r in orders_m.iterrows():
         emps = [e.strip() for e in (r.get("employee_names") or "").split(",") if e.strip()]
@@ -5523,11 +5584,25 @@ def _superadmin_tab2_hr_store_employees():
         per_margin = margin / n
         per_display = (display_amt / n) if n else 0
         for e in emps:
-            rows.append({"employee": e, "sales": per_amt, "margin": per_margin, "display_sales": per_display})
+            rows.append({
+                "store": r.get("_store") or "-",
+                "employee": e,
+                "sales": per_amt,
+                "margin": per_margin,
+                "display_sales": per_display,
+            })
     if not rows:
-        st.info("선택한 월에 직원이 배정된 주문이 없습니다.")
+        st.info("선택한 기간에 직원이 배정된 주문이 없습니다.")
         return
-    emp_df = pd.DataFrame(rows).groupby("employee", as_index=False).agg({"sales": "sum", "margin": "sum", "display_sales": "sum"})
+
+    row_df = pd.DataFrame(rows)
+    emp_df = row_df.groupby("employee", as_index=False).agg({
+        "sales": "sum",
+        "margin": "sum",
+        "display_sales": "sum",
+        "store": "nunique",
+    }).rename(columns={"store": "참여 매장 수"})
+
     total_sales = emp_df["sales"].sum() or 0
     total_margin = emp_df["margin"].sum() or 0
     total_display = emp_df["display_sales"].sum() or 0
@@ -5539,9 +5614,44 @@ def _superadmin_tab2_hr_store_employees():
     emp_df["총 판매액"] = emp_df["sales"].round(0).astype(int)
     emp_df["마진액"] = emp_df["margin"].round(0).astype(int)
     emp_df["전시품 판매액"] = emp_df["display_sales"].round(0).astype(int)
-    display_df = emp_df[["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]].rename(columns={"employee": "직원명"})
+
+    base_cols = ["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]
+    if selected_store == "전체 매장 통합":
+        base_cols.insert(4, "참여 매장 수")
+    display_df = emp_df[base_cols].rename(columns={"employee": "직원명"})
     display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
     st.dataframe(display_fmt, use_container_width=True)
+
+    store_emp = pd.DataFrame()
+    # 4) 전체 통합 모드에서는 매장별·직원별 매출합 보조표 제공
+    if selected_store == "전체 매장 통합":
+        st.markdown("##### 전지점 통합 - 매장별 직원 매출합")
+        store_emp = (
+            row_df.groupby(["store", "employee"], as_index=False)["sales"]
+            .sum()
+            .sort_values(["store", "sales"], ascending=[True, False])
+            .rename(columns={"store": "매장명", "employee": "직원명", "sales": "매출합"})
+        )
+        store_emp["매출합"] = store_emp["매출합"].round(0).astype(int)
+        st.dataframe(_format_df_display(store_emp, ["매출합"]), use_container_width=True)
+
+    # 5) 엑셀 다운로드 (직원 통합표 + 통합모드 시 매장별 보조표)
+    dl_buf = io.BytesIO()
+    with pd.ExcelWriter(dl_buf, engine="openpyxl") as writer:
+        dl_main = display_df.copy()
+        dl_main.to_excel(writer, sheet_name="직원평가요약", index=False)
+        if selected_store == "전체 매장 통합" and not store_emp.empty:
+            store_emp.to_excel(writer, sheet_name="매장별직원매출합", index=False)
+    dl_buf.seek(0)
+    _store_label = "전체매장통합" if selected_store == "전체 매장 통합" else selected_store.replace(" ", "_")
+    _period_label = f"{range_start.isoformat()}_{range_end.isoformat()}"
+    st.download_button(
+        "📥 직원 평가 엑셀 다운로드",
+        data=dl_buf.getvalue(),
+        file_name=f"직원평가_{_store_label}_{_period_label}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="sa_hr_excel_download",
+    )
 
 
 def _superadmin_tab3_notices():
