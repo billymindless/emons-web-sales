@@ -10735,10 +10735,14 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                     lambda oid: _oid_emp_map.get(int(oid), "") if pd.notna(oid) else ""
                 )
 
-            # orders에서 order_id → actual_margin, display_sales_amount 매핑 (KPI 점수용)
+            # orders에서 order_id → total_amount, actual_margin, display_sales_amount (KPI 점수용)
+            # 마진·전시품: sales 각 행의 amount를 주문 total_amount 대비 비율로 나눠 배분 → 감액(음수) 줄에도 음수 기여, 동일 월 다중 sales 행 시 중복 합산 방지
+            _total_map: dict = {}
             _margin_map = {}
             _display_map = {}
             if not orders.empty and "id" in orders.columns:
+                if "total_amount" in orders.columns:
+                    _total_map = orders.set_index("id")["total_amount"].fillna(0).astype(float).to_dict()
                 if "actual_margin" in orders.columns:
                     _margin_map = orders.set_index("id")["actual_margin"].fillna(0).to_dict()
                 if "display_sales_amount" in orders.columns:
@@ -10752,8 +10756,21 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                     continue
                 amt = float(r.get("amount") or 0)
                 oid = r.get("order_id")
-                margin = float(_margin_map.get(int(oid), 0)) / n if oid and pd.notna(oid) else 0
-                display_amt = float(_display_map.get(int(oid), 0)) / n if oid and pd.notna(oid) else 0
+                oid_int = int(oid) if oid is not None and pd.notna(oid) else None
+                if oid_int is None:
+                    margin = 0.0
+                    display_amt = 0.0
+                else:
+                    tot = float(_total_map.get(oid_int, 0) or 0)
+                    base_m = float(_margin_map.get(oid_int, 0) or 0)
+                    base_d = float(_display_map.get(oid_int, 0) or 0)
+                    if tot != 0:
+                        _ratio = amt / tot
+                        margin = (base_m * _ratio) / n
+                        display_amt = (base_d * _ratio) / n
+                    else:
+                        margin = 0.0
+                        display_amt = 0.0
                 per_amt = amt / n
                 for e in emps:
                     rows.append({"employee": e, "sales": per_amt, "margin": margin, "display_sales": display_amt})
@@ -10773,7 +10790,10 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 display_df = emp_df[["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]].rename(columns={"employee": "직원명"})
                 display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
                 st.dataframe(display_fmt, use_container_width=True)
-                st.caption("※ 판매금액은 sales 테이블(transaction_date 기준) 집계. 증액/감액 delta 포함. 마진/전시품은 주문 기준 참조.")
+                st.caption(
+                    "※ 판매금액: sales(transaction_date) 합계. 마진·전시품: 각 sales 행 금액 ÷ 주문 total_amount 비율로 주문 actual_margin·display_sales를 배분 "
+                    "(감액 음수 줄은 마진·전시품도 같은 비율로 감소)."
+                )
             else:
                 st.info("선택한 월에 직원이 배정된 판매 데이터가 없습니다.")
         else:
