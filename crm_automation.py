@@ -11,6 +11,13 @@ import json
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def _today_kst() -> date:
+    return datetime.now(tz=KST).date()
 
 import pandas as pd
 import streamlit as st
@@ -410,7 +417,7 @@ def render_crm_menu() -> None:
     if trigger == "특정일 예약 발송":
         sched = st.date_input(
             "예약 발송 날짜",
-            value=date.today() + timedelta(days=1),
+            value=_today_kst() + timedelta(days=1),
             key="crm_scheduled_date",
         )
         if isinstance(sched, date):

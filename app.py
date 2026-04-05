@@ -21,6 +21,13 @@ from datetime import datetime, date, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
+
+
+def _today_kst() -> date:
+    """앱 전역 '오늘' 기준. 서버가 UTC 등이어도 한국 날짜와 일치."""
+    return datetime.now(tz=KST).date()
+
+
 import requests
 import hashlib
 import time
@@ -2136,7 +2143,7 @@ def _cached_store_aov_30d(db_filename: str) -> float:
     """해당 매장 직전 30일 평균 객단가(주문당 금액). 성과 축하 AOV 비교용. ttl=1시간."""
     if not db_filename:
         return 0.0
-    today = date.today()
+    today = _today_kst()
     start = today - timedelta(days=30)
     start_str = start.isoformat()
     end_str = today.isoformat()
@@ -3915,9 +3922,9 @@ CREATE POLICY "allow_all_app_payment_history" ON app_payment_history FOR ALL USI
     with col1:
         search_name = st.text_input("고객명 검색", key="ph_search_name")
     with col2:
-        start_date = st.date_input("시작일", value=date.today() - timedelta(days=7), key="ph_start")
+        start_date = st.date_input("시작일", value=_today_kst() - timedelta(days=7), key="ph_start")
     with col3:
-        end_date = st.date_input("종료일", value=date.today(), key="ph_end")
+        end_date = st.date_input("종료일", value=_today_kst(), key="ph_end")
     with col4:
         action_filter = st.multiselect(
             "작업 유형",
@@ -5237,7 +5244,7 @@ def render_marketing_insights_tenant():
         if c not in customers_sub.columns:
             customers_sub[c] = None
 
-    today = date.today()
+    today = _today_kst()
     month_start = today.replace(day=1)
     last_month_end = month_start - timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
@@ -5331,7 +5338,7 @@ def render_marketing_insights_superadmin():
     merged_all = merged_all[merged_all["order_date"].notna()]
     merged_all["_dt"] = merged_all["order_date"].dt.date
 
-    today = date.today()
+    today = _today_kst()
     month_start = today.replace(day=1)
     last_month_end = month_start - timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
@@ -5368,7 +5375,7 @@ def _superadmin_tab1_integrated_dashboard():
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
-    today = date.today()
+    today = _today_kst()
     month_start = today.replace(day=1)
     from calendar import monthrange
     month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
@@ -5829,9 +5836,9 @@ def _superadmin_tab_unpaid_report():
     st.subheader("미수금(잔금) 레포트")
     col1, col2 = st.columns(2)
     with col1:
-        report_start = st.date_input("조회 시작일", value=date.today() - timedelta(days=30), key="unpaid_report_start")
+        report_start = st.date_input("조회 시작일", value=_today_kst() - timedelta(days=30), key="unpaid_report_start")
     with col2:
-        report_end = st.date_input("조회 종료일", value=date.today(), key="unpaid_report_end")
+        report_end = st.date_input("조회 종료일", value=_today_kst(), key="unpaid_report_end")
     rows = []
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
@@ -6062,7 +6069,7 @@ def _superadmin_tab5_store_accounts():
 
 def render_monthly_payment_report(is_superadmin: bool):
     """월별 결제수단 집계표 및 직원별 판매 실적 조회 모듈."""
-    today = date.today()
+    today = _today_kst()
     
     st.subheader("📊 통계 및 집계 리포트")
     report_type = st.radio("보고서 종류 선택", ["💳 결제수단 집계표", "👤 직원별 판매 실적"], horizontal=True, key="report_type_radio")
@@ -7590,8 +7597,8 @@ def _render_gamification_feedback(ctx: dict):
     db_filename = ctx.get("db_filename") or ""
     order_date = ctx.get("order_date")
     is_today_first = bool(ctx.get("is_today_first"))
-    year = order_date.year if hasattr(order_date, "year") else date.today().year
-    month = order_date.month if hasattr(order_date, "month") else date.today().month
+    year = order_date.year if hasattr(order_date, "year") else _today_kst().year
+    month = order_date.month if hasattr(order_date, "month") else _today_kst().month
 
     st.subheader("🎉 성과 축하")
     cards_html = []
@@ -7781,7 +7788,7 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
             p_cust_name = st.text_input("고객 이름 *", key="sp_penalty_name")
             p_cust_phone = st.text_input("연락처", key="sp_penalty_phone", placeholder="010-0000-0000")
         with p_col2:
-            p_date = st.date_input("계약일 *", value=date.today(), key="sp_penalty_date")
+            p_date = st.date_input("계약일 *", value=_today_kst(), key="sp_penalty_date")
             p_amount = st.text_input(
                 "위약금 금액 *", key="sp_penalty_amount",
                 on_change=lambda: st.session_state.__setitem__(
@@ -7888,7 +7895,7 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
             e_emp_sel = None
             if not employees.empty:
                 e_emp_sel = st.selectbox("구매 직원 *", options=employees["name"].tolist(), key="sp_emp_buyer")
-            e_date = st.date_input("구매일 *", value=date.today(), key="sp_emp_date")
+            e_date = st.date_input("구매일 *", value=_today_kst(), key="sp_emp_date")
         with e_col2:
             e_category = st.selectbox("품목", options=["옷장", "식탁", "자녀방", "침대", "SSDS침대", "서재_학생", "소파", "소품", "전시품", "기타"], key="sp_emp_category")
             e_cost = st.text_input(
@@ -8130,7 +8137,7 @@ def render_new_sales():
                             sel = q_orders[q_orders["id"] == quick_oid].iloc[0]
                             sel_balance = float(sel.get("balance") or 0)
                             sel_order_date = sel.get("order_date")
-                            default_pay_date = sel_order_date.date() if hasattr(sel_order_date, "date") else date.today()
+                            default_pay_date = sel_order_date.date() if hasattr(sel_order_date, "date") else _today_kst()
                             _customer_balance_payment_ui(
                                 db_filename,
                                 int(quick_oid),
@@ -8246,10 +8253,10 @@ def render_new_sales():
     )
     employee_names_str = ",".join(selected_employees) if selected_employees else ""
     if "order_date" not in st.session_state:
-        st.session_state["order_date"] = date.today()
+        st.session_state["order_date"] = _today_kst()
     order_date = st.date_input("계약일 *", key="order_date")
     if "delivery_date" not in st.session_state:
-        st.session_state["delivery_date"] = date.today()
+        st.session_state["delivery_date"] = _today_kst()
     delivery_date = st.date_input("배송일 *", key="delivery_date")
     CATEGORY_OPTIONS = ["옷장", "식탁", "자녀방", "침대", "SSDS침대", "서재_학생", "소파", "소품", "전시품"]
     selected_categories = st.multiselect("품목/카테고리 (복수 선택) *", options=CATEGORY_OPTIONS, key=f"category_multiselect_{_form_reset}")
@@ -8496,11 +8503,11 @@ def render_new_sales():
                     st.stop()
         use_supabase_op = _supabase_orders_payments_available()
         # 성과 축하는 신규 INSERT 시에만 1회 트리거 (UPDATE/수정 시 미설정). INSERT 전 메타데이터 수집.
-        today_iso = order_date.isoformat() if hasattr(order_date, "isoformat") else str(date.today())
+        today_iso = order_date.isoformat() if hasattr(order_date, "isoformat") else str(_today_kst())
         _count_today_before = _count_orders_on_date(db_filename, today_iso)
         is_today_first = _count_today_before == 0
-        _year = order_date.year if hasattr(order_date, "year") else date.today().year
-        _month = order_date.month if hasattr(order_date, "month") else date.today().month
+        _year = order_date.year if hasattr(order_date, "year") else _today_kst().year
+        _month = order_date.month if hasattr(order_date, "month") else _today_kst().month
         monthly_max_before = _cached_employee_monthly_max(db_filename, employee_names_str, _year, _month)
 
         if use_supabase_op:
@@ -8797,7 +8804,7 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
     # 결제 수단 / 날짜
     _split_date_key = f"{key_prefix}_date"
     if _split_date_key not in st.session_state:
-        st.session_state[_split_date_key] = date.today()
+        st.session_state[_split_date_key] = _today_kst()
     col_m, col_d = st.columns(2)
     with col_m:
         split_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
@@ -8866,7 +8873,7 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
 
         errors = []
         success_count = 0
-        pay_date_str = split_date.isoformat() if hasattr(split_date, "isoformat") else date.today().isoformat()
+        pay_date_str = split_date.isoformat() if hasattr(split_date, "isoformat") else _today_kst().isoformat()
 
         for oid, ak in alloc_keys.items():
             alloc_amt = _parse_comma_to_int(st.session_state.get(ak, "0"))
@@ -8938,7 +8945,7 @@ def _customer_balance_payment_ui(
         st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
     _pay_date_key = f"{key_prefix}_pay_date"
     if _pay_date_key not in st.session_state:
-        st.session_state[_pay_date_key] = default_payment_date or date.today()
+        st.session_state[_pay_date_key] = default_payment_date or _today_kst()
     st.caption("잔금 완납 처리 (결제 추가)")
     add_pay_date = st.date_input("결제 날짜 *", key=_pay_date_key)
     add_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
@@ -8986,7 +8993,7 @@ def _customer_balance_payment_ui(
                 return
             # 온누리상품권 중복 검증: 오늘 날짜 + 승인번호 4자리 조합 (금액 제외)
             onnuri_code = None
-            pay_date_str = add_pay_date.isoformat() if hasattr(add_pay_date, "isoformat") else date.today().isoformat()
+            pay_date_str = add_pay_date.isoformat() if hasattr(add_pay_date, "isoformat") else _today_kst().isoformat()
             if is_onnuri:
                 stage = st.session_state.get(stage_key, "last4")
                 if stage == "last4":
@@ -9113,7 +9120,7 @@ def render_customer_balance():
         "3. 🚨 배송일 후 미결금액",
         "4. 🔴 초과결제 항목"
     ])
-    today = date.today()
+    today = _today_kst()
 
     # ---------- 탭 1: 일반 고객 및 데이터 수정 ----------
     with tab_gen:
@@ -10087,9 +10094,9 @@ def render_customer_balance():
                                                         # 결제 날짜 변경 (기존 날짜 기본값)
                                                         _cur_pay_date = prow.get("payment_date")
                                                         try:
-                                                            _cur_pay_date_val = pd.to_datetime(_cur_pay_date).date() if _cur_pay_date else date.today()
+                                                            _cur_pay_date_val = pd.to_datetime(_cur_pay_date).date() if _cur_pay_date else _today_kst()
                                                         except Exception:
-                                                            _cur_pay_date_val = date.today()
+                                                            _cur_pay_date_val = _today_kst()
                                                         _edit_date_key = f"pay_edit_date_{prow['id']}"
                                                         if _edit_date_key not in st.session_state:
                                                             st.session_state[_edit_date_key] = _cur_pay_date_val
@@ -10142,7 +10149,7 @@ def render_customer_balance():
                                                                 _pay_edit_date_str = (
                                                                     new_pay_date.isoformat()
                                                                     if isinstance(new_pay_date, date)
-                                                                    else date.today().isoformat()
+                                                                    else _today_kst().isoformat()
                                                                 )
                                                                 old_amt_val = float(prow["amount"] or 0)
                                                                 old_fee_val = float(prow["fee_amount"] or 0)
@@ -10615,9 +10622,9 @@ def render_customer_balance():
                                                     st.empty()
                                                 _op_edit_date_key = f"op_edit_date_{prow['id']}"
                                                 try:
-                                                    _op_cur_date_val = pd.to_datetime(prow.get("payment_date")).date() if prow.get("payment_date") else date.today()
+                                                    _op_cur_date_val = pd.to_datetime(prow.get("payment_date")).date() if prow.get("payment_date") else _today_kst()
                                                 except Exception:
-                                                    _op_cur_date_val = date.today()
+                                                    _op_cur_date_val = _today_kst()
                                                 if _op_edit_date_key not in st.session_state:
                                                     st.session_state[_op_edit_date_key] = _op_cur_date_val
                                                 new_pay_date_op = st.date_input("결제 날짜 *", key=_op_edit_date_key)
@@ -10639,7 +10646,7 @@ def render_customer_balance():
                                                         _pay_op_date_str = (
                                                             new_pay_date_op.isoformat()
                                                             if isinstance(new_pay_date_op, date)
-                                                            else date.today().isoformat()
+                                                            else _today_kst().isoformat()
                                                         )
                                                         _old_payment_op = {"payment_id": int(prow["id"]), "amount": _old_amt_op, "method": _prow_method, "card_company": prow.get("card_company")}
                                                         if _supabase_orders_payments_available():
@@ -10946,7 +10953,7 @@ def render_dashboard():
     orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0).astype(int)
     orders["display_cost_amount"] = orders["display_cost_amount"].fillna(0).astype(int)
 
-    today = date.today()
+    today = _today_kst()
     today_str = today.strftime("%Y-%m-%d")
     month_start = today.replace(day=1)
     st.divider()
