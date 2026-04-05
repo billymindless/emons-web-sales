@@ -10760,18 +10760,23 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 if oid_int is None:
                     margin = 0.0
                     display_amt = 0.0
+                    per_amt = amt / n
                 else:
                     tot = float(_total_map.get(oid_int, 0) or 0)
                     base_m = float(_margin_map.get(oid_int, 0) or 0)
                     base_d = float(_display_map.get(oid_int, 0) or 0)
-                    if tot != 0:
+                    # 주문 total_amount=0 인데 sales 행만 남은 경우: 마진은 0·매출만 반영되면 마진율이 비정상적으로 커짐 → 직원 평가 집계에서 제외
+                    if tot == 0:
+                        margin = 0.0
+                        display_amt = 0.0
+                        per_amt = 0.0
+                    else:
                         _ratio = amt / tot
                         margin = (base_m * _ratio) / n
                         display_amt = (base_d * _ratio) / n
-                    else:
-                        margin = 0.0
-                        display_amt = 0.0
-                per_amt = amt / n
+                        per_amt = amt / n
+                if per_amt == 0 and margin == 0 and display_amt == 0:
+                    continue
                 for e in emps:
                     rows.append({"employee": e, "sales": per_amt, "margin": margin, "display_sales": display_amt})
             if rows:
@@ -10792,7 +10797,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 st.dataframe(display_fmt, use_container_width=True)
                 st.caption(
                     "※ 판매금액: sales(transaction_date) 합계. 마진·전시품: 각 sales 행 금액 ÷ 주문 total_amount 비율로 주문 actual_margin·display_sales를 배분 "
-                    "(감액 음수 줄은 마진·전시품도 같은 비율로 감소)."
+                    "(감액 음수 줄은 마진·전시품도 같은 비율로 감소). "
+                    "주문 total_amount가 0인 sales 행은 데이터 불일치로 간주해 직원 평가 합계에서 제외합니다."
                 )
             else:
                 st.info("선택한 월에 직원이 배정된 판매 데이터가 없습니다.")
