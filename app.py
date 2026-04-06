@@ -6067,11 +6067,11 @@ def _superadmin_tab5_store_accounts():
                         st.error(f"삭제 실패: {e}")
 
 
-def _fetch_order_totals_and_margin_for_report(db_fn: str, order_ids: list[int]) -> dict[int, tuple[float, float]]:
-    """order_id -> (total_amount, actual_margin). 월별 결제수단 집계표의 매출 원장·마진 기여용."""
+def _fetch_order_totals_and_margin_for_report(db_fn: str, order_ids: list[int]) -> dict[int, tuple[float, float, int | None]]:
+    """order_id -> (total_amount, actual_margin, customer_id). 월별 결제수단 집계표의 매출 원장·마진 기여용."""
     if not order_ids:
         return {}
-    out: dict[int, tuple[float, float]] = {}
+    out: dict[int, tuple[float, float, int | None]] = {}
     chunks = [order_ids[i : i + 100] for i in range(0, len(order_ids), 100)]
     if _supabase_orders_payments_available():
         client, err = get_supabase_client()
@@ -6081,7 +6081,7 @@ def _fetch_order_totals_and_margin_for_report(db_fn: str, order_ids: list[int]) 
             for ch in chunks:
                 r = (
                     client.table("app_orders")
-                    .select("id, total_amount, actual_margin")
+                    .select("id, total_amount, actual_margin, customer_id")
                     .eq(ORDERS_PAYMENTS_TENANT_COL, db_fn)
                     .in_("id", ch)
                     .execute()
@@ -6090,7 +6090,12 @@ def _fetch_order_totals_and_margin_for_report(db_fn: str, order_ids: list[int]) 
                     oid = int(row["id"])
                     tot = float(row.get("total_amount") or 0)
                     am = float(row.get("actual_margin") or 0) if row.get("actual_margin") is not None else 0.0
-                    out[oid] = (tot, am)
+                    _cid = row.get("customer_id")
+                    try:
+                        cid_i = int(_cid) if _cid is not None and str(_cid).strip() != "" else None
+                    except (TypeError, ValueError):
+                        cid_i = None
+                    out[oid] = (tot, am, cid_i)
         except Exception:
             return out
     else:
@@ -6101,12 +6106,16 @@ def _fetch_order_totals_and_margin_for_report(db_fn: str, order_ids: list[int]) 
             for ch in chunks:
                 placeholders = ",".join(["?"] * len(ch))
                 cur = conn.execute(
-                    f"SELECT id, total_amount, COALESCE(actual_margin, 0) FROM Orders WHERE id IN ({placeholders})",
+                    f"SELECT id, total_amount, COALESCE(actual_margin, 0), customer_id FROM Orders WHERE id IN ({placeholders})",
                     ch,
                 )
                 for row in cur.fetchall():
-                    oid, tot, am = int(row[0]), row[1], row[2]
-                    out[oid] = (float(tot or 0), float(am or 0))
+                    oid, tot, am, cid = int(row[0]), row[1], row[2], row[3] if len(row) > 3 else None
+                    try:
+                        cid_i = int(cid) if cid is not None else None
+                    except (TypeError, ValueError):
+                        cid_i = None
+                    out[oid] = (float(tot or 0), float(am or 0), cid_i)
         except Exception:
             pass
         finally:
@@ -6300,7 +6309,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                             continue
                         _oid_i = int(_oid)
                         _amt = float(_sr.get("amount") or 0)
-                        _tot, _mrg = _omap.get(_oid_i, (0.0, 0.0))
+                        _tot, _mrg, _cid = _omap.get(_oid_i, (0.0, 0.0, None))
                         _ftot = float(_tot)
                         if _ftot != 0:
                             _contrib = round(float(_mrg) * (_amt / _ftot), 0)
@@ -6320,9 +6329,31 @@ def render_monthly_payment_report(is_superadmin: bool):
                             "마진기여액": int(_contrib),
                             "비고": str(_sr.get("note") or "").strip() or "-",
                             "담당직원": str(_sr.get("employee_names") or "").strip() or "-",
+                            "_db_fn": str(_fn),
+                            "_customer_id": _cid,
                         })
                 if _sm_rows:
                     sales_margin_excel_df = pd.DataFrame(_sm_rows)
+                    sales_margin_excel_df["고객명"] = ""
+                    for _fn_u in sales_margin_excel_df["_db_fn"].dropna().unique():
+                        _mu = sales_margin_excel_df["_db_fn"] == _fn_u
+                        _cids_u: list[int] = []
+                        for _x in sales_margin_excel_df.loc[_mu, "_customer_id"].dropna().unique():
+                            try:
+                                _cids_u.append(int(_x))
+                            except (TypeError, ValueError):
+                                pass
+                        _cids_u = list(set(_cids_u))
+                        if not _cids_u:
+                            continue
+                        try:
+                            _cmap = _get_customers_by_ids_supabase(str(_fn_u), _cids_u)
+                            sales_margin_excel_df.loc[_mu, "고객명"] = sales_margin_excel_df.loc[_mu, "_customer_id"].apply(
+                                lambda c, m=_cmap: (m.get(int(c)) or {}).get("name", "") or "" if pd.notna(c) else ""
+                            )
+                        except Exception:
+                            pass
+                    sales_margin_excel_df = sales_margin_excel_df.drop(columns=["_db_fn", "_customer_id"], errors="ignore")
                     sales_margin_excel_df = sales_margin_excel_df.sort_values("거래일자", ascending=False).reset_index(drop=True)
                     sales_margin_monthly_df = (
                         sales_margin_excel_df.groupby("거래월", as_index=False)[["매출변동액", "마진기여액"]]
@@ -6378,9 +6409,9 @@ def render_monthly_payment_report(is_superadmin: bool):
                     if _c in _sm_d_disp.columns:
                         _sm_d_disp[_c] = _sm_d_disp[_c].apply(lambda x: f"{int(x):,}원")
                 if is_superadmin and selected_store == "전체 매장 통합" and "매장명" in _sm_d_disp.columns:
-                    _sm_cols = ["매장명", "거래일자", "거래월", "원본주문ID", "매출변동액", "주문총액", "주문실마진", "마진기여액", "비고", "담당직원"]
+                    _sm_cols = ["매장명", "거래일자", "거래월", "원본주문ID", "고객명", "매출변동액", "주문총액", "주문실마진", "마진기여액", "비고", "담당직원"]
                 else:
-                    _sm_cols = ["거래일자", "거래월", "원본주문ID", "매출변동액", "주문총액", "주문실마진", "마진기여액", "비고", "담당직원"]
+                    _sm_cols = ["거래일자", "거래월", "원본주문ID", "고객명", "매출변동액", "주문총액", "주문실마진", "마진기여액", "비고", "담당직원"]
                 _sm_d_disp = _sm_d_disp[[c for c in _sm_cols if c in _sm_d_disp.columns]]
                 st.dataframe(_sm_d_disp, use_container_width=True, hide_index=True)
 
