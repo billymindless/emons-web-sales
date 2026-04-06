@@ -10931,7 +10931,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 )
 
             # orders에서 order_id → total_amount, actual_margin, display_sales_amount (KPI 점수용)
-            # 마진·전시품: sales 각 행의 amount를 주문 total_amount 대비 비율로 나눠 배분 → 감액(음수) 줄에도 음수 기여, 동일 월 다중 sales 행 시 중복 합산 방지
+            # 총 판매액: 직원별 판매 실적(월별집계표)과 동일 — 매 sales 행마다 amount/n 후 직원별 합산.
+            # 마진·전시품: total_amount>0 일 때만 amount/total 비율로 배분(음수 행 동일 비율).
             _total_map: dict = {}
             _margin_map = {}
             _display_map = {}
@@ -10960,11 +10961,11 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                     tot = float(_total_map.get(oid_int, 0) or 0)
                     base_m = float(_margin_map.get(oid_int, 0) or 0)
                     base_d = float(_display_map.get(oid_int, 0) or 0)
-                    # 주문 total_amount=0 인데 sales 행만 남은 경우: 마진은 0·매출만 반영되면 마진율이 비정상적으로 커짐 → 직원 평가 집계에서 제외
+                    # total_amount=0: 월별 직원 판매 실적(판매금액)과 동일하게 amount/n 반영. 마진·전시품은 비율 불가 → 0 (직원별 판매 실적 표에 마진 컬럼 없음과 동일 취지)
                     if tot == 0:
                         margin = 0.0
                         display_amt = 0.0
-                        per_amt = 0.0
+                        per_amt = amt / n
                     else:
                         _ratio = amt / tot
                         margin = (base_m * _ratio) / n
@@ -10991,9 +10992,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
                 st.dataframe(display_fmt, use_container_width=True)
                 st.caption(
-                    "※ 판매금액: sales(transaction_date) 합계. 마진·전시품: 각 sales 행 금액 ÷ 주문 total_amount 비율로 주문 actual_margin·display_sales를 배분 "
-                    "(감액 음수 줄은 마진·전시품도 같은 비율로 감소). "
-                    "주문 total_amount가 0인 sales 행은 데이터 불일치로 간주해 직원 평가 합계에서 제외합니다."
+                    "※ 총 판매액: **월별 집계표(직원별 판매 실적)** 와 동일하게 sales 각 행 amount를 1/n 한 뒤 합산(주문 total_amount=0 인 행도 동일 반영). "
+                    "마진·전시품: total_amount>0 인 주문만 금액 비율로 배분; total_amount=0 이면 배분 불가로 0."
                 )
             else:
                 st.info("선택한 월에 직원이 배정된 판매 데이터가 없습니다.")
