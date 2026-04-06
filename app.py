@@ -6067,6 +6067,53 @@ def _superadmin_tab5_store_accounts():
                         st.error(f"삭제 실패: {e}")
 
 
+def _fetch_order_totals_and_margin_for_report(db_fn: str, order_ids: list[int]) -> dict[int, tuple[float, float]]:
+    """order_id -> (total_amount, actual_margin). 월별 결제수단 집계표의 매출 원장·마진 기여용."""
+    if not order_ids:
+        return {}
+    out: dict[int, tuple[float, float]] = {}
+    chunks = [order_ids[i : i + 100] for i in range(0, len(order_ids), 100)]
+    if _supabase_orders_payments_available():
+        client, err = get_supabase_client()
+        if err or not client:
+            return {}
+        try:
+            for ch in chunks:
+                r = (
+                    client.table("app_orders")
+                    .select("id, total_amount, actual_margin")
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_fn)
+                    .in_("id", ch)
+                    .execute()
+                )
+                for row in (r.data or []):
+                    oid = int(row["id"])
+                    tot = float(row.get("total_amount") or 0)
+                    am = float(row.get("actual_margin") or 0) if row.get("actual_margin") is not None else 0.0
+                    out[oid] = (tot, am)
+        except Exception:
+            return out
+    else:
+        conn = get_tenant_conn(db_fn)
+        if not conn:
+            return {}
+        try:
+            for ch in chunks:
+                placeholders = ",".join(["?"] * len(ch))
+                cur = conn.execute(
+                    f"SELECT id, total_amount, COALESCE(actual_margin, 0) FROM Orders WHERE id IN ({placeholders})",
+                    ch,
+                )
+                for row in cur.fetchall():
+                    oid, tot, am = int(row[0]), row[1], row[2]
+                    out[oid] = (float(tot or 0), float(am or 0))
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    return out
+
+
 def render_monthly_payment_report(is_superadmin: bool):
     """월별 결제수단 집계표 및 직원별 판매 실적 조회 모듈."""
     today = _today_kst()
@@ -6208,6 +6255,85 @@ def render_monthly_payment_report(is_superadmin: bool):
             st.info("선택한 기간에 결제 데이터가 없습니다.")
             return
 
+        # 매출 원장(sales) 행별 마진 기여액 — 결제 집계와 동일 기간·매장, 엑셀 다중 시트·화면 expander 공용
+        sales_margin_excel_df = pd.DataFrame()
+        sales_margin_monthly_df = pd.DataFrame()
+        try:
+            _sm_parts: list = []
+            if is_superadmin and selected_store == "전체 매장 통합":
+                for _, s in stores.iterrows():
+                    _sfn = s["db_filename"]
+                    _sx = load_sales_with_employees_cached(
+                        _sfn, start_date=date_range_start.isoformat(), end_date=date_range_end.isoformat()
+                    )
+                    if not _sx.empty:
+                        _sx = _sx.copy()
+                        _sx["_store"] = s["store_name"]
+                        _sx["_db_fn"] = _sfn
+                        _sm_parts.append(_sx)
+            else:
+                _sfn = db_filename if not is_superadmin else stores[stores["store_name"] == selected_store].iloc[0]["db_filename"]
+                _sx = load_sales_with_employees_cached(
+                    _sfn, start_date=date_range_start.isoformat(), end_date=date_range_end.isoformat()
+                )
+                if not _sx.empty:
+                    _sx = _sx.copy()
+                    _sx["_store"] = selected_store
+                    _sx["_db_fn"] = _sfn
+                    _sm_parts.append(_sx)
+            if _sm_parts:
+                _sm_all = pd.concat(_sm_parts, ignore_index=True)
+                _sm_all["transaction_date"] = pd.to_datetime(_sm_all["transaction_date"], errors="coerce")
+                _sm_all = _sm_all[_sm_all["transaction_date"].notna()]
+                _sm_all["_pd"] = _sm_all["transaction_date"].dt.date
+                _sm_all = _sm_all[
+                    (_sm_all["_pd"] >= date_range_start) & (_sm_all["_pd"] <= date_range_end)
+                ]
+                _sm_rows: list = []
+                for _fn in _sm_all["_db_fn"].dropna().unique():
+                    _mask_fn = _sm_all["_db_fn"] == _fn
+                    _oids = _sm_all.loc[_mask_fn, "order_id"].dropna().astype(int).unique().tolist()
+                    _omap = _fetch_order_totals_and_margin_for_report(str(_fn), _oids)
+                    for _, _sr in _sm_all.loc[_mask_fn].iterrows():
+                        _oid = _sr.get("order_id")
+                        if pd.isna(_oid):
+                            continue
+                        _oid_i = int(_oid)
+                        _amt = float(_sr.get("amount") or 0)
+                        _tot, _mrg = _omap.get(_oid_i, (0.0, 0.0))
+                        _ftot = float(_tot)
+                        if _ftot != 0:
+                            _contrib = round(float(_mrg) * (_amt / _ftot), 0)
+                        else:
+                            _contrib = 0.0
+                        _td = _sr["transaction_date"]
+                        _dstr = _td.strftime("%Y-%m-%d") if hasattr(_td, "strftime") else str(_td)[:10]
+                        _mstr = _td.strftime("%Y-%m") if hasattr(_td, "strftime") else ""
+                        _sm_rows.append({
+                            "매장명": _sr.get("_store", ""),
+                            "거래일자": _dstr,
+                            "거래월": _mstr,
+                            "원본주문ID": _oid_i,
+                            "매출변동액": int(round(_amt, 0)),
+                            "주문총액": int(round(_ftot, 0)),
+                            "주문실마진": int(round(float(_mrg), 0)),
+                            "마진기여액": int(_contrib),
+                            "비고": str(_sr.get("note") or "").strip() or "-",
+                            "담당직원": str(_sr.get("employee_names") or "").strip() or "-",
+                        })
+                if _sm_rows:
+                    sales_margin_excel_df = pd.DataFrame(_sm_rows)
+                    sales_margin_excel_df = sales_margin_excel_df.sort_values("거래일자", ascending=False).reset_index(drop=True)
+                    sales_margin_monthly_df = (
+                        sales_margin_excel_df.groupby("거래월", as_index=False)[["매출변동액", "마진기여액"]]
+                        .sum()
+                        .sort_values("거래월", ascending=False)
+                        .reset_index(drop=True)
+                    )
+        except Exception:
+            sales_margin_excel_df = pd.DataFrame()
+            sales_margin_monthly_df = pd.DataFrame()
+
         index_col = "결제월" if query_mode == "월별/연도별 조회" else "결제일자"
         total_label = "월별 총 결제액(Total)" if query_mode == "월별/연도별 조회" else "일별 총 결제액(Total)"
         pivot = pay_df.pivot_table(index=index_col, columns="detailed_payment", values="amount", aggfunc="sum", fill_value=0, margins=False)
@@ -6231,9 +6357,40 @@ def render_monthly_payment_report(is_superadmin: bool):
         display_df = pivot.map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
         st.dataframe(display_df, use_container_width=True)
 
+        with st.expander("📒 매출 원장·마진 기여 내역 (감액·증액 대비)", expanded=False):
+            st.caption(
+                "매출 원장(sales) 각 행 금액이 주문 총액에서 차지하는 비율만큼, 해당 주문의 **현재** 실마진(actual_margin)을 배분한 값입니다. "
+                "감액(음수) 행은 마진기여액도 음수로 표시됩니다. (경영 대시보드 월별 직원 판매 평가의 마진 배분과 동일.) "
+                "주문총액·주문실마진은 조회 시점 스냅샷이며, 과거 특정일의 마진 ‘변경분’이 아니라 본 행이 현재 잔고 기준으로 마진 합계에 더하거나 빼는 몫입니다."
+            )
+            if sales_margin_excel_df.empty:
+                st.info("선택 기간에 매출 원장 데이터가 없거나, 주문 정보를 불러오지 못했습니다.")
+            else:
+                st.write("**월별 요약 (매출 변동·마진 기여 합계)**")
+                _sm_m_disp = sales_margin_monthly_df.copy()
+                for _c in ("매출변동액", "마진기여액"):
+                    if _c in _sm_m_disp.columns:
+                        _sm_m_disp[_c] = _sm_m_disp[_c].apply(lambda x: f"{int(x):,}원")
+                st.dataframe(_sm_m_disp, use_container_width=True, hide_index=True)
+                st.write("**행별 상세**")
+                _sm_d_disp = sales_margin_excel_df.copy()
+                for _c in ("매출변동액", "주문총액", "주문실마진", "마진기여액"):
+                    if _c in _sm_d_disp.columns:
+                        _sm_d_disp[_c] = _sm_d_disp[_c].apply(lambda x: f"{int(x):,}원")
+                if is_superadmin and selected_store == "전체 매장 통합" and "매장명" in _sm_d_disp.columns:
+                    _sm_cols = ["매장명", "거래일자", "거래월", "원본주문ID", "매출변동액", "주문총액", "주문실마진", "마진기여액", "비고", "담당직원"]
+                else:
+                    _sm_cols = ["거래일자", "거래월", "원본주문ID", "매출변동액", "주문총액", "주문실마진", "마진기여액", "비고", "담당직원"]
+                _sm_d_disp = _sm_d_disp[[c for c in _sm_cols if c in _sm_d_disp.columns]]
+                st.dataframe(_sm_d_disp, use_container_width=True, hide_index=True)
+
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             pivot.to_excel(writer, sheet_name="결제수단집계")
+            if not sales_margin_monthly_df.empty:
+                sales_margin_monthly_df.to_excel(writer, sheet_name="월별매출마진요약", index=False)
+            if not sales_margin_excel_df.empty:
+                sales_margin_excel_df.to_excel(writer, sheet_name="매출및마진기여", index=False)
         buf.seek(0)
         store_label = "전체매장" if (is_superadmin and selected_store == "전체 매장 통합") else selected_store.replace(" ", "_")
         if query_mode == "월별/연도별 조회":
