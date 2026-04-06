@@ -11528,7 +11528,16 @@ def render_dashboard():
     if len(orders) > 0:
         orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
         period_orders = orders[(orders["order_date"].dt.date >= stats_start) & (orders["order_date"].dt.date <= stats_end)]
-        total_contract = float(period_orders["total_amount"].fillna(0).sum())
+        # 직원 KPI·월별 집계표와 동일: sales(transaction_date) 구간의 amount 순합(감액 음수 포함)
+        period_sales_net = 0.0
+        if not sales_df.empty and "transaction_date" in sales_df.columns and "amount" in sales_df.columns:
+            _sd_stat = sales_df.copy()
+            _sd_stat["transaction_date"] = pd.to_datetime(_sd_stat["transaction_date"], errors="coerce")
+            _sd_stat = _sd_stat.dropna(subset=["transaction_date"])
+            _m_stat = (_sd_stat["transaction_date"].dt.date >= stats_start) & (
+                _sd_stat["transaction_date"].dt.date <= stats_end
+            )
+            period_sales_net = float(_sd_stat.loc[_m_stat, "amount"].fillna(0).astype(float).sum())
         if len(period_orders) > 0 and not payments.empty:
             order_ids = period_orders["id"].tolist()
             pay_df = payments[payments["order_id"].isin(order_ids)][["order_id", "amount"]].copy()
@@ -11539,7 +11548,11 @@ def render_dashboard():
             total_unpaid_period = float(period_orders["_bal"].clip(lower=0).sum())
         else:
             total_unpaid_period = 0.0
-        st.metric("해당 기간 총 계약 금액", f"{total_contract:,.0f}원")
+        st.metric(
+            "해당 기간 총 계약 금액",
+            f"{period_sales_net:,.0f}원",
+            help="sales 테이블 transaction_date·amount 합계(증액·감액 음수 반영). 월별 직원 KPI와 동일 기준.",
+        )
         st.metric("해당 기간 총 미수금", f"{total_unpaid_period:,.0f}원")
     else:
         st.metric("해당 기간 총 계약 금액", "0원")
