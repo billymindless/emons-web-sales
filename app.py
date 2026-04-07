@@ -9603,7 +9603,11 @@ def render_customer_balance():
                     all_cids = [cid]
 
                 if _supabase_orders_payments_available():
-                    all_orders = _load_orders_supabase(db_filename, "id, customer_id, order_date, delivery_date, category, cost_price, total_amount, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names", limit=None)
+                    all_orders = _load_orders_supabase(
+                        db_filename,
+                        "id, customer_id, order_date, delivery_date, category, cost_price, total_amount, actual_margin, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names",
+                        limit=None,
+                    )
                     orders = all_orders[all_orders["customer_id"].isin(all_cids)].copy() if not all_orders.empty and "customer_id" in all_orders.columns else pd.DataFrame()
                     payments = _load_payments_supabase(db_filename)
                 else:
@@ -9611,7 +9615,7 @@ def render_customer_balance():
                     try:
                         placeholders = ",".join("?" * len(all_cids))
                         orders = pd.read_sql(
-                            f"SELECT id, order_date, delivery_date, category, cost_price, total_amount, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names FROM Orders WHERE customer_id IN ({placeholders})",
+                            f"SELECT id, order_date, delivery_date, category, cost_price, total_amount, COALESCE(actual_margin,0) AS actual_margin, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names FROM Orders WHERE customer_id IN ({placeholders})",
                             conn, params=tuple(all_cids)
                         )
                         payments = pd.read_sql("SELECT order_id, amount, fee_amount FROM Payments", conn)
@@ -9924,7 +9928,13 @@ def render_customer_balance():
                                     _use_supa = _supabase_orders_payments_available()
                                     conn = None if _use_supa else get_tenant_conn(db_filename)
                                     old_total = float(orow["total_amount"] or 0)
-                                    old_actual_margin = float(orow.get("actual_margin") or 0)
+                                    _oam = orow.get("actual_margin")
+                                    try:
+                                        old_actual_margin = 0.0 if pd.isna(_oam) else float(_oam)
+                                    except (TypeError, ValueError):
+                                        old_actual_margin = 0.0
+                                    if old_actual_margin != old_actual_margin:  # NaN 방지
+                                        old_actual_margin = 0.0
                                     old_cost = float(orow.get("cost_price") or 0)
                                     old_visit = orow.get("visit_reason") or ""
                                     old_purchase = orow.get("purchase_reason") or ""
