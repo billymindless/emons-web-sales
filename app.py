@@ -1494,9 +1494,9 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
     if err:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = err
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names"])
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names", "note"])
     try:
-        q = client.table("sales").select("transaction_date, amount, order_id, employee_names")
+        q = client.table("sales").select("transaction_date, amount, order_id, employee_names, note")
         tenant_col = _sales_tenant_column()
         if tenant_col:
             q = q.eq(tenant_col, db_filename)
@@ -1507,7 +1507,7 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
         if r.data and len(r.data) > 0:
             st.session_state.pop("supabase_error", None)
             return _filter_sales_to_store_orders(db_filename, pd.DataFrame(r.data))
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names"])
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names", "note"])
     except Exception as e:
         # employee_names 컬럼이 없는 구 스키마면 기본 컬럼만 조회
         try:
@@ -1522,12 +1522,14 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
             if r2.data and len(r2.data) > 0:
                 df2 = pd.DataFrame(r2.data)
                 df2["employee_names"] = None
+                if "note" not in df2.columns:
+                    df2["note"] = None
                 return _filter_sales_to_store_orders(db_filename, df2)
         except Exception:
             pass
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names"])
+        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names", "note"])
 
 
 @st.cache_data(ttl=600)
@@ -9922,6 +9924,7 @@ def render_customer_balance():
                                     _use_supa = _supabase_orders_payments_available()
                                     conn = None if _use_supa else get_tenant_conn(db_filename)
                                     old_total = float(orow["total_amount"] or 0)
+                                    old_actual_margin = float(orow.get("actual_margin") or 0)
                                     old_cost = float(orow.get("cost_price") or 0)
                                     old_visit = orow.get("visit_reason") or ""
                                     old_purchase = orow.get("purchase_reason") or ""
@@ -10023,7 +10026,13 @@ def render_customer_balance():
                                             order_date_label = f"{int(parts[1])}월 {int(parts[2])}일" if len(parts) >= 3 else str(order_date_val)
                                         else:
                                             order_date_label = str(order_date_val)
-                                        note = f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
+                                        _dm_kpi = (
+                                            (old_actual_margin * float(delta) / old_total) if abs(old_total) > 1e-9 else 0.0
+                                        )
+                                        note = (
+                                            f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
+                                            f"|__dm:{int(round(_dm_kpi))}"
+                                        )
                                         # 담당 직원: 수정 후 직원명 우선, 없으면 기존 직원명 사용 (delta도 같은 직원에게 귀속)
                                         _delta_emp = new_employee_names if new_employee_names else old_employee_names
                                         _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(delta), note, employee_names=_delta_emp or None)
@@ -10887,6 +10896,20 @@ def render_customer_balance():
 
 # ========== 탭 0: 경영 대시보드 (로그인 후 첫 화면) ==========
 
+def _kpi_parse_delta_margin_from_sales_note(note: object) -> float | None:
+    """sales.note에 '|__dm:<정수>'(계약 변경 시 KPI용 비례 마진 차액)가 있으면 반환. 없거나 파싱 실패 시 None."""
+    if note is None:
+        return None
+    s = str(note).strip()
+    if "|__dm:" not in s:
+        return None
+    try:
+        tail = s.split("|__dm:", 1)[1].split("|", 1)[0].strip()
+        return float(tail)
+    except (ValueError, IndexError):
+        return None
+
+
 @st.fragment
 def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
     """월별 직원 판매 현황 fragment: 연/월 selectbox 변경 시 이 섹션만 rerun."""
@@ -10932,7 +10955,7 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
 
             # orders에서 order_id → total_amount, actual_margin, display_sales_amount (KPI 점수용)
             # 총 판매액: 직원별 판매 실적(월별집계표)과 동일 — 매 sales 행마다 amount/n 후 직원별 합산.
-            # 마진·전시품: total_amount>0 일 때만 amount/total 비율로 배분(음수 행 동일 비율).
+            # 마진·전시품: total_amount>0 일 때 amount/total 비율로 배분. total_amount=0 이면 note|__dm(계약 변경 시)으로 마진만 배분 가능.
             _total_map: dict = {}
             _margin_map = {}
             _display_map = {}
@@ -10961,9 +10984,10 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                     tot = float(_total_map.get(oid_int, 0) or 0)
                     base_m = float(_margin_map.get(oid_int, 0) or 0)
                     base_d = float(_display_map.get(oid_int, 0) or 0)
-                    # total_amount=0: 월별 직원 판매 실적(판매금액)과 동일하게 amount/n 반영. 마진·전시품은 비율 불가 → 0 (직원별 판매 실적 표에 마진 컬럼 없음과 동일 취지)
+                    _dm_note = _kpi_parse_delta_margin_from_sales_note(r.get("note"))
+                    # total_amount=0: 매출은 amount/n. 마진은 note|__dm(갱신 직전 actual_margin×delta/old_total)이 있으면 그 값/n, 없으면 0.
                     if tot == 0:
-                        margin = 0.0
+                        margin = (_dm_note / n) if _dm_note is not None else 0.0
                         display_amt = 0.0
                         per_amt = amt / n
                     else:
@@ -10993,7 +11017,7 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 st.dataframe(display_fmt, use_container_width=True)
                 st.caption(
                     "※ 총 판매액: **월별 집계표(직원별 판매 실적)** 와 동일하게 sales 각 행 amount를 1/n 한 뒤 합산(주문 total_amount=0 인 행도 동일 반영). "
-                    "마진·전시품: total_amount>0 인 주문만 금액 비율로 배분; total_amount=0 이면 배분 불가로 0."
+                    "마진: total_amount>0 이면 금액 비율로 배분; total_amount=0 이어도 계약 변경 sales 행(note에 KPI용 마진 차액)이 있으면 해당 값을 1/n 반영. 전시품은 total_amount=0 이면 0."
                 )
             else:
                 st.info("선택한 월에 직원이 배정된 판매 데이터가 없습니다.")
