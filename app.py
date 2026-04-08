@@ -6769,6 +6769,7 @@ def render_monthly_payment_report(is_superadmin: bool):
         # employee_names가 없는 레코드(구 데이터): app_orders 테이블에서 employee_names를 보완
         _no_emp_mask = sal_df["employee_names"].isna() | (sal_df["employee_names"].astype(str).str.strip() == "")
         if _no_emp_mask.any():
+            sal_df["employee_names"] = sal_df["employee_names"].astype(object)
             try:
                 _sc, _ = get_supabase_client()
                 if _sc:
@@ -11264,12 +11265,23 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
     if kpi_m.empty:
         return pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
     km = kpi_m.copy()
+    if "employee_names" not in km.columns:
+        km["employee_names"] = None
+    # Arrow-backed StringDtype는 loc에 Series 대입 시 TypeError → object로 풀어서 보완 (pandas 2.2+/3.x, Streamlit Cloud)
+    km["employee_names"] = km["employee_names"].astype(object)
     _no_emp = km["employee_names"].isna() | (km["employee_names"].astype(str).str.strip() == "")
     if _no_emp.any() and not orders.empty and "id" in orders.columns and "employee_names" in orders.columns:
         _oid_emp_map = orders.set_index("id")["employee_names"].to_dict()
-        km.loc[_no_emp, "employee_names"] = km.loc[_no_emp, "order_id"].apply(
-            lambda oid: _oid_emp_map.get(int(oid), "") if pd.notna(oid) else ""
-        )
+
+        def _emp_from_oid(oid: object) -> str:
+            if oid is None or (isinstance(oid, float) and pd.isna(oid)) or pd.isna(oid):
+                return ""
+            try:
+                return str(_oid_emp_map.get(int(oid), "") or "")
+            except (TypeError, ValueError):
+                return ""
+
+        km.loc[_no_emp, "employee_names"] = km.loc[_no_emp, "order_id"].map(_emp_from_oid)
     _total_map: dict = {}
     _margin_map = {}
     _display_map = {}
