@@ -1710,7 +1710,7 @@ def _aggregate_cash_collected_by_employee(
     oid_emp: dict[int, str] = {}
     for _, orow in orders_df.iterrows():
         try:
-            oid_emp[int(orow["id"])] = str(orow.get("employee_names") or "")
+            oid_emp[int(orow["id"])] = _kpi_sanitize_employee_label(orow.get("employee_names"))
         except (TypeError, ValueError, KeyError):
             continue
     if _supabase_orders_payments_available():
