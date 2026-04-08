@@ -7627,6 +7627,84 @@ def _superadmin_tab_danger_zone_data_reset():
             st.rerun()
 
 
+# 앱 내 FAQ (검색 대상: 제목·본문·keywords). 항목 추가 시 이 리스트만 수정하면 됩니다.
+APP_FAQ_ITEMS: list[dict[str, str]] = [
+    {
+        "title": "오늘 입력해도 어제 매출로 잡히나요?",
+        "keywords": "계약일 어제 매출 집계 오늘 입력 날짜",
+        "body": (
+            "계약일을 **어제**로 선택했을 때 그렇게 잡힙니다. "
+            "계약일을 **오늘**로 두면 오늘 매출로 집계됩니다."
+        ),
+    },
+    {
+        "title": "브라우저를 닫았다가 다시 열면 계약일이 또 오늘로 돌아가나요?",
+        "keywords": "브라우저 기본값 계약일 세션 초기화",
+        "body": (
+            "처음 들어올 때 기본값이 오늘일 수 있습니다. "
+            "**등록할 때마다** 실제 계약일인지 **계약일** 필드를 확인하는 습관을 두면 좋습니다."
+        ),
+    },
+    {
+        "title": "계약은 어제인데, 실제 입금은 오늘만 가능한 경우는요?",
+        "keywords": "입금 결제일 계약일 다름 신규 매출 결제변경",
+        "body": (
+            "현재 **신규 매출 등록** 화면에서는 첫 결제의 **결제일**이 **계약일**과 같게 들어갑니다.\n\n"
+            "계약일과 입금일을 다르게 남겨야 하는 경우는, 일단 **1차 계약금 입금 기준**으로 매출 날짜를 작성하고, "
+            "추후 **결제 변경** 메뉴에서 수정해 주세요."
+        ),
+    },
+    {
+        "title": "어제의 매출을 오늘 날짜로 등록하려면요? (예: 4/30 매출을 5/1로 등록)",
+        "keywords": "4/30 5/1 계약일 배송일 새로운 매출 등록 체크리스트",
+        "body": (
+            "집계·통계에 반영되게 하려면 **실제 계약이 이루어진 날**을 **계약일**에 넣는 것이 원칙입니다. "
+            "아래는 **새로운 매출 등록** 시 확인할 절차입니다.\n\n"
+            "1. **새로운 매출 등록** 화면에 들어갑니다.\n"
+            "2. **계약일** = 실제 계약이 있었던 날(예: 어제, 또는 해당 영업일).\n"
+            "3. **배송일** = 실제 또는 예정에 맞게 수정합니다.\n"
+            "4. 고객·금액·결제 정보를 확인합니다.\n"
+            "5. **매출 등록**을 누릅니다.\n\n"
+            "**참고:** 특정 일자로 ‘보이게’만 바꾸고 싶다면 계약일·매출 원장·초기 결제일이 함께 따라가므로, "
+            "운영 규정에 맞는 날짜인지 꼭 확인하세요."
+        ),
+    },
+]
+
+
+def _faq_filter_items(query: str) -> list[dict[str, str]]:
+    q = (query or "").strip().lower()
+    if not q:
+        return list(APP_FAQ_ITEMS)
+    out = []
+    for e in APP_FAQ_ITEMS:
+        blob = " ".join([e.get("title", ""), e.get("keywords", ""), e.get("body", "")]).lower()
+        if q in blob:
+            out.append(e)
+    return out
+
+
+def render_faq_page():
+    """전역 메뉴 FAQ: 검색 + 목록. 항목은 APP_FAQ_ITEMS에서 유지보수."""
+    st.header("❓ FAQ (도움말)")
+    st.caption("키워드로 검색하거나, 아래 질문을 펼쳐 확인하세요. 새 질문은 앱 업데이트 시 목록에 추가됩니다.")
+    _q = st.text_input(
+        "검색",
+        placeholder="예: 계약일, 매출, 입금, 브라우저",
+        key="faq_keyword_search",
+        label_visibility="collapsed",
+    )
+    st.caption("🔎 위 칸에 검색어를 입력하면 제목·내용·연관 키워드에서 찾습니다.")
+    matched = _faq_filter_items(_q)
+    if not matched:
+        st.info("검색 결과가 없습니다. 다른 키워드를 입력해 보세요.")
+        return
+    _expand = bool((_q or "").strip())
+    for i, item in enumerate(matched):
+        with st.expander(item["title"], expanded=_expand and i < 12):
+            st.markdown(item["body"])
+
+
 def render_superadmin():
     # 최고 관리자 화면: 헤더 + 탭을 Sticky Header 컨테이너로 감싸 상단 고정
     st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
@@ -7641,6 +7719,7 @@ def render_superadmin():
         "⑦ 미수금(잔금) 레포트",
         "⑧ 월별 결제수단 집계표",
         "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
+        "⑩ FAQ (도움말)",
     ])
     st.markdown("</div>", unsafe_allow_html=True)
     with t[0]:
@@ -7661,6 +7740,8 @@ def render_superadmin():
         render_monthly_payment_report(is_superadmin=True)
     with t[8]:
         _superadmin_tab_danger_zone_data_reset()
+    with t[9]:
+        render_faq_page()
 
 
 # ========== 탭 1: 매장 관리자 메뉴 (Store Admin 전용) — Employees ==========
@@ -11821,6 +11902,7 @@ def main():
             "5. 매장 관리자 메뉴",
             "6. 월별 결제수단 집계표",
             "7. 고객 CRM 자동화",
+            "8. FAQ (도움말)",
         ]
     else:
         tab_labels = [
@@ -11829,6 +11911,7 @@ def main():
             "3. 새로운 매출 등록",
             "4. 고객 및 잔금 관리",
             "5. 월별 결제수단 집계표",
+            "6. FAQ (도움말)",
         ]
     if "main_tab_idx" not in st.session_state:
         st.session_state["main_tab_idx"] = 0
@@ -11891,6 +11974,10 @@ def main():
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
+    elif role == "store_admin" and idx == 7:
+        render_faq_page()
+    elif role == "user" and idx == 5:
+        render_faq_page()
 
 
 if __name__ == "__main__":
