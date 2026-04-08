@@ -1055,6 +1055,37 @@ def _compute_net_margin_rate(selling_price: float, cost: float, total_fee: float
     net_profit = selling_price - cost - total_fee
     return round((net_profit / selling_price) * 100.0, 1)
 
+
+def _kpi_employee_names_cell_is_blank(val: object) -> bool:
+    """sales/주문의 employee_names 셀이 비었거나 NaN·문자열 'nan' 등인지 (KPI 집계 시 결측으로 취급)."""
+    if val is None:
+        return True
+    if isinstance(val, float) and pd.isna(val):
+        return True
+    if pd.isna(val):
+        return True
+    s = str(val).strip()
+    if not s:
+        return True
+    if s.lower() in ("nan", "none", "null", "<na>", "nat"):
+        return True
+    return False
+
+
+def _kpi_parse_employee_list(raw: object) -> list[str]:
+    """employee_names 필드를 콤마 분리 직원 목록으로 파싱. NaN·'nan' 문자열 등은 빈 목록."""
+    if _kpi_employee_names_cell_is_blank(raw):
+        return []
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    return [p for p in parts if p.lower() not in ("nan", "none", "null", "<na>")]
+
+
+def _kpi_sanitize_employee_label(raw: object) -> str:
+    """주문 employee_names에서 KPI용 단일 문자열(보완용). 비었으면 ''."""
+    emps = _kpi_parse_employee_list(raw)
+    return ",".join(emps) if emps else ""
+
+
 # ========== 경로 설정 ==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "databases")
@@ -1720,8 +1751,8 @@ def _aggregate_cash_collected_by_employee(
             oid_i = int(oid)
         except (TypeError, ValueError):
             continue
-        en = oid_emp.get(oid_i, "") or ""
-        emps = [e.strip() for e in str(en).split(",") if e.strip()]
+        en = oid_emp.get(oid_i, "")
+        emps = _kpi_parse_employee_list(en)
         if not emps:
             continue
         amt = float(pr["amount"])
@@ -5731,7 +5762,7 @@ def _superadmin_tab2_hr_store_employees():
     row_df = df_s.merge(df_cs, on=["store", "employee"], how="outer").fillna(
         {"revenue": 0.0, "margin": 0.0, "display_sales": 0.0, "kpi_receipt": 0.0}
     )
-    row_df = row_df[row_df["employee"].astype(str).str.strip() != ""]
+    row_df = row_df[~row_df["employee"].map(_kpi_employee_names_cell_is_blank)]
     if row_df.empty:
         st.info("선택한 기간에 직원 배정 매출·현금수금·마진·전시 데이터가 없습니다.")
         return
@@ -11269,7 +11300,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
         km["employee_names"] = None
     # Arrow-backed StringDtype는 loc에 Series 대입 시 TypeError → object로 풀어서 보완 (pandas 2.2+/3.x, Streamlit Cloud)
     km["employee_names"] = km["employee_names"].astype(object)
-    _no_emp = km["employee_names"].isna() | (km["employee_names"].astype(str).str.strip() == "")
+    _no_emp = km["employee_names"].map(_kpi_employee_names_cell_is_blank)
     if _no_emp.any() and not orders.empty and "id" in orders.columns and "employee_names" in orders.columns:
         _oid_emp_map = orders.set_index("id")["employee_names"].to_dict()
 
@@ -11277,7 +11308,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
             if oid is None or (isinstance(oid, float) and pd.isna(oid)) or pd.isna(oid):
                 return ""
             try:
-                return str(_oid_emp_map.get(int(oid), "") or "")
+                return _kpi_sanitize_employee_label(_oid_emp_map.get(int(oid)))
             except (TypeError, ValueError):
                 return ""
 
@@ -11294,7 +11325,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
             _display_map = orders.set_index("id")["display_sales_amount"].fillna(0).astype(float).to_dict()
     rows_md: list = []
     for _, r in km.iterrows():
-        emps = [e.strip() for e in str(r.get("employee_names") or "").split(",") if e.strip()]
+        emps = _kpi_parse_employee_list(r.get("employee_names"))
         n = len(emps) if emps else 1
         if not emps:
             continue
@@ -11381,7 +11412,7 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
             emp_merged = df_rev.merge(cash_df, on="employee", how="outer").fillna(
                 {"revenue": 0.0, "margin": 0.0, "display_sales": 0.0, "kpi_receipt": 0.0}
             )
-            emp_merged = emp_merged[emp_merged["employee"].astype(str).str.strip() != ""]
+            emp_merged = emp_merged[~emp_merged["employee"].map(_kpi_employee_names_cell_is_blank)]
 
             if not emp_merged.empty:
                 emp_df = emp_merged.copy()
