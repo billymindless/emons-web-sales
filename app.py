@@ -1642,16 +1642,16 @@ def load_payments_cached(db_filename: str) -> pd.DataFrame:
 
 
 def _payment_method_in_kpi_receipt_bucket(meth: object) -> bool:
-    """KPI '현금수금집계' 점수용: 신용·체크카드만 제외, 그 외 현금성·준현금 수납 포함(메인페이, 이체, 온누리·지류, 지역화폐, 현금 등). payment_date 월별 집계 시 사용."""
+    """KPI '현금수금집계' 점수용: _payment_fee_amount 기준 수수료 0%인 수단만 포함. 신용·메인페이·체크 제외, 그 외 미등록 수단도 제외."""
     s = str(meth or "").strip()
     if not s:
         return False
     if "신용카드" in s:
         return False
+    if "메인페이" in s:
+        return False
     if s == "체크카드" or ("체크" in s and "카드" in s):
         return False
-    if "메인페이" in s:
-        return True
     if "지역화폐" in s:
         return True
     if "온누리" in s:
@@ -1671,7 +1671,7 @@ def _aggregate_cash_collected_by_employee(
 ) -> pd.DataFrame:
     """
     직원 평가용: payment_date가 [range_start, range_end]이고 결제수단이 KPI 현금수금집계 구간
-    (_payment_method_in_kpi_receipt_bucket: 카드류 제외·메인페이·이체·온누리·지역화폐·현금 등)인 결제액만 합산.
+    (_payment_method_in_kpi_receipt_bucket: 수수료 0%만·신용·메인페이·체크 제외)인 결제액만 합산.
     order_id → 해당 주문 employee_names 1/n 배분 후 직원별 합계. (저장/스키마/결제 코어 미변경, 조회·집계만)
     """
     if not db_filename or orders_df is None or orders_df.empty or "id" not in orders_df.columns:
@@ -5672,7 +5672,7 @@ def _superadmin_tab2_hr_store_employees():
     st.caption(f"조회 기간: {range_start.isoformat()} ~ {range_end.isoformat()}")
     st.caption(
         "※ **매출 점수(70)·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
-        "**현금수금집계 점수(10)**: **결제일(payment_date)** 기준, 신용·체크카드 제외 수납(메인페이·이체·온누리·지역화폐·현금 등) 1/n. "
+        "**현금수금집계 점수(10)**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
         "**마진·전시**: 동 기간 sales를 주문 비율로 배분(경영 대시보드 월별 KPI와 동일)."
     )
 
@@ -7860,14 +7860,14 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
     {
         "title": "현금수금집계 점수(10점)에는 어떤 결제가 들어가나요?",
         "keywords": (
-            "현금수금 결제일 payment_date 메인페이 온누리 지역화폐 이체 현금 신용카드 체크카드 "
-            "현금수금집계"
+            "현금수금 결제일 payment_date 온누리 지역화폐 이체 현금 신용카드 체크카드 메인페이 "
+            "현금수금집계 수수료"
         ),
         "body": (
             "- **결제일(`payment_date`)**이 집계 월(또는 HR 기간)에 들어가는 결제만 합산합니다.\n"
-            "- **신용카드·체크카드는 제외**합니다.\n"
-            "- 그 외 **메인페이, 계좌이체(이체), 온누리·온누리지류, 지역화폐, 현금(수금)** 등은 "
-            "**현금수금집계**에 포함됩니다.\n"
+            "- **수수료가 붙는 결제는 제외**합니다. 전산 기준으로 **신용카드·메인페이(2.5%)·체크카드(1.5%)** 는 "
+            "**현금수금집계에 포함되지 않습니다.**\n"
+            "- **수수료 0%** 인 **계좌이체(이체), 온누리·온누리지류, 지역화폐, 현금(수금)** 만 포함됩니다.\n"
             "- 결제 금액도 주문 담당 직원이 여러 명이면 **1/n**으로 나눈 뒤 직원별로 합산하고, 그 비율로 **10점**을 나눕니다."
         ),
     },
@@ -11412,7 +11412,7 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                 st.dataframe(display_fmt, use_container_width=True)
                 st.caption(
                     "※ **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
-                    "**현금수금집계·점수(10)**: 해당 월 **결제일(payment_date)** 기준, 신용·체크카드 제외 수납(메인페이·이체·온누리·지역화폐·현금 등) 1/n. "
+                    "**현금수금집계·점수(10)**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
                     "**마진·전시**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영."
                 )
             else:
