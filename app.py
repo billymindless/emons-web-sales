@@ -7834,7 +7834,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "- **현금수금집계 점수 10점**\n"
             "- **마진 점수 15점**\n"
             "- **전시품 판매 점수 5점**\n\n"
-            "**경영 대시보드**의 「4. 월별 직원 판매 현황 및 평가」와 "
+            "**경영 대시보드**의 「3. 월별 직원 판매 현황 및 평가」와 "
             "**최고 관리자 → 매장별 직원 평가(HR)** 에서 같은 기준으로 집계합니다. "
             "(HR은 선택한 **단일 월** 또는 **연월 범위** 기준입니다.)"
         ),
@@ -7875,7 +7875,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
         "title": "대시보드 ‘해당 기간 총 계약 금액’과 KPI 매출이 다른 이유가 있나요?",
         "keywords": "총 계약 금액 통계 기간별 KPI 차이 sales 순액",
         "body": (
-            "- 「5. 기간별 통계」의 **해당 기간 총 계약 금액**은 선택 기간의 **sales 순액 합(직원 나누기 전)** 입니다.\n"
+            "- 「4. 기간별 통계」의 **해당 기간 총 계약 금액**은 선택 기간의 **sales 순액 합(직원 나누기 전)** 입니다.\n"
             "- KPI **매출 점수(70)** 는 같은 **sales·판매일** 기준이지만 **직원별 1/n 배분 후 비율**로 점수를 매깁니다.\n"
             "- **현금수금집계(10점)** 는 **결제일·결제수단**으로 따로 집계하므로, 위 숫자들과 **항상 같지는 않습니다.**"
         ),
@@ -11320,7 +11320,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
 @st.fragment
 def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_filename: str):
     """월별 직원 판매 현황: 매출 점수(70)=sales 해당월 순액 1/n, 현금수금집계(10)=payment_date·KPI 수납 버킷, 마진(15)·전시(5)=sales·주문 비율."""
-    st.subheader("4. 월별 직원 판매 현황 및 평가")
+    st.subheader("3. 월별 직원 판매 현황 및 평가")
     if not sales_df.empty and "transaction_date" in sales_df.columns:
         _kpi_sales = sales_df.copy()
         _kpi_sales["transaction_date"] = pd.to_datetime(_kpi_sales["transaction_date"], errors="coerce")
@@ -11427,7 +11427,7 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
 def _render_dashboard_todos_only(db_filename: str):
     """To-Do 섹션 fragment: 등록·완료·삭제 시 이 섹션만 rerun (전체 대시보드 재로딩 없음)."""
     todos_df = _get_todos_for_display(db_filename)
-    st.subheader("6. 직원 To-Do 리스트 (인수인계)")
+    st.subheader("5. 직원 To-Do 리스트 (인수인계)")
     if st.button("🔄 서버에서 새로고침", key="todo_refresh_btn_simple"):
         _invalidate_todos_local(db_filename)
         st.rerun()
@@ -11882,60 +11882,12 @@ def render_dashboard():
     else:
         st.info("아직 주문 데이터가 없습니다.")
 
-    # ---------- 3. 이번 달 예상 매출 (Sales 테이블 transaction_date 기준 Net Sales) ----------
-    st.subheader("3. 이번 달 예상 매출 (순매출)")
-    month_start = today.replace(day=1)
-    month_end_str = today.strftime("%Y-%m-%d")
-    month_start_str = month_start.strftime("%Y-%m-%d")
-    if len(sales_df) > 0:
-        sales_df["transaction_date"] = pd.to_datetime(sales_df["transaction_date"], errors="coerce")
-        sales_df = sales_df.dropna(subset=["transaction_date"])
-        if len(sales_df) > 0:
-            month_sales = sales_df[(sales_df["transaction_date"].dt.date >= month_start) & (sales_df["transaction_date"].dt.date <= today)]
-            cumulative = float(month_sales["amount"].sum())
-            days_elapsed = (today - month_start).days + 1
-            avg_daily = cumulative / days_elapsed if days_elapsed else 0
-            from calendar import monthrange
-            days_in_month = monthrange(today.year, today.month)[1]
-            days_left = days_in_month - days_elapsed
-            projected = cumulative + avg_daily * days_left if days_left > 0 else cumulative
-            st.metric("이번 달 누적 매출 (Net Sales)", f"{cumulative:,.0f}원")
-            if "amount" in month_sales.columns:
-                _ns_pos = float(month_sales[month_sales["amount"] > 0]["amount"].sum())
-                _ns_neg = float(month_sales[month_sales["amount"] < 0]["amount"].sum())
-                st.caption(
-                    f"※ 당월 sales 구성(작은 글씨 요약): 신규·증액(양수) {_ns_pos:,.0f}원 · "
-                    f"취소·감액·계약조정(음수) {_ns_neg:,.0f}원 — 위 누적 순액에 모두 반영"
-                )
-            # 이번 달 주문 기준 전시품 판매액 별도 표시 (total_amount에 이미 포함된 금액)
-            try:
-                if not orders.empty and "order_date" in orders.columns and "display_sales_amount" in orders.columns:
-                    _ord_disp = orders.copy()
-                    _ord_disp["order_date"] = pd.to_datetime(_ord_disp["order_date"], errors="coerce")
-                    _ord_disp = _ord_disp.dropna(subset=["order_date"])
-                    _month_ord_disp = _ord_disp[
-                        (_ord_disp["order_date"].dt.date >= month_start) &
-                        (_ord_disp["order_date"].dt.date <= today)
-                    ]
-                    _display_total_month = float(_month_ord_disp["display_sales_amount"].fillna(0).sum())
-                    if _display_total_month > 0:
-                        st.caption(f"※ 이번 달 누적 매출에는 전시품 판매액 {_display_total_month:,.0f}원이 포함되어 있습니다. (주문일 기준)")
-                    else:
-                        st.caption("※ 이번 달 전시품 판매 없음")
-            except Exception:
-                pass
-            st.metric("이번 달 예상 매출 (일평균 기반)", f"{projected:,.0f}원")
-        else:
-            st.metric("이번 달 누적 매출 (Net Sales)", "0원")
-    else:
-        st.metric("이번 달 누적 매출 (Net Sales)", "0원")
-
-    # ---------- 4. 월별 직원 판매 현황 및 평가 (매출70·현금수금10·마진15·전시5) ----------
+    # ---------- 3. 월별 직원 판매 현황 및 평가 (매출70·현금수금10·마진15·전시5) ----------
     # @st.fragment로 분리: 연/월 selectbox 변경 시 이 섹션만 rerun
     _render_kpi_section(sales_df, orders, db_filename)
 
-    # ---------- 5. 관리자 통계: 기간별 총 계약 금액 / 총 미수금 ----------
-    st.subheader("5. 기간별 통계 (총 계약 금액 / 총 미수금)")
+    # ---------- 4. 관리자 통계: 기간별 총 계약 금액 / 총 미수금 ----------
+    st.subheader("4. 기간별 통계 (총 계약 금액 / 총 미수금)")
     if "stats_start" not in st.session_state:
         st.session_state["stats_start"] = today.replace(day=1)
     if "stats_end" not in st.session_state:
@@ -11948,7 +11900,7 @@ def render_dashboard():
     if len(orders) > 0:
         orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
         period_orders = orders[(orders["order_date"].dt.date >= stats_start) & (orders["order_date"].dt.date <= stats_end)]
-        # sales(transaction_date) 구간의 amount 순합(감액 음수 포함) — 4번 매출 점수(70) 직원 배분 전 총액과 동일 기준, 현금수금(10)과는 별개
+        # sales(transaction_date) 구간의 amount 순합(감액 음수 포함) — 3번 매출 점수(70) 직원 배분 전 총액과 동일 기준, 현금수금(10)과는 별개
         period_sales_net = 0.0
         if not sales_df.empty and "transaction_date" in sales_df.columns and "amount" in sales_df.columns:
             _sd_stat = sales_df.copy()
@@ -11971,14 +11923,14 @@ def render_dashboard():
         st.metric(
             "해당 기간 총 계약 금액",
             f"{period_sales_net:,.0f}원",
-            help="sales 테이블 transaction_date·amount 합계(증액·감액 음수 반영). '4. 월별 직원 평가' 매출 점수(70)는 동일 월 sales 순액 1/n 배분이며, 현금수금집계(10)는 payment_date·수납 수단 버킷으로 별도 집계됩니다.",
+            help="sales 테이블 transaction_date·amount 합계(증액·감액 음수 반영). '3. 월별 직원 평가' 매출 점수(70)는 동일 월 sales 순액 1/n 배분이며, 현금수금집계(10)는 payment_date·수납 수단 버킷으로 별도 집계됩니다.",
         )
         st.metric("해당 기간 총 미수금", f"{total_unpaid_period:,.0f}원")
     else:
         st.metric("해당 기간 총 계약 금액", "0원")
         st.metric("해당 기간 총 미수금", "0원")
 
-    # ---------- 6. To-Do 리스트 (직원 간 인수인계) ----------
+    # ---------- 5. To-Do 리스트 (직원 간 인수인계) ----------
     # @st.fragment로 분리: To-Do 등록·완료·삭제 시 이 섹션만 rerun (전체 대시보드 재로딩 없음)
     _render_dashboard_todos_only(db_filename)
 
