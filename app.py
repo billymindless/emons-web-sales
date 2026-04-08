@@ -1641,6 +1641,76 @@ def load_payments_cached(db_filename: str) -> pd.DataFrame:
         conn.close()
 
 
+def _aggregate_cash_collected_by_employee(
+    db_filename: str,
+    range_start: date,
+    range_end: date,
+    orders_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    직원 평가용: payment_date가 [range_start, range_end]이고 결제수단 문자열에 '현금'이 포함된 결제액만 합산.
+    order_id → 해당 주문 employee_names 1/n 배분 후 직원별 합계. (저장/스키마/결제 코어 미변경, 조회·집계만)
+    """
+    if not db_filename or orders_df is None or orders_df.empty or "id" not in orders_df.columns:
+        return pd.DataFrame(columns=["employee", "cash_sales"])
+    oid_emp: dict[int, str] = {}
+    for _, orow in orders_df.iterrows():
+        try:
+            oid_emp[int(orow["id"])] = str(orow.get("employee_names") or "")
+        except (TypeError, ValueError, KeyError):
+            continue
+    if _supabase_orders_payments_available():
+        pay_df = _load_payments_supabase(db_filename)
+    else:
+        conn = get_tenant_conn(db_filename)
+        if not conn:
+            return pd.DataFrame(columns=["employee", "cash_sales"])
+        try:
+            pay_df = pd.read_sql(
+                "SELECT order_id, payment_date, payment_method, amount FROM Payments "
+                "WHERE payment_date IS NOT NULL AND payment_date != ''",
+                conn,
+            )
+        except Exception:
+            pay_df = pd.DataFrame()
+        finally:
+            conn.close()
+    if pay_df is None or pay_df.empty:
+        return pd.DataFrame(columns=["employee", "cash_sales"])
+    if "payment_method" not in pay_df.columns:
+        pay_df = pay_df.copy()
+        pay_df["payment_method"] = ""
+    pay_df = pay_df.copy()
+    pay_df["payment_date"] = pd.to_datetime(pay_df["payment_date"], errors="coerce")
+    pay_df = pay_df[pay_df["payment_date"].notna()]
+    pay_df["_pd"] = pay_df["payment_date"].dt.date
+    pay_df = pay_df[(pay_df["_pd"] >= range_start) & (pay_df["_pd"] <= range_end)]
+    pay_df["amount"] = pd.to_numeric(pay_df["amount"], errors="coerce").fillna(0)
+    pay_df = pay_df[pay_df["amount"] != 0]
+    pay_df = pay_df[pay_df["payment_method"].astype(str).str.contains("현금", na=False)]
+    rows: list[dict] = []
+    for _, pr in pay_df.iterrows():
+        oid = pr.get("order_id")
+        if pd.isna(oid):
+            continue
+        try:
+            oid_i = int(oid)
+        except (TypeError, ValueError):
+            continue
+        en = oid_emp.get(oid_i, "") or ""
+        emps = [e.strip() for e in str(en).split(",") if e.strip()]
+        if not emps:
+            continue
+        amt = float(pr["amount"])
+        n = len(emps)
+        per = amt / n
+        for e in emps:
+            rows.append({"employee": e, "cash_sales": per})
+    if not rows:
+        return pd.DataFrame(columns=["employee", "cash_sales"])
+    return pd.DataFrame(rows).groupby("employee", as_index=False)["cash_sales"].sum()
+
+
 def _utc_z_bounds_for_kst_range(month_start: date, today: date) -> tuple[str, str]:
     """Supabase timestamptz 비교용 UTC 'Z' 문자열 (KST 자정~말)."""
     start_kst = datetime.combine(month_start, dt_time.min, tzinfo=KST)
@@ -5577,34 +5647,60 @@ def _superadmin_tab2_hr_store_employees():
         range_end = date(ey, em, monthrange(ey, em)[1])
 
     st.caption(f"조회 기간: {range_start.isoformat()} ~ {range_end.isoformat()}")
+    st.caption(
+        "※ **매출 점수(80)** 는 계약금이 아니라, 기간 내 **결제일(payment_date) 기준 현금(수금) 입금액**을 주문 담당 직원에게 1/n 배분한 합계 비중입니다. "
+        "마진·전시품 점수는 기존과 같이 **계약일(order_date)** 기준 주문의 마진·전시품액을 1/n 배분합니다."
+    )
 
-    # 3) 기간 필터 후 직원 1/n 분배 집계
+    # 3) 마진·전시: 계약일 기간 주문 1/n | 매출 점수용 금액: 결제일 기간·현금 결제만 1/n (집계만 변경)
     orders_m = orders[(orders["order_date"].dt.date >= range_start) & (orders["order_date"].dt.date <= range_end)].copy()
-    rows = []
+    margin_rows: list = []
     for _, r in orders_m.iterrows():
         emps = [e.strip() for e in (r.get("employee_names") or "").split(",") if e.strip()]
         n = len(emps) if emps else 1
         if not emps:
             continue
-        amt = float(r.get("total_amount") or 0)
         margin = float(r.get("actual_margin") or 0)
         display_amt = float(r.get("display_sales_amount") or 0)
-        per_amt = amt / n
         per_margin = margin / n
         per_display = (display_amt / n) if n else 0
         for e in emps:
-            rows.append({
+            margin_rows.append({
                 "store": r.get("_store") or "-",
                 "employee": e,
-                "sales": per_amt,
                 "margin": per_margin,
                 "display_sales": per_display,
             })
-    if not rows:
-        st.info("선택한 기간에 직원이 배정된 주문이 없습니다.")
+    df_mg = pd.DataFrame(margin_rows) if margin_rows else pd.DataFrame(columns=["store", "employee", "margin", "display_sales"])
+    if not df_mg.empty:
+        df_mg = df_mg.groupby(["store", "employee"], as_index=False).agg({"margin": "sum", "display_sales": "sum"})
+
+    cs_parts: list = []
+    for s in target_rows:
+        _dbf = s["db_filename"]
+        _snm = s["store_name"]
+        o_sub = orders[orders["_store"] == _snm] if "_store" in orders.columns else orders
+        cdf = _aggregate_cash_collected_by_employee(_dbf, range_start, range_end, o_sub)
+        if not cdf.empty:
+            cdf = cdf.copy()
+            cdf["store"] = _snm
+            cs_parts.append(cdf.rename(columns={"cash_sales": "sales"}))
+    if cs_parts:
+        df_cs = pd.concat(cs_parts, ignore_index=True)
+    else:
+        df_cs = pd.DataFrame(columns=["employee", "sales", "store"])
+
+    if df_mg.empty:
+        df_mg = pd.DataFrame(columns=["store", "employee", "margin", "display_sales"])
+    if df_cs.empty:
+        df_cs = pd.DataFrame(columns=["store", "employee", "sales"])
+
+    row_df = df_mg.merge(df_cs, on=["store", "employee"], how="outer").fillna({"margin": 0.0, "display_sales": 0.0, "sales": 0.0})
+    row_df = row_df[row_df["employee"].astype(str).str.strip() != ""]
+    if row_df.empty:
+        st.info("선택한 기간에 직원 배정 주문·현금 수금 데이터가 없습니다.")
         return
 
-    row_df = pd.DataFrame(rows)
     emp_df = row_df.groupby("employee", as_index=False).agg({
         "sales": "sum",
         "margin": "sum",
@@ -5620,29 +5716,29 @@ def _superadmin_tab2_hr_store_employees():
     emp_df["전시품 점수(10)"] = (emp_df["display_sales"] / total_display * 10).round(1) if total_display else 0.0
     emp_df["종합 점수"] = (emp_df["매출 점수(80)"] + emp_df["마진 점수(10)"] + emp_df["전시품 점수(10)"]).round(1)
     emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
-    emp_df["총 판매액"] = emp_df["sales"].round(0).astype(int)
+    emp_df["현금 수금액"] = emp_df["sales"].round(0).astype(int)
     emp_df["마진액"] = emp_df["margin"].round(0).astype(int)
     emp_df["전시품 판매액"] = emp_df["display_sales"].round(0).astype(int)
 
-    base_cols = ["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]
+    base_cols = ["employee", "현금 수금액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]
     if selected_store == "전체 매장 통합":
         base_cols.insert(4, "참여 매장 수")
     display_df = emp_df[base_cols].rename(columns={"employee": "직원명"})
-    display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
+    display_fmt = _format_df_display(display_df, ["현금 수금액", "마진액", "전시품 판매액"])
     st.dataframe(display_fmt, use_container_width=True)
 
     store_emp = pd.DataFrame()
-    # 4) 전체 통합 모드에서는 매장별·직원별 매출합 보조표 제공
+    # 4) 전체 통합: 매장별·직원별 현금 수금 합 보조표
     if selected_store == "전체 매장 통합":
-        st.markdown("##### 전지점 통합 - 매장별 직원 매출합")
+        st.markdown("##### 전지점 통합 - 매장별 직원 현금 수금 합")
         store_emp = (
             row_df.groupby(["store", "employee"], as_index=False)["sales"]
             .sum()
             .sort_values(["store", "sales"], ascending=[True, False])
-            .rename(columns={"store": "매장명", "employee": "직원명", "sales": "매출합"})
+            .rename(columns={"store": "매장명", "employee": "직원명", "sales": "현금수금합"})
         )
-        store_emp["매출합"] = store_emp["매출합"].round(0).astype(int)
-        st.dataframe(_format_df_display(store_emp, ["매출합"]), use_container_width=True)
+        store_emp["현금수금합"] = store_emp["현금수금합"].round(0).astype(int)
+        st.dataframe(_format_df_display(store_emp, ["현금수금합"]), use_container_width=True)
 
     # 5) 엑셀 다운로드 (직원 통합표 + 통합모드 시 매장별 보조표)
     dl_buf = io.BytesIO()
@@ -11002,8 +11098,9 @@ def _kpi_parse_delta_margin_from_sales_note(note: object) -> float | None:
 
 
 @st.fragment
-def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
-    """월별 직원 판매 현황 fragment: 연/월 selectbox 변경 시 이 섹션만 rerun."""
+def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_filename: str):
+    """월별 직원 판매 현황 fragment: 연/월 selectbox 변경 시 이 섹션만 rerun.
+    매출 점수(80)는 월간 **현금(수금) 결제액**(payment_date) 집계만 사용, 마진·전시는 sales·주문 비율 집계 유지."""
     st.subheader("4. 월별 직원 판매 현황 및 평가")
     if not sales_df.empty and "transaction_date" in sales_df.columns:
         _kpi_sales = sales_df.copy()
@@ -11044,9 +11141,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                     lambda oid: _oid_emp_map.get(int(oid), "") if pd.notna(oid) else ""
                 )
 
-            # orders에서 order_id → total_amount, actual_margin, display_sales_amount (KPI 점수용)
-            # 총 판매액: 직원별 판매 실적(월별집계표)과 동일 — 매 sales 행마다 amount/n 후 직원별 합산.
-            # 마진·전시품: total_amount>0 일 때 amount/total 비율로 배분. total_amount=0 이면 note|__dm(계약 변경 시)으로 마진만 배분 가능.
+            # orders에서 order_id → total_amount, actual_margin, display_sales_amount (마진·전시 KPI용)
+            # 매출 점수(80): 별도로 payment_date 월간 현금 결제만 집계(_aggregate_cash_collected_by_employee).
             _total_map: dict = {}
             _margin_map = {}
             _display_map = {}
@@ -11058,7 +11154,7 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 if "display_sales_amount" in orders.columns:
                     _display_map = orders.set_index("id")["display_sales_amount"].fillna(0).to_dict()
 
-            rows = []
+            rows_md: list = []
             for _, r in _kpi_m.iterrows():
                 emps = [e.strip() for e in str(r.get("employee_names") or "").split(",") if e.strip()]
                 n = len(emps) if emps else 1
@@ -11076,7 +11172,6 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                     base_m = float(_margin_map.get(oid_int, 0) or 0)
                     base_d = float(_display_map.get(oid_int, 0) or 0)
                     _dm_note = _kpi_parse_delta_margin_from_sales_note(r.get("note"))
-                    # total_amount=0: 매출은 amount/n. 마진은 note|__dm(갱신 직전 actual_margin×delta/old_total)이 있으면 그 값/n, 없으면 0.
                     if tot == 0:
                         margin = (_dm_note / n) if _dm_note is not None else 0.0
                         display_amt = 0.0
@@ -11089,9 +11184,27 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 if per_amt == 0 and margin == 0 and display_amt == 0:
                     continue
                 for e in emps:
-                    rows.append({"employee": e, "sales": per_amt, "margin": margin, "display_sales": display_amt})
-            if rows:
-                emp_df = pd.DataFrame(rows).groupby("employee", as_index=False).agg({"sales": "sum", "margin": "sum", "display_sales": "sum"})
+                    rows_md.append({"employee": e, "margin": margin, "display_sales": display_amt})
+            df_md = pd.DataFrame(rows_md) if rows_md else pd.DataFrame(columns=["employee", "margin", "display_sales"])
+            if not df_md.empty:
+                df_md = df_md.groupby("employee", as_index=False).agg({"margin": "sum", "display_sales": "sum"})
+
+            cash_df = (
+                _aggregate_cash_collected_by_employee(db_filename, _kpi_start, _kpi_end, orders)
+                if db_filename and not orders.empty
+                else pd.DataFrame(columns=["employee", "cash_sales"])
+            )
+            if not cash_df.empty:
+                cash_df = cash_df.rename(columns={"cash_sales": "sales"})
+            else:
+                cash_df = pd.DataFrame(columns=["employee", "sales"])
+            if df_md.empty:
+                df_md = pd.DataFrame(columns=["employee", "margin", "display_sales"])
+            emp_merged = df_md.merge(cash_df, on="employee", how="outer").fillna({"margin": 0.0, "display_sales": 0.0, "sales": 0.0})
+            emp_merged = emp_merged[emp_merged["employee"].astype(str).str.strip() != ""]
+
+            if not emp_merged.empty:
+                emp_df = emp_merged.copy()
                 total_sales = emp_df["sales"].sum() or 0
                 total_margin = emp_df["margin"].sum() or 0
                 total_display = emp_df["display_sales"].sum() or 0
@@ -11100,18 +11213,20 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame"):
                 emp_df["전시품 점수(10)"] = (emp_df["display_sales"] / total_display * 10).round(1) if total_display else 0.0
                 emp_df["종합 점수"] = (emp_df["매출 점수(80)"] + emp_df["마진 점수(10)"] + emp_df["전시품 점수(10)"]).round(1)
                 emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
-                emp_df["총 판매액"] = emp_df["sales"].round(0).astype(int)
+                emp_df["현금 수금액"] = emp_df["sales"].round(0).astype(int)
                 emp_df["마진액"] = emp_df["margin"].round(0).astype(int)
                 emp_df["전시품 판매액"] = emp_df["display_sales"].round(0).astype(int)
-                display_df = emp_df[["employee", "총 판매액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]].rename(columns={"employee": "직원명"})
-                display_fmt = _format_df_display(display_df, ["총 판매액", "마진액", "전시품 판매액"])
+                display_df = emp_df[
+                    ["employee", "현금 수금액", "마진액", "전시품 판매액", "매출 점수(80)", "마진 점수(10)", "전시품 점수(10)", "종합 점수"]
+                ].rename(columns={"employee": "직원명"})
+                display_fmt = _format_df_display(display_df, ["현금 수금액", "마진액", "전시품 판매액"])
                 st.dataframe(display_fmt, use_container_width=True)
                 st.caption(
-                    "※ 총 판매액: **월별 집계표(직원별 판매 실적)** 와 동일하게 sales 각 행 amount를 1/n 한 뒤 합산(주문 total_amount=0 인 행도 동일 반영). "
-                    "마진: total_amount>0 이면 금액 비율로 배분; total_amount=0 이어도 계약 변경 sales 행(note에 KPI용 마진 차액)이 있으면 해당 값을 1/n 반영. 전시품은 total_amount=0 이면 0."
+                    "※ **현금 수금액·매출 점수(80)**: 해당 월 **결제일** 기준, 결제수단에 '현금'이 포함된 금액만 주문 담당 직원에게 1/n 배분한 합계. "
+                    "**마진·전시품**: sales 원장 해당 월 행을 주문 total 대비 비율로 배분(기존과 동일). total_amount=0 인 경우 note|__dm 마진 차액 반영."
                 )
             else:
-                st.info("선택한 월에 직원이 배정된 판매 데이터가 없습니다.")
+                st.info("선택한 월에 직원이 배정된 평가 데이터(마진·현금 수금)가 없습니다.")
         else:
             st.info("판매 데이터가 없어 월별 집계를 할 수 없습니다.")
     else:
@@ -11625,9 +11740,9 @@ def render_dashboard():
     else:
         st.metric("이번 달 누적 매출 (Net Sales)", "0원")
 
-    # ---------- 4. 월별 직원 판매 현황 및 평가 (sales 테이블 기반 - transaction_date 기준) ----------
+    # ---------- 4. 월별 직원 판매 현황 및 평가 (매출 점수: 월간 현금 수금 / 마진·전시: sales·주문 비율) ----------
     # @st.fragment로 분리: 연/월 selectbox 변경 시 이 섹션만 rerun
-    _render_kpi_section(sales_df, orders)
+    _render_kpi_section(sales_df, orders, db_filename)
 
     # ---------- 5. 관리자 통계: 기간별 총 계약 금액 / 총 미수금 ----------
     st.subheader("5. 기간별 통계 (총 계약 금액 / 총 미수금)")
@@ -11643,7 +11758,7 @@ def render_dashboard():
     if len(orders) > 0:
         orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
         period_orders = orders[(orders["order_date"].dt.date >= stats_start) & (orders["order_date"].dt.date <= stats_end)]
-        # 직원 KPI·월별 집계표와 동일: sales(transaction_date) 구간의 amount 순합(감액 음수 포함)
+        # sales(transaction_date) 구간의 amount 순합(감액 음수 포함) — 직원 평가 매출점수(현금 수금)와는 별개
         period_sales_net = 0.0
         if not sales_df.empty and "transaction_date" in sales_df.columns and "amount" in sales_df.columns:
             _sd_stat = sales_df.copy()
@@ -11666,7 +11781,7 @@ def render_dashboard():
         st.metric(
             "해당 기간 총 계약 금액",
             f"{period_sales_net:,.0f}원",
-            help="sales 테이블 transaction_date·amount 합계(증액·감액 음수 반영). 월별 직원 KPI와 동일 기준.",
+            help="sales 테이블 transaction_date·amount 합계(증액·감액 음수 반영). 위 '4. 월별 직원 평가'의 매출 점수는 현금 수금 기준이므로 본 수치과 다를 수 있습니다.",
         )
         st.metric("해당 기간 총 미수금", f"{total_unpaid_period:,.0f}원")
     else:
