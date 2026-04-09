@@ -5703,8 +5703,8 @@ def _superadmin_tab2_hr_store_employees():
     st.caption(f"조회 기간: {range_start.isoformat()} ~ {range_end.isoformat()}")
     st.caption(
         "※ **매출 점수(70)·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
-        "**현금수금집계 점수(10)**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-        "**마진·전시**: 동 기간 sales를 주문 비율로 배분(경영 대시보드 월별 KPI와 동일)."
+        "**현금수금집계**(금액): **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n — **참고 열**(종합 점수 미반영). "
+        "**마진 점수(20)·전시품 점수(10)**: 동 기간 sales를 주문 비율로 배분(경영 대시보드 월별 KPI와 동일)."
     )
 
     # 3) 매출·마진·전시: sales transaction_date 구간 | 현금수금: payment_date·KPI 수납 버킷 (집계만)
@@ -5776,18 +5776,13 @@ def _superadmin_tab2_hr_store_employees():
     }).rename(columns={"store": "참여 매장 수"})
 
     total_revenue = emp_df["revenue"].sum() or 0
-    total_receipt = emp_df["kpi_receipt"].sum() or 0
     total_margin = emp_df["margin"].sum() or 0
     total_display = emp_df["display_sales"].sum() or 0
     emp_df["매출 점수(70)"] = (emp_df["revenue"] / total_revenue * 70).round(1) if total_revenue else 0.0
-    emp_df["현금수금집계 점수(10)"] = (emp_df["kpi_receipt"] / total_receipt * 10).round(1) if total_receipt else 0.0
-    emp_df["마진 점수(15)"] = (emp_df["margin"] / total_margin * 15).round(1) if total_margin else 0.0
-    emp_df["전시품 점수(5)"] = (emp_df["display_sales"] / total_display * 5).round(1) if total_display else 0.0
+    emp_df["마진 점수(20)"] = (emp_df["margin"] / total_margin * 20).round(1) if total_margin else 0.0
+    emp_df["전시품 점수(10)"] = (emp_df["display_sales"] / total_display * 10).round(1) if total_display else 0.0
     emp_df["종합 점수"] = (
-        emp_df["매출 점수(70)"]
-        + emp_df["현금수금집계 점수(10)"]
-        + emp_df["마진 점수(15)"]
-        + emp_df["전시품 점수(5)"]
+        emp_df["매출 점수(70)"] + emp_df["마진 점수(20)"] + emp_df["전시품 점수(10)"]
     ).round(1)
     emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
     emp_df["매출집계(순액)"] = emp_df["revenue"].round(0).astype(int)
@@ -5802,9 +5797,8 @@ def _superadmin_tab2_hr_store_employees():
         "마진액",
         "전시품 판매액",
         "매출 점수(70)",
-        "현금수금집계 점수(10)",
-        "마진 점수(15)",
-        "전시품 점수(5)",
+        "마진 점수(20)",
+        "전시품 점수(10)",
         "종합 점수",
     ]
     if selected_store == "전체 매장 통합":
@@ -7857,15 +7851,15 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
     {
         "title": "월별 직원 평가(KPI) 종합 점수는 어떻게 나뉘나요?",
         "keywords": (
-            "KPI 직원 평가 매출 현금수금 마진 전시품 종합점수 배점 70 10 15 5 HR 대시보드 "
+            "KPI 직원 평가 매출 현금수금 마진 전시품 종합점수 배점 70 20 10 HR 대시보드 "
             "월별 판매 현황"
         ),
         "body": (
-            "종합 점수는 네 가지 합으로 **100점 만점**입니다.\n\n"
+            "종합 점수는 **세 가지 합**으로 **100점 만점**입니다.\n\n"
             "- **매출 점수 70점**\n"
-            "- **현금수금집계 점수 10점**\n"
-            "- **마진 점수 15점**\n"
-            "- **전시품 판매 점수 5점**\n\n"
+            "- **마진 점수 20점**\n"
+            "- **전시품 판매 점수 10점**\n\n"
+            "**현금수금집계** 금액은 표에 **참고**로 보일 수 있으나, **종합 점수에는 포함되지 않습니다.**\n\n"
             "**경영 대시보드**의 「3. 월별 직원 판매 현황 및 평가」와 "
             "**최고 관리자 → 매장별 직원 평가(HR)** 에서 같은 기준으로 집계합니다. "
             "(HR은 선택한 **단일 월** 또는 **연월 범위** 기준입니다.)"
@@ -7883,14 +7877,14 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "- 각 행 **금액(`amount`)**은 **감액 등 음수**도 그대로 반영된 **순액**입니다.\n"
             "- 해당 행에 적힌 담당 직원이 여 명이면 금액을 **직원 수로 나눈 몫(1/n)** 이 각 직원 매출로 잡힙니다.\n"
             "- 기간(또는 월) 전체에서 직원별로 합친 뒤, 그 비율로 **70점**을 나눕니다.\n\n"
-            "**마진(15)·전시품(5)**\n\n"
+            "**마진(20)·전시품(10)**\n\n"
             "- 같은 **sales** 구간의 행을, 연결된 **주문**의 `total_amount` 등에 대해 **비율로 나눠** 직원에게 배분합니다. "
             "(대시보드 월별 KPI와 동일한 방식입니다.)\n"
             "- 주문 합계가 0인 특수한 경우에는 **메모(note)에 있는 KPI용 마진 차액 표식**이 반영될 수 있습니다."
         ),
     },
     {
-        "title": "현금수금집계 점수(10점)에는 어떤 결제가 들어가나요?",
+        "title": "현금수금집계에는 어떤 결제가 들어가나요? (KPI 종합 점수와의 관계)",
         "keywords": (
             "현금수금 결제일 payment_date 온누리 지역화폐 이체 현금 신용카드 체크카드 메인페이 "
             "현금수금집계 수수료"
@@ -7900,7 +7894,8 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "- **수수료가 붙는 결제는 제외**합니다. 전산 기준으로 **신용카드·메인페이(2.5%)·체크카드(1.5%)** 는 "
             "**현금수금집계에 포함되지 않습니다.**\n"
             "- **수수료 0%** 인 **계좌이체(이체), 온누리·온누리지류, 지역화폐, 현금(수금)** 만 포함됩니다.\n"
-            "- 결제 금액도 주문 담당 직원이 여러 명이면 **1/n**으로 나눈 뒤 직원별로 합산하고, 그 비율로 **10점**을 나눕니다."
+            "- 결제 금액도 주문 담당 직원이 여러 명이면 **1/n**으로 나눈 뒤 직원별로 합산합니다.\n"
+            "- KPI 표의 **현금수금집계** 열은 위 기준의 **금액 참고**이며, **종합 점수(매출70+마진20+전시10)에는 넣지 않습니다.**"
         ),
     },
     {
@@ -7909,7 +7904,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
         "body": (
             "- 「4. 기간별 통계」의 **해당 기간 총 계약 금액**은 선택 기간의 **sales 순액 합(직원 나누기 전)** 입니다.\n"
             "- KPI **매출 점수(70)** 는 같은 **sales·판매일** 기준이지만 **직원별 1/n 배분 후 비율**로 점수를 매깁니다.\n"
-            "- **현금수금집계(10점)** 는 **결제일·결제수단**으로 따로 집계하므로, 위 숫자들과 **항상 같지는 않습니다.**"
+            "- **현금수금집계** 는 **결제일·결제수단**으로 따로 집계한 **참고 금액**이므로, 위 숫자들과 **항상 같지는 않습니다.**"
         ),
     },
     {
@@ -7948,7 +7943,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "**위약금**\n\n"
             "- **고객이 계약을 취소한 뒤** 실제로 **위약금이 발생·수령된 경우**에만 등록합니다.\n"
             "- **실제 수금 금액**에 맞춰 입력해 장부·입금 흐름을 맞추는 용도입니다.\n"
-            "- **결제일·결제수단 기준 수금 집계**(예: KPI **현금수금집계** 등)에는 **포함**될 수 있습니다. "
+            "- **결제일·결제수단 기준 수금 집계**(예: KPI 표의 **현금수금집계** 참고 열)에는 **포함**될 수 있습니다. "
             "(KPI **매출 점수(70)** 등 sales·판매일 기준 영업 매출과는 별개입니다.)\n"
             "- 일반 상품 판매로 보지 않으므로, **취소 후 위약금이 있을 때만** 특수 등록의 위약금으로 넣어 주세요.\n\n"
             "**직원 구매**\n\n"
@@ -11362,7 +11357,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
 
 @st.fragment
 def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_filename: str):
-    """월별 직원 판매 현황: 매출 점수(70)=sales 해당월 순액 1/n, 현금수금집계(10)=payment_date·KPI 수납 버킷, 마진(15)·전시(5)=sales·주문 비율."""
+    """월별 직원 판매 현황: 종합=매출70+마진20+전시10. 매출=sales 해당월 순액 1/n. 현금수금집계는 참고 열. 마진·전시=sales·주문 비율."""
     st.subheader("3. 월별 직원 판매 현황 및 평가")
     if not sales_df.empty and "transaction_date" in sales_df.columns:
         _kpi_sales = sales_df.copy()
@@ -11417,18 +11412,13 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
             if not emp_merged.empty:
                 emp_df = emp_merged.copy()
                 total_revenue = emp_df["revenue"].sum() or 0
-                total_receipt = emp_df["kpi_receipt"].sum() or 0
                 total_margin = emp_df["margin"].sum() or 0
                 total_display = emp_df["display_sales"].sum() or 0
                 emp_df["매출 점수(70)"] = (emp_df["revenue"] / total_revenue * 70).round(1) if total_revenue else 0.0
-                emp_df["현금수금집계 점수(10)"] = (emp_df["kpi_receipt"] / total_receipt * 10).round(1) if total_receipt else 0.0
-                emp_df["마진 점수(15)"] = (emp_df["margin"] / total_margin * 15).round(1) if total_margin else 0.0
-                emp_df["전시품 점수(5)"] = (emp_df["display_sales"] / total_display * 5).round(1) if total_display else 0.0
+                emp_df["마진 점수(20)"] = (emp_df["margin"] / total_margin * 20).round(1) if total_margin else 0.0
+                emp_df["전시품 점수(10)"] = (emp_df["display_sales"] / total_display * 10).round(1) if total_display else 0.0
                 emp_df["종합 점수"] = (
-                    emp_df["매출 점수(70)"]
-                    + emp_df["현금수금집계 점수(10)"]
-                    + emp_df["마진 점수(15)"]
-                    + emp_df["전시품 점수(5)"]
+                    emp_df["매출 점수(70)"] + emp_df["마진 점수(20)"] + emp_df["전시품 점수(10)"]
                 ).round(1)
                 emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
                 emp_df["매출집계(순액)"] = emp_df["revenue"].round(0).astype(int)
@@ -11443,9 +11433,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                         "마진액",
                         "전시품 판매액",
                         "매출 점수(70)",
-                        "현금수금집계 점수(10)",
-                        "마진 점수(15)",
-                        "전시품 점수(5)",
+                        "마진 점수(20)",
+                        "전시품 점수(10)",
                         "종합 점수",
                     ]
                 ].rename(columns={"employee": "직원명"})
@@ -11454,9 +11443,9 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                 )
                 st.dataframe(display_fmt, use_container_width=True)
                 st.caption(
-                    "※ **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
-                    "**현금수금집계·점수(10)**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-                    "**마진·전시**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영."
+                    "※ **종합 점수** = 매출 70 + 마진 20 + 전시품 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
+                    "**현금수금집계**(금액): 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n — **참고 열**(종합에 미포함). "
+                    "**마진·전시 점수**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영."
                 )
             else:
                 st.info("선택한 월에 직원이 배정된 평가 데이터(매출·현금수금·마진·전시)가 없습니다.")
@@ -11925,7 +11914,7 @@ def render_dashboard():
     else:
         st.info("아직 주문 데이터가 없습니다.")
 
-    # ---------- 3. 월별 직원 판매 현황 및 평가 (매출70·현금수금10·마진15·전시5) ----------
+    # ---------- 3. 월별 직원 판매 현황 및 평가 (종합: 매출70+마진20+전시10, 현금수금집계는 참고 열) ----------
     # @st.fragment로 분리: 연/월 selectbox 변경 시 이 섹션만 rerun
     _render_kpi_section(sales_df, orders, db_filename)
 
@@ -11943,7 +11932,7 @@ def render_dashboard():
     if len(orders) > 0:
         orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
         period_orders = orders[(orders["order_date"].dt.date >= stats_start) & (orders["order_date"].dt.date <= stats_end)]
-        # sales(transaction_date) 구간의 amount 순합(감액 음수 포함) — 3번 매출 점수(70) 직원 배분 전 총액과 동일 기준, 현금수금(10)과는 별개
+        # sales(transaction_date) 구간의 amount 순합(감액 음수 포함) — 3번 매출 점수(70) 직원 배분 전 총액과 동일 기준, 현금수금집계(참고)와는 별개
         period_sales_net = 0.0
         if not sales_df.empty and "transaction_date" in sales_df.columns and "amount" in sales_df.columns:
             _sd_stat = sales_df.copy()
@@ -11966,7 +11955,7 @@ def render_dashboard():
         st.metric(
             "해당 기간 총 계약 금액",
             f"{period_sales_net:,.0f}원",
-            help="sales 테이블 transaction_date·amount 합계(증액·감액 음수 반영). '3. 월별 직원 평가' 매출 점수(70)는 동일 월 sales 순액 1/n 배분이며, 현금수금집계(10)는 payment_date·수납 수단 버킷으로 별도 집계됩니다.",
+            help="sales 테이블 transaction_date·amount 합계(증액·감액 음수 반영). '3. 월별 직원 평가' 매출 점수(70)는 동일 월 sales 순액 1/n 배분이며, 현금수금집계는 payment_date·수납 수단 버킷으로 별도 집계된 참고 금액입니다.",
         )
         st.metric("해당 기간 총 미수금", f"{total_unpaid_period:,.0f}원")
     else:
