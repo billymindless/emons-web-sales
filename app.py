@@ -1086,6 +1086,84 @@ def _kpi_sanitize_employee_label(raw: object) -> str:
     return ",".join(emps) if emps else ""
 
 
+def _fetch_order_employee_names_map_by_ids(db_filename: str, order_ids: list) -> dict[int, str]:
+    """order_id → 주문 테이블의 최신 employee_names (Supabase app_orders 또는 SQLite Orders)."""
+    out: dict[int, str] = {}
+    if not db_filename or not order_ids:
+        return out
+    try:
+        oids = sorted({int(x) for x in order_ids})
+    except (TypeError, ValueError):
+        return out
+    if not oids:
+        return out
+    if _supabase_orders_payments_available():
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return out
+        try:
+            for chunk in (oids[i : i + 100] for i in range(0, len(oids), 100)):
+                resp = (
+                    sc.table("app_orders")
+                    .select("id, employee_names")
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                    .in_("id", chunk)
+                    .execute()
+                )
+                for row in resp.data or []:
+                    out[int(row["id"])] = str(row.get("employee_names") or "")
+        except Exception:
+            return out
+        return out
+    conn = get_tenant_conn(db_filename)
+    if not conn:
+        return out
+    try:
+        for chunk in (oids[i : i + 200] for i in range(0, len(oids), 200)):
+            ph = ",".join("?" * len(chunk))
+            cur = conn.execute(f"SELECT id, employee_names FROM Orders WHERE id IN ({ph})", chunk)
+            for row in cur.fetchall():
+                out[int(row[0])] = str(row[1] or "")
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return out
+
+
+def _overlay_sales_df_employee_names_from_live_orders(sal_df: "pd.DataFrame") -> None:
+    """in-place: `_db_fn`·`order_id`가 있으면 주문 테이블 최신 담당 직원으로 `employee_names`를 덮어써 1/n·표시가 주문 수정과 일치."""
+    if sal_df is None or sal_df.empty:
+        return
+    if "order_id" not in sal_df.columns or "employee_names" not in sal_df.columns or "_db_fn" not in sal_df.columns:
+        return
+    sal_df["employee_names"] = sal_df["employee_names"].astype(object)
+    for db_fn in sal_df["_db_fn"].dropna().unique():
+        db_s = str(db_fn)
+        m = sal_df["_db_fn"] == db_fn
+        oids = sal_df.loc[m, "order_id"].dropna().astype(int).unique().tolist()
+        if not oids:
+            continue
+        emp_map = _fetch_order_employee_names_map_by_ids(db_s, oids)
+        if not emp_map:
+            continue
+
+        def _resolve(oid: object, cur: object) -> object:
+            if pd.isna(oid):
+                return cur
+            try:
+                oi = int(oid)
+            except (TypeError, ValueError):
+                return cur
+            ov = emp_map.get(oi)
+            if ov is not None and str(ov).strip():
+                return str(ov).strip()
+            return cur
+
+        sub = sal_df.loc[m, ["order_id", "employee_names"]]
+        sal_df.loc[m, "employee_names"] = [_resolve(a, b) for a, b in zip(sub["order_id"], sub["employee_names"])]
+
+
 # ========== 경로 설정 ==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "databases")
@@ -6478,6 +6556,10 @@ def render_monthly_payment_report(is_superadmin: bool):
                 _sm_all = _sm_all[
                     (_sm_all["_pd"] >= date_range_start) & (_sm_all["_pd"] <= date_range_end)
                 ]
+                try:
+                    _overlay_sales_df_employee_names_from_live_orders(_sm_all)
+                except Exception:
+                    pass
                 _sm_rows: list = []
                 for _fn in _sm_all["_db_fn"].dropna().unique():
                     _mask_fn = _sm_all["_db_fn"] == _fn
@@ -6791,30 +6873,10 @@ def render_monthly_payment_report(is_superadmin: bool):
         sal_df["_pd"] = sal_df["transaction_date"].dt.date
         sal_df = sal_df[(sal_df["_pd"] >= date_range_start) & (sal_df["_pd"] <= date_range_end)]
 
-        # employee_names가 없는 레코드(구 데이터): app_orders 테이블에서 employee_names를 보완
-        _no_emp_mask = sal_df["employee_names"].isna() | (sal_df["employee_names"].astype(str).str.strip() == "")
-        if _no_emp_mask.any():
-            sal_df["employee_names"] = sal_df["employee_names"].astype(object)
-            try:
-                _sc, _ = get_supabase_client()
-                if _sc:
-                    # db_filename별로 나눠서 tenant 필터 적용
-                    for _db_fn_emp in sal_df.loc[_no_emp_mask, "_db_fn"].dropna().unique():
-                        _emp_fn_mask = _no_emp_mask & (sal_df["_db_fn"] == _db_fn_emp)
-                        _order_ids_no_emp = sal_df.loc[_emp_fn_mask, "order_id"].dropna().astype(int).unique().tolist()
-                        if not _order_ids_no_emp:
-                            continue
-                        _chunks = [_order_ids_no_emp[i:i+100] for i in range(0, len(_order_ids_no_emp), 100)]
-                        _emp_map = {}
-                        for _chunk in _chunks:
-                            _r = _sc.table("app_orders").select("id, employee_names").eq("db_filename", _db_fn_emp).in_("id", _chunk).execute()
-                            for _row in (_r.data or []):
-                                _emp_map[_row["id"]] = _row.get("employee_names") or ""
-                        sal_df.loc[_emp_fn_mask, "employee_names"] = sal_df.loc[_emp_fn_mask, "order_id"].apply(
-                            lambda oid: _emp_map.get(int(oid), "") if pd.notna(oid) else ""
-                        )
-            except Exception as _e:
-                st.caption(f"⚠️ 직원명 보완 조회 오류: {_e}")
+        try:
+            _overlay_sales_df_employee_names_from_live_orders(sal_df)
+        except Exception as _e:
+            st.caption(f"⚠️ 직원명(주문 기준) 보완 오류: {_e}")
 
         if sal_df.empty:
             st.info("해당 기간에 판매 데이터가 없습니다.")
@@ -11287,7 +11349,7 @@ def _kpi_parse_delta_margin_from_sales_note(note: object) -> float | None:
 
 
 def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.DataFrame") -> "pd.DataFrame":
-    """sales 원장 구간(transaction_date 필터 적용된 slice)에서 직원별 순매출·마진·전시 배분. amount 음수 반영, 마진은 주문 비율·note|__dm 동일."""
+    """sales 원장 구간에서 직원별 순매출·마진·전시 배분. 1/n 분모는 주문의 최신 employee_names를 우선(sales 스냅샷보다 앞섬). amount 음수·note|__dm 동일."""
     if kpi_m.empty:
         return pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
     km = kpi_m.copy()
@@ -11295,8 +11357,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
         km["employee_names"] = None
     # Arrow-backed StringDtype는 loc에 Series 대입 시 TypeError → object로 풀어서 보완 (pandas 2.2+/3.x, Streamlit Cloud)
     km["employee_names"] = km["employee_names"].astype(object)
-    _no_emp = km["employee_names"].map(_kpi_employee_names_cell_is_blank)
-    if _no_emp.any() and not orders.empty and "id" in orders.columns and "employee_names" in orders.columns:
+    if not orders.empty and "id" in orders.columns and "employee_names" in orders.columns and "order_id" in km.columns:
         _oid_emp_map = orders.set_index("id")["employee_names"].to_dict()
 
         def _emp_from_oid(oid: object) -> str:
@@ -11307,7 +11368,10 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
             except (TypeError, ValueError):
                 return ""
 
-        km.loc[_no_emp, "employee_names"] = km.loc[_no_emp, "order_id"].map(_emp_from_oid)
+        _from_order = km["order_id"].map(_emp_from_oid)
+        _use_order = ~_from_order.map(_kpi_employee_names_cell_is_blank)
+        if _use_order.any():
+            km.loc[_use_order, "employee_names"] = _from_order.loc[_use_order]
     _total_map: dict = {}
     _margin_map = {}
     _display_map = {}
