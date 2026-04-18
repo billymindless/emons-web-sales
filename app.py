@@ -12188,12 +12188,6 @@ def render_dashboard():
               <div class="kpi-month-recv-breakdown">
                 {month_cumulative_methods_html}
               </div>
-              <div class="kpi-detail-stack">
-                <span class="kpi-sub">{html.escape(_recv_month_line1)}</span>
-                <span class="kpi-sub2" style="{'display:none;' if not _recv_month_line2 else ''}">{html.escape(_recv_month_line2)}</span>
-                <span class="kpi-sub2" style="{'display:none;' if not _recv_month_line3 else ''}">{html.escape(_recv_month_line3)}</span>
-                <span class="kpi-sub2 kpi-sub-muted" style="{'display:none;' if not _recv_month_hint else ''}">{html.escape(_recv_month_hint)}</span>
-              </div>
             </td>
             <td>
               <div class="kpi-label">🎯 예상 월매출</div>
