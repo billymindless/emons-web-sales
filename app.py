@@ -11957,7 +11957,6 @@ def render_dashboard():
     )
     _proj_sub = f"일평균 {expected_total_sales/_days_elapsed:,.0f}원 × {_days_in_month}일" if _days_elapsed > 0 and expected_total_sales > 0 else ""
 
-    _contract_daily_foot = "sales 원장 · 당일 transaction_date(순액, 신규·조정 반영)"
     _expected_contract_note_text = "sales 순액 기준(취소·감액·계약조정 반영)"
 
     if payments.empty or "payment_date" not in payments.columns:
@@ -12109,12 +12108,6 @@ def render_dashboard():
             margin-top: 6px;
             line-height: 1.4;
         }}
-        .kpi-daily-foot {{
-            font-size: 0.6rem;
-            color: #78909c;
-            margin-top: 7px;
-            line-height: 1.35;
-        }}
         .kpi-table td.highlight {{
             background: linear-gradient(135deg, #fff3e0, #ffe0b2);
             border: 2px solid #ff6f00;
@@ -12171,7 +12164,6 @@ def render_dashboard():
               <div class="kpi-label">📋 당일 계약<span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
               <div class="kpi-value-daily-contract">{today_sales_net:,.0f}원</div>
               <div class="kpi-daily-meta">({daily_contract_txn_count}건) · 마진율 {daily_contract_margin_pct:.1f}%</div>
-              <div class="kpi-daily-foot">{html.escape(_contract_daily_foot)}</div>
             </td>
             <td>
               <div class="kpi-label">📈 누적매출 (월)</div>
