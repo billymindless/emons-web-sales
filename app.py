@@ -12208,7 +12208,6 @@ def render_dashboard():
             <td class="kpi-td-daily-receipt">
               <div class="kpi-label">💳 일일 수납액<span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
               <div class="kpi-daily-recv-total">{daily_receipt_total:,.0f}원</div>
-              <div class="kpi-daily-recv-caption">결제수단별 (당일 payment_date)</div>
               <div class="kpi-daily-recv-breakdown">
                 {daily_receipt_methods_html}
               </div>
