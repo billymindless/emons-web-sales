@@ -5925,7 +5925,22 @@ def _superadmin_tab2_hr_store_employees():
     display_fmt = _format_df_display(
         display_df, ["매출집계(순액)", "현금수금집계", "마진액", "전시품 판매액"]
     )
-    st.dataframe(display_fmt, use_container_width=True)
+    st.dataframe(
+        display_fmt,
+        use_container_width=True,
+        column_config={
+            "직원명": st.column_config.TextColumn("직원명", width="small"),
+            "매출집계(순액)": st.column_config.TextColumn("매출집계(순액)", width="medium"),
+            "현금수금집계": st.column_config.TextColumn("현금수금집계", width="medium"),
+            "마진액": st.column_config.TextColumn("마진액", width="medium"),
+            "전시품 판매액": st.column_config.TextColumn("전시품 판매액", width="small"),
+            "매출 점수(70)": st.column_config.NumberColumn("매출(70)", format="%.1f", width="small"),
+            "마진 점수(12)": st.column_config.NumberColumn("마진(12)", format="%.1f", width="small"),
+            "전시품 점수(8)": st.column_config.NumberColumn("전시품(8)", format="%.1f", width="small"),
+            "현금수금 점수(10)": st.column_config.NumberColumn("현금수금(10)", format="%.1f", width="small"),
+            "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
+        },
+    )
 
     store_emp = pd.DataFrame()
     # 4) 전체 통합: 매장별·직원별 현금수금집계 합 보조표
@@ -11753,7 +11768,22 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                 display_fmt = _format_df_display(
                     display_df, ["매출집계(순액)", "현금수금집계", "마진액", "전시품 판매액"]
                 )
-                st.dataframe(display_fmt, use_container_width=True)
+                st.dataframe(
+                    display_fmt,
+                    use_container_width=True,
+                    column_config={
+                        "직원명": st.column_config.TextColumn("직원명", width="small"),
+                        "매출집계(순액)": st.column_config.TextColumn("매출집계(순액)", width="medium"),
+                        "현금수금집계": st.column_config.TextColumn("현금수금집계", width="medium"),
+                        "마진액": st.column_config.TextColumn("마진액", width="medium"),
+                        "전시품 판매액": st.column_config.TextColumn("전시품 판매액", width="small"),
+                        "매출 점수(70)": st.column_config.NumberColumn("매출(70)", format="%.1f", width="small"),
+                        "마진 점수(12)": st.column_config.NumberColumn("마진(12)", format="%.1f", width="small"),
+                        "전시품 점수(8)": st.column_config.NumberColumn("전시품(8)", format="%.1f", width="small"),
+                        "현금수금 점수(10)": st.column_config.NumberColumn("현금수금(10)", format="%.1f", width="small"),
+                        "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
+                    },
+                )
                 st.caption(
                     "※ **종합 점수** = 매출 70 + 마진 12 + 전시품 8 + 현금수금 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
                     "**현금수금 점수(10)·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
