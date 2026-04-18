@@ -12215,7 +12215,6 @@ def render_dashboard():
             <td class="kpi-td-month-cumulative-receipt">
               <div class="kpi-label">📊 누적 수납액 (월)</div>
               <div class="kpi-value">{cumulative_sales:,.0f}원</div>
-              <div class="kpi-daily-recv-caption">결제수단별 ({month_start.strftime("%m/%d")} ~ 오늘 payment_date)</div>
               <div class="kpi-month-recv-breakdown">
                 {month_cumulative_methods_html}
               </div>
