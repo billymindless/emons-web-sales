@@ -11817,6 +11817,7 @@ def render_dashboard():
     st.subheader("1. 주요 매출 항목")
     daily_receipt_total = 0.0  # 당일 payment_date 기준 수납 순액(상계·취소 반영)
     daily_receipt_methods_html = ""  # 결제수단별 HTML (이스케이프 포함)
+    month_cumulative_methods_html = ""  # 당월 누적 수납 — 결제수단별 HTML
     cumulative_sales = 0.0
     month_pay_neg_sum = 0.0
     expected_total_sales = 0.0
@@ -11865,6 +11866,23 @@ def render_dashboard():
                             f'<span class="kpi-daily-recv-amt">{daily_receipt_total:,.0f}원</span></div>'
                         )
                 cumulative_sales = float(month_pmt["amount"].fillna(0).sum()) if len(month_pmt) > 0 else 0.0
+                if len(month_pmt) > 0:
+                    if "payment_method" in month_pmt.columns:
+                        _g_month_recv = (
+                            month_pmt.groupby(month_pmt["payment_method"].fillna("미지정").astype(str))["amount"]
+                            .sum()
+                            .sort_values(ascending=False)
+                        )
+                        month_cumulative_methods_html = "".join(
+                            f'<div class="kpi-daily-recv-row"><span class="kpi-daily-recv-m">{html.escape(str(_mk))}</span>'
+                            f'<span class="kpi-daily-recv-amt">{float(_mv):,.0f}원</span></div>'
+                            for _mk, _mv in _g_month_recv.items()
+                        )
+                    else:
+                        month_cumulative_methods_html = (
+                            f'<div class="kpi-daily-recv-row"><span class="kpi-daily-recv-m">수단 미분류</span>'
+                            f'<span class="kpi-daily-recv-amt">{cumulative_sales:,.0f}원</span></div>'
+                        )
                 _neg_month = month_pmt[month_pmt["amount"].astype(float) < 0]
                 month_pay_neg_sum = float(_neg_month["amount"].fillna(0).sum()) if len(_neg_month) else 0.0
 
@@ -11945,8 +11963,12 @@ def render_dashboard():
     if payments.empty or "payment_date" not in payments.columns:
         daily_receipt_total = 0.0
         daily_receipt_methods_html = '<div class="kpi-daily-recv-empty">결제일(payment_date) 없음</div>'
-    elif not daily_receipt_methods_html:
-        daily_receipt_methods_html = '<div class="kpi-daily-recv-empty">당일 수납 내역 없음</div>'
+        month_cumulative_methods_html = '<div class="kpi-daily-recv-empty">결제일(payment_date) 없음</div>'
+    else:
+        if not daily_receipt_methods_html:
+            daily_receipt_methods_html = '<div class="kpi-daily-recv-empty">당일 수납 내역 없음</div>'
+        if not month_cumulative_methods_html:
+            month_cumulative_methods_html = '<div class="kpi-daily-recv-empty">당월 수납 내역 없음</div>'
 
     if payments.empty or "payment_date" not in payments.columns:
         _recv_month_line1 = "⚠️ 결제일(payment_date) 없음 — 수납·상계 표시 불가"
@@ -12015,6 +12037,18 @@ def render_dashboard():
             max-height: 110px;
             overflow-y: auto;
             width: 100%;
+        }}
+        .kpi-month-recv-breakdown {{
+            margin-top: 6px;
+            text-align: left;
+            padding: 0 2px 0 0;
+            max-height: 130px;
+            overflow-y: auto;
+            width: 100%;
+        }}
+        .kpi-td-month-cumulative-receipt {{
+            min-width: 168px;
+            width: 18%;
         }}
         .kpi-daily-recv-row {{
             font-size: 0.62rem;
@@ -12155,9 +12189,13 @@ def render_dashboard():
                 {daily_receipt_methods_html}
               </div>
             </td>
-            <td>
+            <td class="kpi-td-month-cumulative-receipt">
               <div class="kpi-label">📊 누적 수납액 (월)</div>
               <div class="kpi-value">{cumulative_sales:,.0f}원</div>
+              <div class="kpi-daily-recv-caption">결제수단별 ({month_start.strftime("%m/%d")} ~ 오늘 payment_date)</div>
+              <div class="kpi-month-recv-breakdown">
+                {month_cumulative_methods_html}
+              </div>
               <div class="kpi-detail-stack">
                 <span class="kpi-sub">{html.escape(_recv_month_line1)}</span>
                 <span class="kpi-sub2" style="{'display:none;' if not _recv_month_line2 else ''}">{html.escape(_recv_month_line2)}</span>
