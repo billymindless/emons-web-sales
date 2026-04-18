@@ -1741,7 +1741,7 @@ def load_payments_cached(db_filename: str) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         return pd.read_sql(
-            "SELECT order_id, amount, fee_amount, payment_date FROM Payments",
+            "SELECT order_id, amount, fee_amount, payment_date, payment_method FROM Payments",
             conn,
         )
     except Exception:
@@ -11795,11 +11795,11 @@ def render_dashboard():
         _valid_oids = set(orders["id"].dropna().astype(int).tolist())
         sales_df = sales_df[sales_df["order_id"].isin(_valid_oids)].copy()
     if payments.empty:
-        payments = pd.DataFrame(columns=["order_id", "amount"])
+        payments = pd.DataFrame(columns=["order_id", "amount", "payment_method"])
     else:
-        for col in ("order_id", "amount"):
+        for col in ("order_id", "amount", "payment_method"):
             if col not in payments.columns:
-                payments[col] = 0
+                payments[col] = "" if col == "payment_method" else 0
     todos_df = _get_todos_for_display(db_filename)
     if "display_sales_amount" not in orders.columns:
         orders["display_sales_amount"] = 0
@@ -11815,6 +11815,8 @@ def render_dashboard():
 
     # ---------- 1. 주요 매출 항목 (5대 핵심 KPI) ----------
     st.subheader("1. 주요 매출 항목")
+    daily_receipt_total = 0.0  # 당일 payment_date 기준 수납 순액(상계·취소 반영)
+    daily_receipt_methods_html = ""  # 결제수단별 HTML (이스케이프 포함)
     cumulative_sales = 0.0
     month_pay_neg_sum = 0.0
     expected_total_sales = 0.0
@@ -11843,6 +11845,25 @@ def render_dashboard():
             if not pmt.empty:
                 pmt["_date"] = pmt["payment_date"].dt.date
                 month_pmt = pmt[(pmt["_date"] >= month_start) & (pmt["_date"] <= today)]
+                today_pmt = pmt[pmt["_date"] == today]
+                daily_receipt_total = float(today_pmt["amount"].fillna(0).sum()) if len(today_pmt) else 0.0
+                if len(today_pmt) > 0:
+                    if "payment_method" in today_pmt.columns:
+                        _g_recv = (
+                            today_pmt.groupby(today_pmt["payment_method"].fillna("미지정").astype(str))["amount"]
+                            .sum()
+                            .sort_values(ascending=False)
+                        )
+                        daily_receipt_methods_html = "".join(
+                            f'<div class="kpi-daily-recv-row"><span class="kpi-daily-recv-m">{html.escape(str(_mk))}</span>'
+                            f'<span class="kpi-daily-recv-amt">{float(_mv):,.0f}원</span></div>'
+                            for _mk, _mv in _g_recv.items()
+                        )
+                    else:
+                        daily_receipt_methods_html = (
+                            f'<div class="kpi-daily-recv-row"><span class="kpi-daily-recv-m">수단 미분류</span>'
+                            f'<span class="kpi-daily-recv-amt">{daily_receipt_total:,.0f}원</span></div>'
+                        )
                 cumulative_sales = float(month_pmt["amount"].fillna(0).sum()) if len(month_pmt) > 0 else 0.0
                 _neg_month = month_pmt[month_pmt["amount"].astype(float) < 0]
                 month_pay_neg_sum = float(_neg_month["amount"].fillna(0).sum()) if len(_neg_month) else 0.0
@@ -11922,6 +11943,12 @@ def render_dashboard():
     _expected_contract_note_text = "sales 순액 기준(취소·감액·계약조정 반영)"
 
     if payments.empty or "payment_date" not in payments.columns:
+        daily_receipt_total = 0.0
+        daily_receipt_methods_html = '<div class="kpi-daily-recv-empty">결제일(payment_date) 없음</div>'
+    elif not daily_receipt_methods_html:
+        daily_receipt_methods_html = '<div class="kpi-daily-recv-empty">당일 수납 내역 없음</div>'
+
+    if payments.empty or "payment_date" not in payments.columns:
         _recv_month_line1 = "⚠️ 결제일(payment_date) 없음 — 수납·상계 표시 불가"
         _recv_month_line2 = ""
         _recv_month_line3 = ""
@@ -11958,11 +11985,69 @@ def render_dashboard():
             padding: 12px 10px;
             text-align: center;
             vertical-align: top;
-            width: 16.66%;
+            width: 14.28%;
         }}
         .kpi-td-daily-contract {{
+            width: 15%;
+            min-width: 138px;
+        }}
+        .kpi-td-daily-receipt {{
             width: 18%;
-            min-width: 150px;
+            min-width: 168px;
+        }}
+        .kpi-daily-recv-total {{
+            font-size: 1.28rem;
+            font-weight: 800;
+            color: #0d47a1;
+            line-height: 1.2;
+            margin-top: 5px;
+        }}
+        .kpi-daily-recv-caption {{
+            font-size: 0.58rem;
+            color: #90a4ae;
+            margin-top: 4px;
+            font-weight: 600;
+        }}
+        .kpi-daily-recv-breakdown {{
+            margin-top: 8px;
+            text-align: left;
+            padding: 0 2px 0 0;
+            max-height: 110px;
+            overflow-y: auto;
+            width: 100%;
+        }}
+        .kpi-daily-recv-row {{
+            font-size: 0.62rem;
+            color: #546e7a;
+            line-height: 1.5;
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 6px;
+            border-bottom: 1px solid #eceff1;
+            padding: 3px 0;
+        }}
+        .kpi-daily-recv-row:last-child {{
+            border-bottom: none;
+        }}
+        .kpi-daily-recv-m {{
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }}
+        .kpi-daily-recv-amt {{
+            font-size: 0.64rem;
+            font-weight: 700;
+            color: #37474f;
+            white-space: nowrap;
+        }}
+        .kpi-daily-recv-empty {{
+            font-size: 0.62rem;
+            color: #90a4ae;
+            text-align: center;
+            padding: 6px 0;
         }}
         .kpi-value-daily-contract {{
             font-size: 1.22rem;
@@ -12060,6 +12145,14 @@ def render_dashboard():
               <div class="kpi-sub">{month_start.strftime("%m/%d")} ~ 오늘</div>
               <div class="kpi-detail-stack">
                 <span class="kpi-sub2">{html.escape(_expected_contract_note_text)}</span>
+              </div>
+            </td>
+            <td class="kpi-td-daily-receipt">
+              <div class="kpi-label">💳 일일 수납액<span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
+              <div class="kpi-daily-recv-total">{daily_receipt_total:,.0f}원</div>
+              <div class="kpi-daily-recv-caption">결제수단별 (당일 payment_date)</div>
+              <div class="kpi-daily-recv-breakdown">
+                {daily_receipt_methods_html}
               </div>
             </td>
             <td>
