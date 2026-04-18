@@ -1741,13 +1741,41 @@ def load_payments_cached(db_filename: str) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         return pd.read_sql(
-            "SELECT order_id, amount, fee_amount, payment_date, payment_method FROM Payments",
+            "SELECT order_id, amount, fee_amount, payment_date, payment_method, onnuri_approval_code FROM Payments",
             conn,
         )
     except Exception:
         return pd.DataFrame()
     finally:
         conn.close()
+
+
+def _kpi_receipt_method_label_series(df: "pd.DataFrame") -> "pd.Series":
+    """대시보드 수납액 수단별 집계용 라벨. 온누리·온누리지류 등은 '온누리'로 합치고, 수단 공란+온누리 승인번호가 있으면 온누리로 분류."""
+    idx = df.index
+    n = len(df)
+    if "payment_method" in df.columns:
+        pm = df["payment_method"].fillna("").astype(str).str.strip()
+        pm = pm.replace({"nan": "", "None": "", "<NA>": "", "NaT": ""})
+    else:
+        pm = pd.Series([""] * n, index=idx, dtype=str)
+
+    def _fold_onnuri_label(m: object) -> str:
+        s = str(m).strip() if m is not None else ""
+        if not s or s.lower() in ("nan", "none", "<na>"):
+            return ""
+        if "온누리" in s:
+            return "온누리"
+        return s
+
+    out = pm.map(_fold_onnuri_label)
+    has_onn = pd.Series(False, index=idx)
+    if "onnuri_approval_code" in df.columns:
+        oc = df["onnuri_approval_code"].fillna("").astype(str).str.strip()
+        has_onn = oc.ne("") & ~oc.str.lower().isin(("nan", "none", "nat"))
+    out = out.mask((out == "") & has_onn, "온누리")
+    out = out.mask(out == "", "미지정")
+    return out
 
 
 def _payment_method_in_kpi_receipt_bucket(meth: object) -> bool:
@@ -11795,11 +11823,11 @@ def render_dashboard():
         _valid_oids = set(orders["id"].dropna().astype(int).tolist())
         sales_df = sales_df[sales_df["order_id"].isin(_valid_oids)].copy()
     if payments.empty:
-        payments = pd.DataFrame(columns=["order_id", "amount", "payment_method"])
+        payments = pd.DataFrame(columns=["order_id", "amount", "payment_method", "onnuri_approval_code"])
     else:
-        for col in ("order_id", "amount", "payment_method"):
+        for col in ("order_id", "amount", "payment_method", "onnuri_approval_code"):
             if col not in payments.columns:
-                payments[col] = "" if col == "payment_method" else 0
+                payments[col] = "" if col in ("payment_method", "onnuri_approval_code") else 0
     todos_df = _get_todos_for_display(db_filename)
     if "display_sales_amount" not in orders.columns:
         orders["display_sales_amount"] = 0
@@ -11849,9 +11877,9 @@ def render_dashboard():
                 today_pmt = pmt[pmt["_date"] == today]
                 daily_receipt_total = float(today_pmt["amount"].fillna(0).sum()) if len(today_pmt) else 0.0
                 if len(today_pmt) > 0:
-                    if "payment_method" in today_pmt.columns:
+                    if "payment_method" in today_pmt.columns or "onnuri_approval_code" in today_pmt.columns:
                         _g_recv = (
-                            today_pmt.groupby(today_pmt["payment_method"].fillna("미지정").astype(str))["amount"]
+                            today_pmt.groupby(_kpi_receipt_method_label_series(today_pmt), sort=False)["amount"]
                             .sum()
                             .sort_values(ascending=False)
                         )
@@ -11867,9 +11895,9 @@ def render_dashboard():
                         )
                 cumulative_sales = float(month_pmt["amount"].fillna(0).sum()) if len(month_pmt) > 0 else 0.0
                 if len(month_pmt) > 0:
-                    if "payment_method" in month_pmt.columns:
+                    if "payment_method" in month_pmt.columns or "onnuri_approval_code" in month_pmt.columns:
                         _g_month_recv = (
-                            month_pmt.groupby(month_pmt["payment_method"].fillna("미지정").astype(str))["amount"]
+                            month_pmt.groupby(_kpi_receipt_method_label_series(month_pmt), sort=False)["amount"]
                             .sum()
                             .sort_values(ascending=False)
                         )
