@@ -11985,8 +11985,6 @@ def render_dashboard():
     )
     _proj_sub = f"일평균 {expected_total_sales/_days_elapsed:,.0f}원 × {_days_in_month}일" if _days_elapsed > 0 and expected_total_sales > 0 else ""
 
-    _expected_contract_note_text = "sales 순액 기준(취소·감액·계약조정 반영)"
-
     if payments.empty or "payment_date" not in payments.columns:
         daily_receipt_total = 0.0
         daily_receipt_methods_html = '<div class="kpi-daily-recv-empty">결제일(payment_date) 없음</div>'
@@ -12206,9 +12204,6 @@ def render_dashboard():
               <div class="kpi-label">📈 누적매출 (월)</div>
               <div class="kpi-value">{expected_total_sales:,.0f}원</div>
               <div class="kpi-sub">{month_start.strftime("%m/%d")} ~ 오늘</div>
-              <div class="kpi-detail-stack">
-                <span class="kpi-sub2">{html.escape(_expected_contract_note_text)}</span>
-              </div>
             </td>
             <td class="kpi-td-daily-receipt">
               <div class="kpi-label">💳 일일 수납액<span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
