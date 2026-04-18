@@ -11816,6 +11816,8 @@ def render_dashboard():
     # ---------- 1. 주요 매출 항목 (5대 핵심 KPI) ----------
     st.subheader("1. 주요 매출 항목")
     daily_sales = 0.0
+    daily_pay_count = 0  # 당일 결제 건수(payment_date 기준 행 수)
+    daily_margin_pct = 0.0  # 당일 결제에 연결된 주문들의 원가 대비 마진율(참고)
     cumulative_sales = 0.0
     today_pay_neg_sum = 0.0  # 당일 음수 결제(상계·취소·감액 분개) 합 — 일 수납 순액에 포함됨
     month_pay_neg_sum = 0.0
@@ -11845,6 +11847,27 @@ def render_dashboard():
                 today_pmt = pmt[pmt["_date"] == today]
                 month_pmt = pmt[(pmt["_date"] >= month_start) & (pmt["_date"] <= today)]
                 daily_sales = float(today_pmt["amount"].fillna(0).sum()) if len(today_pmt) > 0 else 0.0
+                daily_pay_count = int(len(today_pmt))
+                if daily_pay_count and "order_id" in today_pmt.columns and not orders.empty:
+                    try:
+                        _oid_pay_today = (
+                            pd.to_numeric(today_pmt["order_id"], errors="coerce").dropna().astype(int).unique().tolist()
+                        )
+                        if _oid_pay_today:
+                            _ord_sub = orders[orders["id"].isin(_oid_pay_today)]
+                            if not _ord_sub.empty and "total_amount" in _ord_sub.columns:
+                                _d_tot = float(_ord_sub["total_amount"].fillna(0).astype(float).sum())
+                                _d_cost = (
+                                    float(_ord_sub["cost_price"].fillna(0).astype(float).sum())
+                                    if "cost_price" in _ord_sub.columns
+                                    else 0.0
+                                )
+                                if "display_cost_amount" in _ord_sub.columns:
+                                    _d_cost += float(_ord_sub["display_cost_amount"].fillna(0).astype(float).sum())
+                                if _d_tot > 0:
+                                    daily_margin_pct = (_d_tot - _d_cost) / _d_tot * 100.0
+                    except Exception:
+                        pass
                 cumulative_sales = float(month_pmt["amount"].fillna(0).sum()) if len(month_pmt) > 0 else 0.0
                 _neg_today = today_pmt[today_pmt["amount"].astype(float) < 0]
                 _neg_month = month_pmt[month_pmt["amount"].astype(float) < 0]
@@ -11943,11 +11966,23 @@ def render_dashboard():
             else ""
         )
 
+    _wd_kr_dash = ("월", "화", "수", "목", "금", "토", "일")
+    _dash_daily_date_title = f"{today.year}.{today.month:02d}.{today.day:02d} ({_wd_kr_dash[today.weekday()]})"
+    if payments.empty or "payment_date" not in payments.columns:
+        _recv_daily_compact = "결제일 데이터 없음 — 건수·마진은 참고용으로 표시되지 않을 수 있습니다."
+    else:
+        _recv_daily_compact = (
+            f"상계(음수 결제) {today_pay_neg_sum:,.0f}원이 합산에 포함됩니다."
+            if today_pay_neg_sum != 0
+            else "취소·감액이 반영된 순액입니다."
+        )
+
     st.markdown(
         textwrap.dedent(f"""
         <style>
         .kpi-table {{
             width: 100%;
+            table-layout: fixed;
             border-collapse: separate;
             border-spacing: 8px 0;
             margin-bottom: 0.5rem;
@@ -11955,10 +11990,46 @@ def render_dashboard():
         .kpi-table td {{
             background: #f8f9fa;
             border-radius: 10px;
-            padding: 14px 16px;
+            padding: 12px 10px;
             text-align: center;
             vertical-align: top;
             width: 14.2%;
+        }}
+        .kpi-td-daily-sales {{
+            width: 17%;
+            min-width: 150px;
+        }}
+        .kpi-date-pill {{
+            display: inline-block;
+            font-size: 0.6rem;
+            font-weight: 700;
+            color: #37474f;
+            background: linear-gradient(180deg, #eceff1, #dfe3e6);
+            padding: 2px 8px;
+            border-radius: 999px;
+            margin-left: 5px;
+            vertical-align: middle;
+            letter-spacing: 0.02em;
+        }}
+        .kpi-value-daily {{
+            font-size: 1.22rem;
+            font-weight: 800;
+            color: #1a1a2e;
+            line-height: 1.15;
+            margin-top: 4px;
+        }}
+        .kpi-daily-meta {{
+            font-size: 0.74rem;
+            color: #263238;
+            font-weight: 600;
+            margin-top: 6px;
+            line-height: 1.4;
+        }}
+        .kpi-daily-foot {{
+            font-size: 0.6rem;
+            color: #78909c;
+            margin-top: 7px;
+            line-height: 1.35;
         }}
         .kpi-table td.highlight {{
             background: linear-gradient(135deg, #fff3e0, #ffe0b2);
@@ -12028,15 +12099,11 @@ def render_dashboard():
                 <span class="kpi-sub2">{html.escape(_expected_contract_note_text)}</span>
               </div>
             </td>
-            <td>
-              <div class="kpi-label">📥 일일 수납액</div>
-              <div class="kpi-value">{daily_sales:,.0f}원</div>
-              <div class="kpi-detail-stack">
-                <span class="kpi-sub">{html.escape(_recv_daily_line1)}</span>
-                <span class="kpi-sub2" style="{'display:none;' if not _recv_daily_line2 else ''}">{html.escape(_recv_daily_line2)}</span>
-                <span class="kpi-sub2" style="{'display:none;' if not _recv_daily_line3 else ''}">{html.escape(_recv_daily_line3)}</span>
-                <span class="kpi-sub2 kpi-sub-muted" style="{'display:none;' if not _recv_daily_hint else ''}">{html.escape(_recv_daily_hint)}</span>
-              </div>
+            <td class="kpi-td-daily-sales">
+              <div class="kpi-label">📥 일일 매출<span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
+              <div class="kpi-value-daily">{daily_sales:,.0f}원</div>
+              <div class="kpi-daily-meta">({daily_pay_count}건) · 마진율 {daily_margin_pct:.1f}%</div>
+              <div class="kpi-daily-foot">{html.escape(_recv_daily_compact)}</div>
             </td>
             <td>
               <div class="kpi-label">📊 누적 수납액 (월)</div>
