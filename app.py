@@ -11827,6 +11827,8 @@ def render_dashboard():
     # 당일 sales 테이블 기반 계약 신규/조정 분리
     today_sales_new = 0.0    # 오늘 신규 계약 (양수)
     today_sales_adj = 0.0    # 오늘 금액 수정 조정 (음수 or 양수)
+    daily_contract_txn_count = 0  # 당일 sales 원장 기준 주문 건수(고유 order_id)
+    daily_contract_margin_pct = 0.0  # 당일 원장에 등장한 주문들의 계약금·원가 기준 마진율(표시용)
     try:
         _ph_df_dash = load_payment_history_dashboard_cached(db_filename, month_start, today)
         ph_totals = _dashboard_cancel_reduce_totals_from_ph(_ph_df_dash, today, month_start, today)
@@ -11906,6 +11908,29 @@ def render_dashboard():
             if not _today_sd.empty:
                 today_sales_new = float(_today_sd[_today_sd["amount"] > 0]["amount"].sum())
                 today_sales_adj = float(_today_sd[_today_sd["amount"] < 0]["amount"].sum())
+                try:
+                    if "order_id" in _today_sd.columns:
+                        _oid_ct = (
+                            pd.to_numeric(_today_sd["order_id"], errors="coerce").dropna().astype(int).unique().tolist()
+                        )
+                        daily_contract_txn_count = len(_oid_ct) if _oid_ct else int(len(_today_sd))
+                        if _oid_ct and not orders.empty:
+                            _co_day = orders[orders["id"].isin(_oid_ct)]
+                            if not _co_day.empty and "total_amount" in _co_day.columns:
+                                _ct_tot = float(_co_day["total_amount"].fillna(0).astype(float).sum())
+                                _ct_cst = (
+                                    float(_co_day["cost_price"].fillna(0).astype(float).sum())
+                                    if "cost_price" in _co_day.columns
+                                    else 0.0
+                                )
+                                if "display_cost_amount" in _co_day.columns:
+                                    _ct_cst += float(_co_day["display_cost_amount"].fillna(0).astype(float).sum())
+                                if _ct_tot > 0:
+                                    daily_contract_margin_pct = (_ct_tot - _ct_cst) / _ct_tot * 100.0
+                    else:
+                        daily_contract_txn_count = int(len(_today_sd))
+                except Exception:
+                    daily_contract_txn_count = int(len(_today_sd))
     except Exception:
         pass
 
@@ -11922,15 +11947,7 @@ def render_dashboard():
     )
     _proj_sub = f"일평균 {expected_total_sales/_days_elapsed:,.0f}원 × {_days_in_month}일" if _days_elapsed > 0 and expected_total_sales > 0 else ""
 
-    # 일일 계약매출 보조 설명
-    _contract_sub = ""
-    if today_sales_adj < 0:
-        _contract_sub = f"신규 {today_sales_new:,.0f}원 / 차감 {today_sales_adj:,.0f}원"
-    elif today_sales_adj > 0:
-        _contract_sub = f"신규 {today_sales_new:,.0f}원 / 증액 +{today_sales_adj:,.0f}원"
-    _contract_extra_text = "※ sales 원장 순액: 취소·계약감액 등 음수 트랜잭션 반영" if today_sales_adj < 0 else ""
-    _contract_extra_style = "" if _contract_extra_text else "display:none;"
-
+    _contract_daily_foot = "sales 원장 · 당일 transaction_date(순액, 신규·조정 반영)"
     _expected_contract_note_text = "sales 순액 기준(취소·감액·계약조정 반영)"
 
     if payments.empty or "payment_date" not in payments.columns:
@@ -11995,9 +12012,20 @@ def render_dashboard():
             vertical-align: top;
             width: 14.2%;
         }}
+        .kpi-td-daily-contract {{
+            width: 17%;
+            min-width: 150px;
+        }}
         .kpi-td-daily-sales {{
             width: 17%;
             min-width: 150px;
+        }}
+        .kpi-value-daily-contract {{
+            font-size: 1.22rem;
+            font-weight: 800;
+            color: #e65100;
+            line-height: 1.15;
+            margin-top: 4px;
         }}
         .kpi-date-pill {{
             display: inline-block;
@@ -12083,13 +12111,11 @@ def render_dashboard():
         </style>
         <table class="kpi-table">
           <tr>
-            <td class="highlight">
-              <div class="kpi-label">🔴 일일 계약매출</div>
-              <div class="kpi-value contract">{today_sales_net:,.0f}원</div>
-              <div class="kpi-sub">{html.escape(_contract_sub)}</div>
-              <div class="kpi-detail-stack" style="{_contract_extra_style}">
-                <span class="kpi-sub2">{html.escape(_contract_extra_text)}</span>
-              </div>
+            <td class="highlight kpi-td-daily-contract">
+              <div class="kpi-label">📋 당일 계약<span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
+              <div class="kpi-value-daily-contract">{today_sales_net:,.0f}원</div>
+              <div class="kpi-daily-meta">({daily_contract_txn_count}건) · 마진율 {daily_contract_margin_pct:.1f}%</div>
+              <div class="kpi-daily-foot">{html.escape(_contract_daily_foot)}</div>
             </td>
             <td>
               <div class="kpi-label">📈 누적매출 (월)</div>
