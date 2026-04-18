@@ -12037,6 +12037,18 @@ def render_dashboard():
 
     today_sales_net = today_sales_new + today_sales_adj
 
+    # 당일 계약 마이너스 조정 표시용 HTML (조정분이 있을 때만)
+    if today_sales_adj < 0:
+        _contract_adj_html = (
+            f'<div class="kpi-contract-adj-row">'
+            f'<span class="kpi-contract-adj-positive">{today_sales_new:,.0f}원</span>'
+            f'<span class="kpi-contract-adj-op"> − </span>'
+            f'<span class="kpi-contract-adj-negative">{abs(today_sales_adj):,.0f}원</span>'
+            f'</div>'
+        )
+    else:
+        _contract_adj_html = ""
+
     # 일평균 기반 예상 월매출 계산
     # (이번 달 누적 계약매출 ÷ 경과일수) × 이번 달 총일수
     _days_elapsed = (today - month_start).days + 1  # 1일 ~ 오늘 포함
@@ -12100,6 +12112,28 @@ def render_dashboard():
         .kpi-td-daily-contract {{
             width: 15%;
             min-width: 138px;
+        }}
+        .kpi-contract-adj-row {{
+            margin-top: 6px;
+            font-size: 0.72rem;
+            color: #546e7a;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 2px;
+            flex-wrap: wrap;
+        }}
+        .kpi-contract-adj-positive {{
+            color: #1565c0;
+            font-weight: 600;
+        }}
+        .kpi-contract-adj-op {{
+            color: #78909c;
+            font-weight: 700;
+        }}
+        .kpi-contract-adj-negative {{
+            color: #c62828;
+            font-weight: 600;
         }}
         .kpi-td-daily-receipt {{
             width: 18%;
@@ -12262,6 +12296,7 @@ def render_dashboard():
               </div>
               <div class="kpi-value-daily-contract">{today_sales_net:,.0f}원</div>
               <div class="kpi-daily-meta">({daily_contract_txn_count}건) · 마진율 {daily_contract_margin_pct:.1f}%</div>
+              {_contract_adj_html}
             </td>
             <td>
               <div class="kpi-label">📈 누적매출 (월)</div>
