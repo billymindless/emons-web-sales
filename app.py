@@ -10686,7 +10686,84 @@ def render_customer_balance():
                                                     st.write(f"**미수금:** {current_balance:,.0f}원")
                                                 with col_right:
                                                     if float(prow["amount"] or 0) < 0:
-                                                        st.warning("⚠️ 회계 상계(취소) 처리를 위해 자동 생성된 마이너스 전표는 수정할 수 없습니다.")
+                                                        st.warning(
+                                                            "⚠️ 회계 상계(취소) 처리를 위해 자동 생성된 마이너스 전표는 수정할 수 없습니다. "
+                                                            "필요 시 아래에서 삭제할 수 있습니다."
+                                                        )
+                                                        st.divider()
+                                                        st.markdown("##### 🗑️ 마이너스(상계) 전표 삭제")
+                                                        st.caption(
+                                                            "상계 전표를 삭제하면 결제 합계에서 해당 상계분이 빠져 잔금·마진에 반영됩니다. "
+                                                            "원 양수 결제와의 짝이 맞는지 확인한 뒤 삭제하세요."
+                                                        )
+                                                        _neg_dd_confirm_key = f"pay_neg_del_confirm_{prow['id']}"
+                                                        st.checkbox(
+                                                            f"결제 ID {int(prow['id'])} (상계 {float(prow.get('amount') or 0):,.0f}원) 삭제 동의",
+                                                            key=_neg_dd_confirm_key,
+                                                        )
+                                                        if st.button(
+                                                            "🗑️ 상계 전표 삭제 실행",
+                                                            key=f"pay_neg_del_btn_{prow['id']}",
+                                                            type="secondary",
+                                                        ):
+                                                            if not st.session_state.get(_neg_dd_confirm_key):
+                                                                st.warning("삭제하려면 확인 체크박스를 먼저 선택해 주세요.")
+                                                            else:
+                                                                try:
+                                                                    _neg_amt = float(prow.get("amount") or 0)
+                                                                    _neg_pid = int(prow["id"])
+                                                                    _neg_paid_before, _neg_paid_after = 0.0, 0.0
+                                                                    _neg_cname = ""
+                                                                    if _supabase_orders_payments_available():
+                                                                        _neg_paid_before, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
+                                                                        _neg_cid = _get_order_customer_id_supabase(db_filename, _order_id_pay)
+                                                                        _neg_cname = _get_customer_name_supabase(db_filename, _neg_cid) if _neg_cid else ""
+                                                                        _neg_ok = _delete_payment_supabase(db_filename, _neg_pid)
+                                                                    else:
+                                                                        _neg_conn = get_tenant_conn(db_filename)
+                                                                        try:
+                                                                            _neg_conn.execute("DELETE FROM Payments WHERE id = ?", (_neg_pid,))
+                                                                            _neg_conn.commit()
+                                                                            _neg_ok = True
+                                                                        except Exception:
+                                                                            _neg_ok = False
+                                                                        finally:
+                                                                            _neg_conn.close()
+                                                                    if _neg_ok:
+                                                                        if _supabase_orders_payments_available():
+                                                                            _neg_paid_after, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
+                                                                            _recalc_order_actual_margin_supabase(db_filename, _order_id_pay)
+                                                                        _neg_old_bal = float(orders[orders["id"] == _order_id_pay]["balance"].iloc[0]) if not orders[orders["id"] == _order_id_pay].empty else 0.0
+                                                                        _neg_new_bal = _neg_old_bal + _neg_amt
+                                                                        _insert_payment_history(
+                                                                            None,
+                                                                            _order_id_pay,
+                                                                            _neg_cname,
+                                                                            "결제직접삭제",
+                                                                            {
+                                                                                "order_id": int(_order_id_pay),
+                                                                                "paid_total_before": _neg_paid_before,
+                                                                                "payment": {
+                                                                                    "payment_id": _neg_pid,
+                                                                                    "amount": _neg_amt,
+                                                                                    "method": prow.get("payment_method"),
+                                                                                },
+                                                                            },
+                                                                            {
+                                                                                "order_id": int(_order_id_pay),
+                                                                                "paid_total_after": _neg_paid_after,
+                                                                                "balance_after": _neg_new_bal,
+                                                                            },
+                                                                            "마이너스(상계) 전표 삭제",
+                                                                            db_filename=db_filename,
+                                                                        )
+                                                                        clear_data_cache()
+                                                                        st.success(f"✅ 상계 전표(결제 ID {_neg_pid}) 삭제 완료")
+                                                                        st.rerun()
+                                                                    else:
+                                                                        st.error("삭제 실패. 잠시 후 다시 시도해 주세요.")
+                                                                except Exception as _neg_e:
+                                                                    st.error(f"삭제 오류: {_neg_e}")
                                                     else:
                                                         # 결제 수단 변경
                                                         _cur_method = prow.get("payment_method") or PAYMENT_METHOD_OPTIONS[0]
@@ -11234,7 +11311,81 @@ def render_customer_balance():
                                                 st.write(f"**온누리승인번호:** {prow['onnuri_approval_code']}")
                                         with col_right:
                                             if _prow_amt < 0:
-                                                st.warning("⚠️ 자동 생성된 마이너스 상계 전표는 수정할 수 없습니다.")
+                                                st.warning(
+                                                    "⚠️ 자동 생성된 마이너스 상계 전표는 수정할 수 없습니다. 필요 시 아래에서 삭제할 수 있습니다."
+                                                )
+                                                st.divider()
+                                                st.markdown("##### 🗑️ 마이너스(상계) 전표 삭제")
+                                                st.caption(
+                                                    "상계 전표를 삭제하면 결제 합계에서 해당 상계분이 빠져 잔금·마진에 반영됩니다. "
+                                                    "원 양수 결제와의 짝이 맞는지 확인한 뒤 삭제하세요."
+                                                )
+                                                _op_neg_confirm = f"op_neg_del_confirm_{prow['id']}"
+                                                st.checkbox(
+                                                    f"결제 ID {int(prow['id'])} (상계 {_prow_amt:,.0f}원) 삭제 동의",
+                                                    key=_op_neg_confirm,
+                                                )
+                                                if st.button(
+                                                    "🗑️ 상계 전표 삭제 실행",
+                                                    key=f"op_neg_del_btn_{prow['id']}",
+                                                    type="secondary",
+                                                ):
+                                                    if not st.session_state.get(_op_neg_confirm):
+                                                        st.warning("삭제하려면 확인 체크박스를 먼저 선택해 주세요.")
+                                                    else:
+                                                        try:
+                                                            _op_neg_pid = int(prow["id"])
+                                                            _op_neg_paid_before, _op_neg_paid_after = 0.0, 0.0
+                                                            _op_neg_cname = ""
+                                                            if _supabase_orders_payments_available():
+                                                                _op_neg_paid_before, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
+                                                                _op_neg_cid = _get_order_customer_id_supabase(db_filename, _op_oid)
+                                                                _op_neg_cname = _get_customer_name_supabase(db_filename, _op_neg_cid) if _op_neg_cid else ""
+                                                                _op_neg_ok = _delete_payment_supabase(db_filename, _op_neg_pid)
+                                                            else:
+                                                                _op_neg_conn = get_tenant_conn(db_filename)
+                                                                try:
+                                                                    _op_neg_conn.execute("DELETE FROM Payments WHERE id = ?", (_op_neg_pid,))
+                                                                    _op_neg_conn.commit()
+                                                                    _op_neg_ok = True
+                                                                except Exception:
+                                                                    _op_neg_ok = False
+                                                                finally:
+                                                                    _op_neg_conn.close()
+                                                            if _op_neg_ok:
+                                                                if _supabase_orders_payments_available():
+                                                                    _op_neg_paid_after, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
+                                                                    _recalc_order_actual_margin_supabase(db_filename, _op_oid)
+                                                                _op_neg_new_bal = _op_balance + _prow_amt
+                                                                _insert_payment_history(
+                                                                    None,
+                                                                    _op_oid,
+                                                                    _op_neg_cname,
+                                                                    "결제직접삭제",
+                                                                    {
+                                                                        "order_id": int(_op_oid),
+                                                                        "paid_total_before": _op_neg_paid_before,
+                                                                        "payment": {
+                                                                            "payment_id": _op_neg_pid,
+                                                                            "amount": _prow_amt,
+                                                                            "method": _prow_method,
+                                                                        },
+                                                                    },
+                                                                    {
+                                                                        "order_id": int(_op_oid),
+                                                                        "paid_total_after": _op_neg_paid_after,
+                                                                        "balance_after": _op_neg_new_bal,
+                                                                    },
+                                                                    "마이너스(상계) 전표 삭제",
+                                                                    db_filename=db_filename,
+                                                                )
+                                                                clear_data_cache()
+                                                                st.success(f"✅ 상계 전표(결제 ID {_op_neg_pid}) 삭제 완료")
+                                                                st.rerun()
+                                                            else:
+                                                                st.error("삭제 실패. 잠시 후 다시 시도해 주세요.")
+                                                        except Exception as _op_neg_e:
+                                                            st.error(f"삭제 오류: {_op_neg_e}")
                                             else:
                                                 _cur_method_op = prow.get("payment_method") or PAYMENT_METHOD_OPTIONS[0]
                                                 _method_idx_op = PAYMENT_METHOD_OPTIONS.index(_cur_method_op) if _cur_method_op in PAYMENT_METHOD_OPTIONS else 0
