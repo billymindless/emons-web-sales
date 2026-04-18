@@ -5819,7 +5819,7 @@ def _superadmin_tab2_hr_store_employees():
     st.caption(
         "※ **매출 점수(70)·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
         "**현금수금 점수(10)·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-        "**마진 점수(12)·전시품 점수(8)**: 동 기간 sales를 주문 비율로 배분(경영 대시보드 월별 KPI와 동일)."
+        "**마진 점수(15)·전시품 점수(5)**: 동 기간 sales를 주문 비율로 배분(경영 대시보드 월별 KPI와 동일)."
     )
 
     # 3) 매출·마진·전시: sales transaction_date 구간 | 현금수금: payment_date·KPI 수납 버킷 (집계만)
@@ -5895,11 +5895,11 @@ def _superadmin_tab2_hr_store_employees():
     total_display = emp_df["display_sales"].sum() or 0
     total_kpi_receipt = emp_df["kpi_receipt"].sum() or 0
     emp_df["매출 점수(70)"] = (emp_df["revenue"] / total_revenue * 70).round(1) if total_revenue else 0.0
-    emp_df["마진 점수(12)"] = (emp_df["margin"] / total_margin * 12).round(1) if total_margin else 0.0
-    emp_df["전시품 점수(8)"] = (emp_df["display_sales"] / total_display * 8).round(1) if total_display else 0.0
+    emp_df["마진 점수(15)"] = (emp_df["margin"] / total_margin * 15).round(1) if total_margin else 0.0
+    emp_df["전시품 점수(5)"] = (emp_df["display_sales"] / total_display * 5).round(1) if total_display else 0.0
     emp_df["현금수금 점수(10)"] = (emp_df["kpi_receipt"] / total_kpi_receipt * 10).round(1) if total_kpi_receipt else 0.0
     emp_df["종합 점수"] = (
-        emp_df["매출 점수(70)"] + emp_df["마진 점수(12)"] + emp_df["전시품 점수(8)"] + emp_df["현금수금 점수(10)"]
+        emp_df["매출 점수(70)"] + emp_df["마진 점수(15)"] + emp_df["전시품 점수(5)"] + emp_df["현금수금 점수(10)"]
     ).round(1)
     emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
     emp_df["매출집계(순액)"] = emp_df["revenue"].round(0).astype(int)
@@ -5914,8 +5914,8 @@ def _superadmin_tab2_hr_store_employees():
         "마진액",
         "전시품 판매액",
         "매출 점수(70)",
-        "마진 점수(12)",
-        "전시품 점수(8)",
+        "마진 점수(15)",
+        "전시품 점수(5)",
         "현금수금 점수(10)",
         "종합 점수",
     ]
@@ -5935,8 +5935,8 @@ def _superadmin_tab2_hr_store_employees():
             "마진액": st.column_config.TextColumn("마진액", width="medium"),
             "전시품 판매액": st.column_config.TextColumn("전시품 판매액", width="small"),
             "매출 점수(70)": st.column_config.NumberColumn("매출(70)", format="%.1f", width="small"),
-            "마진 점수(12)": st.column_config.NumberColumn("마진(12)", format="%.1f", width="small"),
-            "전시품 점수(8)": st.column_config.NumberColumn("전시품(8)", format="%.1f", width="small"),
+            "마진 점수(15)": st.column_config.NumberColumn("마진(15)", format="%.1f", width="small"),
+            "전시품 점수(5)": st.column_config.NumberColumn("전시품(5)", format="%.1f", width="small"),
             "현금수금 점수(10)": st.column_config.NumberColumn("현금수금(10)", format="%.1f", width="small"),
             "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
         },
@@ -7968,14 +7968,14 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
     {
         "title": "월별 직원 평가(KPI) 종합 점수는 어떻게 나뉘나요?",
         "keywords": (
-            "KPI 직원 평가 매출 현금수금 마진 전시품 종합점수 배점 70 12 8 10 HR 대시보드 "
+            "KPI 직원 평가 매출 현금수금 마진 전시품 종합점수 배점 70 15 5 10 HR 대시보드 "
             "월별 판매 현황"
         ),
         "body": (
             "종합 점수는 **네 가지 합**으로 **100점 만점**입니다.\n\n"
             "- **매출 점수 70점**\n"
-            "- **마진 점수 12점**\n"
-            "- **전시품 판매 점수 8점**\n"
+            "- **마진 점수 15점**\n"
+            "- **전시품 판매 점수 5점**\n"
             "- **현금수금 점수 10점** (결제일 기준, 수수료 없는 수납: 이체·온누리·지역화폐·현금)\n\n"
             "**경영 대시보드**의 「3. 월별 직원 판매 현황 및 평가」와 "
             "**최고 관리자 → 매장별 직원 평가(HR)** 에서 같은 기준으로 집계합니다. "
@@ -11740,11 +11740,11 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                 total_display = emp_df["display_sales"].sum() or 0
                 total_kpi_receipt = emp_df["kpi_receipt"].sum() or 0
                 emp_df["매출 점수(70)"] = (emp_df["revenue"] / total_revenue * 70).round(1) if total_revenue else 0.0
-                emp_df["마진 점수(12)"] = (emp_df["margin"] / total_margin * 12).round(1) if total_margin else 0.0
-                emp_df["전시품 점수(8)"] = (emp_df["display_sales"] / total_display * 8).round(1) if total_display else 0.0
+                emp_df["마진 점수(15)"] = (emp_df["margin"] / total_margin * 15).round(1) if total_margin else 0.0
+                emp_df["전시품 점수(5)"] = (emp_df["display_sales"] / total_display * 5).round(1) if total_display else 0.0
                 emp_df["현금수금 점수(10)"] = (emp_df["kpi_receipt"] / total_kpi_receipt * 10).round(1) if total_kpi_receipt else 0.0
                 emp_df["종합 점수"] = (
-                    emp_df["매출 점수(70)"] + emp_df["마진 점수(12)"] + emp_df["전시품 점수(8)"] + emp_df["현금수금 점수(10)"]
+                    emp_df["매출 점수(70)"] + emp_df["마진 점수(15)"] + emp_df["전시품 점수(5)"] + emp_df["현금수금 점수(10)"]
                 ).round(1)
                 emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
                 emp_df["매출집계(순액)"] = emp_df["revenue"].round(0).astype(int)
@@ -11759,8 +11759,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                         "마진액",
                         "전시품 판매액",
                         "매출 점수(70)",
-                        "마진 점수(12)",
-                        "전시품 점수(8)",
+                        "마진 점수(15)",
+                        "전시품 점수(5)",
                         "현금수금 점수(10)",
                         "종합 점수",
                     ]
@@ -11778,14 +11778,14 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                         "마진액": st.column_config.TextColumn("마진액", width="medium"),
                         "전시품 판매액": st.column_config.TextColumn("전시품 판매액", width="small"),
                         "매출 점수(70)": st.column_config.NumberColumn("매출(70)", format="%.1f", width="small"),
-                        "마진 점수(12)": st.column_config.NumberColumn("마진(12)", format="%.1f", width="small"),
-                        "전시품 점수(8)": st.column_config.NumberColumn("전시품(8)", format="%.1f", width="small"),
+                        "마진 점수(15)": st.column_config.NumberColumn("마진(15)", format="%.1f", width="small"),
+                        "전시품 점수(5)": st.column_config.NumberColumn("전시품(5)", format="%.1f", width="small"),
                         "현금수금 점수(10)": st.column_config.NumberColumn("현금수금(10)", format="%.1f", width="small"),
                         "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
                     },
                 )
                 st.caption(
-                    "※ **종합 점수** = 매출 70 + 마진 12 + 전시품 8 + 현금수금 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
+                    "※ **종합 점수** = 매출 70 + 마진 15 + 전시품 5 + 현금수금 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
                     "**현금수금 점수(10)·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
                     "**마진·전시 점수**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영."
                 )
