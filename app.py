@@ -10844,17 +10844,44 @@ def render_customer_balance():
                                                             "결제 날짜 *",
                                                             key=_edit_date_key,
                                                         )
-                                                        _pay_amt_key = f"pay_edit_amt_{prow['id']}"
-                                                        if _pay_amt_key not in st.session_state:
-                                                            st.session_state[_pay_amt_key] = _format_number_comma(str(int(float(prow["amount"] or 0))))
-                                                        def _fmt_pay_edit_amt(_k=_pay_amt_key):
-                                                            st.session_state[_k] = _format_number_comma(st.session_state.get(_k, ""))
-                                                        st.text_input(
-                                                            "변경할 새 금액 (0이면 결제 취소)",
-                                                            key=_pay_amt_key,
-                                                            on_change=_fmt_pay_edit_amt,
+                                                        _old_amt_for_mode = int(float(prow["amount"] or 0))
+                                                        _pay_mode_key = f"pay_edit_mode_{prow['id']}"
+                                                        _pay_mode_prev_key = f"pay_edit_mode_prev_{prow['id']}"
+                                                        _pay_mode_cur = st.radio(
+                                                            "입력 방식",
+                                                            ["새 금액 입력", "증감액 입력 (+증액, -감액)"],
+                                                            key=_pay_mode_key,
+                                                            horizontal=True,
+                                                            help="새 금액: 변경 후 최종 금액 전체 입력. 증감액: 변경분만 입력 (예: -1,000,000)",
                                                         )
-                                                        new_amount = _parse_comma_to_int(st.session_state.get(_pay_amt_key, "0"))
+                                                        _is_delta_mode = (_pay_mode_cur == "증감액 입력 (+증액, -감액)")
+                                                        _pay_amt_key = f"pay_edit_amt_{prow['id']}"
+                                                        if st.session_state.get(_pay_mode_prev_key) != _pay_mode_cur:
+                                                            st.session_state[_pay_amt_key] = "0" if _is_delta_mode else _format_number_comma(str(_old_amt_for_mode))
+                                                            st.session_state[_pay_mode_prev_key] = _pay_mode_cur
+                                                        elif _pay_amt_key not in st.session_state:
+                                                            st.session_state[_pay_amt_key] = _format_number_comma(str(_old_amt_for_mode))
+                                                        if _is_delta_mode:
+                                                            st.text_input(
+                                                                "증감액 (예: -1,000,000 감액 / +500,000 증액 / 0 전액취소)",
+                                                                key=_pay_amt_key,
+                                                            )
+                                                            _delta_raw = str(st.session_state.get(_pay_amt_key, "0")).strip()
+                                                            _delta_sign = -1 if _delta_raw.startswith("-") else 1
+                                                            _delta_abs = int(re.sub(r"\D", "", _delta_raw) or "0")
+                                                            _delta_val = _delta_sign * _delta_abs
+                                                            new_amount = max(0, _old_amt_for_mode + _delta_val)
+                                                            st.caption(f"현재: **{_old_amt_for_mode:,}원** → 변경 후: **{new_amount:,}원**")
+                                                        else:
+                                                            def _fmt_pay_edit_amt(_k=_pay_amt_key):
+                                                                st.session_state[_k] = _format_number_comma(st.session_state.get(_k, ""))
+                                                            st.text_input(
+                                                                "변경할 새 금액 (0이면 결제 취소)",
+                                                                key=_pay_amt_key,
+                                                                on_change=_fmt_pay_edit_amt,
+                                                            )
+                                                            new_amount = _parse_comma_to_int(st.session_state.get(_pay_amt_key, "0"))
+                                                            st.caption(f"현재: **{_old_amt_for_mode:,}원** → 변경 후: **{new_amount:,}원**")
                                                         del_reason = st.text_input("결제 변경 사유 (필수, 5자 이상)", key=f"pay_del_reason_{prow['id']}", placeholder="예: 카드 취소 후 현금 결제")
                                                         receipt_upload = st.file_uploader(
                                                             "📷 취소/재결제 영수증 사진 업로드",
@@ -11442,13 +11469,40 @@ def render_customer_balance():
                                                 if _op_edit_date_key not in st.session_state:
                                                     st.session_state[_op_edit_date_key] = _op_cur_date_val
                                                 new_pay_date_op = st.date_input("결제 날짜 *", key=_op_edit_date_key)
+                                                _old_amt_op_for_mode = int(_prow_amt)
+                                                _op_mode_key = f"op_edit_mode_{prow['id']}"
+                                                _op_mode_prev_key = f"op_edit_mode_prev_{prow['id']}"
+                                                _op_mode_cur = st.radio(
+                                                    "입력 방식",
+                                                    ["새 금액 입력", "증감액 입력 (+증액, -감액)"],
+                                                    key=_op_mode_key,
+                                                    horizontal=True,
+                                                    help="새 금액: 변경 후 최종 금액 전체 입력. 증감액: 변경분만 입력 (예: -1,000,000)",
+                                                )
+                                                _is_op_delta_mode = (_op_mode_cur == "증감액 입력 (+증액, -감액)")
                                                 _op_amt_key = f"op_edit_amt_{prow['id']}"
-                                                if _op_amt_key not in st.session_state:
-                                                    st.session_state[_op_amt_key] = _format_number_comma(str(int(_prow_amt)))
-                                                def _fmt_op_amt(_k=_op_amt_key):
-                                                    st.session_state[_k] = _format_number_comma(st.session_state.get(_k, ""))
-                                                st.text_input("변경할 새 금액 (0이면 결제 취소)", key=_op_amt_key, on_change=_fmt_op_amt)
-                                                new_amount_op = _parse_comma_to_int(st.session_state.get(_op_amt_key, "0"))
+                                                if st.session_state.get(_op_mode_prev_key) != _op_mode_cur:
+                                                    st.session_state[_op_amt_key] = "0" if _is_op_delta_mode else _format_number_comma(str(_old_amt_op_for_mode))
+                                                    st.session_state[_op_mode_prev_key] = _op_mode_cur
+                                                elif _op_amt_key not in st.session_state:
+                                                    st.session_state[_op_amt_key] = _format_number_comma(str(_old_amt_op_for_mode))
+                                                if _is_op_delta_mode:
+                                                    st.text_input(
+                                                        "증감액 (예: -1,000,000 감액 / +500,000 증액 / 0 전액취소)",
+                                                        key=_op_amt_key,
+                                                    )
+                                                    _op_delta_raw = str(st.session_state.get(_op_amt_key, "0")).strip()
+                                                    _op_delta_sign = -1 if _op_delta_raw.startswith("-") else 1
+                                                    _op_delta_abs = int(re.sub(r"\D", "", _op_delta_raw) or "0")
+                                                    _op_delta_val = _op_delta_sign * _op_delta_abs
+                                                    new_amount_op = max(0, _old_amt_op_for_mode + _op_delta_val)
+                                                    st.caption(f"현재: **{_old_amt_op_for_mode:,}원** → 변경 후: **{new_amount_op:,}원**")
+                                                else:
+                                                    def _fmt_op_amt(_k=_op_amt_key):
+                                                        st.session_state[_k] = _format_number_comma(st.session_state.get(_k, ""))
+                                                    st.text_input("변경할 새 금액 (0이면 결제 취소)", key=_op_amt_key, on_change=_fmt_op_amt)
+                                                    new_amount_op = _parse_comma_to_int(st.session_state.get(_op_amt_key, "0"))
+                                                    st.caption(f"현재: **{_old_amt_op_for_mode:,}원** → 변경 후: **{new_amount_op:,}원**")
                                                 del_reason_op = st.text_input("결제 변경 사유 (필수, 5자 이상)", key=f"op_del_reason_{prow['id']}", placeholder="예: 온누리 취소 후 카드 결제")
                                                 if st.button("수정 완료", key=f"op_pay_edit_{prow['id']}", type="primary"):
                                                     if not del_reason_op or len(del_reason_op.strip()) < 5:
