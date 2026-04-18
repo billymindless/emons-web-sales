@@ -2410,49 +2410,58 @@ def _cached_store_aov_30d(db_filename: str) -> float:
 @st.cache_data(ttl=3600)
 def _cached_employee_monthly_max(db_filename: str, employee_names: str, year: int, month: int) -> float:
     """해당 매장·직원(들)·연월의 직원별 최고 주문 금액(당월). 성과 축하 개인 최고 기록 비교용. ttl=1시간."""
-    if not db_filename or not employee_names or not str(employee_names).strip():
-        return 0.0
-    month_start = date(year, month, 1)
-    from calendar import monthrange
-    month_end = date(year, month, monthrange(year, month)[1])
-    start_str = month_start.isoformat()
-    end_str = month_end.isoformat()
-    if _supabase_orders_payments_available():
-        df = _load_orders_supabase(db_filename, "id, order_date, total_amount, employee_names", limit=500)
-        if df.empty or "employee_names" not in df.columns:
-            return 0.0
-        df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
-        df = df.dropna(subset=["order_date"])
-        df["_dt"] = df["order_date"].dt.date
-        mask = (df["_dt"] >= month_start) & (df["_dt"] <= month_end)
-        subset = df.loc[mask]
-        names_set = set(n.strip() for n in str(employee_names).split(",") if n.strip())
-        max_val = 0.0
-        for _, row in subset.iterrows():
-            row_names = (row.get("employee_names") or "").split(",")
-            if any(n.strip() in names_set for n in row_names):
-                max_val = max(max_val, float(row.get("total_amount") or 0))
-        return max_val
-    conn = get_tenant_conn(db_filename)
-    if not conn:
-        return 0.0
     try:
-        df = pd.read_sql(
-            "SELECT order_date, total_amount, employee_names FROM Orders WHERE order_date >= ? AND order_date <= ?",
-            conn,
-            params=(start_str, end_str),
-        )
-        if df.empty or "employee_names" not in df.columns:
+        if not db_filename or not employee_names or not str(employee_names).strip():
             return 0.0
-        names_set = set(n.strip() for n in str(employee_names).split(",") if n.strip())
-        max_val = 0.0
-        for _, row in df.iterrows():
-            row_names = (str(row.get("employee_names") or "").split(","))
-            if any(n.strip() in names_set for n in row_names):
-                max_val = max(max_val, float(row.get("total_amount") or 0))
-        return max_val
-    finally:
-        conn.close()
+        month_start = date(year, month, 1)
+        from calendar import monthrange
+        month_end = date(year, month, monthrange(year, month)[1])
+        start_str = month_start.isoformat()
+        end_str = month_end.isoformat()
+        if _supabase_orders_payments_available():
+            df = _load_orders_supabase(db_filename, "id, order_date, total_amount, employee_names", limit=500)
+            if df.empty or "employee_names" not in df.columns:
+                return 0.0
+            df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+            df = df.dropna(subset=["order_date"])
+            df["_dt"] = df["order_date"].dt.date
+            mask = (df["_dt"] >= month_start) & (df["_dt"] <= month_end)
+            subset = df.loc[mask]
+            names_set = set(n.strip() for n in str(employee_names).split(",") if n.strip())
+            max_val = 0.0
+            for _, row in subset.iterrows():
+                row_names = str(row.get("employee_names") or "").split(",")
+                if any(n.strip() in names_set for n in row_names):
+                    try:
+                        max_val = max(max_val, float(row.get("total_amount") or 0))
+                    except (TypeError, ValueError):
+                        pass
+            return max_val
+        conn = get_tenant_conn(db_filename)
+        if not conn:
+            return 0.0
+        try:
+            df = pd.read_sql(
+                "SELECT order_date, total_amount, employee_names FROM Orders WHERE order_date >= ? AND order_date <= ?",
+                conn,
+                params=(start_str, end_str),
+            )
+            if df.empty or "employee_names" not in df.columns:
+                return 0.0
+            names_set = set(n.strip() for n in str(employee_names).split(",") if n.strip())
+            max_val = 0.0
+            for _, row in df.iterrows():
+                row_names = str(row.get("employee_names") or "").split(",")
+                if any(n.strip() in names_set for n in row_names):
+                    try:
+                        max_val = max(max_val, float(row.get("total_amount") or 0))
+                    except (TypeError, ValueError):
+                        pass
+            return max_val
+        finally:
+            conn.close()
+    except Exception:
+        return 0.0
 
 
 def _insert_order_supabase(db_filename: str, payload: dict) -> int | None:
