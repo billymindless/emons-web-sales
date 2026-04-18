@@ -12129,6 +12129,12 @@ def render_dashboard():
             vertical-align: middle;
             letter-spacing: 0.02em;
         }}
+        .kpi-contract-date-below {{
+            margin: 2px 0 6px 0;
+        }}
+        .kpi-contract-date-below .kpi-date-pill {{
+            margin-left: 0;
+        }}
         .kpi-daily-meta {{
             font-size: 0.74rem;
             color: #263238;
@@ -12189,7 +12195,10 @@ def render_dashboard():
         <table class="kpi-table">
           <tr>
             <td class="highlight kpi-td-daily-contract">
-              <div class="kpi-label">📋 당일 계약<span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
+              <div class="kpi-label">📋 당일 계약</div>
+              <div class="kpi-contract-date-below">
+                <span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span>
+              </div>
               <div class="kpi-value-daily-contract">{today_sales_net:,.0f}원</div>
               <div class="kpi-daily-meta">({daily_contract_txn_count}건) · 마진율 {daily_contract_margin_pct:.1f}%</div>
             </td>
