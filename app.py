@@ -12375,33 +12375,118 @@ def render_dashboard():
         _daily_emp_sd = _daily_emp_sd.dropna(subset=["transaction_date"])
         _daily_emp_today = _daily_emp_sd[_daily_emp_sd["transaction_date"].dt.date == today]
         if not _daily_emp_today.empty:
-            _daily_emp_df = _kpi_employee_totals_from_sales_slice(_daily_emp_today, orders)
-            if not _daily_emp_df.empty:
-                _daily_emp_df = _daily_emp_df[
-                    ~_daily_emp_df["employee"].map(_kpi_employee_names_cell_is_blank)
-                ].copy()
-            if not _daily_emp_df.empty:
-                _daily_emp_df["마진율(%)"] = _daily_emp_df.apply(
-                    lambda _r: round(_r["margin"] / _r["revenue"] * 100, 1) if _r["revenue"] != 0 else 0.0,
+            # 양수(판매) / 음수(상계) 분리
+            _daily_amt_num = pd.to_numeric(_daily_emp_today["amount"], errors="coerce").fillna(0)
+            _daily_pos = _daily_emp_today[_daily_amt_num > 0]
+            _daily_neg = _daily_emp_today[_daily_amt_num < 0]
+
+            # 직원별 순액·마진 집계 (마진율 계산 기준)
+            _df_net = _kpi_employee_totals_from_sales_slice(_daily_emp_today, orders)
+            # 직원별 양수(판매금액) 합계
+            _df_pos = (
+                _kpi_employee_totals_from_sales_slice(_daily_pos, orders)
+                if not _daily_pos.empty
+                else pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
+            )
+            # 직원별 음수(상계금액) 합계
+            _df_neg_agg = (
+                _kpi_employee_totals_from_sales_slice(_daily_neg, orders)
+                if not _daily_neg.empty
+                else pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
+            )
+
+            # 이름 없는 행 필터
+            def _daily2_filter_blank(df):
+                if df.empty or "employee" not in df.columns:
+                    return df
+                return df[~df["employee"].map(_kpi_employee_names_cell_is_blank)].copy()
+
+            _df_net = _daily2_filter_blank(_df_net)
+            _df_pos = _daily2_filter_blank(_df_pos)
+            _df_neg_agg = _daily2_filter_blank(_df_neg_agg)
+
+            if not _df_net.empty:
+                # 순액 기준 테이블
+                _merged = _df_net[["employee", "revenue", "margin"]].rename(
+                    columns={"revenue": "순액", "margin": "당일 마진액"}
+                ).copy()
+                # 양수(판매금액) 병합
+                if not _df_pos.empty:
+                    _merged = _merged.merge(
+                        _df_pos[["employee", "revenue"]].rename(columns={"revenue": "당일 판매금액"}),
+                        on="employee", how="left",
+                    )
+                else:
+                    _merged["당일 판매금액"] = 0.0
+                # 음수(상계금액) 병합
+                if not _df_neg_agg.empty:
+                    _merged = _merged.merge(
+                        _df_neg_agg[["employee", "revenue"]].rename(columns={"revenue": "상계금액"}),
+                        on="employee", how="left",
+                    )
+                else:
+                    _merged["상계금액"] = 0.0
+
+                if "당일 판매금액" not in _merged.columns:
+                    _merged["당일 판매금액"] = 0.0
+                if "상계금액" not in _merged.columns:
+                    _merged["상계금액"] = 0.0
+                _merged["당일 판매금액"] = _merged["당일 판매금액"].fillna(0.0)
+                _merged["상계금액"] = _merged["상계금액"].fillna(0.0)
+
+                _merged["마진율(%)"] = _merged.apply(
+                    lambda _r: round(_r["당일 마진액"] / _r["순액"] * 100, 1) if _r["순액"] != 0 else 0.0,
                     axis=1,
                 )
-                _daily_emp_df = _daily_emp_df.sort_values("revenue", ascending=False).reset_index(drop=True)
-                _daily_emp_display = _daily_emp_df.rename(
-                    columns={"employee": "직원명", "revenue": "당일 판매금액", "margin": "당일 마진액"}
-                )[["직원명", "당일 판매금액", "당일 마진액", "마진율(%)"]]
-                _daily_emp_display = _format_df_display(_daily_emp_display, ["당일 판매금액", "당일 마진액"])
-                st.dataframe(
-                    _daily_emp_display,
-                    use_container_width=True,
-                    column_config={
-                        "직원명": st.column_config.TextColumn("직원명", width="small"),
-                        "당일 판매금액": st.column_config.TextColumn("당일 판매금액", width="medium"),
-                        "당일 마진액": st.column_config.TextColumn("당일 마진액", width="medium"),
-                        "마진율(%)": st.column_config.NumberColumn("마진율(%)", format="%.1f%%", width="small"),
-                    },
+                _merged = _merged.sort_values("순액", ascending=False).reset_index(drop=True)
+
+                # 상계금액 열 유무 판단
+                _has_neg = (_merged["상계금액"] < 0).any()
+
+                if _has_neg:
+                    _disp = _merged[["employee", "당일 판매금액", "상계금액", "순액", "당일 마진액", "마진율(%)"]].rename(
+                        columns={"employee": "직원명"}
+                    )
+                    _money_cols = ["당일 판매금액", "상계금액", "순액", "당일 마진액"]
+                else:
+                    _disp = _merged[["employee", "순액", "당일 마진액", "마진율(%)"]].rename(
+                        columns={"employee": "직원명", "순액": "당일 판매금액"}
+                    )
+                    _money_cols = ["당일 판매금액", "당일 마진액"]
+
+                # 포맷 함수
+                def _daily2_fmt_krw(x):
+                    try:
+                        v = float(x)
+                        return f"{v:,.0f}원" if v != 0 else "-"
+                    except (TypeError, ValueError):
+                        return str(x)
+
+                def _daily2_fmt_pct(x):
+                    try:
+                        return f"{float(x):.1f}%"
+                    except (TypeError, ValueError):
+                        return str(x)
+
+                # 음수 빨간색 스타일 적용 (column 단위)
+                def _daily2_color_neg(col):
+                    return [
+                        "color: #d32f2f; font-weight: 600" if (isinstance(v, (int, float)) and v < 0) else ""
+                        for v in col
+                    ]
+
+                _fmt_dict = {c: _daily2_fmt_krw for c in _money_cols}
+                _fmt_dict["마진율(%)"] = _daily2_fmt_pct
+
+                _styler = (
+                    _disp.style
+                    .format(_fmt_dict)
+                    .apply(_daily2_color_neg, subset=_money_cols)
                 )
+                st.dataframe(_styler, use_container_width=True)
                 st.caption(
                     f"※ 기준일: {today.strftime('%Y-%m-%d')} · 판매일(transaction_date) 기준 · 복수 담당자 시 1/n 배분"
+                    + (" · 빨간색 = 마이너스(상계) 금액" if _has_neg else "")
                 )
             else:
                 st.info(f"오늘({today.strftime('%Y-%m-%d')}) 직원이 배정된 판매 데이터가 없습니다.")
