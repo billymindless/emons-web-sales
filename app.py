@@ -11682,7 +11682,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
 @st.fragment
 def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_filename: str):
     """월별 직원 판매 현황: 종합=매출70+마진20+전시10. 매출=sales 해당월 순액 1/n. 현금수금집계는 참고 열. 마진·전시=sales·주문 비율."""
-    st.subheader("3. 월별 직원 판매 현황 및 평가")
+    st.subheader("4. 월별 직원 판매 현황 및 평가")
     if not sales_df.empty and "transaction_date" in sales_df.columns:
         _kpi_sales = sales_df.copy()
         _kpi_sales["transaction_date"] = pd.to_datetime(_kpi_sales["transaction_date"], errors="coerce")
@@ -11801,7 +11801,7 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
 def _render_dashboard_todos_only(db_filename: str):
     """To-Do 섹션 fragment: 등록·완료·삭제 시 이 섹션만 rerun (전체 대시보드 재로딩 없음)."""
     todos_df = _get_todos_for_display(db_filename)
-    st.subheader("5. 직원 To-Do 리스트 (인수인계)")
+    st.subheader("6. 직원 To-Do 리스트 (인수인계)")
     if st.button("🔄 서버에서 새로고침", key="todo_refresh_btn_simple"):
         _invalidate_todos_local(db_filename)
         st.rerun()
@@ -12366,6 +12366,51 @@ def render_dashboard():
     )
 
     st.divider()
+
+    # ---------- 2. 직원별 일일 판매 금액 및 마진율 ----------
+    st.subheader("2. 직원별 일일 판매 금액 및 마진율")
+    if not sales_df.empty and "transaction_date" in sales_df.columns:
+        _daily_emp_sd = sales_df.copy()
+        _daily_emp_sd["transaction_date"] = pd.to_datetime(_daily_emp_sd["transaction_date"], errors="coerce")
+        _daily_emp_sd = _daily_emp_sd.dropna(subset=["transaction_date"])
+        _daily_emp_today = _daily_emp_sd[_daily_emp_sd["transaction_date"].dt.date == today]
+        if not _daily_emp_today.empty:
+            _daily_emp_df = _kpi_employee_totals_from_sales_slice(_daily_emp_today, orders)
+            if not _daily_emp_df.empty:
+                _daily_emp_df = _daily_emp_df[
+                    ~_daily_emp_df["employee"].map(_kpi_employee_names_cell_is_blank)
+                ].copy()
+            if not _daily_emp_df.empty:
+                _daily_emp_df["마진율(%)"] = _daily_emp_df.apply(
+                    lambda _r: round(_r["margin"] / _r["revenue"] * 100, 1) if _r["revenue"] != 0 else 0.0,
+                    axis=1,
+                )
+                _daily_emp_df = _daily_emp_df.sort_values("revenue", ascending=False).reset_index(drop=True)
+                _daily_emp_display = _daily_emp_df.rename(
+                    columns={"employee": "직원명", "revenue": "당일 판매금액", "margin": "당일 마진액"}
+                )[["직원명", "당일 판매금액", "당일 마진액", "마진율(%)"]]
+                _daily_emp_display = _format_df_display(_daily_emp_display, ["당일 판매금액", "당일 마진액"])
+                st.dataframe(
+                    _daily_emp_display,
+                    use_container_width=True,
+                    column_config={
+                        "직원명": st.column_config.TextColumn("직원명", width="small"),
+                        "당일 판매금액": st.column_config.TextColumn("당일 판매금액", width="medium"),
+                        "당일 마진액": st.column_config.TextColumn("당일 마진액", width="medium"),
+                        "마진율(%)": st.column_config.NumberColumn("마진율(%)", format="%.1f%%", width="small"),
+                    },
+                )
+                st.caption(
+                    f"※ 기준일: {today.strftime('%Y-%m-%d')} · 판매일(transaction_date) 기준 · 복수 담당자 시 1/n 배분"
+                )
+            else:
+                st.info(f"오늘({today.strftime('%Y-%m-%d')}) 직원이 배정된 판매 데이터가 없습니다.")
+        else:
+            st.info(f"오늘({today.strftime('%Y-%m-%d')}) 판매 데이터가 없습니다.")
+    else:
+        st.info("판매 데이터가 없습니다.")
+
+    st.divider()
     # 주문별 결제합계 - 이하 "잔금 불일치 경고" + "미수금 현황" 두 곳에서 공유
     _dash_pay_sum = (
         payments.groupby("order_id")["amount"].sum()
@@ -12398,8 +12443,8 @@ def render_dashboard():
                 except Exception as e:
                     st.error(f"보정 중 오류가 발생했습니다: {e}")
 
-    # ---------- 1. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
-    st.subheader("2. 미수금 고객 현황")
+    # ---------- 3. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
+    st.subheader("3. 미수금 고객 현황")
     if len(orders) > 0:
         pay_sum = _dash_pay_sum  # 위에서 이미 계산된 pay_sum 재사용
         orders = orders.copy()
@@ -12427,12 +12472,12 @@ def render_dashboard():
     else:
         st.info("아직 주문 데이터가 없습니다.")
 
-    # ---------- 3. 월별 직원 판매 현황 및 평가 (종합: 매출70+마진20+전시10, 현금수금집계는 참고 열) ----------
+    # ---------- 4. 월별 직원 판매 현황 및 평가 (종합: 매출70+마진20+전시10, 현금수금집계는 참고 열) ----------
     # @st.fragment로 분리: 연/월 selectbox 변경 시 이 섹션만 rerun
     _render_kpi_section(sales_df, orders, db_filename)
 
-    # ---------- 4. 관리자 통계: 기간별 총 계약 금액 / 총 미수금 ----------
-    st.subheader("4. 기간별 통계 (총 계약 금액 / 총 미수금)")
+    # ---------- 5. 관리자 통계: 기간별 총 계약 금액 / 총 미수금 ----------
+    st.subheader("5. 기간별 통계 (총 계약 금액 / 총 미수금)")
     if "stats_start" not in st.session_state:
         st.session_state["stats_start"] = today.replace(day=1)
     if "stats_end" not in st.session_state:
