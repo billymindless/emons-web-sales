@@ -978,6 +978,24 @@ def _format_number_comma(s):
     return f"{int(digits):,}"
 
 
+def _format_signed_number_comma(s):
+    """선행 + / - 는 유지하고 숫자 부분만 천 단위 콤마 (증감액 입력용)."""
+    if s is None:
+        return ""
+    raw = str(s).strip()
+    if raw == "":
+        return ""
+    sign = ""
+    body = raw
+    if body[0] in "+-":
+        sign = body[0]
+        body = body[1:].strip()
+    digits = re.sub(r"\D", "", body)
+    if not digits:
+        return sign
+    return sign + f"{int(digits):,}"
+
+
 def _parse_comma_to_int(s):
     """콤마 포함 문자열을 정수로 변환 (DB 저장·잔금 계산용)."""
     if s is None or s == "":
@@ -11514,9 +11532,12 @@ def render_customer_balance():
                                                 elif _op_amt_key not in st.session_state:
                                                     st.session_state[_op_amt_key] = _format_number_comma(str(_old_amt_op_for_mode))
                                                 if _is_op_delta_mode:
+                                                    def _fmt_op_delta(_k=_op_amt_key):
+                                                        st.session_state[_k] = _format_signed_number_comma(st.session_state.get(_k, ""))
                                                     st.text_input(
                                                         "증감액 (예: -1,000,000 감액 / +500,000 증액 / 0 전액취소)",
                                                         key=_op_amt_key,
+                                                        on_change=_fmt_op_delta,
                                                     )
                                                     _op_delta_raw = str(st.session_state.get(_op_amt_key, "0")).strip()
                                                     _op_delta_sign = -1 if _op_delta_raw.startswith("-") else 1
