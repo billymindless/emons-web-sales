@@ -9676,12 +9676,9 @@ def _customer_balance_payment_ui(
     else:
         st.session_state.pop(stage_key, None)
     reason_key = f"{key_prefix}_reason"
-    edit_reason = st.text_area("수정/취소 사유(필수, 5자 이상)", key=reason_key)
+    edit_reason = st.text_area("결제 메모(선택)", key=reason_key)
     if st.button("결제 등록", key=f"{key_prefix}_btn"):
         if add_amt_int > 0:
-            if not edit_reason or len(edit_reason.strip()) < 5:
-                st.warning("수정/취소 사유를 5자 이상 입력하세요.")
-                return
             # 온누리상품권 중복 검증: 오늘 날짜 + 승인번호 4자리 조합 (금액 제외)
             onnuri_code = None
             pay_date_str = add_pay_date.isoformat() if hasattr(add_pay_date, "isoformat") else _today_kst().isoformat()
