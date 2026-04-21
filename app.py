@@ -12388,8 +12388,71 @@ def render_dashboard():
 
     st.divider()
 
-    # ---------- 2. 직원별 일일 판매 금액 및 마진율 ----------
-    st.subheader("2. 직원별 일일 판매 금액 및 마진율")
+    # 주문별 결제합계 - 이하 "잔금 불일치 경고" + "미수금 현황" 두 곳에서 공유
+    _dash_pay_sum = (
+        payments.groupby("order_id")["amount"].sum()
+        if not payments.empty and "order_id" in payments.columns
+        else pd.Series(dtype=float)
+    )
+    # 잔금 불일치 경고: balance_status가 '완납'인데 실 계산상 잔금이 0이 아닌 건수
+    if len(orders) > 0 and "balance_status" in orders.columns:
+        warn_orders = orders.copy()
+        warn_orders["paid"] = warn_orders["id"].map(_dash_pay_sum).fillna(0)
+        warn_orders["real_balance"] = warn_orders["total_amount"] - warn_orders["paid"]
+        suspicious = warn_orders[(warn_orders["balance_status"] == "완납") & (warn_orders["real_balance"] != 0)]
+        if len(suspicious) > 0:
+            st.error(f"⚠️ 잔금 불일치 의심 건 {len(suspicious)}건 발생 (완납 표시이나 실 잔금이 0이 아님)")
+            with st.expander("📋 잔금 불일치 건 상세"):
+                disp = suspicious.merge(customers[["id", "name"]], left_on="customer_id", right_on="id", how="left", suffixes=("_order", "_cust"))
+                disp = disp.rename(columns={"id_order": "주문ID", "name": "고객명", "total_amount": "총액", "paid": "결제합계", "real_balance": "실잔금", "balance_status": "표시상태"})
+                show_df = disp[["주문ID", "고객명", "총액", "결제합계", "실잔금", "표시상태"]].copy()
+                for col in ("총액", "결제합계", "실잔금"):
+                    show_df[col] = show_df[col].apply(_fmt_num)
+                st.dataframe(show_df, use_container_width=True)
+                st.caption("결제 금액을 수정하려면 **고객 및 잔금 관리** → 고객 선택 → **결제 내역 조회 및 취소** / **잔금 추가 결제**에서 해당 주문을 수정하세요.")
+            if st.button("🔄 잔금 상태 자동 보정 (결제 합계 기준으로 완납/미납 다시 계산)", key="dashboard_balance_fix_btn"):
+                try:
+                    for oid in suspicious["id"].tolist():
+                        _recalc_order_actual_margin_supabase(db_filename, int(oid))
+                    clear_data_cache()
+                    st.toast(f"✅ {len(suspicious)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"보정 중 오류가 발생했습니다: {e}")
+
+    # ---------- 2. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
+    st.subheader("2. 미수금 고객 현황")
+    if len(orders) > 0:
+        pay_sum = _dash_pay_sum  # 위에서 이미 계산된 pay_sum 재사용
+        orders = orders.copy()
+        orders["paid"] = orders["id"].map(pay_sum).fillna(0)
+        orders["balance"] = orders["total_amount"] - orders["paid"]
+        orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
+        orders_with_cust = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
+        orders_with_cust = orders_with_cust.rename(columns={"name": "고객명", "phone1": "전화번호", "delivery_date": "배송일", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
+        # 배송일이 오늘 기준 10일 이내로 남았거나 이미 지난 경우 (delivery_date <= today+10)
+        cutoff = today + timedelta(days=10)
+        mask_date = orders_with_cust["배송일"].dt.date <= cutoff if pd.api.types.is_datetime64_any_dtype(orders_with_cust["배송일"]) else False
+        mask_balance = orders_with_cust["잔금"] > 0
+        unpaid_list = orders_with_cust.loc[mask_balance & (orders_with_cust["배송일"].notna())]
+        if pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
+            unpaid_list = unpaid_list[unpaid_list["배송일"].dt.date <= cutoff]
+        display_cols = ["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]
+        unpaid_list = unpaid_list[["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]].copy()
+        if len(unpaid_list) > 0 and pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
+            unpaid_list["배송일"] = unpaid_list["배송일"].dt.strftime("%Y-%m-%d")
+        if len(unpaid_list) > 0:
+            unpaid_display = _format_df_display(unpaid_list, ["잔금"])
+            st.dataframe(unpaid_display, use_container_width=True)
+        else:
+            st.info("해당 조건의 미수금 고객이 없습니다. (배송일 10일 이내·잔금 있음)")
+    else:
+        st.info("아직 주문 데이터가 없습니다.")
+
+    st.divider()
+
+    # ---------- 3. 직원별 일일 판매 금액 및 마진율 ----------
+    st.subheader("3. 직원별 일일 판매 금액 및 마진율")
     if not sales_df.empty and "transaction_date" in sales_df.columns:
         _daily_emp_sd = sales_df.copy()
         _daily_emp_sd["transaction_date"] = pd.to_datetime(_daily_emp_sd["transaction_date"], errors="coerce")
@@ -12515,68 +12578,6 @@ def render_dashboard():
             st.info(f"오늘({today.strftime('%Y-%m-%d')}) 판매 데이터가 없습니다.")
     else:
         st.info("판매 데이터가 없습니다.")
-
-    st.divider()
-    # 주문별 결제합계 - 이하 "잔금 불일치 경고" + "미수금 현황" 두 곳에서 공유
-    _dash_pay_sum = (
-        payments.groupby("order_id")["amount"].sum()
-        if not payments.empty and "order_id" in payments.columns
-        else pd.Series(dtype=float)
-    )
-    # 잔금 불일치 경고: balance_status가 '완납'인데 실 계산상 잔금이 0이 아닌 건수
-    if len(orders) > 0 and "balance_status" in orders.columns:
-        warn_orders = orders.copy()
-        warn_orders["paid"] = warn_orders["id"].map(_dash_pay_sum).fillna(0)
-        warn_orders["real_balance"] = warn_orders["total_amount"] - warn_orders["paid"]
-        suspicious = warn_orders[(warn_orders["balance_status"] == "완납") & (warn_orders["real_balance"] != 0)]
-        if len(suspicious) > 0:
-            st.error(f"⚠️ 잔금 불일치 의심 건 {len(suspicious)}건 발생 (완납 표시이나 실 잔금이 0이 아님)")
-            with st.expander("📋 잔금 불일치 건 상세"):
-                disp = suspicious.merge(customers[["id", "name"]], left_on="customer_id", right_on="id", how="left", suffixes=("_order", "_cust"))
-                disp = disp.rename(columns={"id_order": "주문ID", "name": "고객명", "total_amount": "총액", "paid": "결제합계", "real_balance": "실잔금", "balance_status": "표시상태"})
-                show_df = disp[["주문ID", "고객명", "총액", "결제합계", "실잔금", "표시상태"]].copy()
-                for col in ("총액", "결제합계", "실잔금"):
-                    show_df[col] = show_df[col].apply(_fmt_num)
-                st.dataframe(show_df, use_container_width=True)
-                st.caption("결제 금액을 수정하려면 **고객 및 잔금 관리** → 고객 선택 → **결제 내역 조회 및 취소** / **잔금 추가 결제**에서 해당 주문을 수정하세요.")
-            if st.button("🔄 잔금 상태 자동 보정 (결제 합계 기준으로 완납/미납 다시 계산)", key="dashboard_balance_fix_btn"):
-                try:
-                    for oid in suspicious["id"].tolist():
-                        _recalc_order_actual_margin_supabase(db_filename, int(oid))
-                    clear_data_cache()
-                    st.toast(f"✅ {len(suspicious)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"보정 중 오류가 발생했습니다: {e}")
-
-    # ---------- 3. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
-    st.subheader("3. 미수금 고객 현황")
-    if len(orders) > 0:
-        pay_sum = _dash_pay_sum  # 위에서 이미 계산된 pay_sum 재사용
-        orders = orders.copy()
-        orders["paid"] = orders["id"].map(pay_sum).fillna(0)
-        orders["balance"] = orders["total_amount"] - orders["paid"]
-        orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
-        orders_with_cust = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
-        orders_with_cust = orders_with_cust.rename(columns={"name": "고객명", "phone1": "전화번호", "delivery_date": "배송일", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
-        # 배송일이 오늘 기준 10일 이내로 남았거나 이미 지난 경우 (delivery_date <= today+10)
-        cutoff = today + timedelta(days=10)
-        mask_date = orders_with_cust["배송일"].dt.date <= cutoff if pd.api.types.is_datetime64_any_dtype(orders_with_cust["배송일"]) else False
-        mask_balance = orders_with_cust["잔금"] > 0
-        unpaid_list = orders_with_cust.loc[mask_balance & (orders_with_cust["배송일"].notna())]
-        if pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
-            unpaid_list = unpaid_list[unpaid_list["배송일"].dt.date <= cutoff]
-        display_cols = ["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]
-        unpaid_list = unpaid_list[["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]].copy()
-        if len(unpaid_list) > 0 and pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
-            unpaid_list["배송일"] = unpaid_list["배송일"].dt.strftime("%Y-%m-%d")
-        if len(unpaid_list) > 0:
-            unpaid_display = _format_df_display(unpaid_list, ["잔금"])
-            st.dataframe(unpaid_display, use_container_width=True)
-        else:
-            st.info("해당 조건의 미수금 고객이 없습니다. (배송일 10일 이내·잔금 있음)")
-    else:
-        st.info("아직 주문 데이터가 없습니다.")
 
     # ---------- 4. 월별 직원 판매 현황 및 평가 (종합: 매출70+마진20+전시10, 현금수금집계는 참고 열) ----------
     # @st.fragment로 분리: 연/월 selectbox 변경 시 이 섹션만 rerun
