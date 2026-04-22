@@ -131,9 +131,24 @@ def _inject_mobile_css():
             /* 표 영역 패딩 최소화, 가로 스크롤 */
             [data-testid="stDataFrame"] { padding: 0 2px !important; overflow-x: auto !important; }
             [data-testid="stDataFrame"] > div { margin: 0 !important; max-width: 100vw !important; }
-            /* 탭 가로 스크롤 */
+            /* 탭 가로 스크롤: Streamlit DOM 구조 변경에 대비해 여러 선택자로 잡음 */
+            [data-testid="stTabs"] { overflow: visible !important; }
+            [data-testid="stTabs"] > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
             [data-testid="stTabs"] > div > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
-            [data-testid="stTabs"] [role="tablist"] { flex-wrap: nowrap !important; }
+            [data-testid="stTabs"] [role="tablist"] {
+                flex-wrap: nowrap !important;
+                overflow-x: auto !important;
+                -webkit-overflow-scrolling: touch !important;
+                padding-left: 0 !important;
+                margin-left: 0 !important;
+            }
+            /* 탭 버튼 최소 너비: 텍스트 잘림 방지 */
+            [data-testid="stTabs"] [role="tab"] {
+                flex-shrink: 0 !important;
+                min-width: max-content !important;
+                padding: 0.4rem 0.6rem !important;
+                font-size: 0.85rem !important;
+            }
             .mobile-menu-hint { display: block !important; }
             /* 터치 친화: 버튼·입력창 최소 높이 */
             button[kind="primary"], button[kind="secondary"], .stButton > button { min-height: 44px !important; padding: 0.5rem 0.75rem !important; font-size: 1rem !important; }
@@ -12744,11 +12759,22 @@ def main():
             background-color: white;
             padding: 1rem 1rem 0 1rem;
             box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.1);
+            /* 탭 목록이 fixed 컨테이너 안에서 잘리지 않도록 */
+            overflow: visible !important;
         }
         /* 사이드바(PC)가 열려 있을 때 본문과 정렬 */
         @media (min-width: 768px) {
             .sticky-header {
                 left: 21rem; /* 사이드바 너비만큼 밀어줌 */
+            }
+        }
+        /* 모바일: sticky-header 좌우 패딩 최소화하여 탭 좌측 잘림 방지 */
+        @media (max-width: 767px) {
+            .sticky-header {
+                left: 0 !important;
+                right: 0 !important;
+                padding: 0.5rem 0.25rem 0 0.25rem !important;
+                overflow-x: visible !important;
             }
         }
         /* 본문이 헤더에 가려지지 않도록 상단 패딩 추가 */
