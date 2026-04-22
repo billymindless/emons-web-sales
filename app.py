@@ -67,6 +67,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
     page_icon=_ICON_PATH if os.path.exists(_ICON_PATH) else "🪑",
+    menu_items={
+        "Get Help": None,
+        "Report a bug": None,
+        "About": "**momo** — 에몬스 울산전시장\n\nⓒ 2025 에몬스 울산전시장. All rights reserved.",
+    },
 )
 
 
@@ -139,6 +144,61 @@ def _inject_mobile_css():
         }
         /* 지도 말풍선 공통 */
         .leaflet-popup-content .map-popup { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _inject_branding_css():
+    """Streamlit 기본 로고·footer·툴바·햄버거 메뉴 숨김 + 네이비 블루 브랜딩 CSS 주입.
+    버튼·링크·강조색은 네이비 블루(#1B3A6B)로 통일.
+    배경색 등 기존 레이아웃은 유지."""
+    st.markdown(
+        """
+        <style>
+        /* ── Streamlit 기본 UI 요소 숨김 ── */
+        /* 우상단 햄버거(⋮) 메뉴 */
+        #MainMenu { visibility: hidden !important; }
+        /* 하단 "Made with Streamlit" 푸터 */
+        footer { visibility: hidden !important; }
+        /* 상단 Streamlit 로고/워터마크 영역 */
+        header[data-testid="stHeader"] { background: transparent !important; }
+        [data-testid="stDecoration"] { display: none !important; }
+        /* 배포 툴바(Share/Edit/Running...) 숨김 */
+        [data-testid="stToolbar"] { display: none !important; }
+        /* 앱 상단 좁은 Streamlit 컬러 바(빨강·주황·초록) */
+        .stApp > header::before { display: none !important; }
+
+        /* ── 네이비 블루 브랜딩 ── */
+        /* 기본 버튼 */
+        .stButton > button[kind="primary"],
+        .stButton > button[data-testid="baseButton-primary"] {
+            background-color: #1B3A6B !important;
+            border-color: #1B3A6B !important;
+            color: #ffffff !important;
+        }
+        .stButton > button[kind="primary"]:hover,
+        .stButton > button[data-testid="baseButton-primary"]:hover {
+            background-color: #142d55 !important;
+            border-color: #142d55 !important;
+        }
+        /* 링크 컬러 */
+        a { color: #1B3A6B !important; }
+        a:hover { color: #142d55 !important; }
+        /* 탭 선택 언더라인 */
+        [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+            border-bottom-color: #1B3A6B !important;
+            color: #1B3A6B !important;
+        }
+        /* 진행 표시줄 */
+        .stProgress > div > div > div { background-color: #1B3A6B !important; }
+        /* 슬라이더 */
+        [data-testid="stSlider"] [role="slider"] { background-color: #1B3A6B !important; }
+        /* 체크박스·라디오 강조 */
+        [data-testid="stCheckbox"] svg, [data-testid="stRadio"] svg {
+            fill: #1B3A6B !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -12648,6 +12708,7 @@ def main():
     ensure_session()
     _inject_mobile_css()
     _inject_favicon()
+    _inject_branding_css()
 
     # 전역 Sticky Header 스타일 주입: 상단 메뉴/탭 고정 및 본문 패딩 조정
     st.markdown(

@@ -1,0 +1,9 @@
+[theme]
+# momo — 에몬스 울산전시장 브랜드 테마 (네이비 블루)
+primaryColor = "#1B3A6B"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showSidebarNavigation = false
