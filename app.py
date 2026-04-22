@@ -4357,7 +4357,7 @@ CREATE POLICY "allow_all_app_payment_history" ON app_payment_history FOR ALL USI
         return ["" for _ in row]
 
     display_cols = [c for c in ["log_id", "changed_at", "customer_name", "action_type", "reason", "입력자", "sale_id"] if c in df_f.columns]
-    st.dataframe(df_f[display_cols].style.apply(_highlight_cancel, axis=1), use_container_width=True)
+    st.dataframe(df_f[display_cols].style.apply(_highlight_cancel, axis=1), width='stretch')
 
     # 상세 내역 (old/new payment data) expander
     with st.expander("📋 결제 변경 상세 내역"):
@@ -5168,7 +5168,7 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig1 = px.pie(region_sales, values="total_amount", names="region", title="① 지역별 매출 분포 (Pie Chart)")
             fig1.update_traces(textposition="inside", textinfo="percent+label", hovertemplate="%{label}<br>매출: %{value:,.0f}원<br>비중: %{percent}<extra></extra>")
             fig1.update_layout(margin=dict(t=40, b=20, l=20, r=20), height=320)
-            st.plotly_chart(fig1, use_container_width=True)
+            st.plotly_chart(fig1, width='stretch')
 
     with c2:
         visit_counts = merged["visit_reason"].fillna("미기입").value_counts().reset_index()
@@ -5180,7 +5180,7 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig2 = go.Figure(data=[go.Pie(labels=visit_counts["visit_reason"], values=visit_counts["count"], hole=0.5, textinfo="percent+label")])
             fig2.update_traces(hovertemplate="%{label}<br>건수: %{value:,}건<extra></extra>")
             fig2.update_layout(title="② 방문 경로 분석", margin=dict(t=40, b=20, l=20, r=20), height=320, showlegend=True)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
     with c1:
         purchase_sales = merged.groupby("purchase_reason", as_index=False)["total_amount"].sum()
@@ -5193,7 +5193,7 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig3 = px.bar(purchase_sales, x="total_amount", y="purchase_reason", orientation="h", title="③ 구매 이유별 총 판매 금액")
             fig3.update_traces(hovertemplate="%{y}<br>총액: %{x:,.0f}원<extra></extra>")
             fig3.update_layout(margin=dict(t=40, b=20, l=20, r=20), height=320, xaxis_title="총 판매 금액(원)", yaxis_title="")
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width='stretch')
 
     with c2:
         cats = merged["category"].fillna("").str.split(",").explode()
@@ -5208,7 +5208,7 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig4 = px.bar(cat_counts, x="count", y="category", orientation="h", title="④ 카테고리별 인기 품목(판매 횟수)")
             fig4.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
             fig4.update_layout(margin=dict(t=40, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(fig4, width='stretch')
 
 
 # 지도 기본 중심/줌 (한국)
@@ -5447,7 +5447,7 @@ def _render_marketing_multi_period_comparison(
             fig_a1 = px.bar(vc_a, x="count", y="visit_reason", orientation="h", title="방문 경로별 고객 수")
             fig_a1.update_traces(hovertemplate="%{y}<br>건수: %{x:,}건<extra></extra>")
             fig_a1.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, yaxis_title="", xaxis_title="건수")
-            st.plotly_chart(fig_a1, use_container_width=True, key=f"{key_prefix}_visit_route_a")
+            st.plotly_chart(fig_a1, width='stretch', key=f"{key_prefix}_visit_route_a")
     with c2:
         st.caption(f"기간 B: {label_b}")
         vc_b = df_period_b["visit_reason"].fillna("미기입").value_counts().reset_index()
@@ -5458,7 +5458,7 @@ def _render_marketing_multi_period_comparison(
             fig_b1 = px.bar(vc_b, x="count", y="visit_reason", orientation="h", title="방문 경로별 고객 수")
             fig_b1.update_traces(hovertemplate="%{y}<br>건수: %{x:,}건<extra></extra>")
             fig_b1.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, yaxis_title="", xaxis_title="건수")
-            st.plotly_chart(fig_b1, use_container_width=True, key=f"{key_prefix}_visit_route_b")
+            st.plotly_chart(fig_b1, width='stretch', key=f"{key_prefix}_visit_route_b")
 
     # ---------- ② 구매 이유별 총판매금액: 세로형 막대, y축 콤마 포맷 ----------
     st.subheader("② 구매 이유별 총판매금액")
@@ -5475,7 +5475,7 @@ def _render_marketing_multi_period_comparison(
             fig_a2.update_traces(hovertemplate="%{x}<br>총액: %{y:,.0f}원<extra></extra>")
             fig_a2.update_layout(margin=dict(t=30, b=80, l=20, r=20), height=320, xaxis_title="", yaxis_title="총 판매금액(원)", xaxis_tickangle=-45)
             fig_a2.update_yaxes(tickformat=",", title="총 판매금액(원)")
-            st.plotly_chart(fig_a2, use_container_width=True, key=f"{key_prefix}_purchase_reason_a")
+            st.plotly_chart(fig_a2, width='stretch', key=f"{key_prefix}_purchase_reason_a")
     with c2:
         st.caption(f"기간 B: {label_b}")
         pr_b = df_period_b.groupby("purchase_reason", as_index=False)["total_amount"].sum()
@@ -5488,7 +5488,7 @@ def _render_marketing_multi_period_comparison(
             fig_b2.update_traces(hovertemplate="%{x}<br>총액: %{y:,.0f}원<extra></extra>")
             fig_b2.update_layout(margin=dict(t=30, b=80, l=20, r=20), height=320, xaxis_title="", yaxis_title="총 판매금액(원)", xaxis_tickangle=-45)
             fig_b2.update_yaxes(tickformat=",", title="총 판매금액(원)")
-            st.plotly_chart(fig_b2, use_container_width=True, key=f"{key_prefix}_purchase_reason_b")
+            st.plotly_chart(fig_b2, width='stretch', key=f"{key_prefix}_purchase_reason_b")
 
     # ---------- ③ 카테고리별 인기 품목 Top 10: 가로형 막대 또는 DataFrame ----------
     st.subheader("③ 카테고리별 인기 품목 (Top 10)")
@@ -5506,8 +5506,8 @@ def _render_marketing_multi_period_comparison(
             fig_a3 = px.bar(cat_a, x="판매건수", y="품목", orientation="h", title="품목별 판매 횟수 Top 10")
             fig_a3.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
             fig_a3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig_a3, use_container_width=True, key=f"{key_prefix}_category_top10_a")
-            st.dataframe(cat_a[["순위", "품목", "판매건수"]], use_container_width=True, key=f"{key_prefix}_category_df_a", height=min(280, 50 + len(cat_a) * 32))
+            st.plotly_chart(fig_a3, width='stretch', key=f"{key_prefix}_category_top10_a")
+            st.dataframe(cat_a[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_a", height=min(280, 50 + len(cat_a) * 32))
     with c2:
         st.caption(f"기간 B: {label_b}")
         cats_b = df_period_b["category"].fillna("").str.split(",").explode().str.strip()
@@ -5521,8 +5521,8 @@ def _render_marketing_multi_period_comparison(
             fig_b3 = px.bar(cat_b, x="판매건수", y="품목", orientation="h", title="품목별 판매 횟수 Top 10")
             fig_b3.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
             fig_b3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig_b3, use_container_width=True, key=f"{key_prefix}_category_top10_b")
-            st.dataframe(cat_b[["순위", "품목", "판매건수"]], use_container_width=True, key=f"{key_prefix}_category_df_b", height=min(280, 50 + len(cat_b) * 32))
+            st.plotly_chart(fig_b3, width='stretch', key=f"{key_prefix}_category_top10_b")
+            st.dataframe(cat_b[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_b", height=min(280, 50 + len(cat_b) * 32))
 
     # ---------- ④ 지역별 매출 분포 지도 (Folium 좌우 비교) ----------
     st.subheader("④ 지역별 매출 분포 지도")
@@ -5775,7 +5775,7 @@ def _superadmin_tab1_integrated_dashboard():
     rank_df = pd.DataFrame(rows).sort_values("이번 달 판매금액", ascending=False).reset_index(drop=True)
     rank_df["순위"] = range(1, len(rank_df) + 1)
     rank_display = _format_df_display(rank_df[["순위", "매장명", "이번 달 판매금액", "미수금 합계"]], ["이번 달 판매금액", "미수금 합계"])
-    st.dataframe(rank_display, use_container_width=True)
+    st.dataframe(rank_display, width='stretch')
 
 
 def _superadmin_tab2_hr_store_employees():
@@ -6005,7 +6005,7 @@ def _superadmin_tab2_hr_store_employees():
     )
     st.dataframe(
         display_fmt,
-        use_container_width=True,
+        width='stretch',
         column_config={
             "직원명": st.column_config.TextColumn("직원명", width="small"),
             "매출집계(순액)": st.column_config.TextColumn("매출집계(순액)", width="medium"),
@@ -6031,7 +6031,7 @@ def _superadmin_tab2_hr_store_employees():
             .rename(columns={"store": "매장명", "employee": "직원명", "kpi_receipt": "현금수금집계합"})
         )
         store_emp["현금수금집계합"] = store_emp["현금수금집계합"].round(0).astype(int)
-        st.dataframe(_format_df_display(store_emp, ["현금수금집계합"]), use_container_width=True)
+        st.dataframe(_format_df_display(store_emp, ["현금수금집계합"]), width='stretch')
 
     # 5) 엑셀 다운로드 (직원 통합표 + 통합모드 시 매장별 보조표)
     dl_buf = io.BytesIO()
@@ -6290,7 +6290,7 @@ def _superadmin_tab_unpaid_report():
         return
     out_df = pd.DataFrame(rows)
     display_df = _format_df_display(out_df, ["총판매금액", "미수금액(잔금)"])
-    st.dataframe(display_df, use_container_width=True)
+    st.dataframe(display_df, width='stretch')
     csv_content = out_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "미수금 레포트 CSV 다운로드",
@@ -6781,7 +6781,7 @@ def render_monthly_payment_report(is_superadmin: bool):
         pivot = pivot.astype(int)
 
         display_df = pivot.map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
-        st.dataframe(display_df, use_container_width=True)
+        st.dataframe(display_df, width='stretch')
 
         with st.expander("📒 매출 원장·마진 기여 내역 (감액·증액 대비)", expanded=False):
             st.caption(
@@ -6797,7 +6797,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                 for _c in ("매출변동액", "마진기여액"):
                     if _c in _sm_m_disp.columns:
                         _sm_m_disp[_c] = _sm_m_disp[_c].apply(lambda x: f"{int(x):,}원")
-                st.dataframe(_sm_m_disp, use_container_width=True, hide_index=True)
+                st.dataframe(_sm_m_disp, width='stretch', hide_index=True)
                 st.write("**행별 상세**")
                 _sm_d_disp = sales_margin_excel_df.copy()
                 for _c in ("매출변동액", "주문총액", "주문실마진", "마진기여액"):
@@ -6808,7 +6808,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                 else:
                     _sm_cols = ["거래일자", "거래월", "원본주문ID", "고객명", "매출변동액", "주문총액", "주문실마진", "마진기여액", "비고", "담당직원"]
                 _sm_d_disp = _sm_d_disp[[c for c in _sm_cols if c in _sm_d_disp.columns]]
-                st.dataframe(_sm_d_disp, use_container_width=True, hide_index=True)
+                st.dataframe(_sm_d_disp, width='stretch', hide_index=True)
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -6917,7 +6917,7 @@ def render_monthly_payment_report(is_superadmin: bool):
                 # 금액 포맷
                 _audit_show["금액"] = _audit_show["금액"].map(lambda x: f"{x:,}" if isinstance(x, (int, float)) else str(x))
 
-                st.dataframe(_audit_show, use_container_width=True, hide_index=True)
+                st.dataframe(_audit_show, width='stretch', hide_index=True)
 
                 # 엑셀 다운로드 (감사 내역) — 고객명 포함
                 _abuf = io.BytesIO()
@@ -7160,7 +7160,7 @@ def render_monthly_payment_report(is_superadmin: bool):
             disp_inline = detail_inline.copy()
             disp_inline["판매금액"] = disp_inline["판매금액"].apply(lambda x: f"{x:,}원")
             disp_inline["판매건수"] = disp_inline["판매건수"].apply(lambda x: f"{x:g}건")
-            st.dataframe(disp_inline, use_container_width=True)
+            st.dataframe(disp_inline, width='stretch')
             st.caption("※ transaction_date(판매/변경 시점) 기준. 증액/감액 delta도 포함됩니다.")
         else:
             # 3-b. 8일 이상: 요약 테이블 표시 + 상세는 다운로드 안내
@@ -7168,7 +7168,7 @@ def render_monthly_payment_report(is_superadmin: bool):
             disp_df["판매금액"] = disp_df["판매금액"].apply(lambda x: f"{x:,}원")
             disp_df["판매건수"] = disp_df["판매건수"].apply(lambda x: f"{x:g}건")
             st.write("📌 **실적 요약**")
-            st.dataframe(disp_df, use_container_width=True)
+            st.dataframe(disp_df, width='stretch')
             st.caption("※ transaction_date(판매/변경 시점) 기준. 증액/감액 delta도 포함됩니다.")
             st.info("📥 이 이상의 데이터는 다운로드 시 상세내역에서 확인가능 (고객명·전화번호·결제수단 포함)")
 
@@ -7807,7 +7807,7 @@ def render_employee_management():
     else:
         df_display = df_display[["id", "email", "사용자명", "권한", "배정매장"]]
         df_display.columns = ["ID", "이메일", "사용자명", "권한", "배정 매장"]
-    st.dataframe(df_display, use_container_width=True)
+    st.dataframe(df_display, width='stretch')
 
 
 CONFIRM_DATA_RESET_PHRASE = "데이터를 모두 초기화합니다"
@@ -8912,7 +8912,7 @@ def render_new_sales():
             "✏️ 신규 고객으로 등록",
             key="btn_new_cust_mode",
             type="secondary" if _panel_open else "primary",
-            use_container_width=True,
+            width='stretch',
         ):
             st.session_state["_cust_search_panel_open"] = False
             for _k in ["_new_sales_selected_customer", "_cust_search_results",
@@ -8924,7 +8924,7 @@ def render_new_sales():
             "🔍 기존 고객 검색",
             key="btn_open_cust_search",
             type="primary" if _panel_open else "secondary",
-            use_container_width=True,
+            width='stretch',
         ):
             st.session_state["_cust_search_panel_open"] = True
             st.rerun()
@@ -10000,7 +10000,7 @@ def render_customer_balance():
                     label_visibility="collapsed",
                 )
             with col_btn:
-                ct_pull_btn = st.button("채널톡 조회", key="ct_pull_btn", use_container_width=True)
+                ct_pull_btn = st.button("채널톡 조회", key="ct_pull_btn", width='stretch')
             if ct_pull_btn and ct_pull_phone and ct_pull_phone.strip():
                 if not ct_secrets_ok:
                     st.error("채널톡 API 키를 먼저 설정해 주세요.")
@@ -10063,7 +10063,7 @@ def render_customer_balance():
                     "status": "상태", "message": "메시지", "store_name": "매장명",
                     "db_filename": "저장DB", "customer_id": "고객ID"
                 })
-                st.dataframe(log_disp, use_container_width=True)
+                st.dataframe(log_disp, width='stretch')
             else:
                 st.info("아직 채널톡 웹훅 수신 로그가 없습니다. 웹훅 수신 서버를 설정하면 여기에 표시됩니다.")
             st.write("**채널톡으로 등록된 고객 (본 매장)**")
@@ -10083,7 +10083,7 @@ def render_customer_balance():
             except Exception:
                 ct_customers = pd.DataFrame()
             if len(ct_customers) > 0:
-                st.dataframe(ct_customers.rename(columns={"id": "ID", "name": "고객명", "phone1": "연락처1", "phone2": "연락처2", "address": "주소", "source": "가입경로"}), use_container_width=True)
+                st.dataframe(ct_customers.rename(columns={"id": "ID", "name": "고객명", "phone1": "연락처1", "phone2": "연락처2", "address": "주소", "source": "가입경로"}), width='stretch')
             else:
                 st.info("채널톡(또는 푸시)으로 등록된 고객이 없습니다.")
 
@@ -10196,11 +10196,11 @@ def render_customer_balance():
                         num_cols = [c for c in ["일반판매가", "전시판매가", "total_amount", "cost_price", "paid", "balance"] if c in orders.columns]
                         disp_df = orders[show_cols].copy()
                         disp_df = disp_df.rename(columns={"id": "주문ID", "order_date": "계약일", "delivery_date": "배송일"})
-                        st.dataframe(_format_df_display(disp_df, num_cols), use_container_width=True)
+                        st.dataframe(_format_df_display(disp_df, num_cols), width='stretch')
                     else:
                         num_cols = [c for c in ["cost_price", "total_amount", "paid", "balance"] if c in orders.columns]
                         disp_df = orders.copy().rename(columns={"id": "주문ID", "order_date": "계약일", "delivery_date": "배송일"})
-                        st.dataframe(_format_df_display(disp_df, num_cols), use_container_width=True)
+                        st.dataframe(_format_df_display(disp_df, num_cols), width='stretch')
                     # 선택된 주문의 변경 이력 보기
                     with st.expander("선택 주문 변경 이력 보기"):
                         def _fmt_order_hist(oid):
@@ -10804,7 +10804,7 @@ def render_customer_balance():
                                         pay_display["amount"] = pay_display["amount"].apply(lambda x: f"{x:,.0f}원")
                                         pay_display["fee_amount"] = pay_display["fee_amount"].fillna(0).apply(lambda x: f"{x:,.0f}원")
                                         pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사", "fee_amount": "수수료"})
-                                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사", "수수료"]], use_container_width=True)
+                                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사", "수수료"]], width='stretch')
                                         for _, prow in pay_list.iterrows():
                                             with st.expander(f"결제 ID {prow['id']} — {prow['payment_method'] or '-'} {float(prow['amount'] or 0):,.0f}원"):
                                                 col_left, col_right = st.columns(2)
@@ -11344,7 +11344,7 @@ def render_customer_balance():
             if len(list_d10) > 0:
                 list_d10["배송일"] = list_d10["delivery_date"].dt.strftime("%Y-%m-%d") if pd.api.types.is_datetime64_any_dtype(list_d10["delivery_date"]) else list_d10["delivery_date"].astype(str)
                 df_d10 = list_d10[["name", "phone1", "배송일", "category", "employee_names", "balance"]].rename(columns={"name": "고객명", "phone1": "전화번호", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
-                st.dataframe(_format_df_display(df_d10, ["잔금"]), use_container_width=True)
+                st.dataframe(_format_df_display(df_d10, ["잔금"]), width='stretch')
                 for _, row in list_d10.iterrows():
                     with st.expander(f"💰 {row['name']} — 잔금 {row['balance']:,.0f}원"):
                         _customer_balance_payment_ui(db_filename, row["id"], row["balance"], key_prefix=f"d10_{row['id']}")
@@ -11371,7 +11371,7 @@ def render_customer_balance():
             if len(list_overdue) > 0:
                 list_overdue["배송일"] = list_overdue["delivery_date"].dt.strftime("%Y-%m-%d")
                 df_over = list_overdue[["name", "phone1", "배송일", "category", "employee_names", "balance"]].rename(columns={"name": "고객명", "phone1": "전화번호", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
-                st.dataframe(_format_df_display(df_over, ["잔금"]), use_container_width=True)
+                st.dataframe(_format_df_display(df_over, ["잔금"]), width='stretch')
                 for _, row in list_overdue.iterrows():
                     with st.expander(f"🚨 {row['name']} — 잔금 {row['balance']:,.0f}원 (배송일 지남)"):
                         _customer_balance_payment_ui(db_filename, row["id"], row["balance"], key_prefix=f"over_{row['id']}")
@@ -11410,7 +11410,7 @@ def render_customer_balance():
                         "employee_names": "담당자", "total_amount": "구매금액", "paid": "결제금액"
                     })
                     st.error(f"⛔ 총 {len(_overpaid_disp)}건, 초과결제 합계 {int(_overpaid_disp['초과금액'].sum()):,}원 — 즉시 확인 필요!")
-                    st.dataframe(_format_df_display(_overpaid_disp, ["구매금액", "결제금액", "초과금액"]), use_container_width=True)
+                    st.dataframe(_format_df_display(_overpaid_disp, ["구매금액", "결제금액", "초과금액"]), width='stretch')
                     st.markdown("---")
                     for _, _op_row in _overpaid.iterrows():
                         _op_oid = _op_row["id"]
@@ -11448,7 +11448,7 @@ def render_customer_balance():
                                 _op_pays_disp = _op_pays[_pay_detail_cols].rename(columns=_pay_col_rename).copy()
                                 _fmt_money_cols = [_pay_col_rename.get(c) for c in ("amount", "fee_amount") if _pay_col_rename.get(c) in _op_pays_disp.columns]
                                 st.caption("📋 현재 결제 내역 — 취소/감액할 건을 아래 수정 패널에서 선택하세요")
-                                st.dataframe(_format_df_display(_op_pays_disp, _fmt_money_cols), use_container_width=True)
+                                st.dataframe(_format_df_display(_op_pays_disp, _fmt_money_cols), width='stretch')
                                 st.markdown("---")
                                 # ── 각 결제건 수정 패널 (탭1과 동일 방식) ──
                                 for _, prow in _op_pays.iterrows():
@@ -11848,7 +11848,7 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                 )
                 st.dataframe(
                     display_fmt,
-                    use_container_width=True,
+                    width='stretch',
                     column_config={
                         "직원명": st.column_config.TextColumn("직원명", width="small"),
                         "매출집계(순액)": st.column_config.TextColumn("매출집계(순액)", width="medium"),
@@ -12465,7 +12465,7 @@ def render_dashboard():
                 show_df = disp[["주문ID", "고객명", "총액", "결제합계", "실잔금", "표시상태"]].copy()
                 for col in ("총액", "결제합계", "실잔금"):
                     show_df[col] = show_df[col].apply(_fmt_num)
-                st.dataframe(show_df, use_container_width=True)
+                st.dataframe(show_df, width='stretch')
                 st.caption("결제 금액을 수정하려면 **고객 및 잔금 관리** → 고객 선택 → **결제 내역 조회 및 취소** / **잔금 추가 결제**에서 해당 주문을 수정하세요.")
             if st.button("🔄 잔금 상태 자동 보정 (결제 합계 기준으로 완납/미납 다시 계산)", key="dashboard_balance_fix_btn"):
                 try:
@@ -12500,7 +12500,7 @@ def render_dashboard():
             unpaid_list["배송일"] = unpaid_list["배송일"].dt.strftime("%Y-%m-%d")
         if len(unpaid_list) > 0:
             unpaid_display = _format_df_display(unpaid_list, ["잔금"])
-            st.dataframe(unpaid_display, use_container_width=True)
+            st.dataframe(unpaid_display, width='stretch')
         else:
             st.info("해당 조건의 미수금 고객이 없습니다. (배송일 10일 이내·잔금 있음)")
     else:
@@ -12624,7 +12624,7 @@ def render_dashboard():
                     .format(_fmt_dict)
                     .apply(_daily2_color_neg, subset=_money_cols)
                 )
-                st.dataframe(_styler, use_container_width=True)
+                st.dataframe(_styler, width='stretch')
                 st.caption(
                     f"※ 기준일: {today.strftime('%Y-%m-%d')} · 판매일(transaction_date) 기준 · 복수 담당자 시 1/n 배분"
                     + (" · 빨간색 = 마이너스(상계) 금액" if _has_neg else "")
@@ -12801,7 +12801,7 @@ def main():
     """
     st.sidebar.markdown(clickable_logo_html, unsafe_allow_html=True)
     # 홈 버튼: 세션 상태만 초기화하고 rerun하여 로그아웃 없이 대시보드로 안전하게 복귀
-    if st.sidebar.button("🏠 첫 화면으로 (대시보드)", use_container_width=True, key="sidebar_home_btn"):
+    if st.sidebar.button("🏠 첫 화면으로 (대시보드)", width='stretch', key="sidebar_home_btn"):
         if "active_admin_page" in st.session_state:
             del st.session_state["active_admin_page"]
         st.rerun()
@@ -12857,19 +12857,19 @@ def main():
     st.sidebar.divider()
     # 관리자 전용: 결제 변경/취소 모니터링 화면 진입 버튼
     if role in ("store_admin", "superadmin"):
-        if st.sidebar.button("🚨 결제 변경/취소 모니터링", use_container_width=True):
+        if st.sidebar.button("🚨 결제 변경/취소 모니터링", width='stretch'):
             st.session_state["active_admin_page"] = "payment_monitor"
         _del_db = st.session_state.get("current_db")
         _pending_del_count = len(_fetch_pending_delete_requests(_del_db)) if _del_db else 0
         _del_btn_label = f"🗑️ 주문 삭제 요청 관리 ({_pending_del_count}건)" if _pending_del_count > 0 else "🗑️ 주문 삭제 요청 관리"
-        if st.sidebar.button(_del_btn_label, use_container_width=True):
+        if st.sidebar.button(_del_btn_label, width='stretch'):
             st.session_state["active_admin_page"] = "delete_requests"
     # 최고 관리자 전용: 직원 계정 관리 및 발령
     if role == "superadmin":
-        if st.sidebar.button("👥 직원 관리", use_container_width=True):
+        if st.sidebar.button("👥 직원 관리", width='stretch'):
             st.session_state["active_admin_page"] = "employee_management"
     st.sidebar.markdown("---")
-    if st.sidebar.button("🚪 로그아웃", use_container_width=True):
+    if st.sidebar.button("🚪 로그아웃", width='stretch'):
         try:
             client, _ = get_supabase_client()
             if client:
