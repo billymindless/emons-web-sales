@@ -184,25 +184,26 @@ def _inject_branding_css():
         #MainMenu { visibility: hidden !important; }
         /* 하단 "Made with Streamlit" 푸터 */
         footer { visibility: hidden !important; }
-        /* Streamlit 헤더: 완전 숨김 X — 사이드바 토글(☰)도 사라지기 때문.
-           배경·그림자만 제거하고 내부 브랜딩 텍스트/장식만 숨김 */
+        /* Streamlit 헤더: 배경만 투명화 (사이드바 토글 ☰ 유지) */
         header[data-testid="stHeader"] {
             background: transparent !important;
             box-shadow: none !important;
         }
         [data-testid="stDecoration"] { display: none !important; }
-        /* 배포 툴바(Share/Edit/Running...) 숨김 */
-        [data-testid="stToolbar"] { display: none !important; }
         /* 앱 상단 좁은 Streamlit 컬러 바(빨강·주황·초록) */
         .stApp > header::before { display: none !important; }
-        /* 헤더 내 페이지 타이틀 텍스트 숨김 (사이드바 토글 버튼은 유지) */
-        header[data-testid="stHeader"] [data-testid="stHeaderNoPadding"] { display: none !important; }
-        /* 모바일: 헤더 높이를 토글 버튼 크기에 맞게 최소화 */
-        @media (max-width: 767px) {
-            header[data-testid="stHeader"] {
-                height: 2.5rem !important;
-                min-height: 2.5rem !important;
-            }
+        /* 툴바는 유지하되 내부 Streamlit 고유 버튼(Deploy·Share 등)만 선택적으로 숨김
+           — 툴바 전체를 숨기면 사이드바 토글(☰)까지 같이 숨겨짐 */
+        [data-testid="stToolbar"] [data-testid="stDeployButton"] { display: none !important; }
+        [data-testid="stToolbar"] [data-testid="stStatusWidget"] { display: none !important; }
+        [data-testid="stToolbarActions"] { display: none !important; }
+        /* 사이드바 토글 버튼(☰)은 명시적으로 보이도록 */
+        [data-testid="stSidebarCollapsedControl"],
+        [data-testid="collapsedControl"] {
+            display: flex !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            z-index: 10000 !important;
         }
 
         /* ── 네이비 블루 브랜딩 ── */
