@@ -5119,7 +5119,30 @@ def get_latest_active_notice():
 
 
 def get_recent_notices(limit: int = 5):
-    """최근 공지사항 limit건 반환. (id, title, content, external_link, created_at)"""
+    """최근 공지사항 limit건 반환. (id, title, content, external_link, message, created_at).
+    1순위 Supabase app_notices (클라우드·로컬 공통 영구 저장). 실패·미생성 시 로컬 SQLite Notices fallback."""
+    # 1) Supabase 우선 조회
+    try:
+        client, err = get_supabase_client()
+        if client and not err:
+            r = (
+                client.table("app_notices")
+                .select("id, title, content, external_link, message, created_at")
+                .eq("is_active", True)
+                .order("created_at", desc=True)
+                .limit(int(limit))
+                .execute()
+            )
+            rows = r.data or []
+            if rows:
+                return pd.DataFrame(rows)
+            # Supabase 연결은 됐으나 공지 0건 → fallback 시도하지 않고 빈 DF 반환
+            return pd.DataFrame(columns=["id", "title", "content", "external_link", "message", "created_at"])
+    except Exception:
+        # app_notices 테이블 미생성 등: 로컬 fallback
+        pass
+
+    # 2) 로컬 SQLite fallback (개발 환경 또는 테이블 미생성 시)
     conn = get_master_conn()
     try:
         df = pd.read_sql(
@@ -6103,7 +6126,12 @@ def _superadmin_tab2_hr_store_employees():
 
 
 def _superadmin_tab3_notices():
-    """③ 전체 매장 공지사항 관리: 제목/내용/외부링크 등록·목록·삭제."""
+    """③ 전체 매장 공지사항 관리: 제목/내용/외부링크 등록·목록·삭제.
+    Supabase app_notices 우선 사용 (클라우드·로컬 공통). 미생성 시 안내 후 로컬 SQLite fallback."""
+    # Supabase 연결 확인
+    client, err = get_supabase_client()
+    _use_supabase = bool(client and not err)
+
     st.subheader("📢 공지사항 등록")
     with st.form("notice_add_form"):
         title = st.text_input("제목 *", placeholder="공지 제목을 입력하세요")
@@ -6111,32 +6139,79 @@ def _superadmin_tab3_notices():
         external_link = st.text_input("외부 링크(URL)", placeholder="유튜브, 회의록 등 URL (선택)")
         if st.form_submit_button("공지 등록"):
             if title and title.strip() and content and content.strip():
-                conn = get_master_conn()
-                conn.execute(
-                    "INSERT INTO Notices (title, content, external_link, message, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
-                    (title.strip(), content.strip(), (external_link.strip() or None), content.strip(), datetime.now(tz=KST).isoformat())
-                )
-                conn.commit()
-                conn.close()
-                st.success("등록되었습니다.")
-                st.rerun()
+                _inserted = False
+                if _use_supabase:
+                    try:
+                        client.table("app_notices").insert({
+                            "title": title.strip(),
+                            "content": content.strip(),
+                            "external_link": (external_link.strip() or None),
+                            "message": content.strip(),
+                            "is_active": True,
+                        }).execute()
+                        _inserted = True
+                    except Exception as e:
+                        _msg = str(e)
+                        if "app_notices" in _msg or "schema cache" in _msg:
+                            st.error("⚠️ **Supabase에 app_notices 테이블이 없습니다.** "
+                                     "Supabase 대시보드 → SQL Editor에서 **SUPABASE_APP_NOTICES.sql** 파일 내용을 실행해 주세요.")
+                        else:
+                            st.error(f"Supabase 등록 실패: {e}")
+                if not _inserted and not _use_supabase:
+                    # 로컬 fallback (Supabase 연결 자체가 안 될 때)
+                    try:
+                        conn = get_master_conn()
+                        conn.execute(
+                            "INSERT INTO Notices (title, content, external_link, message, is_active, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                            (title.strip(), content.strip(), (external_link.strip() or None), content.strip(), datetime.now(tz=KST).isoformat())
+                        )
+                        conn.commit()
+                        conn.close()
+                        _inserted = True
+                    except Exception as e:
+                        st.error(f"로컬 등록 실패: {e}")
+                if _inserted:
+                    st.success("등록되었습니다.")
+                    st.rerun()
             else:
                 st.warning("제목과 내용을 입력하세요.")
+
     st.subheader("공지사항 목록 (삭제)")
-    conn = get_master_conn()
-    try:
-        notices = pd.read_sql(
-            "SELECT id, title, content, external_link, created_at FROM Notices ORDER BY created_at DESC",
-            conn,
-        )
-    finally:
-        conn.close()
+    notices = pd.DataFrame()
+    _source = "local"
+    if _use_supabase:
+        try:
+            r = (
+                client.table("app_notices")
+                .select("id, title, content, external_link, message, created_at")
+                .order("created_at", desc=True)
+                .execute()
+            )
+            notices = pd.DataFrame(r.data or [])
+            _source = "supabase"
+        except Exception as e:
+            _msg = str(e)
+            if "app_notices" in _msg or "schema cache" in _msg:
+                st.warning("⚠️ Supabase app_notices 테이블 미생성 — 로컬 공지사항만 표시됩니다. "
+                           "영구 저장하려면 SQL Editor에서 **SUPABASE_APP_NOTICES.sql**을 실행하세요.")
+            else:
+                st.warning(f"Supabase 조회 실패 — 로컬 fallback: {e}")
+    if notices.empty and _source != "supabase":
+        conn = get_master_conn()
+        try:
+            notices = pd.read_sql(
+                "SELECT id, title, content, external_link, created_at FROM Notices ORDER BY created_at DESC",
+                conn,
+            )
+        finally:
+            conn.close()
     if len(notices) == 0:
         st.info("등록된 공지가 없습니다.")
         return
     for _, row in notices.iterrows():
         t = (row.get("title") or "").strip() or "(제목 없음)"
-        dt = (row.get("created_at") or "")[:10]
+        _created_raw = row.get("created_at") or ""
+        dt = str(_created_raw)[:10]
         with st.expander(f"📌 {dt} — {t}"):
             body = (row.get("content") or row.get("message") or "").strip()
             if body:
@@ -6151,11 +6226,24 @@ def _superadmin_tab3_notices():
                     unsafe_allow_html=True,
                 )
             if st.button("삭제", key=f"notice_del_{row['id']}"):
-                conn = get_master_conn()
-                conn.execute("DELETE FROM Notices WHERE id = ?", (row["id"],))
-                conn.commit()
-                conn.close()
-                st.rerun()
+                _deleted = False
+                if _source == "supabase" and _use_supabase:
+                    try:
+                        client.table("app_notices").delete().eq("id", int(row["id"])).execute()
+                        _deleted = True
+                    except Exception as e:
+                        st.error(f"Supabase 삭제 실패: {e}")
+                else:
+                    try:
+                        conn = get_master_conn()
+                        conn.execute("DELETE FROM Notices WHERE id = ?", (row["id"],))
+                        conn.commit()
+                        conn.close()
+                        _deleted = True
+                    except Exception as e:
+                        st.error(f"로컬 삭제 실패: {e}")
+                if _deleted:
+                    st.rerun()
 
 
 def _superadmin_tab4_backup_csv():
