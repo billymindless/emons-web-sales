@@ -159,6 +159,9 @@ def _inject_mobile_css():
             .mobile-menu-hint { display: block !important; }
             /* 터치 친화: 버튼·입력창 최소 높이 */
             button[kind="primary"], button[kind="secondary"], .stButton > button { min-height: 44px !important; padding: 0.5rem 0.75rem !important; font-size: 1rem !important; }
+            /* Plotly 차트 모바일 반응형: 좌우 여백 줄이고 높이 자동 조정 */
+            [data-testid="stPlotlyChart"] { margin: 0 !important; padding: 0 !important; width: 100% !important; }
+            [data-testid="stPlotlyChart"] > div { width: 100% !important; }
             .stTextInput > div > div > input, .stTextArea > div > div { min-height: 44px !important; font-size: 16px !important; }
             [data-testid="stSelectbox"] > div { min-height: 44px !important; }
             /* 지도 말풍선: 모바일 가독성 */
@@ -12533,6 +12536,124 @@ def render_dashboard():
                     st.rerun()
                 except Exception as e:
                     st.error(f"보정 중 오류가 발생했습니다: {e}")
+
+    # ---------- 1-2. 일별 매출 추이 (이번 달 vs 지난 달 꺾은선) ----------
+    # sales 원장 transaction_date·amount 기준으로 일별 집계 (기존 DB/로직 변경 없음, 표시 전용)
+    # - 지난 달 데이터가 없어도 에러 없이 이번 달만 표시
+    # - 모바일 반응형: plotly config use_container_width=True + 높이 320px
+    st.subheader("📈 일별 매출 추이 (이번 달 vs 지난 달)")
+    try:
+        if sales_df.empty or "transaction_date" not in sales_df.columns or "amount" not in sales_df.columns:
+            st.info("표시할 매출 데이터가 없습니다. 매출이 등록되면 일별 추이가 나타납니다.")
+        else:
+            _sdf = sales_df[["transaction_date", "amount"]].copy()
+            _sdf["transaction_date"] = pd.to_datetime(_sdf["transaction_date"], errors="coerce")
+            _sdf = _sdf.dropna(subset=["transaction_date"])
+            _sdf["amount"] = pd.to_numeric(_sdf["amount"], errors="coerce").fillna(0)
+            _sdf["_date"] = _sdf["transaction_date"].dt.date
+            _sdf["_day"] = _sdf["transaction_date"].dt.day
+            _sdf["_ym"] = _sdf["transaction_date"].dt.strftime("%Y-%m")
+
+            # 이번 달 / 지난 달 기간 계산
+            _this_ym = today.strftime("%Y-%m")
+            _last_month_end = month_start - timedelta(days=1)
+            _last_ym = _last_month_end.strftime("%Y-%m")
+            _last_month_days = _last_month_end.day
+
+            # 이번 달 일별 매출 (1일 ~ 오늘)
+            _this_m = _sdf[_sdf["_ym"] == _this_ym].groupby("_day")["amount"].sum()
+            _this_days = list(range(1, today.day + 1))
+            _this_values = [float(_this_m.get(d, 0)) for d in _this_days]
+            _this_sum = sum(_this_values)
+
+            # 지난 달 일별 매출 (1일 ~ 말일)
+            _last_m = _sdf[_sdf["_ym"] == _last_ym].groupby("_day")["amount"].sum()
+            _last_days = list(range(1, _last_month_days + 1))
+            _last_values = [float(_last_m.get(d, 0)) for d in _last_days]
+            _last_sum = sum(_last_values)
+            _has_last = any(v != 0 for v in _last_values)
+
+            # 동일 기간(이번달 1~오늘과 지난달 1~오늘일)까지의 지난달 누적 — 비교 요약용
+            _last_same_period_sum = sum(_last_values[:today.day]) if _has_last else 0.0
+
+            # 꺾은선 차트 생성 (plotly)
+            fig_daily = go.Figure()
+            # 지난 달 선 (흐린 색, 점선) — 데이터 있을 때만
+            if _has_last:
+                fig_daily.add_trace(go.Scatter(
+                    x=_last_days,
+                    y=_last_values,
+                    mode="lines+markers",
+                    name=f"지난 달 ({_last_ym})",
+                    line=dict(color="#B0BEC5", width=2, dash="dot"),
+                    marker=dict(size=5, color="#B0BEC5"),
+                    hovertemplate="%{x}일<br>%{y:,.0f}원<extra>지난 달</extra>",
+                ))
+            # 이번 달 선 (진한 네이비 블루)
+            fig_daily.add_trace(go.Scatter(
+                x=_this_days,
+                y=_this_values,
+                mode="lines+markers",
+                name=f"이번 달 ({_this_ym})",
+                line=dict(color="#1B3A6B", width=3),
+                marker=dict(size=7, color="#1B3A6B"),
+                hovertemplate="%{x}일<br>%{y:,.0f}원<extra>이번 달</extra>",
+            ))
+            fig_daily.update_layout(
+                height=320,
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis=dict(
+                    title="일(Day)",
+                    dtick=1 if _last_month_days <= 16 else 2,  # 모바일 가독성
+                    tickfont=dict(size=11),
+                    gridcolor="#EEEEEE",
+                ),
+                yaxis=dict(
+                    title="매출(원)",
+                    tickformat=",",
+                    tickfont=dict(size=11),
+                    gridcolor="#EEEEEE",
+                ),
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1,
+                    font=dict(size=11),
+                ),
+                plot_bgcolor="white",
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_daily, width='stretch', config={"displayModeBar": False})
+
+            # 비교 요약 카드 (모바일 친화: columns 자동 세로 배치)
+            _col_a, _col_b, _col_c = st.columns(3)
+            with _col_a:
+                st.metric("이번 달 누적", f"{_this_sum:,.0f}원")
+            with _col_b:
+                if _has_last:
+                    st.metric("지난 달 동기간", f"{_last_same_period_sum:,.0f}원")
+                else:
+                    st.metric("지난 달 동기간", "-")
+            with _col_c:
+                if _has_last and _last_same_period_sum > 0:
+                    _diff_pct = (_this_sum - _last_same_period_sum) / _last_same_period_sum * 100
+                    _delta_str = f"{_diff_pct:+.1f}%"
+                    st.metric("전월 대비", _delta_str, delta=f"{(_this_sum - _last_same_period_sum):,.0f}원")
+                elif not _has_last:
+                    st.metric("전월 대비", "비교 불가", help="지난 달 매출 데이터가 없어 비교할 수 없습니다.")
+                else:
+                    st.metric("전월 대비", "-")
+            if not _has_last:
+                st.caption("💡 지난 달 매출 데이터가 없어 이번 달만 표시됩니다.")
+            else:
+                st.caption(f"💡 이번 달 {today.day}일까지 vs 지난 달 같은 기간 비교. 지난 달 전체 누적: {_last_sum:,.0f}원")
+    except Exception as _e_daily_chart:
+        # 일별 매출 차트는 부가 표시용이므로 예외 발생 시에도 대시보드 전체가 중단되지 않도록 처리
+        st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_daily_chart}")
+
+    st.divider()
 
     # ---------- 2. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
     st.subheader("2. 미수금 고객 현황")
