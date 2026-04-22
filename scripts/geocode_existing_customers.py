@@ -6,10 +6,10 @@ app_customers 테이블에서 주소(address)는 있지만 위도/경도(latitud
 없는 고객을 찾아 카카오 API로 지오코딩 후 Supabase에 업데이트합니다.
 
 사용법:
-    python scripts/geocode_existing_customers.py \
-        --supabase-url https://xxxx.supabase.co \
-        --supabase-key anon-or-service-role-key \
-        --kakao-key YOUR_KAKAO_REST_KEY \
+    python scripts/geocode_existing_customers.py ^
+        --supabase-url https://xxxx.supabase.co ^
+        --supabase-key anon-or-service-role-key ^
+        --kakao-key YOUR_KAKAO_REST_KEY ^
         [--store 매장명]        # 특정 매장만 처리 (생략 시 전체)
         [--dry-run]             # 실제 업데이트 없이 결과만 미리 보기
         [--delay 0.15]          # API 호출 간격 (초, 기본 0.15초)
@@ -25,6 +25,14 @@ import sys
 import time
 import requests
 
+# Windows 터미널 한글 출력을 위한 인코딩 설정
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # supabase 패키지 import
 try:
     from supabase import create_client
@@ -33,11 +41,19 @@ except ImportError:
     sys.exit(1)
 
 
+def log(msg: str):
+    """한글 안전 출력."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("utf-8", errors="replace").decode("ascii", errors="replace"))
+
+
 # ─── 카카오 지오코딩 ───────────────────────────────────────────────────────────
 
 def geocode_kakao(address: str, kakao_key: str) -> dict | None:
     """
-    카카오 로컬 API로 주소 → 위도/경도 변환.
+    카카오 로컬 API로 주소 -> 위도/경도 변환.
     반환: {"latitude", "longitude", "address"} 또는 None.
     """
     if not address or not address.strip():
@@ -62,7 +78,7 @@ def geocode_kakao(address: str, kakao_key: str) -> dict | None:
             "address": d.get("address_name") or address.strip(),
         }
     except Exception as e:
-        print(f"  [지오코딩 오류] {address!r}: {e}")
+        log(f"  [지오코딩 오류] {address!r}: {e}")
         return None
 
 
@@ -80,47 +96,51 @@ def run(args):
     kakao_key = args.kakao_key or os.environ.get("KAKAO_REST_KEY", "")
 
     if not supabase_url or not supabase_key:
-        print("ERROR: --supabase-url 과 --supabase-key 를 입력하거나 환경변수를 설정해 주세요.")
+        log("ERROR: --supabase-url 과 --supabase-key 를 입력하거나 환경변수를 설정해 주세요.")
         sys.exit(1)
     if not kakao_key:
-        print("ERROR: --kakao-key 를 입력하거나 KAKAO_REST_KEY 환경변수를 설정해 주세요.")
+        log("ERROR: --kakao-key 를 입력하거나 KAKAO_REST_KEY 환경변수를 설정해 주세요.")
         sys.exit(1)
 
-    dry_run = args.dry_run
-    delay   = max(0.0, args.delay)
-    limit   = max(0, args.limit)
+    dry_run      = args.dry_run
+    delay        = max(0.0, args.delay)
+    limit        = max(0, args.limit)
     store_filter = (args.store or "").strip()
 
-    print("=" * 60)
-    print("기존 고객 주소 일괄 지오코딩")
-    print("=" * 60)
-    print(f"  Supabase URL : {supabase_url}")
-    print(f"  매장 필터    : {store_filter or '전체'}")
-    print(f"  API 딜레이   : {delay}초")
-    print(f"  처리 한도    : {'전체' if limit == 0 else limit}건")
-    print(f"  DRY RUN      : {'ON (실제 업데이트 안 함)' if dry_run else 'OFF'}")
-    print("=" * 60)
+    log("=" * 60)
+    log("기존 고객 주소 일괄 지오코딩")
+    log("=" * 60)
+    log(f"  Supabase URL : {supabase_url}")
+    log(f"  매장 필터    : {store_filter or '전체'}")
+    log(f"  API 딜레이   : {delay}초")
+    log(f"  처리 한도    : {'전체' if limit == 0 else limit}건")
+    log(f"  DRY RUN      : {'ON (실제 업데이트 안 함)' if dry_run else 'OFF'}")
+    log("=" * 60)
 
     # 2. Supabase 연결
-    client = create_client(supabase_url, supabase_key)
-
-    # 3. 주소 있고 위도/경도 없는 고객 조회
-    print("\n[1/4] 지오코딩이 필요한 고객 조회 중...")
     try:
-        q = (
-            client.table("app_customers")
-            .select("id, store_name, name, address, latitude, longitude")
-            .not_.is_("address", "null")      # 주소 있음
-            .is_("latitude", "null")           # 위도 없음
-        )
-        if store_filter:
-            q = q.eq("store_name", store_filter)
+        client = create_client(supabase_url, supabase_key)
+    except Exception as e:
+        log(f"ERROR: Supabase 연결 실패: {e}")
+        sys.exit(1)
 
-        # 페이지네이션: 최대 1000건씩 (Supabase 기본 1000 limit)
+    # 3. latitude 가 NULL 인 고객 전체 조회 (Python에서 주소 유무 필터링)
+    #    - .not_.is_() 문법이 supabase-py 버전에 따라 다르게 동작하므로
+    #      IS NULL 필터만 사용하고 address 필터는 Python에서 처리
+    log("\n[1/4] 지오코딩이 필요한 고객 조회 중...")
+    try:
         all_rows = []
         page_size = 1000
         offset = 0
         while True:
+            q = (
+                client.table("app_customers")
+                .select("id, store_name, name, address, latitude, longitude")
+                .is_("latitude", "null")   # latitude IS NULL
+            )
+            if store_filter:
+                q = q.eq("store_name", store_filter)
+
             batch = q.range(offset, offset + page_size - 1).execute()
             rows = batch.data or []
             all_rows.extend(rows)
@@ -129,64 +149,70 @@ def run(args):
             offset += page_size
 
     except Exception as e:
-        print(f"ERROR: Supabase 조회 실패: {e}")
+        err_str = str(e)
+        log(f"ERROR: Supabase 조회 실패 ({err_str})")
+        log("  힌트: supabase-url 과 supabase-key 값을 다시 확인해 주세요.")
         sys.exit(1)
 
-    # 빈 주소 제거
+    # 주소 없는 행 Python에서 제거
     all_rows = [r for r in all_rows if (r.get("address") or "").strip()]
 
     total = len(all_rows)
-    print(f"  → {total}건 발견")
+    log(f"  -> 위도/경도 없는 고객 (주소 있음): {total}건 발견")
 
     if total == 0:
-        print("\n모든 고객의 위도/경도가 이미 입력되어 있습니다.")
+        log("\n모든 고객의 위도/경도가 이미 입력되어 있습니다.")
         return
 
     if limit > 0:
         all_rows = all_rows[:limit]
-        print(f"  → 처리 한도 적용: {len(all_rows)}건 처리")
+        log(f"  -> 처리 한도 적용: {len(all_rows)}건만 처리")
 
-    # 4. 주소 중복 제거 (같은 주소는 API 1번만 호출)
-    addr_to_geo: dict[str, dict | None] = {}
-
-    print("\n[2/4] 고유 주소 목록 추출 중...")
-    unique_addresses = list({(r["address"] or "").strip() for r in all_rows if (r.get("address") or "").strip()})
-    print(f"  → 고유 주소 {len(unique_addresses)}개")
+    # 4. 고유 주소 추출 (중복 주소는 API 1번만 호출)
+    log("\n[2/4] 고유 주소 목록 추출 중...")
+    unique_addresses = list({(r["address"] or "").strip() for r in all_rows})
+    log(f"  -> 고유 주소 {len(unique_addresses)}개 (API {len(unique_addresses)}회 호출 예정)")
 
     # 5. 지오코딩 실행
-    print(f"\n[3/4] 카카오 API 지오코딩 시작 (딜레이 {delay}초)...")
+    log(f"\n[3/4] 카카오 API 지오코딩 시작 (딜레이 {delay}초)...")
+    addr_to_geo: dict[str, dict | None] = {}
     success_addr, fail_addr = 0, 0
+
     for i, addr in enumerate(unique_addresses, 1):
         geo = geocode_kakao(addr, kakao_key)
         addr_to_geo[addr] = geo
-        status = f"✓ ({geo['latitude']:.5f}, {geo['longitude']:.5f})" if geo else "✗ 실패"
-        print(f"  [{i}/{len(unique_addresses)}] {addr[:40]!r:<42} {status}")
         if geo:
+            status = f"OK  ({geo['latitude']:.5f}, {geo['longitude']:.5f})"
             success_addr += 1
         else:
+            status = "FAIL (결과 없음)"
             fail_addr += 1
+        short_addr = addr[:40] if len(addr) > 40 else addr
+        log(f"  [{i:3d}/{len(unique_addresses)}] {short_addr:<40} {status}")
         if i < len(unique_addresses):
             time.sleep(delay)
 
-    print(f"\n  지오코딩 결과: 성공 {success_addr}개 / 실패 {fail_addr}개")
+    log(f"\n  지오코딩 결과: 성공 {success_addr}개 / 실패 {fail_addr}개")
 
     # 6. Supabase 업데이트
-    print(f"\n[4/4] Supabase 업데이트 {'(DRY RUN - 실제 저장 안 함)' if dry_run else '중'}...")
+    prefix = "(DRY RUN - 실제 저장 안 함)" if dry_run else ""
+    log(f"\n[4/4] Supabase 업데이트 {prefix}...")
     updated, skipped, errors = 0, 0, 0
 
     for row in all_rows:
         addr = (row.get("address") or "").strip()
         geo  = addr_to_geo.get(addr)
         cid  = row["id"]
-        name = row.get("name") or "-"
+        name = (row.get("name") or "-")[:20]
 
         if not geo:
-            print(f"  SKIP [{cid}] {name!r} - 지오코딩 실패 ({addr[:30]!r})")
+            log(f"  SKIP  [id={cid}] {name} - 지오코딩 실패")
             skipped += 1
             continue
 
+        lat_str = f"({geo['latitude']:.5f}, {geo['longitude']:.5f})"
         if dry_run:
-            print(f"  DRY  [{cid}] {name!r} → ({geo['latitude']:.5f}, {geo['longitude']:.5f})")
+            log(f"  DRY   [id={cid}] {name} -> {lat_str}")
             updated += 1
             continue
 
@@ -195,39 +221,41 @@ def run(args):
                 "latitude":  geo["latitude"],
                 "longitude": geo["longitude"],
             }).eq("id", cid).execute()
-            print(f"  OK   [{cid}] {name!r} → ({geo['latitude']:.5f}, {geo['longitude']:.5f})")
+            log(f"  OK    [id={cid}] {name} -> {lat_str}")
             updated += 1
         except Exception as e:
-            print(f"  ERR  [{cid}] {name!r}: {e}")
+            log(f"  ERROR [id={cid}] {name}: {e}")
             errors += 1
 
     # 7. 결과 요약
-    print("\n" + "=" * 60)
-    print("완료 요약")
-    print("=" * 60)
-    print(f"  처리 대상   : {len(all_rows)}건")
-    print(f"  {'업데이트(예정)' if dry_run else '업데이트 완료'}: {updated}건")
-    print(f"  지오코딩 실패 (스킵): {skipped}건")
+    log("\n" + "=" * 60)
+    log("완료 요약")
+    log("=" * 60)
+    log(f"  처리 대상        : {len(all_rows)}건")
+    action = "업데이트 예정 (DRY RUN)" if dry_run else "업데이트 완료"
+    log(f"  {action:<20}: {updated}건")
+    log(f"  지오코딩 실패 스킵: {skipped}건")
     if not dry_run:
-        print(f"  Supabase 오류: {errors}건")
+        log(f"  Supabase 오류    : {errors}건")
     if dry_run:
-        print("\n  ※ DRY RUN 모드: 실제로 저장되지 않았습니다.")
-        print("     --dry-run 옵션 제거 후 재실행하면 실제 저장됩니다.")
-    print("=" * 60)
+        log("")
+        log("  ※ DRY RUN 모드: 실제로 저장되지 않았습니다.")
+        log("     --dry-run 옵션 제거 후 재실행하면 실제 저장됩니다.")
+    log("=" * 60)
 
 
 # ─── CLI 진입점 ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="app_customers 기존 주소 일괄 지오코딩 → Supabase 업데이트"
+        description="app_customers 기존 주소 일괄 지오코딩 -> Supabase 업데이트"
     )
-    parser.add_argument("--supabase-url",  default="", help="Supabase 프로젝트 URL")
-    parser.add_argument("--supabase-key",  default="", help="Supabase anon/service_role 키")
-    parser.add_argument("--kakao-key",     default="", help="카카오 REST API 키")
-    parser.add_argument("--store",         default="", help="특정 매장명만 처리 (생략 시 전체)")
-    parser.add_argument("--dry-run",       action="store_true", help="미리 보기 (실제 저장 안 함)")
-    parser.add_argument("--delay",         type=float, default=0.15, help="API 호출 간격 초 (기본 0.15)")
-    parser.add_argument("--limit",         type=int,   default=0,    help="처리 최대 건수 (0=전체)")
+    parser.add_argument("--supabase-url", default="", help="Supabase 프로젝트 URL")
+    parser.add_argument("--supabase-key", default="", help="Supabase anon/service_role 키")
+    parser.add_argument("--kakao-key",    default="", help="카카오 REST API 키")
+    parser.add_argument("--store",        default="", help="특정 매장명만 처리 (생략 시 전체)")
+    parser.add_argument("--dry-run",      action="store_true", help="미리 보기 (실제 저장 안 함)")
+    parser.add_argument("--delay",        type=float, default=0.15, help="API 호출 간격 초 (기본 0.15)")
+    parser.add_argument("--limit",        type=int,   default=0,    help="처리 최대 건수 (0=전체)")
     args = parser.parse_args()
     run(args)
