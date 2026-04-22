@@ -131,23 +131,30 @@ def _inject_mobile_css():
             /* 표 영역 패딩 최소화, 가로 스크롤 */
             [data-testid="stDataFrame"] { padding: 0 2px !important; overflow-x: auto !important; }
             [data-testid="stDataFrame"] > div { margin: 0 !important; max-width: 100vw !important; }
-            /* 탭 가로 스크롤: Streamlit DOM 구조 변경에 대비해 여러 선택자로 잡음 */
-            [data-testid="stTabs"] { overflow: visible !important; }
-            [data-testid="stTabs"] > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
+            /* 탭 가로 스크롤: 상위 요소 overflow 클리핑 해제 후 tablist 스크롤 허용 */
+            [data-testid="stTabs"] { overflow: visible !important; width: 100% !important; }
+            [data-testid="stTabs"] > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; width: 100% !important; }
             [data-testid="stTabs"] > div > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
             [data-testid="stTabs"] [role="tablist"] {
+                display: flex !important;
                 flex-wrap: nowrap !important;
                 overflow-x: auto !important;
                 -webkit-overflow-scrolling: touch !important;
-                padding-left: 0 !important;
+                padding-left: 0.25rem !important;
                 margin-left: 0 !important;
+                scrollbar-width: none !important; /* Firefox: 스크롤바 숨김 */
+                -ms-overflow-style: none !important; /* IE: 스크롤바 숨김 */
+                width: 100% !important;
+                box-sizing: border-box !important;
             }
+            /* 탭 스크롤바 숨김 (Webkit) */
+            [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: none !important; }
             /* 탭 버튼 최소 너비: 텍스트 잘림 방지 */
             [data-testid="stTabs"] [role="tab"] {
                 flex-shrink: 0 !important;
                 min-width: max-content !important;
-                padding: 0.4rem 0.6rem !important;
-                font-size: 0.85rem !important;
+                padding: 0.4rem 0.5rem !important;
+                font-size: 0.8rem !important;
             }
             .mobile-menu-hint { display: block !important; }
             /* 터치 친화: 버튼·입력창 최소 높이 */
@@ -177,8 +184,8 @@ def _inject_branding_css():
         #MainMenu { visibility: hidden !important; }
         /* 하단 "Made with Streamlit" 푸터 */
         footer { visibility: hidden !important; }
-        /* 상단 Streamlit 로고/워터마크 영역 */
-        header[data-testid="stHeader"] { background: transparent !important; }
+        /* 상단 Streamlit 헤더 완전 제거 (투명만으로는 공간 차지) */
+        header[data-testid="stHeader"] { display: none !important; }
         [data-testid="stDecoration"] { display: none !important; }
         /* 배포 툴바(Share/Edit/Running...) 숨김 */
         [data-testid="stToolbar"] { display: none !important; }
@@ -12757,10 +12764,11 @@ def main():
             right: 0;
             z-index: 9999;
             background-color: white;
-            padding: 1rem 1rem 0 1rem;
+            padding: 0.75rem 1rem 0 1rem;
             box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.1);
-            /* 탭 목록이 fixed 컨테이너 안에서 잘리지 않도록 */
-            overflow: visible !important;
+            /* fixed 컨테이너 안 탭이 가로로 넘칠 때 스크롤 허용 */
+            overflow-x: auto;
+            overflow-y: visible;
         }
         /* 사이드바(PC)가 열려 있을 때 본문과 정렬 */
         @media (min-width: 768px) {
@@ -12768,18 +12776,24 @@ def main():
                 left: 21rem; /* 사이드바 너비만큼 밀어줌 */
             }
         }
-        /* 모바일: sticky-header 좌우 패딩 최소화하여 탭 좌측 잘림 방지 */
+        /* 모바일: 좌우 패딩 제거하여 탭이 화면 왼쪽 끝부터 시작하도록 */
         @media (max-width: 767px) {
             .sticky-header {
                 left: 0 !important;
                 right: 0 !important;
-                padding: 0.5rem 0.25rem 0 0.25rem !important;
-                overflow-x: visible !important;
+                padding: 0.4rem 0 0 0 !important;
+                overflow-x: auto !important;
             }
         }
         /* 본문이 헤더에 가려지지 않도록 상단 패딩 추가 */
         .block-container {
             padding-top: 6rem !important;
+        }
+        /* 모바일: stHeader가 없어지므로 상단 패딩 줄임 */
+        @media (max-width: 767px) {
+            .block-container {
+                padding-top: 4.5rem !important;
+            }
         }
         </style>
         """,
