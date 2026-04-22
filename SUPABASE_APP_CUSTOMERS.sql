@@ -9,9 +9,15 @@ CREATE TABLE IF NOT EXISTS app_customers (
   phone1 TEXT,
   phone2 TEXT,
   address TEXT,
+  latitude  DOUBLE PRECISION,  -- 카카오 지오코딩 위도 (고객 저장/수정 시 자동 갱신)
+  longitude DOUBLE PRECISION,  -- 카카오 지오코딩 경도 (고객 저장/수정 시 자동 갱신)
   source TEXT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- 기존 테이블에 컬럼 추가 (이미 테이블이 있는 경우 Supabase SQL Editor에서 실행)
+ALTER TABLE app_customers ADD COLUMN IF NOT EXISTS latitude  DOUBLE PRECISION;
+ALTER TABLE app_customers ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
 
 CREATE INDEX IF NOT EXISTS idx_app_customers_store_name ON app_customers(store_name);
 CREATE INDEX IF NOT EXISTS idx_app_customers_phone1 ON app_customers(store_name, phone1);

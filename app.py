@@ -2397,19 +2397,30 @@ def _get_current_store_name_for_customers(db_filename: str) -> str:
 def _supabase_insert_customer(db_filename: str, name: str, phone1: str, phone2: str | None, address: str | None) -> tuple[int | None, str | None]:
     """
     Supabase app_customers 테이블에 고객 1건 INSERT. store_name(현재 매장) 필수 주입.
+    주소가 있으면 카카오 지오코딩으로 latitude/longitude 자동 저장 (KAKAO_REST_KEY 필요).
     반환: (새 customer id, None) 성공 시, (None, 에러_상세_메시지) 실패 시.
     """
     client, err = get_supabase_client()
     if err or not client:
         return None, (err or "Supabase 연결 불가")
     store_name = _get_current_store_name_for_customers(db_filename)
+    addr_clean = (address or "").strip() or None
     payload = {
         "store_name": store_name,
         "name": (name or "").strip() or "미입력",
         "phone1": (phone1 or "").strip() or "",
         "phone2": (phone2 or "").strip() or None,
-        "address": (address or "").strip() or None,
+        "address": addr_clean,
     }
+    # 주소가 있으면 카카오 지오코딩으로 위도/경도 자동 저장
+    if addr_clean:
+        try:
+            _geo = geocode_address_kakao_extended(addr_clean)
+            if _geo:
+                payload["latitude"] = _geo["latitude"]
+                payload["longitude"] = _geo["longitude"]
+        except Exception:
+            pass
     try:
         r = client.table("app_customers").insert(payload).execute()
         if r.data and len(r.data) > 0 and r.data[0].get("id") is not None:
@@ -10628,6 +10639,16 @@ def render_customer_balance():
                                                     "phone2": st.session_state.get(f"{edit_prefix}_phone2") or None,
                                                     "address": st.session_state.get(f"{edit_prefix}_address") or None,
                                                 }
+                                                # 주소가 있으면 카카오 지오코딩으로 위도/경도 자동 업데이트
+                                                _upd_addr = upd_cust.get("address")
+                                                if _upd_addr:
+                                                    try:
+                                                        _geo = geocode_address_kakao_extended(_upd_addr)
+                                                        if _geo:
+                                                            upd_cust["latitude"] = _geo["latitude"]
+                                                            upd_cust["longitude"] = _geo["longitude"]
+                                                    except Exception:
+                                                        pass
                                                 sc.table("app_customers").update(upd_cust).eq("store_name", store_name).eq("id", cid).execute()
                                             # Supabase 직원명 변경 이력 기록 (app_edit_requests)
                                             if old_employee_names != new_employee_names:
