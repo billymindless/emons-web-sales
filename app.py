@@ -184,13 +184,26 @@ def _inject_branding_css():
         #MainMenu { visibility: hidden !important; }
         /* 하단 "Made with Streamlit" 푸터 */
         footer { visibility: hidden !important; }
-        /* 상단 Streamlit 헤더 완전 제거 (투명만으로는 공간 차지) */
-        header[data-testid="stHeader"] { display: none !important; }
+        /* Streamlit 헤더: 완전 숨김 X — 사이드바 토글(☰)도 사라지기 때문.
+           배경·그림자만 제거하고 내부 브랜딩 텍스트/장식만 숨김 */
+        header[data-testid="stHeader"] {
+            background: transparent !important;
+            box-shadow: none !important;
+        }
         [data-testid="stDecoration"] { display: none !important; }
         /* 배포 툴바(Share/Edit/Running...) 숨김 */
         [data-testid="stToolbar"] { display: none !important; }
         /* 앱 상단 좁은 Streamlit 컬러 바(빨강·주황·초록) */
         .stApp > header::before { display: none !important; }
+        /* 헤더 내 페이지 타이틀 텍스트 숨김 (사이드바 토글 버튼은 유지) */
+        header[data-testid="stHeader"] [data-testid="stHeaderNoPadding"] { display: none !important; }
+        /* 모바일: 헤더 높이를 토글 버튼 크기에 맞게 최소화 */
+        @media (max-width: 767px) {
+            header[data-testid="stHeader"] {
+                height: 2.5rem !important;
+                min-height: 2.5rem !important;
+            }
+        }
 
         /* ── 네이비 블루 브랜딩 ── */
         /* 기본 버튼 */
@@ -12757,6 +12770,7 @@ def main():
     st.markdown(
         """
         <style>
+        /* sticky-header: PC에서만 sticky 적용 (모바일은 일반 흐름으로) */
         .sticky-header {
             position: fixed;
             top: 0;
@@ -12766,33 +12780,33 @@ def main():
             background-color: white;
             padding: 0.75rem 1rem 0 1rem;
             box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.1);
-            /* fixed 컨테이너 안 탭이 가로로 넘칠 때 스크롤 허용 */
             overflow-x: auto;
             overflow-y: visible;
         }
-        /* 사이드바(PC)가 열려 있을 때 본문과 정렬 */
+        /* PC: 사이드바(21rem)만큼 밀어줌 */
         @media (min-width: 768px) {
             .sticky-header {
-                left: 21rem; /* 사이드바 너비만큼 밀어줌 */
+                left: 21rem;
             }
         }
-        /* 모바일: 좌우 패딩 제거하여 탭이 화면 왼쪽 끝부터 시작하도록 */
+        /* 모바일: sticky-header 비활성화 — Streamlit에서 동작 안 하므로 일반 흐름으로 */
         @media (max-width: 767px) {
             .sticky-header {
-                left: 0 !important;
-                right: 0 !important;
-                padding: 0.4rem 0 0 0 !important;
-                overflow-x: auto !important;
+                position: static !important;
+                box-shadow: none !important;
+                padding: 0 !important;
             }
         }
-        /* 본문이 헤더에 가려지지 않도록 상단 패딩 추가 */
-        .block-container {
-            padding-top: 6rem !important;
+        /* PC: 본문이 고정 헤더에 가려지지 않도록 상단 패딩 */
+        @media (min-width: 768px) {
+            .block-container {
+                padding-top: 6rem !important;
+            }
         }
-        /* 모바일: stHeader가 없어지므로 상단 패딩 줄임 */
+        /* 모바일: Streamlit stHeader(2.5rem) 바로 아래에서 콘텐츠 시작 */
         @media (max-width: 767px) {
             .block-container {
-                padding-top: 4.5rem !important;
+                padding-top: 0.25rem !important;
             }
         }
         </style>
