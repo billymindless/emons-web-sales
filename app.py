@@ -12664,6 +12664,50 @@ def render_dashboard():
             # 동일 기간(이번달 1~오늘과 지난달 1~오늘일)까지의 지난달 누적 — 비교 요약용
             _last_same_period_sum = sum(_last_values[:today.day]) if _has_last else 0.0
 
+            # 요일·공휴일 판별: 마커 색상 배열 계산 (토→파랑, 일·공휴일→빨강, 평일→기본색)
+            # 한국 공휴일 2025~2026 (대체공휴일 포함, 표시 전용이므로 로직/DB 무관)
+            _KR_HOLIDAYS = {
+                date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
+                date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6),
+                date(2025, 6, 6), date(2025, 8, 15),
+                date(2025, 10, 3), date(2025, 10, 5), date(2025, 10, 6),
+                date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
+                date(2025, 12, 25),
+                date(2026, 1, 1),
+                date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
+                date(2026, 3, 1), date(2026, 3, 2),
+                date(2026, 5, 5), date(2026, 5, 24),
+                date(2026, 6, 6), date(2026, 8, 15),
+                date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),
+                date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9),
+                date(2026, 12, 25),
+            }
+
+            def _marker_style(year, month, day, holidays, is_this):
+                """(color, size) 반환: 토→파랑, 일·공휴일→빨강, 평일→기본색."""
+                try:
+                    d = date(year, month, day)
+                    dow = d.weekday()  # 0=월 … 5=토 6=일
+                    if d in holidays or dow == 6:
+                        return ("#E53935", 10) if is_this else ("#EF9A9A", 7)
+                    if dow == 5:
+                        return ("#1565C0", 10) if is_this else ("#90CAF9", 7)
+                    return ("#1B3A6B", 7) if is_this else ("#B0BEC5", 5)
+                except Exception:
+                    return ("#1B3A6B", 7) if is_this else ("#B0BEC5", 5)
+
+            # 이번 달 마커 색/크기 배열
+            _this_year = today.year
+            _this_month_num = today.month
+            _this_marker_colors = [_marker_style(_this_year, _this_month_num, d, _KR_HOLIDAYS, True)[0] for d in _this_days]
+            _this_marker_sizes  = [_marker_style(_this_year, _this_month_num, d, _KR_HOLIDAYS, True)[1] for d in _this_days]
+
+            # 지난 달 마커 색/크기 배열
+            _last_year  = _last_month_end.year
+            _last_month_num = _last_month_end.month
+            _last_marker_colors = [_marker_style(_last_year, _last_month_num, d, _KR_HOLIDAYS, False)[0] for d in _last_days]
+            _last_marker_sizes  = [_marker_style(_last_year, _last_month_num, d, _KR_HOLIDAYS, False)[1] for d in _last_days]
+
             # 꺾은선 차트 생성 (plotly)
             fig_daily = go.Figure()
             # 지난 달 선 (흐린 색, 점선) — 데이터 있을 때만
@@ -12674,17 +12718,17 @@ def render_dashboard():
                     mode="lines+markers",
                     name=f"지난 달 ({_last_ym})",
                     line=dict(color="#B0BEC5", width=2, dash="dot"),
-                    marker=dict(size=5, color="#B0BEC5"),
+                    marker=dict(size=_last_marker_sizes, color=_last_marker_colors),
                     hovertemplate="%{x}일<br>%{y:,.0f}원<extra>지난 달</extra>",
                 ))
-            # 이번 달 선 (진한 네이비 블루)
+            # 이번 달 선 (진한 네이비 블루 선 + 요일별 마커 색상)
             fig_daily.add_trace(go.Scatter(
                 x=_this_days,
                 y=_this_values,
                 mode="lines+markers",
                 name=f"이번 달 ({_this_ym})",
                 line=dict(color="#1B3A6B", width=3),
-                marker=dict(size=7, color="#1B3A6B"),
+                marker=dict(size=_this_marker_sizes, color=_this_marker_colors),
                 hovertemplate="%{x}일<br>%{y:,.0f}원<extra>이번 달</extra>",
             ))
             fig_daily.update_layout(
