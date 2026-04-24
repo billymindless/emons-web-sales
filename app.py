@@ -6313,8 +6313,7 @@ def _superadmin_tab4_backup_csv():
         }).rename(columns={"amount": "paid", "payment_method": "methods", "onnuri_approval_code": "onnuri_codes"})
         merged = merged.merge(pay_agg, left_on="id", right_index=True, how="left")
         merged["paid"] = merged["paid"].fillna(0)
-        merged["total_sales"] = merged["total_amount"] + merged["display_sales_amount"]
-        merged["balance"] = merged["total_sales"] - merged["paid"]
+        merged["balance"] = merged["total_amount"] - merged["paid"]
         merged["methods"] = merged["methods"].fillna("")
         merged["onnuri_codes"] = merged["onnuri_codes"].fillna("")
         merged["특이사항"] = (merged["visit_reason"].fillna("") + " / " + merged["purchase_reason"].fillna("")).str.strip(" /")
@@ -6327,7 +6326,7 @@ def _superadmin_tab4_backup_csv():
                 "연락처2": o.get("phone2") or "",
                 "주소": o.get("address") or "",
                 "품목": o.get("category") or "",
-                "총판매금액": int(o["total_sales"]),
+                "총판매금액": int(o["total_amount"]),
                 "결제금액": int(o["paid"]),
                 "미수금(잔금)": int(o["balance"]),
                 "결제수단": o.get("methods") or "",
@@ -6408,8 +6407,7 @@ def _superadmin_tab_unpaid_report():
         merged["phone1"] = merged["customer_id"].map(lambda cid: (cust_map.get(int(cid)) or {}).get("phone1", "") if pd.notna(cid) else "")
         merged = merged.merge(payments, left_on="id", right_on="order_id", how="left")
         merged["paid"] = merged["paid"].fillna(0)
-        merged["total_sales"] = merged["total_amount"] + merged["display_sales_amount"]
-        merged["balance"] = merged["total_sales"] - merged["paid"]
+        merged["balance"] = merged["total_amount"] - merged["paid"]
         merged["order_date"] = pd.to_datetime(merged["order_date"], errors="coerce")
         merged = merged[merged["order_date"].notna()]
         merged = merged[(merged["order_date"].dt.date >= report_start) & (merged["order_date"].dt.date <= report_end)]
@@ -6422,7 +6420,7 @@ def _superadmin_tab_unpaid_report():
                 "연락처": o.get("phone1") or "",
                 "판매일자": o["order_date"].strftime("%Y-%m-%d") if pd.notna(o.get("order_date")) else "",
                 "배송일자": str(o.get("delivery_date") or ""),
-                "총판매금액": int(o["total_sales"]),
+                "총판매금액": int(o["total_amount"]),
                 "미수금액(잔금)": int(o["balance"]),
             })
     if not rows:
@@ -11501,8 +11499,7 @@ def render_customer_balance():
         else:
             pay_sum = _shared_pay_sum_d10
             orders["paid"] = orders["id"].map(pay_sum).fillna(0)
-            orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0) if "display_sales_amount" in orders.columns else 0
-            orders["balance"] = orders["total_amount"] + orders["display_sales_amount"] - orders["paid"]
+            orders["balance"] = orders["total_amount"] - orders["paid"]
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
             orders = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
             d10_end = today + timedelta(days=10)
@@ -11534,8 +11531,7 @@ def render_customer_balance():
         else:
             pay_sum = _shared_pay_sum_d10  # 탭2에서 이미 계산된 pay_sum 재사용
             orders["paid"] = orders["id"].map(pay_sum).fillna(0)
-            orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0) if "display_sales_amount" in orders.columns else 0
-            orders["balance"] = orders["total_amount"] + orders["display_sales_amount"] - orders["paid"]
+            orders["balance"] = orders["total_amount"] - orders["paid"]
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
             orders = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
             mask_past = orders["delivery_date"].notna() & (orders["delivery_date"].dt.date < today)
@@ -12628,8 +12624,7 @@ def render_dashboard():
     if len(orders) > 0 and "balance_status" in orders.columns:
         warn_orders = orders.copy()
         warn_orders["paid"] = warn_orders["id"].map(_dash_pay_sum).fillna(0)
-        warn_orders["display_sales_amount"] = warn_orders["display_sales_amount"].fillna(0) if "display_sales_amount" in warn_orders.columns else 0
-        warn_orders["real_balance"] = warn_orders["total_amount"] + warn_orders["display_sales_amount"] - warn_orders["paid"]
+        warn_orders["real_balance"] = warn_orders["total_amount"] - warn_orders["paid"]
         suspicious = warn_orders[(warn_orders["balance_status"] == "완납") & (warn_orders["real_balance"] != 0)]
         if len(suspicious) > 0:
             st.error(f"⚠️ 잔금 불일치 의심 건 {len(suspicious)}건 발생 (완납 표시이나 실 잔금이 0이 아님)")
@@ -12819,8 +12814,7 @@ def render_dashboard():
         pay_sum = _dash_pay_sum  # 위에서 이미 계산된 pay_sum 재사용
         orders = orders.copy()
         orders["paid"] = orders["id"].map(pay_sum).fillna(0)
-        orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0) if "display_sales_amount" in orders.columns else 0
-        orders["balance"] = orders["total_amount"] + orders["display_sales_amount"] - orders["paid"]
+        orders["balance"] = orders["total_amount"] - orders["paid"]
         orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
         orders_with_cust = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
         orders_with_cust = orders_with_cust.rename(columns={"name": "고객명", "phone1": "전화번호", "delivery_date": "배송일", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
