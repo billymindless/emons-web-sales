@@ -9283,8 +9283,8 @@ def render_new_sales():
             _ak = amt_key
             st.text_input(f"금액 #{i+1} *", key=_ak, on_change=lambda k=_ak: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))))
         total_payment_int += _parse_comma_to_int(st.session_state.get(amt_key, "0"))
-        # 온누리상품권 전용 승인번호/영수증 입력 UI (결제 수단에 '온누리'가 포함될 때만)
-        is_onnuri = method and ("온누리" in str(method))
+        # 온누리상품권 전용 승인번호/영수증 입력 UI (전자상품권 '온누리'만 해당, '온누리지류'는 승인번호 불필요)
+        is_onnuri = method and ("온누리" in str(method)) and ("지류" not in str(method))
         onnuri_stage_key = f"pay_onnuri_stage_{i}"
         last4_key = f"pay_onnuri_last4_{i}"
         full_key = f"pay_onnuri_full_{i}"
@@ -9369,7 +9369,7 @@ def render_new_sales():
             amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
             if amt <= 0:
                 continue
-            if not method or "온누리" not in str(method):
+            if not method or "온누리" not in str(method) or "지류" in str(method):
                 continue
             stage_key = f"pay_onnuri_stage_{i}"
             last4_key = f"pay_onnuri_last4_{i}"
@@ -9378,7 +9378,7 @@ def render_new_sales():
             pay_date_str = order_date.isoformat()
             if stage == "last4":
                 last4_raw = (st.session_state.get(last4_key, "") or "").strip()
-                last4_digits = re.sub(r"\\D", "", last4_raw)
+                last4_digits = re.sub(r"\D", "", last4_raw)
                 if len(last4_digits) != 4:
                     st.error("온누리상품권 결제의 승인번호 뒤 4자리를 정확히 입력하세요.")
                     st.stop()
@@ -9407,7 +9407,7 @@ def render_new_sales():
                     st.stop()
             else:
                 full_code_raw = (st.session_state.get(full_key, "") or "").strip()
-                full_digits = re.sub(r"\\D", "", full_code_raw)
+                full_digits = re.sub(r"\D", "", full_code_raw)
                 if len(full_digits) < 8:
                     st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
                     st.stop()
@@ -9458,13 +9458,13 @@ def render_new_sales():
                 total_fees += fee
                 total_paid_initial += amt
                 onnuri_code = None
-                if method and "온누리" in str(method):
+                if method and "온누리" in str(method) and "지류" not in str(method):
                     stage = st.session_state.get(f"pay_onnuri_stage_{i}", "last4")
                     if stage == "last4":
                         raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
                     else:
                         raw = (st.session_state.get(f"pay_onnuri_full_{i}", "") or "").strip()
-                    onnuri_code = re.sub(r"\\D", "", raw) or None
+                    onnuri_code = re.sub(r"\D", "", raw) or None
                 _insert_payment_supabase(db_filename, {
                     "order_id": order_id,
                     "payment_date": order_date.isoformat(),
@@ -9577,13 +9577,13 @@ def render_new_sales():
                     total_fees += fee
                     total_paid_initial += amt
                     onnuri_code = None
-                    if method and "온누리" in str(method):
+                    if method and "온누리" in str(method) and "지류" not in str(method):
                         stage = st.session_state.get(f"pay_onnuri_stage_{i}", "last4")
                         if stage == "last4":
                             raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
                         else:
                             raw = (st.session_state.get(f"pay_onnuri_full_{i}", "") or "").strip()
-                        onnuri_code = re.sub(r"\\D", "", raw) or None
+                        onnuri_code = re.sub(r"\D", "", raw) or None
                     conn.execute("""
                         INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
@@ -9873,8 +9873,8 @@ def _customer_balance_payment_ui(
     if add_amt_int > 0 and add_amt_int > balance:
         _over = add_amt_int - max(balance, 0)
         st.warning(f"⚠️ 입력 금액({add_amt_int:,}원)이 잔금({max(balance,0):,.0f}원)보다 **{_over:,}원 초과**합니다. 결변·카드취소 처리 목적이면 그대로 등록하세요. 초과 금액은 '초과결제 항목' 탭에 표시됩니다.")
-    # 온누리상품권일 때 승인번호/영수증 입력
-    is_onnuri = add_method and ("온누리" in str(add_method))
+    # 온누리상품권일 때 승인번호/영수증 입력 (전자상품권만 해당, 지류는 승인번호 불필요)
+    is_onnuri = add_method and ("온누리" in str(add_method)) and ("지류" not in str(add_method))
     stage_key = f"{key_prefix}_onnuri_stage"
     last4_key = f"{key_prefix}_onnuri_last4"
     full_key = f"{key_prefix}_onnuri_full"
@@ -9905,7 +9905,7 @@ def _customer_balance_payment_ui(
                 stage = st.session_state.get(stage_key, "last4")
                 if stage == "last4":
                     last4_raw = (st.session_state.get(last4_key, "") or "").strip()
-                    last4_digits = re.sub(r"\\D", "", last4_raw)
+                    last4_digits = re.sub(r"\D", "", last4_raw)
                     if len(last4_digits) != 4:
                         st.error("온누리상품권 결제의 승인번호 뒤 4자리를 정확히 입력하세요.")
                         return
@@ -9933,7 +9933,7 @@ def _customer_balance_payment_ui(
                     onnuri_code = last4_digits
                 else:
                     full_raw = (st.session_state.get(full_key, "") or "").strip()
-                    full_digits = re.sub(r"\\D", "", full_raw)
+                    full_digits = re.sub(r"\D", "", full_raw)
                     if len(full_digits) < 8:
                         st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
                         return
