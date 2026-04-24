@@ -107,6 +107,27 @@ def _inject_mobile_css():
             object-fit: contain !important;
         }
         .mobile-menu-hint { display: none; }
+        /* ----- 탭 가로 스크롤: PC·모바일 공통 적용 (탭이 많을 때 잘리지 않도록) ----- */
+        [data-testid="stTabs"] { overflow: visible !important; width: 100% !important; }
+        [data-testid="stTabs"] > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; width: 100% !important; }
+        [data-testid="stTabs"] > div > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
+        [data-testid="stTabs"] [role="tablist"] {
+            display: flex !important;
+            flex-wrap: nowrap !important;
+            overflow-x: auto !important;
+            -webkit-overflow-scrolling: touch !important;
+            padding-left: 0.25rem !important;
+            margin-left: 0 !important;
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+            width: 100% !important;
+            box-sizing: border-box !important;
+        }
+        [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: none !important; }
+        [data-testid="stTabs"] [role="tab"] {
+            flex-shrink: 0 !important;
+            min-width: max-content !important;
+        }
         /* ----- 모바일 구간 (768px 이하) ----- */
         @media (max-width: 768px) {
             /* 반응형 글꼴 크기: 헤더 한 줄에 들어오게 */
@@ -131,28 +152,8 @@ def _inject_mobile_css():
             /* 표 영역 패딩 최소화, 가로 스크롤 */
             [data-testid="stDataFrame"] { padding: 0 2px !important; overflow-x: auto !important; }
             [data-testid="stDataFrame"] > div { margin: 0 !important; max-width: 100vw !important; }
-            /* 탭 가로 스크롤: 상위 요소 overflow 클리핑 해제 후 tablist 스크롤 허용 */
-            [data-testid="stTabs"] { overflow: visible !important; width: 100% !important; }
-            [data-testid="stTabs"] > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; width: 100% !important; }
-            [data-testid="stTabs"] > div > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
-            [data-testid="stTabs"] [role="tablist"] {
-                display: flex !important;
-                flex-wrap: nowrap !important;
-                overflow-x: auto !important;
-                -webkit-overflow-scrolling: touch !important;
-                padding-left: 0.25rem !important;
-                margin-left: 0 !important;
-                scrollbar-width: none !important; /* Firefox: 스크롤바 숨김 */
-                -ms-overflow-style: none !important; /* IE: 스크롤바 숨김 */
-                width: 100% !important;
-                box-sizing: border-box !important;
-            }
-            /* 탭 스크롤바 숨김 (Webkit) */
-            [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: none !important; }
-            /* 탭 버튼 최소 너비: 텍스트 잘림 방지 */
+            /* 모바일 탭 버튼: 텍스트 크기·패딩 추가 조정 */
             [data-testid="stTabs"] [role="tab"] {
-                flex-shrink: 0 !important;
-                min-width: max-content !important;
                 padding: 0.4rem 0.5rem !important;
                 font-size: 0.8rem !important;
             }
