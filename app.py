@@ -6775,7 +6775,8 @@ def render_monthly_payment_report(is_superadmin: bool):
         pay_df = pay_df[(pay_df["_pd"] >= date_range_start) & (pay_df["_pd"] <= date_range_end)]
         pay_df["payment_method"] = pay_df["payment_method"].fillna("미지정")
         if "card_company" not in pay_df.columns:
-            pay_df["card_company"] = None
+            pay_df["card_company"] = ""
+        pay_df["card_company"] = pay_df["card_company"].fillna("").astype(str).replace({"nan": "", "None": "", "none": ""})
         pay_df["amount"] = pd.to_numeric(pay_df["amount"], errors="coerce").fillna(0)
 
         _card_short = {"신한카드": "신한", "삼성카드": "삼성", "KB국민카드": "국민", "현대카드": "현대", "롯데카드": "롯데", "우리카드": "우리", "하나카드": "하나", "BC카드": "BC", "NH농협카드": "농협", "기타": "기타"}
@@ -6784,7 +6785,12 @@ def render_monthly_payment_report(is_superadmin: bool):
             if meth == "메인페이":
                 return "메인페이"
             if meth in ("신용카드", "체크카드"):
-                cc = row.get("card_company") or ""
+                _cc_raw = row.get("card_company")
+                try:
+                    cc = "" if pd.isna(_cc_raw) else str(_cc_raw).strip()
+                except (TypeError, ValueError):
+                    cc = str(_cc_raw or "").strip()
+                cc = "" if cc in ("nan", "None", "none") else cc
                 short = _card_short.get(cc, cc or "미지정")
                 prefix = "신용" if meth == "신용카드" else "체크"
                 return f"{prefix}_{short}" if cc else meth
@@ -7029,14 +7035,19 @@ def render_monthly_payment_report(is_superadmin: bool):
                 _audit_df["결제수단"] = _audit_df["detailed_payment"] if "detailed_payment" in _audit_df.columns else _audit_df.apply(_to_detailed, axis=1)
 
                 # ── 승인번호 (메인페이·온누리·지역화폐 전용, 감사 내역에만 표시) ──
+                def _safe_val(v):
+                    try:
+                        return "" if pd.isna(v) else str(v).strip()
+                    except (TypeError, ValueError):
+                        return str(v or "").strip()
                 def _get_approval(r):
                     meth = str(r.get("payment_method") or "")
                     if meth == "메인페이":
-                        return str(r.get("card_company") or "")
+                        return _safe_val(r.get("card_company"))
                     if "온누리" in meth:
-                        return str(r.get("onnuri_approval_code") or "")
+                        return _safe_val(r.get("onnuri_approval_code"))
                     if meth == "지역화폐":
-                        return str(r.get("card_company") or "")
+                        return _safe_val(r.get("card_company"))
                     return ""
                 _audit_df["승인번호"] = _audit_df.apply(_get_approval, axis=1)
 
