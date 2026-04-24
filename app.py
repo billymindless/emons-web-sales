@@ -6429,8 +6429,18 @@ def _superadmin_tab_unpaid_report():
         st.info("선택 기간 내 잔금이 있는 건이 없습니다.")
         return
     out_df = pd.DataFrame(rows)
-    display_df = _format_df_display(out_df, ["총판매금액", "미수금액(잔금)"])
+
+    # 기간별 총합 행 생성 (화면 표시 전용)
+    total_row = {col: "" for col in out_df.columns}
+    total_row["매장명"] = "【합계】"
+    total_row["총판매금액"] = int(out_df["총판매금액"].sum())
+    total_row["미수금액(잔금)"] = int(out_df["미수금액(잔금)"].sum())
+    display_df = _format_df_display(
+        pd.concat([out_df, pd.DataFrame([total_row])], ignore_index=True),
+        ["총판매금액", "미수금액(잔금)"],
+    )
     st.dataframe(display_df, width='stretch')
+
     csv_content = out_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "미수금 레포트 CSV 다운로드",
@@ -11468,7 +11478,7 @@ def render_customer_balance():
                                     st.error(f"요청 전송 실패: {req_err}")
 
     # ---------- 탭 2·3·4 공통 데이터: 1회만 로드 후 각 탭에서 재사용 ----------
-    order_cols_d10 = "id, customer_id, order_date, delivery_date, total_amount, cost_price, category, employee_names"
+    order_cols_d10 = "id, customer_id, order_date, delivery_date, total_amount, display_sales_amount, cost_price, category, employee_names"
     _shared_orders_d10 = load_orders_cached(db_filename, order_cols_d10, limit=None)
     _shared_payments_d10 = load_payments_cached(db_filename)
     # 탭2·3·4는 id, name, phone1만 사용 → 불필요 컬럼 제외
@@ -11491,7 +11501,8 @@ def render_customer_balance():
         else:
             pay_sum = _shared_pay_sum_d10
             orders["paid"] = orders["id"].map(pay_sum).fillna(0)
-            orders["balance"] = orders["total_amount"] - orders["paid"]
+            orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0) if "display_sales_amount" in orders.columns else 0
+            orders["balance"] = orders["total_amount"] + orders["display_sales_amount"] - orders["paid"]
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
             orders = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
             d10_end = today + timedelta(days=10)
@@ -11523,7 +11534,8 @@ def render_customer_balance():
         else:
             pay_sum = _shared_pay_sum_d10  # 탭2에서 이미 계산된 pay_sum 재사용
             orders["paid"] = orders["id"].map(pay_sum).fillna(0)
-            orders["balance"] = orders["total_amount"] - orders["paid"]
+            orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0) if "display_sales_amount" in orders.columns else 0
+            orders["balance"] = orders["total_amount"] + orders["display_sales_amount"] - orders["paid"]
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
             orders = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
             mask_past = orders["delivery_date"].notna() & (orders["delivery_date"].dt.date < today)
@@ -12616,7 +12628,8 @@ def render_dashboard():
     if len(orders) > 0 and "balance_status" in orders.columns:
         warn_orders = orders.copy()
         warn_orders["paid"] = warn_orders["id"].map(_dash_pay_sum).fillna(0)
-        warn_orders["real_balance"] = warn_orders["total_amount"] - warn_orders["paid"]
+        warn_orders["display_sales_amount"] = warn_orders["display_sales_amount"].fillna(0) if "display_sales_amount" in warn_orders.columns else 0
+        warn_orders["real_balance"] = warn_orders["total_amount"] + warn_orders["display_sales_amount"] - warn_orders["paid"]
         suspicious = warn_orders[(warn_orders["balance_status"] == "완납") & (warn_orders["real_balance"] != 0)]
         if len(suspicious) > 0:
             st.error(f"⚠️ 잔금 불일치 의심 건 {len(suspicious)}건 발생 (완납 표시이나 실 잔금이 0이 아님)")
@@ -12806,7 +12819,8 @@ def render_dashboard():
         pay_sum = _dash_pay_sum  # 위에서 이미 계산된 pay_sum 재사용
         orders = orders.copy()
         orders["paid"] = orders["id"].map(pay_sum).fillna(0)
-        orders["balance"] = orders["total_amount"] - orders["paid"]
+        orders["display_sales_amount"] = orders["display_sales_amount"].fillna(0) if "display_sales_amount" in orders.columns else 0
+        orders["balance"] = orders["total_amount"] + orders["display_sales_amount"] - orders["paid"]
         orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
         orders_with_cust = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
         orders_with_cust = orders_with_cust.rename(columns={"name": "고객명", "phone1": "전화번호", "delivery_date": "배송일", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
