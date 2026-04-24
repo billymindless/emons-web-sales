@@ -2406,8 +2406,9 @@ def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | Non
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=600)
 def _load_payments_supabase(db_filename: str, order_id: int | None = None) -> pd.DataFrame:
-    """app_payments 조회. order_id 지정 시 해당 주문만."""
+    """app_payments 조회. order_id 지정 시 해당 주문만. 10분 캐시 — 저장/삭제 후 clear_data_cache()로 즉시 갱신."""
     if not db_filename:
         return pd.DataFrame()
     client, err = get_supabase_client()
