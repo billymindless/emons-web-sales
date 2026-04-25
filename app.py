@@ -11144,9 +11144,12 @@ def render_customer_balance():
                                                         elif _pay_amt_key not in st.session_state:
                                                             st.session_state[_pay_amt_key] = _format_number_comma(str(_old_amt_for_mode))
                                                         if _is_delta_mode:
+                                                            def _fmt_pay_delta(_k=_pay_amt_key):
+                                                                st.session_state[_k] = _format_signed_number_comma(st.session_state.get(_k, ""))
                                                             st.text_input(
                                                                 "증감액 (예: -1,000,000 감액 / +500,000 증액 / 0 전액취소)",
                                                                 key=_pay_amt_key,
+                                                                on_change=_fmt_pay_delta,
                                                             )
                                                             _delta_raw = str(st.session_state.get(_pay_amt_key, "0")).strip()
                                                             _delta_sign = -1 if _delta_raw.startswith("-") else 1
