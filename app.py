@@ -9345,6 +9345,9 @@ def render_new_sales():
         if not delivery_ok:
             st.error("배송일(필수)을 선택하세요.")
             st.stop()
+        if not selected_categories:
+            st.error("품목/카테고리(필수)를 1개 이상 선택하세요.")
+            st.stop()
         cost_price_int = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
         general_sales_int = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
         display_sales_int = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
