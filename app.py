@@ -8909,6 +8909,10 @@ def render_new_sales():
     if "_gamification_ctx" in st.session_state:
         _render_gamification_feedback(st.session_state["_gamification_ctx"])
         del st.session_state["_gamification_ctx"]
+    # 매출 등록 완료 배너 (st.rerun() 후에도 유지되도록 세션 상태 활용)
+    if "_sales_complete_banner" in st.session_state:
+        _b = st.session_state.pop("_sales_complete_banner")
+        st.success(f"✅ 입력 완료! {_b['cust_name']}님 {_b['amount']:,}원 매출 등록이 완료되었습니다.")
     st.header("새로운 매출 등록")
     # 직원 목록: Supabase app_users/app_user_stores 우선 사용, 없으면 레거시 SQLite Employees 사용
     employees = pd.DataFrame(columns=["id", "name"])
@@ -9536,6 +9540,7 @@ def render_new_sales():
                         del st.session_state[key]
                     except Exception:
                         pass
+            st.session_state["_sales_complete_banner"] = {"amount": final_sales_save, "cust_name": cust_name}
             st.rerun()
         else:
             conn = get_tenant_conn(db_filename)
@@ -9659,6 +9664,7 @@ def render_new_sales():
                         del st.session_state[key]
                     except Exception:
                         pass
+            st.session_state["_sales_complete_banner"] = {"amount": final_sales_save, "cust_name": cust_name}
             st.rerun()
 
 
@@ -9850,6 +9856,10 @@ def _customer_balance_payment_ui(
     default_payment_date: date | None = None,
 ):
     """잔금 완납 처리(결제 추가) 공통 UI. 직원도 사용 가능하되, 모든 변경은 PaymentHistory에 기록."""
+    _pay_done_key = f"_pay_done_{key_prefix}"
+    if _pay_done_key in st.session_state:
+        _pd = st.session_state.pop(_pay_done_key)
+        st.success(f"✅ 결제 입력 완료! {_pd['amount']:,}원이 등록되었습니다.")
     amt_key = f"{key_prefix}_amt"
     if amt_key not in st.session_state:
         st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
@@ -10008,6 +10018,7 @@ def _customer_balance_payment_ui(
                 conn.close()
             clear_data_cache()
             st.toast("등록되었습니다. 잔금이 0원이면 리스트에서 사라집니다.", icon="✅")
+            st.session_state[f"_pay_done_{key_prefix}"] = {"amount": add_amt_int}
             st.rerun()
         else:
             st.warning("금액을 입력하세요.")
