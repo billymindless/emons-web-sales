@@ -109,8 +109,6 @@ def _inject_mobile_css():
         .mobile-menu-hint { display: none; }
         /* ----- 탭 가로 스크롤: PC·모바일 공통 적용 (탭이 많을 때 잘리지 않도록) ----- */
         [data-testid="stTabs"] { overflow: visible !important; width: 100% !important; }
-        [data-testid="stTabs"] > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; width: 100% !important; }
-        [data-testid="stTabs"] > div > div { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; }
         [data-testid="stTabs"] [role="tablist"] {
             display: flex !important;
             flex-wrap: nowrap !important;
@@ -118,12 +116,14 @@ def _inject_mobile_css():
             -webkit-overflow-scrolling: touch !important;
             padding-left: 0.25rem !important;
             margin-left: 0 !important;
-            scrollbar-width: none !important;
-            -ms-overflow-style: none !important;
             width: 100% !important;
             box-sizing: border-box !important;
+            scrollbar-width: thin !important;
+            scrollbar-color: rgba(0,0,0,0.25) transparent !important;
         }
-        [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: none !important; }
+        [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: block !important; height: 3px !important; }
+        [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar-track { background: transparent !important; }
+        [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar-thumb { background-color: rgba(0,0,0,0.25) !important; border-radius: 2px !important; }
         [data-testid="stTabs"] [role="tab"] {
             flex-shrink: 0 !important;
             min-width: max-content !important;
@@ -152,11 +152,16 @@ def _inject_mobile_css():
             /* 표 영역 패딩 최소화, 가로 스크롤 */
             [data-testid="stDataFrame"] { padding: 0 2px !important; overflow-x: auto !important; }
             [data-testid="stDataFrame"] > div { margin: 0 !important; max-width: 100vw !important; }
-            /* 모바일 탭 버튼: 텍스트 크기·패딩 추가 조정 */
+            /* 모바일 탭: 버튼 크기 조정 + 스크롤바 숨김 */
             [data-testid="stTabs"] [role="tab"] {
                 padding: 0.4rem 0.5rem !important;
                 font-size: 0.8rem !important;
             }
+            [data-testid="stTabs"] [role="tablist"] {
+                scrollbar-width: none !important;
+                -ms-overflow-style: none !important;
+            }
+            [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: none !important; }
             .mobile-menu-hint { display: block !important; }
             /* 터치 친화: 버튼·입력창 최소 높이 */
             button[kind="primary"], button[kind="secondary"], .stButton > button { min-height: 44px !important; padding: 0.5rem 0.75rem !important; font-size: 1rem !important; }
