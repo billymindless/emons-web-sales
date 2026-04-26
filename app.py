@@ -4234,6 +4234,159 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
                     st.image(r["file_path"], caption=r["original_name"], use_column_width=True)
 
 
+def render_margin_monitor():
+    """마진 모니터링: 정상 마진율(20%) 대비 ±3% 초과 이탈 주문 표시. store_admin·superadmin 전용."""
+    role = st.session_state.get("role")
+    if role not in ("store_admin", "superadmin"):
+        st.error("접근 권한이 없습니다.")
+        return
+
+    st.header("📊 마진 모니터링")
+    st.caption(
+        "정상 마진율 기준 **20% ± 3%** (17% ~ 23%)를 벗어난 주문을 표시합니다.  \n"
+        "전시품 원가(display_cost_amount) 포함 기준으로 계산합니다."
+    )
+
+    # ── 기간 선택 ──
+    today = _today_kst()
+    from calendar import monthrange
+    month_start = today.replace(day=1)
+    month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
+
+    col_s, col_e = st.columns(2)
+    with col_s:
+        start_d = st.date_input("조회 시작일", value=month_start, key="mm_start")
+    with col_e:
+        end_d = st.date_input("조회 종료일", value=today, key="mm_end")
+
+    MARGIN_TARGET = 20.0
+    MARGIN_TOLERANCE = 3.0
+
+    # ── 매장 선택 (superadmin) / 단일 매장 (store_admin) ──
+    sc, _ = get_supabase_client()
+    if not sc:
+        st.error("Supabase 연결에 실패했습니다.")
+        return
+
+    target_stores: list[dict] = []
+    if role == "superadmin":
+        stores_df = get_supabase_stores_dataframe_cached()
+        store_opts = ["전체 매장"] + stores_df["store_name"].tolist()
+        sel_store = st.selectbox("매장 선택", store_opts, key="mm_store_sel")
+        if sel_store == "전체 매장":
+            target_stores = stores_df[["store_name", "db_filename"]].to_dict("records")
+        else:
+            row = stores_df[stores_df["store_name"] == sel_store].iloc[0]
+            target_stores = [{"store_name": row["store_name"], "db_filename": row["db_filename"]}]
+    else:
+        db_fn = st.session_state.get("current_db")
+        store_name = _get_store_name_by_db(db_fn) or db_fn
+        target_stores = [{"store_name": store_name, "db_filename": db_fn}]
+
+    if st.button("🔍 조회", key="mm_search_btn", type="primary"):
+        st.session_state["mm_queried"] = True
+
+    if not st.session_state.get("mm_queried"):
+        st.info("조회 버튼을 눌러 이상 마진 주문을 확인하세요.")
+        return
+
+    # ── 데이터 조회 ──
+    all_rows = []
+    for s in target_stores:
+        db_fn = s["db_filename"]
+        store_nm = s["store_name"]
+        orders = _load_orders_supabase(
+            db_fn,
+            "id, order_date, employee_names, total_amount, cost_price, display_sales_amount, display_cost_amount, actual_margin",
+            limit=None,
+            start_date=start_d.isoformat(),
+            end_date=end_d.isoformat(),
+        )
+        if orders is None or orders.empty:
+            continue
+        orders["_store"] = store_nm
+        all_rows.append(orders)
+
+    if not all_rows:
+        st.success("✅ 선택 기간에 주문 데이터가 없습니다.")
+        return
+
+    df = pd.concat(all_rows, ignore_index=True)
+    df["total_amount"] = pd.to_numeric(df["total_amount"], errors="coerce").fillna(0)
+    df["cost_price"] = pd.to_numeric(df["cost_price"], errors="coerce").fillna(0)
+    df["display_cost_amount"] = pd.to_numeric(df["display_cost_amount"], errors="coerce").fillna(0)
+    df["display_sales_amount"] = pd.to_numeric(df["display_sales_amount"], errors="coerce").fillna(0)
+    df["actual_margin"] = pd.to_numeric(df["actual_margin"], errors="coerce").fillna(0)
+
+    # 마진율 계산 (판매가 0이면 제외)
+    df = df[df["total_amount"] > 0].copy()
+    df["마진율(%)"] = (df["actual_margin"] / df["total_amount"] * 100).round(1)
+
+    # 이상 마진 필터: 20% 기준 ±3% 초과
+    abnormal = df[
+        (df["마진율(%)"] < MARGIN_TARGET - MARGIN_TOLERANCE) |
+        (df["마진율(%)"] > MARGIN_TARGET + MARGIN_TOLERANCE)
+    ].copy()
+
+    if abnormal.empty:
+        st.success(f"✅ 선택 기간에 이상 마진 주문이 없습니다. (기준: {MARGIN_TARGET}% ± {MARGIN_TOLERANCE}%)")
+        return
+
+    # 이상 유형 분류
+    def _margin_flag(rate):
+        if rate < 0:
+            return "🔴 음수 마진"
+        elif rate < MARGIN_TARGET - MARGIN_TOLERANCE:
+            return "🟠 마진 낮음"
+        else:
+            return "🟡 마진 높음"
+
+    abnormal["이상 유형"] = abnormal["마진율(%)"].apply(_margin_flag)
+
+    # 표시 컬럼 구성
+    disp = abnormal.rename(columns={
+        "_store": "매장명",
+        "id": "주문ID",
+        "order_date": "주문일",
+        "employee_names": "담당직원",
+        "total_amount": "판매금액",
+        "cost_price": "일반원가",
+        "display_sales_amount": "전시판매가",
+        "display_cost_amount": "전시원가",
+        "actual_margin": "마진액",
+    })
+    show_cols = ["매장명", "주문ID", "주문일", "담당직원",
+                 "판매금액", "일반원가", "전시판매가", "전시원가",
+                 "마진액", "마진율(%)", "이상 유형"]
+    if role != "superadmin":
+        show_cols = [c for c in show_cols if c != "매장명"]
+    disp = disp[[c for c in show_cols if c in disp.columns]].sort_values("마진율(%)")
+
+    st.error(f"⚠️ 이상 마진 주문 **{len(disp)}건** 발견 (기준: {MARGIN_TARGET}% ± {MARGIN_TOLERANCE}%)")
+
+    # 통화 포맷
+    disp_fmt = disp.copy()
+    for col in ["판매금액", "일반원가", "전시판매가", "전시원가", "마진액"]:
+        if col in disp_fmt.columns:
+            disp_fmt[col] = disp_fmt[col].apply(lambda x: f"{int(x):,}원")
+    disp_fmt["마진율(%)"] = disp_fmt["마진율(%)"].apply(lambda x: f"{x:.1f}%")
+    st.dataframe(disp_fmt, width="stretch")
+    st.caption("※ actual_margin = 판매가 − (일반원가 + 전시원가) − 카드수수료 기준")
+
+    # 엑셀 다운로드
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        disp.to_excel(writer, sheet_name="이상마진주문", index=False)
+    buf.seek(0)
+    st.download_button(
+        "📥 이상 마진 주문 엑셀 다운로드",
+        data=buf.getvalue(),
+        file_name=f"이상마진모니터링_{start_d.isoformat()}_{end_d.isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="mm_dl_btn",
+    )
+
+
 def render_payment_history_monitor():
     """매장 관리자/최고 관리자용 결제 변경/취소 모니터링 화면. Supabase app_payment_history 우선."""
     db_filename = st.session_state.get("current_db")
@@ -13284,6 +13437,10 @@ def main():
     if role in ("store_admin", "superadmin"):
         if st.sidebar.button("🚨 결제 변경/취소 모니터링", width='stretch'):
             st.session_state["active_admin_page"] = "payment_monitor"
+            st.session_state.pop("mm_queried", None)
+        if st.sidebar.button("📊 마진 모니터링", width='stretch'):
+            st.session_state["active_admin_page"] = "margin_monitor"
+            st.session_state.pop("mm_queried", None)
         _del_db = st.session_state.get("current_db")
         _pending_del_count = len(_fetch_pending_delete_requests(_del_db)) if _del_db else 0
         _del_btn_label = f"🗑️ 주문 삭제 요청 관리 ({_pending_del_count}건)" if _pending_del_count > 0 else "🗑️ 주문 삭제 요청 관리"
@@ -13308,6 +13465,11 @@ def main():
     # 관리자 전용 모니터링 화면 라우팅
     if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "payment_monitor":
         render_payment_history_monitor()
+        return
+
+    # 관리자 전용: 마진 모니터링
+    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "margin_monitor":
+        render_margin_monitor()
         return
 
     # 관리자 전용: 주문 삭제 요청 관리 화면 라우팅
