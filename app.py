@@ -4236,7 +4236,8 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
 
 def render_margin_monitor():
     """마진 모니터링: 정상 마진율(20%) 대비 ±3% 초과 이탈 주문 표시. store_admin·superadmin 전용."""
-    role = st.session_state.get("role")
+    _user = st.session_state.get("current_user") or {}
+    role = _user.get("role", "")
     if role not in ("store_admin", "superadmin"):
         st.error("접근 권한이 없습니다.")
         return
