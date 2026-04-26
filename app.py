@@ -8574,10 +8574,7 @@ def render_faq_page():
 
 
 def render_superadmin():
-    # 최고 관리자 화면: 헤더 + 탭을 Sticky Header 컨테이너로 감싸 상단 고정
-    st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
-    st.header("최고 관리자 메뉴")
-    t = st.tabs([
+    _SUPERADMIN_MENUS = [
         "① 전 지점 통합 대시보드",
         "② 매장별 직원 평가 현황 (HR)",
         "③ 📢 공지사항 관리",
@@ -8588,27 +8585,46 @@ def render_superadmin():
         "⑧ 월별 결제수단 집계표",
         "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
         "⑩ FAQ (도움말)",
-    ])
+    ]
+    if "superadmin_menu_idx" not in st.session_state:
+        st.session_state["superadmin_menu_idx"] = 0
+    if st.session_state["superadmin_menu_idx"] >= len(_SUPERADMIN_MENUS):
+        st.session_state["superadmin_menu_idx"] = 0
+
+    st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
+    st.header("최고 관리자 메뉴")
+    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
+    menu_sel = st.selectbox(
+        "최고 관리자 메뉴",
+        _SUPERADMIN_MENUS,
+        index=st.session_state["superadmin_menu_idx"],
+        key="superadmin_menu_select",
+        label_visibility="collapsed",
+    )
     st.markdown("</div>", unsafe_allow_html=True)
-    with t[0]:
+
+    st.session_state["superadmin_menu_idx"] = _SUPERADMIN_MENUS.index(menu_sel)
+    st.divider()
+
+    if menu_sel == "① 전 지점 통합 대시보드":
         _superadmin_tab1_integrated_dashboard()
-    with t[1]:
+    elif menu_sel == "② 매장별 직원 평가 현황 (HR)":
         _superadmin_tab2_hr_store_employees()
-    with t[2]:
+    elif menu_sel == "③ 📢 공지사항 관리":
         _superadmin_tab3_notices()
-    with t[3]:
+    elif menu_sel == "④ 원클릭 데이터 백업 (CSV)":
         _superadmin_tab4_backup_csv()
-    with t[4]:
+    elif menu_sel == "⑤ 매장 계정 관리":
         _superadmin_tab5_store_accounts()
-    with t[5]:
+    elif menu_sel == "⑥ 전 지점 마케팅 분석":
         render_marketing_insights_superadmin()
-    with t[6]:
+    elif menu_sel == "⑦ 미수금(잔금) 레포트":
         _superadmin_tab_unpaid_report()
-    with t[7]:
+    elif menu_sel == "⑧ 월별 결제수단 집계표":
         render_monthly_payment_report(is_superadmin=True)
-    with t[8]:
+    elif menu_sel == "⑨ ⚠️ 데이터 초기화 (Danger Zone)":
         _superadmin_tab_danger_zone_data_reset()
-    with t[9]:
+    elif menu_sel == "⑩ FAQ (도움말)":
         render_faq_page()
 
 
