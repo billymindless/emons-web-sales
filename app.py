@@ -8168,10 +8168,12 @@ def _superadmin_tab_danger_zone_data_reset():
             disabled=not phrase_ok,
             type="primary",
         ):
-            client, err = get_supabase_client()
-            if err or not client:
-                st.error("Supabase 연결에 실패했습니다.")
-                return
+            # DELETE는 RLS를 우회하는 service_role_key 클라이언트 필요
+            admin_client, admin_err = get_supabase_admin_client()
+            if admin_err or not admin_client:
+                st.error(f"관리자 권한 Supabase 클라이언트 생성 실패: {admin_err or '연결 불가'}")
+                st.caption("`.streamlit/secrets.toml` 의 `[supabase] service_role_key` 를 확인해 주세요.")
+                st.stop()
 
             all_errors = []
             deleted_stores = []
@@ -8188,7 +8190,7 @@ def _superadmin_tab_danger_zone_data_reset():
                 if not db_fn:
                     continue
                 store_name_val = _get_store_name_by_db(db_fn) or sname
-                errs = _danger_zone_delete_store_data(client, db_fn, store_name_val, scope)
+                errs = _danger_zone_delete_store_data(admin_client, db_fn, store_name_val, scope)
                 all_errors.extend(errs)
                 deleted_stores.append(sname)
                 progress.progress((i + 1) / len(target_stores), text=f"{sname} 처리 완료")
@@ -8198,13 +8200,22 @@ def _superadmin_tab_danger_zone_data_reset():
 
             if all_errors:
                 st.warning("일부 삭제 실패:\n" + "\n".join(all_errors[:10]))
+                st.session_state["dz_result"] = ("warn", f"일부 삭제 실패: {'; '.join(all_errors[:3])}")
             else:
-                st.success(
-                    f"✅ 초기화 완료!  \n"
-                    f"처리 매장: {', '.join(deleted_stores)}  \n"
-                    f"삭제 테이블: {', '.join(deleted_tables)}"
+                st.session_state["dz_result"] = (
+                    "ok",
+                    f"✅ 초기화 완료! 처리 매장: {', '.join(deleted_stores)} | 삭제 테이블: {', '.join(deleted_tables)}",
                 )
             st.rerun()
+
+    # expander 밖에서 결과 메시지 표시 (rerun 후에도 유지)
+    dz_result = st.session_state.pop("dz_result", None)
+    if dz_result:
+        status, msg = dz_result
+        if status == "ok":
+            st.success(msg)
+        else:
+            st.warning(msg)
 
 
 # 앱 내 FAQ (검색 대상: 제목·본문·keywords). 항목 추가 시 이 리스트만 수정하면 됩니다.
