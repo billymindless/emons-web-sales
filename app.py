@@ -4242,10 +4242,14 @@ def render_margin_monitor():
         st.error("접근 권한이 없습니다.")
         return
 
+    # 이상 마진 기준: 17% 이하 또는 23% 이상
+    MARGIN_LOW = 17.0
+    MARGIN_HIGH = 23.0
+
     st.header("📊 마진 모니터링")
     st.caption(
-        "정상 마진율 기준 **20% ± 3%** (17% ~ 23%)를 벗어난 주문을 표시합니다.  \n"
-        "전시품 원가(display_cost_amount) 포함 기준으로 계산합니다."
+        f"정상 마진율 기준 **{MARGIN_LOW}% 초과 ~ {MARGIN_HIGH}% 미만** 범위를 벗어난 주문을 표시합니다.  \n"
+        "마진율 = (판매가 − 일반원가 − **전시원가**) ÷ 판매가 × 100 (원가 기준, 수수료 별도)"
     )
 
     # ── 기간 선택 ──
@@ -4259,9 +4263,6 @@ def render_margin_monitor():
         start_d = st.date_input("조회 시작일", value=month_start, key="mm_start")
     with col_e:
         end_d = st.date_input("조회 종료일", value=today, key="mm_end")
-
-    MARGIN_TARGET = 20.0
-    MARGIN_TOLERANCE = 3.0
 
     # ── 매장 선택 (superadmin) / 단일 매장 (store_admin) ──
     sc, _ = get_supabase_client()
@@ -4313,34 +4314,38 @@ def render_margin_monitor():
         return
 
     df = pd.concat(all_rows, ignore_index=True)
-    df["total_amount"] = pd.to_numeric(df["total_amount"], errors="coerce").fillna(0)
-    df["cost_price"] = pd.to_numeric(df["cost_price"], errors="coerce").fillna(0)
-    df["display_cost_amount"] = pd.to_numeric(df["display_cost_amount"], errors="coerce").fillna(0)
-    df["display_sales_amount"] = pd.to_numeric(df["display_sales_amount"], errors="coerce").fillna(0)
-    df["actual_margin"] = pd.to_numeric(df["actual_margin"], errors="coerce").fillna(0)
+    for _c in ["total_amount", "cost_price", "display_cost_amount", "display_sales_amount", "actual_margin"]:
+        df[_c] = pd.to_numeric(df[_c], errors="coerce").fillna(0)
 
-    # 마진율 계산 (판매가 0이면 제외)
+    # 판매가 0이면 제외
     df = df[df["total_amount"] > 0].copy()
-    df["마진율(%)"] = (df["actual_margin"] / df["total_amount"] * 100).round(1)
 
-    # 이상 마진 필터: 20% 기준 ±3% 초과
+    # ── 마진율 재계산 (전시품 원가 명시적 포함, 수수료 제외 원가 기준) ──
+    # 전시품 판매가(display_sales_amount)는 total_amount에 이미 합산되어 있음
+    # 전시품 원가(display_cost_amount)를 명시적으로 차감하여 재계산
+    df["재계산_마진액"] = df["total_amount"] - df["cost_price"] - df["display_cost_amount"]
+    df["마진율(%)"] = (df["재계산_마진액"] / df["total_amount"] * 100).round(1)
+    # DB actual_margin 기준 마진율 (수수료 포함 실질마진, 참고용)
+    df["실질마진율(수수료포함,%)"] = (df["actual_margin"] / df["total_amount"] * 100).round(1)
+
+    # ── 이상 마진 필터: 17% 이하(<=) 또는 23% 이상(>=) ──
     abnormal = df[
-        (df["마진율(%)"] < MARGIN_TARGET - MARGIN_TOLERANCE) |
-        (df["마진율(%)"] > MARGIN_TARGET + MARGIN_TOLERANCE)
+        (df["마진율(%)"] <= MARGIN_LOW) |
+        (df["마진율(%)"] >= MARGIN_HIGH)
     ].copy()
 
     if abnormal.empty:
-        st.success(f"✅ 선택 기간에 이상 마진 주문이 없습니다. (기준: {MARGIN_TARGET}% ± {MARGIN_TOLERANCE}%)")
+        st.success(f"✅ 선택 기간에 이상 마진 주문이 없습니다. (기준: {MARGIN_LOW}% 이하 또는 {MARGIN_HIGH}% 이상)")
         return
 
     # 이상 유형 분류
     def _margin_flag(rate):
         if rate < 0:
             return "🔴 음수 마진"
-        elif rate < MARGIN_TARGET - MARGIN_TOLERANCE:
-            return "🟠 마진 낮음"
+        elif rate <= MARGIN_LOW:
+            return "🟠 마진 낮음 (17% 이하)"
         else:
-            return "🟡 마진 높음"
+            return "🟡 마진 높음 (23% 이상)"
 
     abnormal["이상 유형"] = abnormal["마진율(%)"].apply(_margin_flag)
 
@@ -4354,25 +4359,37 @@ def render_margin_monitor():
         "cost_price": "일반원가",
         "display_sales_amount": "전시판매가",
         "display_cost_amount": "전시원가",
-        "actual_margin": "마진액",
+        "재계산_마진액": "마진액(원가기준)",
+        "actual_margin": "실질마진액(수수료포함)",
     })
     show_cols = ["매장명", "주문ID", "주문일", "담당직원",
                  "판매금액", "일반원가", "전시판매가", "전시원가",
-                 "마진액", "마진율(%)", "이상 유형"]
+                 "마진액(원가기준)", "마진율(%)", "실질마진율(수수료포함,%)", "이상 유형"]
     if role != "superadmin":
         show_cols = [c for c in show_cols if c != "매장명"]
     disp = disp[[c for c in show_cols if c in disp.columns]].sort_values("마진율(%)")
 
-    st.error(f"⚠️ 이상 마진 주문 **{len(disp)}건** 발견 (기준: {MARGIN_TARGET}% ± {MARGIN_TOLERANCE}%)")
+    # 유형별 건수 요약
+    low_cnt = (abnormal["마진율(%)"] <= MARGIN_LOW).sum()
+    high_cnt = (abnormal["마진율(%)"] >= MARGIN_HIGH).sum()
+    st.error(
+        f"⚠️ 이상 마진 주문 **{len(disp)}건** 발견  \n"
+        f"🟠 마진 낮음(17% 이하): **{low_cnt}건** | 🟡 마진 높음(23% 이상): **{high_cnt}건**"
+    )
 
     # 통화 포맷
     disp_fmt = disp.copy()
-    for col in ["판매금액", "일반원가", "전시판매가", "전시원가", "마진액"]:
+    for col in ["판매금액", "일반원가", "전시판매가", "전시원가", "마진액(원가기준)", "실질마진액(수수료포함)"]:
         if col in disp_fmt.columns:
             disp_fmt[col] = disp_fmt[col].apply(lambda x: f"{int(x):,}원")
     disp_fmt["마진율(%)"] = disp_fmt["마진율(%)"].apply(lambda x: f"{x:.1f}%")
+    if "실질마진율(수수료포함,%)" in disp_fmt.columns:
+        disp_fmt["실질마진율(수수료포함,%)"] = disp_fmt["실질마진율(수수료포함,%)"].apply(lambda x: f"{x:.1f}%")
     st.dataframe(disp_fmt, width="stretch")
-    st.caption("※ actual_margin = 판매가 − (일반원가 + 전시원가) − 카드수수료 기준")
+    st.caption(
+        "※ **마진율(%)** = (판매금액 − 일반원가 − 전시원가) ÷ 판매금액 × 100 (원가 기준, 수수료 미포함)  \n"
+        "※ **실질마진율** = actual_margin ÷ 판매금액 × 100 (수수료 차감 후 실질 마진, 참고용)"
+    )
 
     # 엑셀 다운로드
     buf = io.BytesIO()
