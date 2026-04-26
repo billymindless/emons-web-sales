@@ -7229,9 +7229,10 @@ def render_monthly_payment_report(is_superadmin: bool):
 
         df_emp = pd.DataFrame(rows)
 
-        # order_id로 고객정보 조회 (db_filename별 배치, app_orders + tenant 필터 적용)
+        # order_id로 고객정보 + 원가 조회 (db_filename별 배치, app_orders 단일 쿼리로 통합)
         df_emp["고객명"] = ""
         df_emp["전화번호"] = ""
+        df_emp["원가(배분)"] = 0.0
         try:
             _sc, _ = get_supabase_client()
             if _sc:
@@ -7242,10 +7243,15 @@ def render_monthly_payment_report(is_superadmin: bool):
                         continue
                     _chunks = [_oids[i:i+100] for i in range(0, len(_oids), 100)]
                     _cid_map = {}
+                    _cost_map: dict = {}
                     for _chunk in _chunks:
-                        _r = _sc.table("app_orders").select("id, customer_id").eq("db_filename", _fn).in_("id", _chunk).execute()
+                        _r = _sc.table("app_orders").select(
+                            "id, customer_id, cost_price, display_cost_amount"
+                        ).eq("db_filename", _fn).in_("id", _chunk).execute()
                         for _row in (_r.data or []):
-                            _cid_map[_row["id"]] = _row.get("customer_id")
+                            _rid = _row["id"]
+                            _cid_map[_rid] = _row.get("customer_id")
+                            _cost_map[_rid] = float(_row.get("cost_price") or 0) + float(_row.get("display_cost_amount") or 0)
                     _cids = [v for v in _cid_map.values() if v is not None]
                     if _cids:
                         _cust_map = _get_customers_by_ids_supabase(str(_fn), list(set(int(c) for c in _cids)))
@@ -7255,6 +7261,12 @@ def render_monthly_payment_report(is_superadmin: bool):
                         df_emp.loc[_mask, "전화번호"] = df_emp.loc[_mask, "원본주문ID"].apply(
                             lambda oid, cm=_cid_map, cu=_cust_map: (cu.get(int(cm.get(int(oid), -1) or -1)) or {}).get("phone1", "") if pd.notna(oid) and int(oid) in cm else ""
                         )
+                    # 원가 1/n 배분: 판매건수(=1/n)를 곱해 직원별로 나눔
+                    df_emp.loc[_mask, "원가(배분)"] = df_emp.loc[_mask].apply(
+                        lambda r, cm=_cost_map: cm.get(int(r["원본주문ID"]), 0) * r["판매건수"]
+                        if pd.notna(r["원본주문ID"]) else 0,
+                        axis=1,
+                    )
         except Exception as _e:
             st.caption(f"⚠️ 고객정보 조회 오류: {_e}")
 
@@ -7264,95 +7276,118 @@ def render_monthly_payment_report(is_superadmin: bool):
         _date_diff = (date_range_end - date_range_start).days
         _show_inline_detail = (query_mode == "직접 날짜 지정") and (_date_diff <= 7)
 
-        # 결제수단 조회 (1주일 이하 직접 날짜 지정 모드에서만)
+        # 결제수단 + 카드수수료 조회 (수수료는 항상, 결제수단 표시는 7일 이하 상세 모드에서만)
         df_emp["결제수단"] = ""
-        if _show_inline_detail:
-            try:
-                _sc, _ = get_supabase_client()
-                if _sc:
-                    for _fn in df_emp["_db_fn"].dropna().unique():
-                        _mask = df_emp["_db_fn"] == _fn
-                        _oids = df_emp.loc[_mask, "원본주문ID"].dropna().astype(int).unique().tolist()
-                        if not _oids:
-                            continue
-                        _pay_method_map: dict = {}
-                        _chunks = [_oids[i:i+100] for i in range(0, len(_oids), 100)]
-                        for _chunk in _chunks:
-                            _pr = _sc.table("app_payments").select(
-                                "order_id, payment_method, card_company"
-                            ).eq(ORDERS_PAYMENTS_TENANT_COL, _fn).in_("order_id", _chunk).execute()
-                            for _prow in (_pr.data or []):
-                                _oid_key = _prow.get("order_id")
-                                if _oid_key is None:
-                                    continue
-                                _pm = str(_prow.get("payment_method") or "").strip()
-                                _cc = str(_prow.get("card_company") or "").strip()
-                                if _cc and _cc not in ("-", ""):
-                                    _pm = f"{_pm}({_cc})" if _pm else _cc
-                                if _pm:
-                                    existing = _pay_method_map.get(int(_oid_key), [])
-                                    if _pm not in existing:
-                                        existing.append(_pm)
-                                    _pay_method_map[int(_oid_key)] = existing
+        df_emp["카드수수료(배분)"] = 0.0
+        try:
+            _sc, _ = get_supabase_client()
+            if _sc:
+                for _fn in df_emp["_db_fn"].dropna().unique():
+                    _mask = df_emp["_db_fn"] == _fn
+                    _oids = df_emp.loc[_mask, "원본주문ID"].dropna().astype(int).unique().tolist()
+                    if not _oids:
+                        continue
+                    _pay_method_map: dict = {}
+                    _fee_map: dict = {}
+                    _chunks = [_oids[i:i+100] for i in range(0, len(_oids), 100)]
+                    for _chunk in _chunks:
+                        _pr = _sc.table("app_payments").select(
+                            "order_id, payment_method, card_company, fee_amount"
+                        ).eq(ORDERS_PAYMENTS_TENANT_COL, _fn).in_("order_id", _chunk).execute()
+                        for _prow in (_pr.data or []):
+                            _oid_key = _prow.get("order_id")
+                            if _oid_key is None:
+                                continue
+                            _pm = str(_prow.get("payment_method") or "").strip()
+                            _cc = str(_prow.get("card_company") or "").strip()
+                            if _cc and _cc not in ("-", ""):
+                                _pm = f"{_pm}({_cc})" if _pm else _cc
+                            if _pm:
+                                existing = _pay_method_map.get(int(_oid_key), [])
+                                if _pm not in existing:
+                                    existing.append(_pm)
+                                _pay_method_map[int(_oid_key)] = existing
+                            # 수수료 합산 (동일 주문 복수 결제 건 누적)
+                            _fee_map[int(_oid_key)] = _fee_map.get(int(_oid_key), 0.0) + float(_prow.get("fee_amount") or 0)
+                    if _show_inline_detail:
                         df_emp.loc[_mask, "결제수단"] = df_emp.loc[_mask, "원본주문ID"].apply(
                             lambda oid, pm=_pay_method_map: ", ".join(pm.get(int(oid), [])) if pd.notna(oid) else ""
                         )
-            except Exception as _pe:
-                st.caption(f"⚠️ 결제수단 조회 오류: {_pe}")
+                    # 수수료 1/n 배분: 판매건수(=1/n) 곱
+                    df_emp.loc[_mask, "카드수수료(배분)"] = df_emp.loc[_mask].apply(
+                        lambda r, fm=_fee_map: fm.get(int(r["원본주문ID"]), 0.0) * r["판매건수"]
+                        if pd.notna(r["원본주문ID"]) else 0.0,
+                        axis=1,
+                    )
+        except Exception as _pe:
+            st.caption(f"⚠️ 결제수단/수수료 조회 오류: {_pe}")
+
+        # 마진(배분) = 판매금액 - 원가(배분) - 카드수수료(배분)
+        df_emp["마진(배분)"] = df_emp["판매금액"] - df_emp["원가(배분)"] - df_emp["카드수수료(배분)"]
 
         # 3. 요약 집계 (Excel 및 >7일 화면용으로 항상 계산)
+        _money_cols = ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)", "판매건수"]
         if selected_emp == "전체 직원":
-            summary = df_emp.groupby(["매장명", group_col, "직원명"], as_index=False)[["판매금액", "판매건수"]].sum()
+            summary = df_emp.groupby(["매장명", group_col, "직원명"], as_index=False)[_money_cols].sum()
         else:
-            summary = df_emp.groupby(["매장명", group_col], as_index=False)[["판매금액", "판매건수"]].sum()
+            summary = df_emp.groupby(["매장명", group_col], as_index=False)[_money_cols].sum()
             summary.insert(2, "직원명", selected_emp)
 
         summary = summary.sort_values(by=["매장명", group_col, "판매금액"], ascending=[True, True, False]).reset_index(drop=True)
-        summary["판매금액"] = summary["판매금액"].round(0).astype(int)
+        for _c in ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)"]:
+            summary[_c] = summary[_c].round(0).astype(int)
         summary["판매건수"] = summary["판매건수"].round(2)
 
-        # 3-a. 7일 이하 직접 날짜 지정: 상세내역 단일 테이블만 표시 (고객명·전화번호·결제수단·원본주문ID 포함)
+        # 3-a. 7일 이하 직접 날짜 지정: 상세내역 단일 테이블만 표시
         if _show_inline_detail:
-            st.write("📋 **판매 상세 내역 (결제수단 포함)**")
+            st.write("📋 **판매 상세 내역 (원가·수수료·마진 포함)**")
             detail_inline = df_emp.copy()
-            detail_inline["판매금액"] = detail_inline["판매금액"].round(0).astype(int)
+            for _c in ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)"]:
+                detail_inline[_c] = detail_inline[_c].round(0).astype(int)
             detail_inline["판매건수"] = detail_inline["판매건수"].round(2)
             detail_inline = detail_inline.sort_values(by=["일자", "매장명", "직원명"], ascending=[True, True, True])
             detail_inline = detail_inline.drop(columns=[c for c in ["_db_fn", "월"] if c in detail_inline.columns])
-            inline_cols = ["매장명", "일자", "직원명", "고객명", "전화번호", "결제수단", "비고", "판매금액", "판매건수", "원본주문ID"]
+            inline_cols = ["매장명", "일자", "직원명", "고객명", "전화번호", "결제수단", "비고",
+                           "판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)", "판매건수", "원본주문ID"]
             detail_inline = detail_inline[[c for c in inline_cols if c in detail_inline.columns]]
             disp_inline = detail_inline.copy()
-            disp_inline["판매금액"] = disp_inline["판매금액"].apply(lambda x: f"{x:,}원")
+            for _c in ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)"]:
+                if _c in disp_inline.columns:
+                    disp_inline[_c] = disp_inline[_c].apply(lambda x: f"{x:,}원")
             disp_inline["판매건수"] = disp_inline["판매건수"].apply(lambda x: f"{x:g}건")
             st.dataframe(disp_inline, width='stretch')
-            st.caption("※ transaction_date(판매/변경 시점) 기준. 증액/감액 delta도 포함됩니다.")
+            st.caption("※ transaction_date(판매/변경 시점) 기준. 원가·수수료는 주문 기준 1/n 배분액입니다.")
         else:
             # 3-b. 8일 이상: 요약 테이블 표시 + 상세는 다운로드 안내
             disp_df = summary.copy()
-            disp_df["판매금액"] = disp_df["판매금액"].apply(lambda x: f"{x:,}원")
+            for _c in ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)"]:
+                if _c in disp_df.columns:
+                    disp_df[_c] = disp_df[_c].apply(lambda x: f"{x:,}원")
             disp_df["판매건수"] = disp_df["판매건수"].apply(lambda x: f"{x:g}건")
             st.write("📌 **실적 요약**")
             st.dataframe(disp_df, width='stretch')
-            st.caption("※ transaction_date(판매/변경 시점) 기준. 증액/감액 delta도 포함됩니다.")
-            st.info("📥 이 이상의 데이터는 다운로드 시 상세내역에서 확인가능 (고객명·전화번호·결제수단 포함)")
+            st.caption("※ transaction_date(판매/변경 시점) 기준. 원가·수수료는 주문 기준 1/n 배분액입니다.")
+            st.info("📥 원가·수수료·마진 상세내역은 엑셀 다운로드 → [상세내역] 시트에서 확인하세요.")
 
-        # 4. 엑셀 다운로드 (다중 시트: 요약 + 상세 분리, 결제수단 포함)
+        # 4. 엑셀 다운로드 (다중 시트: 요약 + 상세 분리, 원가·수수료·마진 포함)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             summary.to_excel(writer, sheet_name="집계요약", index=False)
 
             detail_df = df_emp.copy()
-            detail_df["판매금액"] = detail_df["판매금액"].round(0).astype(int)
+            for _c in ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)"]:
+                detail_df[_c] = detail_df[_c].round(0).astype(int)
             detail_df["판매건수"] = detail_df["판매건수"].round(2)
             detail_df = detail_df.sort_values(by=["일자", "매장명", "직원명"], ascending=[False, True, True])
             detail_df = detail_df.drop(columns=[c for c in ["_db_fn"] if c in detail_df.columns])
-            ordered_cols = ["매장명", "일자", "월", "직원명", "고객명", "전화번호", "결제수단", "비고", "판매금액", "판매건수", "원본주문ID"]
+            ordered_cols = ["매장명", "일자", "월", "직원명", "고객명", "전화번호", "결제수단", "비고",
+                            "판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)", "판매건수", "원본주문ID"]
             detail_df = detail_df[[c for c in ordered_cols if c in detail_df.columns]]
             detail_df.to_excel(writer, sheet_name="상세내역", index=False)
 
         buf.seek(0)
         store_label = "전체매장" if (is_superadmin and selected_store == "전체 매장 통합") else selected_store.replace(" ", "_")
-        dl_name = f"직원판매실적_상세포함_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx"
+        dl_name = f"직원판매실적_원가수수료마진포함_{store_label}_{date_range_start.isoformat()}_{date_range_end.isoformat()}.xlsx"
         st.download_button("📊 요약 및 상세내역 엑셀 다운로드", data=buf.getvalue(), file_name=dl_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="emp_perf_detail_dl")
 
 
