@@ -5784,6 +5784,7 @@ def _superadmin_tab1_integrated_dashboard():
     all_payments = []
     store_orders = {}
     store_payments = {}
+    total_fees_month = 0.0
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
         if _supabase_orders_payments_available():
@@ -5799,7 +5800,7 @@ def _superadmin_tab1_integrated_dashboard():
                 except Exception:
                     orders = pd.DataFrame()
                 try:
-                    payments = pd.read_sql("SELECT order_id, amount FROM Payments", conn)
+                    payments = pd.read_sql("SELECT order_id, amount, fee_amount FROM Payments", conn)
                 except Exception:
                     payments = pd.DataFrame()
             finally:
@@ -5819,6 +5820,10 @@ def _superadmin_tab1_integrated_dashboard():
         store_orders[s["store_name"]] = month_ord
         store_payments[s["store_name"]] = payments
         all_orders.append(orders)
+        # 이번 달 주문에 해당하는 결제 수수료 합산
+        if not payments.empty and "fee_amount" in payments.columns and not month_ord.empty:
+            month_fees = payments[payments["order_id"].isin(month_ord["id"])]["fee_amount"].fillna(0).sum()
+            total_fees_month += float(month_fees)
     if not all_orders:
         st.metric("이번 달 전 지점 총매출", "0원")
         st.metric("이번 달 전 지점 총마진", "0원")
@@ -5835,13 +5840,15 @@ def _superadmin_tab1_integrated_dashboard():
     total_sales_month = month_combined["total_amount"].sum()
     total_margin_month = month_combined["actual_margin"].fillna(0).sum()
     total_unpaid_all = combined["_balance"].clip(lower=0).sum()
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("이번 달 전 지점 총매출", f"{total_sales_month:,.0f}원")
     with c2:
         st.metric("이번 달 전 지점 총마진", f"{total_margin_month:,.0f}원")
     with c3:
         st.metric("전체 누적 미수금", f"{total_unpaid_all:,.0f}원")
+    with c4:
+        st.metric("이번 달 전 지점 카드수수료", f"{total_fees_month:,.0f}원", help="신용카드·체크카드·메인페이 등 이번 달 주문 기준 수수료 합계")
     st.subheader("매장별 실적 랭킹 (이번 달 최종 판매금액)")
     rows = []
     for store_name, ord_df in store_orders.items():
