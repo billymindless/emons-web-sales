@@ -8248,7 +8248,7 @@ def _superadmin_tab_danger_zone_data_reset():
     app_users, app_stores 등 마스터 데이터는 절대 삭제하지 않음.
     """
     # superadmin 이중 확인
-    if st.session_state.get("role") != "superadmin":
+    if (st.session_state.get("current_user") or {}).get("role") != "superadmin":
         st.error("이 기능은 최고 관리자(superadmin)만 사용할 수 있습니다.")
         return
 
