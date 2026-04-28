@@ -2421,7 +2421,7 @@ def _load_payments_supabase(db_filename: str, order_id: int | None = None) -> pd
         return pd.DataFrame()
     try:
         q = client.table("app_payments").select(
-            "id, order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by"
+            "id, order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at"
         ).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
         if order_id is not None:
             q = q.eq("order_id", order_id)
@@ -7442,10 +7442,14 @@ def render_monthly_payment_report(is_superadmin: bool):
                     return resolved if resolved else str(val)
                 _audit_df["입력자"] = _audit_df["created_by"].apply(_resolve_name)
 
-                # ── 입력일자 ──
+                # ── 입력일자 (UTC → KST +9h 변환 후 표시) ──
                 if "created_at" in _audit_df.columns:
-                    _audit_df["입력일자"] = pd.to_datetime(_audit_df["created_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
-                    _audit_df["입력일자"] = _audit_df["입력일자"].fillna("미상")
+                    _kst = (
+                        pd.to_datetime(_audit_df["created_at"], errors="coerce", utc=True)
+                        .dt.tz_convert("Asia/Seoul")
+                        .dt.strftime("%Y-%m-%d %H:%M:%S")
+                    )
+                    _audit_df["입력일자"] = _kst.fillna("미상")
                 else:
                     _audit_df["입력일자"] = "미상"
 
