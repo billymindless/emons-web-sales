@@ -4296,12 +4296,85 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
         if logs.empty:
             st.info("변경 이력이 없습니다. (수정 요청 이력만 표시됩니다)")
         else:
+            # 현재 주문 원가 정보 (이력별 before/after 마진 계산용)
+            _order_cost_info: dict = {}
+            try:
+                sc2, _ = get_supabase_client()
+                if sc2:
+                    _oc = sc2.table("app_orders").select(
+                        "cost_price, display_cost_amount, display_sales_amount"
+                    ).eq("id", int(order_id)).execute()
+                    if _oc.data:
+                        _order_cost_info = _oc.data[0]
+            except Exception:
+                pass
+            _cost_price = float(_order_cost_info.get("cost_price") or 0)
+            _disp_cost  = float(_order_cost_info.get("display_cost_amount") or 0)
+
+            import re as _re
             for _, row in logs.iterrows():
+                _payload = str(row.get("new_value") or "")
+                # payload에서 변경 유형 추출
+                _ptype = ""
+                if "[high_amount_change]" in _payload:
+                    _ptype = "high_amount_change"
+                elif "[payment_cancel]" in _payload:
+                    _ptype = "payment_cancel"
+
+                # 이력 항목 제목
                 _status_icon = "✅" if row.get("status") == "approved" else ("❌" if row.get("status") == "rejected" else "⏳")
-                with st.expander(f"{row['created_at']} — {row['actor_username']} [{_status_icon} {row.get('status', '-')}]"):
+                _type_label = {"high_amount_change": "📉 판매금액 변경", "payment_cancel": "💳 결제 취소"}.get(_ptype, "📋 변경")
+                with st.expander(f"{row['created_at']} — {row['actor_username']} | {_type_label} [{_status_icon} {row.get('status', '-')}]"):
                     st.write(f"**사유:** {row['reason']}")
                     st.write(f"**검토자:** {row.get('reviewed_by', '-')}")
-                    st.caption(f"변경 내용(payload): {row['new_value']}")
+                    st.caption(f"변경 내용(payload): {_payload}")
+
+                    # ── 판매금액 변경 시 → before/after 마진 검증 ──
+                    if _ptype == "high_amount_change":
+                        _m = _re.search(r"([\d,]+)원\s*→\s*([\d,]+)원", _payload)
+                        if _m:
+                            _old_total = float(_m.group(1).replace(",", ""))
+                            _new_total = float(_m.group(2).replace(",", ""))
+                            _old_margin = _old_total - _cost_price - _disp_cost
+                            _new_margin = _new_total - _cost_price - _disp_cost
+                            _old_rate = (_old_margin / _old_total * 100) if _old_total else 0
+                            _new_rate = (_new_margin / _new_total * 100) if _new_total else 0
+                            _delta_margin = _new_margin - _old_margin
+
+                            st.markdown("**📊 원가·마진 Before / After 검증**")
+                            _ca, _cb = st.columns(2)
+                            with _ca:
+                                st.markdown("**변경 전**")
+                                st.markdown(f"""
+| 항목 | 금액 |
+|---|---|
+| 판매금액 | {_old_total:,.0f}원 |
+| 원가 합계 | {_cost_price + _disp_cost:,.0f}원 |
+| **마진** | **{_old_margin:,.0f}원** |
+| 마진율 | {_old_rate:.1f}% |
+""")
+                                if _old_rate > 60:
+                                    st.warning(f"⚠️ 마진율 {_old_rate:.1f}% 비정상")
+                            with _cb:
+                                st.markdown("**변경 후 (현재)**")
+                                st.markdown(f"""
+| 항목 | 금액 |
+|---|---|
+| 판매금액 | {_new_total:,.0f}원 |
+| 원가 합계 | {_cost_price + _disp_cost:,.0f}원 |
+| **마진** | **{_new_margin:,.0f}원** |
+| 마진율 | {_new_rate:.1f}% |
+""")
+                                if _new_rate < -5:
+                                    st.warning(f"⚠️ 마진율 {_new_rate:.1f}% 음수")
+
+                            _color = "red" if _delta_margin < 0 else "green"
+                            st.markdown(
+                                f"**마진 변화:** :{_color}[{_delta_margin:+,.0f}원]"
+                                f"&nbsp;&nbsp;|&nbsp;&nbsp;판매금액 변화: {_new_total - _old_total:+,.0f}원"
+                            )
+                            if abs(_delta_margin - (_new_total - _old_total)) < 1:
+                                st.caption("ℹ️ 원가 불변 → 마진 변화 = 판매금액 변화 (정상)")
         return
     # ── SQLite 경로 ──
     conn = get_tenant_conn(db_filename)
@@ -4321,15 +4394,50 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
         )
     except Exception:
         logs = pd.DataFrame()
+    # SQLite 경로 원가 정보 (before/after 마진 계산용)
+    _sq_cost_price = 0.0
+    _sq_disp_cost  = 0.0
+    try:
+        _sq_conn = get_tenant_conn(db_filename)
+        if _sq_conn:
+            _sq_r = _sq_conn.execute(
+                "SELECT cost_price, display_cost_amount FROM Orders WHERE id=?", (int(order_id),)
+            ).fetchone()
+            if _sq_r:
+                _sq_cost_price = float(_sq_r[0] or 0)
+                _sq_disp_cost  = float(_sq_r[1] or 0)
+            _sq_conn.close()
+    except Exception:
+        pass
+
     if len(logs) == 0:
         st.info("변경 이력이 없습니다.")
     else:
+        import re as _re2
         for _, row in logs.iterrows():
             with st.expander(f"{row['created_at']} — {row['actor_username']} / {row['field_name']}"):
                 st.write(f"필드: **{row['field_name']}**")
                 st.write(f"변경 전: `{row['old_value']}`")
                 st.write(f"변경 후: `{row['new_value']}`")
                 st.write(f"사유: {row['reason']}")
+                # total_amount 필드 변경 시 before/after 마진 검증
+                if str(row.get("field_name") or "").strip() == "total_amount":
+                    try:
+                        _sq_old = float(str(row.get("old_value") or "0").replace(",", ""))
+                        _sq_new = float(str(row.get("new_value") or "0").replace(",", ""))
+                        _sq_old_mg = _sq_old - _sq_cost_price - _sq_disp_cost
+                        _sq_new_mg = _sq_new - _sq_cost_price - _sq_disp_cost
+                        _sq_old_rate = (_sq_old_mg / _sq_old * 100) if _sq_old else 0
+                        _sq_new_rate = (_sq_new_mg / _sq_new * 100) if _sq_new else 0
+                        st.markdown("**📊 원가·마진 Before / After 검증**")
+                        _sc1, _sc2 = st.columns(2)
+                        with _sc1:
+                            st.markdown(f"**변경 전:** 판매 {_sq_old:,.0f}원 / 마진 {_sq_old_mg:,.0f}원 ({_sq_old_rate:.1f}%)")
+                        with _sc2:
+                            st.markdown(f"**변경 후:** 판매 {_sq_new:,.0f}원 / 마진 {_sq_new_mg:,.0f}원 ({_sq_new_rate:.1f}%)")
+                        st.markdown(f"마진 변화: **{_sq_new_mg - _sq_old_mg:+,.0f}원**")
+                    except Exception:
+                        pass
     # 관련 결제 영수증 조회 (SQLite 전용)
     try:
         receipts = pd.read_sql(
