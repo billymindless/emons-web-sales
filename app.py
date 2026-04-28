@@ -4144,9 +4144,132 @@ def _insert_payment_history(
     return supa_error
 
 
+def _render_order_cost_verify(db_filename: str, order_id: int):
+    """선택 주문의 원가·매출액·마진 검증 패널. 변경 이력 뷰 상단에 표시."""
+    import math
+
+    # 주문 데이터 조회
+    order_row = None
+    payments_df = pd.DataFrame()
+    if _supabase_orders_payments_available():
+        try:
+            sc, err = get_supabase_client()
+            if sc and not err:
+                r_o = sc.table("app_orders").select(
+                    "id, order_date, category, employee_names, total_amount, cost_price, "
+                    "display_sales_amount, display_cost_amount, actual_margin, balance_status"
+                ).eq("id", int(order_id)).execute()
+                if r_o.data:
+                    order_row = r_o.data[0]
+                r_p = sc.table("app_payments").select(
+                    "payment_date, amount, payment_method, card_company, fee_amount"
+                ).eq("db_filename", db_filename).eq("order_id", int(order_id)).order("payment_date").execute()
+                if r_p.data:
+                    payments_df = pd.DataFrame(r_p.data)
+        except Exception:
+            pass
+    else:
+        conn = get_tenant_conn(db_filename)
+        if conn:
+            try:
+                order_row = conn.execute(
+                    "SELECT id, order_date, category, employee_names, total_amount, cost_price, "
+                    "display_sales_amount, display_cost_amount, actual_margin, balance_status "
+                    "FROM Orders WHERE id=?", (int(order_id),)
+                ).fetchone()
+                if order_row:
+                    cols = ["id","order_date","category","employee_names","total_amount","cost_price",
+                            "display_sales_amount","display_cost_amount","actual_margin","balance_status"]
+                    order_row = dict(zip(cols, order_row))
+                p_rows = conn.execute(
+                    "SELECT payment_date, amount, payment_method, card_company, fee_amount "
+                    "FROM Payments WHERE order_id=? ORDER BY payment_date", (int(order_id),)
+                ).fetchall()
+                if p_rows:
+                    payments_df = pd.DataFrame(p_rows, columns=["payment_date","amount","payment_method","card_company","fee_amount"])
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+    if not order_row:
+        st.warning("주문 데이터를 불러올 수 없습니다.")
+        return
+
+    st.markdown("#### 🔍 원가·매출액·마진 검증")
+
+    total_amt   = float(order_row.get("total_amount") or 0)
+    cost_price  = float(order_row.get("cost_price") or 0)
+    disp_sale   = float(order_row.get("display_sales_amount") or 0)
+    disp_cost   = float(order_row.get("display_cost_amount") or 0)
+    stored_mg   = float(order_row.get("actual_margin") or 0)
+
+    basic_mg    = total_amt - cost_price - disp_cost
+    sum_fee     = float(payments_df["fee_amount"].fillna(0).sum()) if not payments_df.empty else 0.0
+    recalc_mg   = basic_mg - sum_fee
+    margin_rate = (recalc_mg / total_amt * 100) if total_amt else 0.0
+    cost_rate   = ((cost_price + disp_cost) / total_amt * 100) if total_amt else 0.0
+
+    # ── 요약 지표 4개 ──
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("판매금액", f"{total_amt:,.0f}원")
+    c2.metric("원가 합계", f"{cost_price + disp_cost:,.0f}원", f"원가율 {cost_rate:.1f}%")
+    c3.metric("수수료 합계", f"{sum_fee:,.0f}원")
+    c4.metric("재계산 마진", f"{recalc_mg:,.0f}원", f"마진율 {margin_rate:.1f}%")
+
+    # ── 상세 계산 과정 ──
+    with st.expander("📐 계산 상세 보기", expanded=False):
+        st.markdown(f"""
+| 항목 | 금액 |
+|---|---|
+| 판매금액 (total_amount) | **{total_amt:,.0f}원** |
+| 일반 원가 (cost_price) | {cost_price:,.0f}원 |
+| 전시 원가 (display_cost_amount) | {disp_cost:,.0f}원 |
+| 전시 판매가 (display_sales_amount) | {disp_sale:,.0f}원 |
+| **기본 마진** (판매금액 − 원가 − 전시원가) | **{basic_mg:,.0f}원** |
+| 결제 수수료 합계 | −{sum_fee:,.0f}원 |
+| **재계산 actual_margin** | **{recalc_mg:,.0f}원** |
+| DB 저장 actual_margin | {stored_mg:,.0f}원 {'✅' if abs(recalc_mg - stored_mg) < 1 else '⚠️ 불일치'} |
+""")
+
+    # ── 결제 내역 ──
+    if not payments_df.empty:
+        with st.expander(f"💳 결제 내역 ({len(payments_df)}건)", expanded=False):
+            disp_p = payments_df.copy()
+            disp_p["amount"] = disp_p["amount"].apply(lambda x: f"{float(x or 0):,.0f}원")
+            disp_p["fee_amount"] = disp_p["fee_amount"].apply(lambda x: f"{float(x or 0):,.0f}원")
+            disp_p = disp_p.rename(columns={
+                "payment_date": "결제일", "amount": "결제금액",
+                "payment_method": "결제수단", "card_company": "카드사", "fee_amount": "수수료"
+            })
+            st.dataframe(disp_p, use_container_width=True)
+    else:
+        st.caption("등록된 결제 내역이 없습니다.")
+
+    # ── 이상 감지 경고 ──
+    warnings = []
+    if cost_price == 0 and disp_cost == 0:
+        warnings.append("원가(cost_price)와 전시원가가 모두 0원입니다. 원가가 미입력된 것으로 보입니다.")
+    if total_amt > 0 and margin_rate > 60:
+        warnings.append(f"마진율이 {margin_rate:.1f}%로 비정상적으로 높습니다. 원가 입력을 확인하세요.")
+    if total_amt > 0 and margin_rate < -5:
+        warnings.append(f"마진율이 {margin_rate:.1f}%로 음수입니다. 판매금액 또는 원가 입력을 확인하세요.")
+    if abs(recalc_mg - stored_mg) >= 1:
+        warnings.append(f"저장된 마진({stored_mg:,.0f}원)과 재계산 마진({recalc_mg:,.0f}원)이 일치하지 않습니다. 결제 재계산이 필요할 수 있습니다.")
+
+    if warnings:
+        for w in warnings:
+            st.warning(f"⚠️ {w}")
+    else:
+        st.success("✅ 원가·마진 검증 이상 없음")
+
+
 def _render_order_audit_trail(db_filename: str, order_id: int):
     """주문(Order) 기준 변경 이력(AuditLogs) + 관련 결제 영수증 표시 공통 UI.
     Supabase 환경: app_edit_requests 테이블에서 이력 조회. SQLite 환경: AuditLogs 테이블 사용."""
+    # ── 원가·매출액 검증 패널 ──
+    _render_order_cost_verify(db_filename, order_id)
+    st.divider()
     logs = pd.DataFrame()
     # ── Supabase 경로 ──
     if _supabase_orders_payments_available():
