@@ -12108,9 +12108,7 @@ def render_customer_balance():
     with tab_anomaly:
         st.subheader("🔴 초과결제 항목 (결제금액 > 구매금액)")
         st.caption("결제 금액이 구매 금액을 초과한 건입니다. 결제 수단 변경(결변) 또는 카드 취소 처리로 정리해 주세요.")
-        if role not in ("store_admin", "superadmin"):
-            st.info("매장 관리자 또는 최고 관리자만 조회할 수 있습니다.")
-        else:
+        if True:
             _a_orders = _shared_orders_d10
             _a_payments = _shared_payments_d10
             _a_customers = _shared_customers_d10
