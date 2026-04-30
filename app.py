@@ -10294,6 +10294,18 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
     total_balance = float(orders_df["balance"].sum())
     st.metric("전체 주문 합산 잔금", f"{total_balance:,.0f}원")
 
+    # 실제 입금액 입력 (배분 합계와 반드시 일치해야 등록 가능)
+    _actual_paid_key = f"{key_prefix}_actual_paid"
+    if _actual_paid_key not in st.session_state:
+        st.session_state[_actual_paid_key] = ""
+    st.text_input(
+        "실제 입금액 ★ (고객이 실제 납부한 총 금액)",
+        key=_actual_paid_key,
+        placeholder="예: 1,000,000",
+        help="각 주문 배분 금액의 합계와 반드시 일치해야 등록됩니다.",
+        on_change=lambda: st.session_state.__setitem__(_actual_paid_key, _format_number_comma(st.session_state.get(_actual_paid_key, ""))),
+    )
+
     # 결제 수단 / 날짜
     _split_date_key = f"{key_prefix}_date"
     if _split_date_key not in st.session_state:
@@ -10316,12 +10328,23 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         split_card = None
         st.session_state.pop(f"{key_prefix}_card", None)
 
-    # 온누리상품권 승인번호
+    # 온누리상품권 승인번호 (2단계 중복 검증)
     is_onnuri_split = split_method and "온누리" in str(split_method)
+    _onnuri_stage_key = f"{key_prefix}_onnuri_stage"
+    _onnuri_last4_key = f"{key_prefix}_onnuri_last4"
+    _onnuri_full_key = f"{key_prefix}_onnuri_full"
     if is_onnuri_split:
-        split_onnuri = st.text_input("온누리 승인번호 뒤 4자리 (대표 1건)", key=f"{key_prefix}_onnuri", max_chars=4)
+        if _onnuri_stage_key not in st.session_state:
+            st.session_state[_onnuri_stage_key] = "last4"
+        _onnuri_stage = st.session_state.get(_onnuri_stage_key, "last4")
+        if _onnuri_stage == "last4":
+            st.text_input("온누리 승인번호 뒤 4자리", key=_onnuri_last4_key, max_chars=4)
+        else:
+            st.text_input("온누리 승인번호 전체 (8자리 이상)", key=_onnuri_full_key)
     else:
-        split_onnuri = None
+        st.session_state.pop(_onnuri_stage_key, None)
+        st.session_state.pop(_onnuri_last4_key, None)
+        st.session_state.pop(_onnuri_full_key, None)
         st.session_state.pop(f"{key_prefix}_onnuri", None)
 
     st.markdown("**주문별 배분 금액 입력**")
@@ -10349,10 +10372,32 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                 on_change=lambda k=ak: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))),
             )
 
-    # 합계 검증
+    # 배분 합계 ↔ 실입금액 일치 검증 (실시간 표시)
     alloc_total = sum(_parse_comma_to_int(st.session_state.get(ak, "0")) for ak in alloc_keys.values())
+    actual_paid_int = _parse_comma_to_int(st.session_state.get(_actual_paid_key, "0"))
+
     if alloc_total > 0:
-        st.info(f"배분 합계: **{alloc_total:,.0f}원**")
+        if actual_paid_int > 0:
+            _diff = alloc_total - actual_paid_int
+            if _diff == 0:
+                st.success(f"✅ 배분 합계 **{alloc_total:,.0f}원** = 실입금액 **{actual_paid_int:,.0f}원** (일치)")
+            elif _diff > 0:
+                st.error(f"❌ 배분 합계({alloc_total:,}원)가 실입금액({actual_paid_int:,}원)보다 **{_diff:,}원 초과**합니다.")
+            else:
+                st.error(f"❌ 배분 합계({alloc_total:,}원)가 실입금액({actual_paid_int:,}원)보다 **{-_diff:,}원 부족**합니다.")
+        else:
+            st.info(f"배분 합계: **{alloc_total:,.0f}원** | ← 위의 실제 입금액을 입력하세요.")
+
+    # 주문별 잔금 초과 배분 경고
+    for _, _orow_chk in orders_df.iterrows():
+        _oid_chk = int(_orow_chk["id"])
+        _bal_chk = float(_orow_chk.get("balance") or 0)
+        _ak_chk = alloc_keys.get(_oid_chk)
+        if _ak_chk:
+            _alloc_chk = _parse_comma_to_int(st.session_state.get(_ak_chk, "0"))
+            if _alloc_chk > 0 and _alloc_chk > _bal_chk:
+                _over_chk = _alloc_chk - _bal_chk
+                st.warning(f"⚠️ 주문 #{_oid_chk}: 배분 금액({_alloc_chk:,}원)이 잔금({_bal_chk:,.0f}원)보다 **{_over_chk:,}원 초과**합니다.")
 
     split_reason = st.text_area("처리 사유 (필수, 5자 이상)", key=f"{key_prefix}_reason", placeholder="예: 온누리상품권 100만원 단일 결제 — 70만/30만 분배")
 
@@ -10363,10 +10408,56 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         if alloc_total <= 0:
             st.warning("배분 금액을 1원 이상 입력하세요.")
             return
+        if actual_paid_int <= 0:
+            st.error("실제 입금액을 입력하세요.")
+            return
+        if alloc_total != actual_paid_int:
+            st.error(f"배분 합계({alloc_total:,}원)와 실제 입금액({actual_paid_int:,}원)이 일치하지 않습니다. 각 주문 배분 금액 또는 실제 입금액을 수정하세요.")
+            return
+
+        # 온누리 중복 검증
+        onnuri_code = None
+        pay_date_str = split_date.isoformat() if hasattr(split_date, "isoformat") else _today_kst().isoformat()
+        if is_onnuri_split:
+            _onnuri_stage = st.session_state.get(_onnuri_stage_key, "last4")
+            if _onnuri_stage == "last4":
+                last4_raw = (st.session_state.get(_onnuri_last4_key, "") or "").strip()
+                last4_digits = re.sub(r"\D", "", last4_raw)
+                if len(last4_digits) != 4:
+                    st.error("온누리상품권 승인번호 뒤 4자리를 정확히 입력하세요.")
+                    return
+                if _supabase_orders_payments_available():
+                    dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
+                else:
+                    conn_chk = get_tenant_conn(db_filename)
+                    try:
+                        dup_cnt = conn_chk.execute(
+                            """
+                            SELECT COUNT(*) FROM Payments
+                            WHERE payment_method LIKE '%온누리%'
+                              AND payment_date = ?
+                              AND onnuri_approval_code IS NOT NULL
+                              AND substr(onnuri_approval_code, -4) = ?
+                            """,
+                            (pay_date_str, last4_digits),
+                        ).fetchone()[0]
+                    finally:
+                        conn_chk.close()
+                if dup_cnt > 0:
+                    st.session_state[_onnuri_stage_key] = "full"
+                    st.error("⚠️ 동일한 결제일, 승인번호 4자리를 가진 온누리 기록이 이미 존재합니다. 정상 중복 건일 경우 승인번호 전체(8자리 이상)를 입력하세요.")
+                    return
+                onnuri_code = last4_digits
+            else:
+                full_raw = (st.session_state.get(_onnuri_full_key, "") or "").strip()
+                full_digits = re.sub(r"\D", "", full_raw)
+                if len(full_digits) < 8:
+                    st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
+                    return
+                onnuri_code = full_digits
 
         errors = []
         success_count = 0
-        pay_date_str = split_date.isoformat() if hasattr(split_date, "isoformat") else _today_kst().isoformat()
 
         for oid, ak in alloc_keys.items():
             alloc_amt = _parse_comma_to_int(st.session_state.get(ak, "0"))
@@ -10377,7 +10468,6 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                 continue
             bal = float(orow_match.iloc[0].get("balance") or 0)
             fee = _payment_fee_amount(split_method, alloc_amt)
-            onnuri_code = split_onnuri if is_onnuri_split else None
             try:
                 if _supabase_orders_payments_available():
                     old_paid, _ = _sum_payments_by_order_supabase(db_filename, oid)
