@@ -6836,24 +6836,30 @@ def _superadmin_tab_unpaid_report():
                 "배송일자": str(o.get("delivery_date") or ""),
                 "총판매금액": int(o["total_amount"]),
                 "미수금액(잔금)": int(o["balance"]),
+                "_db_filename": db_fn,
+                "_order_id": int(o["id"]),
             })
     if not rows:
         st.info("선택 기간 내 잔금이 있는 건이 없습니다.")
         return
     out_df = pd.DataFrame(rows)
 
+    # _db_filename, _order_id 는 내부 연결용 필드 — 화면/CSV에서 제외
+    display_cols = [c for c in out_df.columns if not c.startswith("_")]
+    display_out = out_df[display_cols]
+
     # 기간별 총합 행 생성 (화면 표시 전용)
-    total_row = {col: "" for col in out_df.columns}
+    total_row = {col: "" for col in display_cols}
     total_row["매장명"] = "【합계】"
-    total_row["총판매금액"] = int(out_df["총판매금액"].sum())
-    total_row["미수금액(잔금)"] = int(out_df["미수금액(잔금)"].sum())
+    total_row["총판매금액"] = int(display_out["총판매금액"].sum())
+    total_row["미수금액(잔금)"] = int(display_out["미수금액(잔금)"].sum())
     display_df = _format_df_display(
-        pd.concat([out_df, pd.DataFrame([total_row])], ignore_index=True),
+        pd.concat([display_out, pd.DataFrame([total_row])], ignore_index=True),
         ["총판매금액", "미수금액(잔금)"],
     )
     st.dataframe(display_df, width='stretch')
 
-    csv_content = out_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    csv_content = display_out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "미수금 레포트 CSV 다운로드",
         data=csv_content,
@@ -6861,6 +6867,26 @@ def _superadmin_tab_unpaid_report():
         mime="text/csv; charset=utf-8",
         key="unpaid_report_dl",
     )
+
+    st.markdown("---")
+    st.subheader("잔금 결제 처리")
+    st.caption("아래 항목을 클릭하면 해당 고객의 잔금 결제를 바로 진행할 수 있습니다.")
+    for i, r in enumerate(rows):
+        label = f"[{r['매장명']}]  {r['고객명']}  |  잔금 {r['미수금액(잔금)']:,}원"
+        with st.expander(label):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.write(f"**연락처:** {r['연락처']}")
+                st.write(f"**판매일자:** {r['판매일자']}")
+            with col_b:
+                st.write(f"**배송일자:** {r['배송일자']}")
+                st.write(f"**총판매금액:** {r['총판매금액']:,}원")
+            _customer_balance_payment_ui(
+                r["_db_filename"],
+                r["_order_id"],
+                float(r["미수금액(잔금)"]),
+                key_prefix=f"unpaid_pay_{i}",
+            )
 
 
 def _superadmin_tab5_store_accounts():
