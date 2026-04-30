@@ -9872,6 +9872,24 @@ def render_new_sales():
             help="(판매가 − 원가 − 수수료) / 판매가 × 100 (카드·메인페이 등 수수료 반영 후 최종 마진율)",
         )
 
+    # 이상 마진율 사유 입력 (10% 이하 또는 30% 이상이면 필수)
+    _MARGIN_REASON_LOW = 10.0
+    _MARGIN_REASON_HIGH = 30.0
+    _margin_reason_required = final_sales > 0 and (basic_margin_rate < _MARGIN_REASON_LOW or basic_margin_rate > _MARGIN_REASON_HIGH)
+    if _margin_reason_required:
+        _margin_direction = "낮습니다 (10% 미만)" if basic_margin_rate < _MARGIN_REASON_LOW else "높습니다 (30% 초과)"
+        st.warning(
+            f"⚠️ 현재 마진율이 **{basic_margin_rate:.1f}%** 로 정상 범위(10%~30%)보다 **{_margin_direction}**. "
+            "등록하려면 아래에 사유를 반드시 입력하세요."
+        )
+        st.text_input(
+            "이상 마진율 사유 (필수, 5자 이상) *",
+            key="margin_anomaly_reason",
+            placeholder="예: 현대임직원할인, 전시품 처분 할인, 소품 고마진 등",
+        )
+    else:
+        st.session_state.pop("margin_anomaly_reason", None)
+
     if st.button("매출 등록"):
         cust_name_ok = cust_name and cust_name.strip()
         phone1_ok = phone1 and phone1.strip()
@@ -9908,6 +9926,16 @@ def render_new_sales():
         margin_out_of_range = net_margin_rate_save < 15 or net_margin_rate_save > 25
         if margin_out_of_range:
             st.warning(f"⚠️ 주의: 실질 마진율이 {net_margin_rate_save:.1f}%입니다. 적정 범위(15%~25%)를 벗어났습니다.")
+        # 이상 마진율 사유 필수 검증: 10% 미만 또는 30% 초과 시 사유 5자 이상 필수
+        if final_sales_save > 0 and (net_margin_rate_save < 10.0 or net_margin_rate_save > 30.0):
+            _margin_reason_val = (st.session_state.get("margin_anomaly_reason") or "").strip()
+            if len(_margin_reason_val) < 5:
+                _direction_msg = "낮습니다 (10% 미만)" if net_margin_rate_save < 10.0 else "높습니다 (30% 초과)"
+                st.error(
+                    f"⚠️ 마진율이 **{net_margin_rate_save:.1f}%** 로 정상 범위(10%~30%)보다 {_direction_msg}. "
+                    "이상 마진율 사유를 5자 이상 입력해야 등록할 수 있습니다."
+                )
+                st.stop()
         # 온누리상품권 결제에 대한 부정 사용 방지 검증
         # 1차: 승인번호 뒤 4자리 + 결제일 기준 중복 여부 확인 (금액 제외)
         # 중복 발견 시 해당 슬롯은 전체 승인번호(8자리 이상) 입력 단계로 전환
@@ -10026,7 +10054,9 @@ def render_new_sales():
             remaining = final_sales_save - total_paid_initial
             balance_status = _balance_status_from_remaining(remaining)
             _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
-            _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
+            _margin_reason_saved = (st.session_state.get("margin_anomaly_reason") or "").strip()
+            _sales_note = "신규 주문" + (f" | 이상마진 사유: {_margin_reason_saved}" if _margin_reason_saved else "")
+            _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), _sales_note, unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
             clear_data_cache()
             st.success("매출등록이 완료되었습니다.")
             net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
@@ -10078,6 +10108,7 @@ def render_new_sales():
                     "cost_price", "total_amount", "display_sales_amount", "display_cost_amount",
                     "visit_reason", "purchase_reason",
                     "payment_rows",
+                    "margin_anomaly_reason",
                 ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_", "new_sales_employee_multiselect", "category_multiselect")):
                     try:
                         del st.session_state[key]
@@ -10141,7 +10172,9 @@ def render_new_sales():
                 remaining = final_sales_save - total_paid_initial
                 balance_status = _balance_status_from_remaining(remaining)
                 conn.execute("UPDATE Orders SET balance_status = ? WHERE id = ?", (balance_status, order_id))
-                _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), "신규 주문", unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
+                _margin_reason_saved = (st.session_state.get("margin_anomaly_reason") or "").strip()
+                _sales_note = "신규 주문" + (f" | 이상마진 사유: {_margin_reason_saved}" if _margin_reason_saved else "")
+                _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), _sales_note, unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
                 conn.commit()
                 clear_data_cache()
                 net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
@@ -10202,6 +10235,7 @@ def render_new_sales():
                     "cost_price", "total_amount", "display_sales_amount", "display_cost_amount",
                     "visit_reason", "purchase_reason",
                     "payment_rows",
+                    "margin_anomaly_reason",
                 ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_", "new_sales_employee_multiselect", "category_multiselect")):
                     try:
                         del st.session_state[key]
