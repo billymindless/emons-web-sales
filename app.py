@@ -7506,8 +7506,42 @@ def render_monthly_payment_report(is_superadmin: bool):
                 # ── 금액 ──
                 _audit_df["금액"] = pd.to_numeric(_audit_df.get("amount", 0), errors="coerce").fillna(0).astype(int)
 
+                # ── 고객명 (order_id → customer_id → name 역조회) ──
+                _oid_to_cname: dict = {}
+                try:
+                    _sc_a, _ = get_supabase_client()
+                    if _sc_a and "order_id" in _audit_df.columns:
+                        _db_fn_col = "_db_fn" if "_db_fn" in _audit_df.columns else None
+                        _db_fn_groups = _audit_df[_db_fn_col].dropna().unique().tolist() if _db_fn_col else [db_fn]
+                        for _a_fn in _db_fn_groups:
+                            _a_oids = (
+                                _audit_df.loc[_audit_df[_db_fn_col] == _a_fn, "order_id"]
+                                if _db_fn_col else _audit_df["order_id"]
+                            ).dropna().astype(int).unique().tolist()
+                            if not _a_oids:
+                                continue
+                            _a_cid_map: dict = {}
+                            for _a_chunk in [_a_oids[i:i + 100] for i in range(0, len(_a_oids), 100)]:
+                                _a_r = _sc_a.table("app_orders").select("id, customer_id").eq("db_filename", _a_fn).in_("id", _a_chunk).execute()
+                                for _a_row in (_a_r.data or []):
+                                    _a_cid_map[_a_row["id"]] = _a_row.get("customer_id")
+                            _a_cids = [v for v in _a_cid_map.values() if v is not None]
+                            if not _a_cids:
+                                continue
+                            _a_cust_map = _get_customers_by_ids_supabase(str(_a_fn), list(set(int(c) for c in _a_cids)))
+                            for _a_oid in _a_oids:
+                                _a_cid = _a_cid_map.get(_a_oid)
+                                if _a_cid is not None:
+                                    _oid_to_cname[_a_oid] = (_a_cust_map.get(int(_a_cid)) or {}).get("name", "")
+                except Exception:
+                    pass
+                if "order_id" in _audit_df.columns:
+                    _audit_df["고객명"] = _audit_df["order_id"].apply(
+                        lambda oid: _oid_to_cname.get(int(oid), "") if pd.notna(oid) else ""
+                    )
+
                 # ── 표시 컬럼 선택 ──
-                _show_cols = ["결제일자", "입력일자", "입력자", "결제수단", "승인번호", "금액"]
+                _show_cols = ["결제일자", "입력일자", "입력자", "고객명", "결제수단", "승인번호", "금액"]
                 if "_store" in _audit_df.columns:
                     _show_cols = ["매장"] + _show_cols
                     _audit_df["매장"] = _audit_df["_store"]
@@ -7558,8 +7592,8 @@ def render_monthly_payment_report(is_superadmin: bool):
                 except Exception:
                     pass  # 고객명 조회 실패 시 빈 칸 유지 (다운로드는 정상 동작)
 
-                # _audit_df 인덱스 기준으로 고객명 컬럼 생성 후 _audit_excel에 병합
-                if "order_id" in _audit_df.columns and _oid_to_cname:
+                # 고객명이 아직 없을 경우에만 삽입 (화면 표시용 fetch에서 이미 추가된 경우 중복 방지)
+                if "고객명" not in _audit_excel.columns and "order_id" in _audit_df.columns and _oid_to_cname:
                     _cname_series = _audit_df["order_id"].apply(
                         lambda oid: _oid_to_cname.get(int(oid), "") if pd.notna(oid) else ""
                     ).reindex(_audit_excel.index, fill_value="")
