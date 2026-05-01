@@ -4346,16 +4346,56 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
             _cost_price = float(_order_cost_info.get("cost_price") or 0)
             _disp_cost  = float(_order_cost_info.get("display_cost_amount") or 0)
 
+            # ── sales 이벤트 누적합 사전 계산 (Before/After 판매금액 표시용) ──
+            _sales_running = 0.0
+            for _e in sorted(all_events, key=lambda x: x["created_at"]):
+                if _e["source"] == "sales":
+                    _e["_sales_before"] = _sales_running
+                    _sales_running += float(_e["amount"] or 0)
+                    _e["_sales_after"] = _sales_running
+
             st.caption(f"총 {len(all_events)}건의 이력이 있습니다.")
             for evt in all_events:
                 if evt["source"] == "sales":
-                    amt = evt["amount"]
-                    amt_str = f"{amt:+,.0f}원" if amt is not None else ""
-                    _s_label = "💰 매출 등록" if (amt or 0) >= 0 else "📉 매출 차감(변경)"
+                    amt = evt["amount"] or 0
+                    amt_str = f"{amt:+,.0f}원" if amt != 0 else ""
+                    _s_label = "💰 매출 등록" if amt >= 0 else "📉 매출 차감(변경)"
+                    s_before = evt.get("_sales_before", 0)
+                    s_after  = evt.get("_sales_after", 0)
+                    # 원가는 현재 DB 기준 (변경이력 없으면 동일값)
+                    _total_cost = _cost_price + _disp_cost
+                    _margin_before = s_before - _total_cost
+                    _margin_after  = s_after  - _total_cost
+                    _rate_before = (_margin_before / s_before * 100) if s_before else 0
+                    _rate_after  = (_margin_after  / s_after  * 100) if s_after  else 0
                     with st.expander(f"{evt['created_at']} — {evt['actor']} | {_s_label} {amt_str}"):
                         st.write(f"**내용:** {evt['note_display'] or '-'}")
                         st.write(f"**담당직원:** {evt['actor']}")
-                        # KPI 마진 영향 (|__dm: 파싱)
+                        # ── 매출·원가·마진 Before / After 테이블 ──
+                        st.markdown("**📊 매출·원가·마진 변동**")
+                        _c1, _c2 = st.columns(2)
+                        with _c1:
+                            st.markdown("**변경 전**")
+                            st.markdown(
+                                f"| 항목 | 금액 |\n|---|---|\n"
+                                f"| 판매금액 | {s_before:,.0f}원 |\n"
+                                f"| 원가 합계 | {_total_cost:,.0f}원 |\n"
+                                f"| **마진** | **{_margin_before:,.0f}원** |\n"
+                                f"| 마진율 | {_rate_before:.1f}% |"
+                            )
+                        with _c2:
+                            st.markdown("**변경 후**")
+                            st.markdown(
+                                f"| 항목 | 금액 |\n|---|---|\n"
+                                f"| 판매금액 | {s_after:,.0f}원 |\n"
+                                f"| 원가 합계 | {_total_cost:,.0f}원 |\n"
+                                f"| **마진** | **{_margin_after:,.0f}원** |\n"
+                                f"| 마진율 | {_rate_after:.1f}% |"
+                            )
+                        _dm_delta = _margin_after - _margin_before
+                        _dm_color = "red" if _dm_delta < 0 else "green"
+                        st.markdown(f"**판매금액 변화:** {amt:+,.0f}원  |  **마진 변화:** :{_dm_color}[{_dm_delta:+,.0f}원]")
+                        # KPI 마진 영향 (저장된 |__dm: 값, 원가 미포함 비율배분 기준)
                         _dm_val = None
                         if "|__dm:" in evt["payload"]:
                             try:
@@ -4363,8 +4403,8 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
                             except Exception:
                                 pass
                         if _dm_val is not None:
-                            _dm_color = "red" if _dm_val < 0 else "green"
-                            st.markdown(f"**KPI 마진 영향:** :{_dm_color}[{_dm_val:+,.0f}원]")
+                            _dm_kpi_color = "red" if _dm_val < 0 else "green"
+                            st.caption(f"※ KPI 마진 영향(변경 당시 기준): :{_dm_kpi_color}[{_dm_val:+,.0f}원]")
                 else:
                     # app_edit_requests 이력
                     _payload = evt["payload"]
@@ -4381,9 +4421,54 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
                     with st.expander(f"{evt['created_at']} — {evt['actor']} | {_type_label} [{_status_icon} {evt['status']}]"):
                         st.write(f"**사유:** {evt['reason']}")
                         st.write(f"**검토자:** {evt['reviewed_by']}")
-                        st.caption(f"변경 내용: {_payload}")
-                        # 판매금액 변경 before/after 마진 검증
-                        if _ptype == "high_amount_change":
+                        # ── payload 파싱: "필드: X원 → Y원" 형식 항목 테이블 표시 ──
+                        _field_rows = []
+                        for _seg in _payload.split("|"):
+                            _seg = _seg.strip()
+                            if "→" in _seg and ":" in _seg:
+                                _fname, _fval = _seg.split(":", 1)
+                                _fname = _fname.strip()
+                                _parts = _fval.split("→")
+                                if len(_parts) == 2:
+                                    _field_rows.append((_fname, _parts[0].strip(), _parts[1].strip()))
+                        if _field_rows:
+                            st.markdown("**📋 변경 항목**")
+                            _tbl = "| 항목 | 변경 전 | 변경 후 |\n|---|---|---|\n"
+                            _tbl += "\n".join(f"| {r[0]} | {r[1]} | {r[2]} |" for r in _field_rows)
+                            st.markdown(_tbl)
+                            # 원가·판매금액 변경이 포함된 경우 마진 before/after 추가 계산
+                            _sale_row = next((r for r in _field_rows if "판매금액" in r[0]), None)
+                            _cost_row = next((r for r in _field_rows if "원가" in r[0] and "전시" not in r[0]), None)
+                            _dcost_row = next((r for r in _field_rows if "전시품원가" in r[0]), None)
+                            if _sale_row or _cost_row or _dcost_row:
+                                def _parse_amt(s):
+                                    try:
+                                        return float(s.replace(",", "").replace("원", "").strip())
+                                    except Exception:
+                                        return None
+                                _sale_b = _parse_amt(_sale_row[1]) if _sale_row else _cost_price + _disp_cost + (_cost_price if not _cost_row else 0)
+                                _sale_a = _parse_amt(_sale_row[2]) if _sale_row else None
+                                _cost_b = _parse_amt(_cost_row[1]) if _cost_row else _cost_price
+                                _cost_a = _parse_amt(_cost_row[2]) if _cost_row else _cost_price
+                                _dc_b   = _parse_amt(_dcost_row[1]) if _dcost_row else _disp_cost
+                                _dc_a   = _parse_amt(_dcost_row[2]) if _dcost_row else _disp_cost
+                                if _sale_b is not None and _sale_a is not None and _cost_b is not None and _cost_a is not None:
+                                    _mg_b = _sale_b - _cost_b - _dc_b
+                                    _mg_a = _sale_a - _cost_a - _dc_a
+                                    _rate_b2 = (_mg_b / _sale_b * 100) if _sale_b else 0
+                                    _rate_a2 = (_mg_a / _sale_a * 100) if _sale_a else 0
+                                    st.markdown("**📊 마진 Before / After**")
+                                    _cx1, _cx2 = st.columns(2)
+                                    with _cx1:
+                                        st.markdown(f"**변경 전**\n\n마진 **{_mg_b:,.0f}원** ({_rate_b2:.1f}%)")
+                                    with _cx2:
+                                        st.markdown(f"**변경 후**\n\n마진 **{_mg_a:,.0f}원** ({_rate_a2:.1f}%)")
+                                    _dmc = "red" if (_mg_a - _mg_b) < 0 else "green"
+                                    st.markdown(f"**마진 변화:** :{_dmc}[{_mg_a - _mg_b:+,.0f}원]")
+                        else:
+                            st.caption(f"변경 내용: {_payload}")
+                        # 구형 high_amount_change 포맷 처리 (X원 → Y원 패턴)
+                        if _ptype == "high_amount_change" and not _field_rows:
                             _m = _re.search(r"([\d,]+)원\s*→\s*([\d,]+)원", _payload)
                             if _m:
                                 _old_total = float(_m.group(1).replace(",", ""))
