@@ -4299,16 +4299,13 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
             pass
 
         # 2. sales 테이블: 매출 등록/변경 이력 (금액 변경 차액 포함)
+        # order_id는 전역 고유값이므로 테넌트 필터 없이 조회 (db_filename=NULL 레코드도 포함)
         try:
             sc2, err2 = get_supabase_client()
             if sc2 and not err2:
                 sq = sc2.table("sales").select(
                     "transaction_date, amount, note, employee_names"
-                ).eq("order_id", int(order_id))
-                _stc = _sales_tenant_column()
-                if _stc:
-                    sq = sq.eq(_stc, db_filename)
-                sq = sq.order("transaction_date", desc=True)
+                ).eq("order_id", int(order_id)).order("transaction_date", desc=True)
                 rs = sq.execute()
                 for x in (rs.data or []):
                     note_raw = str(x.get("note") or "")
