@@ -10230,6 +10230,19 @@ def render_new_sales():
     else:
         st.session_state.pop("margin_anomaly_reason", None)
 
+    # 결제 합계가 0원이면 사유 필수 입력 (계약금 0원 등록 방지·근거 확보)
+    if total_payment_int <= 0:
+        st.warning(
+            "⚠️ 결제 합계가 **0원**입니다. 등록하려면 아래에 사유(5자 이상)를 반드시 입력하세요."
+        )
+        st.text_input(
+            "결제 0원 사유 (필수, 5자 이상) *",
+            key="zero_payment_reason",
+            placeholder="예: 전액 어음 처리, 인수금 추후 수령 예정, 계약만 선접수 등",
+        )
+    else:
+        st.session_state.pop("zero_payment_reason", None)
+
     if st.button("매출 등록"):
         cust_name_ok = cust_name and cust_name.strip()
         phone1_ok = phone1 and phone1.strip()
@@ -10246,6 +10259,10 @@ def render_new_sales():
         if not selected_categories:
             st.error("품목/카테고리(필수)를 1개 이상 선택하세요.")
             st.stop()
+        # 담당 직원 필수 — 미선택 시 KPI/직원평가에서 영구 누락되므로 저장 차단
+        if not selected_employees:
+            st.error("담당 직원(필수)을 1명 이상 선택하세요. KPI·실적 분배에 필요합니다.")
+            st.stop()
         cost_price_int = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
         general_sales_int = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
         display_sales_int = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
@@ -10253,9 +10270,29 @@ def render_new_sales():
         final_sales_save = general_sales_int + display_sales_int
         final_cost_save = cost_price_int + display_cost_int
         basic_margin_save = final_sales_save - final_cost_save
+        # 판매가/원가 0원 등록 차단 — 0원 매출은 KPI·마진율 계산을 왜곡시킴
+        if final_sales_save <= 0:
+            st.error("판매가(필수)를 입력하세요. 일반/전시품 합계가 0원보다 커야 합니다.")
+            st.stop()
+        if general_sales_int > 0 and cost_price_int <= 0:
+            st.error("일반제품 원가(필수)를 입력하세요.")
+            st.stop()
+        if has_display:
+            if display_sales_int <= 0:
+                st.error("전시품 판매가(필수)를 입력하세요.")
+                st.stop()
+            if display_cost_int <= 0:
+                st.error("전시품 원가(필수)를 입력하세요.")
+                st.stop()
         # 결제 합계 및 미수금(잔금) 계산 — 완불이 아니어도 저장 가능(계약금만 받고 저장 가능)
         total_payment_slots = sum(_parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")) for i in range(slot_count))
         unpaid_balance = final_sales_save - total_payment_slots  # 판매가 - 수납액 = 미수금
+        # 결제 합계 0원이면 사유 5자 이상 필수 — 근거 없는 0원 등록 차단
+        if total_payment_slots <= 0:
+            _zero_pay_reason_val = (st.session_state.get("zero_payment_reason") or "").strip()
+            if len(_zero_pay_reason_val) < 5:
+                st.error("결제 합계가 0원입니다. 등록하려면 **결제 0원 사유(5자 이상)** 를 입력하세요.")
+                st.stop()
         # 수수료 합계 및 실질 마진율 (신용카드·메인페이 2.5% 반영)
         total_fees_save = 0.0
         for i in range(slot_count):
@@ -10398,7 +10435,12 @@ def render_new_sales():
             balance_status = _balance_status_from_remaining(remaining)
             _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
             _margin_reason_saved = (st.session_state.get("margin_anomaly_reason") or "").strip()
-            _sales_note = "신규 주문" + (f" | 이상마진 사유: {_margin_reason_saved}" if _margin_reason_saved else "")
+            _zero_pay_reason_saved = (st.session_state.get("zero_payment_reason") or "").strip() if total_payment_slots <= 0 else ""
+            _sales_note = "신규 주문"
+            if _margin_reason_saved:
+                _sales_note += f" | 이상마진 사유: {_margin_reason_saved}"
+            if _zero_pay_reason_saved:
+                _sales_note += f" | 결제0 사유: {_zero_pay_reason_saved}"
             _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), _sales_note, unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
             clear_data_cache()
             _saving_msg.empty()
@@ -10453,6 +10495,7 @@ def render_new_sales():
                     "visit_reason", "purchase_reason",
                     "payment_rows",
                     "margin_anomaly_reason",
+                    "zero_payment_reason",
                 ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_", "new_sales_employee_multiselect", "category_multiselect")):
                     try:
                         del st.session_state[key]
@@ -10517,7 +10560,12 @@ def render_new_sales():
                 balance_status = _balance_status_from_remaining(remaining)
                 conn.execute("UPDATE Orders SET balance_status = ? WHERE id = ?", (balance_status, order_id))
                 _margin_reason_saved = (st.session_state.get("margin_anomaly_reason") or "").strip()
-                _sales_note = "신규 주문" + (f" | 이상마진 사유: {_margin_reason_saved}" if _margin_reason_saved else "")
+                _zero_pay_reason_saved = (st.session_state.get("zero_payment_reason") or "").strip() if total_payment_slots <= 0 else ""
+                _sales_note = "신규 주문"
+                if _margin_reason_saved:
+                    _sales_note += f" | 이상마진 사유: {_margin_reason_saved}"
+                if _zero_pay_reason_saved:
+                    _sales_note += f" | 결제0 사유: {_zero_pay_reason_saved}"
                 _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), _sales_note, unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
                 conn.commit()
                 clear_data_cache()
@@ -10581,6 +10629,7 @@ def render_new_sales():
                     "visit_reason", "purchase_reason",
                     "payment_rows",
                     "margin_anomaly_reason",
+                    "zero_payment_reason",
                 ) or key.startswith(("pay_", "pay_onnuri_", "gen_pay", "d10_", "over_", "new_sales_employee_multiselect", "category_multiselect")):
                     try:
                         del st.session_state[key]
