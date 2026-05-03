@@ -6969,7 +6969,12 @@ def _superadmin_tab_unpaid_report():
 
     # _db_filename, _order_id 는 내부 연결용 필드 — 화면/CSV에서 제외
     display_cols = [c for c in out_df.columns if not c.startswith("_")]
-    display_out = out_df[display_cols]
+    display_out = out_df[display_cols].copy()
+
+    # 배송일자 기준 오름차순 정렬
+    display_out["_배송일_sort"] = pd.to_datetime(display_out["배송일자"], errors="coerce")
+    display_out = display_out.sort_values("_배송일_sort", ascending=True, na_position="last")
+    display_out = display_out.drop(columns=["_배송일_sort"])
 
     # 기간별 총합 행 생성 (화면 표시 전용)
     total_row = {col: "" for col in display_cols}
