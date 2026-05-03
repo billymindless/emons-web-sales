@@ -13713,6 +13713,7 @@ def render_dashboard():
         display_cols = ["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]
         unpaid_list = unpaid_list[["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]].copy()
         if len(unpaid_list) > 0 and pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
+            unpaid_list = unpaid_list.sort_values("배송일", ascending=True)
             unpaid_list["배송일"] = unpaid_list["배송일"].dt.strftime("%Y-%m-%d")
         if len(unpaid_list) > 0:
             unpaid_display = _format_df_display(unpaid_list, ["잔금"])
