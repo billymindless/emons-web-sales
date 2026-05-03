@@ -4643,7 +4643,7 @@ def render_margin_monitor():
         store_nm = s["store_name"]
         orders = _load_orders_supabase(
             db_fn,
-            "id, order_date, employee_names, total_amount, cost_price, display_sales_amount, display_cost_amount, actual_margin",
+            "id, order_date, employee_names, total_amount, cost_price, display_sales_amount, display_cost_amount, actual_margin, customer_id",
             limit=None,
             start_date=start_d.isoformat(),
             end_date=end_d.isoformat(),
@@ -4651,6 +4651,16 @@ def render_margin_monitor():
         if orders is None or orders.empty:
             continue
         orders["_store"] = store_nm
+        # 고객명 조회 후 merge
+        customers_df = load_customers_cached(db_fn, limit=None, col_list="id, name")
+        if not customers_df.empty and "customer_id" in orders.columns:
+            orders["customer_id"] = pd.to_numeric(orders["customer_id"], errors="coerce")
+            customers_df["id"] = pd.to_numeric(customers_df["id"], errors="coerce")
+            orders = orders.merge(customers_df[["id", "name"]], left_on="customer_id", right_on="id", how="left")
+            orders = orders.rename(columns={"name": "고객명"})
+            orders = orders.drop(columns=["id_y"], errors="ignore").rename(columns={"id_x": "id"})
+        else:
+            orders["고객명"] = ""
         all_rows.append(orders)
 
     if not all_rows:
@@ -4706,7 +4716,7 @@ def render_margin_monitor():
         "재계산_마진액": "마진액(원가기준)",
         "actual_margin": "실질마진액(수수료포함)",
     })
-    show_cols = ["매장명", "주문ID", "주문일", "담당직원",
+    show_cols = ["매장명", "주문ID", "주문일", "고객명", "담당직원",
                  "판매금액", "일반원가", "전시판매가", "전시원가",
                  "마진액(원가기준)", "마진율(%)", "실질마진율(수수료포함,%)", "이상 유형"]
     if role != "superadmin":
