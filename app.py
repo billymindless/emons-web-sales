@@ -2780,11 +2780,18 @@ def _count_payments_onnuri_dup_supabase(db_filename: str, payment_date: str, onn
 def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = "", unpaid_balance: float | None = None, employee_names: str | None = None):
     """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). order_id, amount, transaction_date, note, employee_names, created_at 저장.
     employee_names: 쉼표 구분 직원명 (1/n 분배 기준). unpaid_balance(미수금)는 sales.unpaid_balance 컬럼에 저장(없으면 제외 후 재시도).
-    employee_names는 sales.employee_names 컬럼에 저장(없으면 제외 후 재시도)."""
+    employee_names는 sales.employee_names 컬럼에 저장(없으면 제외 후 재시도).
+    실패 시 st.session_state["_sales_insert_error_banner"]에 order_id와 이유를 기록하여 호출측 UI에서 배너로 노출한다."""
     client, err = get_supabase_client()
     if err:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = err
+        st.session_state["_sales_insert_error_banner"] = {
+            "order_id": order_id,
+            "amount": float(amount),
+            "transaction_date": str(transaction_date),
+            "reason": f"Supabase 클라이언트 연결 실패: {err}",
+        }
         return
     try:
         payload = {
@@ -2823,9 +2830,17 @@ def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date:
                 client.table("sales").insert(payload).execute()
             else:
                 raise
+        # sales INSERT 성공: 이전 실패 배너가 남아있으면 제거
+        st.session_state.pop("_sales_insert_error_banner", None)
     except Exception as e:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
+        st.session_state["_sales_insert_error_banner"] = {
+            "order_id": order_id,
+            "amount": float(amount),
+            "transaction_date": str(transaction_date),
+            "reason": str(e),
+        }
 
 
 def create_tenant_db(db_filename: str):
@@ -9636,6 +9651,20 @@ def render_new_sales():
     if "_sales_complete_banner" in st.session_state:
         _b = st.session_state.pop("_sales_complete_banner")
         st.success(f"✅ 입력 완료! {_b['cust_name']}님 {_b['amount']:,}원 매출 등록이 완료되었습니다.")
+    # sales 테이블 INSERT 실패 경고 배너 (주문·결제는 저장되었으나 매출 집계·KPI 반영 실패)
+    if "_sales_insert_error_banner" in st.session_state:
+        _se = st.session_state.pop("_sales_insert_error_banner")
+        _oid = _se.get("order_id")
+        _amt = _se.get("amount") or 0
+        _td = _se.get("transaction_date", "")
+        _reason = _se.get("reason", "원인 미상")
+        st.error(
+            f"⚠️ **매출 집계(sales) 기록 실패** — 주문 #{_oid} ({_td}, {_amt:,.0f}원)\n\n"
+            f"- 오류: `{_reason}`\n"
+            f"- 주문·결제는 정상 저장되었으나 **sales 테이블 INSERT가 실패**하여 "
+            f"월 매출·KPI 대시보드에 반영되지 않습니다.\n"
+            f"- 관리자에게 해당 order_id({_oid})로 sales 레코드 수동 복구를 요청하세요."
+        )
     st.header("새로운 매출 등록")
     # 직원 목록: Supabase app_users/app_user_stores 우선 사용, 없으면 레거시 SQLite Employees 사용
     employees = pd.DataFrame(columns=["id", "name"])
