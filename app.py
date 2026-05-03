@@ -10178,6 +10178,9 @@ def render_new_sales():
         _month = order_date.month if hasattr(order_date, "month") else _today_kst().month
         monthly_max_before = _cached_employee_monthly_max(db_filename, employee_names_str, _year, _month)
 
+        _saving_msg = st.empty()
+        _saving_msg.info("⏳ 저장하는 중입니다... 잠시 기다려 주세요.")
+
         if use_supabase_op:
             if is_new_customer:
                 customer_id, ins_err = _supabase_insert_customer(db_filename, cust_name, phone1, phone2, address_full)
@@ -10241,6 +10244,7 @@ def render_new_sales():
             _sales_note = "신규 주문" + (f" | 이상마진 사유: {_margin_reason_saved}" if _margin_reason_saved else "")
             _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), _sales_note, unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
             clear_data_cache()
+            _saving_msg.empty()
             st.success("매출등록이 완료되었습니다.")
             net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
             st.session_state["_gamification_ctx"] = {
@@ -10363,6 +10367,7 @@ def render_new_sales():
                 net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
             finally:
                 conn.close()
+            _saving_msg.empty()
             st.session_state["_gamification_ctx"] = {
                 "amount": final_sales_save,
                 "cost": final_cost_save,
