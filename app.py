@@ -14040,6 +14040,7 @@ def main():
     if st.sidebar.button("🏠 첫 화면으로 (대시보드)", width='stretch', key="sidebar_home_btn"):
         if "active_admin_page" in st.session_state:
             del st.session_state["active_admin_page"]
+        st.session_state["main_tab_idx"] = 0
         st.rerun()
     # 한 직원이 여러 매장: 매장 선택 드롭다운 (superadmin 제외)
     allowed_stores = user.get("allowed_stores") or []
