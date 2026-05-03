@@ -2843,6 +2843,103 @@ def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date:
         }
 
 
+def _reconcile_missing_sales(db_filename: str) -> dict:
+    """app_orders에는 있지만 sales 테이블에 없는 주문(매출 누락)을 찾아 자동 복구.
+
+    동작:
+      1) app_orders에서 db_filename 매장의 모든 주문 메타(id, order_date, total_amount,
+         employee_names) 조회
+      2) sales에서 db_filename 매장(테넌트 컬럼 미설정 시 전체)의 order_id 집합 조회
+      3) 차집합 = 누락 주문 → 각각에 대해 결제합 계산 후 _insert_sales_transaction 호출
+         (note에 '신규 주문 (정합성 자동 복구)' 표기, transaction_date는 order_date 사용)
+
+    반환: {"missing": [...], "recovered": [...], "failed": [{"order_id":.., "reason":..}],
+           "skipped_reason": str|None}
+    핵심 INSERT 로직(_insert_sales_transaction)을 재사용하므로 기존 데이터 흐름과 100% 동일."""
+    result: dict = {"missing": [], "recovered": [], "failed": [], "skipped_reason": None}
+    if not db_filename:
+        result["skipped_reason"] = "db_filename 누락"
+        return result
+    if not _supabase_orders_payments_available():
+        result["skipped_reason"] = "Supabase orders/payments 비활성 환경"
+        return result
+    client, err = get_supabase_client()
+    if err or not client:
+        result["skipped_reason"] = f"Supabase 연결 실패: {err}"
+        return result
+
+    try:
+        ord_resp = (
+            client.table("app_orders")
+            .select("id, order_date, total_amount, employee_names")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .execute()
+        )
+        order_rows = ord_resp.data or []
+    except Exception as e:
+        result["skipped_reason"] = f"app_orders 조회 실패: {e}"
+        return result
+
+    if not order_rows:
+        return result
+
+    try:
+        sel = client.table("sales").select("order_id")
+        tenant_col = _sales_tenant_column()
+        if tenant_col:
+            sel = sel.eq(tenant_col, db_filename)
+        sales_resp = sel.execute()
+        sales_oids = {
+            int(r["order_id"]) for r in (sales_resp.data or [])
+            if r.get("order_id") is not None
+        }
+    except Exception as e:
+        result["skipped_reason"] = f"sales 조회 실패: {e}"
+        return result
+
+    missing_orders = [
+        o for o in order_rows
+        if o.get("id") is not None and int(o["id"]) not in sales_oids
+    ]
+    result["missing"] = [int(o["id"]) for o in missing_orders]
+
+    if not missing_orders:
+        return result
+
+    for o in missing_orders:
+        oid = int(o["id"])
+        try:
+            order_date_raw = o.get("order_date") or ""
+            transaction_date = str(order_date_raw)[:10] if order_date_raw else _today_kst().isoformat()
+            total_amount = float(o.get("total_amount") or 0)
+            employee_names = o.get("employee_names")
+            paid, _ = _sum_payments_by_order_supabase(db_filename, oid)
+            unpaid_balance = total_amount - float(paid or 0)
+
+            st.session_state.pop("_sales_insert_error_banner", None)
+            _insert_sales_transaction(
+                db_filename,
+                oid,
+                transaction_date,
+                total_amount,
+                note="신규 주문 (정합성 자동 복구)",
+                unpaid_balance=unpaid_balance,
+                employee_names=(employee_names or None),
+            )
+            err_banner = st.session_state.pop("_sales_insert_error_banner", None)
+            if err_banner and err_banner.get("order_id") == oid:
+                result["failed"].append({"order_id": oid, "reason": err_banner.get("reason", "원인 미상")})
+            else:
+                result["recovered"].append(oid)
+        except Exception as e:
+            result["failed"].append({"order_id": oid, "reason": str(e)})
+
+    if result["recovered"]:
+        clear_data_cache()
+
+    return result
+
+
 def create_tenant_db(db_filename: str):
     """
     신규 매장 생성 시 해당 매장 전용 SQLite 파일에 5개 테이블을 자동 생성.
@@ -9143,6 +9240,37 @@ def render_store_admin_employees():
     if not store_id:
         st.error("현재 매장 정보를 Supabase에서 찾을 수 없습니다.")
         return
+
+    # ---------- 매출 정합성 점검 (sales 누락 자동 복구) ----------
+    with st.expander("🔧 매출 정합성 점검 (sales 누락 자동 복구)", expanded=False):
+        st.caption(
+            "주문(app_orders)은 저장됐지만 매출(sales)에 기록되지 않은 누락 건을 찾아 "
+            "자동으로 복구합니다. KPI·월매출에 반영되지 않은 주문을 발견했을 때 사용하세요."
+        )
+        if st.button("정합성 점검 실행", key="reconcile_sales_btn"):
+            with st.spinner("점검 중... 매장의 모든 주문과 sales 레코드를 비교합니다."):
+                _rec = _reconcile_missing_sales(db_filename)
+            if _rec.get("skipped_reason"):
+                st.warning(f"⏭️ 점검 건너뜀: {_rec['skipped_reason']}")
+            else:
+                _missing = _rec.get("missing", [])
+                _recovered = _rec.get("recovered", [])
+                _failed = _rec.get("failed", [])
+                if not _missing:
+                    st.success("✅ 누락 주문 없음 — 모든 주문이 sales 테이블에 정상 기록되어 있습니다.")
+                else:
+                    st.info(f"📋 누락 주문 발견: {len(_missing)}건 (order_id: {_missing})")
+                    if _recovered:
+                        st.success(
+                            f"✅ 자동 복구 성공: {len(_recovered)}건 (order_id: {_recovered}) — "
+                            "다음 대시보드 진입 시 KPI·월매출에 반영됩니다."
+                        )
+                    if _failed:
+                        st.error(
+                            f"❌ 복구 실패: {len(_failed)}건\n\n"
+                            + "\n".join(f"- order_id #{f['order_id']}: {f['reason']}" for f in _failed)
+                            + "\n\n→ 관리자에게 수동 INSERT를 요청하세요."
+                        )
 
     st.header("직원 마스터 (Employees)")
     users = _get_supabase_users_list()
