@@ -11600,108 +11600,24 @@ def render_customer_balance():
                             # ── ⚖️ 실시간 잔금 검증 및 안내 로직 ──
                             _old_paid_total = float(orow["paid"])
                             _new_balance_preview = _edit_total - _old_paid_total
-                            if _new_balance_preview >= 0:
-                                st.session_state.pop(f"{edit_prefix}_allow_overpay", None)
-
                             st.markdown("#### ⚖️ 결제 및 잔금 검증")
                             st.metric("현재까지 결제된 총 금액", f"{int(_old_paid_total):,}원")
 
                             _block_update = False
-                            # ── 감액 동시 처리 UI ──
-                            _overdue_reduction_plan: dict = {}  # {payment_id: new_amount}
                             if _new_balance_preview < 0:
-                                # 감액 필요 금액
                                 _need_reduce = int(-_new_balance_preview)
                                 st.warning(
-                                    f"⚠️ **계약 감액 처리 필요**: 새 계약금액({_edit_total:,}원)이 결제 합계({int(_old_paid_total):,}원)보다 "
+                                    f"⚠️ **초과결제 안내**: 새 계약금액({_edit_total:,}원)이 결제 합계({int(_old_paid_total):,}원)보다 "
                                     f"**{_need_reduce:,}원** 적습니다.\n\n"
-                                    f"아래에서 감액할 결제 건을 선택하면 **계약금액 + 결제 감액이 동시에 저장**됩니다."
+                                    f"저장 시 결제 내역은 그대로 유지되고, 잔금 상태는 **초과결제({_need_reduce:,}원)**로 처리됩니다."
                                 )
-                                _allow_overpay_edit = st.checkbox(
-                                    "✅ 초과 허용: 결제 합계가 새 계약금액보다 커도 저장합니다. (잔금 상태는 이상결제로 저장되며, 초과결제 항목 탭에서도 동일 기준으로 표시됩니다.)",
-                                    key=f"{edit_prefix}_allow_overpay",
-                                )
-                                # 이 주문의 결제 목록 로드
-                                if _supabase_orders_payments_available():
-                                    _reduce_pays = _load_payments_supabase(db_filename, sel_oid)
-                                else:
-                                    _rp_conn = get_tenant_conn(db_filename)
-                                    try:
-                                        _reduce_pays = pd.read_sql(
-                                            "SELECT id, payment_date, amount, payment_method, card_company FROM Payments WHERE order_id=? ORDER BY id",
-                                            _rp_conn, params=(sel_oid,)
-                                        )
-                                    except Exception:
-                                        _reduce_pays = pd.DataFrame()
-                                    finally:
-                                        _rp_conn.close()
-
-                                # 양수 결제 건만 표시 (마이너스 상계 전표 제외)
-                                if not _reduce_pays.empty and "amount" in _reduce_pays.columns:
-                                    _reduce_pays_pos = _reduce_pays[_reduce_pays["amount"].astype(float) > 0].copy()
-                                else:
-                                    _reduce_pays_pos = pd.DataFrame()
-
-                                if _reduce_pays_pos.empty:
-                                    if not _allow_overpay_edit:
-                                        _block_update = True
-                                        st.error("⛔ 조정 가능한 결제 내역이 없습니다. 결제 섹션에서 직접 처리하거나, 위 「초과 허용」을 선택해 주세요.")
-                                else:
-                                    st.markdown("**감액할 결제 건 선택 (새 금액 입력)**")
-                                    _running_need = _need_reduce
-                                    for _, _pr in _reduce_pays_pos.iterrows():
-                                        _pr_id = int(_pr["id"])
-                                        _pr_amt = float(_pr["amount"] or 0)
-                                        _pr_method = str(_pr.get("payment_method") or "-")
-                                        _pr_date = str(_pr.get("payment_date") or "-")[:10]
-                                        _pr_key = f"reduce_amt_{_pr_id}_{sel_oid}"
-                                        # 기본값: 남은 조정필요액만큼 차감
-                                        _default_new = max(0, int(_pr_amt) - _running_need)
-                                        if _pr_key not in st.session_state:
-                                            st.session_state[_pr_key] = _format_number_comma(str(_default_new))
-                                        _rc1, _rc2, _rc3 = st.columns([3, 2, 2])
-                                        with _rc1:
-                                            st.write(f"결제 #{_pr_id} | {_pr_method} | {_pr_date} | **{_pr_amt:,.0f}원**")
-                                        with _rc2:
-                                            st.text_input(
-                                                "새 금액",
-                                                key=_pr_key,
-                                                label_visibility="collapsed",
-                                                on_change=lambda k=_pr_key: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))),
-                                            )
-                                        with _rc3:
-                                            _new_pr_val = _parse_comma_to_int(st.session_state.get(_pr_key, "0"))
-                                            _delta_pr = int(_pr_amt) - _new_pr_val
-                                            if _delta_pr > 0:
-                                                st.caption(f"▼ -{_delta_pr:,}원 감액")
-                                            elif _delta_pr < 0:
-                                                st.caption(f"▲ +{-_delta_pr:,}원 증액")
-                                            else:
-                                                st.caption("변경 없음")
-                                        _overdue_reduction_plan[_pr_id] = _new_pr_val
-                                        _running_need -= max(0, int(_pr_amt) - _new_pr_val)
-
-                                    # 조정 후 잔금 재계산
-                                    _planned_new_paid = sum(
-                                        _parse_comma_to_int(st.session_state.get(f"reduce_amt_{_pr_id}_{sel_oid}", "0"))
-                                        for _pr_id in _overdue_reduction_plan
-                                    )
-                                    _planned_balance = _edit_total - _planned_new_paid
-                                    if _planned_balance < 0:
-                                        if not _allow_overpay_edit:
-                                            _block_update = True
-                                            st.error(f"⛔ 조정 후에도 결제 합계({_planned_new_paid:,}원)가 새 계약금액({_edit_total:,}원)을 초과합니다. 감액을 더 늘리거나 「초과 허용」을 선택해 주세요.")
-                                    elif _planned_balance == 0:
-                                        st.success(f"✅ 조정 후 잔금: {_planned_balance:,}원 (완납)")
-                                    else:
-                                        st.info(f"ℹ️ 조정 후 예상 잔금: {_planned_balance:,}원")
                             elif _edit_total != float(orow["total_amount"] or 0) and _new_balance_preview > 0:
                                 st.warning(f"⚠️ 증액 안내: 총 계약 금액이 늘어나서 **{int(_new_balance_preview):,}원**의 추가 잔금이 발생합니다.\\n\\n"
                                            f"👉 **다음 단계:** 아래 [수정 완료] 버튼을 누른 후, 화면 하단의 **[잔금 추가 결제]** 탭을 열어 증액된 금액만큼 추가 결제를 진행해 주세요.")
                             else:
                                 st.info(f"✅ 변경 후 예상 잔금: {int(_new_balance_preview):,}원")
 
-                            # 승인 절차 없이 전 직원 직접 수정 (결제 초과 시 기본은 버튼 잠금, 「초과 허용」 시 저장 가능)
+                            # 승인 절차 없이 전 직원 직접 수정 (결제 초과 시 초과결제 상태로 그대로 저장)
                             edit_reason = st.text_area("변경 사유(필수, 예: 단가 할인, 옵션 추가 등)", key=f"{edit_prefix}_reason")
                             
                             if st.button("수정 완료 (Update)", key=f"{edit_prefix}_update_btn", disabled=_block_update, type="primary"):
@@ -11741,68 +11657,7 @@ def render_customer_balance():
                                         payment_total = float(pay_sum_row[0]) if pay_sum_row else 0
                                         
                                     balance_check = new_total - payment_total
-                                    _allow_overpay_save = bool(st.session_state.get(f"{edit_prefix}_allow_overpay"))
-                                    if balance_check < 0:
-                                        # 초과 허용: 결제는 그대로 두고 계약만 반영 → 재계산 시 balance_status=이상결제, 초과결제 탭은 balance<0 동일
-                                        if _allow_overpay_save:
-                                            pass
-                                        elif _overdue_reduction_plan:
-                                            today_str_reduce = datetime.now(tz=KST).strftime("%Y-%m-%d")
-                                            _reduce_err = None
-                                            for _rpid, _new_ramt in _overdue_reduction_plan.items():
-                                                try:
-                                                    if _use_supa:
-                                                        _old_pay_rows = _load_payments_supabase(db_filename, sel_oid)
-                                                        if not _old_pay_rows.empty and "id" in _old_pay_rows.columns:
-                                                            _match = _old_pay_rows[_old_pay_rows["id"] == _rpid]
-                                                            if not _match.empty:
-                                                                _old_amt = float(_match.iloc[0]["amount"] or 0)
-                                                                _old_method = str(_match.iloc[0].get("payment_method") or "")
-                                                                if int(_old_amt) != _new_ramt:
-                                                                    # 역분개(상계) 엔트리: 구 금액 음수
-                                                                    _diff_amt = _new_ramt - int(_old_amt)
-                                                                    sc_r, _ = get_supabase_client()
-                                                                    if sc_r:
-                                                                        sc_r.table("app_payments").insert({
-                                                                            ORDERS_PAYMENTS_TENANT_COL: db_filename,
-                                                                            "order_id": sel_oid,
-                                                                            "payment_date": today_str_reduce,
-                                                                            "amount": _diff_amt,
-                                                                            "payment_method": _old_method or None,
-                                                                            "fee_amount": 0,
-                                                                            "created_by": _current_username(),
-                                                                        }).execute()
-                                                    else:
-                                                        if conn:
-                                                            _old_ramt_row = conn.execute("SELECT amount, payment_method FROM Payments WHERE id=?", (_rpid,)).fetchone()
-                                                            if _old_ramt_row:
-                                                                _old_amt_sql = float(_old_ramt_row[0] or 0)
-                                                                _old_method_sql = _old_ramt_row[1] or ""
-                                                                if int(_old_amt_sql) != _new_ramt:
-                                                                    _diff_sql = _new_ramt - int(_old_amt_sql)
-                                                                    conn.execute(
-                                                                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, fee_amount, created_by, created_at) VALUES (?,?,?,?,0,?,datetime('now', '+9 hours'))",
-                                                                        (sel_oid, today_str_reduce, _diff_sql, _old_method_sql or None, _current_username()),
-                                                                    )
-                                                except Exception as _re:
-                                                    _reduce_err = str(_re)
-                                            if _reduce_err:
-                                                st.warning(f"⚠️ 결제 감액 처리 중 일부 오류: {_reduce_err}")
-                                            # 감액 적용 후 payment_total 재계산
-                                            if _use_supa:
-                                                payment_total, _ = _sum_payments_by_order_supabase(db_filename, sel_oid)
-                                            else:
-                                                if conn:
-                                                    payment_total = float(conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id=?", (sel_oid,)).fetchone()[0] or 0)
-                                            balance_check = new_total - payment_total
-                                            if balance_check < 0:
-                                                st.error(f"⛔ 감액 처리 후에도 결제 합계({payment_total:,.0f}원)가 새 계약금액({new_total:,.0f}원)을 초과합니다. 「초과 허용」으로 저장하려면 해당 옵션을 켠 뒤 다시 시도해 주세요.")
-                                                if conn: conn.close()
-                                                st.stop()
-                                        else:
-                                            st.error(f"⛔ 초과결제 감지: 결제 금액이 구매 금액보다 큽니다. 결제 내역을 조정하거나 「초과 허용」을 선택해 주세요.")
-                                            if conn: conn.close()
-                                            st.stop()
+                                    # balance_check < 0(초과결제)이면 결제 내역 그대로 유지, 계약금액만 변경 → balance_status=이상결제로 자동 처리
 
                                     margin_pct = (new_total - new_cost - new_display_cost) / new_total * 100 if new_total else 0
                                     if margin_pct < 15 or margin_pct > 25:
