@@ -5881,8 +5881,22 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             fig1.update_layout(margin=dict(t=40, b=20, l=20, r=20), height=320)
             st.plotly_chart(fig1, width='stretch')
 
+    _VISIT_REASON_NORMALIZE = {
+        "매장외관": "매장외관(지나가다)",
+        "재구매": "기존고객(재구매 AS)",
+        "소개": "지인/업체소개",
+        "광고(SNS 외)": "광고 및 홍보",
+    }
+    _PURCHASE_REASON_NORMALIZE = {
+        "교체(이사없이)": "단순 교체/추가",
+        "이사": "일반 이사",
+        "공동구매(입주, 가구쇼 등)": "신규 입주",
+        "현대임직원할인": "기타(사무용 등)",
+    }
+
     with c2:
-        visit_counts = merged["visit_reason"].fillna("미기입").value_counts().reset_index()
+        _visit_col = merged["visit_reason"].fillna("미기입").replace(_VISIT_REASON_NORMALIZE)
+        visit_counts = _visit_col.value_counts().reset_index()
         visit_counts.columns = ["visit_reason", "count"]
         if len(visit_counts) == 0 or visit_counts["count"].sum() == 0:
             st.info("데이터가 충분하지 않습니다.")
@@ -5894,7 +5908,9 @@ def _render_marketing_insights_charts(orders: pd.DataFrame, customers: pd.DataFr
             st.plotly_chart(fig2, width='stretch')
 
     with c1:
-        purchase_sales = merged.groupby("purchase_reason", as_index=False)["total_amount"].sum()
+        _merged_pr = merged.copy()
+        _merged_pr["purchase_reason"] = _merged_pr["purchase_reason"].replace(_PURCHASE_REASON_NORMALIZE)
+        purchase_sales = _merged_pr.groupby("purchase_reason", as_index=False)["total_amount"].sum()
         purchase_sales = purchase_sales[purchase_sales["purchase_reason"].notna() & (purchase_sales["purchase_reason"] != "")]
         if len(purchase_sales) == 0:
             st.info("데이터가 충분하지 않습니다.")
@@ -6145,12 +6161,25 @@ def _render_marketing_multi_period_comparison(
     label_a = f"{range_start_a} ~ {range_end_a}"
     label_b = f"{range_start_b} ~ {range_end_b}"
 
+    _VISIT_REASON_NORMALIZE_CMP = {
+        "매장외관": "매장외관(지나가다)",
+        "재구매": "기존고객(재구매 AS)",
+        "소개": "지인/업체소개",
+        "광고(SNS 외)": "광고 및 홍보",
+    }
+    _PURCHASE_REASON_NORMALIZE_CMP = {
+        "교체(이사없이)": "단순 교체/추가",
+        "이사": "일반 이사",
+        "공동구매(입주, 가구쇼 등)": "신규 입주",
+        "현대임직원할인": "기타(사무용 등)",
+    }
+
     # ---------- ① 방문 경로 분석 (유입 경로별 고객 수): Pie 또는 가로형 막대 ----------
     st.subheader("① 방문 경로 분석 (유입 경로별 고객 수)")
     c1, c2 = st.columns(2)
     with c1:
         st.caption(f"기간 A: {label_a}")
-        vc_a = df_period_a["visit_reason"].fillna("미기입").value_counts().reset_index()
+        vc_a = df_period_a["visit_reason"].fillna("미기입").replace(_VISIT_REASON_NORMALIZE_CMP).value_counts().reset_index()
         vc_a.columns = ["visit_reason", "count"]
         if len(vc_a) == 0 or vc_a["count"].sum() == 0:
             st.info("데이터 없음")
@@ -6161,7 +6190,7 @@ def _render_marketing_multi_period_comparison(
             st.plotly_chart(fig_a1, width='stretch', key=f"{key_prefix}_visit_route_a")
     with c2:
         st.caption(f"기간 B: {label_b}")
-        vc_b = df_period_b["visit_reason"].fillna("미기입").value_counts().reset_index()
+        vc_b = df_period_b["visit_reason"].fillna("미기입").replace(_VISIT_REASON_NORMALIZE_CMP).value_counts().reset_index()
         vc_b.columns = ["visit_reason", "count"]
         if len(vc_b) == 0 or vc_b["count"].sum() == 0:
             st.info("데이터 없음")
@@ -6176,7 +6205,9 @@ def _render_marketing_multi_period_comparison(
     c1, c2 = st.columns(2)
     with c1:
         st.caption(f"기간 A: {label_a}")
-        pr_a = df_period_a.groupby("purchase_reason", as_index=False)["total_amount"].sum()
+        _pr_a = df_period_a.copy()
+        _pr_a["purchase_reason"] = _pr_a["purchase_reason"].replace(_PURCHASE_REASON_NORMALIZE_CMP)
+        pr_a = _pr_a.groupby("purchase_reason", as_index=False)["total_amount"].sum()
         pr_a = pr_a[pr_a["purchase_reason"].notna() & (pr_a["purchase_reason"] != "")]
         if len(pr_a) == 0:
             st.info("데이터 없음")
@@ -6189,7 +6220,9 @@ def _render_marketing_multi_period_comparison(
             st.plotly_chart(fig_a2, width='stretch', key=f"{key_prefix}_purchase_reason_a")
     with c2:
         st.caption(f"기간 B: {label_b}")
-        pr_b = df_period_b.groupby("purchase_reason", as_index=False)["total_amount"].sum()
+        _pr_b = df_period_b.copy()
+        _pr_b["purchase_reason"] = _pr_b["purchase_reason"].replace(_PURCHASE_REASON_NORMALIZE_CMP)
+        pr_b = _pr_b.groupby("purchase_reason", as_index=False)["total_amount"].sum()
         pr_b = pr_b[pr_b["purchase_reason"].notna() & (pr_b["purchase_reason"] != "")]
         if len(pr_b) == 0:
             st.info("데이터 없음")
