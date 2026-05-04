@@ -10110,9 +10110,34 @@ def render_new_sales():
             help="(판매가 − 원가) / 판매가 × 100 (카드 수수료 미반영 기본 마진율)",
         )
 
-    VISIT_REASON_OPTIONS = ["매장외관", "재구매", "소개", "광고(SNS 외)"]
+    VISIT_REASON_OPTIONS = [
+        "온라인검색",
+        "광고 및 홍보",
+        "매장외관(지나가다)",
+        "지인/업체소개",
+        "기존고객(재구매 AS)",
+        "박람회 및 제휴업체",
+        "기타(메모필수)",
+    ]
     PURCHASE_REASON_OPTIONS = ["교체(이사없이)", "신혼/혼수", "공동구매(입주, 가구쇼 등)", "이사", "현대임직원할인"]
-    visit_reason = st.selectbox("방문 이유 *", options=VISIT_REASON_OPTIONS, key="visit_reason")
+    visit_reason_sel = st.radio(
+        "방문 이유 * (필수, 1개 선택)",
+        options=VISIT_REASON_OPTIONS,
+        key="visit_reason_radio",
+        horizontal=True,
+        index=None,
+    )
+    visit_reason_memo = ""
+    if visit_reason_sel == "기타(메모필수)":
+        visit_reason_memo = st.text_input(
+            "기타 방문 이유 메모 (필수) *",
+            key="visit_reason_memo",
+            placeholder="예: 유튜브 영상 시청 후 방문",
+        )
+        visit_reason = f"기타: {visit_reason_memo.strip()}" if visit_reason_memo.strip() else ""
+    else:
+        st.session_state.pop("visit_reason_memo", None)
+        visit_reason = visit_reason_sel or ""
     purchase_reason = st.selectbox("구매 이유 *", options=PURCHASE_REASON_OPTIONS, key="purchase_reason")
 
     # ----- 다중(복합) 결제 수단: 기본 4개, 최대 20개 (플러스 버튼으로 추가) -----
@@ -10253,6 +10278,15 @@ def render_new_sales():
         if not selected_categories:
             st.error("품목/카테고리(필수)를 1개 이상 선택하세요.")
             st.stop()
+        # 방문 이유 필수
+        if not visit_reason_sel:
+            st.error("방문 이유(필수)를 선택하세요.")
+            st.stop()
+        if visit_reason_sel == "기타(메모필수)":
+            _memo_val = (st.session_state.get("visit_reason_memo") or "").strip()
+            if not _memo_val:
+                st.error("방문 이유 '기타' 선택 시 메모를 반드시 입력해야 합니다.")
+                st.stop()
         # 담당 직원 필수 — 미선택 시 KPI/직원평가에서 영구 누락되므로 저장 차단
         if not selected_employees:
             st.error("담당 직원(필수)을 1명 이상 선택하세요. KPI·실적 분배에 필요합니다.")
