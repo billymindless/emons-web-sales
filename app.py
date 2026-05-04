@@ -4507,16 +4507,10 @@ def _render_order_audit_trail(db_filename: str, order_id: int):
                         _dm_delta = _margin_after - _margin_before
                         _dm_color = "red" if _dm_delta < 0 else "green"
                         st.markdown(f"**판매금액 변화:** {amt:+,.0f}원  |  **마진 변화:** :{_dm_color}[{_dm_delta:+,.0f}원]")
-                        # KPI 마진 영향 (저장된 |__dm: 값, 원가 미포함 비율배분 기준)
-                        _dm_val = None
+                        # KPI 마진 영향: 마진 변화 전체를 표시 (직원이 체감하는 실질 영향과 동일)
                         if "|__dm:" in evt["payload"]:
-                            try:
-                                _dm_val = float(evt["payload"].split("|__dm:")[1].split("|")[0].strip())
-                            except Exception:
-                                pass
-                        if _dm_val is not None:
-                            _dm_kpi_color = "red" if _dm_val < 0 else "green"
-                            st.caption(f"※ KPI 마진 영향(변경 당시 기준): :{_dm_kpi_color}[{_dm_val:+,.0f}원]")
+                            _dm_kpi_color = "red" if _dm_delta < 0 else "green"
+                            st.caption(f"※ KPI 마진 영향: :{_dm_kpi_color}[{_dm_delta:+,.0f}원]")
                 else:
                     # app_edit_requests 이력
                     _payload = evt["payload"]
