@@ -10119,7 +10119,13 @@ def render_new_sales():
         "박람회 및 제휴업체",
         "기타(메모필수)",
     ]
-    PURCHASE_REASON_OPTIONS = ["교체(이사없이)", "신혼/혼수", "공동구매(입주, 가구쇼 등)", "이사", "현대임직원할인"]
+    PURCHASE_REASON_OPTIONS = [
+        "신혼/혼수",
+        "신규 입주",
+        "일반 이사",
+        "단순 교체/추가",
+        "기타(사무용 등)",
+    ]
     visit_reason_sel = st.radio(
         "방문 이유 * (필수, 1개 선택)",
         options=VISIT_REASON_OPTIONS,
@@ -10138,7 +10144,14 @@ def render_new_sales():
     else:
         st.session_state.pop("visit_reason_memo", None)
         visit_reason = visit_reason_sel or ""
-    purchase_reason = st.selectbox("구매 이유 *", options=PURCHASE_REASON_OPTIONS, key="purchase_reason")
+    purchase_reason_sel = st.radio(
+        "구매 이유 * (필수, 1개 선택)",
+        options=PURCHASE_REASON_OPTIONS,
+        key="purchase_reason_radio",
+        horizontal=True,
+        index=None,
+    )
+    purchase_reason = purchase_reason_sel or ""
 
     # ----- 다중(복합) 결제 수단: 기본 4개, 최대 20개 (플러스 버튼으로 추가) -----
     MAX_PAYMENT_SLOTS = 20
@@ -10287,6 +10300,10 @@ def render_new_sales():
             if not _memo_val:
                 st.error("방문 이유 '기타' 선택 시 메모를 반드시 입력해야 합니다.")
                 st.stop()
+        # 구매 이유 필수
+        if not purchase_reason_sel:
+            st.error("구매 이유(필수)를 선택하세요.")
+            st.stop()
         # 담당 직원 필수 — 미선택 시 KPI/직원평가에서 영구 누락되므로 저장 차단
         if not selected_employees:
             st.error("담당 직원(필수)을 1명 이상 선택하세요. KPI·실적 분배에 필요합니다.")
