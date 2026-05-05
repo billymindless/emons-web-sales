@@ -11984,14 +11984,14 @@ def render_customer_balance():
                                 if _supabase_orders_payments_available():
                                     pay_list = _load_payments_supabase(db_filename, _order_id_pay)
                                     if not pay_list.empty:
-                                        pay_list = pay_list[["id", "payment_date", "amount", "payment_method", "card_company", "fee_amount"]]
+                                        pay_list = pay_list[["id", "payment_date", "amount", "payment_method", "card_company", "onnuri_approval_code", "fee_amount"]]
                                     else:
                                         pay_list = pd.DataFrame()
                                 else:
                                     _conn_pay = get_tenant_conn(db_filename)
                                     try:
                                         pay_list = pd.read_sql(
-                                            "SELECT id, payment_date, amount, payment_method, card_company, fee_amount FROM Payments WHERE order_id = ? ORDER BY id",
+                                            "SELECT id, payment_date, amount, payment_method, card_company, onnuri_approval_code, fee_amount FROM Payments WHERE order_id = ? ORDER BY id",
                                             _conn_pay, params=(_order_id_pay,)
                                         )
                                     except Exception:
@@ -12015,8 +12015,12 @@ def render_customer_balance():
                                         pay_display = pay_list.copy()
                                         pay_display["amount"] = pay_display["amount"].apply(lambda x: f"{x:,.0f}원")
                                         pay_display["fee_amount"] = pay_display["fee_amount"].fillna(0).apply(lambda x: f"{x:,.0f}원")
-                                        pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사", "fee_amount": "수수료"})
-                                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사", "수수료"]], width='stretch')
+                                        # 온누리 결제의 경우 card_company 대신 onnuri_approval_code를 카드사 컬럼에 표시
+                                        if "onnuri_approval_code" in pay_display.columns:
+                                            mask = pay_display["card_company"].isna() | (pay_display["card_company"].astype(str).isin(["None", "nan", ""]))
+                                            pay_display.loc[mask, "card_company"] = pay_display.loc[mask, "onnuri_approval_code"]
+                                        pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료"})
+                                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료"]], width='stretch')
                                         for _, prow in pay_list.iterrows():
                                             with st.expander(f"결제 ID {prow['id']} — {prow['payment_method'] or '-'} {float(prow['amount'] or 0):,.0f}원"):
                                                 col_left, col_right = st.columns(2)
