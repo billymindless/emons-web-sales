@@ -725,8 +725,10 @@ def _get_app_user_display_name_map():
     return out
 
 
+@st.cache_data(ttl=3600)
 def _get_supabase_user_store_ids(user_id: int):
-    """한 직원의 배정 매장 id 목록 (Supabase app_user_stores)."""
+    """한 직원의 배정 매장 id 목록 (Supabase app_user_stores). 1시간 캐시.
+    매장/직원 배정 변경 시 clear_data_cache()로 갱신."""
     if not user_id:
         return []
     client, err = get_supabase_client()
@@ -3717,15 +3719,18 @@ def _insert_delete_request(db_filename: str, order_id: int, reason: str, request
         return False, str(e)
 
 
-def _fetch_pending_delete_requests(db_filename: str) -> list:
-    """해당 매장의 미처리 삭제 요청 목록 조회 (관리자용)."""
+@st.cache_data(ttl=60)
+def _fetch_pending_delete_requests(db_filename: str, target_username: str = "") -> list:
+    """해당 매장의 미처리 삭제 요청 목록 조회 (관리자용). 60초 캐시 — 사이드바 표시용으로 잦은 메뉴 이동 시 HTTP 절약.
+    target_username을 캐시 키에 포함시켜 다중 사용자 환경에서도 안전.
+    삭제 요청 처리/생성 시 clear_data_cache()로 즉시 갱신."""
     if not _supabase_orders_payments_available() or not db_filename:
         return []
     try:
         sc, err = get_supabase_client()
         if err or not sc:
             return []
-        username = _current_username()
+        username = (target_username or "").strip() or _current_username()
         r = (
             sc.table("app_edit_requests")
             .select("id, created_at, entity_id, requested_by, reason, status")
@@ -3926,7 +3931,7 @@ def _render_admin_delete_requests(db_filename: str):
     reviewed_by = _current_username()
 
     # ── 대기 중인 요청 ──
-    requests_list = _fetch_pending_delete_requests(db_filename)
+    requests_list = _fetch_pending_delete_requests(db_filename, reviewed_by)
 
     if not requests_list:
         st.info("현재 처리 대기 중인 삭제 요청이 없습니다.")
@@ -14297,7 +14302,7 @@ def main():
             st.session_state["active_admin_page"] = "margin_monitor"
             st.session_state.pop("mm_queried", None)
         _del_db = st.session_state.get("current_db")
-        _pending_del_count = len(_fetch_pending_delete_requests(_del_db)) if _del_db else 0
+        _pending_del_count = len(_fetch_pending_delete_requests(_del_db, _current_username())) if _del_db else 0
         _del_btn_label = f"🗑️ 주문 삭제 요청 관리 ({_pending_del_count}건)" if _pending_del_count > 0 else "🗑️ 주문 삭제 요청 관리"
         if st.sidebar.button(_del_btn_label, width='stretch'):
             st.session_state["active_admin_page"] = "delete_requests"
