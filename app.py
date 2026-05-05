@@ -10221,10 +10221,10 @@ def render_new_sales():
             if method in _CARD_WITH_COMPANY:
                 card_company = st.selectbox(f"카드사 #{i+1} *", options=CARD_COMPANY_OPTIONS, key=card_key)
             elif method == "메인페이":
-                st.text_input(f"메인페이 승인번호 4자리 #{i+1}", key=card_key, max_chars=4)
+                st.text_input(f"메인페이 승인번호 4자리 #{i+1} *", key=card_key, max_chars=4)
                 card_company = st.session_state.get(card_key)
             elif method == "지역화폐":
-                st.text_input(f"지역화폐 승인번호 #{i+1}", key=card_key)
+                st.text_input(f"지역화폐 승인번호 #{i+1} *", key=card_key)
                 card_company = st.session_state.get(card_key)
             else:
                 card_company = None
@@ -10243,9 +10243,9 @@ def render_new_sales():
                 st.session_state[onnuri_stage_key] = "last4"
             stage = st.session_state.get(onnuri_stage_key, "last4")
             if stage == "last4":
-                st.text_input(f"온누리 승인번호 뒤 4자리 #{i+1}", key=last4_key, max_chars=4)
+                st.text_input(f"온누리 승인번호 뒤 4자리 #{i+1} *", key=last4_key, max_chars=4)
             else:
-                st.text_input(f"온누리 승인번호 전체 (8자리 이상) #{i+1}", key=full_key)
+                st.text_input(f"온누리 승인번호 전체 (8자리 이상) #{i+1} *", key=full_key)
             st.file_uploader(
                 "온누리상품권 영수증 사진(선택)",
                 type=["png", "jpg", "jpeg", "webp"],
@@ -10391,6 +10391,22 @@ def render_new_sales():
                     "이상 마진율 사유를 5자 이상 입력해야 등록할 수 있습니다."
                 )
                 st.stop()
+        # 메인페이·지역화폐 승인번호 필수 검증
+        for i in range(slot_count):
+            method = st.session_state.get(f"pay_method_{i}", "")
+            amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
+            if amt <= 0:
+                continue
+            if method == "메인페이":
+                _appr = re.sub(r"\D", "", (st.session_state.get(f"pay_card_{i}", "") or "").strip())
+                if len(_appr) != 4:
+                    st.error(f"결제 #{i+1} 메인페이 승인번호 4자리를 정확히 입력하세요.")
+                    st.stop()
+            elif method == "지역화폐":
+                _appr = (st.session_state.get(f"pay_card_{i}", "") or "").strip()
+                if not _appr:
+                    st.error(f"결제 #{i+1} 지역화폐 승인번호를 입력하세요.")
+                    st.stop()
         # 온누리상품권 결제에 대한 부정 사용 방지 검증
         # 1차: 승인번호 뒤 4자리 + 결제일 기준 중복 여부 확인 (금액 제외)
         # 중복 발견 시 해당 슬롯은 전체 승인번호(8자리 이상) 입력 단계로 전환
@@ -12134,7 +12150,7 @@ def render_customer_balance():
                                                         elif new_method == "메인페이":
                                                             _cur_appr = prow.get("card_company") or ""
                                                             new_card_company = st.text_input(
-                                                                "메인페이 승인번호 4자리",
+                                                                "메인페이 승인번호 4자리 *",
                                                                 value=_cur_appr,
                                                                 max_chars=4,
                                                                 key=f"pay_edit_card_{prow['id']}",
@@ -12142,7 +12158,7 @@ def render_customer_balance():
                                                         elif new_method == "지역화폐":
                                                             _cur_appr = prow.get("card_company") or ""
                                                             new_card_company = st.text_input(
-                                                                "지역화폐 승인번호",
+                                                                "지역화폐 승인번호 *",
                                                                 value=_cur_appr,
                                                                 key=f"pay_edit_card_{prow['id']}",
                                                             )
@@ -12150,7 +12166,7 @@ def render_customer_balance():
                                                             _cur_onnuri = prow.get("onnuri_approval_code") or ""
                                                             new_card_company = None
                                                             new_onnuri_code = st.text_input(
-                                                                "온누리 승인번호",
+                                                                "온누리 승인번호 *",
                                                                 value=_cur_onnuri,
                                                                 key=f"pay_edit_card_{prow['id']}",
                                                             )
@@ -12221,6 +12237,12 @@ def render_customer_balance():
                                                         if st.button("수정 완료", key=f"pay_edit_{prow['id']}"):
                                                             if not del_reason or len(del_reason.strip()) < 5:
                                                                 st.warning("사유를 5자 이상 입력하세요.")
+                                                            elif new_method == "메인페이" and len(re.sub(r"\D", "", (new_card_company or ""))) != 4:
+                                                                st.warning("메인페이 승인번호 4자리를 정확히 입력하세요.")
+                                                            elif new_method == "지역화폐" and not (new_card_company or "").strip():
+                                                                st.warning("지역화폐 승인번호를 입력하세요.")
+                                                            elif "온누리" in str(new_method) and "지류" not in str(new_method) and not (new_onnuri_code or "").strip():
+                                                                st.warning("온누리 승인번호를 입력하세요.")
                                                             else:
                                                                 receipt_path_saved = None
                                                                 if receipt_upload:
