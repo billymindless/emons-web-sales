@@ -10486,7 +10486,7 @@ def render_new_sales():
                 if amt <= 0:
                     continue
                 method = st.session_state.get(f"pay_method_{i}", "")
-                card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "메인페이") else None
+                card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "메인페이", "체크카드", "지역화폐") else None
                 fee = _payment_fee_amount(method, amt)
                 total_fees += fee
                 total_paid_initial += amt
@@ -12121,6 +12121,7 @@ def render_customer_balance():
                                                             key=f"pay_edit_method_{prow['id']}",
                                                         )
                                                         # 카드사/승인번호 (수단에 따라)
+                                                        new_onnuri_code = None
                                                         if new_method in _CARD_WITH_COMPANY:
                                                             _cur_card = prow.get("card_company") or CARD_COMPANY_OPTIONS[0]
                                                             _card_idx = CARD_COMPANY_OPTIONS.index(_cur_card) if _cur_card in CARD_COMPANY_OPTIONS else 0
@@ -12143,6 +12144,14 @@ def render_customer_balance():
                                                             new_card_company = st.text_input(
                                                                 "지역화폐 승인번호",
                                                                 value=_cur_appr,
+                                                                key=f"pay_edit_card_{prow['id']}",
+                                                            )
+                                                        elif "온누리" in str(new_method) and "지류" not in str(new_method):
+                                                            _cur_onnuri = prow.get("onnuri_approval_code") or ""
+                                                            new_card_company = None
+                                                            new_onnuri_code = st.text_input(
+                                                                "온누리 승인번호",
+                                                                value=_cur_onnuri,
                                                                 key=f"pay_edit_card_{prow['id']}",
                                                             )
                                                         else:
@@ -12257,6 +12266,7 @@ def render_customer_balance():
                                                                             "payment_method": prow["payment_method"],
                                                                             "card_company": prow["card_company"],
                                                                             "fee_amount": -old_fee_val,
+                                                                            "onnuri_approval_code": prow.get("onnuri_approval_code"),
                                                                             "created_by": _current_username(),
                                                                         },
                                                                         _error_detail=_rev_err,
@@ -12288,6 +12298,7 @@ def render_customer_balance():
                                                                                 "payment_method": new_method,
                                                                                 "card_company": new_card_company,
                                                                                 "fee_amount": float(new_fee),
+                                                                                "onnuri_approval_code": new_onnuri_code,
                                                                                 "created_by": _current_username(),
                                                                             },
                                                                             _error_detail=_new_err,
