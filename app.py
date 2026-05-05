@@ -10486,7 +10486,7 @@ def render_new_sales():
                 if amt <= 0:
                     continue
                 method = st.session_state.get(f"pay_method_{i}", "")
-                card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "메인페이", "체크카드", "지역화폐") else None
+                card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("메인페이", "지역화폐") else None
                 fee = _payment_fee_amount(method, amt)
                 total_fees += fee
                 total_paid_initial += amt
