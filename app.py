@@ -2415,22 +2415,31 @@ def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | Non
 
 @st.cache_data(ttl=600)
 def _load_payments_supabase(db_filename: str, order_id: int | None = None) -> pd.DataFrame:
-    """app_payments 조회. order_id 지정 시 해당 주문만. 10분 캐시 — 저장/삭제 후 clear_data_cache()로 즉시 갱신."""
+    """app_payments 조회. order_id 지정 시 해당 주문만. 10분 캐시 — 저장/삭제 후 clear_data_cache()로 즉시 갱신.
+    PostgREST 기본 행 상한(1000) 초과 시 누락 방지를 위해 페이지네이션으로 전체 조회."""
     if not db_filename:
         return pd.DataFrame()
     client, err = get_supabase_client()
     if err or not client:
         return pd.DataFrame()
     try:
-        q = client.table("app_payments").select(
-            "id, order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at"
-        ).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
-        if order_id is not None:
-            q = q.eq("order_id", order_id)
-        q = q.order("id")
-        r = q.execute()
-        rows = (r.data or []) if hasattr(r, "data") else []
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
+        _PAGE = 1000
+        all_rows: list = []
+        offset = 0
+        while True:
+            q = client.table("app_payments").select(
+                "id, order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at"
+            ).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            if order_id is not None:
+                q = q.eq("order_id", order_id)
+            q = q.order("id").range(offset, offset + _PAGE - 1)
+            r = q.execute()
+            rows = (r.data or []) if hasattr(r, "data") else []
+            all_rows.extend(rows)
+            if len(rows) < _PAGE:
+                break
+            offset += _PAGE
+        return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
