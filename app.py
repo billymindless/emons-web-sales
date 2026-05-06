@@ -2685,6 +2685,13 @@ def _insert_payment_supabase(
             if _error_detail is not None:
                 _error_detail.append(f"order_id 변환 실패: {payload.get('order_id')!r}")
             return None
+    # amount/fee_amount는 BIGINT 컬럼 — float("-200000.0") 형태를 int로 강제 변환
+    for _fld in ("amount", "fee_amount"):
+        if _fld in payload and payload[_fld] is not None:
+            try:
+                payload[_fld] = int(round(float(payload[_fld])))
+            except (TypeError, ValueError):
+                pass
     payload[ORDERS_PAYMENTS_TENANT_COL] = db_filename
     try:
         r = client.table("app_payments").insert(payload).execute()
@@ -2706,6 +2713,13 @@ def _update_payment_supabase(db_filename: str, payment_id: int, updates: dict) -
     client, err = get_supabase_client()
     if err or not client:
         return False
+    updates = dict(updates)
+    for _fld in ("amount", "fee_amount"):
+        if _fld in updates and updates[_fld] is not None:
+            try:
+                updates[_fld] = int(round(float(updates[_fld])))
+            except (TypeError, ValueError):
+                pass
     try:
         client.table("app_payments").update(updates).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", payment_id).execute()
         return True
