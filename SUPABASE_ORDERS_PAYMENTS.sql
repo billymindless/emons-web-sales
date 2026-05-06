@@ -34,10 +34,10 @@ CREATE TABLE IF NOT EXISTS app_payments (
   db_filename TEXT NOT NULL,
   order_id BIGINT NOT NULL,
   payment_date TEXT NOT NULL,
-  amount REAL NOT NULL,
+  amount BIGINT NOT NULL,       -- 원화 금액은 정수(원 단위). REAL(float4) 사용 시 6자리 유효숫자 한계로 100만원대에서 반올림 오류 발생
   payment_method TEXT,
   card_company TEXT,
-  fee_amount REAL,
+  fee_amount BIGINT,            -- 수수료도 정수(원 단위)
   onnuri_approval_code TEXT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
