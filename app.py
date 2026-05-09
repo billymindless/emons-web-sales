@@ -8212,10 +8212,22 @@ def render_monthly_payment_report(is_superadmin: bool):
                            "판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)", "판매건수", "원본주문ID"]
             detail_inline = detail_inline[[c for c in inline_cols if c in detail_inline.columns]]
             disp_inline = detail_inline.copy()
+            # 합계 행 계산 (포맷 적용 전 숫자 상태에서)
+            _sum_row = {c: "" for c in disp_inline.columns}
+            _sum_row["매장명"] = "【합계】"
+            for _c in ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)"]:
+                if _c in disp_inline.columns:
+                    _sum_row[_c] = int(disp_inline[_c].sum())
+            if "판매건수" in disp_inline.columns:
+                _sum_row["판매건수"] = round(disp_inline["판매건수"].sum(), 2)
             for _c in ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)"]:
                 if _c in disp_inline.columns:
                     disp_inline[_c] = disp_inline[_c].apply(lambda x: f"{x:,}원")
+                    _sum_row[_c] = f"{_sum_row[_c]:,}원"
             disp_inline["판매건수"] = disp_inline["판매건수"].apply(lambda x: f"{x:g}건")
+            if "판매건수" in disp_inline.columns:
+                _sum_row["판매건수"] = f"{_sum_row['판매건수']:g}건"
+            disp_inline = pd.concat([disp_inline, pd.DataFrame([_sum_row])], ignore_index=True)
             st.dataframe(disp_inline, width='stretch')
             st.caption("※ transaction_date(판매/변경 시점) 기준. 원가·수수료는 주문 기준 1/n 배분액입니다.")
         else:
@@ -9320,7 +9332,7 @@ def render_superadmin():
         "⑤ 매장 계정 관리",
         "⑥ 전 지점 마케팅 분석",
         "⑦ 미수금(잔금) 레포트",
-        "⑧ 월별 결제수단 집계표",
+        "⑧ 결제수단별 집계표",
         "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
         "⑩ FAQ (도움말)",
     ]
@@ -9358,7 +9370,7 @@ def render_superadmin():
         render_marketing_insights_superadmin()
     elif menu_sel == "⑦ 미수금(잔금) 레포트":
         _superadmin_tab_unpaid_report()
-    elif menu_sel == "⑧ 월별 결제수단 집계표":
+    elif menu_sel == "⑧ 결제수단별 집계표":
         render_monthly_payment_report(is_superadmin=True)
     elif menu_sel == "⑨ ⚠️ 데이터 초기화 (Danger Zone)":
         _superadmin_tab_danger_zone_data_reset()
@@ -14479,7 +14491,7 @@ def main():
             "3. 새로운 매출 등록",
             "4. 고객 및 잔금 관리",
             "5. 매장 관리자 메뉴",
-            "6. 월별 결제수단 집계표",
+            "6. 결제수단별 집계표",
             "7. 고객 CRM 자동화",
             "8. FAQ (도움말)",
         ]
@@ -14489,7 +14501,7 @@ def main():
             "2. 마케팅 인사이트",
             "3. 새로운 매출 등록",
             "4. 고객 및 잔금 관리",
-            "5. 월별 결제수단 집계표",
+            "5. 결제수단별 집계표",
             "6. FAQ (도움말)",
         ]
     if "main_tab_idx" not in st.session_state:
