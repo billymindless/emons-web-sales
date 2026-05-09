@@ -12076,6 +12076,10 @@ def render_customer_balance():
                                         if "onnuri_approval_code" in pay_display.columns:
                                             mask = pay_display["card_company"].isna() | (pay_display["card_company"].astype(str).isin(["None", "nan", ""]))
                                             pay_display.loc[mask, "card_company"] = pay_display.loc[mask, "onnuri_approval_code"]
+                                        # card_company가 여전히 비어 있으면 payment_method(신용카드/체크카드 등)로 대체
+                                        pay_display["card_company"] = pay_display["card_company"].fillna("").astype(str).replace({"None": "", "nan": "", "none": ""})
+                                        empty_card = pay_display["card_company"].str.strip() == ""
+                                        pay_display.loc[empty_card, "card_company"] = pay_display.loc[empty_card, "payment_method"].fillna("-")
                                         pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료"})
                                         st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료"]], width='stretch')
                                         for _, prow in pay_list.iterrows():
