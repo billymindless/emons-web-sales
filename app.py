@@ -6324,8 +6324,8 @@ def render_marketing_insights_tenant():
         st.info("아직 분석할 데이터가 없습니다.")
         return
 
-    # 컬럼 존재 여부 체크: 있는 컬럼만 사용
-    wanted_cols = ["id", "name", "address"]
+    # 컬럼 존재 여부 체크: 있는 컬럼만 사용 (latitude/longitude 포함 시 지오코딩 API 호출 스킵)
+    wanted_cols = ["id", "name", "address", "latitude", "longitude"]
     available_cols = [c for c in wanted_cols if c in customers.columns]
     if "id" not in available_cols:
         st.info("고객 데이터에 id 컬럼이 없어 병합할 수 없습니다.")
@@ -6383,13 +6383,19 @@ def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str,
     if map_data.empty:
         st.info("지오코딩 가능한 주소가 없습니다.")
         return
+    _MAP_MARKER_LIMIT = 300
+    if len(map_data) > _MAP_MARKER_LIMIT:
+        st.caption(f"⚡ 마커 수가 많아 최근 {_MAP_MARKER_LIMIT}건만 표시합니다. (전체 {len(map_data)}건)")
+        map_data = map_data.head(_MAP_MARKER_LIMIT)
     m = _create_folium_map(map_data, _MAP_CENTER, _MAP_ZOOM, key_prefix)
     if m:
         st_folium(m, returned_objects=[], use_container_width=True, key=f"{key_prefix}_single_map")
 
 
+@st.fragment
 def render_marketing_insights_superadmin():
-    """최고 관리자: 다중 기간 비교 대시보드 (Comparative Analytics Dashboard)."""
+    """최고 관리자: 다중 기간 비교 대시보드 (Comparative Analytics Dashboard).
+    @st.fragment: 기간 날짜 선택 시 이 섹션만 재실행 — 전체 페이지 Full Rerun 방지."""
     stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
@@ -6403,7 +6409,8 @@ def render_marketing_insights_superadmin():
         if len(orders) == 0:
             continue
         if not customers.empty and "address" in customers.columns:
-            cust_sub = customers[["id", "name", "address"]]
+            _ll_cols = [c for c in ["latitude", "longitude"] if c in customers.columns]
+            cust_sub = customers[["id", "name", "address"] + _ll_cols]
         else:
             cust_sub = customers[["id", "name"]].copy() if not customers.empty else pd.DataFrame(columns=["id", "name", "address"])
             if not cust_sub.empty:
