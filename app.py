@@ -5973,7 +5973,9 @@ _MAP_ZOOM = 7
 
 def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
     """merged(orders+customers)에서 주소 지오코딩 후 latitude, longitude, address, building_name, 고객명, 품목, 금액, 배송일자 포함 DataFrame 반환.
-    app_customers에 latitude, longitude가 있으면 우선 사용(지오코딩 스킵)."""
+    app_customers에 latitude, longitude가 있으면 우선 사용(지오코딩 스킵).
+    카카오 API로 신규 지오코딩 시 app_customers.latitude/longitude에 영속 저장 (세션 재시작 후에도 재호출 없음).
+    merged에 _db_fn 또는 _store 컬럼이 있어야 영속 저장이 활성화됨."""
     def _safe_strip_text(v) -> str:
         try:
             if v is None or pd.isna(v):
@@ -5988,6 +5990,10 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
     if "geo_cache" not in st.session_state:
         st.session_state.geo_cache = {}
     cache = st.session_state.geo_cache
+
+    # (store_name, customer_id) → (lat, lon) : 카카오 신규 지오코딩 건만 수집 (영속 저장용)
+    pending_geo_saves: dict[tuple, tuple] = {}
+
     rows = []
     for _, row in merged.iterrows():
         # app_customers에 latitude, longitude가 있으면 활용 (유효한 숫자일 때만)
@@ -6009,6 +6015,7 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
         addr = _safe_strip_text(row.get("address"))
         if not addr:
             continue
+        newly_geocoded = False
         if addr in cache:
             ent = cache[addr]
             lat, lon = ent["latitude"], ent["longitude"]
@@ -6024,6 +6031,21 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
             building_name = ext.get("building_name")
             bname = ext.get("bname")
             cache[addr] = {"latitude": lat, "longitude": lon, "address": addr_display, "building_name": building_name, "bname": bname}
+            newly_geocoded = True
+
+        # 신규 지오코딩 건: 영속 저장을 위해 (store_name, customer_id) 수집
+        if newly_geocoded:
+            cid = row.get("customer_id")
+            store_name = row.get("_store") or ""
+            if not store_name:
+                db_fn = row.get("_db_fn") or ""
+                if db_fn:
+                    store_name = _get_current_store_name_for_customers(str(db_fn))
+            if cid and store_name:
+                key = (store_name, int(cid))
+                if key not in pending_geo_saves:
+                    pending_geo_saves[key] = (lat, lon)
+
         rows.append({
             "latitude": lat,
             "longitude": lon,
@@ -6035,6 +6057,18 @@ def _build_map_data_with_geocoding(merged: pd.DataFrame) -> pd.DataFrame:
             "total_amount": int(row.get("total_amount") or 0),
             "delivery_date": str(row.get("delivery_date") or row.get("order_date") or "-")[:10],
         })
+
+    # 신규 지오코딩 결과를 app_customers에 영속 저장 (오류는 조용히 무시 — 지도 렌더링 방해 금지)
+    if pending_geo_saves:
+        try:
+            sc, _ = get_supabase_client()
+            if sc:
+                for (store_name, cid), (lat, lon) in pending_geo_saves.items():
+                    sc.table("app_customers").update({"latitude": lat, "longitude": lon}).eq("store_name", store_name).eq("id", cid).execute()
+                load_customers_cached.clear()
+        except Exception:
+            pass
+
     if not rows:
         return pd.DataFrame(columns=["latitude", "longitude", "address", "building_name", "bname", "customer_name", "category", "total_amount", "delivery_date"])
     return pd.DataFrame(rows)
@@ -6368,6 +6402,7 @@ def render_marketing_insights_tenant():
     if len(merged) == 0:
         st.info("등록된 매출 데이터가 없습니다. 기간을 선택해도 비교할 데이터가 없습니다.")
         return
+    merged["_db_fn"] = db_filename  # 지오코딩 영속 저장용
     _render_marketing_multi_period_comparison(
         merged,
         range_start_a, range_end_a,
@@ -6458,6 +6493,7 @@ def render_marketing_insights_superadmin():
         else:
             m = orders.merge(cust_sub, left_on="customer_id", right_on="id", how="left")
         m["_store"] = s["store_name"]
+        m["_db_fn"] = db_fn  # 지오코딩 영속 저장용
         merged_list.append(m)
     if not merged_list:
         st.info("데이터가 충분하지 않습니다.")
