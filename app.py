@@ -8001,6 +8001,7 @@ def render_monthly_payment_report(is_superadmin: bool):
         df_emp["고객명"] = ""
         df_emp["전화번호"] = ""
         df_emp["원가(배분)"] = 0.0
+        _all_total_map: dict = {}  # order_id -> total_amount (모든 fn 누적, 수수료 배분에서도 공유)
         try:
             _sc, _ = get_supabase_client()
             if _sc:
@@ -8012,14 +8013,17 @@ def render_monthly_payment_report(is_superadmin: bool):
                     _chunks = [_oids[i:i+100] for i in range(0, len(_oids), 100)]
                     _cid_map = {}
                     _cost_map: dict = {}
+                    _total_map: dict = {}
                     for _chunk in _chunks:
                         _r = _sc.table("app_orders").select(
-                            "id, customer_id, cost_price, display_cost_amount"
+                            "id, customer_id, cost_price, display_cost_amount, total_amount"
                         ).eq("db_filename", _fn).in_("id", _chunk).execute()
                         for _row in (_r.data or []):
                             _rid = _row["id"]
                             _cid_map[_rid] = _row.get("customer_id")
                             _cost_map[_rid] = float(_row.get("cost_price") or 0) + float(_row.get("display_cost_amount") or 0)
+                            _total_map[_rid] = float(_row.get("total_amount") or 0)
+                    _all_total_map.update(_total_map)  # 수수료 배분 블록에서도 공유
                     _cids = [v for v in _cid_map.values() if v is not None]
                     if _cids:
                         _cust_map = _get_customers_by_ids_supabase(str(_fn), list(set(int(c) for c in _cids)))
@@ -8029,12 +8033,17 @@ def render_monthly_payment_report(is_superadmin: bool):
                         df_emp.loc[_mask, "전화번호"] = df_emp.loc[_mask, "원본주문ID"].apply(
                             lambda oid, cm=_cid_map, cu=_cust_map: (cu.get(int(cm.get(int(oid), -1) or -1)) or {}).get("phone1", "") if pd.notna(oid) and int(oid) in cm else ""
                         )
-                    # 원가 1/n 배분: 판매건수(=1/n)를 곱해 직원별로 나눔
-                    df_emp.loc[_mask, "원가(배분)"] = df_emp.loc[_mask].apply(
-                        lambda r, cm=_cost_map: cm.get(int(r["원본주문ID"]), 0) * r["판매건수"]
-                        if pd.notna(r["원본주문ID"]) else 0,
-                        axis=1,
-                    )
+                    # 원가 배분: (sales 행 금액 / 주문 총액) 비율 × 직원 1/n
+                    # 금액 변경 추가 행 등 부분 매출 행에 전체 원가가 잡히는 문제 방지
+                    def _calc_cost_ratio(r, cm=_cost_map, tm=_total_map):
+                        if pd.isna(r["원본주문ID"]):
+                            return 0.0
+                        oid_i = int(r["원본주문ID"])
+                        cost = cm.get(oid_i, 0.0)
+                        total = tm.get(oid_i, 0.0)
+                        ratio = (float(r["판매금액"]) / total) if total != 0 else 1.0
+                        return cost * ratio * r["판매건수"]
+                    df_emp.loc[_mask, "원가(배분)"] = df_emp.loc[_mask].apply(_calc_cost_ratio, axis=1)
         except Exception as _e:
             st.caption(f"⚠️ 고객정보 조회 오류: {_e}")
 
@@ -8081,12 +8090,16 @@ def render_monthly_payment_report(is_superadmin: bool):
                         df_emp.loc[_mask, "결제수단"] = df_emp.loc[_mask, "원본주문ID"].apply(
                             lambda oid, pm=_pay_method_map: ", ".join(pm.get(int(oid), [])) if pd.notna(oid) else ""
                         )
-                    # 수수료 1/n 배분: 판매건수(=1/n) 곱
-                    df_emp.loc[_mask, "카드수수료(배분)"] = df_emp.loc[_mask].apply(
-                        lambda r, fm=_fee_map: fm.get(int(r["원본주문ID"]), 0.0) * r["판매건수"]
-                        if pd.notna(r["원본주문ID"]) else 0.0,
-                        axis=1,
-                    )
+                    # 수수료 배분: (sales 행 금액 / 주문 총액) 비율 × 직원 1/n
+                    def _calc_fee_ratio(r, fm=_fee_map, tm=_all_total_map):
+                        if pd.isna(r["원본주문ID"]):
+                            return 0.0
+                        oid_i = int(r["원본주문ID"])
+                        fee = fm.get(oid_i, 0.0)
+                        total = tm.get(oid_i, 0.0)
+                        ratio = (float(r["판매금액"]) / total) if total != 0 else 1.0
+                        return fee * ratio * r["판매건수"]
+                    df_emp.loc[_mask, "카드수수료(배분)"] = df_emp.loc[_mask].apply(_calc_fee_ratio, axis=1)
         except Exception as _pe:
             st.caption(f"⚠️ 결제수단/수수료 조회 오류: {_pe}")
 
