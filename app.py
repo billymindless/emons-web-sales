@@ -6048,7 +6048,8 @@ _MAP_POPUP_STYLE = (
 
 
 def _create_folium_map(df: pd.DataFrame, center: tuple, zoom_start: int, key: str = "") -> "folium.Map | None":
-    """DataFrame(latitude, longitude, address, building_name, customer_name, category, total_amount, delivery_date)로 Folium 지도 생성. 말풍선 상단에 [건물명] 굵게 표시."""
+    """DataFrame(latitude, longitude, address, building_name, customer_name, category, total_amount, delivery_date[, order_count])로
+    Folium 지도 생성. order_count 컬럼이 있으면 고객 단위 집계 팝업(건수·합계) 표시."""
     if not FOLIUM_AVAILABLE or df.empty:
         return None
     m = folium.Map(location=center, zoom_start=zoom_start, tiles="OpenStreetMap")
@@ -6066,14 +6067,22 @@ def _create_folium_map(df: pd.DataFrame, center: tuple, zoom_start: int, key: st
         if building_name:
             line1 = f"<strong>[{html.escape(str(building_name))}]</strong><br>"
         line_addr = f"<b>주소:</b> {html.escape(addr or '-')}<br>" if addr else ""
+        order_count = r.get("order_count")
+        if order_count and int(order_count) > 1:
+            line_count = f"<b>주문 건수:</b> {int(order_count)}건<br>"
+            line_amount = f"<b>총 금액:</b> {int(r.get('total_amount', 0)):,.0f}원<br>"
+        else:
+            line_count = ""
+            line_amount = f"<b>금액:</b> {int(r.get('total_amount', 0)):,.0f}원<br>"
         popup_html = (
             f'<div class="map-popup" style="{_MAP_POPUP_STYLE}">'
             f"{line1}"
             f"{line_addr}"
             f"<b>고객명:</b> {html.escape(str(r.get('customer_name', '-')))}<br>"
             f"<b>품목:</b> {html.escape(str(r.get('category', '-')))}<br>"
-            f"<b>금액:</b> {int(r.get('total_amount',0)):,.0f}원<br>"
-            f"<b>배송일:</b> {html.escape(str(r.get('delivery_date', '-')))}"
+            f"{line_count}"
+            f"{line_amount}"
+            f"<b>최근 배송:</b> {html.escape(str(r.get('delivery_date', '-')))}"
             f"</div>"
         )
         folium.Marker([lat, lon], popup=folium.Popup(popup_html, max_width=320)).add_to(mc)
@@ -6383,10 +6392,38 @@ def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str,
     if map_data.empty:
         st.info("지오코딩 가능한 주소가 없습니다.")
         return
+
+    # 고객(좌표) 단위 집계: 같은 위치의 여러 주문 → 마커 1개 (건수·합계·최신 배송일)
+    def _join_categories(series):
+        cats = sorted({c.strip() for v in series for c in str(v).split(",") if c.strip() and c.strip() != "-"})
+        return ", ".join(cats) if cats else "-"
+
+    def _customer_label(series):
+        uniq = series.dropna().unique()
+        if len(uniq) == 0:
+            return "-"
+        if len(uniq) == 1:
+            return str(uniq[0])
+        return f"{uniq[0]} 외 {len(uniq)-1}명"
+
+    map_data = (
+        map_data.groupby(["latitude", "longitude"], as_index=False)
+        .agg(
+            address=("address", "first"),
+            building_name=("building_name", "first"),
+            bname=("bname", "first"),
+            customer_name=("customer_name", _customer_label),
+            category=("category", _join_categories),
+            total_amount=("total_amount", "sum"),
+            order_count=("total_amount", "count"),
+            delivery_date=("delivery_date", "max"),
+        )
+    )
+
     _MAP_MARKER_LIMIT = 300
     if len(map_data) > _MAP_MARKER_LIMIT:
-        st.caption(f"⚡ 마커 수가 많아 최근 {_MAP_MARKER_LIMIT}건만 표시합니다. (전체 {len(map_data)}건)")
-        map_data = map_data.head(_MAP_MARKER_LIMIT)
+        st.caption(f"⚡ 위치 수가 많아 상위 {_MAP_MARKER_LIMIT}곳만 표시합니다. (전체 {len(map_data)}곳)")
+        map_data = map_data.nlargest(_MAP_MARKER_LIMIT, "total_amount")
     m = _create_folium_map(map_data, _MAP_CENTER, _MAP_ZOOM, key_prefix)
     if m:
         st_folium(m, returned_objects=[], use_container_width=True, key=f"{key_prefix}_single_map")
