@@ -8190,10 +8190,10 @@ def render_monthly_payment_report(is_superadmin: bool):
             if r["원가(배분)"] != 0.0:
                 return r["마진(배분)"]
             note = str(r.get("비고") or "")
-            if "|__dm:" not in note:
+            if "|__dm2:" not in note:
                 return r["마진(배분)"]
             try:
-                tail = note.split("|__dm:", 1)[1].split("|", 1)[0].strip()
+                tail = note.split("|__dm2:", 1)[1].split("|", 1)[0].strip()
                 return float(tail) * r["판매건수"]
             except (ValueError, IndexError):
                 return r["마진(배분)"]
@@ -11926,6 +11926,7 @@ def render_customer_balance():
                                         _dm_kpi = new_basic_margin - old_basic_margin
                                         note = (
                                             f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
+                                            f"|__dm2:{int(round(_dm_kpi))}"
                                             f"|__dm:{int(round(_dm_kpi))}"
                                         )
                                         # 담당 직원: 수정 후 직원명 우선, 없으면 기존 직원명 사용 (delta도 같은 직원에게 귀속)
@@ -13074,14 +13075,15 @@ def render_customer_balance():
 # ========== 탭 0: 경영 대시보드 (로그인 후 첫 화면) ==========
 
 def _kpi_parse_delta_margin_from_sales_note(note: object) -> float | None:
-    """sales.note에 '|__dm:<정수>'(계약 변경 시 KPI용 비례 마진 차액)가 있으면 반환. 없거나 파싱 실패 시 None."""
+    """sales.note에 '|__dm2:<정수>'(새 공식: delta_sales - delta_cost)가 있으면 반환.
+    구형 '|__dm:' 태그는 잘못된 비율 공식이므로 무시하고 None 반환."""
     if note is None:
         return None
     s = str(note).strip()
-    if "|__dm:" not in s:
+    if "|__dm2:" not in s:
         return None
     try:
-        tail = s.split("|__dm:", 1)[1].split("|", 1)[0].strip()
+        tail = s.split("|__dm2:", 1)[1].split("|", 1)[0].strip()
         return float(tail)
     except (ValueError, IndexError):
         return None
