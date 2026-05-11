@@ -8185,6 +8185,19 @@ def render_monthly_payment_report(is_superadmin: bool):
 
         # 마진(배분) = 판매금액 - 원가(배분) - 카드수수료(배분)
         df_emp["마진(배분)"] = df_emp["판매금액"] - df_emp["원가(배분)"] - df_emp["카드수수료(배분)"]
+        # 원가 조회 실패(=0)인 주문변경 행에서 |__dm: 노트가 있으면 해당 마진 차액으로 보완
+        def _patch_dm_margin(r):
+            if r["원가(배분)"] != 0.0:
+                return r["마진(배분)"]
+            note = str(r.get("비고") or "")
+            if "|__dm:" not in note:
+                return r["마진(배분)"]
+            try:
+                tail = note.split("|__dm:", 1)[1].split("|", 1)[0].strip()
+                return float(tail) * r["판매건수"]
+            except (ValueError, IndexError):
+                return r["마진(배분)"]
+        df_emp["마진(배분)"] = df_emp.apply(_patch_dm_margin, axis=1)
 
         # 3. 요약 집계 (Excel 및 >7일 화면용으로 항상 계산)
         _money_cols = ["판매금액", "원가(배분)", "카드수수료(배분)", "마진(배분)", "판매건수"]
