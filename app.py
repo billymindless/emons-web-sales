@@ -11907,9 +11907,10 @@ def render_customer_balance():
                                             order_date_label = f"{int(parts[1])}월 {int(parts[2])}일" if len(parts) >= 3 else str(order_date_val)
                                         else:
                                             order_date_label = str(order_date_val)
-                                        _dm_kpi = (
-                                            (old_actual_margin * float(delta) / old_total) if abs(old_total) > 1e-9 else 0.0
-                                        )
+                                        old_display_cost = float(orow.get("display_cost_amount") or 0)
+                                        old_basic_margin = old_total - old_cost - old_display_cost
+                                        new_basic_margin = new_total - new_cost - new_display_cost
+                                        _dm_kpi = new_basic_margin - old_basic_margin
                                         note = (
                                             f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
                                             f"|__dm:{int(round(_dm_kpi))}"
@@ -13125,8 +13126,12 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
             base_m = float(_margin_map.get(oid_int, 0) or 0)
             base_d = float(_display_map.get(oid_int, 0) or 0)
             _dm_note = _kpi_parse_delta_margin_from_sales_note(r.get("note"))
-            if tot == 0:
-                margin = (_dm_note / n) if _dm_note is not None else 0.0
+            if _dm_note is not None:
+                margin = _dm_note / n
+                display_amt = 0.0
+                per_amt = amt / n
+            elif tot == 0:
+                margin = 0.0
                 display_amt = 0.0
                 per_amt = amt / n
             else:
