@@ -1,5 +1,6 @@
 # .gitignore
 .streamlit/secrets.toml
+.streamlit/secrets.toml.bak
 databases/
 __pycache__/
 *.db
