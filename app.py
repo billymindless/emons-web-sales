@@ -33,18 +33,14 @@ import hashlib
 import time
 import plotly.express as px
 import plotly.graph_objects as go
-try:
-    from crm_automation import render_crm_menu  # type: ignore
-    CRM_MODULE_AVAILABLE = True
-except Exception:
-    CRM_MODULE_AVAILABLE = False
-try:
-    import folium
-    from folium.plugins import MarkerCluster
-    from streamlit_folium import st_folium
-    FOLIUM_AVAILABLE = True
-except ImportError:
-    FOLIUM_AVAILABLE = False
+# v1: CRM 자동발송 미구현 — 메뉴 비노출
+CRM_MODULE_AVAILABLE = False
+
+# v1: 채널톡 연동 제외 — v2 정책 확정 후 재투입
+CHANNEL_TALK_ENABLED = False
+
+# v1: Folium 지도/지오코딩 비활성
+FOLIUM_AVAILABLE = False
 
 try:
     from supabase import create_client as _create_supabase_client
@@ -511,32 +507,8 @@ def _supabase_run_sql_file(db_url: str, sql_path: str) -> bool:
 
 
 def _supabase_run_app_tables_sql():
-    """
-    Supabase DB에 app_stores, app_users, app_user_stores, app_edit_requests 테이블이 없으면 생성.
-    st.secrets의 supabase.database_url (Postgres 연결 문자열)이 있으면 psycopg2로 DDL 실행.
-    성공 시 True, 실패 또는 URL 없음 시 False.
-    """
-    secrets = (st.secrets.get("supabase") or {}) if "secrets" in dir(st) else {}
-    if not secrets:
-        try:
-            import streamlit as _st
-            secrets = _st.secrets.get("supabase") or {}
-        except Exception:
-            pass
-    db_url = (secrets.get("database_url") or secrets.get("db_url") or "").strip()
-    if not db_url:
-        return False
-    sql_files = [
-        "SUPABASE_APP_TABLES.sql",
-        "SUPABASE_APP_EDIT_REQUESTS.sql",
-    ]
-    ok = False
-    for fname in sql_files:
-        fpath = os.path.join(BASE_DIR, fname)
-        if os.path.isfile(fpath):
-            _supabase_run_sql_file(db_url, fpath)
-            ok = True
-    return ok
+    """스키마 마이그레이션은 tools/supabase/01_init_schema.sql 로 관리. 런타임 DDL 실행 제거."""
+    return False
 
 
 def ensure_supabase_app_tables():
@@ -3082,23 +3054,8 @@ def create_tenant_db(db_filename: str):
 # ========== 인증 및 세션 ==========
 
 def verify_user(username: str, password: str):
-    """
-    Master DB에서 사용자 검증.
-    성공 시 (user_id, username, role, store_id, db_filename) 튜플 반환.
-    실패 시 None.
-    """
-    pw_hash = hashlib.sha256(password.encode()).hexdigest()
-    conn = get_master_conn()
-    try:
-        row = conn.execute("""
-            SELECT u.id, u.username, u.role, u.store_id, s.db_filename
-            FROM Users u
-            LEFT JOIN Stores s ON u.store_id = s.id
-            WHERE u.username = ? AND u.password = ?
-        """, (username, pw_hash)).fetchone()
-        return row
-    finally:
-        conn.close()
+    """레거시 SHA256 로그인 경로 — Supabase Auth 단일화로 제거됨."""
+    raise NotImplementedError("verify_user는 v1에서 제거됐습니다. Supabase Auth를 사용하세요.")
 
 
 def get_app_user_by_email(email: str):
@@ -3110,44 +3067,8 @@ def get_app_user_by_email(email: str):
     if not email or not str(email).strip():
         return None
     email_clean = str(email).strip().lower()
-    if ensure_supabase_app_tables():
-        row = _get_supabase_app_user_by_email(email_clean)
-        if row is not None:
-            return row
-        if email_clean == "billymind@gmail.com":
-            _ensure_supabase_superadmin_email(email_clean)
-            return _get_supabase_app_user_by_email(email_clean)
-        return None
-    conn = get_master_conn()
-    try:
-        cur = conn.execute("PRAGMA table_info(Users)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "email" not in cols:
-            conn.execute("ALTER TABLE Users ADD COLUMN email TEXT")
-            conn.commit()
-        row = conn.execute("""
-            SELECT u.id, u.username, u.role, u.store_id, s.db_filename
-            FROM Users u
-            LEFT JOIN Stores s ON u.store_id = s.id
-            WHERE u.email IS NOT NULL AND TRIM(u.email) != '' AND LOWER(TRIM(u.email)) = ?
-        """, (email_clean,)).fetchone()
-        if row is not None:
-            return row
-        if email_clean == "billymind@gmail.com":
-            conn.execute("UPDATE Users SET email = ? WHERE username = 'superadmin'", (email_clean,))
-            conn.commit()
-            row = conn.execute("""
-                SELECT u.id, u.username, u.role, u.store_id, s.db_filename
-                FROM Users u
-                LEFT JOIN Stores s ON u.store_id = s.id
-                WHERE u.email IS NOT NULL AND TRIM(u.email) != '' AND LOWER(TRIM(u.email)) = ?
-            """, (email_clean,)).fetchone()
-            return row
-        return None
-    except Exception:
-        return None
-    finally:
-        conn.close()
+    row = _get_supabase_app_user_by_email(email_clean)
+    return row
 
 
 def get_user_allowed_stores(user_id: int):
@@ -3214,18 +3135,23 @@ def ensure_session():
 #  - Network: 새로고침 시 요청 URL에 ?auth= 가 붙는 요청이 한 번이라도 가는지 확인
 #  - URL이 2083자 제한으로 잘리면 검증 실패 → auth 길이 < 80이면 삭제 스크립트를 주입하지 않도록 함
 AUTH_STORAGE_KEY = "momo_auth"
-_AUTH_SECRET_FALLBACK = "momo-default-secret-change-in-production"
 
 
 def _get_auth_secret() -> str:
-    """st.secrets → os.environ → fallback 순으로 HMAC 서명 키를 반환."""
+    """st.secrets → os.environ 순으로 MOMO_AUTH_SECRET을 반환. 미설정 시 즉시 RuntimeError."""
     try:
         val = st.secrets.get("MOMO_AUTH_SECRET") or ""
         if val and str(val).strip():
             return str(val).strip()
     except Exception:
         pass
-    return os.environ.get("MOMO_AUTH_SECRET", _AUTH_SECRET_FALLBACK)
+    env_val = os.environ.get("MOMO_AUTH_SECRET", "").strip()
+    if env_val:
+        return env_val
+    raise RuntimeError(
+        "MOMO_AUTH_SECRET 환경변수가 설정되지 않았습니다. "
+        ".streamlit/secrets.toml 또는 환경변수에 MOMO_AUTH_SECRET을 설정하세요."
+    )
 AUTH_EXPIRY_DAYS = 30
 AUTH_SESSION_SECONDS = AUTH_EXPIRY_DAYS * 24 * 3600  # 토큰 만료일과 동일 (30일)
 
@@ -9346,8 +9272,7 @@ def render_superadmin():
         "⑥ 전 지점 마케팅 분석",
         "⑦ 미수금(잔금) 레포트",
         "⑧ 결제수단별 집계표",
-        "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
-        "⑩ FAQ (도움말)",
+        "⑨ FAQ (도움말)",
     ]
     if "superadmin_menu_idx" not in st.session_state:
         st.session_state["superadmin_menu_idx"] = 0
@@ -9385,9 +9310,7 @@ def render_superadmin():
         _superadmin_tab_unpaid_report()
     elif menu_sel == "⑧ 결제수단별 집계표":
         render_monthly_payment_report(is_superadmin=True)
-    elif menu_sel == "⑨ ⚠️ 데이터 초기화 (Danger Zone)":
-        _superadmin_tab_danger_zone_data_reset()
-    elif menu_sel == "⑩ FAQ (도움말)":
+    elif menu_sel == "⑨ FAQ (도움말)":
         render_faq_page()
 
 
@@ -10701,28 +10624,7 @@ def render_new_sales():
                 "is_today_first": is_today_first,
                 "monthly_max_before": monthly_max_before,
             }
-            # 채널톡 PUSH: 백그라운드 스레드로 전송 (UI 블로킹 방지)
-            def _channel_talk_sync_supa():
-                try:
-                    if not _get_channel_talk_secrets():
-                        return
-                    store_name_ct = _get_store_name_by_db(db_filename)
-                    store_tag_key_ct = _get_store_tag_key(store_name_ct)
-                    unpaid_ct = float(remaining) if remaining > 0 else 0.0
-                    sync_channel_talk_customer(
-                        customer_name=cust_name.strip(),
-                        phone_number=phone1.strip(),
-                        purchase_amount=final_sales_save,
-                        item_category=category or "",
-                        purchase_date=order_date,
-                        store_tag_key=store_tag_key_ct,
-                        is_returning=(not is_new_customer),
-                        unpaid_balance=unpaid_ct,
-                    )
-                except Exception:
-                    pass
-            threading.Thread(target=_channel_talk_sync_supa, daemon=True).start()
-            st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
+            st.toast("등록이 완료되었습니다.", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             st.session_state["_cust_search_panel_open"] = False
             # 반복 등록 시 금액이 이전 건과 동일하게 남는 현상 방지: 비위젯 상태 초기화 후 위젯 키는 삭제
@@ -10833,29 +10735,7 @@ def render_new_sales():
             if margin_out_of_range:
                 store_name = _get_store_name_by_db(db_filename)
                 _insert_admin_alert(store_name, "margin", f"{store_name}에서 실질 마진율 {net_margin_rate_save:.1f}% 건이 등록되었습니다.")
-            # 채널톡 PUSH: 백그라운드 스레드로 전송해 UI 블로킹 방지
-            _sqlite_remaining = remaining  # 클로저에서 사용할 변수 캡처
-            def _channel_talk_sync():
-                try:
-                    if not _get_channel_talk_secrets():
-                        return
-                    store_name_ct = _get_store_name_by_db(db_filename)
-                    store_tag_key_ct = _get_store_tag_key(store_name_ct)
-                    unpaid_ct = float(_sqlite_remaining) if _sqlite_remaining > 0 else 0.0
-                    sync_channel_talk_customer(
-                        customer_name=cust_name.strip(),
-                        phone_number=phone1.strip(),
-                        purchase_amount=final_sales_save,
-                        item_category=category or "",
-                        purchase_date=order_date,
-                        store_tag_key=store_tag_key_ct,
-                        is_returning=(not is_new_customer),
-                        unpaid_balance=unpaid_ct,
-                    )
-                except Exception:
-                    pass
-            threading.Thread(target=_channel_talk_sync, daemon=True).start()
-            st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
+            st.toast("등록이 완료되었습니다.", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             st.session_state["_cust_search_panel_open"] = False
             # 반복 등록 시 금액이 이전 건과 동일하게 남는 현상 방지: 비위젯 상태 초기화 후 위젯 키는 삭제
@@ -11451,117 +11331,7 @@ def render_customer_balance():
                 except Exception as e:
                     st.error(f"엑셀 파일을 읽을 수 없습니다: {e}")
 
-        # 채널톡 PUSH + PULL 연동
-        with st.expander("📤 채널톡 연동 (PUSH 자동 / PULL 단건 조회)"):
-            st.caption(
-                "**PUSH**: '새로운 매출 등록' 저장 시 해당 고객 정보가 채널톡에 자동 전송됩니다. "
-                "태그 형식: `매장키구매/품목` (예: 삼산구매/옷장). "
-                "재구매 시 `재구매_매장키`, 미수금 있을 시 `미수금_매장키` 태그도 자동 추가됩니다.\n\n"
-                "**PULL**: 아래에서 전화번호로 채널톡 고객 정보를 단건 조회할 수 있습니다."
-            )
-            ct_secrets_ok = bool(_get_channel_talk_secrets())
-            if not ct_secrets_ok:
-                st.warning("채널톡 API 키가 설정되지 않았습니다. `.streamlit/secrets.toml`의 `[channel_talk]` 항목을 설정해 주세요.")
-            else:
-                st.success("채널톡 API 키가 설정되어 있습니다.")
-
-            st.markdown("---")
-            st.markdown("**📥 채널톡 고객 단건 조회 (PULL)**")
-            col_ph, col_btn = st.columns([3, 1])
-            with col_ph:
-                ct_pull_phone = st.text_input(
-                    "조회할 전화번호 입력",
-                    placeholder="01012345678",
-                    key="ct_pull_phone_input",
-                    label_visibility="collapsed",
-                )
-            with col_btn:
-                ct_pull_btn = st.button("채널톡 조회", key="ct_pull_btn", width='stretch')
-            if ct_pull_btn and ct_pull_phone and ct_pull_phone.strip():
-                if not ct_secrets_ok:
-                    st.error("채널톡 API 키를 먼저 설정해 주세요.")
-                else:
-                    with st.spinner("채널톡에서 고객 정보를 조회 중..."):
-                        ct_user = fetch_channel_talk_customer_by_phone(ct_pull_phone.strip())
-                    if ct_user:
-                        profile = ct_user.get("profile") or {}
-                        tags_ct = ct_user.get("tags") or []
-                        st.success("채널톡에서 고객 정보를 찾았습니다.")
-                        info_cols = st.columns(3)
-                        info_cols[0].metric("이름", profile.get("name") or ct_user.get("name") or "-")
-                        info_cols[1].metric("연락처", profile.get("mobileNumber") or ct_pull_phone.strip())
-                        info_cols[2].metric("최근 구매액", f"{int(profile.get('오프라인_최근구매액') or 0):,}원")
-                        st.write("**태그:**", ", ".join(tags_ct) if tags_ct else "없음")
-                        st.write("**최근 구매일:**", profile.get("오프라인_최근구매일") or "-")
-                        st.write("**최근 구매 품목:**", profile.get("오프라인_구매품목") or "-")
-                        st.write("**누적 구매 횟수:**", profile.get("오프라인_누적구매횟수") or "-")
-
-        # 채널톡 웹훅 수신 로그
-        with st.expander("📋 채널톡 웹훅 수신 로그"):
-            st.caption("채널톡에서 웹훅이 들어왔을 때 우리 DB에 등록된 기록입니다.")
-            log_df = pd.DataFrame()
-            try:
-                sc_log, _ = get_supabase_client()
-                if sc_log:
-                    role = (st.session_state.get("current_user") or {}).get("role", "")
-                    store_name_log = _get_current_store_name_for_customers(db_filename)
-                    q_log = sc_log.table("channel_talk_webhook_log").select(
-                        "id, created_at, store_key, phone, name, status, message, store_name, customer_id"
-                    ).order("id", desc=True).limit(100)
-                    if role != "superadmin" and store_name_log:
-                        q_log = q_log.eq("store_name", store_name_log)
-                    r_log = q_log.execute()
-                    log_df = pd.DataFrame(r_log.data) if r_log.data else pd.DataFrame()
-            except Exception:
-                pass
-            if log_df.empty:
-                conn_m = get_master_conn()
-                try:
-                    role = (st.session_state.get("current_user") or {}).get("role", "")
-                    if role == "superadmin":
-                        log_df = pd.read_sql(
-                            "SELECT id, created_at, store_key, phone, name, status, message, db_filename, customer_id FROM ChannelTalkWebhookLog ORDER BY id DESC LIMIT 100",
-                            conn_m,
-                        )
-                    else:
-                        log_df = pd.read_sql(
-                            "SELECT id, created_at, store_key, phone, name, status, message, db_filename, customer_id FROM ChannelTalkWebhookLog WHERE db_filename = ? ORDER BY id DESC LIMIT 100",
-                            conn_m,
-                            params=(db_filename,),
-                        )
-                except Exception:
-                    log_df = pd.DataFrame()
-                finally:
-                    conn_m.close()
-            if len(log_df) > 0:
-                log_disp = log_df.rename(columns={
-                    "created_at": "수신 시각", "store_key": "매장키", "phone": "연락처", "name": "고객명",
-                    "status": "상태", "message": "메시지", "store_name": "매장명",
-                    "db_filename": "저장DB", "customer_id": "고객ID"
-                })
-                st.dataframe(log_disp, width='stretch')
-            else:
-                st.info("아직 채널톡 웹훅 수신 로그가 없습니다. 웹훅 수신 서버를 설정하면 여기에 표시됩니다.")
-            st.write("**채널톡으로 등록된 고객 (본 매장)**")
-            try:
-                sc, _ = get_supabase_client()
-                if sc:
-                    store_name = _get_current_store_name_for_customers(db_filename)
-                    if store_name:
-                        qct = sc.table("app_customers").select("id, name, phone1, phone2, address, source").eq("store_name", store_name).in_("source", ["채널톡", "채널톡_웹훅"])
-                        r = qct.order("id", desc=True).limit(100).execute()
-                    else:
-                        r = type("R", (), {"data": None})()
-                        r.data = None
-                    ct_customers = pd.DataFrame(r.data) if r.data else pd.DataFrame()
-                else:
-                    ct_customers = pd.DataFrame()
-            except Exception:
-                ct_customers = pd.DataFrame()
-            if len(ct_customers) > 0:
-                st.dataframe(ct_customers.rename(columns={"id": "ID", "name": "고객명", "phone1": "연락처1", "phone2": "연락처2", "address": "주소", "source": "가입경로"}), width='stretch')
-            else:
-                st.info("채널톡(또는 푸시)으로 등록된 고객이 없습니다.")
+        # 채널톡 연동 — v2에서 지원 예정 (CHANNEL_TALK_ENABLED=False)
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")
