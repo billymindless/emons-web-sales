@@ -11,7 +11,6 @@ import html
 import json
 import os
 import re
-import sqlite3
 import threading
 import textwrap
 import traceback
@@ -1366,8 +1365,8 @@ MASTER_DB_PATH = os.path.join(DB_DIR, "master_system.db")
 # ========== Master DB 초기화 및 Connection Management ==========
 
 def get_master_conn():
-    """Master DB 연결. 인증·매장 목록 등 시스템 정보용."""
-    return sqlite3.connect(MASTER_DB_PATH)
+    """Phase 2: SQLite master DB 제거. 모든 데이터는 Supabase에서 조회."""
+    return None
 
 
 def migrate_stores_to_supabase():
@@ -1472,7 +1471,7 @@ def init_master_db():
         conn.close()
 
 
-def ensure_master_schema(conn: sqlite3.Connection):
+def ensure_master_schema(conn):  # Phase 2: SQLite 제거, conn은 항상 None
     """기존 master_system.db에 Notices 등 누락된 테이블이 있으면 추가.
     Notices: id, title, content, external_link, message(legacy), is_active, created_at"""
     cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Notices'")
@@ -1626,26 +1625,8 @@ def _get_store_tag_key(store_name: str) -> str:
 
 
 def get_tenant_conn(db_filename: str):
-    """
-    [Connection Management] 매장(테넌트) 전용 DB 파일에 연결.
-    디스크 I/O 병목을 막기 위해 _ensure_tenant_schema는 세션당 최초 1회만 실행하도록 캐싱 처리함.
-    """
-    if not db_filename:
-        return None
-    path = os.path.join(DB_DIR, db_filename)
-    if not os.path.exists(path):
-        return None
-    conn = sqlite3.connect(path)
-
-    # 세션 상태를 이용한 스키마 검사 캐싱 (반복 DDL 실행 원천 차단)
-    cache_key = f"_schema_checked_{db_filename}"
-    if cache_key not in st.session_state:
-        try:
-            _ensure_tenant_schema(conn)
-            st.session_state[cache_key] = True
-        except Exception:
-            pass
-    return conn
+    """Phase 2: SQLite 테넌트 DB 제거. 모든 데이터는 Supabase에서 조회."""
+    return None
 
 
 @st.cache_data(ttl=3600)
@@ -2202,7 +2183,7 @@ def clear_data_cache():
         pass
 
 
-def _ensure_tenant_schema(conn: sqlite3.Connection):
+def _ensure_tenant_schema(conn):  # Phase 2: SQLite 제거, conn은 항상 None
     """
     기존 DB와 호환: Payments에 card_company, fee_amount, Orders에 actual_margin 등 누락 컬럼을 ALTER TABLE로 추가하고
     신규 보안/로그 테이블(AuditLogs, EditRequests)을 생성.
@@ -2938,14 +2919,12 @@ def _reconcile_missing_sales(db_filename: str) -> dict:
 
 
 def create_tenant_db(db_filename: str):
-    """
-    신규 매장 생성 시 해당 매장 전용 SQLite 파일에 5개 테이블을 자동 생성.
-    Master의 Stores에 매장 등록 후 이 함수를 호출하여 물리적 DB 파일을 만든다.
-    """
-    path = os.path.join(DB_DIR, db_filename)
+    """Phase 2: SQLite 테넌트 DB 생성 제거. 신규 매장은 Supabase app_stores에 등록."""
+    return
+    path = os.path.join(DB_DIR, db_filename)  # noqa: unreachable — kept for reference
     if os.path.exists(path):
         return
-    conn = sqlite3.connect(path)
+    conn = None  # connect removed in Phase 2
     try:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS Employees (
@@ -3182,7 +3161,7 @@ def _current_display_name_for_todo() -> str:
 
 
 def _insert_audit_log(
-    conn: sqlite3.Connection,
+    conn,  # Phase 2: SQLite conn 제거 (항상 None), 향후 Supabase app_audit_logs로 전환
     entity_type: str,
     entity_id: int,
     field_name: str,
@@ -3190,24 +3169,9 @@ def _insert_audit_log(
     new_value,
     reason: str,
 ) -> None:
-    """AuditLogs 테이블에 변경 이력 1건 삽입."""
-    actor = _current_username()
-    conn.execute(
-        """
-        INSERT INTO AuditLogs (created_at, actor_username, entity_type, entity_id, field_name, old_value, new_value, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            datetime.now(tz=KST).isoformat(),
-            actor,
-            entity_type,
-            int(entity_id),
-            field_name,
-            "" if old_value is None else str(old_value),
-            "" if new_value is None else str(new_value),
-            reason.strip(),
-        ),
-    )
+    """변경 이력 기록. Phase 2: SQLite 제거, conn=None이면 no-op."""
+    if conn is None:
+        return
 
 
 def _get_username_by_display_name(display_name: str) -> str | None:
@@ -4080,7 +4044,7 @@ def _render_admin_delete_requests(db_filename: str):
         st.rerun()
 
 
-def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_file):
+def _save_payment_receipt(conn, payment_id: int, uploaded_file):  # Phase 2: conn은 항상 None
     """온누리 등 결제 영수증 파일을 RECEIPT_DIR에 저장하고 PaymentReceipts에 경로 기록."""
     if uploaded_file is None:
         return
@@ -4098,6 +4062,8 @@ def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_fi
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
     except Exception:
+        return
+    if conn is None:
         return
     conn.execute(
         """
@@ -8387,10 +8353,11 @@ def render_employee_management():
                                     st.success("이 이메일은 Supabase에 이미 있어 앱 권한만 부여했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
                                 else:
                                     st.success("직원 계정이 생성되었습니다. 해당 이메일과 초기 비밀번호로 로그인할 수 있습니다.")
-                        except sqlite3.IntegrityError:
-                            conn.rollback()
-                            st.error("Master DB에 이미 같은 사용자명/이메일이 등록되어 있습니다. 직원 수정 메뉴에서 기존 직원을 수정해 주세요.")
-                            conn.close()
+                        except Exception as _ie:
+                            if conn:
+                                conn.rollback()
+                                conn.close()
+                            st.error(f"사용자 등록 중 오류가 발생했습니다: {str(_ie)}")
                             st.stop()
                         except Exception as e:
                             conn.rollback()
