@@ -10537,13 +10537,18 @@ def render_new_sales():
                     "이상 마진율 사유를 5자 이상 입력해야 등록할 수 있습니다."
                 )
                 st.stop()
-        # 메인페이·지역화폐 승인번호 필수 검증
+        # 카드사·승인번호 필수 검증
         for i in range(slot_count):
             method = st.session_state.get(f"pay_method_{i}", "")
             amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
             if amt <= 0:
                 continue
-            if method == "메인페이":
+            if method in _CARD_WITH_COMPANY:
+                _cc = (st.session_state.get(f"pay_card_{i}", "") or "").strip()
+                if not _cc:
+                    st.error(f"결제 #{i+1} {method} 카드사를 선택하세요.")
+                    st.stop()
+            elif method == "메인페이":
                 _appr = re.sub(r"\D", "", (st.session_state.get(f"pay_card_{i}", "") or "").strip())
                 if len(_appr) != 4:
                     st.error(f"결제 #{i+1} 메인페이 승인번호 4자리를 정확히 입력하세요.")
@@ -12183,19 +12188,32 @@ def render_customer_balance():
                                         if "onnuri_approval_code" in pay_display.columns:
                                             mask = pay_display["card_company"].isna() | (pay_display["card_company"].astype(str).isin(["None", "nan", ""]))
                                             pay_display.loc[mask, "card_company"] = pay_display.loc[mask, "onnuri_approval_code"]
-                                        # card_company가 여전히 비어 있으면 payment_method(신용카드/체크카드 등)로 대체
+                                        # 신용카드/체크카드인데 card_company가 비어 있으면 "(카드사 미입력)"으로 표시
                                         pay_display["card_company"] = pay_display["card_company"].fillna("").astype(str).replace({"None": "", "nan": "", "none": ""})
                                         empty_card = pay_display["card_company"].str.strip() == ""
-                                        pay_display.loc[empty_card, "card_company"] = pay_display.loc[empty_card, "payment_method"].fillna("-")
+                                        card_method_mask = pay_display["payment_method"].isin(("신용카드", "체크카드"))
+                                        pay_display.loc[empty_card & card_method_mask, "card_company"] = "(카드사 미입력)"
+                                        pay_display.loc[empty_card & ~card_method_mask, "card_company"] = pay_display.loc[empty_card & ~card_method_mask, "payment_method"].fillna("-")
                                         pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료"})
                                         st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료"]], width='stretch')
                                         for _, prow in pay_list.iterrows():
-                                            with st.expander(f"결제 ID {prow['id']} — {prow['payment_method'] or '-'} {float(prow['amount'] or 0):,.0f}원"):
+                                            _prow_cc = (prow.get("card_company") or "").strip()
+                                            _prow_cc = "" if _prow_cc in ("None", "nan", "none") else _prow_cc
+                                            _prow_method_label = prow['payment_method'] or '-'
+                                            if prow.get("payment_method") in ("신용카드", "체크카드") and _prow_cc:
+                                                _prow_method_label = f"{prow['payment_method']} ({_prow_cc})"
+                                            with st.expander(f"결제 ID {prow['id']} — {_prow_method_label} {float(prow['amount'] or 0):,.0f}원"):
                                                 col_left, col_right = st.columns(2)
                                                 with col_left:
                                                     st.info("**기존 결제 내역 (비교용)**")
                                                     st.write(f"**총판매금액:** {total_sales:,.0f}원")
-                                                    st.write(f"**기존 결제수단:** {prow['payment_method'] or '-'}")
+                                                    _disp_cc = (prow.get("card_company") or "").strip()
+                                                    _disp_cc = "" if _disp_cc in ("None", "nan", "none") else _disp_cc
+                                                    if prow.get("payment_method") in ("신용카드", "체크카드"):
+                                                        st.write(f"**기존 결제수단:** {prow['payment_method'] or '-'}")
+                                                        st.write(f"**카드사:** {_disp_cc if _disp_cc else '⚠️ 미입력'}")
+                                                    else:
+                                                        st.write(f"**기존 결제수단:** {prow['payment_method'] or '-'}")
                                                     st.write(f"**결제금액:** {float(prow['amount'] or 0):,.0f}원")
                                                     st.write(f"**미수금:** {current_balance:,.0f}원")
                                                 with col_right:
@@ -12389,6 +12407,8 @@ def render_customer_balance():
                                                         if st.button("수정 완료", key=f"pay_edit_{prow['id']}"):
                                                             if not del_reason or len(del_reason.strip()) < 5:
                                                                 st.warning("사유를 5자 이상 입력하세요.")
+                                                            elif new_method in _CARD_WITH_COMPANY and not (new_card_company or "").strip():
+                                                                st.warning(f"{new_method} 카드사를 선택하세요.")
                                                             elif new_method == "메인페이" and len(re.sub(r"\D", "", (new_card_company or ""))) != 4:
                                                                 st.warning("메인페이 승인번호 4자리를 정확히 입력하세요.")
                                                             elif new_method == "지역화폐" and not (new_card_company or "").strip():
