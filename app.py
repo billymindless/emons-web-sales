@@ -12197,7 +12197,7 @@ def render_customer_balance():
                                         pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료"})
                                         st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료"]], width='stretch')
                                         for _, prow in pay_list.iterrows():
-                                            _prow_cc = (prow.get("card_company") or "").strip()
+                                            _prow_cc = str(prow.get("card_company") or "").strip()
                                             _prow_cc = "" if _prow_cc in ("None", "nan", "none") else _prow_cc
                                             _prow_method_label = prow['payment_method'] or '-'
                                             if prow.get("payment_method") in ("신용카드", "체크카드") and _prow_cc:
@@ -12207,7 +12207,7 @@ def render_customer_balance():
                                                 with col_left:
                                                     st.info("**기존 결제 내역 (비교용)**")
                                                     st.write(f"**총판매금액:** {total_sales:,.0f}원")
-                                                    _disp_cc = (prow.get("card_company") or "").strip()
+                                                    _disp_cc = str(prow.get("card_company") or "").strip()
                                                     _disp_cc = "" if _disp_cc in ("None", "nan", "none") else _disp_cc
                                                     if prow.get("payment_method") in ("신용카드", "체크카드"):
                                                         st.write(f"**기존 결제수단:** {prow['payment_method'] or '-'}")
