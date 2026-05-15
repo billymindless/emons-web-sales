@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 """
 momo - 가구 매장 세일즈 및 경영 대시보드
@@ -1292,8 +1292,8 @@ def _overlay_sales_df_employee_names_from_live_orders(sal_df: "pd.DataFrame") ->
 # ========== 경로 설정 ==========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_DIR = os.path.join(BASE_DIR, "databases")
-EMONS_LOG_SVG_PATH = os.path.normpath(os.path.join(BASE_DIR, "emons-log.svg"))
-EMONS_LOGO_SVG_PATH = os.path.normpath(os.path.join(BASE_DIR, "emons-logo.svg"))
+MOMO_LOG_SVG_PATH = os.path.normpath(os.path.join(BASE_DIR, "momo-log.svg"))
+MOMO_LOGO_SVG_PATH = os.path.normpath(os.path.join(BASE_DIR, "momo-logo.svg"))
 LOGO_SVG_PATH = os.path.normpath(os.path.join(BASE_DIR, "logo.svg"))
 LOGO_PATH = os.path.normpath(os.path.join(BASE_DIR, "logo.png"))
 os.makedirs(DB_DIR, exist_ok=True)
@@ -1311,12 +1311,12 @@ LOGO_FALLBACK_MSG = "momo 로고를 불러올 수 없습니다. (경로 확인 �
 
 
 def _resolve_logo_path():
-    """로고 경로 반환. emons-log.svg → emons-logo.svg → logo.svg → logo.png. app 기준·실행 폴더 순."""
+    """로고 경로 반환. momo-log.svg → momo-logo.svg → logo.svg → logo.png. app 기준·실행 폴더 순."""
     for _name, path in [
-        ("emons-log.svg", EMONS_LOG_SVG_PATH),
-        ("emons-log.svg", os.path.normpath(os.path.join(os.getcwd(), "emons-log.svg"))),
-        ("emons-logo.svg", EMONS_LOGO_SVG_PATH),
-        ("emons-logo.svg", os.path.normpath(os.path.join(os.getcwd(), "emons-logo.svg"))),
+        ("momo-log.svg", MOMO_LOG_SVG_PATH),
+        ("momo-log.svg", os.path.normpath(os.path.join(os.getcwd(), "momo-log.svg"))),
+        ("momo-logo.svg", MOMO_LOGO_SVG_PATH),
+        ("momo-logo.svg", os.path.normpath(os.path.join(os.getcwd(), "momo-logo.svg"))),
         ("logo.svg", LOGO_SVG_PATH),
         ("logo.svg", os.path.normpath(os.path.join(os.getcwd(), "logo.svg"))),
         ("logo.png", LOGO_PATH),
@@ -1329,7 +1329,7 @@ def _resolve_logo_path():
 
 def _common_logo_html(
     logo_path: str | None,
-    fallback_id: str = "emons-logo-fallback",
+    fallback_id: str = "momo-logo-fallback",
     href: str | None = None,
 ) -> str:
     """
@@ -3210,22 +3210,22 @@ def ensure_session():
 #
 # [다중 새로고침 시 로그아웃 디버깅 체크리스트]
 #  - F12 → Console: "토큰 삭제됨" 로그가 뜨면 → 원인(로그아웃 클릭 / 1시간 만료 또는 무효) 확인
-#  - Application → Local Storage / Session Storage: emons_auth 키가 새로고침 후에도 있는지 확인
+#  - Application → Local Storage / Session Storage: momo_auth 키가 새로고침 후에도 있는지 확인
 #  - Network: 새로고침 시 요청 URL에 ?auth= 가 붙는 요청이 한 번이라도 가는지 확인
 #  - URL이 2083자 제한으로 잘리면 검증 실패 → auth 길이 < 80이면 삭제 스크립트를 주입하지 않도록 함
-AUTH_STORAGE_KEY = "emons_auth"
-_AUTH_SECRET_FALLBACK = "emons-default-secret-change-in-production"
+AUTH_STORAGE_KEY = "momo_auth"
+_AUTH_SECRET_FALLBACK = "momo-default-secret-change-in-production"
 
 
 def _get_auth_secret() -> str:
     """st.secrets → os.environ → fallback 순으로 HMAC 서명 키를 반환."""
     try:
-        val = st.secrets.get("EMONS_AUTH_SECRET") or ""
+        val = st.secrets.get("MOMO_AUTH_SECRET") or ""
         if val and str(val).strip():
             return str(val).strip()
     except Exception:
         pass
-    return os.environ.get("EMONS_AUTH_SECRET", _AUTH_SECRET_FALLBACK)
+    return os.environ.get("MOMO_AUTH_SECRET", _AUTH_SECRET_FALLBACK)
 AUTH_EXPIRY_DAYS = 30
 AUTH_SESSION_SECONDS = AUTH_EXPIRY_DAYS * 24 * 3600  # 토큰 만료일과 동일 (30일)
 
@@ -5181,7 +5181,7 @@ def _inject_js_url_auth_save_and_replace_state():
             var params = new URLSearchParams(window.location.search);
             var auth = params.get("auth");
             if (auth) {
-                var key = "emons_auth";
+                var key = "momo_auth";
                 localStorage.setItem(key, auth);
                 sessionStorage.setItem(key, auth);
                 console.log("--- 토큰 저장됨 ---");
@@ -5203,7 +5203,7 @@ def _inject_js_localStorage_redirect_with_auth():
         <script>
         (function(){
             if (window.location.search.includes("auth=")) return;
-            var key = "emons_auth";
+            var key = "momo_auth";
             var val = localStorage.getItem(key);
             if (!val) { val = sessionStorage.getItem(key); if (val) { localStorage.setItem(key, val); } }
             if (val) {
@@ -5224,7 +5224,7 @@ def _inject_js_clear_auth_on_logout():
         """
         <script>
         (function(){
-            var key = "emons_auth";
+            var key = "momo_auth";
             localStorage.removeItem(key);
             sessionStorage.removeItem(key);
             console.log("--- 토큰 삭제됨: 원인=로그아웃 버튼 클릭 ---");
@@ -5244,7 +5244,7 @@ def _inject_js_clear_auth_and_remove_auth_param():
         """
         <script>
         (function(){
-            var key = "emons_auth";
+            var key = "momo_auth";
             localStorage.removeItem(key);
             sessionStorage.removeItem(key);
             console.log("--- 토큰 삭제됨: 원인=1시간 만료 또는 토큰 무효 ---");
@@ -5571,10 +5571,10 @@ def _inject_js_login_form_attributes():
                 if (form) {
                     var inputs = form.querySelectorAll('input:not([type="hidden"])');
                     if (inputs.length >= 2 && !inputs[0].getAttribute('name')) {
-                        inputs[0].setAttribute('id', 'emons-username');
+                        inputs[0].setAttribute('id', 'momo-username');
                         inputs[0].setAttribute('name', 'username');
                         inputs[0].setAttribute('autocomplete', 'username');
-                        inputs[1].setAttribute('id', 'emons-password');
+                        inputs[1].setAttribute('id', 'momo-password');
                         inputs[1].setAttribute('name', 'password');
                         inputs[1].setAttribute('autocomplete', 'current-password');
                     }
@@ -5605,8 +5605,8 @@ def render_login():
     st.markdown(
         """
         <style>
-        /* 로그인 화면 emons 로고: PC — 적당한 크기로 제한 */
-        .emons-login-logo img {
+        /* 로그인 화면 momo 로고: PC — 적당한 크기로 제한 */
+        .momo-login-logo img {
             max-width: 350px !important;
             width: auto !important;
             height: auto !important;
@@ -5614,12 +5614,12 @@ def render_login():
         }
         @media (max-width: 768px) {
             /* 모바일: 상단 여백으로 잘림 방지, 화면 너비의 60% 크기 */
-            .emons-login-logo {
+            .momo-login-logo {
                 margin-top: 1.5rem;
                 padding-top: 1rem;
                 box-sizing: border-box;
             }
-            .emons-login-logo img {
+            .momo-login-logo img {
                 width: 60% !important;
                 max-width: 60% !important;
                 height: auto !important;
@@ -5631,8 +5631,8 @@ def render_login():
     )
     # 로고: 로그인 화면에서도 좌측 상단 고정 (공통 레이아웃), 에러 시 빨간 메시지
     logo_html = (
-        '<div class="emons-login-logo">'
-        + _common_logo_html(_resolve_logo_path(), fallback_id="emons-logo-fallback-login")
+        '<div class="momo-login-logo">'
+        + _common_logo_html(_resolve_logo_path(), fallback_id="momo-logo-fallback-login")
         + "</div>"
     )
     st.markdown(logo_html, unsafe_allow_html=True)
@@ -5712,7 +5712,7 @@ def render_login():
         """
         <script>
         (function(){
-            var KEY = 'emons_login_email';
+            var KEY = 'momo_login_email';
             try {
                 var u = new URL(window.location.href);
                 if (!u.searchParams.get('email') && localStorage.getItem(KEY)) {
@@ -14354,7 +14354,7 @@ def main():
         # json.dumps로 JS 문자열 이스케이프 후 </script> 시퀀스 추가 방어 (XSS 차단)
         _val_js = json.dumps(str(_pending)).replace("</", r"<\/").replace("<!--", r"<\!--")
         st.markdown(
-            f'<script>(function(){{ try {{ localStorage.setItem("emons_login_email", {_val_js}); }} catch(e) {{}} }})();</script>',
+            f'<script>(function(){{ try {{ localStorage.setItem("momo_login_email", {_val_js}); }} catch(e) {{}} }})();</script>',
             unsafe_allow_html=True,
         )
 
@@ -14387,12 +14387,12 @@ def main():
         st.rerun()
         return
 
-    # 로그인 후 사이드바: 좌측 상단 공통 로고(emons-log.svg / emons-logo.svg 우선, 에러 시 빨간 메시지)
+    # 로그인 후 사이드바: 좌측 상단 공통 로고(momo-log.svg / momo-logo.svg 우선, 에러 시 빨간 메시지)
     # 로고를 클릭하면 항상 현재 토큰을 포함한 URL(?home=1&auth=...)로 이동하여
     # 새 세션이 열리더라도 URL 토큰으로 즉시 로그인 복구 후 대시보드(홈)로 돌아오도록 처리.
     raw_logo_html = _common_logo_html(
         _resolve_logo_path(),
-        fallback_id="emons-logo-fallback-sidebar",
+        fallback_id="momo-logo-fallback-sidebar",
     )
     clickable_logo_html = f"""
     <div style="cursor:pointer;"
