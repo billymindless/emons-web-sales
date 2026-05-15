@@ -554,7 +554,7 @@ def get_supabase_stores_dataframe_cached():
 def _get_supabase_app_user_by_email(email: str):
     """
     Supabase app_users에서 이메일로 사용자 조회.
-    반환: (id, username, role, store_id, db_filename) 또는 None.
+    반환: (id, username, role, store_id, db_filename, org_id) 또는 None.
     """
     if not email or not str(email).strip():
         return None
@@ -563,12 +563,16 @@ def _get_supabase_app_user_by_email(email: str):
         return None
     try:
         email_clean = str(email).strip().lower()
-        r = client.table("app_users").select("id, username, role, store_id").eq("email", email_clean).execute()
+        r = client.table("app_users").select("id, username, role, store_id, org_id").eq("email", email_clean).execute()
         rows = (r.data or []) if hasattr(r, "data") else []
         if not rows:
             return None
         row = rows[0]
-        uid, username, role, store_id = row.get("id"), row.get("username"), row.get("role"), row.get("store_id")
+        uid = row.get("id")
+        username = row.get("username")
+        role = row.get("role")
+        store_id = row.get("store_id")
+        org_id = row.get("org_id")
         db_filename = ""
         first_sid = store_id
         if not first_sid:
@@ -579,26 +583,40 @@ def _get_supabase_app_user_by_email(email: str):
             s = client.table("app_stores").select("db_filename").eq("id", first_sid).maybe_single().execute()
             if s.data and s.data.get("db_filename"):
                 db_filename = s.data["db_filename"]
-        return (uid, username, role, store_id, db_filename)
+        return (uid, username, role, store_id, db_filename, org_id)
     except Exception:
         return None
 
 
 @st.cache_data(ttl=1800)
 def _get_supabase_user_allowed_stores(user_id: int):
-    """접근 가능 매장 목록 캐시 (30분). 로그인 사용자별로 캐시되며, 배정 변경 시 clear_data_cache()로 갱신."""
+    """
+    접근 가능 매장 목록 (30분 캐시).
+    - org_owner / org_admin: 자신의 org에 속한 모든 매장
+    - store_manager / staff / store_admin / user: app_user_stores 배정 매장만
+    """
     if not user_id:
         return []
     client, err = get_supabase_client()
     if err or not client:
         return []
     try:
+        # 사용자 role + org_id 조회
+        ur = client.table("app_users").select("role, org_id, store_id").eq("id", user_id).maybe_single().execute()
+        user_role = ur.data.get("role", "") if ur.data else ""
+        org_id = ur.data.get("org_id") if ur.data else None
+
+        # org 수준 권한: 해당 org의 전 매장
+        if _is_org_level(user_role) and org_id:
+            sr = client.table("app_stores").select("id, db_filename, store_name").eq("org_id", org_id).execute()
+            stores = sr.data or []
+            return sorted([(s["id"], s["db_filename"], s["store_name"]) for s in stores], key=lambda x: (x[2] or "", x[0]))
+
+        # 지점 수준: app_user_stores 배정 목록
         us = client.table("app_user_stores").select("store_id").eq("user_id", user_id).execute()
         store_ids = [x["store_id"] for x in (us.data or [])]
-        if not store_ids:
-            row = client.table("app_users").select("store_id").eq("id", user_id).maybe_single().execute()
-            if row.data and row.data.get("store_id"):
-                store_ids = [row.data["store_id"]]
+        if not store_ids and ur.data and ur.data.get("store_id"):
+            store_ids = [ur.data["store_id"]]
         if not store_ids:
             return []
         out = []
@@ -3094,6 +3112,35 @@ def ensure_session():
         st.session_state.current_db = None
 
 
+# ─── 역할 매트릭스 헬퍼 ────────────────────────────────────────────────────────
+# 구 역할(store_admin / user)과 신 역할(org_owner / org_admin / store_manager / staff)을
+# 동시에 처리하는 단일 진입점. 앱 전역에서 role 문자열 비교 대신 이 함수들을 사용.
+
+def _is_momo_operator(role: str) -> bool:
+    """momo 내부 운영자 전용 (superadmin). /admin 페이지에서만 접근."""
+    return role == "superadmin"
+
+def _is_org_level(role: str) -> bool:
+    """조직(본사) 수준 권한: 전 지점 데이터 접근 가능."""
+    return role in ("org_owner", "org_admin")
+
+def _is_manager(role: str) -> bool:
+    """매장 관리자 이상 (지점 관리 가능). 구 store_admin 포함."""
+    return role in ("org_owner", "org_admin", "store_manager", "store_admin")
+
+def _is_billing_role(role: str) -> bool:
+    """결제·구독·플랜 변경 권한 (org_owner만)."""
+    return role == "org_owner"
+
+def _can_access_admin_tools(role: str) -> bool:
+    """모니터링·매출 관리 도구 접근 (매장 관리자 이상)."""
+    return _is_manager(role)
+
+def _effective_store_admin_role(role: str) -> bool:
+    """기존 store_admin 권한이 필요한 코드에서 호환성 체크."""
+    return role in ("store_admin", "store_manager", "org_owner", "org_admin")
+
+
 # ========== 로그인 상태 유지 (localStorage + query_params) ==========
 # [토큰 삭제] 다음 두 경우에만 수행. 그 외에는 삭제하지 않음.
 #  1) 로그아웃 버튼 클릭 (logout=1) → _inject_js_clear_auth_on_logout
@@ -5551,25 +5598,31 @@ def render_login():
                             if not app_user:
                                 st.error("이 이메일은 등록된 사용자가 아닙니다. 관리자에게 문의하세요.")
                             else:
-                                user_id, uname, role, store_id, db_filename = app_user
-                                allowed_stores = get_user_allowed_stores(user_id) if role != "superadmin" else []
+                                # org_id 포함 (Phase 4): 6-tuple로 확장
+                                _au = app_user
+                                user_id  = _au[0]
+                                uname    = _au[1]
+                                role     = _au[2]
+                                store_id = _au[3]
+                                db_filename = _au[4]
+                                org_id   = _au[5] if len(_au) > 5 else None
+                                allowed_stores = get_user_allowed_stores(user_id) if not _is_momo_operator(role) else []
                                 if allowed_stores:
-                                    # 기본 매장(app_users.store_id)이 allowed_stores에 있으면 우선 적용
                                     _matched_store = next((s for s in allowed_stores if s[0] == store_id), None)
                                     if _matched_store:
                                         store_id, db_filename = _matched_store[0], _matched_store[1]
                                     else:
-                                        # 기본 매장이 없거나 배정 목록과 불일치하면 첫 매장으로 fallback
                                         store_id, db_filename = allowed_stores[0][0], allowed_stores[0][1]
                                 display_map = _get_app_user_display_name_map()
                                 display_name = (display_map.get(str(uname).strip()) or display_map.get(str(uname).strip().lower()) or uname or "").strip()
                                 st.session_state.logged_in = True
                                 st.session_state.current_user = {
-                                    "id": user_id, "username": uname, "name": display_name or None, "role": role,
+                                    "id": user_id, "username": uname, "name": display_name or None,
+                                    "role": role, "org_id": org_id,
                                     "store_id": store_id, "db_filename": db_filename,
                                     "allowed_stores": allowed_stores,
                                 }
-                                st.session_state.current_db = db_filename if role != "superadmin" else None
+                                st.session_state.current_db = db_filename if not _is_momo_operator(role) else None
                                 st.session_state["supabase_session"] = {
                                     "access_token": session.access_token,
                                     "refresh_token": session.refresh_token,
@@ -9400,6 +9453,21 @@ def render_faq_page():
     for i, item in enumerate(matched):
         with st.expander(item["title"], expanded=_expand and i < 12):
             st.markdown(item["body"])
+
+
+def render_admin_console():
+    """
+    momo 운영자 전용 콘솔 (?page=admin).
+    일반 가입자는 접근 불가. render_superadmin() 메뉴에 운영자 전용 항목 추가.
+    """
+    st.markdown(
+        "<div style='background:#fff0f0;border:1px solid #e05;border-radius:8px;"
+        "padding:0.6rem 1rem;margin-bottom:1rem;font-size:0.9rem;'>"
+        "⚙️ <b>momo 운영자 콘솔</b> — 이 페이지는 momo 내부 운영자 전용입니다."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    render_superadmin()
 
 
 def render_superadmin():
@@ -14274,6 +14342,19 @@ def main():
             render_login()
         return
 
+    # /admin 페이지: momo 운영자 전용 콘솔
+    try:
+        _page_param = st.query_params.get("page", "")
+    except Exception:
+        _page_param = ""
+    if _page_param == "admin":
+        user_for_admin = st.session_state.get("current_user") or {}
+        if not _is_momo_operator(user_for_admin.get("role", "")):
+            st.error("🚫 이 페이지는 momo 운영자 전용입니다.")
+            return
+        render_admin_console()
+        return
+
     user = st.session_state.current_user
     role = user["role"]
 
@@ -14377,7 +14458,7 @@ def main():
                         st.error(f"비밀번호 변경에 실패했습니다: {str(e)}")
     st.sidebar.divider()
     # 관리자 전용: 결제 변경/취소 모니터링 화면 진입 버튼
-    if role in ("store_admin", "superadmin"):
+    if _can_access_admin_tools(role):
         if st.sidebar.button("🚨 결제 변경/취소 모니터링", width='stretch'):
             st.session_state["active_admin_page"] = "payment_monitor"
             st.session_state.pop("mm_queried", None)
@@ -14389,10 +14470,17 @@ def main():
         _del_btn_label = f"🗑️ 주문 삭제 요청 관리 ({_pending_del_count}건)" if _pending_del_count > 0 else "🗑️ 주문 삭제 요청 관리"
         if st.sidebar.button(_del_btn_label, width='stretch'):
             st.session_state["active_admin_page"] = "delete_requests"
-    # 최고 관리자 전용: 직원 계정 관리 및 발령
-    if role == "superadmin":
+    # org_owner / org_admin / store_manager: 직원 계정 관리
+    if _is_manager(role):
         if st.sidebar.button("👥 직원 관리", width='stretch'):
             st.session_state["active_admin_page"] = "employee_management"
+    # momo 운영자: /admin 콘솔 진입 링크
+    if _is_momo_operator(role):
+        st.sidebar.markdown(
+            "<a href='?page=admin' target='_self' style='display:block;padding:0.4rem 0;"
+            "font-size:0.9rem;color:#e05;font-weight:600;'>⚙️ momo 운영자 콘솔</a>",
+            unsafe_allow_html=True,
+        )
     st.sidebar.markdown("---")
     if st.sidebar.button("🚪 로그아웃", width='stretch'):
         try:
@@ -14405,18 +14493,21 @@ def main():
             del st.session_state[key]
         st.rerun()
 
+    # momo 운영자(superadmin): /admin 페이지로만 접근
+    if _is_momo_operator(role):
+        st.info("momo 운영자 콘솔은 좌측 사이드바의 **⚙️ momo 운영자 콘솔** 링크 또는 `?page=admin` 으로 접속하세요.")
+        return
+
     # 관리자 전용 모니터링 화면 라우팅
-    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "payment_monitor":
+    if _can_access_admin_tools(role) and st.session_state.get("active_admin_page") == "payment_monitor":
         render_payment_history_monitor()
         return
 
-    # 관리자 전용: 마진 모니터링
-    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "margin_monitor":
+    if _can_access_admin_tools(role) and st.session_state.get("active_admin_page") == "margin_monitor":
         render_margin_monitor()
         return
 
-    # 관리자 전용: 주문 삭제 요청 관리 화면 라우팅
-    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "delete_requests":
+    if _can_access_admin_tools(role) and st.session_state.get("active_admin_page") == "delete_requests":
         _del_db = st.session_state.get("current_db")
         if _del_db:
             _render_admin_delete_requests(_del_db)
@@ -14424,18 +14515,18 @@ def main():
             st.warning("매장 DB 정보를 찾을 수 없습니다.")
         return
 
-    # 최고 관리자 전용: 직원 계정 관리 및 발령
-    if role == "superadmin" and st.session_state.get("active_admin_page") == "employee_management":
+    # 직원 계정 관리: 매니저 이상
+    if _is_manager(role) and st.session_state.get("active_admin_page") == "employee_management":
         render_employee_management()
         return
 
-    # Superadmin: 5탭 최고 관리자 메뉴
-    if role == "superadmin":
+    # org_owner / org_admin: 전사 관리 메뉴 (기존 superadmin 메뉴 재활용)
+    if _is_org_level(role):
         render_superadmin()
         return
 
     # 일반/매장 관리자: 메뉴를 상단 셀렉트로 노출 (모바일에서도 잘 보이게), 넘버링 및 그룹 구분
-    if role == "store_admin":
+    if _effective_store_admin_role(role):
         tab_labels = [
             "1. 대시보드",
             "2. 마케팅 인사이트",
@@ -14487,12 +14578,11 @@ def main():
     idx = tab_labels.index(menu_sel)
     st.session_state["main_tab_idx"] = idx
     st.session_state["current_menu"] = idx
-    # 로그인 직후 1회: 내 알림 배너 (주문 수정 / 매출 배분 알림) — 일반 직원용
-    _db_fn_for_notif = st.session_state.get("current_db") or (user.get("db_filename") if role != "superadmin" else None)
-    if _db_fn_for_notif and role != "superadmin":
+    # 로그인 직후 1회: 내 알림 배너 + 부정행위 경보
+    _db_fn_for_notif = st.session_state.get("current_db") or user.get("db_filename")
+    if _db_fn_for_notif:
         _render_login_notifications(_db_fn_for_notif)
-    # 로그인 직후 1회: 부정행위 의심 경보 배너 — 매장관리자·통합관리자 전용
-    if _db_fn_for_notif and role in ("store_admin", "superadmin"):
+    if _db_fn_for_notif and _can_access_admin_tools(role):
         _render_admin_fraud_alerts(_db_fn_for_notif)
 
     # 대시보드 탭 선택 시 캐시 재사용으로 즉시 표시
@@ -14505,20 +14595,20 @@ def main():
         render_new_sales()
     elif idx == 3:
         render_customer_balance()
-    elif role == "store_admin" and idx == 4:
+    elif _effective_store_admin_role(role) and idx == 4:
         render_store_admin_employees()
-    elif role == "store_admin" and idx == 5:
+    elif _effective_store_admin_role(role) and idx == 5:
         render_monthly_payment_report(is_superadmin=False)
-    elif role == "user" and idx == 4:
+    elif role in ("user", "staff") and idx == 4:
         render_monthly_payment_report(is_superadmin=False)
-    elif role == "store_admin" and idx == 6:
+    elif _effective_store_admin_role(role) and idx == 6:
         if CRM_MODULE_AVAILABLE:
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
-    elif role == "store_admin" and idx == 7:
+    elif _effective_store_admin_role(role) and idx == 7:
         render_faq_page()
-    elif role == "user" and idx == 5:
+    elif role in ("user", "staff") and idx == 5:
         render_faq_page()
 
 
