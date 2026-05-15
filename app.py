@@ -5588,6 +5588,15 @@ def render_login():
 
     st.caption("💡 로그인할 때 사용한 이메일은 이 기기(브라우저)에만 저장되며, 다음 로그인 시 자동으로 채워집니다.")
 
+    st.markdown("---")
+    st.markdown(
+        "<div style='text-align:center;font-size:0.95rem;'>"
+        "아직 계정이 없으신가요?&nbsp;&nbsp;"
+        "<a href='?page=signup' style='font-weight:600;'>회원가입하기 →</a>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
     # 이메일 자동 저장/자동 입력: localStorage 사용 (같은 브라우저에서 다음 로그인 시 이메일 유지)
     # 1) URL에 email이 없고 localStorage에 저장된 이메일이 있으면 ?email= 붙여서 이동 → 서버에서 default value로 채움
     # 2) 로그인 성공 시에는 메인 화면 로드 시 한 번만 localStorage에 저장(위에서 _pending_save_login_email 설정)
@@ -5631,6 +5640,270 @@ def render_login():
     )
     # 로그인 폼 input에 autocomplete 등 속성 최적화 (브라우저 자동 완성 동작)
     _inject_js_login_form_attributes()
+
+
+# ========== 회원가입 ==========
+
+_PLANS = {
+    "solo": {
+        "label": "소호 플랜",
+        "emoji": "🏪",
+        "desc": "매장 1개 · 직원 3명 이하",
+        "price": "무료 (베타)",
+        "max_stores": 1,
+    },
+    "business": {
+        "label": "비즈니스 플랜",
+        "emoji": "🏢",
+        "desc": "매장 최대 5개 · 직원 무제한",
+        "price": "월 29,000원 (베타 무료)",
+        "max_stores": 5,
+    },
+    "enterprise": {
+        "label": "엔터프라이즈 플랜",
+        "emoji": "🌐",
+        "desc": "매장 무제한 · 전담 지원",
+        "price": "별도 문의",
+        "max_stores": 999,
+    },
+}
+
+
+def _signup_create_account(
+    store_name: str,
+    email: str,
+    password: str,
+    plan: str,
+    owner_name: str,
+) -> tuple[bool, str]:
+    """
+    회원가입 처리:
+    1. Supabase Auth 계정 생성
+    2. app_stores INSERT
+    3. app_users INSERT (role=store_admin)
+    4. app_user_stores INSERT
+    반환: (성공여부, 메시지)
+    """
+    # ── admin client 필요 (서버 사이드 계정 생성)
+    try:
+        secrets = st.secrets
+        url = secrets["supabase"]["url"]
+        service_key = secrets["supabase"]["service_role_key"]
+    except Exception:
+        return False, "서버 설정 오류: Supabase 키를 확인해 주세요."
+
+    from supabase import create_client as _create_client
+    admin = _create_client(url, service_key)
+
+    # 1) Supabase Auth 계정 생성
+    try:
+        auth_res = admin.auth.admin.create_user({
+            "email": email.strip(),
+            "password": password,
+            "email_confirm": True,
+        })
+        auth_uid = auth_res.user.id if auth_res.user else None
+        if not auth_uid:
+            return False, "계정 생성에 실패했습니다. 잠시 후 다시 시도해 주세요."
+    except Exception as e:
+        msg = str(e)
+        if "already registered" in msg or "already been registered" in msg or "duplicate" in msg.lower():
+            return False, "이미 가입된 이메일입니다. 로그인 화면에서 로그인해 주세요."
+        return False, f"계정 생성 오류: {msg}"
+
+    # 2) db_filename 자동 생성 (store_1.db ~ store_N.db)
+    try:
+        existing = admin.table("app_stores").select("id").order("id", desc=True).limit(1).execute()
+        max_id = int(existing.data[0]["id"]) if existing.data else 0
+        db_filename = f"store_{max_id + 1}.db"
+    except Exception as e:
+        return False, f"매장 등록 실패: {e}"
+
+    # 3) app_stores INSERT
+    try:
+        store_res = admin.table("app_stores").insert({
+            "store_name": store_name.strip(),
+            "db_filename": db_filename,
+        }).execute()
+        store_id = store_res.data[0]["id"] if store_res.data else None
+        if not store_id:
+            return False, "매장 등록에 실패했습니다."
+    except Exception as e:
+        msg = str(e).lower()
+        if "unique" in msg or "duplicate" in msg:
+            return False, f"'{store_name}' 매장명이 이미 사용 중입니다. 다른 이름을 사용해 주세요."
+        return False, f"매장 등록 오류: {e}"
+
+    # 4) app_users INSERT
+    import hashlib as _hl
+    pw_hash = _hl.sha256("supabase_managed".encode()).hexdigest()
+    username = email.strip().split("@")[0].lower().replace(".", "_")
+    try:
+        user_res = admin.table("app_users").insert({
+            "username": username,
+            "password": pw_hash,
+            "email": email.strip().lower(),
+            "role": "store_admin",
+            "store_id": int(store_id),
+            "name": owner_name.strip() or None,
+            "plan": plan,
+        }).execute()
+        user_id = user_res.data[0]["id"] if user_res.data else None
+        if not user_id:
+            return False, "사용자 등록에 실패했습니다."
+    except Exception as e:
+        msg = str(e).lower()
+        if "unique" in msg or "duplicate" in msg:
+            return False, "이미 등록된 이메일 또는 사용자명입니다."
+        return False, f"사용자 등록 오류: {e}"
+
+    # 5) app_stores.owner_user_id 업데이트 (owner 연결)
+    try:
+        admin.table("app_stores").update({"owner_user_id": int(user_id)}).eq("id", int(store_id)).execute()
+    except Exception:
+        pass  # owner 업데이트 실패는 치명적이지 않음
+
+    # 6) app_user_stores INSERT
+    try:
+        admin.table("app_user_stores").insert({
+            "user_id": int(user_id),
+            "store_id": int(store_id),
+        }).execute()
+    except Exception:
+        pass  # 연결 실패는 치명적이지 않음
+
+    return True, f"가입 완료! {store_name} 매장이 생성됐습니다. 방금 입력한 이메일과 비밀번호로 로그인해 주세요."
+
+
+def render_signup():
+    """자가 가입 화면: 플랜 선택 → 매장명/이름/이메일/비밀번호 입력 → 계정 자동 생성."""
+    ensure_session()
+
+    # ── 로고
+    logo_html = (
+        '<div class="momo-login-logo">'
+        + _common_logo_html(_resolve_logo_path(), fallback_id="momo-logo-fallback-signup")
+        + "</div>"
+    )
+    st.markdown(logo_html, unsafe_allow_html=True)
+    st.title("momo")
+    st.subheader("회원가입")
+
+    # ── 플랜 선택 카드
+    st.markdown("#### 플랜을 선택해 주세요")
+    plan_cols = st.columns(3)
+    plan_keys = list(_PLANS.keys())
+
+    current_plan = st.session_state.get("_signup_plan", "solo")
+
+    for i, (pk, pv) in enumerate(_PLANS.items()):
+        with plan_cols[i]:
+            selected = current_plan == pk
+            border_color = "#1f77b4" if selected else "#ddd"
+            bg_color = "#f0f7ff" if selected else "#fafafa"
+            st.markdown(
+                f"""
+                <div style="border:2px solid {border_color};border-radius:12px;
+                            padding:1.1rem;background:{bg_color};min-height:140px;
+                            text-align:center;cursor:pointer;">
+                  <div style="font-size:2rem;">{pv['emoji']}</div>
+                  <div style="font-weight:700;font-size:1rem;margin:0.3rem 0;">{pv['label']}</div>
+                  <div style="font-size:0.82rem;color:#555;">{pv['desc']}</div>
+                  <div style="font-size:0.85rem;font-weight:600;color:#1f77b4;margin-top:0.5rem;">{pv['price']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "✓ 선택됨" if selected else "선택",
+                key=f"plan_select_{pk}",
+                use_container_width=True,
+                type="primary" if selected else "secondary",
+            ):
+                st.session_state["_signup_plan"] = pk
+                st.rerun()
+
+    chosen_plan = st.session_state.get("_signup_plan", "solo")
+    chosen_info = _PLANS[chosen_plan]
+    st.success(f"**{chosen_info['emoji']} {chosen_info['label']}** 선택됨 — {chosen_info['desc']}")
+
+    st.markdown("---")
+    st.markdown("#### 가입 정보를 입력해 주세요")
+
+    with st.form("signup_form"):
+        owner_name = st.text_input(
+            "담당자 이름 *",
+            placeholder="예: 홍길동",
+            help="매장 관리자 이름입니다.",
+        )
+        store_name = st.text_input(
+            "매장명 *",
+            placeholder="예: 홍길동 인테리어",
+            help="가입 후 슈퍼어드민에서 추가 매장을 등록할 수 있습니다.",
+        )
+        email = st.text_input(
+            "이메일 *",
+            placeholder="예: you@example.com",
+            help="로그인에 사용할 이메일 주소입니다.",
+        )
+        password = st.text_input("비밀번호 *", type="password", help="6자 이상")
+        password2 = st.text_input("비밀번호 확인 *", type="password")
+
+        agree = st.checkbox("서비스 이용약관 및 개인정보처리방침에 동의합니다.")
+
+        submitted = st.form_submit_button("🚀 가입하기", use_container_width=True, type="primary")
+
+        if submitted:
+            # 입력값 검증
+            errors = []
+            if not owner_name or not owner_name.strip():
+                errors.append("담당자 이름을 입력해 주세요.")
+            if not store_name or not store_name.strip():
+                errors.append("매장명을 입력해 주세요.")
+            if not email or "@" not in email:
+                errors.append("유효한 이메일 주소를 입력해 주세요.")
+            if not password or len(password) < 6:
+                errors.append("비밀번호는 6자 이상이어야 합니다.")
+            if password != password2:
+                errors.append("비밀번호가 일치하지 않습니다.")
+            if not agree:
+                errors.append("이용약관에 동의해 주세요.")
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                with st.spinner("계정을 생성하는 중..."):
+                    ok, msg = _signup_create_account(
+                        store_name=store_name,
+                        email=email,
+                        password=password,
+                        plan=chosen_plan,
+                        owner_name=owner_name,
+                    )
+                if ok:
+                    st.session_state["_signup_done"] = True
+                    st.session_state["_signup_email"] = email.strip()
+                    st.session_state.pop("_signup_plan", None)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    # 가입 완료 배너 (rerun 후 표시)
+    if st.session_state.get("_signup_done"):
+        st.balloons()
+        st.success(
+            f"🎉 가입이 완료되었습니다! "
+            f"**{st.session_state.get('_signup_email', '')}** 으로 로그인해 주세요."
+        )
+        st.session_state.pop("_signup_done", None)
+
+    st.markdown("---")
+    st.markdown(
+        "<div style='text-align:center'>이미 계정이 있으신가요? "
+        "<a href='?page=login'>로그인하기</a></div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ========== 최고 관리자 (Superadmin) 전용: 공지 조회 ==========
@@ -13989,9 +14262,16 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # Supabase Auth: 로그인하지 않았으면 로그인 화면만 표시
+    # 로그인하지 않은 상태: page 파라미터로 signup / login 분기
     if not st.session_state.logged_in:
-        render_login()
+        try:
+            page = st.query_params.get("page", "login")
+        except Exception:
+            page = "login"
+        if page == "signup":
+            render_signup()
+        else:
+            render_login()
         return
 
     user = st.session_state.current_user
