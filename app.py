@@ -7714,22 +7714,49 @@ def _superadmin_tab5_store_accounts():
                     else:
                         st.warning("새 비밀번호를 입력하세요.")
 
-    st.subheader("매장 삭제 (이중 확인)")
+    st.subheader("가입조직 삭제")
     if len(stores) > 0:
-        del_store_name = st.selectbox("삭제할 매장 선택", store_options, key="sa_del_store_sel")
+        del_store_name = st.selectbox("삭제할 가입조직(매장) 선택", store_options, key="sa_del_store_sel")
         if del_store_name:
             s = stores[stores["store_name"] == del_store_name].iloc[0]
-            st.warning("매장 삭제 시 해당 매장 배정이 해제되고 매장 행이 삭제됩니다. 복구할 수 없습니다.")
-            confirm = st.checkbox(f"'{s['store_name']}' 매장 삭제에 동의합니다.", key="del_confirm_final")
-            if st.button("매장 삭제", key="del_btn_final"):
+            org_id_to_del = s.get("org_id") if hasattr(s, "get") else s["org_id"] if "org_id" in s.index else None
+
+            st.error(
+                "⚠️ **주의: 가입조직 삭제는 되돌릴 수 없습니다.**\n\n"
+                "삭제 시 다음 데이터가 **모두 영구 삭제**됩니다:\n"
+                "- 해당 매장(app_stores) 및 가입 조직(app_orgs) 레코드\n"
+                "- 해당 조직의 구독(app_subscriptions) 및 청구(app_invoices) 이력\n"
+                "- 직원 매장 배정(app_user_stores) 및 매장 연결 정보\n"
+                "- 로컬 SQLite DB 파일"
+            )
+            confirm = st.checkbox(
+                f"'{s['store_name']}' 가입조직 삭제에 동의합니다.",
+                key="del_confirm_final",
+            )
+            if st.button("가입조직 삭제", key="del_btn_final", type="primary"):
                 if not confirm:
-                    st.error("위 체크박스를 선택한 후 삭제할 수 있습니다.")
+                    st.error("위 체크박스를 체크한 후 삭제할 수 있습니다.")
                 else:
                     try:
                         sid = int(s["id"])
+                        # 매장 관련 정리
                         client.table("app_user_stores").delete().eq("store_id", sid).execute()
                         client.table("app_users").update({"store_id": None}).eq("store_id", sid).execute()
                         client.table("app_stores").delete().eq("id", sid).execute()
+                        # 가입 조직(app_orgs) 및 관련 구독·청구 삭제
+                        if org_id_to_del:
+                            try:
+                                client.table("app_invoices").delete().eq("org_id", org_id_to_del).execute()
+                            except Exception:
+                                pass
+                            try:
+                                client.table("app_subscriptions").delete().eq("org_id", org_id_to_del).execute()
+                            except Exception:
+                                pass
+                            try:
+                                client.table("app_orgs").delete().eq("id", org_id_to_del).execute()
+                            except Exception:
+                                pass
                         clear_data_cache()
                         db_path = os.path.join(DB_DIR, s["db_filename"])
                         if os.path.exists(db_path):
@@ -7737,7 +7764,7 @@ def _superadmin_tab5_store_accounts():
                                 os.remove(db_path)
                             except Exception:
                                 pass
-                        _flash("매장이 삭제되었습니다.")
+                        _flash(f"가입조직 '{s['store_name']}'이(가) 삭제되었습니다.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"삭제 실패: {e}")
