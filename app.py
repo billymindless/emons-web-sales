@@ -3233,7 +3233,7 @@ def _get_auth_secret() -> str:
         ".streamlit/secrets.toml 또는 환경변수에 MOMO_AUTH_SECRET을 설정하세요."
     )
 AUTH_EXPIRY_DAYS = 30
-AUTH_SESSION_SECONDS = AUTH_EXPIRY_DAYS * 24 * 3600  # 토큰 만료일과 동일 (30일)
+AUTH_SESSION_SECONDS = 5 * 3600  # 로그인 세션 유지: 5시간
 
 
 def _current_username() -> str:
@@ -5104,6 +5104,7 @@ def _create_auth_token(user_info: dict) -> str:
         "role": user_info.get("role"),
         "store_id": user_info.get("store_id"),
         "db_filename": user_info.get("db_filename"),
+        "org_id": user_info.get("org_id"),
         "logged_at": now,
         "exp": now + AUTH_EXPIRY_DAYS * 24 * 3600,
     }
@@ -5138,13 +5139,14 @@ def _verify_auth_token(token: str) -> dict | None:
             "role": payload["role"],
             "store_id": payload.get("store_id"),
             "db_filename": payload.get("db_filename"),
+            "org_id": payload.get("org_id"),
         }
     except Exception:
         return None
 
 
 def _try_restore_from_query_params():
-    """URL의 auth가 있으면 검증(1시간 이내) 후 세션 복구. 복구 시 True."""
+    """URL의 auth가 있으면 검증 후 세션 복구. 복구 시 True."""
     try:
         q = st.query_params
     except Exception:
@@ -5589,6 +5591,8 @@ def _inject_js_login_form_attributes():
 
 def render_login():
     ensure_session()
+    # localStorage에 저장된 auth 토큰이 있으면 ?auth=로 리다이렉트 → 세션 자동 복구 (5시간 유지)
+    _inject_js_localStorage_redirect_with_auth()
     # 이메일 자동 입력: URL의 email 파라미터 또는 localStorage(아래 스크립트에서 리다이렉트)로 복원
     try:
         default_email = (st.query_params.get("email") or "").strip()
@@ -5678,20 +5682,22 @@ def render_login():
                                         store_id, db_filename = allowed_stores[0][0], allowed_stores[0][1]
                                 display_map = _get_app_user_display_name_map()
                                 display_name = (display_map.get(str(uname).strip()) or display_map.get(str(uname).strip().lower()) or uname or "").strip()
-                                st.session_state.logged_in = True
-                                st.session_state.current_user = {
+                                _current_user = {
                                     "id": user_id, "username": uname, "name": display_name or None,
                                     "role": role, "org_id": org_id,
                                     "store_id": store_id, "db_filename": db_filename,
                                     "allowed_stores": allowed_stores,
                                 }
+                                st.session_state.logged_in = True
+                                st.session_state.current_user = _current_user
                                 st.session_state.current_db = db_filename if not _is_momo_operator(role) else None
                                 st.session_state["supabase_session"] = {
                                     "access_token": session.access_token,
                                     "refresh_token": session.refresh_token,
                                 }
-                                # 성공 시 다음 접속을 위해 이메일을 브라우저에 저장할 예정(메인 로드 시 스크립트로 저장)
+                                # 5시간 세션 유지를 위해 auth 토큰을 localStorage에 저장 (다음 main() 로드 시 실행)
                                 st.session_state["_pending_save_login_email"] = str(email).strip()
+                                st.session_state["_pending_auth_token"] = _create_auth_token(_current_user)
                                 st.rerun()
                     except Exception as e:
                         # 디버깅용: 어디에서 오류가 나는지 터미널에 전체 스택을 출력
@@ -15974,6 +15980,14 @@ def _init_system_once():
 def main():
     _init_system_once()
     ensure_session()
+
+    # URL에 auth= 토큰이 있으면 localStorage에 저장하고 URL에서 제거 (항상 실행)
+    _inject_js_url_auth_save_and_replace_state()
+
+    # 세션 미복구 상태에서 URL에 auth= 토큰이 있으면 복구 시도 (새로고침 시 localStorage 리다이렉트 복구)
+    if not st.session_state.logged_in:
+        _try_restore_from_query_params()
+
     _inject_mobile_css()
     _inject_favicon()
     _inject_branding_css()
@@ -16026,13 +16040,20 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # 로그인 성공 직후: 브라우저 localStorage에 이메일 저장(한 번만 실행 후 플래그 제거)
+    # 로그인 성공 직후: 브라우저 localStorage에 이메일 + auth 토큰 저장 (한 번만 실행)
     _pending = st.session_state.pop("_pending_save_login_email", None)
+    _pending_token = st.session_state.pop("_pending_auth_token", None)
     if _pending:
-        # json.dumps로 JS 문자열 이스케이프 후 </script> 시퀀스 추가 방어 (XSS 차단)
         _val_js = json.dumps(str(_pending)).replace("</", r"<\/").replace("<!--", r"<\!--")
         st.markdown(
             f'<script>(function(){{ try {{ localStorage.setItem("momo_login_email", {_val_js}); }} catch(e) {{}} }})();</script>',
+            unsafe_allow_html=True,
+        )
+    if _pending_token:
+        # auth 토큰을 localStorage에 저장 → 새로고침 시 _inject_js_localStorage_redirect_with_auth가 읽어서 복구
+        _tok_js = json.dumps(str(_pending_token)).replace("</", r"<\/")
+        st.markdown(
+            f'<script>(function(){{ try {{ localStorage.setItem("momo_auth", {_tok_js}); sessionStorage.setItem("momo_auth", {_tok_js}); }} catch(e) {{}} }})();</script>',
             unsafe_allow_html=True,
         )
 
