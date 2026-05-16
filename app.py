@@ -5595,45 +5595,57 @@ def render_login():
         default_email = (st.query_params.get("email") or "").strip()
     except Exception:
         default_email = ""
-    # 로그인 화면 로고 전용 CSS: @media로 모바일/PC 구분
+    # 로그인 화면 레이아웃 CSS: 가운데 정렬 + 폼 너비 제한
     st.markdown(
         """
         <style>
-        /* 로그인 화면 momo 로고: PC — 적당한 크기로 제한 */
-        .momo-login-logo img {
-            max-width: 350px !important;
+        /* 로그인 전체 래퍼: 화면 중앙 배치 */
+        .momo-login-wrap {
+            max-width: 420px;
+            margin: 3rem auto 0 auto;
+            padding: 0 1rem;
+            text-align: center;
+        }
+        /* 로고 크기 */
+        .momo-login-wrap img {
+            max-width: 220px !important;
             width: auto !important;
             height: auto !important;
             object-fit: contain;
+            margin-bottom: 1.5rem;
+        }
+        /* Streamlit 폼 너비 강제 제한 */
+        .momo-login-wrap [data-testid="stForm"] {
+            text-align: left;
         }
         @media (max-width: 768px) {
-            /* 모바일: 상단 여백으로 잘림 방지, 화면 너비의 60% 크기 */
-            .momo-login-logo {
-                margin-top: 1.5rem;
-                padding-top: 1rem;
-                box-sizing: border-box;
-            }
-            .momo-login-logo img {
-                width: 60% !important;
-                max-width: 60% !important;
-                height: auto !important;
-            }
+            .momo-login-wrap { margin-top: 2rem; }
+            .momo-login-wrap img { max-width: 160px !important; }
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    # 로고: 로그인 화면에서도 좌측 상단 고정 (공통 레이아웃), 에러 시 빨간 메시지
-    logo_html = (
-        '<div class="momo-login-logo">'
-        + _common_logo_html(_resolve_logo_path(), fallback_id="momo-logo-fallback-login")
-        + "</div>"
-    )
-    st.markdown(logo_html, unsafe_allow_html=True)
-    with st.form("login_form"):
-        email = st.text_input("이메일", value=default_email, key="login_email", type="default", placeholder="예: you@example.com")
-        password = st.text_input("비밀번호", type="password", key="login_password")
-        submitted = st.form_submit_button("로그인")
+    logo_inner = _common_logo_html(_resolve_logo_path(), fallback_id="momo-logo-fallback-login")
+    st.markdown(f'<div class="momo-login-wrap">{logo_inner}</div>', unsafe_allow_html=True)
+
+    # 중앙 컬럼으로 폼 너비 제한
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        with st.form("login_form"):
+            email = st.text_input("이메일", value=default_email, key="login_email", type="default", placeholder="예: you@example.com")
+            password = st.text_input("비밀번호", type="password", key="login_password")
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                submitted = st.form_submit_button("로그인", use_container_width=True)
+            with btn_col2:
+                go_signup = st.form_submit_button("회원가입", use_container_width=True, type="secondary")
+        if go_signup:
+            try:
+                st.query_params.from_dict({"page": "signup"})
+            except Exception:
+                pass
+            st.rerun()
         if submitted:
             if not (email and str(email).strip()):
                 st.error("이메일을 입력해 주세요.")
