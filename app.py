@@ -3109,6 +3109,27 @@ def ensure_session():
         st.session_state.current_db = None
 
 
+def _flash(msg: str, level: str = "success") -> None:
+    """다음 rerun 후 화면 상단에 메시지를 한 번 표시하도록 세션에 저장."""
+    st.session_state["_flash_msg"] = msg
+    st.session_state["_flash_level"] = level
+
+
+def _render_flash() -> None:
+    """세션에 저장된 플래시 메시지를 표시하고 즉시 제거."""
+    msg = st.session_state.pop("_flash_msg", None)
+    level = st.session_state.pop("_flash_level", "success")
+    if msg:
+        if level == "success":
+            _flash(msg)
+        elif level == "error":
+            st.error(msg)
+        elif level == "warning":
+            st.warning(msg)
+        else:
+            st.info(msg)
+
+
 # ─── 역할 매트릭스 헬퍼 ────────────────────────────────────────────────────────
 # 구 역할(store_admin / user)과 신 역할(org_owner / org_admin / store_manager / staff)을
 # 동시에 처리하는 단일 진입점. 앱 전역에서 role 문자열 비교 대신 이 함수들을 사용.
@@ -4391,7 +4412,7 @@ def _render_order_cost_verify(db_filename: str, order_id: int):
         for w in warnings:
             st.warning(f"⚠️ {w}")
     else:
-        st.success("✅ 원가·마진 검증 이상 없음")
+        _flash("✅ 원가·마진 검증 이상 없음")
 
 
 def _render_order_audit_trail(db_filename: str, order_id: int):
@@ -6068,7 +6089,7 @@ def render_signup():
     # 가입 완료 배너 (rerun 후 표시)
     if st.session_state.get("_signup_done"):
         st.balloons()
-        st.success(
+        _flash(
             f"🎉 가입이 완료되었습니다! "
             f"**{st.session_state.get('_signup_email', '')}** 으로 로그인해 주세요."
         )
@@ -7539,7 +7560,7 @@ def _superadmin_tab5_store_accounts():
                 }).execute()
                 create_tenant_db(db_filename)
                 clear_data_cache()
-                st.success(f"매장 '{store_name}'이(가) 생성되었습니다. DB: {db_filename}")
+                _flash(f"매장 '{store_name}'이(가) 생성되었습니다. DB: {db_filename}")
                 st.rerun()
             except Exception as e:
                 err_str = str(e).lower()
@@ -7570,7 +7591,7 @@ def _superadmin_tab5_store_accounts():
                             "email": None,
                         }).execute()
                         clear_data_cache()
-                        st.success("계정이 생성되었습니다.")
+                        _flash("계정이 생성되었습니다.")
                         st.rerun()
                     except Exception as e:
                         err_str = str(e).lower()
@@ -7604,7 +7625,7 @@ def _superadmin_tab5_store_accounts():
                                 "db_filename": edit_db.strip(),
                             }).eq("id", int(sid)).execute()
                             clear_data_cache()
-                            st.success("저장되었습니다.")
+                            _flash("저장되었습니다.")
                             st.rerun()
                         except Exception as e:
                             err_str = str(e).lower()
@@ -7626,7 +7647,7 @@ def _superadmin_tab5_store_accounts():
                                 "password": hashlib.sha256(new_pw.encode()).hexdigest(),
                             }).eq("id", int(u["id"])).execute()
                             clear_data_cache()
-                            st.success("변경되었습니다.")
+                            _flash("변경되었습니다.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"변경 실패: {e}")
@@ -7656,7 +7677,7 @@ def _superadmin_tab5_store_accounts():
                                 os.remove(db_path)
                             except Exception:
                                 pass
-                        st.success("매장이 삭제되었습니다.")
+                        _flash("매장이 삭제되었습니다.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"삭제 실패: {e}")
@@ -8643,7 +8664,7 @@ def render_employee_management():
                             if existing:
                                 user_id = int(existing["id"])
                                 _supabase_update_app_user(user_id, emp_name_val, role, first_store_id, selected_store_ids)
-                                st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+                                _flash("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
                                 clear_data_cache()
                             else:
                                 user_id, ins_err = _supabase_insert_app_user(username, str(emp_email).strip(), role, first_store_id, emp_name_val)
@@ -8882,7 +8903,7 @@ def render_employee_management():
                                     st.warning("일부 변경 실패: " + " / ".join(email_errs))
                                 else:
                                     clear_data_cache()
-                                    st.success(f"이메일이 {new_email_clean} 으로 변경되었습니다.")
+                                    _flash(f"이메일이 {new_email_clean} 으로 변경되었습니다.")
                                     st.rerun()
 
                     # ----- 비밀번호 리셋 (동일 직원 대상) -----
@@ -8905,7 +8926,7 @@ def render_employee_management():
                                         auth_uid = _supabase_auth_uid_by_email(admin_client, target_email)
                                         if auth_uid:
                                             admin_client.auth.admin.update_user_by_id(auth_uid, {"password": emp_reset_pw})
-                                            st.success("비밀번호가 변경되었습니다. 해당 직원은 다음 로그인부터 새 비밀번호를 사용합니다.")
+                                            _flash("비밀번호가 변경되었습니다. 해당 직원은 다음 로그인부터 새 비밀번호를 사용합니다.")
                                             clear_data_cache()
                                             st.rerun()
                                         else:
@@ -8920,7 +8941,7 @@ def render_employee_management():
                                                 created_user = getattr(created, "user", None) or (created.get("user") if isinstance(created, dict) else None)
                                                 created_uid = getattr(created_user, "id", None) if created_user is not None and hasattr(created_user, "id") else (created_user.get("id") if isinstance(created_user, dict) else None)
                                                 if created_uid:
-                                                    st.success("Supabase Auth 계정이 없어 새로 생성한 뒤 비밀번호를 설정했습니다. 해당 직원은 즉시 로그인할 수 있습니다.")
+                                                    _flash("Supabase Auth 계정이 없어 새로 생성한 뒤 비밀번호를 설정했습니다. 해당 직원은 즉시 로그인할 수 있습니다.")
                                                     clear_data_cache()
                                                     st.rerun()
                                                 else:
@@ -8933,7 +8954,7 @@ def render_employee_management():
                                                         auth_uid_retry = _supabase_auth_uid_by_email(admin_client, target_email)
                                                         if auth_uid_retry:
                                                             admin_client.auth.admin.update_user_by_id(auth_uid_retry, {"password": emp_reset_pw})
-                                                            st.success("기존 Supabase Auth 계정을 찾아 비밀번호를 변경했습니다.")
+                                                            _flash("기존 Supabase Auth 계정을 찾아 비밀번호를 변경했습니다.")
                                                             clear_data_cache()
                                                             st.rerun()
                                                         else:
@@ -8951,7 +8972,7 @@ def render_employee_management():
                                         conn.execute("UPDATE Users SET password = ? WHERE id = ?", (pw_hash, edit_user_id))
                                         conn.commit()
                                         conn.close()
-                                        st.success("비밀번호가 변경되었습니다.")
+                                        _flash("비밀번호가 변경되었습니다.")
                                         st.rerun()
                                     except Exception as e:
                                         st.error(f"비밀번호 변경 실패: {str(e)}")
@@ -9013,7 +9034,7 @@ def render_employee_management():
                                 cur_role = u.get("role") if u else "user"
                                 _supabase_update_app_user(store_edit_user_id, cur_name, cur_role, first_sid, store_ids)
                                 clear_data_cache()
-                                st.success(f"배정 매장이 저장되었습니다. 기본 매장: {edit_primary_store2}")
+                                _flash(f"배정 매장이 저장되었습니다. 기본 매장: {edit_primary_store2}")
                             else:
                                 conn = get_master_conn()
                                 try:
@@ -9064,7 +9085,7 @@ def render_employee_management():
                                 if use_supabase:
                                     _supabase_delete_app_user(del_user_id)
                                     clear_data_cache()
-                                    st.success("직원이 삭제되었습니다.")
+                                    _flash("직원이 삭제되었습니다.")
                                 else:
                                     conn = get_master_conn()
                                     conn.execute("DELETE FROM UserStores WHERE user_id = ?", (del_user_id,))
@@ -9334,7 +9355,7 @@ def _superadmin_tab_danger_zone_data_reset():
     if dz_result:
         status, msg = dz_result
         if status == "ok":
-            st.success(msg)
+            _flash(msg)
         else:
             st.warning(msg)
 
@@ -9916,7 +9937,7 @@ def render_onboarding_wizard() -> None:
     # ── Step 4: 완료
     elif step >= 4:
         st.balloons()
-        st.success("🎉 온보딩 완료! 이제 momo를 사용할 수 있습니다.")
+        _flash("🎉 온보딩 완료! 이제 momo를 사용할 수 있습니다.")
         if client and org_id:
             try:
                 client.table("app_orgs").update({"onboarding_done": True}).eq("id", int(org_id)).execute()
@@ -10145,7 +10166,7 @@ def render_product_catalog_admin() -> None:
                     except Exception:
                         pass
 
-            st.success(f"완료! 제품 {inserted_products}개, 옵션값 {inserted_options}개 등록됐습니다.")
+            _flash(f"완료! 제품 {inserted_products}개, 옵션값 {inserted_options}개 등록됐습니다.")
 
     # ── 탭 2: 수동 등록
     with tab_manual:
@@ -10273,7 +10294,7 @@ def render_product_selector(order_id: int) -> None:
                 except Exception:
                     pass
             st.session_state.pop(cart_key, None)
-            st.success("저장 완료!")
+            _flash("저장 완료!")
             st.rerun()
 
     # 카테고리 탭
@@ -10473,7 +10494,7 @@ def render_delivery_region_admin() -> None:
                     "region_name": rg_name.strip(),
                     "region_code": rg_code.strip().upper(),
                 }).execute()
-                st.success(f"'{rg_name}' 지역 등록 완료!")
+                _flash(f"'{rg_name}' 지역 등록 완료!")
                 st.rerun()
             except Exception as e:
                 st.error(f"등록 오류 (중복 코드?): {e}")
@@ -10509,7 +10530,7 @@ def render_delivery_region_admin() -> None:
                         "login_id": dr_login.strip(),
                         "password_hash": pw_hash,
                     }).execute()
-                    st.success(f"'{dr_name}' 기사 등록 완료! (로그인 ID: {dr_login})")
+                    _flash(f"'{dr_name}' 기사 등록 완료! (로그인 ID: {dr_login})")
                     st.rerun()
                 except Exception as e:
                     st.error(f"등록 오류 (ID 중복?): {e}")
@@ -10622,7 +10643,7 @@ def render_delivery_slot_settings() -> None:
                     }, on_conflict="region_id,day_of_week,time_slot").execute()
                 except Exception:
                     pass
-            st.success("슬롯 설정 저장 완료!")
+            _flash("슬롯 설정 저장 완료!")
             st.rerun()
 
     with tab_override:
@@ -10643,7 +10664,7 @@ def render_delivery_slot_settings() -> None:
                     "max_count": int(ov_count),
                     "note": ov_note.strip() or None,
                 }, on_conflict="region_id,override_date,time_slot").execute()
-                st.success(f"{ov_date} {('오전' if ov_slot=='morning' else '오후')} 예외 설정 완료!")
+                _flash(f"{ov_date} {('오전' if ov_slot=='morning' else '오후')} 예외 설정 완료!")
                 st.rerun()
             except Exception as e:
                 st.error(f"오류: {e}")
@@ -10917,7 +10938,7 @@ def render_delivery_schedule_admin() -> None:
                             update_data["region_id"] = int(rg_id_for_driver)
                         try:
                             client.table("app_deliveries").update(update_data).eq("id", d["id"]).execute()
-                            st.success("배정 완료!")
+                            _flash("배정 완료!")
                             st.rerun()
                         except Exception as e:
                             st.error(f"오류: {e}")
@@ -10953,7 +10974,7 @@ def render_delivery_schedule_admin() -> None:
                         "status": "loaded",
                         "loaded_at": datetime.now(_tz.utc).isoformat(),
                     }).eq("id", int(did)).execute()
-                st.success(f"{len(ids_to_load)}건 상차완료 처리됐습니다.")
+                _flash(f"{len(ids_to_load)}건 상차완료 처리됐습니다.")
                 st.rerun()
 
     with tab_status:
@@ -11263,7 +11284,7 @@ def render_store_admin_employees():
                 _recovered = _rec.get("recovered", [])
                 _failed = _rec.get("failed", [])
                 if not _missing:
-                    st.success("✅ 누락 주문 없음 — 모든 주문이 sales 테이블에 정상 기록되어 있습니다.")
+                    _flash("✅ 누락 주문 없음 — 모든 주문이 sales 테이블에 정상 기록되어 있습니다.")
                 else:
                     st.info(f"📋 누락 주문 발견: {len(_missing)}건 (order_id: {_missing})")
                     if _recovered:
@@ -11348,7 +11369,7 @@ def render_store_admin_employees():
                                 "role": new_role,
                             }).eq("id", int(row["id"])).execute()
                             clear_data_cache()
-                            st.success("수정되었습니다.")
+                            _flash("수정되었습니다.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"수정 실패: {e}")
@@ -11357,7 +11378,7 @@ def render_store_admin_employees():
                             client.table("app_user_stores").delete().eq("user_id", int(row["id"])).eq("store_id", int(store_id)).execute()
                             client.table("app_users").update({"store_id": None}).eq("id", int(row["id"])).eq("store_id", int(store_id)).execute()
                             clear_data_cache()
-                            st.success("매장에서 제거되었습니다.")
+                            _flash("매장에서 제거되었습니다.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"제거 실패: {e}")
@@ -11634,7 +11655,7 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                 })
                                 _recalc_order_actual_margin_supabase(db_filename, oid)
                                 clear_data_cache()
-                                st.success(f"✅ 위약금 {p_amt_int:,}원 등록 완료! (주문 #{oid})")
+                                _flash(f"✅ 위약금 {p_amt_int:,}원 등록 완료! (주문 #{oid})")
                                 for k in ["sp_penalty_name", "sp_penalty_phone", "sp_penalty_amount", "sp_penalty_reason", "sp_penalty_card"]:
                                     st.session_state.pop(k, None)
                                 st.rerun()
@@ -11660,7 +11681,7 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                             _recalc_order_actual_margin(conn, oid, db_filename)
                             conn.commit()
                             clear_data_cache()
-                            st.success(f"✅ 위약금 {p_amt_int:,}원 등록 완료!")
+                            _flash(f"✅ 위약금 {p_amt_int:,}원 등록 완료!")
                             for k in ["sp_penalty_name", "sp_penalty_phone", "sp_penalty_amount", "sp_penalty_reason", "sp_penalty_card"]:
                                 st.session_state.pop(k, None)
                             st.rerun()
@@ -11735,7 +11756,7 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                 })
                                 _recalc_order_actual_margin_supabase(db_filename, oid)
                                 clear_data_cache()
-                                st.success(f"✅ 직원 구매 {e_cost_int:,}원 등록 완료! (주문 #{oid})")
+                                _flash(f"✅ 직원 구매 {e_cost_int:,}원 등록 완료! (주문 #{oid})")
                                 for k in ["sp_emp_cost", "sp_emp_card"]:
                                     st.session_state.pop(k, None)
                                 st.rerun()
@@ -11761,7 +11782,7 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                             _recalc_order_actual_margin(conn, oid, db_filename)
                             conn.commit()
                             clear_data_cache()
-                            st.success(f"✅ 직원 구매 {e_cost_int:,}원 등록 완료!")
+                            _flash(f"✅ 직원 구매 {e_cost_int:,}원 등록 완료!")
                             for k in ["sp_emp_cost", "sp_emp_card"]:
                                 st.session_state.pop(k, None)
                             st.rerun()
@@ -11784,7 +11805,7 @@ def render_new_sales():
     # 매출 등록 완료 배너 (st.rerun() 후에도 유지되도록 세션 상태 활용)
     if "_sales_complete_banner" in st.session_state:
         _b = st.session_state.pop("_sales_complete_banner")
-        st.success(f"✅ 입력 완료! {_b['cust_name']}님 {_b['amount']:,}원 매출 등록이 완료되었습니다.")
+        _flash(f"✅ 입력 완료! {_b['cust_name']}님 {_b['amount']:,}원 매출 등록이 완료되었습니다.")
     # sales 테이블 INSERT 실패 경고 배너 (주문·결제는 저장되었으나 매출 집계·KPI 반영 실패)
     if "_sales_insert_error_banner" in st.session_state:
         _se = st.session_state.pop("_sales_insert_error_banner")
@@ -11987,7 +12008,7 @@ def render_new_sales():
     if selected_customer_row and st.session_state.get("_cust_search_panel_open"):
         _sel_name = selected_customer_row.get("name") or ""
         _sel_phone = selected_customer_row.get("phone1") or "-"
-        st.success(f"✅ 선택된 고객: **{_sel_name}** ({_sel_phone})")
+        _flash(f"✅ 선택된 고객: **{_sel_name}** ({_sel_phone})")
         if st.button("❌ 선택 해제 (신규 고객으로 전환)", key="btn_clear_cust_sel"):
             for _k in ["_new_sales_selected_customer", "_cust_search_results",
                        "new_sales_cust_name", "new_sales_cust_search", "new_sales_cust_select"]:
@@ -12955,7 +12976,7 @@ def _customer_balance_payment_ui(
     _pay_done_key = f"_pay_done_{key_prefix}"
     if _pay_done_key in st.session_state:
         _pd = st.session_state.pop(_pay_done_key)
-        st.success(f"✅ 결제 입력 완료! {_pd['amount']:,}원이 등록되었습니다.")
+        _flash(f"✅ 결제 입력 완료! {_pd['amount']:,}원이 등록되었습니다.")
     amt_key = f"{key_prefix}_amt"
     if amt_key not in st.session_state:
         st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
@@ -13970,7 +13991,7 @@ def render_customer_balance():
                                                                             db_filename=db_filename,
                                                                         )
                                                                         clear_data_cache()
-                                                                        st.success(f"✅ 상계 전표(결제 ID {_neg_pid}) 삭제 완료")
+                                                                        _flash(f"✅ 상계 전표(결제 ID {_neg_pid}) 삭제 완료")
                                                                         st.rerun()
                                                                     else:
                                                                         st.error("삭제 실패. 잠시 후 다시 시도해 주세요.")
@@ -14266,7 +14287,7 @@ def render_customer_balance():
                                                                     conn.close()
                                                                     _pay_edit_committed = True
                                                                 if _pay_edit_committed:
-                                                                    st.success("변경이 완료되었습니다.")
+                                                                    _flash("변경이 완료되었습니다.")
                                                                     # ── 부정행위 탐지: 결제 취소 시 관리자 경보 (코어 로직 무관) ──
                                                                     try:
                                                                         if action == "결제취소":
@@ -14330,7 +14351,7 @@ def render_customer_balance():
                                                                         db_filename=db_filename,
                                                                     )
                                                                     clear_data_cache()
-                                                                    st.success(f"✅ 결제 ID {_dd_pid} 삭제 완료")
+                                                                    _flash(f"✅ 결제 ID {_dd_pid} 삭제 완료")
                                                                     st.rerun()
                                                                 else:
                                                                     st.error("삭제 실패. 잠시 후 다시 시도해 주세요.")
@@ -14406,7 +14427,7 @@ def render_customer_balance():
                                 _req_by = _current_username()
                                 ok, req_err = _insert_delete_request(db_filename, int(del_oid), del_reason.strip(), _req_by)
                                 if ok:
-                                    st.success(f"주문 #{del_oid} 삭제 요청이 관리자에게 전송되었습니다. 승인 후 삭제됩니다.")
+                                    _flash(f"주문 #{del_oid} 삭제 요청이 관리자에게 전송되었습니다. 승인 후 삭제됩니다.")
                                 else:
                                     st.error(f"요청 전송 실패: {req_err}")
 
@@ -15033,7 +15054,7 @@ def _render_dashboard_todos_only(db_filename: str):
             with st.expander(f"{'✅ 완료' if is_done else '⬜'} {content_preview} (by {author_display})", expanded=not is_done):
                 st.caption(row["created_date"])
                 if is_done:
-                    st.success("✅ **완료된 업무입니다.**")
+                    _flash("✅ **완료된 업무입니다.**")
                 st.write(row["content"] or "")
                 if not is_done and st.button("완료 처리", key=f"todo_done_s_{row['id']}"):
                     client, err = get_supabase_client()
@@ -15982,6 +16003,9 @@ def main():
     _inject_favicon()
     _inject_branding_css()
 
+    # 폼 완료 후 flash 메시지 표시 (st.rerun() 이후에도 유지)
+    _render_flash()
+
     # 전역 Sticky Header 스타일 주입: 상단 메뉴/탭 고정 및 본문 패딩 조정
     st.markdown(
         """
@@ -16251,7 +16275,7 @@ def main():
                 else:
                     try:
                         auth_client.auth.update_user({"password": new_pw})
-                        st.success("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.")
+                        _flash("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"비밀번호 변경에 실패했습니다: {str(e)}")
