@@ -11227,8 +11227,189 @@ def render_delivery_portal() -> None:
         st.rerun()
 
 
+_OPERATOR_PLAN_AMOUNTS = {
+    "lite":          {"monthly": 39_000,  "annual": 390_000},
+    "pro_growth":    {"monthly": 99_000,  "annual": 990_000},
+    "pro_unlimited": {"monthly": 199_000, "annual": 1_990_000},
+    "starter":       {"monthly": 39_000,  "annual": 390_000},
+    "growth":        {"monthly": 99_000,  "annual": 990_000},
+    "pro":           {"monthly": 199_000, "annual": 1_990_000},
+}
+
+
+def _superadmin_tab_sales_dashboard():
+    """① 세일즈 대시보드: momo 플랫폼 구독 수익·가입자 현황. 개별 매장 데이터 없음."""
+    client, err = get_supabase_admin_client()
+    if err or not client:
+        st.error(f"Supabase 연결 실패: {err}")
+        return
+
+    # ── 데이터 로드 ──
+    try:
+        orgs_r = client.table("app_orgs").select(
+            "id, name, plan, status, edition, created_at, trial_ends_at"
+        ).order("id").execute()
+        orgs = orgs_r.data or []
+    except Exception as e:
+        st.error(f"가입 조직 조회 실패: {e}")
+        orgs = []
+
+    try:
+        subs_r = client.table("app_subscriptions").select(
+            "id, org_id, plan, billing_cycle, status, current_period_end"
+        ).execute()
+        subs = subs_r.data or []
+    except Exception:
+        subs = []
+
+    try:
+        inv_r = client.table("app_invoices").select(
+            "id, org_id, amount, status, paid_at"
+        ).eq("status", "paid").execute()
+        invoices = inv_r.data or []
+    except Exception:
+        invoices = []
+
+    today = _today_kst()
+    month_start = today.replace(day=1).isoformat()
+
+    # ── 섹션 1: KPI 메트릭 ──
+    st.subheader("핵심 지표")
+
+    total_orgs = len(orgs)
+    trial_orgs = sum(1 for o in orgs if o.get("plan") == "trial")
+    paid_orgs = sum(1 for o in orgs if o.get("plan") not in ("trial", None) and o.get("status") == "active")
+    active_subs = [s for s in subs if s.get("status") == "active"]
+
+    # MRR 계산: 활성 구독 × 플랜 단가
+    mrr = 0
+    for s in active_subs:
+        plan_key = s.get("plan", "")
+        cycle = s.get("billing_cycle", "monthly")
+        unit = _OPERATOR_PLAN_AMOUNTS.get(plan_key, {}).get("monthly", 0)
+        if cycle == "annual":
+            unit = _OPERATOR_PLAN_AMOUNTS.get(plan_key, {}).get("annual", 0) // 12
+        mrr += unit
+
+    # 이번 달 수납
+    this_month_paid = sum(
+        int(iv.get("amount") or 0)
+        for iv in invoices
+        if (iv.get("paid_at") or "") >= month_start
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("전체 가입 조직", f"{total_orgs}개")
+    c2.metric("유료 활성", f"{paid_orgs}개")
+    c3.metric("트라이얼 중", f"{trial_orgs}개")
+    c4.metric("이번 달 수납", f"{this_month_paid:,}원")
+    c5.metric("예상 MRR", f"{mrr:,}원")
+
+    st.divider()
+
+    # ── 섹션 2: 월별 수납 매출 차트 (최근 12개월) ──
+    st.subheader("월별 수납 매출 (최근 12개월)")
+    if invoices:
+        inv_df = pd.DataFrame(invoices)
+        inv_df["paid_at"] = pd.to_datetime(inv_df["paid_at"], errors="coerce")
+        inv_df = inv_df.dropna(subset=["paid_at"])
+        inv_df["yearmonth"] = inv_df["paid_at"].dt.to_period("M").astype(str)
+        monthly = inv_df.groupby("yearmonth")["amount"].sum().reset_index()
+        monthly.columns = ["월", "수납액"]
+        monthly = monthly.sort_values("월").tail(12)
+        if not monthly.empty:
+            fig = px.bar(
+                monthly, x="월", y="수납액",
+                text=monthly["수납액"].apply(lambda v: f"{int(v):,}원"),
+                labels={"수납액": "수납액(원)", "월": ""},
+            )
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=320, margin=dict(t=20, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("수납 내역이 없습니다.")
+    else:
+        st.info("수납된 인보이스가 없습니다.")
+
+    st.divider()
+
+    # ── 섹션 3: 연간 누적 매출 ──
+    st.subheader("연간 누적 수납")
+    col_y, col_cycle = st.columns(2)
+    with col_y:
+        if invoices:
+            inv_df2 = pd.DataFrame(invoices)
+            inv_df2["paid_at"] = pd.to_datetime(inv_df2["paid_at"], errors="coerce")
+            inv_df2 = inv_df2.dropna(subset=["paid_at"])
+            inv_df2["year"] = inv_df2["paid_at"].dt.year.astype(str)
+            yearly = inv_df2.groupby("year")["amount"].sum().reset_index()
+            yearly.columns = ["연도", "수납액"]
+            yearly["수납액(원)"] = yearly["수납액"].apply(lambda v: f"{int(v):,}원")
+            st.dataframe(yearly[["연도", "수납액(원)"]], use_container_width=True, hide_index=True)
+        else:
+            st.info("데이터 없음")
+    with col_cycle:
+        if subs:
+            monthly_cnt = sum(1 for s in subs if s.get("billing_cycle") == "monthly")
+            annual_cnt = sum(1 for s in subs if s.get("billing_cycle") == "annual")
+            st.metric("월간 요금제 구독", f"{monthly_cnt}건")
+            st.metric("연간 요금제 구독", f"{annual_cnt}건")
+        else:
+            st.info("구독 없음")
+
+    st.divider()
+
+    # ── 섹션 4: 가입자 현황 테이블 ──
+    st.subheader("가입자 현황")
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        st.markdown("**플랜별 조직 수**")
+        plan_counts = {}
+        for o in orgs:
+            p = o.get("plan") or "unknown"
+            plan_counts[p] = plan_counts.get(p, 0) + 1
+        plan_df = pd.DataFrame(
+            [{"플랜": k, "조직 수": v} for k, v in sorted(plan_counts.items())]
+        )
+        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
+    with col_b:
+        st.markdown("**에디션별 조직 수**")
+        edition_counts = {}
+        for o in orgs:
+            e = o.get("edition") or "lite"
+            edition_counts[e] = edition_counts.get(e, 0) + 1
+        edition_df = pd.DataFrame(
+            [{"에디션": k, "조직 수": v} for k, v in sorted(edition_counts.items())]
+        )
+        st.dataframe(edition_df, use_container_width=True, hide_index=True)
+
+    with col_c:
+        st.markdown("**최근 30일 신규 가입**")
+        cutoff = (today - timedelta(days=30)).isoformat()
+        recent = sum(
+            1 for o in orgs
+            if (o.get("created_at") or "") >= cutoff
+        )
+        st.metric("신규 가입 조직", f"{recent}개")
+
+        st.markdown("**구독 상태별**")
+        if subs:
+            status_counts = {}
+            for s in subs:
+                st_ = s.get("status") or "unknown"
+                status_counts[st_] = status_counts.get(st_, 0) + 1
+            status_df = pd.DataFrame(
+                [{"상태": k, "건수": v} for k, v in sorted(status_counts.items())]
+            )
+            st.dataframe(status_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("구독 없음")
+
+
 def _superadmin_tab_org_list():
-    """① 가입 조직 현황: app_orgs 운영 정보만 표시. 매출·고객 개인정보 없음."""
+    """② 가입 조직 현황: app_orgs 운영 정보만 표시. 매출·고객 개인정보 없음."""
     client, err = get_supabase_admin_client()
     if err or not client:
         st.error(f"Supabase 연결 실패: {err}")
@@ -11344,11 +11525,12 @@ def render_admin_console():
     )
 
     _OPERATOR_MENUS = [
-        "① 가입 조직 현황",
-        "② 비밀번호 초기화",
-        "③ 📢 공지사항 관리",
-        "④ 매장 계정 관리",
-        "⑤ FAQ (도움말)",
+        "① 세일즈 대시보드",
+        "② 가입 조직 현황",
+        "③ 비밀번호 초기화",
+        "④ 📢 공지사항 관리",
+        "⑤ 매장 계정 관리",
+        "⑥ FAQ (도움말)",
     ]
     if "operator_menu_idx" not in st.session_state:
         st.session_state["operator_menu_idx"] = 0
@@ -11370,15 +11552,17 @@ def render_admin_console():
     st.session_state["operator_menu_idx"] = _OPERATOR_MENUS.index(menu_sel)
     st.divider()
 
-    if menu_sel == "① 가입 조직 현황":
+    if menu_sel == "① 세일즈 대시보드":
+        _superadmin_tab_sales_dashboard()
+    elif menu_sel == "② 가입 조직 현황":
         _superadmin_tab_org_list()
-    elif menu_sel == "② 비밀번호 초기화":
+    elif menu_sel == "③ 비밀번호 초기화":
         _superadmin_tab_reset_password()
-    elif menu_sel == "③ 📢 공지사항 관리":
+    elif menu_sel == "④ 📢 공지사항 관리":
         _superadmin_tab3_notices()
-    elif menu_sel == "④ 매장 계정 관리":
+    elif menu_sel == "⑤ 매장 계정 관리":
         _superadmin_tab5_store_accounts()
-    elif menu_sel == "⑤ FAQ (도움말)":
+    elif menu_sel == "⑥ FAQ (도움말)":
         render_faq_page()
 
 
