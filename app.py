@@ -9820,15 +9820,20 @@ def _render_pro_sidebar_menu(org_id: int) -> None:
     if not _has_product_catalog(org_id):
         return
     st.sidebar.markdown("---")
-    st.sidebar.markdown(
-        """**Pro 메뉴**
-- [📦 제품 카탈로그](?page=products)
-- [🚚 배송 배정](?page=delivery_admin)
-- [🗓️ 배송 슬롯 설정](?page=delivery_slots)
-- [🗺️ 지역·기사 관리](?page=delivery_regions)
-        """,
-        unsafe_allow_html=False,
-    )
+    st.sidebar.markdown("**Pro 메뉴**")
+    _pro_menu = [
+        ("📦 제품 카탈로그", "products"),
+        ("🚚 배송 배정", "delivery_admin"),
+        ("🗓️ 배송 슬롯 설정", "delivery_slots"),
+        ("🗺️ 지역·기사 관리", "delivery_regions"),
+    ]
+    for label, page_key in _pro_menu:
+        if st.sidebar.button(label, key=f"pro_menu_{page_key}", use_container_width=True):
+            try:
+                st.query_params.from_dict({"page": page_key})
+            except Exception:
+                pass
+            st.rerun()
 
 
 def render_onboarding_wizard() -> None:
@@ -16241,13 +16246,14 @@ def main():
     if _is_manager(role):
         if st.sidebar.button("👥 직원 관리", width='stretch'):
             st.session_state["active_admin_page"] = "employee_management"
-    # momo 운영자: /admin 콘솔 진입 링크
+    # momo 운영자: /admin 콘솔 진입 버튼
     if _is_momo_operator(role):
-        st.sidebar.markdown(
-            "<a href='?page=admin' target='_self' style='display:block;padding:0.4rem 0;"
-            "font-size:0.9rem;color:#e05;font-weight:600;'>⚙️ momo 운영자 콘솔</a>",
-            unsafe_allow_html=True,
-        )
+        if st.sidebar.button("⚙️ momo 운영자 콘솔", key="sidebar_admin_console", use_container_width=True):
+            try:
+                st.query_params.from_dict({"page": "admin"})
+            except Exception:
+                pass
+            st.rerun()
     st.sidebar.markdown("---")
     if st.sidebar.button("🚪 로그아웃", width='stretch'):
         try:
