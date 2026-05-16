@@ -5698,46 +5698,64 @@ def render_login():
 # ========== 회원가입 ==========
 
 _PLANS = {
-    "solo": {
-        "label": "소호 플랜",
-        "emoji": "🏪",
-        "desc": "매장 1개 · 직원 3명 이하",
-        "price": "무료 (베타)",
-        "max_stores": 1,
-    },
-    "business": {
-        "label": "비즈니스 플랜",
-        "emoji": "🏢",
-        "desc": "매장 최대 5개 · 직원 무제한",
-        "price": "월 29,000원 (베타 무료)",
+    "trial": {
+        "label": "14일 무료체험",
+        "emoji": "🎁",
+        "desc": "전 기능 무제한 · 카드 등록 불필요",
+        "price": "무료",
         "max_stores": 5,
+        "monthly_krw": 0,
+        "annual_krw": 0,
     },
-    "enterprise": {
-        "label": "엔터프라이즈 플랜",
+    "starter": {
+        "label": "Starter",
+        "emoji": "🏪",
+        "desc": "지점 1개 · 직원 무제한",
+        "price": "월 39,000원",
+        "max_stores": 1,
+        "monthly_krw": 39000,
+        "annual_krw": 390000,
+    },
+    "growth": {
+        "label": "Growth",
+        "emoji": "🏢",
+        "desc": "지점 최대 5개 · 직원 무제한",
+        "price": "월 99,000원",
+        "max_stores": 5,
+        "monthly_krw": 99000,
+        "annual_krw": 990000,
+    },
+    "pro": {
+        "label": "Pro",
         "emoji": "🌐",
-        "desc": "매장 무제한 · 전담 지원",
-        "price": "별도 문의",
+        "desc": "지점 무제한 · 전담 지원",
+        "price": "월 199,000원",
         "max_stores": 999,
+        "monthly_krw": 199000,
+        "annual_krw": 1990000,
     },
 }
+
+_TRIAL_DAYS = 14
 
 
 def _signup_create_account(
     store_name: str,
     email: str,
     password: str,
-    plan: str,
     owner_name: str,
 ) -> tuple[bool, str]:
     """
-    회원가입 처리:
+    회원가입 처리 (Phase 5):
     1. Supabase Auth 계정 생성
-    2. app_stores INSERT
-    3. app_users INSERT (role=store_admin)
-    4. app_user_stores INSERT
+    2. app_orgs INSERT  (plan='trial', trial_ends_at = now+14일)
+    3. app_stores INSERT (본점, is_headquarters=True, org_id 연결)
+    4. app_users INSERT  (role='org_owner', org_id 연결)
+    5. app_user_stores INSERT
     반환: (성공여부, 메시지)
     """
-    # ── admin client 필요 (서버 사이드 계정 생성)
+    from datetime import datetime, timezone, timedelta
+
     try:
         secrets = st.secrets
         url = secrets["supabase"]["url"]
@@ -5764,7 +5782,22 @@ def _signup_create_account(
             return False, "이미 가입된 이메일입니다. 로그인 화면에서 로그인해 주세요."
         return False, f"계정 생성 오류: {msg}"
 
-    # 2) db_filename 자동 생성 (store_1.db ~ store_N.db)
+    # 2) app_orgs INSERT (trial)
+    trial_ends = (datetime.now(timezone.utc) + timedelta(days=_TRIAL_DAYS)).isoformat()
+    try:
+        org_res = admin.table("app_orgs").insert({
+            "name": store_name.strip(),
+            "plan": "trial",
+            "trial_ends_at": trial_ends,
+            "onboarding_done": False,
+        }).execute()
+        org_id = org_res.data[0]["id"] if org_res.data else None
+        if not org_id:
+            return False, "조직 등록에 실패했습니다."
+    except Exception as e:
+        return False, f"조직 등록 오류: {e}"
+
+    # 3) db_filename 자동 생성 및 app_stores INSERT (본점)
     try:
         existing = admin.table("app_stores").select("id").order("id", desc=True).limit(1).execute()
         max_id = int(existing.data[0]["id"]) if existing.data else 0
@@ -5772,11 +5805,12 @@ def _signup_create_account(
     except Exception as e:
         return False, f"매장 등록 실패: {e}"
 
-    # 3) app_stores INSERT
     try:
         store_res = admin.table("app_stores").insert({
             "store_name": store_name.strip(),
             "db_filename": db_filename,
+            "org_id": int(org_id),
+            "is_headquarters": True,
         }).execute()
         store_id = store_res.data[0]["id"] if store_res.data else None
         if not store_id:
@@ -5787,7 +5821,7 @@ def _signup_create_account(
             return False, f"'{store_name}' 매장명이 이미 사용 중입니다. 다른 이름을 사용해 주세요."
         return False, f"매장 등록 오류: {e}"
 
-    # 4) app_users INSERT
+    # 4) app_users INSERT (org_owner)
     import hashlib as _hl
     pw_hash = _hl.sha256("supabase_managed".encode()).hexdigest()
     username = email.strip().split("@")[0].lower().replace(".", "_")
@@ -5796,10 +5830,11 @@ def _signup_create_account(
             "username": username,
             "password": pw_hash,
             "email": email.strip().lower(),
-            "role": "store_admin",
+            "role": "org_owner",
             "store_id": int(store_id),
+            "org_id": int(org_id),
             "name": owner_name.strip() or None,
-            "plan": plan,
+            "plan": "trial",
         }).execute()
         user_id = user_res.data[0]["id"] if user_res.data else None
         if not user_id:
@@ -5810,22 +5845,23 @@ def _signup_create_account(
             return False, "이미 등록된 이메일 또는 사용자명입니다."
         return False, f"사용자 등록 오류: {e}"
 
-    # 5) app_stores.owner_user_id 업데이트 (owner 연결)
+    # 5) app_stores.owner_user_id 업데이트
     try:
         admin.table("app_stores").update({"owner_user_id": int(user_id)}).eq("id", int(store_id)).execute()
     except Exception:
-        pass  # owner 업데이트 실패는 치명적이지 않음
+        pass
 
     # 6) app_user_stores INSERT
     try:
         admin.table("app_user_stores").insert({
             "user_id": int(user_id),
             "store_id": int(store_id),
+            "role": "org_owner",
         }).execute()
     except Exception:
-        pass  # 연결 실패는 치명적이지 않음
+        pass
 
-    return True, f"가입 완료! {store_name} 매장이 생성됐습니다. 방금 입력한 이메일과 비밀번호로 로그인해 주세요."
+    return True, f"가입 완료! **{store_name}** 조직이 생성됐습니다.\n14일 무료체험이 시작됩니다. 방금 입력한 이메일과 비밀번호로 로그인해 주세요."
 
 
 def render_signup():
@@ -5842,43 +5878,40 @@ def render_signup():
     st.title("momo")
     st.subheader("회원가입")
 
-    # ── 플랜 선택 카드
-    st.markdown("#### 플랜을 선택해 주세요")
-    plan_cols = st.columns(3)
-    plan_keys = list(_PLANS.keys())
+    # ── 14일 무료체험 배너
+    st.markdown(
+        """
+        <div style="background:linear-gradient(135deg,#1f77b4,#0d5fa8);border-radius:12px;
+                    padding:1.4rem 1.8rem;color:#fff;margin-bottom:1.2rem;">
+          <div style="font-size:1.5rem;font-weight:700;margin-bottom:0.4rem;">
+            🎁 14일 무료체험 — 모든 기능 즉시 이용 가능
+          </div>
+          <div style="font-size:0.92rem;opacity:0.9;">
+            카드 등록 없이 바로 시작하세요. 체험 종료 후 플랜을 선택하시면 계속 이용 가능합니다.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    current_plan = st.session_state.get("_signup_plan", "solo")
-
-    for i, (pk, pv) in enumerate(_PLANS.items()):
+    # ── 향후 선택 가능한 유료 플랜 미리보기
+    st.markdown("##### 체험 후 선택 가능한 플랜")
+    paid_plans = {k: v for k, v in _PLANS.items() if k != "trial"}
+    plan_cols = st.columns(len(paid_plans))
+    for i, (pk, pv) in enumerate(paid_plans.items()):
         with plan_cols[i]:
-            selected = current_plan == pk
-            border_color = "#1f77b4" if selected else "#ddd"
-            bg_color = "#f0f7ff" if selected else "#fafafa"
             st.markdown(
                 f"""
-                <div style="border:2px solid {border_color};border-radius:12px;
-                            padding:1.1rem;background:{bg_color};min-height:140px;
-                            text-align:center;cursor:pointer;">
-                  <div style="font-size:2rem;">{pv['emoji']}</div>
-                  <div style="font-weight:700;font-size:1rem;margin:0.3rem 0;">{pv['label']}</div>
-                  <div style="font-size:0.82rem;color:#555;">{pv['desc']}</div>
-                  <div style="font-size:0.85rem;font-weight:600;color:#1f77b4;margin-top:0.5rem;">{pv['price']}</div>
+                <div style="border:1px solid #ddd;border-radius:10px;padding:1rem;
+                            background:#fafafa;min-height:130px;text-align:center;">
+                  <div style="font-size:1.8rem;">{pv['emoji']}</div>
+                  <div style="font-weight:700;margin:0.3rem 0;">{pv['label']}</div>
+                  <div style="font-size:0.8rem;color:#555;">{pv['desc']}</div>
+                  <div style="font-size:0.85rem;font-weight:600;color:#1f77b4;margin-top:0.4rem;">{pv['price']}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-            if st.button(
-                "✓ 선택됨" if selected else "선택",
-                key=f"plan_select_{pk}",
-                use_container_width=True,
-                type="primary" if selected else "secondary",
-            ):
-                st.session_state["_signup_plan"] = pk
-                st.rerun()
-
-    chosen_plan = st.session_state.get("_signup_plan", "solo")
-    chosen_info = _PLANS[chosen_plan]
-    st.success(f"**{chosen_info['emoji']} {chosen_info['label']}** 선택됨 — {chosen_info['desc']}")
 
     st.markdown("---")
     st.markdown("#### 가입 정보를 입력해 주세요")
@@ -5931,7 +5964,6 @@ def render_signup():
                         store_name=store_name,
                         email=email,
                         password=password,
-                        plan=chosen_plan,
                         owner_name=owner_name,
                     )
                 if ok:
@@ -9453,6 +9485,359 @@ def render_faq_page():
     for i, item in enumerate(matched):
         with st.expander(item["title"], expanded=_expand and i < 12):
             st.markdown(item["body"])
+
+
+def render_billing_page() -> None:
+    """
+    구독 관리 / 결제수단 등록 페이지 (?page=billing).
+    토스페이먼츠 빌링키 발급 플로우를 components.html 로 띄운다.
+    """
+    import streamlit.components.v1 as _stc
+    _inject_branding_css()
+
+    user = st.session_state.get("current_user", {})
+    org_id = user.get("org_id")
+    role = user.get("role", "")
+
+    if not _is_billing_role(role) and not _is_momo_operator(role):
+        st.error("구독 관리는 조직 소유자(org_owner) 또는 superadmin만 접근할 수 있습니다.")
+        return
+
+    st.title("💳 구독 & 결제 관리")
+
+    # 현재 구독 상태
+    trial_status = _get_trial_status(org_id) if org_id else {}
+
+    col_info, col_action = st.columns([2, 1])
+    with col_info:
+        if trial_status.get("has_subscription"):
+            st.success("✅ 구독 활성 상태")
+        elif trial_status.get("trial_active"):
+            st.info(f"🎁 무료체험 중 — **{trial_status.get('days_left', 0)}일** 남음")
+        else:
+            st.error("⛔ 무료체험 만료 — 구독이 필요합니다.")
+
+    # ── 플랜 선택
+    st.markdown("---")
+    st.subheader("플랜 선택")
+
+    paid_plans = {k: v for k, v in _PLANS.items() if k != "trial"}
+    cycle = st.radio("결제 주기", ["monthly", "annual"], format_func=lambda x: "월간 결제" if x == "monthly" else "연간 결제 (2개월 할인)", horizontal=True)
+
+    selected_plan_key = st.session_state.get("_billing_selected_plan", "starter")
+    cols = st.columns(len(paid_plans))
+    for i, (pk, pv) in enumerate(paid_plans.items()):
+        with cols[i]:
+            is_sel = selected_plan_key == pk
+            amount = pv["annual_krw"] if cycle == "annual" else pv["monthly_krw"]
+            border = "2px solid #1f77b4" if is_sel else "1px solid #ddd"
+            bg = "#f0f7ff" if is_sel else "#fafafa"
+            st.markdown(
+                f"""<div style="border:{border};border-radius:10px;padding:1rem;
+                              background:{bg};text-align:center;min-height:150px;">
+                  <div style="font-size:1.8rem;">{pv['emoji']}</div>
+                  <div style="font-weight:700;margin:0.3rem 0;">{pv['label']}</div>
+                  <div style="font-size:0.8rem;color:#555;">{pv['desc']}</div>
+                  <div style="font-size:1rem;font-weight:700;color:#1f77b4;margin-top:0.5rem;">
+                    {amount:,}원/{("년" if cycle == "annual" else "월")}
+                  </div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            if st.button("선택" if not is_sel else "✓ 선택됨", key=f"billing_plan_{pk}",
+                         use_container_width=True, type="primary" if is_sel else "secondary"):
+                st.session_state["_billing_selected_plan"] = pk
+                st.rerun()
+
+    chosen_plan = st.session_state.get("_billing_selected_plan", "starter")
+    chosen = _PLANS[chosen_plan]
+    amount = chosen["annual_krw"] if cycle == "annual" else chosen["monthly_krw"]
+    st.markdown(f"선택: **{chosen['emoji']} {chosen['label']}** — **{amount:,}원/{('년' if cycle == 'annual' else '월')}**")
+
+    st.markdown("---")
+    st.subheader("결제수단 등록")
+
+    # 토스페이먼츠 빌링키 발급 (테스트 클라이언트 키)
+    toss_client_key = st.secrets.get("toss", {}).get("client_key", "test_ck_D5GePWvyJnrK0W0k6q8gLzN97Eoq")
+    api_base = st.secrets.get("api", {}).get("base_url", "http://localhost:8000")
+    customer_key = f"org_{org_id}" if org_id else "unknown"
+    order_id = f"billing_{org_id}_{int(__import__('time').time())}"
+
+    billing_html = f"""
+    <div id="billing-widget-wrap" style="padding:1rem 0;"></div>
+    <button id="issue-billing-btn"
+            style="background:#1f77b4;color:#fff;border:none;border-radius:8px;
+                   padding:0.75rem 2rem;font-size:1rem;cursor:pointer;margin-top:0.8rem;">
+      💳 카드 등록하기
+    </button>
+    <div id="billing-msg" style="margin-top:0.8rem;color:#c62828;"></div>
+
+    <script src="https://js.tosspayments.com/v2/standard"></script>
+    <script>
+    (async function() {{
+      const clientKey = "{toss_client_key}";
+      const customerKey = "{customer_key}";
+
+      const toss = await TossPayments(clientKey);
+      const billing = toss.billing({{ customerKey }});
+
+      document.getElementById('issue-billing-btn').addEventListener('click', async function() {{
+        try {{
+          await billing.requestBillingAuth({{
+            method: "CARD",
+            successUrl: window.location.origin + "/?page=billing&toss_success=1&plan={chosen_plan}&cycle={cycle}",
+            failUrl:    window.location.origin + "/?page=billing&toss_fail=1",
+            customerEmail: "{user.get('email', '')}",
+            customerName:  "{user.get('name') or user.get('username', '')}",
+          }});
+        }} catch(e) {{
+          document.getElementById('billing-msg').textContent = '오류: ' + e.message;
+        }}
+      }});
+    }})();
+    </script>
+    """
+    _stc.html(billing_html, height=200)
+
+    # 빌링키 발급 콜백 처리 (successUrl 리다이렉트 후)
+    try:
+        auth_key = st.query_params.get("authKey")
+        toss_success = st.query_params.get("toss_success")
+        toss_plan = st.query_params.get("plan", chosen_plan)
+        toss_cycle = st.query_params.get("cycle", cycle)
+    except Exception:
+        auth_key = toss_success = toss_plan = toss_cycle = None
+
+    if toss_success and auth_key:
+        with st.spinner("빌링키를 발급하고 구독을 등록하는 중..."):
+            import requests as _req
+            try:
+                resp = _req.post(
+                    f"{api_base}/billing/issue-key",
+                    json={
+                        "auth_key": auth_key,
+                        "customer_key": customer_key,
+                        "org_id": org_id,
+                        "plan": toss_plan,
+                        "billing_cycle": toss_cycle,
+                    },
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    st.success("✅ 구독 등록 완료! 서비스를 계속 이용하실 수 있습니다.")
+                    st.session_state["_onboarding_done_cache"] = False
+                    st.query_params.from_dict({})
+                    st.rerun()
+                else:
+                    st.error(f"빌링키 발급 실패: {resp.text}")
+            except Exception as e:
+                st.error(f"API 연결 오류: {e}")
+
+    elif st.query_params.get("toss_fail"):
+        st.error("결제 등록이 취소되었거나 실패했습니다. 다시 시도해 주세요.")
+        st.query_params.from_dict({"page": "billing"})
+
+    st.markdown("---")
+    if st.button("← 돌아가기", use_container_width=True):
+        st.query_params.from_dict({})
+        st.rerun()
+
+
+def _get_trial_status(org_id: int) -> dict:
+    """
+    org_id 의 트라이얼/구독 상태를 반환.
+    {
+      "locked": bool,       # True면 접근 차단
+      "trial_active": bool,
+      "days_left": int,     # 트라이얼 남은 일수 (음수=만료)
+      "has_subscription": bool,
+      "plan": str,
+    }
+    """
+    from datetime import datetime, timezone
+    client, err = get_supabase_client()
+    if err or not client:
+        return {"locked": False, "trial_active": False, "days_left": 0, "has_subscription": False, "plan": "unknown"}
+
+    try:
+        org_row = client.table("app_orgs").select("plan,trial_ends_at").eq("id", int(org_id)).maybe_single().execute()
+        data = org_row.data if isinstance(org_row.data, dict) else (org_row.data[0] if org_row.data else {})
+    except Exception:
+        return {"locked": False, "trial_active": False, "days_left": 0, "has_subscription": False, "plan": "unknown"}
+
+    plan = (data or {}).get("plan", "trial")
+    trial_ends_str = (data or {}).get("trial_ends_at")
+
+    # 유료 구독 여부 확인
+    has_sub = False
+    try:
+        sub = client.table("app_subscriptions").select("id").eq("org_id", int(org_id)).in_("status", ["active"]).limit(1).execute()
+        has_sub = bool(sub.data)
+    except Exception:
+        pass
+
+    if has_sub:
+        return {"locked": False, "trial_active": False, "days_left": 0, "has_subscription": True, "plan": plan}
+
+    # 트라이얼 남은 일수 계산
+    days_left = 0
+    trial_active = False
+    if trial_ends_str:
+        try:
+            trial_ends_dt = datetime.fromisoformat(trial_ends_str.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            days_left = (trial_ends_dt - now).days
+            trial_active = days_left >= 0
+        except Exception:
+            pass
+
+    locked = (plan == "trial" and not trial_active and not has_sub)
+    return {
+        "locked": locked,
+        "trial_active": trial_active,
+        "days_left": days_left,
+        "has_subscription": has_sub,
+        "plan": plan,
+    }
+
+
+def _render_trial_banner(trial_status: dict) -> None:
+    """트라이얼 상태 배너 (사이드바 또는 상단에 표시)."""
+    if trial_status.get("has_subscription"):
+        return
+    days = trial_status.get("days_left", 0)
+    if trial_status.get("trial_active"):
+        color = "#ff9800" if days <= 3 else "#1f77b4"
+        st.sidebar.markdown(
+            f"""<div style="background:{color};color:#fff;border-radius:8px;padding:0.6rem 0.8rem;
+                          font-size:0.82rem;margin-bottom:0.6rem;">
+              🎁 무료체험 <b>{days}일</b> 남음
+              &nbsp;<a href='?page=billing' style='color:#ffe082;'>플랜 업그레이드</a>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    elif trial_status.get("locked"):
+        st.sidebar.error("⛔ 무료체험이 종료되었습니다.\n[플랜 선택하기](?page=billing)")
+
+
+def render_onboarding_wizard() -> None:
+    """
+    최초 로그인 시 표시되는 온보딩 위저드 (4단계).
+    완료 시 app_orgs.onboarding_done = True 로 업데이트.
+    """
+    user = st.session_state.get("current_user", {})
+    org_id = user.get("org_id")
+
+    st.title("🎉 momo에 오신 것을 환영합니다!")
+    st.markdown("빠른 설정을 완료하면 바로 시작할 수 있어요. **(약 2분 소요)**")
+
+    step = st.session_state.get("_onboarding_step", 1)
+    steps = ["📍 매장 정보", "👥 직원 초대", "💳 결제수단 (선택)", "✅ 완료"]
+
+    # 진행 표시
+    prog_html = "".join(
+        f'<span style="padding:0.3rem 0.8rem;border-radius:20px;margin:0 0.2rem;font-size:0.82rem;'
+        f'background:{"#1f77b4" if i+1==step else "#ddd"};color:{"#fff" if i+1==step else "#555"};">'
+        f'{s}</span>'
+        for i, s in enumerate(steps)
+    )
+    st.markdown(f'<div style="text-align:center;margin-bottom:1.4rem;">{prog_html}</div>', unsafe_allow_html=True)
+
+    client, _ = get_supabase_client()
+
+    # ── Step 1: 매장 정보
+    if step == 1:
+        st.subheader("📍 매장 정보를 채워주세요")
+        store_id = user.get("store_id")
+        with st.form("onboarding_step1"):
+            address = st.text_input("매장 주소", placeholder="예: 울산시 남구 삼산로 10번길 5")
+            phone   = st.text_input("매장 연락처", placeholder="예: 052-123-4567")
+            submitted = st.form_submit_button("다음 →", type="primary", use_container_width=True)
+        if submitted and client and store_id:
+            try:
+                update = {}
+                if address:
+                    update["address"] = address.strip()
+                if phone:
+                    update["phone"] = phone.strip()
+                if update:
+                    client.table("app_stores").update(update).eq("id", int(store_id)).execute()
+            except Exception:
+                pass
+            st.session_state["_onboarding_step"] = 2
+            st.rerun()
+
+    # ── Step 2: 직원 초대
+    elif step == 2:
+        st.subheader("👥 직원을 초대해 보세요 (선택)")
+        st.info("나중에 [설정 > 직원 관리]에서도 초대할 수 있습니다.")
+        with st.form("onboarding_step2"):
+            emp_email = st.text_input("직원 이메일", placeholder="예: staff@example.com (선택)")
+            submitted = st.form_submit_button("다음 →", type="primary", use_container_width=True)
+        col1, col2 = st.columns(2)
+        if col1.button("← 이전", use_container_width=True):
+            st.session_state["_onboarding_step"] = 1
+            st.rerun()
+        if submitted:
+            st.session_state["_onboarding_step"] = 3
+            st.rerun()
+
+    # ── Step 3: 결제수단 등록 (선택)
+    elif step == 3:
+        st.subheader("💳 결제수단 등록 (선택)")
+        trial_status = _get_trial_status(org_id) if org_id else {}
+        days_left = trial_status.get("days_left", 0)
+        st.markdown(
+            f"무료체험 **{days_left}일** 남았습니다. 지금 결제수단을 등록해두면 체험 종료 후 자동으로 연결됩니다."
+        )
+        col1, col2 = st.columns(2)
+        if col1.button("← 이전", use_container_width=True):
+            st.session_state["_onboarding_step"] = 2
+            st.rerun()
+        if col2.button("결제수단 등록하기 →", type="primary", use_container_width=True):
+            st.query_params.from_dict({"page": "billing"})
+            st.rerun()
+        if st.button("나중에 등록할게요 →", use_container_width=True):
+            st.session_state["_onboarding_step"] = 4
+            st.rerun()
+
+    # ── Step 4: 완료
+    elif step >= 4:
+        st.balloons()
+        st.success("🎉 온보딩 완료! 이제 momo를 사용할 수 있습니다.")
+        if client and org_id:
+            try:
+                client.table("app_orgs").update({"onboarding_done": True}).eq("id", int(org_id)).execute()
+            except Exception:
+                pass
+        if st.button("🏠 대시보드로 이동", type="primary", use_container_width=True):
+            st.session_state.pop("_onboarding_step", None)
+            st.query_params.from_dict({})
+            st.rerun()
+
+
+def render_trial_locked_page() -> None:
+    """무료체험 만료 후 구독 미등록 시 표시하는 잠금 화면."""
+    _inject_branding_css()
+    st.title("⛔ 무료체험이 종료되었습니다")
+    st.markdown(
+        """
+        **14일 무료체험 기간이 만료**되었습니다.
+
+        서비스를 계속 이용하려면 아래에서 플랜을 선택하고 결제수단을 등록해 주세요.
+        결제 등록 즉시 잠금이 해제됩니다.
+        """
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💳 플랜 선택 & 결제 등록", type="primary", use_container_width=True):
+            st.query_params.from_dict({"page": "billing"})
+            st.rerun()
+    with col2:
+        if st.button("🔓 로그아웃", use_container_width=True):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
 
 
 def render_admin_console():
@@ -14357,6 +14742,36 @@ def main():
 
     user = st.session_state.current_user
     role = user["role"]
+
+    # 결제 페이지 (?page=billing)
+    if _page_param == "billing":
+        render_billing_page()
+        return
+
+    # 트라이얼 / 잠금 체크 (superadmin·momo operator 제외)
+    if not _is_momo_operator(role):
+        _org_id = user.get("org_id")
+        if _org_id:
+            _trial_st = _get_trial_status(int(_org_id))
+            _render_trial_banner(_trial_st)
+            if _trial_st.get("locked"):
+                render_trial_locked_page()
+                return
+            # 온보딩 위저드: org_owner가 onboarding_done=False 인 경우
+            if _is_org_level(role) and not st.session_state.get("_onboarding_done_cache"):
+                try:
+                    _client_ob, _ = get_supabase_client()
+                    if _client_ob:
+                        _ob_row = _client_ob.table("app_orgs").select("onboarding_done").eq("id", int(_org_id)).maybe_single().execute()
+                        _ob_data = _ob_row.data if isinstance(_ob_row.data, dict) else (_ob_row.data[0] if _ob_row.data else {})
+                        _ob_done = (_ob_data or {}).get("onboarding_done", False)
+                        if not _ob_done:
+                            render_onboarding_wizard()
+                            return
+                        else:
+                            st.session_state["_onboarding_done_cache"] = True
+                except Exception:
+                    pass
 
     # 쿼리 파라미터를 이용한 홈 이동(?home=1) 처리:
     # 로고 클릭 시 언제든지 메인 대시보드/홈으로 돌아갈 수 있도록,

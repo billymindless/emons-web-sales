@@ -7,7 +7,8 @@ folium>=0.15.0
 streamlit-folium>=0.15.0
 supabase>=2.0.0
 psycopg2-binary>=2.9.0
-# 채널톡 웹훅 API 서버 (api.py)
+# 빌링 API 서버 (api.py)
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 httpx>=0.27.0
+pydantic>=2.0.0
