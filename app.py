@@ -5595,39 +5595,33 @@ def render_login():
         default_email = (st.query_params.get("email") or "").strip()
     except Exception:
         default_email = ""
-    # 로그인 화면 레이아웃 CSS: 가운데 정렬 + 폼 너비 제한
+    # 로그인 화면 레이아웃 CSS: 로고 정중앙 + 폼 너비 제한
     st.markdown(
         """
         <style>
-        /* 로그인 전체 래퍼: 화면 중앙 배치 */
-        .momo-login-wrap {
-            max-width: 420px;
-            margin: 3rem auto 0 auto;
-            padding: 0 1rem;
-            text-align: center;
+        /* 로그인 로고: 화면 정중앙 */
+        .momo-login-logo-center {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 4rem auto 2rem auto;
         }
-        /* 로고 크기 */
-        .momo-login-wrap img {
-            max-width: 220px !important;
+        .momo-login-logo-center img {
+            max-width: 330px !important;
             width: auto !important;
             height: auto !important;
             object-fit: contain;
-            margin-bottom: 1.5rem;
-        }
-        /* Streamlit 폼 너비 강제 제한 */
-        .momo-login-wrap [data-testid="stForm"] {
-            text-align: left;
         }
         @media (max-width: 768px) {
-            .momo-login-wrap { margin-top: 2rem; }
-            .momo-login-wrap img { max-width: 160px !important; }
+            .momo-login-logo-center { margin: 2.5rem auto 1.5rem auto; }
+            .momo-login-logo-center img { max-width: 220px !important; }
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
     logo_inner = _common_logo_html(_resolve_logo_path(), fallback_id="momo-logo-fallback-login")
-    st.markdown(f'<div class="momo-login-wrap">{logo_inner}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="momo-login-logo-center">{logo_inner}</div>', unsafe_allow_html=True)
 
     # 중앙 컬럼으로 폼 너비 제한
     _, col, _ = st.columns([1, 2, 1])
