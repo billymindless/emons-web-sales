@@ -10370,7 +10370,7 @@ def render_new_sales():
                 st.text_input(f"메인페이 승인번호 4자리 #{i+1} *", key=card_key, max_chars=4)
                 card_company = st.session_state.get(card_key)
             elif method == "지역화폐":
-                st.text_input(f"지역화폐 승인번호 #{i+1} *", key=card_key)
+                st.text_input(f"지역화폐 승인번호 6자리 #{i+1} *", key=card_key, max_chars=6)
                 card_company = st.session_state.get(card_key)
             else:
                 card_company = None
@@ -10554,9 +10554,9 @@ def render_new_sales():
                     st.error(f"결제 #{i+1} 메인페이 승인번호 4자리를 정확히 입력하세요.")
                     st.stop()
             elif method == "지역화폐":
-                _appr = (st.session_state.get(f"pay_card_{i}", "") or "").strip()
-                if not _appr:
-                    st.error(f"결제 #{i+1} 지역화폐 승인번호를 입력하세요.")
+                _appr = re.sub(r"\D", "", (st.session_state.get(f"pay_card_{i}", "") or "").strip())
+                if len(_appr) != 6:
+                    st.error(f"결제 #{i+1} 지역화폐 승인번호 6자리를 정확히 입력하세요.")
                     st.stop()
         # 온누리상품권 결제에 대한 부정 사용 방지 검증
         # 1차: 승인번호 뒤 4자리 + 결제일 기준 중복 여부 확인 (금액 제외)
@@ -12328,8 +12328,9 @@ def render_customer_balance():
                                                         elif new_method == "지역화폐":
                                                             _cur_appr = prow.get("card_company") or ""
                                                             new_card_company = st.text_input(
-                                                                "지역화폐 승인번호 *",
+                                                                "지역화폐 승인번호 6자리 *",
                                                                 value=_cur_appr,
+                                                                max_chars=6,
                                                                 key=f"pay_edit_card_{prow['id']}",
                                                             )
                                                         elif "온누리" in str(new_method) and "지류" not in str(new_method):
@@ -12411,8 +12412,8 @@ def render_customer_balance():
                                                                 st.warning(f"{new_method} 카드사를 선택하세요.")
                                                             elif new_method == "메인페이" and len(re.sub(r"\D", "", (new_card_company or ""))) != 4:
                                                                 st.warning("메인페이 승인번호 4자리를 정확히 입력하세요.")
-                                                            elif new_method == "지역화폐" and not (new_card_company or "").strip():
-                                                                st.warning("지역화폐 승인번호를 입력하세요.")
+                                                            elif new_method == "지역화폐" and len(re.sub(r"\D", "", (new_card_company or "").strip())) != 6:
+                                                                st.warning("지역화폐 승인번호 6자리를 정확히 입력하세요.")
                                                             elif "온누리" in str(new_method) and "지류" not in str(new_method) and not (new_onnuri_code or "").strip():
                                                                 st.warning("온누리 승인번호를 입력하세요.")
                                                             else:
