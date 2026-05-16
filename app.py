@@ -1,8 +1,5 @@
 ﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
-"""
-momo - 가구 매장 세일즈 및 경영 대시보드
-"""
 import base64
 import calendar
 import io
