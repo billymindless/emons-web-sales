@@ -5633,8 +5633,6 @@ def render_login():
         + "</div>"
     )
     st.markdown(logo_html, unsafe_allow_html=True)
-    st.title("momo")
-    st.subheader("로그인")
     with st.form("login_form"):
         email = st.text_input("이메일", value=default_email, key="login_email", type="default", placeholder="예: you@example.com")
         password = st.text_input("비밀번호", type="password", key="login_password")
@@ -5707,17 +5705,6 @@ def render_login():
                             st.error("이메일 또는 비밀번호가 올바르지 않습니다.")
                         else:
                             st.error(f"로그인 중 오류가 발생했습니다: {err_msg}")
-
-    st.caption("💡 로그인할 때 사용한 이메일은 이 기기(브라우저)에만 저장되며, 다음 로그인 시 자동으로 채워집니다.")
-
-    st.markdown("---")
-    st.markdown(
-        "<div style='text-align:center;font-size:0.95rem;'>"
-        "아직 계정이 없으신가요?&nbsp;&nbsp;"
-        "<a href='?page=signup' style='font-weight:600;'>회원가입하기 →</a>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
 
     # 이메일 자동 저장/자동 입력: localStorage 사용 (같은 브라우저에서 다음 로그인 시 이메일 유지)
     # 1) URL에 email이 없고 localStorage에 저장된 이메일이 있으면 ?email= 붙여서 이동 → 서버에서 default value로 채움
