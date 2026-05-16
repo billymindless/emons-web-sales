@@ -16074,6 +16074,22 @@ def main():
         render_delivery_portal()
         return
 
+    # Pro 서브 페이지 공통: 사이드바 홈 버튼 + Pro 메뉴
+    _pro_subpages = {"products", "delivery_admin", "delivery_slots", "delivery_regions", "billing"}
+    if _page_param in _pro_subpages:
+        _org_id_sub = user.get("org_id")
+        # 사이드바 홈 버튼
+        st.sidebar.markdown("---")
+        if st.sidebar.button("🏠 홈으로", key="subpage_home_btn", use_container_width=True, type="primary"):
+            try:
+                st.query_params.from_dict({})
+            except Exception:
+                pass
+            st.rerun()
+        # Pro 메뉴 유지
+        if _org_id_sub:
+            _render_pro_sidebar_menu(int(_org_id_sub))
+
     # 제품 카탈로그 관리 (?page=products) — Pro 에디션
     if _page_param == "products":
         render_product_catalog_admin()
