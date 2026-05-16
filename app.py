@@ -5604,7 +5604,7 @@ def render_login():
             display: flex;
             justify-content: center;
             align-items: center;
-            margin: 4rem auto 2rem auto;
+            margin: 4rem auto 0.5rem auto;
         }
         .momo-login-logo-center img {
             max-width: 330px !important;
