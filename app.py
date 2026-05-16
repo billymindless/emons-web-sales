@@ -11227,10 +11227,113 @@ def render_delivery_portal() -> None:
         st.rerun()
 
 
+def _superadmin_tab_org_list():
+    """① 가입 조직 현황: app_orgs 운영 정보만 표시. 매출·고객 개인정보 없음."""
+    client, err = get_supabase_admin_client()
+    if err or not client:
+        st.error(f"Supabase 연결 실패: {err}")
+        return
+    try:
+        r = client.table("app_orgs").select(
+            "id, name, plan, status, edition, trial_ends_at, onboarding_done, created_at"
+        ).order("id").execute()
+        orgs = r.data or []
+    except Exception as e:
+        st.error(f"조회 실패: {e}")
+        return
+
+    if not orgs:
+        st.info("등록된 조직이 없습니다.")
+        return
+
+    st.subheader(f"전체 가입 조직 ({len(orgs)}개)")
+    rows = []
+    for o in orgs:
+        trial_end = str(o.get("trial_ends_at") or "")[:10]
+        created = str(o.get("created_at") or "")[:10]
+        rows.append({
+            "ID": o["id"],
+            "조직명": o.get("name", ""),
+            "플랜": o.get("plan", ""),
+            "에디션": o.get("edition", "lite"),
+            "상태": o.get("status", ""),
+            "온보딩완료": "✅" if o.get("onboarding_done") else "❌",
+            "트라이얼만료": trial_end,
+            "가입일": created,
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("구독 상태 변경")
+    org_options = {f"[{o['id']}] {o.get('name','')}": o["id"] for o in orgs}
+    sel_org_label = st.selectbox("조직 선택", list(org_options.keys()), key="sa_org_status_sel")
+    sel_org_id = org_options[sel_org_label]
+    cur_org = next((o for o in orgs if o["id"] == sel_org_id), {})
+    new_status = st.selectbox(
+        "새 상태",
+        ["active", "suspended", "cancelled"],
+        index=["active", "suspended", "cancelled"].index(cur_org.get("status", "active")),
+        key="sa_org_new_status",
+    )
+    new_plan = st.selectbox(
+        "플랜 변경",
+        ["trial", "lite", "pro_growth", "pro_unlimited"],
+        index=["trial", "lite", "pro_growth", "pro_unlimited"].index(cur_org.get("plan", "trial")) if cur_org.get("plan") in ["trial","lite","pro_growth","pro_unlimited"] else 0,
+        key="sa_org_new_plan",
+    )
+    if st.button("저장", key="sa_org_status_save", type="primary"):
+        try:
+            client.table("app_orgs").update({"status": new_status, "plan": new_plan}).eq("id", sel_org_id).execute()
+            _flash(f"조직 ID {sel_org_id} 상태 → {new_status} / 플랜 → {new_plan} 변경 완료")
+            st.rerun()
+        except Exception as e:
+            st.error(f"변경 실패: {e}")
+
+
+def _superadmin_tab_reset_password():
+    """② 비밀번호 초기화: 이메일 입력 → Supabase Auth 비밀번호 강제 변경."""
+    client, err = get_supabase_admin_client()
+    if err or not client:
+        st.error(f"Supabase 연결 실패: {err}")
+        return
+
+    st.subheader("비밀번호 초기화")
+    st.info("가입자 이메일을 입력하면 새 임시 비밀번호로 초기화합니다. 고객 데이터는 조회하지 않습니다.")
+
+    with st.form("sa_pw_reset_form"):
+        target_email = st.text_input("이메일 *", placeholder="가입자 이메일 주소")
+        new_pw = st.text_input("새 임시 비밀번호 *", type="password", placeholder="6자 이상")
+        submitted = st.form_submit_button("비밀번호 초기화", type="primary", use_container_width=True)
+
+    if submitted:
+        if not target_email or not target_email.strip():
+            st.error("이메일을 입력하세요.")
+        elif not new_pw or len(new_pw) < 6:
+            st.error("비밀번호는 6자 이상이어야 합니다.")
+        else:
+            # app_users에 등록된 이메일인지 확인 (이름·연락처 등 개인정보 조회 없이 존재 여부만)
+            try:
+                check = client.table("app_users").select("id, email").eq("email", target_email.strip()).maybe_single().execute()
+                if not check.data:
+                    st.error("등록된 이메일이 아닙니다.")
+                else:
+                    # Supabase Auth 비밀번호 변경
+                    auth_users = client.auth.admin.list_users()
+                    auth_user = next((u for u in (auth_users or []) if (u.email or "").lower() == target_email.strip().lower()), None)
+                    if not auth_user:
+                        st.error("Supabase Auth 계정을 찾을 수 없습니다.")
+                    else:
+                        client.auth.admin.update_user_by_id(auth_user.id, {"password": new_pw})
+                        _flash(f"{target_email} 비밀번호가 초기화되었습니다.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"처리 중 오류: {e}")
+
+
 def render_admin_console():
     """
     momo 운영자 전용 콘솔 (?page=admin).
-    일반 가입자는 접근 불가. render_superadmin() 메뉴에 운영자 전용 항목 추가.
+    매출·고객 개인정보에 접근하지 않는 운영 기능만 제공.
     """
     st.markdown(
         "<div style='background:#fff0f0;border:1px solid #e05;border-radius:8px;"
@@ -11239,14 +11342,55 @@ def render_admin_console():
         "</div>",
         unsafe_allow_html=True,
     )
-    render_superadmin()
+
+    _OPERATOR_MENUS = [
+        "① 가입 조직 현황",
+        "② 비밀번호 초기화",
+        "③ 📢 공지사항 관리",
+        "④ 매장 계정 관리",
+        "⑤ FAQ (도움말)",
+    ]
+    if "operator_menu_idx" not in st.session_state:
+        st.session_state["operator_menu_idx"] = 0
+    if st.session_state["operator_menu_idx"] >= len(_OPERATOR_MENUS):
+        st.session_state["operator_menu_idx"] = 0
+
+    st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
+    st.header("momo 운영자 콘솔")
+    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
+    menu_sel = st.selectbox(
+        "운영자 메뉴",
+        _OPERATOR_MENUS,
+        index=st.session_state["operator_menu_idx"],
+        key="operator_menu_select",
+        label_visibility="collapsed",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.session_state["operator_menu_idx"] = _OPERATOR_MENUS.index(menu_sel)
+    st.divider()
+
+    if menu_sel == "① 가입 조직 현황":
+        _superadmin_tab_org_list()
+    elif menu_sel == "② 비밀번호 초기화":
+        _superadmin_tab_reset_password()
+    elif menu_sel == "③ 📢 공지사항 관리":
+        _superadmin_tab3_notices()
+    elif menu_sel == "④ 매장 계정 관리":
+        _superadmin_tab5_store_accounts()
+    elif menu_sel == "⑤ FAQ (도움말)":
+        render_faq_page()
 
 
-def render_superadmin():
-    _SUPERADMIN_MENUS = [
+def render_org_owner_console():
+    """
+    org_owner / org_admin 전용 전사 관리 콘솔.
+    자사 데이터(매출·HR·마케팅·미수금 등)에 접근 가능.
+    """
+    _ORG_MENUS = [
         "① 전 지점 통합 대시보드",
         "② 매장별 직원 평가 현황 (HR)",
-        "③ 📢 공지사항 관리",
+        "③ 📢 공지사항",
         "④ 원클릭 데이터 백업 (CSV)",
         "⑤ 매장 계정 관리",
         "⑥ 전 지점 마케팅 분석",
@@ -11254,32 +11398,32 @@ def render_superadmin():
         "⑧ 결제수단별 집계표",
         "⑨ FAQ (도움말)",
     ]
-    if "superadmin_menu_idx" not in st.session_state:
-        st.session_state["superadmin_menu_idx"] = 0
-    if st.session_state["superadmin_menu_idx"] >= len(_SUPERADMIN_MENUS):
-        st.session_state["superadmin_menu_idx"] = 0
+    if "orgowner_menu_idx" not in st.session_state:
+        st.session_state["orgowner_menu_idx"] = 0
+    if st.session_state["orgowner_menu_idx"] >= len(_ORG_MENUS):
+        st.session_state["orgowner_menu_idx"] = 0
 
     st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
-    st.header("최고 관리자 메뉴")
+    st.header("전사 관리 메뉴")
     st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
     menu_sel = st.selectbox(
-        "최고 관리자 메뉴",
-        _SUPERADMIN_MENUS,
-        index=st.session_state["superadmin_menu_idx"],
-        key="superadmin_menu_select",
+        "전사 관리 메뉴",
+        _ORG_MENUS,
+        index=st.session_state["orgowner_menu_idx"],
+        key="orgowner_menu_select",
         label_visibility="collapsed",
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.session_state["superadmin_menu_idx"] = _SUPERADMIN_MENUS.index(menu_sel)
+    st.session_state["orgowner_menu_idx"] = _ORG_MENUS.index(menu_sel)
     st.divider()
 
     if menu_sel == "① 전 지점 통합 대시보드":
         _superadmin_tab1_integrated_dashboard()
     elif menu_sel == "② 매장별 직원 평가 현황 (HR)":
         _superadmin_tab2_hr_store_employees()
-    elif menu_sel == "③ 📢 공지사항 관리":
-        _superadmin_tab3_notices()
+    elif menu_sel == "③ 📢 공지사항":
+        _render_recent_notices_section()
     elif menu_sel == "④ 원클릭 데이터 백업 (CSV)":
         _superadmin_tab4_backup_csv()
     elif menu_sel == "⑤ 매장 계정 관리":
@@ -11292,6 +11436,11 @@ def render_superadmin():
         render_monthly_payment_report(is_superadmin=True)
     elif menu_sel == "⑨ FAQ (도움말)":
         render_faq_page()
+
+
+def render_superadmin():
+    """하위 호환: org_owner 콘솔로 위임."""
+    render_org_owner_console()
 
 
 # ========== 탭 1: 매장 관리자 메뉴 (Store Admin 전용) — Employees ==========
@@ -16393,9 +16542,9 @@ def main():
         render_employee_management()
         return
 
-    # org_owner / org_admin: 전사 관리 메뉴 (기존 superadmin 메뉴 재활용)
+    # org_owner / org_admin: 전사 관리 콘솔 (자사 매출·HR 데이터 접근 가능)
     if _is_org_level(role):
-        render_superadmin()
+        render_org_owner_console()
         return
 
     # 일반/매장 관리자: 메뉴를 상단 셀렉트로 노출 (모바일에서도 잘 보이게), 넘버링 및 그룹 구분
