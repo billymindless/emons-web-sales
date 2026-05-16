@@ -711,12 +711,18 @@ def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
 
 @st.cache_data(ttl=3600)
 def _get_supabase_users_list():
-    """Supabase app_users 전체 목록 캐시 (10분). 직원 추가/수정 후 clear_data_cache() 호출 시 갱신."""
+    """Supabase app_users 전체 목록 캐시 (10분). superadmin은 제외. 직원 추가/수정 후 clear_data_cache() 호출 시 갱신."""
     client, err = get_supabase_client()
     if err or not client:
         return []
     try:
-        r = client.table("app_users").select("id, username, email, role, name, store_id").order("username").execute()
+        r = (
+            client.table("app_users")
+            .select("id, username, email, role, name, store_id, org_id")
+            .neq("role", "superadmin")
+            .order("username")
+            .execute()
+        )
         return (r.data or []) if hasattr(r, "data") else []
     except Exception:
         return []
@@ -757,9 +763,14 @@ def _get_supabase_user_store_ids(user_id: int):
 
 
 @st.cache_data(ttl=3600)
-def _get_supabase_employee_list_with_stores():
-    """직원 명부 + 배정매장 문자열 캐시 (10분). 직원/매장 변경 시 clear_data_cache()로 갱신."""
+def _get_supabase_employee_list_with_stores(org_id=None):
+    """직원 명부 + 배정매장 문자열 캐시 (1시간). superadmin 제외. org_id 전달 시 해당 조직 직원만 반환."""
     users = _get_supabase_users_list()
+    if not users:
+        return []
+    # org_id가 주어진 경우 해당 조직의 직원만 필터링
+    if org_id:
+        users = [u for u in users if u.get("org_id") == org_id]
     if not users:
         return []
     client, err = get_supabase_client()
@@ -9154,7 +9165,8 @@ def render_employee_management():
 
     st.subheader("직원 명부")
     if use_supabase:
-        emp_list = _get_supabase_employee_list_with_stores()
+        _current_org_id = st.session_state.get("org_id")
+        emp_list = _get_supabase_employee_list_with_stores(org_id=_current_org_id)
         df = pd.DataFrame(emp_list) if emp_list else pd.DataFrame(columns=["id", "email", "username", "name", "role", "배정매장", "기본매장"])
     else:
         conn = get_master_conn()
