@@ -295,6 +295,33 @@ def get_supabase_client():
         return None, f"Supabase 연결에 실패했습니다: {err_msg}"
 
 
+def get_supabase_admin_client():
+    """
+    service_role key로 Supabase 관리자 클라이언트 반환 (RLS 우회).
+    superadmin 전용 작업(매장 생성·삭제, 사용자 관리 등)에 사용.
+    반환: (client, None) 또는 (None, error_message).
+    """
+    global _supabase_admin_client_cache
+    if _create_supabase_client is None:
+        return None, "Supabase 라이브러리가 없습니다."
+    try:
+        secrets = st.secrets.get("supabase") or {}
+        url = (secrets.get("url") or "").strip()
+        key = (secrets.get("service_role_key") or secrets.get("service_key") or "").strip()
+        if not url or not key:
+            # service_role_key 미설정 시 anon 클라이언트로 폴백
+            return get_supabase_client()
+        if _supabase_admin_client_cache is not None:
+            _client, _url, _key = _supabase_admin_client_cache
+            if _url == url and _key == key:
+                return _client, None
+        client = _create_supabase_client(url, key)
+        _supabase_admin_client_cache = (client, url, key)
+        return client, None
+    except Exception as e:
+        return None, f"관리자 클라이언트 연결 실패: {e}"
+
+
 def get_supabase_client_or_warn():
     """Supabase 클라이언트 반환 (내부적으로 Singleton 재사용). 실패 시 화면에 경고를 띄우고 None 반환."""
     client, err = get_supabase_client()
@@ -521,14 +548,16 @@ def ensure_supabase_app_tables():
 
 @st.cache_data(ttl=3600)
 def _get_supabase_stores_list():
-    """Supabase app_stores 목록 캐시 (10분). 매장 추가/수정 후 clear_data_cache() 호출 시 갱신."""
-    client, err = get_supabase_client()
+    """Supabase app_stores 전체 목록 반환. service_role key로 RLS 우회."""
+    client, err = get_supabase_admin_client()
     if err or not client:
         return []
     try:
-        r = client.table("app_stores").select("id, store_name, db_filename").order("id").execute()
+        r = client.table("app_stores").select("id, store_name, db_filename, org_id, is_headquarters").order("id").execute()
         return (r.data or []) if hasattr(r, "data") else []
-    except Exception:
+    except Exception as e:
+        # 에러를 세션에 기록해 슈퍼어드민 화면에서 확인 가능하게 함
+        st.session_state["_stores_list_error"] = str(e)
         return []
 
 
@@ -7528,10 +7557,30 @@ def _superadmin_tab_unpaid_report():
 
 def _superadmin_tab5_store_accounts():
     """⑤ 매장 계정 관리: Supabase app_stores / app_users만 사용. 매장 생성·수정·삭제 및 계정 발급·비밀번호 변경."""
-    client, err = get_supabase_client()
+    client, err = get_supabase_admin_client()
     if err or not client:
         st.error(f"Supabase 연결이 필요합니다: {err or '연결 실패'}")
         return
+
+    # 저장 목록 에러가 있으면 표시
+    stores_err = st.session_state.pop("_stores_list_error", None)
+    if stores_err:
+        st.error(f"⚠️ 매장 목록 조회 오류 (DB 직접 확인 필요): {stores_err}")
+
+    # DB 실제 상태 직접 확인 버튼
+    with st.expander("🔍 DB 직접 조회 (오류 진단용)", expanded=False):
+        if st.button("app_stores 전체 조회", key="sa_debug_stores"):
+            try:
+                r = client.table("app_stores").select("*").order("id").execute()
+                rows = r.data or []
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    st.info(f"총 {len(rows)}개 매장이 DB에 있습니다.")
+                else:
+                    st.info("app_stores 테이블이 비어 있습니다.")
+            except Exception as e:
+                st.error(f"조회 실패: {e}")
+
     stores_list = _get_supabase_stores_list()
     stores = pd.DataFrame(stores_list).sort_values("store_name", ignore_index=True) if stores_list else pd.DataFrame(columns=["id", "store_name", "db_filename"])
     if stores.empty or "store_name" not in stores.columns:
