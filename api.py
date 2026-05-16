@@ -83,6 +83,13 @@ class ScheduleRequest(BaseModel):
 # ───────────────────────────────────────────────────────────
 
 _PLAN_AMOUNTS = {
+    # Lite 에디션 (품목 에디션) — 최대 3지점
+    "lite":          {"monthly": 39_000,  "annual": 390_000},
+    # Pro 에디션 (제품 에디션) — 최대 5지점
+    "pro_growth":    {"monthly": 99_000,  "annual": 990_000},
+    # Pro 에디션 (제품 에디션) — 무제한 지점
+    "pro_unlimited": {"monthly": 199_000, "annual": 1_990_000},
+    # 레거시 키 호환
     "starter": {"monthly": 39_000,  "annual": 390_000},
     "growth":  {"monthly": 99_000,  "annual": 990_000},
     "pro":     {"monthly": 199_000, "annual": 1_990_000},

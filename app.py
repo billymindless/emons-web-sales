@@ -3140,6 +3140,69 @@ def _effective_store_admin_role(role: str) -> bool:
     """기존 store_admin 권한이 필요한 코드에서 호환성 체크."""
     return role in ("store_admin", "store_manager", "org_owner", "org_admin")
 
+def _is_delivery_role(role: str) -> bool:
+    """배송팀 계정 여부."""
+    return role == "delivery_staff"
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_org_edition(org_id: int) -> str:
+    """app_orgs.edition 조회 (lite | pro). 캐시 5분."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return "lite"
+    try:
+        r = client.table("app_orgs").select("edition").eq("id", int(org_id)).maybe_single().execute()
+        data = r.data if isinstance(r.data, dict) else (r.data[0] if r.data else {})
+        return (data or {}).get("edition", "lite")
+    except Exception:
+        return "lite"
+
+def _has_product_catalog(org_id: int) -> bool:
+    """Pro 에디션만 제품 카탈로그 메뉴 활성화."""
+    return _get_org_edition(org_id) == "pro"
+
+def _get_available_delivery_dates(
+    region_id: int,
+    weeks_ahead: int = 8,
+    from_date=None,
+) -> list[dict]:
+    """
+    오늘부터 weeks_ahead주 이내 날짜 중 슬롯 잔여 > 0 인 날짜 반환.
+    반환: [{"date": "2026-06-01", "morning": 2, "afternoon": 3}, ...]
+    """
+    from datetime import date, timedelta
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    start = from_date or date.today()
+    end = start + timedelta(weeks=weeks_ahead)
+    result = []
+    cur = start + timedelta(days=1)  # 내일부터
+    while cur <= end:
+        morning = afternoon = 0
+        try:
+            rm = client.rpc("get_delivery_slot_remaining", {
+                "p_region_id": region_id,
+                "p_date": cur.isoformat(),
+                "p_time_slot": "morning",
+            }).execute()
+            morning = rm.data if isinstance(rm.data, int) else 0
+        except Exception:
+            pass
+        try:
+            ra = client.rpc("get_delivery_slot_remaining", {
+                "p_region_id": region_id,
+                "p_date": cur.isoformat(),
+                "p_time_slot": "afternoon",
+            }).execute()
+            afternoon = ra.data if isinstance(ra.data, int) else 0
+        except Exception:
+            pass
+        if morning > 0 or afternoon > 0:
+            result.append({"date": cur.isoformat(), "morning": morning, "afternoon": afternoon})
+        cur += timedelta(days=1)
+    return result
+
 
 # ========== 로그인 상태 유지 (localStorage + query_params) ==========
 # [토큰 삭제] 다음 두 경우에만 수행. 그 외에는 삭제하지 않음.
@@ -5744,11 +5807,12 @@ def _signup_create_account(
     email: str,
     password: str,
     owner_name: str,
+    edition: str = "lite",
 ) -> tuple[bool, str]:
     """
-    회원가입 처리 (Phase 5):
+    회원가입 처리 (Phase 7 보강):
     1. Supabase Auth 계정 생성
-    2. app_orgs INSERT  (plan='trial', trial_ends_at = now+14일)
+    2. app_orgs INSERT  (plan='trial', trial_ends_at = now+14일, edition)
     3. app_stores INSERT (본점, is_headquarters=True, org_id 연결)
     4. app_users INSERT  (role='org_owner', org_id 연결)
     5. app_user_stores INSERT
@@ -5790,6 +5854,7 @@ def _signup_create_account(
             "plan": "trial",
             "trial_ends_at": trial_ends,
             "onboarding_done": False,
+            "edition": edition,
         }).execute()
         org_id = org_res.data[0]["id"] if org_res.data else None
         if not org_id:
@@ -5894,24 +5959,53 @@ def render_signup():
         unsafe_allow_html=True,
     )
 
-    # ── 향후 선택 가능한 유료 플랜 미리보기
-    st.markdown("##### 체험 후 선택 가능한 플랜")
-    paid_plans = {k: v for k, v in _PLANS.items() if k != "trial"}
-    plan_cols = st.columns(len(paid_plans))
-    for i, (pk, pv) in enumerate(paid_plans.items()):
-        with plan_cols[i]:
+    # ── 에디션 선택 (Lite vs Pro)
+    st.markdown("#### 에디션을 선택해 주세요")
+    _EDITIONS = {
+        "lite": {
+            "label": "Lite (품목 에디션)",
+            "emoji": "📋",
+            "desc": "품목명 텍스트로 간단히 매출 관리\n단독 또는 소규모 지점 (최대 3개)",
+            "badge": "월 39,000원~",
+            "color": "#1f77b4",
+        },
+        "pro": {
+            "label": "Pro (제품 에디션)",
+            "emoji": "🏭",
+            "desc": "제품 카탈로그 + 기성품/주문제작 옵션\n본점-지점 조직 + 배송팀 포털 포함",
+            "badge": "월 99,000원~",
+            "color": "#e65100",
+        },
+    }
+    selected_edition = st.session_state.get("_signup_edition", "lite")
+    ed_cols = st.columns(2)
+    for i, (ek, ev) in enumerate(_EDITIONS.items()):
+        with ed_cols[i]:
+            is_sel = selected_edition == ek
+            border = f"2px solid {ev['color']}" if is_sel else "1px solid #ddd"
+            bg = "#f0f7ff" if is_sel and ek == "lite" else ("#fff3e0" if is_sel else "#fafafa")
             st.markdown(
-                f"""
-                <div style="border:1px solid #ddd;border-radius:10px;padding:1rem;
-                            background:#fafafa;min-height:130px;text-align:center;">
-                  <div style="font-size:1.8rem;">{pv['emoji']}</div>
-                  <div style="font-weight:700;margin:0.3rem 0;">{pv['label']}</div>
-                  <div style="font-size:0.8rem;color:#555;">{pv['desc']}</div>
-                  <div style="font-size:0.85rem;font-weight:600;color:#1f77b4;margin-top:0.4rem;">{pv['price']}</div>
-                </div>
-                """,
+                f"""<div style="border:{border};border-radius:12px;padding:1.2rem;
+                              background:{bg};min-height:140px;text-align:center;">
+                  <div style="font-size:2rem;">{ev['emoji']}</div>
+                  <div style="font-weight:700;font-size:1rem;margin:0.3rem 0;">{ev['label']}</div>
+                  <div style="font-size:0.8rem;color:#555;white-space:pre-line;">{ev['desc']}</div>
+                  <div style="font-size:0.85rem;font-weight:700;color:{ev['color']};margin-top:0.5rem;">{ev['badge']}</div>
+                </div>""",
                 unsafe_allow_html=True,
             )
+            if st.button(
+                "✓ 선택됨" if is_sel else "선택",
+                key=f"edition_sel_{ek}",
+                use_container_width=True,
+                type="primary" if is_sel else "secondary",
+            ):
+                st.session_state["_signup_edition"] = ek
+                st.rerun()
+
+    _sel_ed = st.session_state.get("_signup_edition", "lite")
+    _sel_ed_info = _EDITIONS[_sel_ed]
+    st.info(f"**{_sel_ed_info['emoji']} {_sel_ed_info['label']}** 선택됨 — 14일 무료체험 후 요금 발생")
 
     st.markdown("---")
     st.markdown("#### 가입 정보를 입력해 주세요")
@@ -5965,6 +6059,7 @@ def render_signup():
                         email=email,
                         password=password,
                         owner_name=owner_name,
+                        edition=st.session_state.get("_signup_edition", "lite"),
                     )
                 if ok:
                     st.session_state["_signup_done"] = True
@@ -9720,6 +9815,22 @@ def _render_trial_banner(trial_status: dict) -> None:
         st.sidebar.error("⛔ 무료체험이 종료되었습니다.\n[플랜 선택하기](?page=billing)")
 
 
+def _render_pro_sidebar_menu(org_id: int) -> None:
+    """Pro 에디션 전용 사이드바 메뉴 추가."""
+    if not _has_product_catalog(org_id):
+        return
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(
+        """**Pro 메뉴**
+- [📦 제품 카탈로그](?page=products)
+- [🚚 배송 배정](?page=delivery_admin)
+- [🗓️ 배송 슬롯 설정](?page=delivery_slots)
+- [🗺️ 지역·기사 관리](?page=delivery_regions)
+        """,
+        unsafe_allow_html=False,
+    )
+
+
 def render_onboarding_wizard() -> None:
     """
     최초 로그인 시 표시되는 온보딩 위저드 (4단계).
@@ -9838,6 +9949,1211 @@ def render_trial_locked_page() -> None:
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
+
+
+# ===========================================================================
+# Phase 7 — 제품 카탈로그 (Pro 에디션 전용)
+# ===========================================================================
+
+def _get_products(org_id: int, active_only: bool = True) -> list[dict]:
+    """org_id 제품 목록 + 카테고리명 조회."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        q = (
+            client.table("app_products")
+            .select("id,name,sku,product_type,base_price,is_active,category_id,app_product_categories(name)")
+            .eq("org_id", int(org_id))
+        )
+        if active_only:
+            q = q.eq("is_active", True)
+        r = q.order("id", desc=False).execute()
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _get_product_with_options(product_id: int) -> dict:
+    """제품 + 옵션 그룹 + 옵션 값 전체 조회."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return {}
+    try:
+        r = (
+            client.table("app_products")
+            .select("*,app_product_option_groups(*,app_product_option_values(*))")
+            .eq("id", int(product_id))
+            .maybe_single()
+            .execute()
+        )
+        return r.data if isinstance(r.data, dict) else {}
+    except Exception:
+        return {}
+
+
+def render_product_catalog_admin() -> None:
+    """
+    관리자용 제품 카탈로그 관리 (Pro 에디션 전용).
+    탭 1: 엑셀 업로드 일괄 등록
+    탭 2: 수동 단품 등록
+    탭 3: 제품 목록 / 비활성화
+    """
+    user = st.session_state.get("current_user", {})
+    org_id = user.get("org_id")
+    if not org_id or not _has_product_catalog(int(org_id)):
+        st.warning("제품 카탈로그는 **Pro 에디션** 전용 기능입니다.")
+        return
+
+    st.subheader("📦 제품 카탈로그 관리")
+    tab_upload, tab_manual, tab_list = st.tabs(["📤 엑셀 업로드", "✏️ 수동 등록", "📋 제품 목록"])
+
+    client, _ = get_supabase_client()
+
+    # ── 카테고리 목록 로드 (공통)
+    try:
+        cat_res = client.table("app_product_categories").select("id,name").eq("org_id", int(org_id)).order("sort_order").execute()
+        categories = cat_res.data or []
+    except Exception:
+        categories = []
+    cat_map = {c["name"]: c["id"] for c in categories}
+    cat_names = [c["name"] for c in categories]
+
+    # ── 탭 1: 엑셀 업로드
+    with tab_upload:
+        st.markdown(
+            """**엑셀 컬럼 순서:** `카테고리 | 제품명 | SKU | 타입 | 옵션그룹명 | 옵션값 | 가격`
+
+- 타입: `ready_made` / `custom` / `standard`
+- 옵션 없는 제품은 옵션그룹명·옵션값 비워두기
+- 같은 SKU는 옵션 행이 여러 개여도 자동 병합
+            """
+        )
+        # 샘플 다운로드
+        import io as _io
+        sample_data = (
+            "카테고리,제품명,SKU,타입,옵션그룹명,옵션값,가격\n"
+            "가구,식탁,TBL-001,ready_made,사이즈,4인용,450000\n"
+            "가구,식탁,TBL-001,ready_made,사이즈,6인용,590000\n"
+            "가구,의자,CHR-001,ready_made,,,85000\n"
+            "소파,3인 소파,SFA-001,custom,사이즈,3인용,0\n"
+            "소파,3인 소파,SFA-001,custom,원단,패브릭,0\n"
+            "소파,3인 소파,SFA-001,custom,원단,소가죽,150000\n"
+        )
+        st.download_button(
+            "📥 샘플 엑셀 다운로드",
+            data=sample_data.encode("utf-8-sig"),
+            file_name="제품등록_샘플.csv",
+            mime="text/csv",
+        )
+
+        uploaded = st.file_uploader("엑셀/CSV 파일 선택", type=["xlsx", "xls", "csv"])
+        if uploaded and st.button("📤 업로드 실행", type="primary"):
+            import pandas as _pd
+            try:
+                if uploaded.name.endswith(".csv"):
+                    df = _pd.read_csv(uploaded, encoding="utf-8-sig")
+                else:
+                    df = _pd.read_excel(uploaded)
+                df.columns = ["카테고리", "제품명", "SKU", "타입", "옵션그룹명", "옵션값", "가격"]
+                df = df.fillna("")
+            except Exception as e:
+                st.error(f"파일 파싱 오류: {e}")
+                return
+
+            inserted_products = 0
+            inserted_options = 0
+            sku_to_product_id: dict = {}
+
+            with st.spinner("업로드 중..."):
+                for _, row in df.iterrows():
+                    cat_name = str(row["카테고리"]).strip()
+                    prod_name = str(row["제품명"]).strip()
+                    sku = str(row["SKU"]).strip() or None
+                    ptype = str(row["타입"]).strip() or "standard"
+                    group_name = str(row["옵션그룹명"]).strip()
+                    value_label = str(row["옵션값"]).strip()
+                    try:
+                        price = int(float(str(row["가격"]).replace(",", "") or 0))
+                    except Exception:
+                        price = 0
+
+                    if not prod_name:
+                        continue
+
+                    # 카테고리 upsert
+                    cat_id = None
+                    if cat_name:
+                        if cat_name not in cat_map:
+                            try:
+                                cr = client.table("app_product_categories").insert(
+                                    {"org_id": int(org_id), "name": cat_name}
+                                ).execute()
+                                cat_map[cat_name] = cr.data[0]["id"]
+                            except Exception:
+                                pass
+                        cat_id = cat_map.get(cat_name)
+
+                    # 제품 upsert (SKU 기준 or 이름 기준)
+                    cache_key = sku or prod_name
+                    if cache_key not in sku_to_product_id:
+                        try:
+                            pr = client.table("app_products").insert({
+                                "org_id": int(org_id),
+                                "category_id": cat_id,
+                                "name": prod_name,
+                                "sku": sku,
+                                "product_type": ptype,
+                                "base_price": price if not group_name else 0,
+                            }).execute()
+                            pid = pr.data[0]["id"]
+                            sku_to_product_id[cache_key] = pid
+                            inserted_products += 1
+                        except Exception:
+                            # 이미 있으면 조회
+                            try:
+                                ex = client.table("app_products").select("id").eq("org_id", int(org_id)).eq("name", prod_name).limit(1).execute()
+                                sku_to_product_id[cache_key] = ex.data[0]["id"] if ex.data else None
+                            except Exception:
+                                continue
+
+                    pid = sku_to_product_id.get(cache_key)
+                    if not pid or not group_name or not value_label:
+                        continue
+
+                    # 옵션 그룹 upsert
+                    price_mode = "fixed" if ptype == "ready_made" else "delta"
+                    try:
+                        gr = client.table("app_product_option_groups").select("id").eq("product_id", int(pid)).eq("group_name", group_name).limit(1).execute()
+                        if gr.data:
+                            gid = gr.data[0]["id"]
+                        else:
+                            gr2 = client.table("app_product_option_groups").insert(
+                                {"product_id": int(pid), "group_name": group_name, "price_mode": price_mode}
+                            ).execute()
+                            gid = gr2.data[0]["id"]
+                    except Exception:
+                        continue
+
+                    # 옵션 값 insert
+                    try:
+                        client.table("app_product_option_values").insert(
+                            {"group_id": int(gid), "value_label": value_label, "price": price}
+                        ).execute()
+                        inserted_options += 1
+                    except Exception:
+                        pass
+
+            st.success(f"완료! 제품 {inserted_products}개, 옵션값 {inserted_options}개 등록됐습니다.")
+
+    # ── 탭 2: 수동 등록
+    with tab_manual:
+        with st.form("product_manual_form"):
+            new_cat = st.selectbox("카테고리", cat_names + ["+ 새 카테고리 추가"])
+            new_cat_name = ""
+            if new_cat == "+ 새 카테고리 추가":
+                new_cat_name = st.text_input("새 카테고리명")
+            prod_name = st.text_input("제품명 *")
+            sku_input = st.text_input("SKU (선택)")
+            ptype_input = st.selectbox("제품 타입", ["ready_made", "custom", "standard"],
+                                       format_func=lambda x: {"ready_made":"기성품","custom":"주문제작","standard":"표준"}[x])
+            base_price_input = st.number_input("기본 가격 (원)", min_value=0, step=1000)
+            submitted_m = st.form_submit_button("등록", type="primary", use_container_width=True)
+
+        if submitted_m and prod_name.strip() and client:
+            cat_id = None
+            target_cat = new_cat_name.strip() if new_cat == "+ 새 카테고리 추가" else new_cat
+            if target_cat:
+                if target_cat not in cat_map:
+                    try:
+                        cr = client.table("app_product_categories").insert(
+                            {"org_id": int(org_id), "name": target_cat}
+                        ).execute()
+                        cat_map[target_cat] = cr.data[0]["id"]
+                    except Exception:
+                        pass
+                cat_id = cat_map.get(target_cat)
+            try:
+                client.table("app_products").insert({
+                    "org_id": int(org_id),
+                    "category_id": cat_id,
+                    "name": prod_name.strip(),
+                    "sku": sku_input.strip() or None,
+                    "product_type": ptype_input,
+                    "base_price": int(base_price_input),
+                }).execute()
+                st.success(f"'{prod_name}' 등록 완료!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"등록 오류: {e}")
+
+    # ── 탭 3: 제품 목록
+    with tab_list:
+        products = _get_products(int(org_id), active_only=False)
+        if not products:
+            st.info("등록된 제품이 없습니다.")
+            return
+        import pandas as _pd
+        df = _pd.DataFrame([{
+            "ID": p["id"],
+            "카테고리": (p.get("app_product_categories") or {}).get("name", "-"),
+            "제품명": p["name"],
+            "SKU": p.get("sku") or "-",
+            "타입": {"ready_made":"기성품","custom":"주문제작","standard":"표준"}.get(p["product_type"], p["product_type"]),
+            "기본가격": f"{p['base_price']:,}원",
+            "활성": "✅" if p["is_active"] else "❌",
+        } for p in products])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        toggle_id = st.number_input("비활성화/활성화할 제품 ID", min_value=1, step=1, value=1)
+        if st.button("활성/비활성 전환", use_container_width=True) and client:
+            try:
+                cur = next((p for p in products if p["id"] == toggle_id), None)
+                if cur:
+                    client.table("app_products").update({"is_active": not cur["is_active"]}).eq("id", int(toggle_id)).execute()
+                    st.rerun()
+            except Exception as e:
+                st.error(f"오류: {e}")
+
+
+# ===========================================================================
+# Phase 7 — 제품 선택기 (판매 입력 화면 임베드)
+# ===========================================================================
+
+def render_product_selector(order_id: int) -> None:
+    """
+    판매 입력 화면 내 제품 선택기 (Pro 에디션).
+    기성품: 카테고리 탭 → 옵션 pill → 수량 → 즉시 등록
+    주문제작: 4단계 위저드
+    """
+    user = st.session_state.get("current_user", {})
+    org_id = user.get("org_id")
+    if not org_id or not _has_product_catalog(int(org_id)):
+        return
+
+    client, _ = get_supabase_client()
+    if not client:
+        return
+
+    st.markdown("---")
+    st.subheader("🛒 제품 추가")
+
+    # 카테고리 목록
+    try:
+        cat_res = client.table("app_product_categories").select("id,name").eq("org_id", int(org_id)).order("sort_order").execute()
+        categories = cat_res.data or []
+    except Exception:
+        categories = []
+
+    if not categories:
+        st.info("등록된 제품 카테고리가 없습니다. 제품 카탈로그 메뉴에서 먼저 제품을 등록해 주세요.")
+        return
+
+    # 장바구니 표시
+    cart_key = f"_cart_{order_id}"
+    cart: list[dict] = st.session_state.get(cart_key, [])
+    if cart:
+        st.markdown("**담긴 제품:**")
+        for ci, item in enumerate(cart):
+            opts = ", ".join(f"{k}: {v['label']}" for k, v in (item.get("options") or {}).items() if k != "note")
+            st.markdown(f"- {item['name']}{' / ' + opts if opts else ''} × {item['qty']}개 — **{item['total']:,}원**")
+        if st.button("✅ 제품 목록 저장", type="primary", key=f"cart_save_{order_id}"):
+            for item in cart:
+                try:
+                    client.table("app_order_items").insert({
+                        "order_id": int(order_id),
+                        "product_id": item.get("product_id"),
+                        "product_name": item["name"],
+                        "qty": item["qty"],
+                        "unit_price": item["unit_price"],
+                        "selected_options": item.get("options", {}),
+                        "custom_note": item.get("note", ""),
+                    }).execute()
+                except Exception:
+                    pass
+            st.session_state.pop(cart_key, None)
+            st.success("저장 완료!")
+            st.rerun()
+
+    # 카테고리 탭
+    tab_labels = [c["name"] for c in categories]
+    tabs = st.tabs(tab_labels)
+    for ti, (cat, tab) in enumerate(zip(categories, tabs)):
+        with tab:
+            try:
+                prods = client.table("app_products").select("id,name,product_type,base_price").eq("org_id", int(org_id)).eq("category_id", cat["id"]).eq("is_active", True).execute()
+                prod_list = prods.data or []
+            except Exception:
+                prod_list = []
+
+            if not prod_list:
+                st.info("이 카테고리에 제품이 없습니다.")
+                continue
+
+            for prod in prod_list:
+                with st.expander(f"**{prod['name']}**  ({prod['product_type']})", expanded=False):
+                    if prod["product_type"] == "ready_made":
+                        _render_ready_made_selector(prod, order_id, cart_key, client)
+                    elif prod["product_type"] == "custom":
+                        _render_custom_wizard(prod, order_id, cart_key, client)
+                    else:
+                        # standard: 수량만 입력
+                        qty = st.number_input("수량", min_value=1, step=1, key=f"std_qty_{prod['id']}_{order_id}")
+                        if st.button("장바구니 추가", key=f"std_add_{prod['id']}_{order_id}"):
+                            cart.append({
+                                "product_id": prod["id"],
+                                "name": prod["name"],
+                                "qty": qty,
+                                "unit_price": prod["base_price"],
+                                "total": prod["base_price"] * qty,
+                                "options": {},
+                            })
+                            st.session_state[cart_key] = cart
+                            st.rerun()
+
+
+def _render_ready_made_selector(prod: dict, order_id: int, cart_key: str, client) -> None:
+    """기성품: 옵션 pill 선택 → 수량 → 장바구니 추가."""
+    pd = _get_product_with_options(prod["id"])
+    option_groups = pd.get("app_product_option_groups") or []
+
+    cart: list[dict] = st.session_state.get(cart_key, [])
+    selected_opts: dict = {}
+    final_price = prod["base_price"]
+
+    for grp in option_groups:
+        vals = grp.get("app_product_option_values") or []
+        if not vals:
+            continue
+        labels = [v["value_label"] for v in vals]
+        chosen_label = st.radio(
+            grp["group_name"],
+            labels,
+            horizontal=True,
+            key=f"rm_{prod['id']}_{grp['id']}_{order_id}",
+        )
+        chosen_val = next((v for v in vals if v["value_label"] == chosen_label), None)
+        if chosen_val:
+            if grp["price_mode"] == "fixed":
+                final_price = chosen_val["price"]
+            else:
+                final_price += chosen_val["price"]
+            selected_opts[grp["group_name"]] = {"label": chosen_label, "price": chosen_val["price"]}
+
+    qty = st.number_input("수량", min_value=1, step=1, key=f"rm_qty_{prod['id']}_{order_id}")
+    st.markdown(f"**소계: {final_price * qty:,}원**")
+
+    if st.button("장바구니 추가", key=f"rm_add_{prod['id']}_{order_id}", type="primary"):
+        cart.append({
+            "product_id": prod["id"],
+            "name": prod["name"],
+            "qty": qty,
+            "unit_price": final_price,
+            "total": final_price * qty,
+            "options": selected_opts,
+        })
+        st.session_state[cart_key] = cart
+        st.rerun()
+
+
+def _render_custom_wizard(prod: dict, order_id: int, cart_key: str, client) -> None:
+    """주문제작 4단계 위저드."""
+    pd = _get_product_with_options(prod["id"])
+    option_groups = pd.get("app_product_option_groups") or []
+
+    cart: list[dict] = st.session_state.get(cart_key, [])
+    step_key = f"_cw_step_{prod['id']}_{order_id}"
+    opts_key = f"_cw_opts_{prod['id']}_{order_id}"
+
+    step = st.session_state.get(step_key, 1)
+    selected_opts: dict = st.session_state.get(opts_key, {})
+    total_steps = len(option_groups) + 2  # 옵션 그룹수 + 기타입력 + 최종확인
+
+    st.markdown(f"**단계 {step}/{total_steps}**")
+
+    if step <= len(option_groups):
+        grp = option_groups[step - 1]
+        vals = grp.get("app_product_option_values") or []
+        labels = [v["value_label"] for v in vals]
+        chosen = st.radio(
+            f"**{grp['group_name']} 선택**",
+            labels,
+            key=f"cw_{prod['id']}_{grp['id']}_{order_id}",
+        )
+        chosen_val = next((v for v in vals if v["value_label"] == chosen), None)
+        if st.button("다음 →", key=f"cw_next_{prod['id']}_{step}_{order_id}", type="primary"):
+            if chosen_val:
+                selected_opts[grp["group_name"]] = {"label": chosen, "price": chosen_val["price"]}
+                st.session_state[opts_key] = selected_opts
+            st.session_state[step_key] = step + 1
+            st.rerun()
+
+    elif step == len(option_groups) + 1:
+        # 기타 입력
+        note = st.text_area("특이사항 (선택)", placeholder="색상, 특별 요청 등", key=f"cw_note_{prod['id']}_{order_id}")
+        col1, col2 = st.columns(2)
+        if col1.button("← 이전", key=f"cw_prev_{prod['id']}_{step}_{order_id}"):
+            st.session_state[step_key] = step - 1
+            st.rerun()
+        if col2.button("다음 →", key=f"cw_next2_{prod['id']}_{step}_{order_id}", type="primary"):
+            selected_opts["note"] = note
+            st.session_state[opts_key] = selected_opts
+            st.session_state[step_key] = step + 1
+            st.rerun()
+
+    else:
+        # 최종 확인
+        base = prod["base_price"]
+        delta_sum = sum(v["price"] for k, v in selected_opts.items() if k != "note" and isinstance(v, dict))
+        final = base + delta_sum
+        qty = st.number_input("수량", min_value=1, step=1, key=f"cw_qty_{prod['id']}_{order_id}")
+        st.markdown(f"**기본가** {base:,}원 + **옵션 합계** {delta_sum:,}원 = **최종 {final:,}원** × {qty}개 = **{final*qty:,}원**")
+        opts_display = {k: v["label"] if isinstance(v, dict) else v for k, v in selected_opts.items() if k != "note"}
+        if opts_display:
+            st.json(opts_display)
+        col1, col2 = st.columns(2)
+        if col1.button("← 이전", key=f"cw_prev2_{prod['id']}_{order_id}"):
+            st.session_state[step_key] = step - 1
+            st.rerun()
+        if col2.button("장바구니 추가", key=f"cw_confirm_{prod['id']}_{order_id}", type="primary"):
+            cart.append({
+                "product_id": prod["id"],
+                "name": prod["name"],
+                "qty": qty,
+                "unit_price": final,
+                "total": final * qty,
+                "options": selected_opts,
+                "note": selected_opts.get("note", ""),
+            })
+            st.session_state[cart_key] = cart
+            st.session_state.pop(step_key, None)
+            st.session_state.pop(opts_key, None)
+            st.rerun()
+
+
+# ===========================================================================
+# Phase 8 — 배송팀 포털 (Pro 에디션 전용)
+# ===========================================================================
+
+def render_delivery_region_admin() -> None:
+    """지역 정의 + 배송 기사 계정 관리 (org_owner 전용)."""
+    import hashlib as _hl
+    user = st.session_state.get("current_user", {})
+    org_id = user.get("org_id")
+    role = user.get("role", "")
+    if not _is_billing_role(role):
+        st.error("지역·기사 관리는 조직 소유자(org_owner)만 접근할 수 있습니다.")
+        return
+
+    client, _ = get_supabase_client()
+    if not client:
+        st.error("DB 연결 오류")
+        return
+
+    st.subheader("🗺️ 배송 지역 · 기사 관리")
+    tab_region, tab_driver, tab_list = st.tabs(["📍 지역 관리", "👤 기사 등록", "📋 기사 목록"])
+
+    # 지역 목록 공통 로드
+    try:
+        rg_res = client.table("app_delivery_regions").select("id,region_name,region_code,is_active").eq("org_id", int(org_id)).order("id").execute()
+        regions = rg_res.data or []
+    except Exception:
+        regions = []
+
+    with tab_region:
+        with st.form("region_form"):
+            rg_name = st.text_input("지역명 *", placeholder="예: 울산")
+            rg_code = st.text_input("지역코드 *", placeholder="예: ULS")
+            sub_rg = st.form_submit_button("지역 등록", type="primary", use_container_width=True)
+        if sub_rg and rg_name.strip() and rg_code.strip():
+            try:
+                client.table("app_delivery_regions").insert({
+                    "org_id": int(org_id),
+                    "region_name": rg_name.strip(),
+                    "region_code": rg_code.strip().upper(),
+                }).execute()
+                st.success(f"'{rg_name}' 지역 등록 완료!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"등록 오류 (중복 코드?): {e}")
+
+        if regions:
+            st.markdown("**등록된 지역:**")
+            for r in regions:
+                col1, col2 = st.columns([4, 1])
+                col1.markdown(f"- **{r['region_name']}** ({r['region_code']}) {'✅' if r['is_active'] else '❌'}")
+                if col2.button("전환", key=f"rg_toggle_{r['id']}"):
+                    client.table("app_delivery_regions").update({"is_active": not r["is_active"]}).eq("id", r["id"]).execute()
+                    st.rerun()
+
+    with tab_driver:
+        if not regions:
+            st.warning("먼저 지역을 등록해 주세요.")
+        else:
+            region_options = {r["region_name"]: r["id"] for r in regions if r["is_active"]}
+            with st.form("driver_form"):
+                dr_region = st.selectbox("담당 지역 *", list(region_options.keys()))
+                dr_name = st.text_input("기사 이름 *")
+                dr_login = st.text_input("로그인 ID *", help="기사가 포털 로그인 시 사용하는 ID")
+                dr_pw = st.text_input("초기 비밀번호 *", type="password")
+                sub_dr = st.form_submit_button("기사 등록", type="primary", use_container_width=True)
+            if sub_dr and dr_name.strip() and dr_login.strip() and dr_pw:
+                region_id = region_options[dr_region]
+                pw_hash = _hl.sha256(dr_pw.encode()).hexdigest()
+                try:
+                    client.table("app_delivery_drivers").insert({
+                        "org_id": int(org_id),
+                        "region_id": int(region_id),
+                        "driver_name": dr_name.strip(),
+                        "login_id": dr_login.strip(),
+                        "password_hash": pw_hash,
+                    }).execute()
+                    st.success(f"'{dr_name}' 기사 등록 완료! (로그인 ID: {dr_login})")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"등록 오류 (ID 중복?): {e}")
+
+    with tab_list:
+        try:
+            dr_res = client.table("app_delivery_drivers").select("id,driver_name,login_id,is_active,app_delivery_regions(region_name)").eq("org_id", int(org_id)).order("id").execute()
+            drivers = dr_res.data or []
+        except Exception:
+            drivers = []
+        if not drivers:
+            st.info("등록된 기사가 없습니다.")
+        else:
+            import pandas as _pd
+            df = _pd.DataFrame([{
+                "ID": d["id"],
+                "지역": (d.get("app_delivery_regions") or {}).get("region_name", "-"),
+                "이름": d["driver_name"],
+                "로그인ID": d["login_id"],
+                "활성": "✅" if d["is_active"] else "❌",
+            } for d in drivers])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            toggle_dr = st.number_input("기사 ID (활성/비활성 전환)", min_value=1, step=1, value=1)
+            if st.button("기사 활성/비활성 전환", use_container_width=True):
+                cur = next((d for d in drivers if d["id"] == toggle_dr), None)
+                if cur:
+                    client.table("app_delivery_drivers").update({"is_active": not cur["is_active"]}).eq("id", int(toggle_dr)).execute()
+                    st.rerun()
+
+
+def render_delivery_slot_settings() -> None:
+    """
+    배송 슬롯 설정 — 마스터 + delivery_staff 접근 가능.
+    탭 1: 요일별 기본 슬롯 설정
+    탭 2: 날짜별 예외 설정
+    탭 3: 슬롯 현황 달력
+    """
+    from datetime import date, timedelta
+    user = st.session_state.get("current_user", {})
+    org_id = user.get("org_id")
+    role = user.get("role", "")
+    client, _ = get_supabase_client()
+    if not client or not org_id:
+        return
+
+    st.subheader("🗓️ 배송 슬롯 설정")
+
+    # 지역 목록
+    try:
+        rg_res = client.table("app_delivery_regions").select("id,region_name").eq("org_id", int(org_id)).eq("is_active", True).order("id").execute()
+        regions = rg_res.data or []
+    except Exception:
+        regions = []
+
+    if not regions:
+        st.warning("등록된 지역이 없습니다. 지역 관리 메뉴에서 먼저 등록해 주세요.")
+        return
+
+    region_options = {r["region_name"]: r["id"] for r in regions}
+
+    # delivery_staff는 자기 지역만
+    if _is_delivery_role(role):
+        driver_region_id = user.get("region_id")
+        region_options = {k: v for k, v in region_options.items() if v == driver_region_id}
+
+    if not region_options:
+        st.info("접근 가능한 지역이 없습니다.")
+        return
+
+    sel_region_name = st.selectbox("지역 선택", list(region_options.keys()))
+    sel_region_id = region_options[sel_region_name]
+
+    tab_template, tab_override, tab_calendar = st.tabs(["📅 요일별 기본 설정", "📌 날짜별 예외", "📊 슬롯 현황"])
+
+    _DAYS = ["월", "화", "수", "목", "금", "토", "일"]
+    _SLOTS = {"morning": "오전", "afternoon": "오후"}
+
+    with tab_template:
+        st.markdown("요일별 오전/오후 최대 배송 건수를 설정합니다. (0 = 휴무)")
+        # 기존 설정 로드
+        try:
+            tpl_res = client.table("app_delivery_slot_templates").select("day_of_week,time_slot,max_count").eq("region_id", int(sel_region_id)).execute()
+            tpl_data = {(t["day_of_week"], t["time_slot"]): t["max_count"] for t in (tpl_res.data or [])}
+        except Exception:
+            tpl_data = {}
+
+        with st.form(f"slot_template_form_{sel_region_id}"):
+            new_vals = {}
+            cols = st.columns(7)
+            for di, day in enumerate(_DAYS):
+                with cols[di]:
+                    st.markdown(f"**{day}**")
+                    for slot_key, slot_label in _SLOTS.items():
+                        cur_val = tpl_data.get((di, slot_key), 0)
+                        new_vals[(di, slot_key)] = st.number_input(
+                            slot_label, min_value=0, max_value=20, value=cur_val,
+                            key=f"tpl_{sel_region_id}_{di}_{slot_key}",
+                        )
+            saved = st.form_submit_button("저장", type="primary", use_container_width=True)
+
+        if saved:
+            for (dow, slot), cnt in new_vals.items():
+                try:
+                    client.table("app_delivery_slot_templates").upsert({
+                        "org_id": int(org_id),
+                        "region_id": int(sel_region_id),
+                        "day_of_week": dow,
+                        "time_slot": slot,
+                        "max_count": int(cnt),
+                    }, on_conflict="region_id,day_of_week,time_slot").execute()
+                except Exception:
+                    pass
+            st.success("슬롯 설정 저장 완료!")
+            st.rerun()
+
+    with tab_override:
+        st.markdown("특정 날짜의 슬롯을 예외 설정합니다. (0 = 해당일 휴무)")
+        with st.form(f"slot_override_form_{sel_region_id}"):
+            ov_date = st.date_input("날짜")
+            ov_slot = st.radio("시간대", ["morning", "afternoon"], format_func=lambda x: "오전" if x == "morning" else "오후", horizontal=True)
+            ov_count = st.number_input("최대 건수", min_value=0, max_value=20, value=0)
+            ov_note = st.text_input("메모 (선택)")
+            sub_ov = st.form_submit_button("예외 설정 저장", type="primary", use_container_width=True)
+        if sub_ov:
+            try:
+                client.table("app_delivery_slot_overrides").upsert({
+                    "org_id": int(org_id),
+                    "region_id": int(sel_region_id),
+                    "override_date": ov_date.isoformat(),
+                    "time_slot": ov_slot,
+                    "max_count": int(ov_count),
+                    "note": ov_note.strip() or None,
+                }, on_conflict="region_id,override_date,time_slot").execute()
+                st.success(f"{ov_date} {('오전' if ov_slot=='morning' else '오후')} 예외 설정 완료!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"오류: {e}")
+
+        # 기존 예외 목록
+        try:
+            ov_res = client.table("app_delivery_slot_overrides").select("override_date,time_slot,max_count,note").eq("region_id", int(sel_region_id)).order("override_date").limit(30).execute()
+            overrides = ov_res.data or []
+        except Exception:
+            overrides = []
+        if overrides:
+            import pandas as _pd
+            df_ov = _pd.DataFrame([{
+                "날짜": o["override_date"],
+                "시간대": "오전" if o["time_slot"] == "morning" else "오후",
+                "최대건수": o["max_count"],
+                "메모": o.get("note") or "",
+            } for o in overrides])
+            st.dataframe(df_ov, use_container_width=True, hide_index=True)
+
+    with tab_calendar:
+        today = date.today()
+        view_month_offset = st.session_state.get(f"_slot_month_{sel_region_id}", 0)
+        col_prev, col_title, col_next = st.columns([1, 4, 1])
+        if col_prev.button("← 이전달", key=f"slot_prev_{sel_region_id}"):
+            st.session_state[f"_slot_month_{sel_region_id}"] = view_month_offset - 1
+            st.rerun()
+        if col_next.button("다음달 →", key=f"slot_next_{sel_region_id}"):
+            st.session_state[f"_slot_month_{sel_region_id}"] = view_month_offset + 1
+            st.rerun()
+
+        view_date = today.replace(day=1)
+        for _ in range(abs(view_month_offset)):
+            if view_month_offset > 0:
+                next_m = view_date.replace(day=28) + timedelta(days=4)
+                view_date = next_m.replace(day=1)
+            else:
+                view_date = (view_date - timedelta(days=1)).replace(day=1)
+        col_title.markdown(f"**{view_date.year}년 {view_date.month}월**", unsafe_allow_html=True)
+
+        # 해당 월 배송 사용량 조회
+        month_start = view_date
+        if view_date.month == 12:
+            month_end = view_date.replace(year=view_date.year+1, month=1, day=1) - timedelta(days=1)
+        else:
+            month_end = view_date.replace(month=view_date.month+1, day=1) - timedelta(days=1)
+
+        try:
+            used_res = client.table("app_deliveries").select("scheduled_date,time_slot").eq("region_id", int(sel_region_id)).gte("scheduled_date", month_start.isoformat()).lte("scheduled_date", month_end.isoformat()).not_.in_("status", ["cancelled"]).execute()
+            used_by_date: dict = {}
+            for u in (used_res.data or []):
+                k = (u["scheduled_date"], u["time_slot"])
+                used_by_date[k] = used_by_date.get(k, 0) + 1
+        except Exception:
+            used_by_date = {}
+
+        # 달력 렌더링
+        cal_html = '<table style="width:100%;border-collapse:collapse;font-size:0.8rem;">'
+        cal_html += '<tr>' + ''.join(f'<th style="padding:4px;text-align:center;background:#f0f0f0;">{d}</th>' for d in _DAYS) + '</tr>'
+
+        first_dow = ((month_start.weekday()) % 7)
+        cur_day = month_start - timedelta(days=first_dow)
+        while cur_day <= month_end or cur_day.weekday() != 0:
+            if cur_day.weekday() == 0:
+                cal_html += '<tr>'
+            if month_start <= cur_day <= month_end:
+                # 각 슬롯 용량 조회 (간략화: template만 사용, override 별도 표시)
+                dow = (cur_day.weekday()) % 7
+                morning_max = afternoon_max = 0
+                try:
+                    tm = client.table("app_delivery_slot_templates").select("max_count").eq("region_id", int(sel_region_id)).eq("day_of_week", dow).eq("time_slot", "morning").maybe_single().execute()
+                    morning_max = (tm.data or {}).get("max_count", 0) if tm.data else 0
+                    ta = client.table("app_delivery_slot_templates").select("max_count").eq("region_id", int(sel_region_id)).eq("day_of_week", dow).eq("time_slot", "afternoon").maybe_single().execute()
+                    afternoon_max = (ta.data or {}).get("max_count", 0) if ta.data else 0
+                except Exception:
+                    pass
+
+                m_used = used_by_date.get((cur_day.isoformat(), "morning"), 0)
+                a_used = used_by_date.get((cur_day.isoformat(), "afternoon"), 0)
+
+                def _color(used, mx):
+                    if mx == 0:
+                        return "#bbb"
+                    if used >= mx:
+                        return "#e53935"
+                    if mx - used <= 2:
+                        return "#fb8c00"
+                    return "#43a047"
+
+                mc = _color(m_used, morning_max)
+                ac = _color(a_used, afternoon_max)
+                is_today = "font-weight:700;" if cur_day == today else ""
+                cal_html += (
+                    f'<td style="border:1px solid #ddd;padding:4px;vertical-align:top;{is_today}">'
+                    f'<div style="font-size:0.75rem;">{cur_day.day}</div>'
+                    f'<div style="color:{mc};font-size:0.7rem;">오전 {m_used}/{morning_max}</div>'
+                    f'<div style="color:{ac};font-size:0.7rem;">오후 {a_used}/{afternoon_max}</div>'
+                    f'</td>'
+                )
+            else:
+                cal_html += '<td style="border:1px solid #eee;background:#fafafa;"></td>'
+            if cur_day.weekday() == 6:
+                cal_html += '</tr>'
+            cur_day += timedelta(days=1)
+        cal_html += '</table>'
+        st.markdown(cal_html, unsafe_allow_html=True)
+
+
+def render_delivery_date_picker(region_id: int | None = None) -> str | None:
+    """
+    판매 입력 화면 내 배송일 선택기.
+    "N주 후" 빠른 버튼 + 슬롯 잔여 날짜 목록 표시.
+    반환: 선택된 날짜 문자열 (YYYY-MM-DD) 또는 None
+    """
+    from datetime import date, timedelta
+    user = st.session_state.get("current_user", {})
+    org_id = user.get("org_id")
+
+    # region_id 없으면 조직 첫 번째 지역 사용
+    if region_id is None and org_id:
+        try:
+            client, _ = get_supabase_client()
+            if client:
+                rg = client.table("app_delivery_regions").select("id").eq("org_id", int(org_id)).eq("is_active", True).order("id").limit(1).execute()
+                region_id = rg.data[0]["id"] if rg.data else None
+        except Exception:
+            pass
+
+    st.markdown("**배송 희망일 선택**")
+
+    # 빠른 선택 버튼
+    quick_map = {"2주 후": 2, "3주 후": 3, "4주 후": 4, "6주 후": 6}
+    q_cols = st.columns(len(quick_map) + 1)
+    sel_weeks_key = "_delivery_weeks_sel"
+    sel_date_key = "_delivery_date_sel"
+
+    for i, (label, weeks) in enumerate(quick_map.items()):
+        if q_cols[i].button(label, key=f"dw_{weeks}", use_container_width=True):
+            st.session_state[sel_weeks_key] = weeks
+            st.session_state.pop(sel_date_key, None)
+            st.rerun()
+    if q_cols[-1].button("직접 선택", key="dw_custom", use_container_width=True):
+        st.session_state[sel_weeks_key] = 0
+        st.session_state.pop(sel_date_key, None)
+        st.rerun()
+
+    chosen_weeks = st.session_state.get(sel_weeks_key)
+
+    if chosen_weeks == 0:
+        # 직접 날짜 선택
+        chosen = st.date_input("날짜 선택", min_value=date.today() + timedelta(days=1), key="dd_custom_date")
+        slot_choice = st.radio("시간대", ["morning", "afternoon"], format_func=lambda x: "오전" if x == "morning" else "오후", horizontal=True, key="dd_custom_slot")
+        if st.button("이 날짜로 설정", type="primary", key="dd_set_custom"):
+            result = chosen.isoformat()
+            st.session_state[sel_date_key] = result
+            return result
+        return st.session_state.get(sel_date_key)
+
+    elif chosen_weeks:
+        if region_id:
+            from_dt = date.today() + timedelta(weeks=chosen_weeks - 1)
+            avail = _get_available_delivery_dates(region_id, weeks_ahead=2, from_date=from_dt)
+        else:
+            avail = []
+
+        if not avail:
+            st.warning("선택 기간에 배송 가능한 슬롯이 없습니다. 슬롯 설정을 확인해 주세요.")
+            return st.session_state.get(sel_date_key)
+
+        for item in avail[:10]:
+            from datetime import datetime
+            d = datetime.strptime(item["date"], "%Y-%m-%d").date()
+            day_kor = ["월","화","수","목","금","토","일"][d.weekday()]
+            col_info, col_m, col_a = st.columns([2, 1, 1])
+            col_info.markdown(f"**{item['date']} ({day_kor})**")
+            if item["morning"] > 0:
+                if col_m.button(f"오전 {item['morning']}건", key=f"ds_{item['date']}_m", use_container_width=True):
+                    result = item["date"]
+                    st.session_state[sel_date_key] = result
+                    st.session_state["_delivery_slot_sel"] = "morning"
+                    return result
+            else:
+                col_m.markdown("<span style='color:#bbb'>오전 마감</span>", unsafe_allow_html=True)
+            if item["afternoon"] > 0:
+                if col_a.button(f"오후 {item['afternoon']}건", key=f"ds_{item['date']}_a", use_container_width=True):
+                    result = item["date"]
+                    st.session_state[sel_date_key] = result
+                    st.session_state["_delivery_slot_sel"] = "afternoon"
+                    return result
+            else:
+                col_a.markdown("<span style='color:#bbb'>오후 마감</span>", unsafe_allow_html=True)
+
+    return st.session_state.get(sel_date_key)
+
+
+def render_delivery_schedule_admin() -> None:
+    """
+    배송 배정 + 상차완료 관리.
+    탭 1: 미배정 주문 → 날짜+기사 배정
+    탭 2: 상차관리 (assigned → loaded)
+    탭 3: 전체 배송 현황
+    """
+    from datetime import date, timedelta
+    user = st.session_state.get("current_user", {})
+    org_id = user.get("org_id")
+    client, _ = get_supabase_client()
+    if not client or not org_id:
+        return
+
+    st.subheader("🚚 배송 배정 관리")
+
+    # 지역 목록
+    try:
+        rg_res = client.table("app_delivery_regions").select("id,region_name").eq("org_id", int(org_id)).eq("is_active", True).order("id").execute()
+        regions = rg_res.data or []
+    except Exception:
+        regions = []
+
+    region_options = {"전체": None} | {r["region_name"]: r["id"] for r in regions}
+
+    tab_assign, tab_load, tab_status = st.tabs(["📋 배송 배정", "📦 상차완료 처리", "📊 배송 현황"])
+
+    with tab_assign:
+        sel_rg = st.selectbox("지역 필터", list(region_options.keys()), key="sched_region_filter")
+        sel_rg_id = region_options[sel_rg]
+
+        # 미배정 주문 목록 (app_deliveries.status='pending' 또는 app_orders에 delivery_date 있고 배송 미생성)
+        try:
+            dq = client.table("app_deliveries").select("id,order_id,scheduled_date,time_slot,status,region_id,driver_id").eq("org_id", int(org_id)).in_("status", ["pending"]).order("id", desc=False).limit(50)
+            if sel_rg_id:
+                dq = dq.eq("region_id", int(sel_rg_id))
+            pending_res = dq.execute()
+            pending = pending_res.data or []
+        except Exception:
+            pending = []
+
+        if not pending:
+            st.info("배정 대기 중인 배송이 없습니다.")
+        else:
+            for d in pending:
+                with st.expander(f"배송 #{d['id']} | 주문 #{d.get('order_id') or '-'} | {d.get('scheduled_date') or '날짜 미정'}"):
+                    # 기사 선택 (지역별)
+                    rg_id_for_driver = d.get("region_id") or sel_rg_id
+                    drivers = []
+                    if rg_id_for_driver:
+                        try:
+                            dr_res = client.table("app_delivery_drivers").select("id,driver_name").eq("region_id", int(rg_id_for_driver)).eq("is_active", True).execute()
+                            drivers = dr_res.data or []
+                        except Exception:
+                            pass
+
+                    new_date = st.date_input("배송일", value=date.today() + timedelta(days=14), key=f"assign_date_{d['id']}")
+                    new_slot = st.radio("시간대", ["morning", "afternoon", "any"],
+                                        format_func=lambda x: {"morning":"오전","afternoon":"오후","any":"미정"}[x],
+                                        horizontal=True, key=f"assign_slot_{d['id']}")
+                    driver_opts = {dr["driver_name"]: dr["id"] for dr in drivers}
+                    driver_opts["미배정"] = None
+                    chosen_driver = st.selectbox("담당 기사", list(driver_opts.keys()), key=f"assign_driver_{d['id']}")
+                    note = st.text_input("배송 메모", key=f"assign_note_{d['id']}")
+
+                    if st.button("배정 확정", type="primary", key=f"assign_confirm_{d['id']}"):
+                        update_data = {
+                            "status": "assigned",
+                            "scheduled_date": new_date.isoformat(),
+                            "time_slot": new_slot,
+                            "delivery_note": note or None,
+                        }
+                        if driver_opts[chosen_driver]:
+                            update_data["driver_id"] = int(driver_opts[chosen_driver])
+                        if rg_id_for_driver:
+                            update_data["region_id"] = int(rg_id_for_driver)
+                        try:
+                            client.table("app_deliveries").update(update_data).eq("id", d["id"]).execute()
+                            st.success("배정 완료!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"오류: {e}")
+
+    with tab_load:
+        load_date = st.date_input("상차 날짜", value=date.today(), key="load_date_sel")
+        try:
+            ld_res = client.table("app_deliveries").select("id,order_id,driver_id,time_slot,app_delivery_drivers(driver_name),app_delivery_regions(region_name)").eq("org_id", int(org_id)).eq("status", "assigned").eq("scheduled_date", load_date.isoformat()).execute()
+            load_list = ld_res.data or []
+        except Exception:
+            load_list = []
+
+        if not load_list:
+            st.info(f"{load_date} 상차 예정 배송이 없습니다.")
+        else:
+            st.markdown(f"**{load_date} 상차 예정: {len(load_list)}건**")
+            select_all = st.checkbox("전체 선택", key="load_select_all")
+            checked = {}
+            for d in load_list:
+                dr_name = (d.get("app_delivery_drivers") or {}).get("driver_name", "미배정")
+                rg_name = (d.get("app_delivery_regions") or {}).get("region_name", "-")
+                slot_label = {"morning":"오전","afternoon":"오후","any":"미정"}.get(d.get("time_slot","any"), "미정")
+                checked[d["id"]] = st.checkbox(
+                    f"배송 #{d['id']} | 주문 #{d.get('order_id') or '-'} | {rg_name} | {slot_label} | {dr_name}",
+                    value=select_all,
+                    key=f"load_chk_{d['id']}",
+                )
+            from datetime import datetime, timezone as _tz
+            if st.button("✅ 선택 항목 상차완료 처리", type="primary", use_container_width=True):
+                ids_to_load = [did for did, chk in checked.items() if chk]
+                for did in ids_to_load:
+                    client.table("app_deliveries").update({
+                        "status": "loaded",
+                        "loaded_at": datetime.now(_tz.utc).isoformat(),
+                    }).eq("id", int(did)).execute()
+                st.success(f"{len(ids_to_load)}건 상차완료 처리됐습니다.")
+                st.rerun()
+
+    with tab_status:
+        import pandas as _pd
+        status_filter = st.multiselect("상태 필터", ["pending","assigned","loaded","arrived","completed","cancelled"],
+                                       default=["assigned","loaded","arrived"])
+        try:
+            st_res = client.table("app_deliveries").select("id,order_id,scheduled_date,time_slot,status,loaded_at,arrived_at,completed_at,app_delivery_regions(region_name),app_delivery_drivers(driver_name)").eq("org_id", int(org_id)).in_("status", status_filter).order("scheduled_date", desc=False).limit(100).execute()
+            stat_list = st_res.data or []
+        except Exception:
+            stat_list = []
+        if stat_list:
+            df = _pd.DataFrame([{
+                "#": d["id"],
+                "주문": d.get("order_id") or "-",
+                "배송일": d.get("scheduled_date") or "-",
+                "시간대": {"morning":"오전","afternoon":"오후","any":"미정"}.get(d.get("time_slot","any"), "-"),
+                "지역": (d.get("app_delivery_regions") or {}).get("region_name", "-"),
+                "기사": (d.get("app_delivery_drivers") or {}).get("driver_name", "-"),
+                "상태": d["status"],
+                "상차완료": d.get("loaded_at", "-") or "-",
+                "도착확인": d.get("arrived_at", "-") or "-",
+                "배송완료": d.get("completed_at", "-") or "-",
+            } for d in stat_list])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("해당 상태의 배송이 없습니다.")
+
+
+def render_delivery_portal() -> None:
+    """
+    배송기사 전용 포털 (?page=delivery).
+    region_id 격리: 자신의 지역 배송만 조회.
+    loaded → arrived → completed 상태 처리.
+    """
+    from datetime import datetime, timezone as _tz, date, timedelta
+    import hashlib as _hl
+
+    _inject_branding_css()
+
+    # ── 배송기사 로그인 분기
+    user = st.session_state.get("current_user", {})
+    role = user.get("role", "")
+    org_id = user.get("org_id")
+
+    if not st.session_state.get("logged_in") or not _is_delivery_role(role):
+        # 배송기사 전용 로그인
+        st.title("🚚 배송팀 포털")
+        st.markdown("배송팀 전용 로그인 화면입니다.")
+        with st.form("delivery_login"):
+            org_id_input = st.number_input("조직 ID", min_value=1, step=1, help="관리자에게 문의")
+            login_id = st.text_input("로그인 ID")
+            password = st.text_input("비밀번호", type="password")
+            sub = st.form_submit_button("로그인", type="primary", use_container_width=True)
+        if sub:
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error("서버 오류")
+                return
+            pw_hash = _hl.sha256(password.encode()).hexdigest()
+            try:
+                dr = client.table("app_delivery_drivers").select("id,driver_name,region_id,is_active,app_delivery_regions(region_name)").eq("org_id", int(org_id_input)).eq("login_id", login_id.strip()).eq("password_hash", pw_hash).maybe_single().execute()
+                data = dr.data if isinstance(dr.data, dict) else (dr.data[0] if dr.data else None)
+                if not data:
+                    st.error("로그인 정보가 올바르지 않습니다.")
+                    return
+                if not data["is_active"]:
+                    st.error("비활성화된 계정입니다. 관리자에게 문의하세요.")
+                    return
+                st.session_state.logged_in = True
+                st.session_state.current_user = {
+                    "role": "delivery_staff",
+                    "driver_id": data["id"],
+                    "driver_name": data["driver_name"],
+                    "region_id": data["region_id"],
+                    "region_name": (data.get("app_delivery_regions") or {}).get("region_name", ""),
+                    "org_id": org_id_input,
+                }
+                st.rerun()
+            except Exception as e:
+                st.error(f"로그인 오류: {e}")
+        return
+
+    # ── 배송기사 메인 화면
+    region_id = user.get("region_id")
+    region_name = user.get("region_name", "")
+    driver_name = user.get("driver_name", "")
+
+    st.title(f"🚚 배송 포털 — {region_name} ({driver_name})")
+
+    client, _ = get_supabase_client()
+    if not client:
+        st.error("DB 연결 오류")
+        return
+
+    # 날짜 탭
+    today = date.today()
+    tab_today, tab_tomorrow, tab_week = st.tabs([
+        f"오늘 ({today.strftime('%m/%d')})",
+        f"내일 ({(today+timedelta(days=1)).strftime('%m/%d')})",
+        "이번 주 전체",
+    ])
+
+    def _render_driver_list(deliveries: list, key_prefix: str):
+        if not deliveries:
+            st.info("해당 날짜에 배송이 없습니다.")
+            return
+        for d in deliveries:
+            slot_label = {"morning":"오전","afternoon":"오후","any":"미정"}.get(d.get("time_slot","any"), "미정")
+            status_label = {
+                "loaded": "📦 상차완료 → 도착확인 필요",
+                "arrived": "✅ 도착확인 완료 → 배송완료 처리 필요",
+                "completed": "🏁 배송완료",
+            }.get(d["status"], d["status"])
+
+            # 고객·주문 정보 조회
+            order_id = d.get("order_id")
+            customer_info = ""
+            product_info = ""
+            if order_id:
+                try:
+                    ord_r = client.table("app_orders").select("customer_id,delivery_date,app_customers(name,phone1,address,delivery_address_detail,elevator_yn,delivery_note)").eq("id", int(order_id)).maybe_single().execute()
+                    ord_data = ord_r.data if isinstance(ord_r.data, dict) else {}
+                    cust = (ord_data or {}).get("app_customers") or {}
+                    customer_info = f"{cust.get('name','')} | {cust.get('phone1','')} | {cust.get('address','')} {cust.get('delivery_address_detail','')}"
+                    elev = "엘리베이터 있음" if cust.get("elevator_yn") else "엘리베이터 없음"
+                except Exception:
+                    pass
+                try:
+                    items_r = client.table("app_order_items").select("product_name,qty,unit_price,selected_options").eq("order_id", int(order_id)).execute()
+                    items = items_r.data or []
+                    if items:
+                        product_info = " / ".join(
+                            f"{it['product_name']} ×{it['qty']}"
+                            for it in items
+                        )
+                except Exception:
+                    pass
+
+            with st.container():
+                st.markdown(
+                    f"""<div style="border:1px solid #ddd;border-radius:8px;padding:0.8rem;margin-bottom:0.6rem;">
+                      <b>#{d['id']}</b> &nbsp; {slot_label} &nbsp; <span style="color:#1f77b4">{status_label}</span><br>
+                      <small>👤 {customer_info}</small><br>
+                      {"<small>🪑 " + product_info + "</small><br>" if product_info else ""}
+                      {("<small>🚪 " + elev + "</small><br>") if customer_info else ""}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+                col_note, col_action = st.columns([2, 1])
+                memo = col_note.text_input("현장 메모", value=d.get("driver_memo") or "", key=f"memo_{d['id']}_{key_prefix}")
+                if d["status"] == "loaded":
+                    if col_action.button("📍 도착확인", key=f"arrive_{d['id']}_{key_prefix}", type="primary", use_container_width=True):
+                        client.table("app_deliveries").update({
+                            "status": "arrived",
+                            "arrived_at": datetime.now(_tz.utc).isoformat(),
+                            "driver_memo": memo or None,
+                        }).eq("id", d["id"]).execute()
+                        st.rerun()
+                elif d["status"] == "arrived":
+                    if col_action.button("✅ 배송완료", key=f"done_{d['id']}_{key_prefix}", type="primary", use_container_width=True):
+                        client.table("app_deliveries").update({
+                            "status": "completed",
+                            "completed_at": datetime.now(_tz.utc).isoformat(),
+                            "driver_memo": memo or None,
+                        }).eq("id", d["id"]).execute()
+                        st.rerun()
+                elif d["status"] == "completed":
+                    col_action.success("완료")
+
+    def _load_deliveries(target_date=None, week_start=None, week_end=None):
+        try:
+            q = (
+                client.table("app_deliveries")
+                .select("id,order_id,scheduled_date,time_slot,status,driver_memo,app_delivery_regions(region_name)")
+                .eq("region_id", int(region_id))
+                .in_("status", ["loaded", "arrived", "completed"])
+                .order("time_slot")
+            )
+            if target_date:
+                q = q.eq("scheduled_date", target_date.isoformat())
+            elif week_start and week_end:
+                q = q.gte("scheduled_date", week_start.isoformat()).lte("scheduled_date", week_end.isoformat())
+            return q.execute().data or []
+        except Exception:
+            return []
+
+    with tab_today:
+        _render_driver_list(_load_deliveries(target_date=today), "today")
+    with tab_tomorrow:
+        _render_driver_list(_load_deliveries(target_date=today + timedelta(days=1)), "tomorrow")
+    with tab_week:
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
+        _render_driver_list(_load_deliveries(week_start=week_start, week_end=week_end), "week")
+
+    st.markdown("---")
+    if st.button("🔓 로그아웃", use_container_width=True):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
 
 
 def render_admin_console():
@@ -14748,6 +16064,40 @@ def main():
         render_billing_page()
         return
 
+    # 배송기사 포털 (?page=delivery) — 비로그인도 접근 가능 (자체 로그인 처리)
+    if _page_param == "delivery":
+        render_delivery_portal()
+        return
+
+    # 제품 카탈로그 관리 (?page=products) — Pro 에디션
+    if _page_param == "products":
+        render_product_catalog_admin()
+        return
+
+    # 배송 관리 (?page=delivery_admin) — 관리자용
+    if _page_param == "delivery_admin":
+        if _is_manager(role):
+            render_delivery_schedule_admin()
+        else:
+            st.error("접근 권한이 없습니다.")
+        return
+
+    # 슬롯 설정 (?page=delivery_slots)
+    if _page_param == "delivery_slots":
+        if _is_manager(role) or _is_delivery_role(role):
+            render_delivery_slot_settings()
+        else:
+            st.error("접근 권한이 없습니다.")
+        return
+
+    # 지역·기사 관리 (?page=delivery_regions)
+    if _page_param == "delivery_regions":
+        if _is_billing_role(role):
+            render_delivery_region_admin()
+        else:
+            st.error("조직 소유자(org_owner)만 접근 가능합니다.")
+        return
+
     # 트라이얼 / 잠금 체크 (superadmin·momo operator 제외)
     if not _is_momo_operator(role):
         _org_id = user.get("org_id")
@@ -14757,6 +16107,8 @@ def main():
             if _trial_st.get("locked"):
                 render_trial_locked_page()
                 return
+            # Pro 에디션 사이드바 메뉴
+            _render_pro_sidebar_menu(int(_org_id))
             # 온보딩 위저드: org_owner가 onboarding_done=False 인 경우
             if _is_org_level(role) and not st.session_state.get("_onboarding_done_cache"):
                 try:
