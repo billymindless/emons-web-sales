@@ -17,6 +17,7 @@ import textwrap
 import traceback
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 from datetime import datetime, date, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
@@ -14379,6 +14380,9 @@ def main():
 
     user = st.session_state.current_user
     role = user["role"]
+
+    # 세션 유지 하트비트: 5분(300,000ms)마다 rerun으로 Streamlit Cloud 세션 만료 방지
+    st_autorefresh(interval=300_000, limit=None, key="session_keepalive")
 
     # 쿼리 파라미터를 이용한 홈 이동(?home=1) 처리:
     # 로고 클릭 시 언제든지 메인 대시보드/홈으로 돌아갈 수 있도록,
