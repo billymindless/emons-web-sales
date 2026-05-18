@@ -5164,6 +5164,14 @@ def _try_restore_from_query_params():
     user = _verify_auth_token(auth)
     if not user:
         return False
+    # allowed_stores는 JWT 토큰에 포함되지 않으므로 DB에서 다시 조회
+    if user.get("role") != "superadmin":
+        try:
+            user["allowed_stores"] = get_user_allowed_stores(user["id"])
+        except Exception:
+            user["allowed_stores"] = []
+    else:
+        user["allowed_stores"] = []
     st.session_state.logged_in = True
     st.session_state.current_user = user
     st.session_state.current_db = user.get("db_filename") if user.get("role") != "superadmin" else None
