@@ -5197,19 +5197,23 @@ def _inject_js_url_auth_save_and_replace_state():
 
 
 def _inject_js_localStorage_redirect_with_auth():
-    """로그인 페이지: URL에 토큰이 없을 때만. localStorage(또는 sessionStorage)에 토큰이 있으면 ?auth= 붙여 한 번만 이동."""
+    """로그인 페이지: URL에 토큰이 없을 때만. localStorage(또는 sessionStorage)에 토큰이 있으면 ?auth= 붙여 한 번만 이동.
+    토큰이 없으면 console.log로 알려서 F12 디버깅 가능."""
     st.markdown(
         """
         <script>
         (function(){
-            if (window.location.search.includes("auth=")) return;
+            if (window.location.search.includes("auth=")) { console.log("[momo-auth] URL에 ?auth= 이미 있음, redirect 생략"); return; }
             var key = "emons_auth";
             var val = localStorage.getItem(key);
             if (!val) { val = sessionStorage.getItem(key); if (val) { localStorage.setItem(key, val); } }
             if (val) {
+                console.log("[momo-auth] localStorage 토큰 발견 → ?auth= 붙여 reload");
                 var u = new URL(window.location.href);
                 u.searchParams.set("auth", val);
                 window.location.replace(u.toString());
+            } else {
+                console.log("[momo-auth] localStorage에 토큰 없음 → 로그인 필요");
             }
         })();
         </script>
@@ -5240,7 +5244,8 @@ def _inject_js_clear_auth_on_logout():
 
 def _inject_js_save_token(token: str):
     """로그인 성공 직후: 발급된 토큰을 localStorage/sessionStorage에 저장 (reload 없이).
-    다음 새로고침 시 _inject_js_localStorage_redirect_with_auth에서 ?auth= 로 붙여 세션 복구한다."""
+    다음 새로고침 시 _inject_js_localStorage_redirect_with_auth에서 ?auth= 로 붙여 세션 복구한다.
+    안전망: 즉시 1회 + 500ms 후 1회 추가 저장으로 DOM 준비 전 실행되어도 누락 방지."""
     if not token:
         return
     safe = json.dumps(str(token))
@@ -5248,12 +5253,16 @@ def _inject_js_save_token(token: str):
         f"""
         <script>
         (function(){{
-            try {{
-                var token = {safe};
-                localStorage.setItem("emons_auth", token);
-                sessionStorage.setItem("emons_auth", token);
-                console.log("--- 토큰 저장됨 (로그인 성공) ---");
-            }} catch(e) {{}}
+            var token = {safe};
+            function _saveToken() {{
+                try {{
+                    localStorage.setItem("emons_auth", token);
+                    sessionStorage.setItem("emons_auth", token);
+                    console.log("[momo-auth] 토큰 저장됨 (로그인 성공), 길이:", token.length);
+                }} catch(e) {{ console.warn("[momo-auth] 토큰 저장 실패:", e); }}
+            }}
+            _saveToken();
+            setTimeout(_saveToken, 500);
         }})();
         </script>
         """,
@@ -5735,6 +5744,7 @@ def render_login():
                             st.error(f"로그인 중 오류가 발생했습니다: {err_msg}")
 
     st.caption("💡 로그인할 때 사용한 이메일은 이 기기(브라우저)에만 저장되며, 다음 로그인 시 자동으로 채워집니다.")
+    st.caption("🔒 한 번 로그인하면 이 브라우저에서 **30일간 자동 로그인**이 유지됩니다 (회사 PC 전용).")
 
     # 이메일 자동 저장/자동 입력: localStorage 사용 (같은 브라우저에서 다음 로그인 시 이메일 유지)
     # 1) URL에 email이 없고 localStorage에 저장된 이메일이 있으면 ?email= 붙여서 이동 → 서버에서 default value로 채움
@@ -5745,7 +5755,10 @@ def render_login():
         (function(){
             var KEY = 'emons_login_email';
             try {
+                // 자동 로그인 토큰 redirect와 충돌 방지: emons_auth가 localStorage에 있으면 그쪽이 먼저 처리하도록 양보
+                if (localStorage.getItem('emons_auth')) { return; }
                 var u = new URL(window.location.href);
+                if (u.searchParams.get('auth')) { return; }
                 if (!u.searchParams.get('email') && localStorage.getItem(KEY)) {
                     u.searchParams.set('email', localStorage.getItem(KEY));
                     window.location.replace(u.toString());
