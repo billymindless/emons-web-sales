@@ -5170,65 +5170,15 @@ def _try_restore_from_query_params():
 
 
 def _inject_js_url_auth_save_and_replace_state():
-    """URL에 ?auth= 가 있으면 부모 윈도우의 localStorage에 저장 + URL에서 ?auth= 제거.
-    components.html(iframe) 안에서 window.parent로 부모 접근. <script>가 실제로 실행되도록 보장."""
-    components.html(
-        """
-        <script>
-        (function(){
-            try {
-                var w = window.parent;
-                var params = new URLSearchParams(w.location.search);
-                var auth = params.get("auth");
-                if (auth) {
-                    w.localStorage.setItem("emons_auth", auth);
-                    w.sessionStorage.setItem("emons_auth", auth);
-                    console.log("[momo-auth] URL의 토큰을 localStorage에 동기화 (length:", auth.length, ")");
-                    params.delete("auth");
-                    var cleanUrl = w.location.pathname + (params.toString() ? "?" + params.toString() : "");
-                    w.history.replaceState({}, "", cleanUrl);
-                }
-            } catch(e) { console.warn("[momo-auth] url sync 실패:", e); }
-        })();
-        </script>
-        """,
-        height=0,
-    )
+    """[비활성] components.html iframe sandbox 제약으로 부모 navigation/URL 변경이 차단되므로,
+    URL에서 ?auth= 를 제거하지 않고 그대로 유지한다. F5 시 URL의 ?auth= 로 자동 복구."""
+    return
 
 
 def _inject_js_localStorage_redirect_with_auth():
-    """로그인 페이지: 부모 윈도우의 localStorage에 토큰이 있으면 ?auth= 붙여 한 번만 reload.
-    components.html(iframe) 안에서 window.parent로 부모 접근."""
-    components.html(
-        """
-        <script>
-        (function(){
-            try {
-                var w = window.parent;
-                if (w.location.search.includes("auth=")) {
-                    console.log("[momo-auth] URL에 ?auth= 이미 있음, redirect 생략");
-                    return;
-                }
-                var key = "emons_auth";
-                var val = w.localStorage.getItem(key);
-                if (!val) {
-                    val = w.sessionStorage.getItem(key);
-                    if (val) { w.localStorage.setItem(key, val); }
-                }
-                if (val) {
-                    console.log("[momo-auth] localStorage 토큰 발견 → ?auth= 붙여 reload (length:", val.length, ")");
-                    var u = new URL(w.location.href);
-                    u.searchParams.set("auth", val);
-                    w.location.replace(u.toString());
-                } else {
-                    console.log("[momo-auth] localStorage에 토큰 없음 → 로그인 필요");
-                }
-            } catch(e) { console.warn("[momo-auth] redirect 실패:", e); }
-        })();
-        </script>
-        """,
-        height=0,
-    )
+    """[비활성] components.html iframe sandbox 제약으로 부모 navigation이 SecurityError로 차단됨.
+    토큰 자동 복구는 URL ?auth= 파라미터 유지 방식으로 처리한다."""
+    return
 
 
 def _inject_js_clear_auth_on_logout():
@@ -5740,14 +5690,22 @@ def render_login():
                                 }
                                 # 성공 시 다음 접속을 위해 이메일을 브라우저에 저장할 예정(메인 로드 시 스크립트로 저장)
                                 st.session_state["_pending_save_login_email"] = str(email).strip()
-                                # 자동 로그인 유지용 토큰 생성 (30일) → main()에서 localStorage에 저장
-                                st.session_state["_pending_auth_token"] = _create_auth_token({
+                                # 자동 로그인 유지용 토큰 생성 (30일).
+                                # 핵심: Streamlit components.html iframe의 sandbox 제약으로 JS 기반 navigation이 차단되므로,
+                                # localStorage 의존을 포기하고 URL ?auth= 파라미터에 토큰을 직접 유지하여
+                                # F5 새로고침 시 URL이 살아남는 것을 이용해 자동 복구한다.
+                                _auth_token = _create_auth_token({
                                     "id": user_id,
                                     "username": uname,
                                     "role": role,
                                     "store_id": store_id,
                                     "db_filename": db_filename,
                                 })
+                                st.session_state["_pending_auth_token"] = _auth_token
+                                try:
+                                    st.query_params["auth"] = _auth_token
+                                except Exception:
+                                    pass
                                 st.rerun()
                     except Exception as e:
                         # 디버깅용: 어디에서 오류가 나는지 터미널에 전체 스택을 출력
@@ -14414,9 +14372,8 @@ def main():
         )
 
     # Supabase Auth: 로그인하지 않았으면 로그인 화면만 표시
+    # (자동 복구는 URL ?auth= 파라미터 + _try_restore_from_query_params() 로 처리됨)
     if not st.session_state.logged_in:
-        # localStorage에 토큰이 있으면 ?auth= 붙여 한 번 reload → 위쪽 _try_restore_from_query_params로 복구됨
-        _inject_js_localStorage_redirect_with_auth()
         render_login()
         return
 
@@ -14549,6 +14506,11 @@ def main():
             pass
         for key in list(st.session_state.keys()):
             del st.session_state[key]
+        # URL에 보존된 ?auth= 토큰도 함께 정리 (자동 재로그인 차단)
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
         st.rerun()
 
     # 관리자 전용 모니터링 화면 라우팅
