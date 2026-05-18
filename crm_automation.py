@@ -73,17 +73,17 @@ def _query_targets(
     조건에 맞는 고객(중복 제거)을 DataFrame으로 반환.
     """
     sc = _get_supabase()
-    if not sc or not store_name:
+    if not sc or not db_filename:
         return pd.DataFrame()
     try:
-        # app_orders 조회 (store_name 기준)
+        # app_orders 조회 (db_filename 기준 — store_name 컬럼 없음)
         q = (
             sc.table("app_orders")
             .select(
                 "id, customer_id, order_date, delivery_date, category,"
                 " total_amount, employee_names"
             )
-            .eq("store_name", store_name)
+            .eq("db_filename", db_filename)
         )
         if order_date_start:
             q = q.gte("order_date", str(order_date_start))
