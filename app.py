@@ -16,6 +16,7 @@ import threading
 import textwrap
 import traceback
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from datetime import datetime, date, timedelta, time as dt_time, timezone
 from zoneinfo import ZoneInfo
@@ -5169,95 +5170,106 @@ def _try_restore_from_query_params():
 
 
 def _inject_js_url_auth_save_and_replace_state():
-    """
-    최상단 스크립트: URL에 ?auth= 가 있으면 가장 먼저 실행.
-    1) auth 값을 localStorage + sessionStorage에 즉시 저장
-    2) history.replaceState로만 URL에서 ?auth= 제거 (리다이렉트/ pushState 사용 안 함 → Session History Skippable 경고 방지)
-    """
-    st.markdown(
+    """URL에 ?auth= 가 있으면 부모 윈도우의 localStorage에 저장 + URL에서 ?auth= 제거.
+    components.html(iframe) 안에서 window.parent로 부모 접근. <script>가 실제로 실행되도록 보장."""
+    components.html(
         """
         <script>
         (function(){
-            var params = new URLSearchParams(window.location.search);
-            var auth = params.get("auth");
-            if (auth) {
-                var key = "emons_auth";
-                localStorage.setItem(key, auth);
-                sessionStorage.setItem(key, auth);
-                console.log("--- 토큰 저장됨 ---");
-                params.delete("auth");
-                var cleanUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
-                window.history.replaceState({}, "", cleanUrl);
-            }
+            try {
+                var w = window.parent;
+                var params = new URLSearchParams(w.location.search);
+                var auth = params.get("auth");
+                if (auth) {
+                    w.localStorage.setItem("emons_auth", auth);
+                    w.sessionStorage.setItem("emons_auth", auth);
+                    console.log("[momo-auth] URL의 토큰을 localStorage에 동기화 (length:", auth.length, ")");
+                    params.delete("auth");
+                    var cleanUrl = w.location.pathname + (params.toString() ? "?" + params.toString() : "");
+                    w.history.replaceState({}, "", cleanUrl);
+                }
+            } catch(e) { console.warn("[momo-auth] url sync 실패:", e); }
         })();
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
 
 
 def _inject_js_localStorage_redirect_with_auth():
-    """로그인 페이지: URL에 토큰이 없을 때만. localStorage(또는 sessionStorage)에 토큰이 있으면 ?auth= 붙여 한 번만 이동.
-    토큰이 없으면 console.log로 알려서 F12 디버깅 가능."""
-    st.markdown(
+    """로그인 페이지: 부모 윈도우의 localStorage에 토큰이 있으면 ?auth= 붙여 한 번만 reload.
+    components.html(iframe) 안에서 window.parent로 부모 접근."""
+    components.html(
         """
         <script>
         (function(){
-            if (window.location.search.includes("auth=")) { console.log("[momo-auth] URL에 ?auth= 이미 있음, redirect 생략"); return; }
-            var key = "emons_auth";
-            var val = localStorage.getItem(key);
-            if (!val) { val = sessionStorage.getItem(key); if (val) { localStorage.setItem(key, val); } }
-            if (val) {
-                console.log("[momo-auth] localStorage 토큰 발견 → ?auth= 붙여 reload");
-                var u = new URL(window.location.href);
-                u.searchParams.set("auth", val);
-                window.location.replace(u.toString());
-            } else {
-                console.log("[momo-auth] localStorage에 토큰 없음 → 로그인 필요");
-            }
+            try {
+                var w = window.parent;
+                if (w.location.search.includes("auth=")) {
+                    console.log("[momo-auth] URL에 ?auth= 이미 있음, redirect 생략");
+                    return;
+                }
+                var key = "emons_auth";
+                var val = w.localStorage.getItem(key);
+                if (!val) {
+                    val = w.sessionStorage.getItem(key);
+                    if (val) { w.localStorage.setItem(key, val); }
+                }
+                if (val) {
+                    console.log("[momo-auth] localStorage 토큰 발견 → ?auth= 붙여 reload (length:", val.length, ")");
+                    var u = new URL(w.location.href);
+                    u.searchParams.set("auth", val);
+                    w.location.replace(u.toString());
+                } else {
+                    console.log("[momo-auth] localStorage에 토큰 없음 → 로그인 필요");
+                }
+            } catch(e) { console.warn("[momo-auth] redirect 실패:", e); }
         })();
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
 
 
 def _inject_js_clear_auth_on_logout():
-    """유일한 삭제 경로 1: 유저가 로그아웃 버튼을 클릭했을 때만 호출됨."""
-    st.markdown(
+    """유일한 삭제 경로 1: 유저가 로그아웃 버튼을 클릭했을 때만 호출됨.
+    components.html(iframe) 안에서 window.parent로 부모 접근."""
+    components.html(
         """
         <script>
         (function(){
-            var key = "emons_auth";
-            localStorage.removeItem(key);
-            sessionStorage.removeItem(key);
-            console.log("--- 토큰 삭제됨: 원인=로그아웃 버튼 클릭 ---");
-            var u = new URL(window.location.href);
-            u.searchParams.delete("logout");
-            window.history.replaceState({}, "", u.toString());
+            try {
+                var w = window.parent;
+                w.localStorage.removeItem("emons_auth");
+                w.sessionStorage.removeItem("emons_auth");
+                console.log("[momo-auth] 토큰 삭제됨: 원인=로그아웃 버튼 클릭");
+                var u = new URL(w.location.href);
+                u.searchParams.delete("logout");
+                w.history.replaceState({}, "", u.toString());
+            } catch(e) { console.warn("[momo-auth] logout 실패:", e); }
         })();
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
 
 
 def _inject_js_save_token(token: str):
-    """로그인 성공 직후: 발급된 토큰을 localStorage/sessionStorage에 저장 (reload 없이).
-    다음 새로고침 시 _inject_js_localStorage_redirect_with_auth에서 ?auth= 로 붙여 세션 복구한다.
-    안전망: 즉시 1회 + 500ms 후 1회 추가 저장으로 DOM 준비 전 실행되어도 누락 방지."""
+    """로그인 성공 직후: 발급된 토큰을 부모 윈도우의 localStorage/sessionStorage에 저장.
+    components.html(iframe) 안에서 window.parent로 부모 접근. 즉시 + 500ms 후 재시도로 안정성 강화."""
     if not token:
         return
     safe = json.dumps(str(token))
-    st.markdown(
+    components.html(
         f"""
         <script>
         (function(){{
             var token = {safe};
             function _saveToken() {{
                 try {{
-                    localStorage.setItem("emons_auth", token);
-                    sessionStorage.setItem("emons_auth", token);
+                    var w = window.parent;
+                    w.localStorage.setItem("emons_auth", token);
+                    w.sessionStorage.setItem("emons_auth", token);
                     console.log("[momo-auth] 토큰 저장됨 (로그인 성공), 길이:", token.length);
                 }} catch(e) {{ console.warn("[momo-auth] 토큰 저장 실패:", e); }}
             }}
@@ -5266,27 +5278,30 @@ def _inject_js_save_token(token: str):
         }})();
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
 
 
 def _inject_js_clear_auth_and_remove_auth_param():
-    """유일한 삭제 경로 2: 30일 만료 또는 서명 무효일 때만 호출됨. (URL 잘림 시에는 호출 안 함)"""
-    st.markdown(
+    """유일한 삭제 경로 2: 30일 만료 또는 서명 무효일 때만 호출됨.
+    components.html(iframe) 안에서 window.parent로 부모 접근."""
+    components.html(
         """
         <script>
         (function(){
-            var key = "emons_auth";
-            localStorage.removeItem(key);
-            sessionStorage.removeItem(key);
-            console.log("--- 토큰 삭제됨: 원인=30일 만료 또는 토큰 무효 ---");
-            var u = new URL(window.location.href);
-            u.searchParams.delete("auth");
-            window.history.replaceState({}, "", u.toString());
+            try {
+                var w = window.parent;
+                w.localStorage.removeItem("emons_auth");
+                w.sessionStorage.removeItem("emons_auth");
+                console.log("[momo-auth] 토큰 삭제됨: 원인=30일 만료 또는 토큰 무효");
+                var u = new URL(w.location.href);
+                u.searchParams.delete("auth");
+                w.history.replaceState({}, "", u.toString());
+            } catch(e) { console.warn("[momo-auth] clear 실패:", e); }
         })();
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
 
 
@@ -5749,46 +5764,28 @@ def render_login():
     # 이메일 자동 저장/자동 입력: localStorage 사용 (같은 브라우저에서 다음 로그인 시 이메일 유지)
     # 1) URL에 email이 없고 localStorage에 저장된 이메일이 있으면 ?email= 붙여서 이동 → 서버에서 default value로 채움
     # 2) 로그인 성공 시에는 메인 화면 로드 시 한 번만 localStorage에 저장(위에서 _pending_save_login_email 설정)
-    st.markdown(
+    # 이메일 자동입력: 부모 윈도우 localStorage 접근 (components.html iframe 안에서 실행)
+    # 단, 자동 로그인 토큰(emons_auth)이 있으면 _inject_js_localStorage_redirect_with_auth 가 먼저 처리하므로 양보
+    components.html(
         """
         <script>
         (function(){
             var KEY = 'emons_login_email';
             try {
-                // 자동 로그인 토큰 redirect와 충돌 방지: emons_auth가 localStorage에 있으면 그쪽이 먼저 처리하도록 양보
-                if (localStorage.getItem('emons_auth')) { return; }
-                var u = new URL(window.location.href);
+                var w = window.parent;
+                if (w.localStorage.getItem('emons_auth')) { return; }
+                var u = new URL(w.location.href);
                 if (u.searchParams.get('auth')) { return; }
-                if (!u.searchParams.get('email') && localStorage.getItem(KEY)) {
-                    u.searchParams.set('email', localStorage.getItem(KEY));
-                    window.location.replace(u.toString());
+                if (!u.searchParams.get('email') && w.localStorage.getItem(KEY)) {
+                    u.searchParams.set('email', w.localStorage.getItem(KEY));
+                    w.location.replace(u.toString());
                     return;
                 }
             } catch(e) {}
-            function attachSaveOnLoginClick() {
-                var forms = document.querySelectorAll('form');
-                for (var i = 0; i < forms.length; i++) {
-                    var form = forms[i];
-                    var btn = form.querySelector('button[kind="primary"], button');
-                    if (!btn || btn.textContent.trim() !== '로그인') continue;
-                    var inputs = form.querySelectorAll('input:not([type="password"])');
-                    var emailInput = inputs[0];
-                    if (!emailInput) continue;
-                    btn.removeEventListener('click', _saveEmail);
-                    btn.addEventListener('click', _saveEmail);
-                    function _saveEmail() {
-                        var val = (emailInput.value || '').trim();
-                        if (val) try { localStorage.setItem(KEY, val); } catch(e) {}
-                    }
-                    break;
-                }
-            }
-            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', attachSaveOnLoginClick);
-            else setTimeout(attachSaveOnLoginClick, 300);
         })();
         </script>
         """,
-        unsafe_allow_html=True,
+        height=0,
     )
     # 로그인 폼 input에 autocomplete 등 속성 최적화 (브라우저 자동 완성 동작)
     _inject_js_login_form_attributes()
@@ -14407,14 +14404,13 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # 로그인 성공 직후: 브라우저 localStorage에 이메일 저장(한 번만 실행 후 플래그 제거)
+    # 로그인 성공 직후: 부모 윈도우 localStorage에 이메일 저장(한 번만 실행 후 플래그 제거)
     _pending = st.session_state.pop("_pending_save_login_email", None)
     if _pending:
-        # json.dumps로 JS 문자열 이스케이프 후 </script> 시퀀스 추가 방어 (XSS 차단)
         _val_js = json.dumps(str(_pending)).replace("</", r"<\/").replace("<!--", r"<\!--")
-        st.markdown(
-            f'<script>(function(){{ try {{ localStorage.setItem("emons_login_email", {_val_js}); }} catch(e) {{}} }})();</script>',
-            unsafe_allow_html=True,
+        components.html(
+            f'<script>(function(){{ try {{ window.parent.localStorage.setItem("emons_login_email", {_val_js}); }} catch(e) {{}} }})();</script>',
+            height=0,
         )
 
     # Supabase Auth: 로그인하지 않았으면 로그인 화면만 표시
