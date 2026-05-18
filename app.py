@@ -5120,7 +5120,7 @@ def _create_auth_token(user_info: dict) -> str:
 
 
 def _verify_auth_token(token: str) -> dict | None:
-    """토큰 검증 + 로그인 후 1시간 이내인지 확인. 통과 시 유저 정보 dict, 아니면 None."""
+    """토큰 검증 + 로그인 후 AUTH_SESSION_SECONDS(=30일) 이내인지 확인. 통과 시 유저 정보 dict, 아니면 None."""
     if not token or "." not in token:
         return None
     try:
@@ -5135,7 +5135,7 @@ def _verify_auth_token(token: str) -> dict | None:
         payload = json.loads(raw.decode())
         if payload.get("exp", 0) < time.time():
             return None
-        # 로그인한 지 1시간 초과 시 세션 만료 (다중 새로고침 시에도 동일 기준)
+        # 로그인한 지 AUTH_SESSION_SECONDS(=30일) 초과 시 세션 만료
         logged_at = payload.get("logged_at", 0)
         if (time.time() - logged_at) > AUTH_SESSION_SECONDS:
             return None
@@ -5151,7 +5151,7 @@ def _verify_auth_token(token: str) -> dict | None:
 
 
 def _try_restore_from_query_params():
-    """URL의 auth가 있으면 검증(1시간 이내) 후 세션 복구. 복구 시 True."""
+    """URL의 auth가 있으면 검증(30일 이내) 후 세션 복구. 복구 시 True."""
     try:
         q = st.query_params
     except Exception:
@@ -5238,8 +5238,31 @@ def _inject_js_clear_auth_on_logout():
     )
 
 
+def _inject_js_save_token(token: str):
+    """로그인 성공 직후: 발급된 토큰을 localStorage/sessionStorage에 저장 (reload 없이).
+    다음 새로고침 시 _inject_js_localStorage_redirect_with_auth에서 ?auth= 로 붙여 세션 복구한다."""
+    if not token:
+        return
+    safe = json.dumps(str(token))
+    st.markdown(
+        f"""
+        <script>
+        (function(){{
+            try {{
+                var token = {safe};
+                localStorage.setItem("emons_auth", token);
+                sessionStorage.setItem("emons_auth", token);
+                console.log("--- 토큰 저장됨 (로그인 성공) ---");
+            }} catch(e) {{}}
+        }})();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _inject_js_clear_auth_and_remove_auth_param():
-    """유일한 삭제 경로 2: 1시간 만료 또는 서명 무효일 때만 호출됨. (URL 잘림 시에는 호출 안 함)"""
+    """유일한 삭제 경로 2: 30일 만료 또는 서명 무효일 때만 호출됨. (URL 잘림 시에는 호출 안 함)"""
     st.markdown(
         """
         <script>
@@ -5247,7 +5270,7 @@ def _inject_js_clear_auth_and_remove_auth_param():
             var key = "emons_auth";
             localStorage.removeItem(key);
             sessionStorage.removeItem(key);
-            console.log("--- 토큰 삭제됨: 원인=1시간 만료 또는 토큰 무효 ---");
+            console.log("--- 토큰 삭제됨: 원인=30일 만료 또는 토큰 무효 ---");
             var u = new URL(window.location.href);
             u.searchParams.delete("auth");
             window.history.replaceState({}, "", u.toString());
@@ -5693,6 +5716,14 @@ def render_login():
                                 }
                                 # 성공 시 다음 접속을 위해 이메일을 브라우저에 저장할 예정(메인 로드 시 스크립트로 저장)
                                 st.session_state["_pending_save_login_email"] = str(email).strip()
+                                # 자동 로그인 유지용 토큰 생성 (30일) → main()에서 localStorage에 저장
+                                st.session_state["_pending_auth_token"] = _create_auth_token({
+                                    "id": user_id,
+                                    "username": uname,
+                                    "role": role,
+                                    "store_id": store_id,
+                                    "db_filename": db_filename,
+                                })
                                 st.rerun()
                     except Exception as e:
                         # 디버깅용: 어디에서 오류가 나는지 터미널에 전체 스택을 출력
@@ -14301,6 +14332,20 @@ def main():
     _inject_favicon()
     _inject_branding_css()
 
+    # ========== 자동 로그인 복구 (30일 토큰) ==========
+    # 우선순위:
+    #  1) URL에 ?logout=1 → localStorage 정리
+    #  2) URL에 ?auth=토큰 + 미로그인 → 검증 후 세션 복구 + localStorage 동기화
+    #  3) 로그인 성공 직후 _pending_auth_token이 있으면 → localStorage 저장
+    _maybe_clear_localStorage_on_logout()
+    if not st.session_state.logged_in:
+        if _try_restore_from_query_params():
+            # 복구 성공: URL의 ?auth=를 localStorage에 저장하고 URL 깨끗하게 정리
+            _inject_js_url_auth_save_and_replace_state()
+    _pending_token = st.session_state.pop("_pending_auth_token", None)
+    if _pending_token:
+        _inject_js_save_token(_pending_token)
+
     # 전역 Sticky Header 스타일 주입: 상단 메뉴/탭 고정 및 본문 패딩 조정
     st.markdown(
         """
@@ -14361,6 +14406,8 @@ def main():
 
     # Supabase Auth: 로그인하지 않았으면 로그인 화면만 표시
     if not st.session_state.logged_in:
+        # localStorage에 토큰이 있으면 ?auth= 붙여 한 번 reload → 위쪽 _try_restore_from_query_params로 복구됨
+        _inject_js_localStorage_redirect_with_auth()
         render_login()
         return
 
