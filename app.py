@@ -6644,6 +6644,125 @@ def _superadmin_tab1_integrated_dashboard():
     rank_display = _format_df_display(rank_df[["순위", "매장명", "이번 달 판매금액", "미수금 합계"]], ["이번 달 판매금액", "미수금 합계"])
     st.dataframe(rank_display, width='stretch')
 
+    # ---------- 일별 매출 추이 (이번 달 vs 지난 달) — 전체 통합 또는 매장별 ----------
+    st.divider()
+    st.subheader("📈 일별 매출 추이 (이번 달 vs 지난 달)")
+    _store_opts = ["전체 매장 통합"] + stores["store_name"].tolist()
+    _sel_store = st.selectbox("매장 선택", _store_opts, key="sa_dash_daily_store")
+    try:
+        # combined에는 모든 기간 주문이 있음 (month_start 기준 필터 없이 all_orders로 재조합)
+        _all_combined = pd.concat(all_orders, ignore_index=True) if all_orders else pd.DataFrame()
+        if _all_combined.empty:
+            st.info("표시할 매출 데이터가 없습니다.")
+        else:
+            if _sel_store != "전체 매장 통합":
+                _all_combined = _all_combined[_all_combined["_store"] == _sel_store]
+
+            _sdf = _all_combined[["order_date", "total_amount"]].copy()
+            _sdf["order_date"] = pd.to_datetime(_sdf["order_date"], errors="coerce")
+            _sdf = _sdf.dropna(subset=["order_date"])
+            _sdf["total_amount"] = pd.to_numeric(_sdf["total_amount"], errors="coerce").fillna(0)
+            _sdf["_day"] = _sdf["order_date"].dt.day
+            _sdf["_ym"] = _sdf["order_date"].dt.strftime("%Y-%m")
+
+            _this_ym = today.strftime("%Y-%m")
+            _last_month_end = month_start - timedelta(days=1)
+            _last_ym = _last_month_end.strftime("%Y-%m")
+            _last_month_days = _last_month_end.day
+
+            _this_m = _sdf[_sdf["_ym"] == _this_ym].groupby("_day")["total_amount"].sum()
+            _this_days = list(range(1, today.day + 1))
+            _this_values = [float(_this_m.get(d, 0)) for d in _this_days]
+            _this_sum = sum(_this_values)
+
+            _last_m = _sdf[_sdf["_ym"] == _last_ym].groupby("_day")["total_amount"].sum()
+            _last_days = list(range(1, _last_month_days + 1))
+            _last_values = [float(_last_m.get(d, 0)) for d in _last_days]
+            _last_sum = sum(_last_values)
+            _has_last = any(v != 0 for v in _last_values)
+            _last_same_period_sum = sum(_last_values[:today.day]) if _has_last else 0.0
+
+            _KR_HOLIDAYS = {
+                date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
+                date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6),
+                date(2025, 6, 6), date(2025, 8, 15),
+                date(2025, 10, 3), date(2025, 10, 5), date(2025, 10, 6),
+                date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
+                date(2025, 12, 25),
+                date(2026, 1, 1),
+                date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
+                date(2026, 3, 1), date(2026, 3, 2),
+                date(2026, 5, 5), date(2026, 5, 24),
+                date(2026, 6, 6), date(2026, 8, 15),
+                date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),
+                date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9),
+                date(2026, 12, 25),
+            }
+
+            def _sa_marker_style(year, month, day, holidays, is_this):
+                try:
+                    d = date(year, month, day)
+                    dow = d.weekday()
+                    if d in holidays or dow == 6:
+                        return ("#E53935", 10) if is_this else ("#EF9A9A", 7)
+                    if dow == 5:
+                        return ("#1565C0", 10) if is_this else ("#90CAF9", 7)
+                    return ("#1B3A6B", 7) if is_this else ("#B0BEC5", 5)
+                except Exception:
+                    return ("#1B3A6B", 7) if is_this else ("#B0BEC5", 5)
+
+            _this_year = today.year
+            _this_month_num = today.month
+            _this_mc = [_sa_marker_style(_this_year, _this_month_num, d, _KR_HOLIDAYS, True)[0] for d in _this_days]
+            _this_ms = [_sa_marker_style(_this_year, _this_month_num, d, _KR_HOLIDAYS, True)[1] for d in _this_days]
+            _last_year = _last_month_end.year
+            _last_month_num = _last_month_end.month
+            _last_mc = [_sa_marker_style(_last_year, _last_month_num, d, _KR_HOLIDAYS, False)[0] for d in _last_days]
+            _last_ms = [_sa_marker_style(_last_year, _last_month_num, d, _KR_HOLIDAYS, False)[1] for d in _last_days]
+
+            fig_sa_daily = go.Figure()
+            if _has_last:
+                fig_sa_daily.add_trace(go.Scatter(
+                    x=_last_days, y=_last_values, mode="lines+markers",
+                    name=f"지난 달 ({_last_ym})",
+                    line=dict(color="#B0BEC5", width=2, dash="dot"),
+                    marker=dict(size=_last_ms, color=_last_mc),
+                    hovertemplate="%{x}일<br>%{y:,.0f}원<extra>지난 달</extra>",
+                ))
+            fig_sa_daily.add_trace(go.Scatter(
+                x=_this_days, y=_this_values, mode="lines+markers",
+                name=f"이번 달 ({_this_ym})",
+                line=dict(color="#1B3A6B", width=3),
+                marker=dict(size=_this_ms, color=_this_mc),
+                hovertemplate="%{x}일<br>%{y:,.0f}원<extra>이번 달</extra>",
+            ))
+            fig_sa_daily.update_layout(
+                height=320,
+                margin=dict(l=10, r=10, t=10, b=10),
+                xaxis=dict(title="일(Day)", dtick=1 if _last_month_days <= 16 else 2,
+                           tickfont=dict(size=11), gridcolor="#EEEEEE"),
+                yaxis=dict(title="매출(원)", tickformat=",", tickfont=dict(size=11), gridcolor="#EEEEEE"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
+                plot_bgcolor="white", hovermode="x unified",
+            )
+            st.plotly_chart(fig_sa_daily, width='stretch', config={"displayModeBar": False})
+
+            _ca, _cb, _cc = st.columns(3)
+            with _ca:
+                st.metric("이번 달 누적", f"{_this_sum:,.0f}원")
+            with _cb:
+                st.metric("지난 달 동기간", f"{_last_same_period_sum:,.0f}원" if _has_last else "-")
+            with _cc:
+                if _has_last and _last_same_period_sum > 0:
+                    _dp = (_this_sum - _last_same_period_sum) / _last_same_period_sum * 100
+                    st.metric("전월 대비", f"{_dp:+.1f}%", delta=f"{(_this_sum - _last_same_period_sum):,.0f}원")
+                else:
+                    st.metric("전월 대비", "-")
+            if _has_last:
+                st.caption(f"💡 이번 달 {today.day}일까지 vs 지난 달 같은 기간 비교. 지난 달 전체 누적: {_last_sum:,.0f}원")
+    except Exception as _e_sa_chart:
+        st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_sa_chart}")
+
 
 def _superadmin_tab2_hr_store_employees():
     """② 매장별 직원 평가 현황 (HR): 매장/전체 + 단일월/연월범위 집계."""
