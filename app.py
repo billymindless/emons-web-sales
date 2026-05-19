@@ -6650,8 +6650,42 @@ def _superadmin_tab1_integrated_dashboard():
     _store_opts = ["전체 매장 통합"] + stores["store_name"].tolist()
     _sel_store = st.selectbox("매장 선택", _store_opts, key="sa_dash_daily_store")
     try:
-        # combined에는 모든 기간 주문이 있음 (month_start 기준 필터 없이 all_orders로 재조합)
-        _all_combined = pd.concat(all_orders, ignore_index=True) if all_orders else pd.DataFrame()
+        # all_orders는 이번 달만 포함 → 지난달 데이터를 별도 로드 (KPI 계산에 영향 없음)
+        _last_month_start_dt = (month_start - timedelta(days=1)).replace(day=1)
+        _last_month_end_dt = month_start - timedelta(days=1)
+        _last_orders_list = []
+        for _, _s in stores.iterrows():
+            _db_fn = _s["db_filename"]
+            try:
+                if _supabase_orders_payments_available():
+                    _lo = _load_orders_supabase(
+                        _db_fn, "id, order_date, total_amount",
+                        limit=None,
+                        start_date=_last_month_start_dt.isoformat(),
+                        end_date=_last_month_end_dt.isoformat(),
+                    )
+                else:
+                    _conn = get_tenant_conn(_db_fn)
+                    if _conn:
+                        try:
+                            _lo = pd.read_sql(
+                                "SELECT id, order_date, total_amount FROM Orders WHERE order_date >= ? AND order_date <= ?",
+                                _conn, params=(_last_month_start_dt.isoformat(), _last_month_end_dt.isoformat()),
+                            )
+                        finally:
+                            _conn.close()
+                    else:
+                        _lo = pd.DataFrame()
+                if not _lo.empty:
+                    _lo["_store"] = _s["store_name"]
+                    _last_orders_list.append(_lo)
+            except Exception:
+                pass
+
+        # 이번 달 + 지난달 합산
+        _this_parts = [df for df in all_orders if df is not None and not df.empty]
+        _all_parts = _this_parts + _last_orders_list
+        _all_combined = pd.concat(_all_parts, ignore_index=True) if _all_parts else pd.DataFrame()
         if _all_combined.empty:
             st.info("표시할 매출 데이터가 없습니다.")
         else:
