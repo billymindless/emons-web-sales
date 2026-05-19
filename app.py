@@ -6548,168 +6548,233 @@ def render_marketing_insights_superadmin():
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
 
 def _superadmin_tab1_integrated_dashboard():
-    """① 전 지점 통합 대시보드: 이번 달 총매출/총마진/전체 미수금 + 매장별 랭킹."""
+    """① 전 지점 통합 대시보드: 매장 선택(전체/개별) + 섹션 1~5 (매장관리자 대시보드 동일 구조, Todo 제외)."""
     _render_recent_notices_section()
     stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
         st.info("등록된 매장이 없습니다.")
         return
+
+    from calendar import monthrange
     today = _today_kst()
     month_start = today.replace(day=1)
-    from calendar import monthrange
     month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
-    start_str = month_start.isoformat()
-    end_str = month_end.isoformat()
-    all_orders = []
-    all_payments = []
-    store_orders = {}
-    store_payments = {}
-    total_fees_month = 0.0
-    for _, s in stores.iterrows():
-        db_fn = s["db_filename"]
-        if _supabase_orders_payments_available():
-            orders = _load_orders_supabase(db_fn, "id, order_date, total_amount, actual_margin", limit=None, start_date=start_str, end_date=end_str)
-            payments = _load_payments_supabase(db_fn)
+    last_month_end_dt = month_start - timedelta(days=1)
+    last_month_start_dt = last_month_end_dt.replace(day=1)
+
+    # ── 매장 선택 드롭다운 ──────────────────────────────
+    store_opts = ["전체 매장 통합"] + stores["store_name"].tolist()
+    sel_store = st.selectbox("📍 조회 매장 선택", store_opts, key="sa_tab1_store_sel")
+    is_all = sel_store == "전체 매장 통합"
+    db_filename = None if is_all else stores[stores["store_name"] == sel_store].iloc[0]["db_filename"]
+
+    st.header(f"경영 대시보드 — {'전체 매장 통합' if is_all else sel_store}")
+
+    # ── 데이터 로드 ─────────────────────────────────────
+    order_cols = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, display_sales_amount, display_cost_amount, balance_status"
+    with st.spinner("데이터 불러오는 중..."):
+        if is_all:
+            _o_parts, _p_parts, _s_parts, _cu_parts = [], [], [], []
+            _store_rank_rows = []
+            total_fees_month = 0.0
+            for _, _sr in stores.iterrows():
+                _fn = _sr["db_filename"]
+                _sn = _sr["store_name"]
+                try:
+                    _o = load_orders_cached(_fn, order_cols, limit=None)
+                    _p = load_payments_cached(_fn)
+                    _sf = load_sales_cached(_fn, limit=None)
+                    _cu = load_customers_cached(_fn, limit=None, col_list="id, name, phone1")
+                    if not _o.empty:
+                        _o["_store"] = _sn
+                        _o_parts.append(_o)
+                    if not _p.empty:
+                        _p["_store"] = _sn
+                        _p_parts.append(_p)
+                        if "fee_amount" in _p.columns:
+                            _o_tmp = _o.copy()
+                            if not _o_tmp.empty and "order_date" in _o_tmp.columns:
+                                _o_tmp["order_date"] = pd.to_datetime(_o_tmp["order_date"], errors="coerce")
+                                _mo_ids = set(_o_tmp[_o_tmp["order_date"].dt.date.between(month_start, month_end)]["id"].dropna().astype(int).tolist())
+                                if "order_id" in _p.columns:
+                                    total_fees_month += float(_p[_p["order_id"].isin(_mo_ids)]["fee_amount"].fillna(0).sum())
+                    if not _sf.empty:
+                        _sf["_store"] = _sn
+                        _s_parts.append(_sf)
+                    if not _cu.empty:
+                        _cu["_store"] = _sn
+                        _cu_parts.append(_cu)
+                    # 매장별 랭킹용 집계
+                    _o2 = _o.copy()
+                    if not _o2.empty and "order_date" in _o2.columns:
+                        _o2["order_date"] = pd.to_datetime(_o2["order_date"], errors="coerce")
+                        _mo2 = _o2[_o2["order_date"].dt.date.between(month_start, month_end)]
+                        _ps2 = _p.groupby("order_id")["amount"].sum() if not _p.empty and "order_id" in _p.columns else pd.Series(dtype=float)
+                        _o2["_paid"] = _o2["id"].map(_ps2).fillna(0)
+                        _o2["_bal"] = _o2["total_amount"].fillna(0) - _o2["_paid"]
+                        _store_rank_rows.append({
+                            "매장명": _sn,
+                            "이번 달 판매금액": int(_mo2["total_amount"].fillna(0).sum()),
+                            "미수금 합계": int(_o2["_bal"].clip(lower=0).sum()),
+                        })
+                except Exception:
+                    pass
+            orders = pd.concat(_o_parts, ignore_index=True) if _o_parts else pd.DataFrame()
+            payments = pd.concat(_p_parts, ignore_index=True) if _p_parts else pd.DataFrame()
+            sales_df = pd.concat(_s_parts, ignore_index=True) if _s_parts else pd.DataFrame()
+            customers = pd.concat(_cu_parts, ignore_index=True) if _cu_parts else pd.DataFrame()
         else:
-            conn = get_tenant_conn(db_fn)
-            if not conn:
-                continue
-            try:
-                try:
-                    orders = pd.read_sql("SELECT id, order_date, total_amount, actual_margin FROM Orders WHERE order_date >= ? AND order_date <= ?", conn, params=(start_str, end_str))
-                except Exception:
-                    orders = pd.DataFrame()
-                try:
-                    payments = pd.read_sql("SELECT order_id, amount, fee_amount FROM Payments", conn)
-                except Exception:
-                    payments = pd.DataFrame()
-            finally:
-                conn.close()
+            orders = load_orders_cached(db_filename, order_cols, limit=None)
+            payments = load_payments_cached(db_filename)
+            sales_df = load_sales_cached(db_filename, limit=None)
+            customers = load_customers_cached(db_filename, limit=None, col_list="id, name, phone1")
+            total_fees_month = float(payments["fee_amount"].fillna(0).sum()) if not payments.empty and "fee_amount" in payments.columns else 0.0
+            _store_rank_rows = []
 
-        if len(orders) == 0:
-            store_orders[s["store_name"]] = pd.DataFrame()
-            store_payments[s["store_name"]] = pd.DataFrame()
-            continue
+    # 공통 컬럼 보정
+    for _c in ["id","customer_id","order_date","delivery_date","total_amount","cost_price","actual_margin","employee_names","category","display_sales_amount","display_cost_amount","balance_status"]:
+        if _c not in orders.columns:
+            orders[_c] = None
+    for _c in ("order_id","amount","payment_method","payment_date","onnuri_approval_code"):
+        if _c not in payments.columns:
+            payments[_c] = "" if _c in ("payment_method","onnuri_approval_code") else 0
 
+    if not orders.empty and "order_date" in orders.columns:
         orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
-        orders["_store"] = s["store_name"]
-        pay_sum = payments.groupby("order_id")["amount"].sum() if not payments.empty and "order_id" in payments.columns else pd.Series(dtype=float)
-        orders["_paid"] = orders["id"].map(pay_sum).fillna(0)
-        orders["_balance"] = orders["total_amount"] - orders["_paid"]
-        month_ord = orders[(orders["order_date"].dt.date >= month_start) & (orders["order_date"].dt.date <= month_end)]
-        store_orders[s["store_name"]] = month_ord
-        store_payments[s["store_name"]] = payments
-        all_orders.append(orders)
-        # 이번 달 주문에 해당하는 결제 수수료 합산
-        if not payments.empty and "fee_amount" in payments.columns and not month_ord.empty:
-            month_fees = payments[payments["order_id"].isin(month_ord["id"])]["fee_amount"].fillna(0).sum()
-            total_fees_month += float(month_fees)
-    if not all_orders:
-        st.metric("이번 달 전 지점 총매출", "0원")
-        st.metric("이번 달 전 지점 총마진", "0원")
-        st.metric("전체 누적 미수금", "0원")
-        return
-    all_orders_nonempty = [df for df in all_orders if df is not None and len(df) > 0]
-    if not all_orders_nonempty:
-        st.metric("이번 달 전 지점 총매출", "0원")
-        st.metric("이번 달 전 지점 총마진", "0원")
-        st.metric("전체 누적 미수금", "0원")
-        return
-    combined = pd.concat(all_orders_nonempty, ignore_index=True)
-    month_combined = combined[(combined["order_date"].dt.date >= month_start) & (combined["order_date"].dt.date <= month_end)]
-    total_sales_month = month_combined["total_amount"].sum()
-    total_margin_month = month_combined["actual_margin"].fillna(0).sum()
-    total_unpaid_all = combined["_balance"].clip(lower=0).sum()
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("이번 달 전 지점 총매출", f"{total_sales_month:,.0f}원")
-    with c2:
-        st.metric("이번 달 전 지점 총마진", f"{total_margin_month:,.0f}원")
-    with c3:
-        st.metric("전체 누적 미수금", f"{total_unpaid_all:,.0f}원")
-    with c4:
-        st.metric("이번 달 전 지점 카드수수료", f"{total_fees_month:,.0f}원", help="신용카드·체크카드·메인페이 등 이번 달 주문 기준 수수료 합계")
-    st.subheader("매장별 실적 랭킹 (이번 달 최종 판매금액)")
-    rows = []
-    for store_name, ord_df in store_orders.items():
-        if len(ord_df) == 0:
-            rows.append({"매장명": store_name, "이번 달 판매금액": 0, "미수금 합계": 0})
-            continue
-        sales = ord_df["total_amount"].sum()
-        full_for_store = next((o for o in all_orders if (o["_store"] == store_name).all()), None)
-        unpaid = full_for_store["_balance"].clip(lower=0).sum() if full_for_store is not None and "_balance" in full_for_store.columns else 0
-        rows.append({"매장명": store_name, "이번 달 판매금액": int(sales), "미수금 합계": int(unpaid)})
-    rank_df = pd.DataFrame(rows).sort_values("이번 달 판매금액", ascending=False).reset_index(drop=True)
-    rank_df["순위"] = range(1, len(rank_df) + 1)
-    rank_display = _format_df_display(rank_df[["순위", "매장명", "이번 달 판매금액", "미수금 합계"]], ["이번 달 판매금액", "미수금 합계"])
-    st.dataframe(rank_display, width='stretch')
+    month_orders = orders[orders["order_date"].dt.date.between(month_start, month_end)] if not orders.empty and "order_date" in orders.columns else pd.DataFrame()
 
-    # ---------- 일별 매출 추이 (이번 달 vs 지난 달) — 전체 통합 또는 매장별 ----------
+    if not payments.empty and "payment_date" in payments.columns:
+        payments["payment_date"] = pd.to_datetime(payments["payment_date"], errors="coerce")
+    month_payments = payments[payments["payment_date"].dt.date.between(month_start, month_end)] if not payments.empty and "payment_date" in payments.columns else pd.DataFrame()
+    today_payments = payments[payments["payment_date"].dt.date == today] if not payments.empty and "payment_date" in payments.columns else pd.DataFrame()
+
+    if not sales_df.empty and "transaction_date" in sales_df.columns:
+        sales_df["transaction_date"] = pd.to_datetime(sales_df["transaction_date"], errors="coerce")
+        sales_df["amount"] = pd.to_numeric(sales_df.get("amount", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    month_sales = sales_df[sales_df["transaction_date"].dt.date.between(month_start, month_end)] if not sales_df.empty and "transaction_date" in sales_df.columns else pd.DataFrame()
+    today_sales = sales_df[sales_df["transaction_date"].dt.date == today] if not sales_df.empty and "transaction_date" in sales_df.columns else pd.DataFrame()
+
+    _dash_pay_sum = payments.groupby("order_id")["amount"].sum() if not payments.empty and "order_id" in payments.columns else pd.Series(dtype=float)
+
+    # ── 1. 주요 매출 항목 ──────────────────────────────
+    st.subheader("1. 주요 매출 항목")
+
+    _today_contract = float(today_sales[today_sales["amount"] > 0]["amount"].sum()) if not today_sales.empty and "amount" in today_sales.columns else 0.0
+    _month_sales_total = float(month_sales["amount"].sum()) if not month_sales.empty and "amount" in month_sales.columns else 0.0
+    _today_receipt = float(today_payments["amount"].sum()) if not today_payments.empty and "amount" in today_payments.columns else 0.0
+    _month_receipt = float(month_payments["amount"].sum()) if not month_payments.empty and "amount" in month_payments.columns else 0.0
+    _month_margin = float(month_orders["actual_margin"].fillna(0).sum()) if not month_orders.empty and "actual_margin" in month_orders.columns else 0.0
+    _month_total_amt = float(month_orders["total_amount"].fillna(0).sum()) if not month_orders.empty else 0.0
+    _margin_rate = (_month_margin / _month_total_amt * 100) if _month_total_amt > 0 else 0.0
+    _month_count = len(month_orders)
+    _total_unpaid = 0.0
+    if not orders.empty and "id" in orders.columns:
+        _oc = orders.copy()
+        _oc["_paid"] = _oc["id"].map(_dash_pay_sum).fillna(0)
+        _oc["_bal"] = _oc["total_amount"].fillna(0) - _oc["_paid"]
+        _total_unpaid = float(_oc["_bal"].clip(lower=0).sum())
+    _days_so_far = max(today.day, 1)
+    _expected_month = (_month_sales_total / _days_so_far) * month_end.day if _month_sales_total > 0 else 0.0
+
+    _kc1, _kc2, _kc3, _kc4 = st.columns(4)
+    with _kc1:
+        st.metric("당일 계약금액", f"{_today_contract:,.0f}원")
+    with _kc2:
+        st.metric("이번 달 누적 매출", f"{_month_sales_total:,.0f}원")
+    with _kc3:
+        st.metric("당일 수납", f"{_today_receipt:,.0f}원")
+    with _kc4:
+        st.metric("이번 달 누적 수납", f"{_month_receipt:,.0f}원")
+    _kc5, _kc6, _kc7, _kc8 = st.columns(4)
+    with _kc5:
+        st.metric("이번 달 마진", f"{_month_margin:,.0f}원")
+    with _kc6:
+        st.metric("누적 마진율", f"{_margin_rate:.1f}%")
+    with _kc7:
+        st.metric("이번 달 판매건수", f"{_month_count}건")
+    with _kc8:
+        st.metric("이번 달 카드수수료", f"{total_fees_month:,.0f}원")
+
+    # 전체 매장 통합일 때 매장별 랭킹 표시
+    if is_all and _store_rank_rows:
+        st.caption("▼ 매장별 이번 달 실적")
+        _rank_df = pd.DataFrame(_store_rank_rows).sort_values("이번 달 판매금액", ascending=False).reset_index(drop=True)
+        _rank_df.insert(0, "순위", range(1, len(_rank_df) + 1))
+        st.dataframe(_format_df_display(_rank_df, ["이번 달 판매금액", "미수금 합계"]), width="stretch")
+
     st.divider()
+
+    # ── 1-2. 일별 매출 추이 (이번 달 vs 지난 달) ────────
     st.subheader("📈 일별 매출 추이 (이번 달 vs 지난 달)")
-    _store_opts = ["전체 매장 통합"] + stores["store_name"].tolist()
-    _sel_store = st.selectbox("매장 선택", _store_opts, key="sa_dash_daily_store")
     try:
-        # all_orders는 이번 달만 포함 → 지난달 데이터를 별도 로드 (KPI 계산에 영향 없음)
-        _last_month_start_dt = (month_start - timedelta(days=1)).replace(day=1)
-        _last_month_end_dt = month_start - timedelta(days=1)
-        _last_orders_list = []
-        for _, _s in stores.iterrows():
-            _db_fn = _s["db_filename"]
+        # 지난달 데이터 로드 (all_orders/sales_df에 포함 안 된 경우 대비)
+        _prev_o_parts = []
+        if is_all:
+            for _, _sr in stores.iterrows():
+                try:
+                    if _supabase_orders_payments_available():
+                        _lo = _load_orders_supabase(_sr["db_filename"], "id, order_date, total_amount", limit=None,
+                                                    start_date=last_month_start_dt.isoformat(), end_date=last_month_end_dt.isoformat())
+                    else:
+                        _conn = get_tenant_conn(_sr["db_filename"])
+                        if _conn:
+                            try:
+                                _lo = pd.read_sql("SELECT id, order_date, total_amount FROM Orders WHERE order_date >= ? AND order_date <= ?",
+                                                  _conn, params=(last_month_start_dt.isoformat(), last_month_end_dt.isoformat()))
+                            finally:
+                                _conn.close()
+                        else:
+                            _lo = pd.DataFrame()
+                    if not _lo.empty:
+                        _lo["_store"] = _sr["store_name"]
+                        _prev_o_parts.append(_lo)
+                except Exception:
+                    pass
+        else:
             try:
                 if _supabase_orders_payments_available():
-                    _lo = _load_orders_supabase(
-                        _db_fn, "id, order_date, total_amount",
-                        limit=None,
-                        start_date=_last_month_start_dt.isoformat(),
-                        end_date=_last_month_end_dt.isoformat(),
-                    )
+                    _lo = _load_orders_supabase(db_filename, "id, order_date, total_amount", limit=None,
+                                                start_date=last_month_start_dt.isoformat(), end_date=last_month_end_dt.isoformat())
                 else:
-                    _conn = get_tenant_conn(_db_fn)
+                    _conn = get_tenant_conn(db_filename)
                     if _conn:
                         try:
-                            _lo = pd.read_sql(
-                                "SELECT id, order_date, total_amount FROM Orders WHERE order_date >= ? AND order_date <= ?",
-                                _conn, params=(_last_month_start_dt.isoformat(), _last_month_end_dt.isoformat()),
-                            )
+                            _lo = pd.read_sql("SELECT id, order_date, total_amount FROM Orders WHERE order_date >= ? AND order_date <= ?",
+                                              _conn, params=(last_month_start_dt.isoformat(), last_month_end_dt.isoformat()))
                         finally:
                             _conn.close()
                     else:
                         _lo = pd.DataFrame()
                 if not _lo.empty:
-                    _lo["_store"] = _s["store_name"]
-                    _last_orders_list.append(_lo)
+                    _lo["_store"] = sel_store
+                    _prev_o_parts.append(_lo)
             except Exception:
                 pass
 
-        # 이번 달 + 지난달 합산
-        _this_parts = [df for df in all_orders if df is not None and not df.empty]
-        _all_parts = _this_parts + _last_orders_list
-        _all_combined = pd.concat(_all_parts, ignore_index=True) if _all_parts else pd.DataFrame()
-        if _all_combined.empty:
+        # 이번달 주문 + 지난달 주문 합산
+        _this_o = orders[["order_date","total_amount","_store"]].copy() if "_store" in orders.columns else orders[["order_date","total_amount"]].assign(_store=sel_store if not is_all else "전체") if not orders.empty else pd.DataFrame()
+        _chart_parts = ([_this_o] if not _this_o.empty else []) + _prev_o_parts
+        _chart_df = pd.concat(_chart_parts, ignore_index=True) if _chart_parts else pd.DataFrame()
+
+        if _chart_df.empty:
             st.info("표시할 매출 데이터가 없습니다.")
         else:
-            if _sel_store != "전체 매장 통합":
-                _all_combined = _all_combined[_all_combined["_store"] == _sel_store]
-
-            _sdf = _all_combined[["order_date", "total_amount"]].copy()
-            _sdf["order_date"] = pd.to_datetime(_sdf["order_date"], errors="coerce")
-            _sdf = _sdf.dropna(subset=["order_date"])
-            _sdf["total_amount"] = pd.to_numeric(_sdf["total_amount"], errors="coerce").fillna(0)
-            _sdf["_day"] = _sdf["order_date"].dt.day
-            _sdf["_ym"] = _sdf["order_date"].dt.strftime("%Y-%m")
+            _chart_df["order_date"] = pd.to_datetime(_chart_df["order_date"], errors="coerce")
+            _chart_df = _chart_df.dropna(subset=["order_date"])
+            _chart_df["total_amount"] = pd.to_numeric(_chart_df["total_amount"], errors="coerce").fillna(0)
+            _chart_df["_day"] = _chart_df["order_date"].dt.day
+            _chart_df["_ym"] = _chart_df["order_date"].dt.strftime("%Y-%m")
 
             _this_ym = today.strftime("%Y-%m")
-            _last_month_end = month_start - timedelta(days=1)
-            _last_ym = _last_month_end.strftime("%Y-%m")
-            _last_month_days = _last_month_end.day
+            _last_ym = last_month_end_dt.strftime("%Y-%m")
+            _last_month_days = last_month_end_dt.day
 
-            _this_m = _sdf[_sdf["_ym"] == _this_ym].groupby("_day")["total_amount"].sum()
+            _this_m = _chart_df[_chart_df["_ym"] == _this_ym].groupby("_day")["total_amount"].sum()
             _this_days = list(range(1, today.day + 1))
             _this_values = [float(_this_m.get(d, 0)) for d in _this_days]
             _this_sum = sum(_this_values)
 
-            _last_m = _sdf[_sdf["_ym"] == _last_ym].groupby("_day")["total_amount"].sum()
+            _last_m = _chart_df[_chart_df["_ym"] == _last_ym].groupby("_day")["total_amount"].sum()
             _last_days = list(range(1, _last_month_days + 1))
             _last_values = [float(_last_m.get(d, 0)) for d in _last_days]
             _last_sum = sum(_last_values)
@@ -6717,85 +6782,154 @@ def _superadmin_tab1_integrated_dashboard():
             _last_same_period_sum = sum(_last_values[:today.day]) if _has_last else 0.0
 
             _KR_HOLIDAYS = {
-                date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
-                date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6),
-                date(2025, 6, 6), date(2025, 8, 15),
-                date(2025, 10, 3), date(2025, 10, 5), date(2025, 10, 6),
-                date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
-                date(2025, 12, 25),
-                date(2026, 1, 1),
-                date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
-                date(2026, 3, 1), date(2026, 3, 2),
-                date(2026, 5, 5), date(2026, 5, 24),
-                date(2026, 6, 6), date(2026, 8, 15),
-                date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),
-                date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9),
-                date(2026, 12, 25),
+                date(2025,1,1),date(2025,1,28),date(2025,1,29),date(2025,1,30),
+                date(2025,3,1),date(2025,5,5),date(2025,5,6),date(2025,6,6),date(2025,8,15),
+                date(2025,10,3),date(2025,10,5),date(2025,10,6),date(2025,10,7),date(2025,10,8),date(2025,10,9),date(2025,12,25),
+                date(2026,1,1),date(2026,2,17),date(2026,2,18),date(2026,2,19),
+                date(2026,3,1),date(2026,3,2),date(2026,5,5),date(2026,5,24),date(2026,6,6),date(2026,8,15),
+                date(2026,9,24),date(2026,9,25),date(2026,9,26),date(2026,10,3),date(2026,10,5),date(2026,10,9),date(2026,12,25),
             }
-
-            def _sa_marker_style(year, month, day, holidays, is_this):
+            def _sa2_marker(year, month, day, holidays, is_this):
                 try:
-                    d = date(year, month, day)
-                    dow = d.weekday()
-                    if d in holidays or dow == 6:
-                        return ("#E53935", 10) if is_this else ("#EF9A9A", 7)
-                    if dow == 5:
-                        return ("#1565C0", 10) if is_this else ("#90CAF9", 7)
-                    return ("#1B3A6B", 7) if is_this else ("#B0BEC5", 5)
+                    _d = date(year, month, day); dow = _d.weekday()
+                    if _d in holidays or dow == 6: return ("#E53935",10) if is_this else ("#EF9A9A",7)
+                    if dow == 5: return ("#1565C0",10) if is_this else ("#90CAF9",7)
+                    return ("#1B3A6B",7) if is_this else ("#B0BEC5",5)
                 except Exception:
-                    return ("#1B3A6B", 7) if is_this else ("#B0BEC5", 5)
+                    return ("#1B3A6B",7) if is_this else ("#B0BEC5",5)
 
-            _this_year = today.year
-            _this_month_num = today.month
-            _this_mc = [_sa_marker_style(_this_year, _this_month_num, d, _KR_HOLIDAYS, True)[0] for d in _this_days]
-            _this_ms = [_sa_marker_style(_this_year, _this_month_num, d, _KR_HOLIDAYS, True)[1] for d in _this_days]
-            _last_year = _last_month_end.year
-            _last_month_num = _last_month_end.month
-            _last_mc = [_sa_marker_style(_last_year, _last_month_num, d, _KR_HOLIDAYS, False)[0] for d in _last_days]
-            _last_ms = [_sa_marker_style(_last_year, _last_month_num, d, _KR_HOLIDAYS, False)[1] for d in _last_days]
+            _tmc = [_sa2_marker(today.year, today.month, d, _KR_HOLIDAYS, True)[0] for d in _this_days]
+            _tms = [_sa2_marker(today.year, today.month, d, _KR_HOLIDAYS, True)[1] for d in _this_days]
+            _lmc = [_sa2_marker(last_month_end_dt.year, last_month_end_dt.month, d, _KR_HOLIDAYS, False)[0] for d in _last_days]
+            _lms = [_sa2_marker(last_month_end_dt.year, last_month_end_dt.month, d, _KR_HOLIDAYS, False)[1] for d in _last_days]
 
-            fig_sa_daily = go.Figure()
+            _fig = go.Figure()
             if _has_last:
-                fig_sa_daily.add_trace(go.Scatter(
-                    x=_last_days, y=_last_values, mode="lines+markers",
-                    name=f"지난 달 ({_last_ym})",
-                    line=dict(color="#B0BEC5", width=2, dash="dot"),
-                    marker=dict(size=_last_ms, color=_last_mc),
-                    hovertemplate="%{x}일<br>%{y:,.0f}원<extra>지난 달</extra>",
-                ))
-            fig_sa_daily.add_trace(go.Scatter(
-                x=_this_days, y=_this_values, mode="lines+markers",
-                name=f"이번 달 ({_this_ym})",
-                line=dict(color="#1B3A6B", width=3),
-                marker=dict(size=_this_ms, color=_this_mc),
-                hovertemplate="%{x}일<br>%{y:,.0f}원<extra>이번 달</extra>",
-            ))
-            fig_sa_daily.update_layout(
-                height=320,
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis=dict(title="일(Day)", dtick=1 if _last_month_days <= 16 else 2,
-                           tickfont=dict(size=11), gridcolor="#EEEEEE"),
+                _fig.add_trace(go.Scatter(x=_last_days, y=_last_values, mode="lines+markers",
+                    name=f"지난 달 ({_last_ym})", line=dict(color="#B0BEC5", width=2, dash="dot"),
+                    marker=dict(size=_lms, color=_lmc),
+                    hovertemplate="%{x}일<br>%{y:,.0f}원<extra>지난 달</extra>"))
+            _fig.add_trace(go.Scatter(x=_this_days, y=_this_values, mode="lines+markers",
+                name=f"이번 달 ({_this_ym})", line=dict(color="#1B3A6B", width=3),
+                marker=dict(size=_tms, color=_tmc),
+                hovertemplate="%{x}일<br>%{y:,.0f}원<extra>이번 달</extra>"))
+            _fig.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10),
+                xaxis=dict(title="일(Day)", dtick=1 if _last_month_days<=16 else 2, tickfont=dict(size=11), gridcolor="#EEEEEE"),
                 yaxis=dict(title="매출(원)", tickformat=",", tickfont=dict(size=11), gridcolor="#EEEEEE"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
-                plot_bgcolor="white", hovermode="x unified",
-            )
-            st.plotly_chart(fig_sa_daily, width='stretch', config={"displayModeBar": False})
+                plot_bgcolor="white", hovermode="x unified")
+            st.plotly_chart(_fig, width="stretch", config={"displayModeBar": False})
 
             _ca, _cb, _cc = st.columns(3)
-            with _ca:
-                st.metric("이번 달 누적", f"{_this_sum:,.0f}원")
-            with _cb:
-                st.metric("지난 달 동기간", f"{_last_same_period_sum:,.0f}원" if _has_last else "-")
+            with _ca: st.metric("이번 달 누적", f"{_this_sum:,.0f}원")
+            with _cb: st.metric("지난 달 동기간", f"{_last_same_period_sum:,.0f}원" if _has_last else "-")
             with _cc:
                 if _has_last and _last_same_period_sum > 0:
                     _dp = (_this_sum - _last_same_period_sum) / _last_same_period_sum * 100
-                    st.metric("전월 대비", f"{_dp:+.1f}%", delta=f"{(_this_sum - _last_same_period_sum):,.0f}원")
+                    st.metric("전월 대비", f"{_dp:+.1f}%", delta=f"{(_this_sum-_last_same_period_sum):,.0f}원")
                 else:
                     st.metric("전월 대비", "-")
             if _has_last:
                 st.caption(f"💡 이번 달 {today.day}일까지 vs 지난 달 같은 기간 비교. 지난 달 전체 누적: {_last_sum:,.0f}원")
-    except Exception as _e_sa_chart:
-        st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_sa_chart}")
+    except Exception as _e_chart:
+        st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_chart}")
+
+    st.divider()
+
+    # ── 2. 미수금 고객 현황 ────────────────────────────
+    st.subheader("2. 미수금 고객 현황")
+    try:
+        if not orders.empty and "id" in orders.columns:
+            _o2 = orders.copy()
+            _o2["paid"] = _o2["id"].map(_dash_pay_sum).fillna(0)
+            _o2["balance"] = _o2["total_amount"].fillna(0) - _o2["paid"]
+            _o2["delivery_date"] = pd.to_datetime(_o2["delivery_date"], errors="coerce")
+            _cutoff = today + timedelta(days=10)
+            _unpaid = _o2[(_o2["balance"] > 0) & (_o2["delivery_date"].notna())]
+            if not customers.empty and "id" in customers.columns:
+                _unpaid = _unpaid.merge(customers[["id","name","phone1"]], left_on="customer_id", right_on="id", how="left", suffixes=("","_c"))
+            _unpaid = _unpaid.rename(columns={"name":"고객명","phone1":"전화번호","delivery_date":"배송일","category":"품목","employee_names":"담당자","balance":"잔금"})
+            _show_cols = [c for c in ["고객명","전화번호","배송일","품목","잔금","담당자"] if c in _unpaid.columns]
+            if "_store" in orders.columns and is_all:
+                _unpaid["매장"] = orders.loc[_unpaid.index, "_store"] if "_store" in orders.columns else ""
+                _show_cols = ["매장"] + _show_cols
+            _unpaid_disp = _unpaid[_show_cols].copy()
+            if "잔금" in _unpaid_disp.columns:
+                _unpaid_disp["잔금"] = _unpaid_disp["잔금"].apply(lambda v: f"{v:,.0f}원" if pd.notna(v) else "-")
+            if "배송일" in _unpaid_disp.columns:
+                _unpaid_disp["배송일"] = pd.to_datetime(_unpaid_disp["배송일"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-")
+            if len(_unpaid_disp) == 0:
+                st.success("미수금 고객이 없습니다.")
+            else:
+                st.dataframe(_unpaid_disp, width="stretch")
+                st.caption(f"총 {len(_unpaid_disp)}건의 미수금 고객 (잔금 > 0)")
+        else:
+            st.info("주문 데이터가 없습니다.")
+    except Exception as _e2:
+        st.caption(f"미수금 고객 현황을 표시할 수 없습니다: {_e2}")
+
+    st.divider()
+
+    # ── 3. 직원별 일일 판매 금액 및 마진율 ─────────────
+    st.subheader("3. 직원별 일일 판매 금액 및 마진율")
+    try:
+        if today_sales.empty or "amount" not in today_sales.columns:
+            st.info(f"오늘({today.strftime('%Y-%m-%d')}) 등록된 매출이 없습니다.")
+        else:
+            _emp_totals = _kpi_employee_totals_from_sales_slice(today_sales, orders)
+            if _emp_totals.empty:
+                st.info("오늘 직원별 매출 데이터가 없습니다.")
+            else:
+                _emp_disp = _emp_totals.copy()
+                _emp_disp = _emp_disp.rename(columns={"employee":"직원명","revenue":"매출(순액)","margin":"마진","display_sales":"전시금액"})
+                for _col in ("매출(순액)","마진","전시금액"):
+                    if _col in _emp_disp.columns:
+                        _emp_disp[_col] = _emp_disp[_col].apply(lambda v: f"{v:,.0f}원" if pd.notna(v) else "-")
+                st.dataframe(_emp_disp, width="stretch")
+    except Exception as _e3:
+        st.caption(f"직원별 일일 판매를 표시할 수 없습니다: {_e3}")
+
+    st.divider()
+
+    # ── 4. 월별 직원 판매 현황 및 평가 ─────────────────
+    # 개별 매장 선택 시에만 활성화 (전체 통합 시 안내 표시)
+    if not is_all and db_filename:
+        _render_kpi_section(sales_df, orders, db_filename)
+    else:
+        st.subheader("4. 월별 직원 판매 현황 및 평가")
+        st.info("💡 개별 매장을 선택하면 직원별 월간 판매 평가를 확인할 수 있습니다.")
+
+    st.divider()
+
+    # ── 5. 기간별 통계 (총 계약 금액 / 총 미수금) ──────
+    st.subheader("5. 기간별 통계 (총 계약 금액 / 총 미수금)")
+    try:
+        _s_col, _e_col = st.columns(2)
+        with _s_col:
+            _stats_start = st.date_input("시작일", value=month_start, key="sa_tab1_stats_start")
+        with _e_col:
+            _stats_end = st.date_input("종료일", value=today, key="sa_tab1_stats_end")
+        if _stats_start and _stats_end and _stats_start <= _stats_end:
+            _period_sales = pd.DataFrame()
+            if not sales_df.empty and "transaction_date" in sales_df.columns:
+                _period_sales = sales_df[sales_df["transaction_date"].dt.date.between(_stats_start, _stats_end)]
+            _period_orders = pd.DataFrame()
+            if not orders.empty and "order_date" in orders.columns:
+                _period_orders = orders[orders["order_date"].dt.date.between(_stats_start, _stats_end)]
+            _total_contract = float(_period_sales["amount"].sum()) if not _period_sales.empty and "amount" in _period_sales.columns else 0.0
+            _total_unpaid_period = 0.0
+            if not _period_orders.empty and "id" in _period_orders.columns:
+                _po = _period_orders.copy()
+                _po["_paid"] = _po["id"].map(_dash_pay_sum).fillna(0)
+                _po["_bal"] = _po["total_amount"].fillna(0) - _po["_paid"]
+                _total_unpaid_period = float(_po["_bal"].clip(lower=0).sum())
+            _sc1, _sc2 = st.columns(2)
+            with _sc1:
+                st.metric(f"총 계약 금액 ({_stats_start}~{_stats_end})", f"{_total_contract:,.0f}원")
+            with _sc2:
+                st.metric(f"총 미수금 ({_stats_start}~{_stats_end})", f"{_total_unpaid_period:,.0f}원")
+    except Exception as _e5:
+        st.caption(f"기간별 통계를 표시할 수 없습니다: {_e5}")
 
 
 def _superadmin_tab2_hr_store_employees():
