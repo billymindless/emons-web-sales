@@ -6985,7 +6985,13 @@ def _superadmin_tab1_integrated_dashboard():
                 pass
 
         # 이번달 주문 + 지난달 주문 합산
-        _this_o = orders[["order_date","total_amount","_store"]].copy() if "_store" in orders.columns else orders[["order_date","total_amount"]].assign(_store=sel_store if not is_all else "전체") if not orders.empty else pd.DataFrame()
+        # orders는 전 기간 데이터를 포함하므로 이번 달만 필터해야 _prev_o_parts(지난달)와 중복 없이 합산됨
+        _this_ym_str = today.strftime("%Y-%m")
+        if not orders.empty and "order_date" in orders.columns:
+            _o_this_month = orders[pd.to_datetime(orders["order_date"], errors="coerce").dt.strftime("%Y-%m") == _this_ym_str]
+            _this_o = _o_this_month[["order_date","total_amount","_store"]].copy() if "_store" in _o_this_month.columns else _o_this_month[["order_date","total_amount"]].assign(_store=sel_store if not is_all else "전체")
+        else:
+            _this_o = pd.DataFrame()
         _chart_parts = ([_this_o] if not _this_o.empty else []) + _prev_o_parts
         _chart_df = pd.concat(_chart_parts, ignore_index=True) if _chart_parts else pd.DataFrame()
 
