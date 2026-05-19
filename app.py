@@ -6547,6 +6547,266 @@ def render_marketing_insights_superadmin():
 
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
 
+def _render_main_kpi_section(orders: "pd.DataFrame", payments: "pd.DataFrame", sales_df: "pd.DataFrame",
+                             today: "date", month_start: "date", month_end: "date",
+                             db_filename: str | None = None):
+    """매장관리자 대시보드와 동일한 '1. 주요 매출 항목' HTML KPI 테이블 렌더링.
+    superadmin 대시보드에서 재사용. render_dashboard()는 수정하지 않음."""
+    import textwrap as _tw
+    daily_receipt_total = 0.0
+    daily_receipt_methods_html = ""
+    month_cumulative_methods_html = ""
+    cumulative_sales = 0.0
+    month_pay_neg_sum = 0.0
+    expected_total_sales = 0.0
+    margin_pct = 0.0
+    order_count = 0
+    today_sales_new = 0.0
+    today_sales_adj = 0.0
+    daily_contract_txn_count = 0
+    daily_contract_margin_pct = 0.0
+
+    try:
+        if db_filename:
+            _ph_df = load_payment_history_dashboard_cached(db_filename, month_start, today)
+            ph_totals = _dashboard_cancel_reduce_totals_from_ph(_ph_df, today, month_start, today)
+        else:
+            ph_totals = {"today_cancel": 0.0, "today_reduce": 0.0, "month_cancel": 0.0, "month_reduce": 0.0}
+    except Exception:
+        ph_totals = {"today_cancel": 0.0, "today_reduce": 0.0, "month_cancel": 0.0, "month_reduce": 0.0}
+
+    try:
+        if not payments.empty and "payment_date" in payments.columns and "amount" in payments.columns:
+            pmt = payments.copy()
+            pmt["payment_date"] = pd.to_datetime(pmt["payment_date"], errors="coerce")
+            pmt = pmt.dropna(subset=["payment_date"])
+            if not pmt.empty:
+                pmt["_date"] = pmt["payment_date"].dt.date
+                month_pmt = pmt[(pmt["_date"] >= month_start) & (pmt["_date"] <= today)]
+                today_pmt = pmt[pmt["_date"] == today]
+                daily_receipt_total = float(today_pmt["amount"].fillna(0).sum()) if len(today_pmt) else 0.0
+                if len(today_pmt) > 0:
+                    if "payment_method" in today_pmt.columns or "onnuri_approval_code" in today_pmt.columns:
+                        _g_recv = today_pmt.groupby(_kpi_receipt_method_label_series(today_pmt), sort=False)["amount"].sum().sort_values(ascending=False)
+                        daily_receipt_methods_html = "".join(
+                            f'<div class="kpi-daily-recv-row"><span class="kpi-daily-recv-m">{html.escape(str(mk))}</span>'
+                            f'<span class="kpi-daily-recv-amt">{float(mv):,.0f}원</span></div>'
+                            for mk, mv in _g_recv.items()
+                        )
+                    else:
+                        daily_receipt_methods_html = (
+                            f'<div class="kpi-daily-recv-row"><span class="kpi-daily-recv-m">수단 미분류</span>'
+                            f'<span class="kpi-daily-recv-amt">{daily_receipt_total:,.0f}원</span></div>'
+                        )
+                cumulative_sales = float(month_pmt["amount"].fillna(0).sum()) if len(month_pmt) > 0 else 0.0
+                if len(month_pmt) > 0:
+                    if "payment_method" in month_pmt.columns or "onnuri_approval_code" in month_pmt.columns:
+                        _g_month = month_pmt.groupby(_kpi_receipt_method_label_series(month_pmt), sort=False)["amount"].sum().sort_values(ascending=False)
+                        month_cumulative_methods_html = "".join(
+                            f'<div class="kpi-daily-recv-row"><span class="kpi-daily-recv-m">{html.escape(str(mk))}</span>'
+                            f'<span class="kpi-daily-recv-amt">{float(mv):,.0f}원</span></div>'
+                            for mk, mv in _g_month.items()
+                        )
+                    else:
+                        month_cumulative_methods_html = (
+                            f'<div class="kpi-daily-recv-row"><span class="kpi-daily-recv-m">수단 미분류</span>'
+                            f'<span class="kpi-daily-recv-amt">{cumulative_sales:,.0f}원</span></div>'
+                        )
+                _neg_month = month_pmt[month_pmt["amount"].astype(float) < 0]
+                month_pay_neg_sum = float(_neg_month["amount"].fillna(0).sum()) if len(_neg_month) else 0.0
+
+        if not orders.empty and "order_date" in orders.columns:
+            ord_df = orders.copy()
+            ord_df["order_date"] = pd.to_datetime(ord_df["order_date"], errors="coerce")
+            ord_df = ord_df.dropna(subset=["order_date"])
+            if not ord_df.empty:
+                month_ord = ord_df[ord_df["order_date"].dt.date.between(month_start, today)]
+                if len(month_ord) > 0:
+                    tot_amt = month_ord["total_amount"].fillna(0)
+                    tot_cost = month_ord["cost_price"].fillna(0) if "cost_price" in month_ord.columns else pd.Series(0, index=month_ord.index)
+                    if "display_cost_amount" in month_ord.columns:
+                        tot_cost = tot_cost + month_ord["display_cost_amount"].fillna(0)
+                    sum_sales = float(tot_amt.sum())
+                    sum_cost = float(tot_cost.sum())
+                    margin_pct = (sum_sales - sum_cost) / sum_sales * 100 if sum_sales else 0.0
+                    order_count = len(month_ord)
+
+        if not sales_df.empty and "transaction_date" in sales_df.columns:
+            _sd = sales_df.copy()
+            _sd["transaction_date"] = pd.to_datetime(_sd["transaction_date"], errors="coerce")
+            _sd = _sd.dropna(subset=["transaction_date"])
+            _sd["_date"] = _sd["transaction_date"].dt.date
+            _month_sd = _sd[_sd["_date"].between(month_start, today)]
+            if not _month_sd.empty:
+                expected_total_sales = float(_month_sd["amount"].sum())
+            _today_sd = _sd[_sd["_date"] == today]
+            if not _today_sd.empty:
+                today_sales_new = float(_today_sd[_today_sd["amount"] > 0]["amount"].sum())
+                today_sales_adj = float(_today_sd[_today_sd["amount"] < 0]["amount"].sum())
+                try:
+                    if "order_id" in _today_sd.columns:
+                        _oid_ct = pd.to_numeric(_today_sd["order_id"], errors="coerce").dropna().astype(int).unique().tolist()
+                        daily_contract_txn_count = len(_oid_ct) if _oid_ct else int(len(_today_sd))
+                        if _oid_ct and not orders.empty:
+                            _co_day = orders[orders["id"].isin(_oid_ct)]
+                            if not _co_day.empty and "total_amount" in _co_day.columns:
+                                _ct_tot = float(_co_day["total_amount"].fillna(0).astype(float).sum())
+                                _ct_cst = float(_co_day["cost_price"].fillna(0).astype(float).sum()) if "cost_price" in _co_day.columns else 0.0
+                                if "display_cost_amount" in _co_day.columns:
+                                    _ct_cst += float(_co_day["display_cost_amount"].fillna(0).astype(float).sum())
+                                if _ct_tot > 0:
+                                    daily_contract_margin_pct = (_ct_tot - _ct_cst) / _ct_tot * 100.0
+                    else:
+                        daily_contract_txn_count = int(len(_today_sd))
+                except Exception:
+                    daily_contract_txn_count = int(len(_today_sd))
+    except Exception:
+        pass
+
+    today_sales_net = today_sales_new + today_sales_adj
+    _contract_adj_display = "" if today_sales_adj < 0 else "display:none;"
+    _contract_adj_new_fmt = f"{today_sales_new:,.0f}"
+    _contract_adj_neg_fmt = f"{abs(today_sales_adj):,.0f}"
+
+    _days_elapsed = (today - month_start).days + 1
+    _days_in_month = month_end.day
+    projected_monthly_sales = (
+        (expected_total_sales / _days_elapsed * _days_in_month)
+        if _days_elapsed > 0 and expected_total_sales > 0 else 0.0
+    )
+    _proj_sub = f"일평균 {expected_total_sales/_days_elapsed:,.0f}원 × {_days_in_month}일" if _days_elapsed > 0 and expected_total_sales > 0 else ""
+
+    if payments.empty or "payment_date" not in payments.columns:
+        daily_receipt_total = 0.0
+        daily_receipt_methods_html = '<div class="kpi-daily-recv-empty">결제일(payment_date) 없음</div>'
+        month_cumulative_methods_html = '<div class="kpi-daily-recv-empty">결제일(payment_date) 없음</div>'
+    else:
+        if not daily_receipt_methods_html:
+            daily_receipt_methods_html = '<div class="kpi-daily-recv-empty">당일 수납 내역 없음</div>'
+        if not month_cumulative_methods_html:
+            month_cumulative_methods_html = '<div class="kpi-daily-recv-empty">당월 수납 내역 없음</div>'
+
+    if payments.empty or "payment_date" not in payments.columns:
+        _recv_month_line2 = ""
+        _recv_month_line3 = ""
+    else:
+        _recv_month_line2 = f"당월 상계(음수 결제) 합: {month_pay_neg_sum:,.0f}원"
+        _recv_month_line3 = (
+            f"이력·취소/삭제 {ph_totals['month_cancel']:,.0f}원 · "
+            f"이력·감액(결제변경) {ph_totals['month_reduce']:,.0f}원"
+        )
+
+    _wd_kr = ("월", "화", "수", "목", "금", "토", "일")
+    _dash_daily_date_title = f"{today.year}.{today.month:02d}.{today.day:02d} ({_wd_kr[today.weekday()]})"
+
+    st.markdown(
+        _tw.dedent(f"""
+        <style>
+        .kpi-table {{
+            width: 100%;
+            table-layout: fixed;
+            border-collapse: separate;
+            border-spacing: 8px 0;
+            margin-bottom: 0.5rem;
+        }}
+        .kpi-table td {{
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 12px 10px;
+            text-align: center;
+            vertical-align: top;
+            width: 14.28%;
+        }}
+        .kpi-td-daily-contract {{ width: 15%; min-width: 138px; }}
+        .kpi-contract-adj-row {{
+            margin-top: 6px; font-size: 0.72rem; color: #546e7a;
+            display: flex; justify-content: center; align-items: center; gap: 2px; flex-wrap: wrap;
+        }}
+        .kpi-contract-adj-positive {{ color: #1565c0; font-weight: 600; }}
+        .kpi-contract-adj-op {{ color: #78909c; font-weight: 700; }}
+        .kpi-contract-adj-negative {{ color: #c62828; font-weight: 600; }}
+        .kpi-td-daily-receipt {{ width: 18%; min-width: 168px; }}
+        .kpi-daily-recv-total {{ font-size: 1.28rem; font-weight: 800; color: #0d47a1; line-height: 1.2; margin-top: 5px; }}
+        .kpi-daily-recv-caption {{ font-size: 0.58rem; color: #90a4ae; margin-top: 4px; font-weight: 600; }}
+        .kpi-daily-recv-breakdown {{ margin-top: 8px; text-align: left; padding: 0 2px 0 0; max-height: 110px; overflow-y: auto; width: 100%; }}
+        .kpi-month-recv-breakdown {{ margin-top: 6px; text-align: left; padding: 0 2px 0 0; max-height: 130px; overflow-y: auto; width: 100%; }}
+        .kpi-td-month-cumulative-receipt {{ min-width: 168px; width: 18%; }}
+        .kpi-daily-recv-row {{
+            font-size: 0.62rem; color: #546e7a; line-height: 1.5;
+            display: flex; justify-content: space-between; align-items: baseline; gap: 6px;
+            border-bottom: 1px solid #eceff1; padding: 3px 0;
+        }}
+        .kpi-daily-recv-row:last-child {{ border-bottom: none; }}
+        .kpi-daily-recv-m {{ flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        .kpi-daily-recv-amt {{ font-size: 0.64rem; font-weight: 700; color: #37474f; white-space: nowrap; }}
+        .kpi-daily-recv-empty {{ font-size: 0.62rem; color: #90a4ae; text-align: center; padding: 6px 0; }}
+        .kpi-value-daily-contract {{ font-size: 1.22rem; font-weight: 800; color: #e65100; line-height: 1.15; margin-top: 4px; }}
+        .kpi-date-pill {{
+            display: inline-block; font-size: 0.6rem; font-weight: 700; color: #37474f;
+            background: linear-gradient(180deg, #eceff1, #dfe3e6); padding: 2px 8px; border-radius: 999px;
+            margin-left: 5px; vertical-align: middle; letter-spacing: 0.02em;
+        }}
+        .kpi-contract-date-below {{ margin: 2px 0 6px 0; }}
+        .kpi-contract-date-below .kpi-date-pill {{ margin-left: 0; }}
+        .kpi-daily-meta {{ font-size: 0.74rem; color: #263238; font-weight: 600; margin-top: 6px; line-height: 1.4; }}
+        .kpi-table td.highlight {{ background: linear-gradient(135deg, #fff3e0, #ffe0b2); border: 2px solid #ff6f00; }}
+        .kpi-label {{ font-size: 0.78rem; color: #666; font-weight: 600; letter-spacing: 0.03em; margin-bottom: 6px; }}
+        .kpi-value {{ font-size: 1.45rem; font-weight: 800; color: #1a1a2e; line-height: 1.2; }}
+        .kpi-value.contract {{ color: #e65100; font-size: 1.6rem; }}
+        .kpi-sub {{ font-size: 0.7rem; color: #888; margin-top: 4px; }}
+        .kpi-sub2 {{ font-size: 0.62rem; color: #777; margin-top: 3px; line-height: 1.35; }}
+        .kpi-sub-muted {{ color: #999; font-size: 0.58rem; }}
+        .kpi-detail-stack {{ display: flex; flex-direction: column; align-items: center; gap: 6px; margin-top: 8px; width: 100%; }}
+        .kpi-detail-stack .kpi-sub, .kpi-detail-stack .kpi-sub2 {{ display: block; margin-top: 0; }}
+        </style>
+        <table class="kpi-table">
+          <tr>
+            <td class="highlight kpi-td-daily-contract">
+              <div class="kpi-label">📋 당일 계약</div>
+              <div class="kpi-contract-date-below"><span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
+              <div class="kpi-value-daily-contract">{today_sales_net:,.0f}원</div>
+              <div class="kpi-daily-meta">({daily_contract_txn_count}건) · 마진율 {daily_contract_margin_pct:.1f}%</div>
+              <div class="kpi-contract-adj-row" style="{_contract_adj_display}">
+                <span class="kpi-contract-adj-positive">{_contract_adj_new_fmt}원</span>
+                <span class="kpi-contract-adj-op"> &minus; </span>
+                <span class="kpi-contract-adj-negative">{_contract_adj_neg_fmt}원</span>
+              </div>
+            </td>
+            <td>
+              <div class="kpi-label">📈 누적매출 (월)</div>
+              <div class="kpi-value">{expected_total_sales:,.0f}원</div>
+              <div class="kpi-sub">{month_start.strftime("%m/%d")} ~ 오늘</div>
+            </td>
+            <td class="kpi-td-daily-receipt">
+              <div class="kpi-label">💳 일일 수납액<span class="kpi-date-pill">{html.escape(_dash_daily_date_title)}</span></div>
+              <div class="kpi-daily-recv-total">{daily_receipt_total:,.0f}원</div>
+              <div class="kpi-daily-recv-breakdown">{daily_receipt_methods_html}</div>
+            </td>
+            <td class="kpi-td-month-cumulative-receipt">
+              <div class="kpi-label">📊 누적 수납액 (월)</div>
+              <div class="kpi-value">{cumulative_sales:,.0f}원</div>
+              <div class="kpi-month-recv-breakdown">{month_cumulative_methods_html}</div>
+            </td>
+            <td>
+              <div class="kpi-label">🎯 예상 월매출</div>
+              <div class="kpi-value">{projected_monthly_sales:,.0f}원</div>
+              <div class="kpi-sub">{_proj_sub}</div>
+            </td>
+            <td>
+              <div class="kpi-label">💹 누적 마진율 (월)</div>
+              <div class="kpi-value">{margin_pct:.1f}%</div>
+            </td>
+            <td>
+              <div class="kpi-label">🛒 판매건수</div>
+              <div class="kpi-value">{order_count}건</div>
+            </td>
+          </tr>
+        </table>
+        """),
+        unsafe_allow_html=True,
+    )
+
+
 def _superadmin_tab1_integrated_dashboard():
     """① 전 지점 통합 대시보드: 매장 선택(전체/개별) + 섹션 1~5 (매장관리자 대시보드 동일 구조, Todo 제외)."""
     _render_recent_notices_section()
@@ -6658,42 +6918,15 @@ def _superadmin_tab1_integrated_dashboard():
 
     # ── 1. 주요 매출 항목 ──────────────────────────────
     st.subheader("1. 주요 매출 항목")
-
-    _today_contract = float(today_sales[today_sales["amount"] > 0]["amount"].sum()) if not today_sales.empty and "amount" in today_sales.columns else 0.0
-    _month_sales_total = float(month_sales["amount"].sum()) if not month_sales.empty and "amount" in month_sales.columns else 0.0
-    _today_receipt = float(today_payments["amount"].sum()) if not today_payments.empty and "amount" in today_payments.columns else 0.0
-    _month_receipt = float(month_payments["amount"].sum()) if not month_payments.empty and "amount" in month_payments.columns else 0.0
-    _month_margin = float(month_orders["actual_margin"].fillna(0).sum()) if not month_orders.empty and "actual_margin" in month_orders.columns else 0.0
-    _month_total_amt = float(month_orders["total_amount"].fillna(0).sum()) if not month_orders.empty else 0.0
-    _margin_rate = (_month_margin / _month_total_amt * 100) if _month_total_amt > 0 else 0.0
-    _month_count = len(month_orders)
-    _total_unpaid = 0.0
-    if not orders.empty and "id" in orders.columns:
-        _oc = orders.copy()
-        _oc["_paid"] = _oc["id"].map(_dash_pay_sum).fillna(0)
-        _oc["_bal"] = _oc["total_amount"].fillna(0) - _oc["_paid"]
-        _total_unpaid = float(_oc["_bal"].clip(lower=0).sum())
-    _days_so_far = max(today.day, 1)
-    _expected_month = (_month_sales_total / _days_so_far) * month_end.day if _month_sales_total > 0 else 0.0
-
-    _kc1, _kc2, _kc3, _kc4 = st.columns(4)
-    with _kc1:
-        st.metric("당일 계약금액", f"{_today_contract:,.0f}원")
-    with _kc2:
-        st.metric("이번 달 누적 매출", f"{_month_sales_total:,.0f}원")
-    with _kc3:
-        st.metric("당일 수납", f"{_today_receipt:,.0f}원")
-    with _kc4:
-        st.metric("이번 달 누적 수납", f"{_month_receipt:,.0f}원")
-    _kc5, _kc6, _kc7, _kc8 = st.columns(4)
-    with _kc5:
-        st.metric("이번 달 마진", f"{_month_margin:,.0f}원")
-    with _kc6:
-        st.metric("누적 마진율", f"{_margin_rate:.1f}%")
-    with _kc7:
-        st.metric("이번 달 판매건수", f"{_month_count}건")
-    with _kc8:
-        st.metric("이번 달 카드수수료", f"{total_fees_month:,.0f}원")
+    _render_main_kpi_section(
+        orders=orders,
+        payments=payments,
+        sales_df=sales_df,
+        today=today,
+        month_start=month_start,
+        month_end=month_end,
+        db_filename=db_filename,
+    )
 
     # 전체 매장 통합일 때 매장별 랭킹 표시
     if is_all and _store_rank_rows:
