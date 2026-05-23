@@ -531,6 +531,7 @@ def _supabase_run_app_tables_sql():
     sql_files = [
         "SUPABASE_APP_TABLES.sql",
         "SUPABASE_APP_EDIT_REQUESTS.sql",
+        "SUPABASE_APP_ERP_ATTENDANCE.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -8857,6 +8858,1321 @@ def _get_store_ids_by_display_names(display_names: list):
     return result
 
 
+# =============================================================================
+# ERP 근태/휴가 관리 모듈
+# =============================================================================
+# 다음 5개 테이블 사용 (SUPABASE_APP_ERP_ATTENDANCE.sql):
+#  - app_staffing_rules      : 요일별 시간대 최소 근무 인원 규칙
+#  - app_shift_schedules     : 사전 근무 일정 계획
+#  - app_leave_grants        : 직원별 연차 부여 및 입사일
+#  - app_attendance_logs     : 실제 근태 기록 (다점포)
+#  - app_overtime_requests   : 추가근무 신청/승인
+#
+# 직원 식별: home_db_filename + employee_name (표시명)
+# 다점포 근무: work_db_filename + work_location_name 으로 별도 기록
+
+_ERP_WORK_TYPES = ["정상", "연차", "반차", "조퇴", "지각", "시차적립", "시차사용", "행사", "추가근무"]
+_ERP_LEAVE_DEDUCTION_MAP = {"연차": 1.0, "반차": 0.5}
+_ERP_DOW_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+_ERP_BADGE_COLORS = {
+    "연차": "#43A047",
+    "반차": "#29B6F6",
+    "조퇴": "#E53935",
+    "지각": "#E53935",
+    "시차적립": "#FB8C00",
+    "시차사용": "#1E88E5",
+    "행사": "#8E24AA",
+    "추가근무": "#6D4C41",
+    "정상": "#90A4AE",
+}
+
+
+def _erp_minutes_between(t_start, t_end) -> int:
+    """time 객체 또는 'HH:MM[:SS]' 문자열 두 개의 분 차이. 음수면 0."""
+    def _to_min(t):
+        if t is None or t == "":
+            return None
+        if isinstance(t, dt_time):
+            return t.hour * 60 + t.minute
+        s = str(t).strip()
+        if not s:
+            return None
+        try:
+            parts = s.split(":")
+            return int(parts[0]) * 60 + int(parts[1])
+        except Exception:
+            return None
+    a, b = _to_min(t_start), _to_min(t_end)
+    if a is None or b is None:
+        return 0
+    diff = b - a
+    return diff if diff > 0 else 0
+
+
+def _erp_parse_time(s, default=None):
+    """문자열/time → datetime.time. 실패 시 default."""
+    if isinstance(s, dt_time):
+        return s
+    if s is None or s == "":
+        return default
+    try:
+        parts = str(s).split(":")
+        return dt_time(int(parts[0]), int(parts[1]))
+    except Exception:
+        return default
+
+
+def _erp_get_employee_names_for_store(db_filename: str) -> list:
+    """현재 매장에 소속된 직원 표시명 목록 (관리자용)."""
+    if not db_filename:
+        return []
+    try:
+        names = _get_supabase_store_assigned_employee_names(db_filename) or []
+        return sorted(set(n for n in names if n))
+    except Exception:
+        return []
+
+
+def _erp_fetch_table(table: str, filters: dict | None = None, order: str | None = None) -> list:
+    """범용 Supabase 단순 조회. filters는 단일 eq 조건들."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        q = client.table(table).select("*")
+        for k, v in (filters or {}).items():
+            if v is not None:
+                q = q.eq(k, v)
+        if order:
+            q = q.order(order)
+        r = q.execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception as e:
+        st.caption(f"⚠️ {table} 조회 실패: {e}")
+        return []
+
+
+def _erp_fetch_range(table: str, db_col: str, db_filename: str, date_col: str, start: date, end: date, extra_eq: dict | None = None) -> list:
+    """날짜 범위 조회 (start, end 포함). extra_eq: 추가 eq 조건."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        q = client.table(table).select("*").eq(db_col, db_filename).gte(date_col, start.isoformat()).lte(date_col, end.isoformat())
+        for k, v in (extra_eq or {}).items():
+            if v is not None:
+                q = q.eq(k, v)
+        r = q.order(date_col).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception as e:
+        st.caption(f"⚠️ {table} 범위 조회 실패: {e}")
+        return []
+
+
+def _erp_count_active_at(shifts: list, slot_start: dt_time, slot_end: dt_time) -> int:
+    """shifts(같은 날짜)에서 [slot_start, slot_end)와 겹치는 인원 수."""
+    s0 = slot_start.hour * 60 + slot_start.minute
+    e0 = slot_end.hour * 60 + slot_end.minute
+    cnt = 0
+    for s in shifts:
+        st_t = _erp_parse_time(s.get("shift_start"))
+        en_t = _erp_parse_time(s.get("shift_end"))
+        if not st_t or not en_t:
+            continue
+        s1 = st_t.hour * 60 + st_t.minute
+        e1 = en_t.hour * 60 + en_t.minute
+        if s1 < e0 and e1 > s0:
+            cnt += 1
+    return cnt
+
+
+def _erp_validate_shifts_against_rules(db_filename: str, planned_shifts_by_date: dict) -> list:
+    """
+    planned_shifts_by_date: {date: [{employee_name, shift_start, shift_end}, ...]}
+    반환: 위반 메시지 리스트 (빈 리스트 = OK)
+    """
+    rules_all = _erp_fetch_table("app_staffing_rules", {"db_filename": db_filename})
+    rules_by_dow = {}
+    for r in rules_all:
+        rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
+    violations = []
+    for d, shifts in sorted(planned_shifts_by_date.items()):
+        dow = d.weekday()
+        rules = rules_by_dow.get(dow, [])
+        if not rules:
+            continue
+        for rule in rules:
+            slot_s = _erp_parse_time(rule.get("slot_start"))
+            slot_e = _erp_parse_time(rule.get("slot_end"))
+            min_n = int(rule.get("min_staff") or 1)
+            if not slot_s or not slot_e:
+                continue
+            cnt = _erp_count_active_at(shifts, slot_s, slot_e)
+            if cnt < min_n:
+                violations.append(
+                    f"{d.isoformat()}({_ERP_DOW_LABELS[dow]}) {rule.get('slot_start')}~{rule.get('slot_end')} "
+                    f"구간 {min_n - cnt}명 부족 (배정 {cnt}명 / 최소 {min_n}명)"
+                )
+    return violations
+
+
+def _erp_compute_remaining_comptime(home_db: str, employee_name: str) -> int:
+    """잔여 시차(분) = SUM(시차적립.diff_minutes) - SUM(시차사용.diff_minutes). approved 만 집계."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return 0
+    try:
+        r = client.table("app_attendance_logs").select("work_type, diff_minutes, status").eq(
+            "home_db_filename", home_db).eq("employee_name", employee_name).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        earn = sum(int(x.get("diff_minutes") or 0) for x in rows if x.get("work_type") == "시차적립" and (x.get("status") or "approved") == "approved")
+        use = sum(int(x.get("diff_minutes") or 0) for x in rows if x.get("work_type") == "시차사용" and (x.get("status") or "approved") == "approved")
+        return earn - use
+    except Exception:
+        return 0
+
+
+def _erp_compute_monthly_accrued(hire_date_str: str | None, as_of: date) -> int:
+    """입사일 기반 월차 적립분: min(경과 개월, 11). hire_date가 없거나 미래면 0."""
+    if not hire_date_str:
+        return 0
+    try:
+        hd = datetime.fromisoformat(str(hire_date_str)[:10]).date()
+    except Exception:
+        return 0
+    if hd > as_of:
+        return 0
+    months = (as_of.year - hd.year) * 12 + (as_of.month - hd.month)
+    if as_of.day < hd.day:
+        months -= 1
+    return max(0, min(months, 11))
+
+
+def _erp_insert_row(table: str, row: dict) -> tuple[bool, str]:
+    """단일 행 insert. (성공, 에러문) 반환."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return False, err or "Supabase 클라이언트 없음"
+    try:
+        client.table(table).insert(row).execute()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _erp_update_row(table: str, row_id: int, patch: dict) -> tuple[bool, str]:
+    client, err = get_supabase_client()
+    if err or not client:
+        return False, err or "Supabase 클라이언트 없음"
+    try:
+        client.table(table).update(patch).eq("id", row_id).execute()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _erp_delete_row(table: str, row_id: int) -> tuple[bool, str]:
+    client, err = get_supabase_client()
+    if err or not client:
+        return False, err or "Supabase 클라이언트 없음"
+    try:
+        client.table(table).delete().eq("id", row_id).execute()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def render_erp_attendance():
+    """ERP 근태 관리: 사전 일정·최소인원·캘린더·근태·시차·연차·월말요약 통합 화면."""
+    user = st.session_state.get("current_user") or {}
+    role = user.get("role") or "user"
+    me_name = _get_current_user_display_name() or (user.get("username") or "")
+    current_db = st.session_state.get("current_db")
+    today = _today_kst()
+
+    st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
+    st.header("🗓️ 근태 관리 (ERP)")
+    if st.button("← 첫 화면으로", key="erp_back_btn"):
+        if "active_admin_page" in st.session_state:
+            del st.session_state["active_admin_page"]
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if role == "superadmin":
+        _erp_render_superadmin_view(today)
+        return
+
+    if not current_db:
+        st.warning("매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 선택해 주세요.")
+        return
+
+    if role == "store_admin":
+        tab_labels = ["근무 일정 계획", "최소 인원 설정", "캘린더", "근태 입력",
+                      "추가근무·시차 관리", "연차/월차 관리", "월말 요약"]
+    else:
+        tab_labels = ["캘린더", "근태 입력", "추가근무·시차 신청", "내 연차 현황"]
+
+    tabs = st.tabs(tab_labels)
+
+    if role == "store_admin":
+        with tabs[0]:
+            _erp_tab_shift_plan(current_db, me_name)
+        with tabs[1]:
+            _erp_tab_staffing_rules(current_db, me_name)
+        with tabs[2]:
+            _erp_tab_calendar(current_db, role, me_name, today)
+        with tabs[3]:
+            _erp_tab_attendance_input(current_db, role, me_name)
+        with tabs[4]:
+            _erp_tab_comptime_overtime(current_db, role, me_name)
+        with tabs[5]:
+            _erp_tab_leave_grants(current_db, me_name)
+        with tabs[6]:
+            _erp_tab_monthly_summary(current_db, today)
+    else:
+        with tabs[0]:
+            _erp_tab_calendar(current_db, role, me_name, today)
+        with tabs[1]:
+            _erp_tab_attendance_input(current_db, role, me_name)
+        with tabs[2]:
+            _erp_tab_comptime_overtime(current_db, role, me_name)
+        with tabs[3]:
+            _erp_tab_my_leave_status(current_db, me_name)
+
+
+# ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
+
+def _erp_tab_shift_plan(current_db: str, me_name: str):
+    st.subheader("📅 근무 일정 계획 (사전 배정)")
+    st.caption("주/월 단위로 직원 근무 일정을 계획합니다. 저장 시 최소 인원 규칙 위반 여부를 검증합니다.")
+
+    today = _today_kst()
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        period_mode = st.radio("기간", ["1주", "2주", "1개월"], horizontal=True, key="erp_shift_period")
+    with col_b:
+        base_date = st.date_input("시작일", value=today, key="erp_shift_base_date")
+    if period_mode == "1주":
+        days_n = 7
+    elif period_mode == "2주":
+        days_n = 14
+    else:
+        days_n = 30
+    date_list = [base_date + timedelta(days=i) for i in range(days_n)]
+
+    employees = _erp_get_employee_names_for_store(current_db)
+    if not employees:
+        st.info("이 매장에 배정된 직원이 없습니다. 먼저 [직원 관리]에서 직원을 등록·배정해 주세요.")
+        return
+
+    existing = _erp_fetch_range("app_shift_schedules", "db_filename", current_db, "shift_date", date_list[0], date_list[-1])
+    existing_by_key = {}
+    for row in existing:
+        key = (str(row.get("employee_name") or ""), str(row.get("shift_date") or "")[:10])
+        existing_by_key[key] = row
+
+    st.markdown("##### ⬇️ 직원별 일정 입력")
+    st.caption("각 셀에 'HH:MM-HH:MM' 형식(예: 09:00-18:00)으로 입력하세요. 비우면 휴무입니다.")
+
+    with st.form("erp_shift_plan_form", clear_on_submit=False):
+        edits = {}
+        for emp in employees:
+            st.markdown(f"**{emp}**")
+            cols = st.columns(min(7, days_n))
+            for i, d in enumerate(date_list):
+                col = cols[i % len(cols)]
+                if i > 0 and i % len(cols) == 0:
+                    cols = st.columns(min(7, days_n))
+                    col = cols[0]
+                key = (emp, d.isoformat())
+                row = existing_by_key.get(key)
+                default = ""
+                if row:
+                    ss = str(row.get("shift_start") or "")[:5]
+                    ee = str(row.get("shift_end") or "")[:5]
+                    if ss and ee:
+                        default = f"{ss}-{ee}"
+                with col:
+                    label = f"{d.month}/{d.day} ({_ERP_DOW_LABELS[d.weekday()]})"
+                    val = st.text_input(label, value=default, key=f"shift_{emp}_{d.isoformat()}",
+                                        placeholder="09:00-18:00")
+                    edits[key] = val.strip()
+            st.divider()
+
+        loc_input = st.text_input("기본 근무 장소 (선택, 신규 행에만 적용)", value="", key="erp_shift_loc",
+                                   placeholder="예: 본점 / 백화점 / 행사장")
+        submitted = st.form_submit_button("💾 일정 저장 (최소 인원 검증)", type="primary")
+
+    if submitted:
+        planned_by_date: dict[date, list] = {}
+        new_rows = []
+        delete_ids = []
+        updates = []
+        for (emp, d_str), val in edits.items():
+            d = datetime.fromisoformat(d_str).date()
+            existing_row = existing_by_key.get((emp, d_str))
+            if not val:
+                if existing_row:
+                    delete_ids.append(int(existing_row["id"]))
+                continue
+            try:
+                a, b = val.split("-", 1)
+                t1 = _erp_parse_time(a.strip())
+                t2 = _erp_parse_time(b.strip())
+                if not t1 or not t2:
+                    raise ValueError()
+            except Exception:
+                st.error(f"⛔ {emp} / {d_str}: '{val}' 형식이 올바르지 않습니다. (예: 09:00-18:00)")
+                return
+            planned_by_date.setdefault(d, []).append({
+                "employee_name": emp,
+                "shift_start": t1.strftime("%H:%M:%S"),
+                "shift_end": t2.strftime("%H:%M:%S"),
+            })
+            new_row = {
+                "db_filename": current_db,
+                "employee_name": emp,
+                "shift_date": d_str,
+                "shift_start": t1.strftime("%H:%M:%S"),
+                "shift_end": t2.strftime("%H:%M:%S"),
+                "work_location_name": loc_input or (existing_row.get("work_location_name") if existing_row else None),
+                "created_by": me_name,
+            }
+            if existing_row:
+                updates.append((int(existing_row["id"]), new_row))
+            else:
+                new_rows.append(new_row)
+
+        violations = _erp_validate_shifts_against_rules(current_db, planned_by_date)
+        if violations:
+            st.error("⛔ 최소 인원 규칙 위반으로 저장이 중단되었습니다.")
+            for v in violations:
+                st.markdown(f"- {v}")
+            st.caption("최소 인원 규칙을 조정하거나 일정을 다시 배정해 주세요.")
+            return
+
+        ok_n, err_n = 0, 0
+        for row in new_rows:
+            ok, e = _erp_insert_row("app_shift_schedules", row)
+            if ok:
+                ok_n += 1
+            else:
+                err_n += 1
+                st.caption(f"⚠️ 추가 실패: {e}")
+        for rid, patch in updates:
+            ok, e = _erp_update_row("app_shift_schedules", rid, patch)
+            if ok:
+                ok_n += 1
+            else:
+                err_n += 1
+                st.caption(f"⚠️ 수정 실패: {e}")
+        for rid in delete_ids:
+            _erp_delete_row("app_shift_schedules", rid)
+        st.success(f"✅ 일정 저장 완료. 처리 {ok_n}건 / 실패 {err_n}건")
+        st.rerun()
+
+
+# ---------- 탭 2: 최소 근무 인원 규칙 설정 (store_admin) ----------
+
+def _erp_tab_staffing_rules(current_db: str, me_name: str):
+    st.subheader("👥 최소 근무 인원 규칙 설정")
+    st.caption("요일별 시간대마다 최소 근무 인원을 정합니다. 근무 일정 저장 시 자동으로 검증됩니다.")
+
+    rules = _erp_fetch_table("app_staffing_rules", {"db_filename": current_db}, order="day_of_week")
+    rules_by_dow = {}
+    for r in rules:
+        rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
+
+    dow_tabs = st.tabs([f"{lbl}({i})" for i, lbl in enumerate(_ERP_DOW_LABELS)])
+    for dow_i, tab in enumerate(dow_tabs):
+        with tab:
+            day_rules = sorted(rules_by_dow.get(dow_i, []), key=lambda x: str(x.get("slot_start") or ""))
+            if day_rules:
+                st.markdown(f"**현재 {_ERP_DOW_LABELS[dow_i]}요일 규칙**")
+                for rule in day_rules:
+                    rc = st.columns([2, 2, 2, 1])
+                    with rc[0]:
+                        st.text(f"{str(rule.get('slot_start') or '')[:5]} ~ {str(rule.get('slot_end') or '')[:5]}")
+                    with rc[1]:
+                        st.text(f"최소 {rule.get('min_staff')}명")
+                    with rc[2]:
+                        st.caption(f"수정: {str(rule.get('updated_at') or '')[:16]}")
+                    with rc[3]:
+                        if st.button("삭제", key=f"erp_rule_del_{rule['id']}"):
+                            _erp_delete_row("app_staffing_rules", int(rule["id"]))
+                            st.rerun()
+            else:
+                st.info(f"{_ERP_DOW_LABELS[dow_i]}요일에 설정된 규칙이 없습니다.")
+
+            with st.form(f"erp_rule_add_{dow_i}", clear_on_submit=True):
+                fc = st.columns([1, 1, 1, 1])
+                with fc[0]:
+                    s_t = st.time_input("시작", value=dt_time(9, 0), key=f"erp_rule_s_{dow_i}")
+                with fc[1]:
+                    e_t = st.time_input("종료", value=dt_time(18, 0), key=f"erp_rule_e_{dow_i}")
+                with fc[2]:
+                    n = st.number_input("최소 인원", min_value=1, max_value=20, value=1, step=1, key=f"erp_rule_n_{dow_i}")
+                with fc[3]:
+                    add = st.form_submit_button("➕ 추가")
+                if add:
+                    if e_t <= s_t:
+                        st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
+                    else:
+                        ok, err = _erp_insert_row("app_staffing_rules", {
+                            "db_filename": current_db,
+                            "day_of_week": dow_i,
+                            "slot_start": s_t.strftime("%H:%M:%S"),
+                            "slot_end": e_t.strftime("%H:%M:%S"),
+                            "min_staff": int(n),
+                            "created_by": me_name,
+                        })
+                        if ok:
+                            st.success("규칙이 추가되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"추가 실패: {err}")
+
+
+# ---------- 탭 3: 월별 캘린더 ----------
+
+def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
+    import calendar as _cal
+    st.subheader("🗓️ 월별 캘린더")
+
+    col_y, col_m, col_emp = st.columns([1, 1, 2])
+    with col_y:
+        year = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_cal_year")
+    with col_m:
+        month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="erp_cal_month")
+    with col_emp:
+        if role in ("store_admin", "superadmin"):
+            emp_opts = ["(전체)"] + _erp_get_employee_names_for_store(current_db)
+            selected_emp = st.selectbox("직원", emp_opts, key="erp_cal_emp")
+        else:
+            selected_emp = me_name
+            st.text_input("직원", value=me_name, disabled=True, key="erp_cal_emp_fixed")
+
+    last_day = _cal.monthrange(int(year), int(month))[1]
+    period_start = date(int(year), int(month), 1)
+    period_end = date(int(year), int(month), last_day)
+
+    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db, "log_date", period_start, period_end)
+    shifts = _erp_fetch_range("app_shift_schedules", "db_filename", current_db, "shift_date", period_start, period_end)
+    if selected_emp and selected_emp != "(전체)":
+        logs = [l for l in logs if (l.get("employee_name") or "") == selected_emp]
+        shifts = [s for s in shifts if (s.get("employee_name") or "") == selected_emp]
+
+    rules_all = _erp_fetch_table("app_staffing_rules", {"db_filename": current_db})
+    rules_by_dow = {}
+    for r in rules_all:
+        rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
+
+    shifts_by_date: dict[str, list] = {}
+    for s in shifts:
+        shifts_by_date.setdefault(str(s.get("shift_date") or "")[:10], []).append(s)
+    logs_by_date: dict[str, list] = {}
+    for l in logs:
+        logs_by_date.setdefault(str(l.get("log_date") or "")[:10], []).append(l)
+
+    shortage_dates = set()
+    for d_iso, day_shifts in shifts_by_date.items():
+        try:
+            d = datetime.fromisoformat(d_iso).date()
+        except Exception:
+            continue
+        for rule in rules_by_dow.get(d.weekday(), []):
+            slot_s = _erp_parse_time(rule.get("slot_start"))
+            slot_e = _erp_parse_time(rule.get("slot_end"))
+            if not slot_s or not slot_e:
+                continue
+            if _erp_count_active_at(day_shifts, slot_s, slot_e) < int(rule.get("min_staff") or 1):
+                shortage_dates.add(d_iso)
+                break
+
+    cal_obj = _cal.Calendar(firstweekday=6)
+    weeks = cal_obj.monthdayscalendar(int(year), int(month))
+
+    html = ["<table style='width:100%; border-collapse: collapse; font-size: 0.85rem;'>"]
+    html.append("<thead><tr>")
+    for d_label in ["일", "월", "화", "수", "목", "금", "토"]:
+        color = "#E53935" if d_label == "일" else ("#1565C0" if d_label == "토" else "#37474F")
+        html.append(f"<th style='border:1px solid #ddd; padding:6px; background:#F5F5F5; color:{color};'>{d_label}</th>")
+    html.append("</tr></thead><tbody>")
+    for week in weeks:
+        html.append("<tr>")
+        for d_num in week:
+            if d_num == 0:
+                html.append("<td style='border:1px solid #eee; height: 110px;'></td>")
+                continue
+            d_iso = date(int(year), int(month), d_num).isoformat()
+            border_color = "#E53935" if d_iso in shortage_dates else "#ddd"
+            border_width = "2px" if d_iso in shortage_dates else "1px"
+            cell = [f"<td style='border:{border_width} solid {border_color}; vertical-align:top; padding:4px; height:110px; min-width:90px;'>"]
+            cell.append(f"<div style='font-weight:bold; font-size:0.9rem;'>{d_num}</div>")
+            if d_iso in shortage_dates:
+                cell.append("<div style='color:#E53935; font-size:0.7rem; font-weight:bold;'>⚠️ 인원 부족</div>")
+            for sh in shifts_by_date.get(d_iso, []):
+                ss = str(sh.get("shift_start") or "")[:5]
+                ee = str(sh.get("shift_end") or "")[:5]
+                emp = sh.get("employee_name") or ""
+                loc = sh.get("work_location_name") or ""
+                txt = f"{emp} {ss}-{ee}"
+                if loc:
+                    txt += f" <i style='color:#777'>@{loc}</i>"
+                cell.append(f"<div style='color:#555; font-size:0.7rem;'>📋 {txt}</div>")
+            for lg in logs_by_date.get(d_iso, []):
+                wt = lg.get("work_type") or "정상"
+                color = _ERP_BADGE_COLORS.get(wt, "#90A4AE")
+                emp = lg.get("employee_name") or ""
+                extra = ""
+                if wt in ("시차적립", "시차사용"):
+                    extra = f" {lg.get('diff_minutes') or 0}분"
+                loc = lg.get("work_location_name") or ""
+                cell.append(
+                    f"<div style='margin-top:2px;'><span style='background:{color}; color:white; padding:1px 5px; border-radius:3px; font-size:0.7rem;'>{wt}{extra}</span>"
+                    + (f" <span style='font-size:0.7rem; color:#555;'>{emp}</span>" if (role in ('store_admin','superadmin') and selected_emp == '(전체)') else "")
+                    + (f" <i style='color:#777; font-size:0.7rem;'>@{loc}</i>" if loc else "")
+                    + "</div>"
+                )
+            cell.append("</td>")
+            html.append("".join(cell))
+        html.append("</tr>")
+    html.append("</tbody></table>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+    with st.expander("🎨 범례"):
+        legends = []
+        for wt, col in _ERP_BADGE_COLORS.items():
+            legends.append(f"<span style='background:{col};color:white;padding:1px 6px;border-radius:3px;margin-right:4px;font-size:0.75rem;'>{wt}</span>")
+        st.markdown(" ".join(legends), unsafe_allow_html=True)
+        st.caption("📋 회색 텍스트 = 사전 계획된 근무 시각 / 빨간 테두리 = 해당 날짜 최소 인원 미달")
+
+
+# ---------- 탭 4: 근태 입력 ----------
+
+def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
+    st.subheader("✏️ 근태 입력")
+    st.caption("실제 출퇴근·휴가·시차 등을 기록합니다. 다점포 근무 시 근무 장소를 표기하면 통합 집계됩니다.")
+
+    today = _today_kst()
+    with st.form("erp_attendance_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            if role in ("store_admin", "superadmin"):
+                emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
+                target_emp = st.selectbox("직원", emp_opts, key="erp_att_emp")
+            else:
+                target_emp = me_name
+                st.text_input("직원", value=me_name, disabled=True)
+            log_date = st.date_input("날짜", value=today, key="erp_att_date")
+            work_type = st.selectbox("근태 유형", _ERP_WORK_TYPES, key="erp_att_type")
+        with col2:
+            start_time = st.time_input("실제 출근 시각", value=dt_time(9, 0), key="erp_att_start")
+            end_time = st.time_input("실제 퇴근 시각", value=dt_time(18, 0), key="erp_att_end")
+            work_loc = st.text_input("근무 장소 (다른 매장·행사장·백화점 등)", value="", key="erp_att_loc",
+                                      placeholder="예: 백화점 행사장 / 학성점 지원")
+
+        diff_min_input = 0
+        if work_type in ("시차적립", "시차사용"):
+            diff_min_input = st.number_input("시차 분수", min_value=0, max_value=1440, value=60, step=15, key="erp_att_diff")
+        note = st.text_input("비고", value="", key="erp_att_note")
+        submitted = st.form_submit_button("💾 저장", type="primary")
+
+    if submitted:
+        if work_type == "행사" and not (work_loc or "").strip():
+            st.error("행사 유형은 '근무 장소'를 반드시 입력해 주세요.")
+            return
+        leave_ded = float(_ERP_LEAVE_DEDUCTION_MAP.get(work_type, 0))
+        diff_minutes = 0
+        if work_type in ("시차적립", "시차사용"):
+            diff_minutes = int(diff_min_input)
+        elif work_type in ("조퇴", "지각"):
+            std_e = dt_time(18, 0)
+            if work_type == "조퇴" and end_time:
+                diff_minutes = max(0, (std_e.hour * 60 + std_e.minute) - (end_time.hour * 60 + end_time.minute))
+            elif work_type == "지각" and start_time:
+                std_s = dt_time(9, 0)
+                diff_minutes = max(0, (start_time.hour * 60 + start_time.minute) - (std_s.hour * 60 + std_s.minute))
+
+        status = "approved"
+        if work_type == "시차사용":
+            remain = _erp_compute_remaining_comptime(current_db, target_emp)
+            if remain < diff_minutes:
+                status = "pending"
+                st.warning(f"⚠️ 잔여 시차({remain}분) < 신청({diff_minutes}분). 관리자 승인 대기 상태로 저장됩니다.")
+            else:
+                st.success(f"✅ 잔여 시차 {remain}분 확인 → 즉시 승인")
+
+        row = {
+            "home_db_filename": current_db,
+            "work_db_filename": current_db,
+            "work_location_name": (work_loc or "").strip() or None,
+            "employee_name": target_emp,
+            "log_date": log_date.isoformat(),
+            "work_type": work_type,
+            "leave_deduction": leave_ded,
+            "diff_minutes": diff_minutes,
+            "start_time": start_time.strftime("%H:%M:%S") if start_time else None,
+            "end_time": end_time.strftime("%H:%M:%S") if end_time else None,
+            "status": status,
+            "note": (note or "").strip() or None,
+            "created_by": me_name,
+        }
+        ok, err = _erp_insert_row("app_attendance_logs", row)
+        if ok:
+            st.success("✅ 근태 기록이 저장되었습니다.")
+        else:
+            st.error(f"저장 실패: {err}")
+
+    st.divider()
+    st.markdown("##### 📋 최근 7일 내 본인/관리 근태 기록")
+    period_start = today - timedelta(days=7)
+    recent = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db, "log_date", period_start, today)
+    if role not in ("store_admin", "superadmin"):
+        recent = [r for r in recent if (r.get("employee_name") or "") == me_name]
+    if not recent:
+        st.info("최근 7일간 기록이 없습니다.")
+        return
+    df = pd.DataFrame(recent)
+    show_cols = ["log_date", "employee_name", "work_type", "start_time", "end_time", "diff_minutes",
+                 "leave_deduction", "work_location_name", "status", "note", "created_by"]
+    df = df[[c for c in show_cols if c in df.columns]].sort_values("log_date", ascending=False)
+    st.dataframe(df, width='stretch', hide_index=True)
+
+
+# ---------- 탭 5: 추가근무 & 시차 관리 ----------
+
+def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
+    st.subheader("⏱️ 추가근무 & 시차 관리")
+    today = _today_kst()
+
+    if role in ("store_admin", "superadmin"):
+        st.markdown("##### 🗓️ 주말 회의 시차 일괄 등록 (관리자)")
+        st.caption("주말 회의 참석 직원 전체에게 시차적립을 일괄 INSERT 합니다.")
+        with st.form("erp_weekend_meeting_form", clear_on_submit=True):
+            mc = st.columns([1, 1, 2])
+            with mc[0]:
+                m_date = st.date_input("회의 날짜", value=today, key="erp_wm_date")
+            with mc[1]:
+                m_min = st.number_input("적립 분수", min_value=15, max_value=480, value=60, step=15, key="erp_wm_min")
+            with mc[2]:
+                emp_pool = _erp_get_employee_names_for_store(current_db)
+                m_emps = st.multiselect("참석 직원", emp_pool, default=emp_pool, key="erp_wm_emps")
+            m_note = st.text_input("비고", value="주말 회의", key="erp_wm_note")
+            m_submit = st.form_submit_button("📥 일괄 등록")
+        if m_submit:
+            if not m_emps:
+                st.warning("참석 직원을 1명 이상 선택해 주세요.")
+            else:
+                ok_n, err_n = 0, 0
+                for emp in m_emps:
+                    row = {
+                        "home_db_filename": current_db,
+                        "work_db_filename": current_db,
+                        "employee_name": emp,
+                        "log_date": m_date.isoformat(),
+                        "work_type": "시차적립",
+                        "leave_deduction": 0,
+                        "diff_minutes": int(m_min),
+                        "status": "approved",
+                        "note": m_note,
+                        "created_by": me_name,
+                    }
+                    ok, _ = _erp_insert_row("app_attendance_logs", row)
+                    if ok:
+                        ok_n += 1
+                    else:
+                        err_n += 1
+                st.success(f"✅ 일괄 등록 완료: {ok_n}건 / 실패 {err_n}건")
+        st.divider()
+
+    st.markdown("##### 🕒 시차 사용 신청")
+    remain_min = _erp_compute_remaining_comptime(current_db, me_name) if role == "user" else None
+    if role == "user":
+        st.caption(f"내 잔여 시차: **{remain_min}분** ({remain_min // 60}시간 {remain_min % 60}분)")
+    with st.form("erp_comp_use_form", clear_on_submit=True):
+        cc = st.columns(3)
+        with cc[0]:
+            if role in ("store_admin", "superadmin"):
+                emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
+                cu_emp = st.selectbox("직원", emp_opts, key="erp_cu_emp")
+            else:
+                cu_emp = me_name
+                st.text_input("직원", value=me_name, disabled=True, key="erp_cu_emp_fixed")
+        with cc[1]:
+            cu_date = st.date_input("날짜", value=today, key="erp_cu_date")
+        with cc[2]:
+            cu_min = st.number_input("사용 분수", min_value=15, max_value=480, value=60, step=15, key="erp_cu_min")
+        cu_note = st.text_input("사유", value="", key="erp_cu_note")
+        cu_submit = st.form_submit_button("➡️ 신청")
+    if cu_submit:
+        emp_remain = _erp_compute_remaining_comptime(current_db, cu_emp)
+        status = "approved" if emp_remain >= int(cu_min) else "pending"
+        row = {
+            "home_db_filename": current_db,
+            "work_db_filename": current_db,
+            "employee_name": cu_emp,
+            "log_date": cu_date.isoformat(),
+            "work_type": "시차사용",
+            "leave_deduction": 0,
+            "diff_minutes": int(cu_min),
+            "status": status,
+            "note": cu_note,
+            "created_by": me_name,
+        }
+        ok, err = _erp_insert_row("app_attendance_logs", row)
+        if ok:
+            if status == "approved":
+                st.success(f"✅ 잔여 {emp_remain}분 → 즉시 승인 (사용 {cu_min}분)")
+            else:
+                st.warning(f"⚠️ 잔여 {emp_remain}분 < 사용 {cu_min}분 → 관리자 승인 대기 (pending)")
+        else:
+            st.error(f"저장 실패: {err}")
+
+    st.divider()
+    st.markdown("##### 📝 추가근무 신청")
+    with st.form("erp_overtime_form", clear_on_submit=True):
+        oc = st.columns(4)
+        with oc[0]:
+            if role in ("store_admin", "superadmin"):
+                ov_emp = st.selectbox("직원", _erp_get_employee_names_for_store(current_db) or [me_name], key="erp_ov_emp")
+            else:
+                ov_emp = me_name
+                st.text_input("직원", value=me_name, disabled=True, key="erp_ov_emp_fixed")
+        with oc[1]:
+            ov_date = st.date_input("날짜", value=today, key="erp_ov_date")
+        with oc[2]:
+            ov_start = st.time_input("시작", value=dt_time(18, 0), key="erp_ov_start")
+        with oc[3]:
+            ov_end = st.time_input("종료", value=dt_time(20, 0), key="erp_ov_end")
+        ov_loc = st.text_input("근무 장소", value="", key="erp_ov_loc")
+        ov_reason = st.text_input("사유", value="", key="erp_ov_reason")
+        ov_submit = st.form_submit_button("➡️ 신청")
+    if ov_submit:
+        mins = _erp_minutes_between(ov_start, ov_end)
+        if mins <= 0:
+            st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
+        else:
+            row = {
+                "home_db_filename": current_db,
+                "employee_name": ov_emp,
+                "request_date": ov_date.isoformat(),
+                "work_location_name": (ov_loc or "").strip() or None,
+                "extra_start": ov_start.strftime("%H:%M:%S"),
+                "extra_end": ov_end.strftime("%H:%M:%S"),
+                "extra_minutes": mins,
+                "reason": ov_reason,
+                "status": "pending",
+                "created_by": me_name,
+            }
+            ok, err = _erp_insert_row("app_overtime_requests", row)
+            if ok:
+                st.success(f"✅ 추가근무 신청 완료 ({mins}분) — 관리자 승인 대기")
+            else:
+                st.error(f"신청 실패: {err}")
+
+    if role in ("store_admin", "superadmin"):
+        st.divider()
+        st.markdown("##### ✅ 추가근무 승인 대기 목록 (관리자)")
+        pending = _erp_fetch_table("app_overtime_requests", {"home_db_filename": current_db, "status": "pending"})
+        if not pending:
+            st.info("대기 중인 추가근무 신청이 없습니다.")
+        else:
+            for req in pending:
+                rc = st.columns([2, 2, 1, 1, 1, 1])
+                with rc[0]:
+                    st.text(f"{req.get('request_date')} {req.get('employee_name')}")
+                with rc[1]:
+                    st.caption(f"{str(req.get('extra_start') or '')[:5]}~{str(req.get('extra_end') or '')[:5]} "
+                                f"({req.get('extra_minutes')}분) @ {req.get('work_location_name') or '-'}")
+                with rc[2]:
+                    st.caption(f"사유: {req.get('reason') or '-'}")
+                with rc[3]:
+                    if st.button("승인", key=f"erp_ov_app_{req['id']}", type="primary"):
+                        ok, _ = _erp_update_row("app_overtime_requests", int(req["id"]), {
+                            "status": "approved",
+                            "reviewed_by": me_name,
+                            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        if ok:
+                            st.rerun()
+                with rc[4]:
+                    if st.button("반려", key=f"erp_ov_rej_{req['id']}"):
+                        ok, _ = _erp_update_row("app_overtime_requests", int(req["id"]), {
+                            "status": "rejected",
+                            "reviewed_by": me_name,
+                            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        if ok:
+                            st.rerun()
+                with rc[5]:
+                    st.caption(f"신청: {str(req.get('created_at') or '')[:16]}")
+
+        st.divider()
+        st.markdown("##### ✅ 시차 사용 승인 대기 목록 (관리자)")
+        comp_pending = _erp_fetch_table("app_attendance_logs", {"home_db_filename": current_db})
+        comp_pending = [r for r in comp_pending if r.get("work_type") == "시차사용" and (r.get("status") or "approved") == "pending"]
+        if not comp_pending:
+            st.info("대기 중인 시차 사용이 없습니다.")
+        else:
+            for req in comp_pending:
+                rc = st.columns([2, 2, 2, 1, 1])
+                with rc[0]:
+                    st.text(f"{req.get('log_date')} {req.get('employee_name')}")
+                with rc[1]:
+                    st.caption(f"사용: {req.get('diff_minutes')}분")
+                with rc[2]:
+                    cur_remain = _erp_compute_remaining_comptime(current_db, req.get('employee_name'))
+                    st.caption(f"현재 잔여: {cur_remain}분 / 사유: {req.get('note') or '-'}")
+                with rc[3]:
+                    if st.button("승인", key=f"erp_cu_app_{req['id']}", type="primary"):
+                        _erp_update_row("app_attendance_logs", int(req["id"]), {"status": "approved"})
+                        st.rerun()
+                with rc[4]:
+                    if st.button("반려(삭제)", key=f"erp_cu_rej_{req['id']}"):
+                        _erp_delete_row("app_attendance_logs", int(req["id"]))
+                        st.rerun()
+
+
+# ---------- 탭 6: 연차/월차 관리 (store_admin) ----------
+
+def _erp_tab_leave_grants(current_db: str, me_name: str):
+    st.subheader("🎫 연차/월차 관리")
+    today = _today_kst()
+
+    st.markdown("##### ✏️ 직원별 입사일·연차 부여")
+    employees = _erp_get_employee_names_for_store(current_db)
+    if not employees:
+        st.info("이 매장에 배정된 직원이 없습니다.")
+        return
+
+    with st.form("erp_leave_grant_form", clear_on_submit=False):
+        gc = st.columns([2, 2, 1, 1])
+        with gc[0]:
+            g_emp = st.selectbox("직원", employees, key="erp_lg_emp")
+        with gc[1]:
+            g_hire = st.date_input("입사일", value=today, key="erp_lg_hire")
+        with gc[2]:
+            g_year = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_lg_year")
+        with gc[3]:
+            g_days = st.number_input("연차 일수", min_value=0.0, max_value=40.0, value=15.0, step=0.5, key="erp_lg_days")
+        g_submit = st.form_submit_button("💾 저장 (UPSERT)", type="primary")
+
+    if g_submit:
+        existing = _erp_fetch_table("app_leave_grants", {
+            "home_db_filename": current_db,
+            "employee_name": g_emp,
+            "year": int(g_year),
+        })
+        row = {
+            "home_db_filename": current_db,
+            "employee_name": g_emp,
+            "hire_date": g_hire.isoformat(),
+            "year": int(g_year),
+            "annual_days": float(g_days),
+            "created_by": me_name,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if existing:
+            ok, err = _erp_update_row("app_leave_grants", int(existing[0]["id"]), row)
+        else:
+            ok, err = _erp_insert_row("app_leave_grants", row)
+        if ok:
+            st.success("저장 완료")
+            st.rerun()
+        else:
+            st.error(f"저장 실패: {err}")
+
+    st.divider()
+    st.markdown("##### 📊 직원별 연차/월차 현황")
+    year_for_view = st.number_input("조회 연도", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_lg_view_year")
+    year_start = date(int(year_for_view), 1, 1)
+    year_end = date(int(year_for_view), 12, 31)
+
+    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db, "log_date", year_start, year_end)
+    rows = []
+    for emp in employees:
+        grants = _erp_fetch_table("app_leave_grants", {
+            "home_db_filename": current_db,
+            "employee_name": emp,
+            "year": int(year_for_view),
+        })
+        grant = grants[0] if grants else {}
+        annual = float(grant.get("annual_days") or 0)
+        hire = grant.get("hire_date")
+        emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
+        annual_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
+        half_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
+        monthly_accrued = _erp_compute_monthly_accrued(hire, today if today.year == int(year_for_view) else date(int(year_for_view), 12, 31))
+        comp_remain = _erp_compute_remaining_comptime(current_db, emp)
+        rows.append({
+            "직원명": emp,
+            "입사일": hire or "-",
+            "연차부여": annual,
+            "연차사용": annual_used,
+            "잔여연차": annual - annual_used,
+            "월차적립": monthly_accrued,
+            "월차사용(반차합)": half_used,
+            "잔여월차": monthly_accrued - half_used,
+            "잔여시차(분)": comp_remain,
+        })
+    if rows:
+        df = pd.DataFrame(rows)
+        st.dataframe(df, width='stretch', hide_index=True)
+    else:
+        st.info("표시할 데이터가 없습니다.")
+
+
+# ---------- 탭 7: 월말 급여 요약 (store_admin) ----------
+
+def _erp_tab_monthly_summary(current_db: str, today: date):
+    st.subheader("📊 월말 급여 요약")
+    import calendar as _cal
+    col_y, col_m = st.columns(2)
+    with col_y:
+        s_year = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_sum_year")
+    with col_m:
+        s_month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="erp_sum_month")
+    last_day = _cal.monthrange(int(s_year), int(s_month))[1]
+    p_start = date(int(s_year), int(s_month), 1)
+    p_end = date(int(s_year), int(s_month), last_day)
+
+    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db, "log_date", p_start, p_end)
+    overtime = _erp_fetch_range("app_overtime_requests", "home_db_filename", current_db, "request_date", p_start, p_end, extra_eq={"status": "approved"})
+    employees = _erp_get_employee_names_for_store(current_db)
+
+    rows = []
+    for emp in employees:
+        emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
+        normal_days = sum(1 for l in emp_logs if (l.get("work_type") or "") in ("정상", "행사"))
+        annual_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
+        half_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
+        early_late_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") in ("조퇴", "지각"))
+        comp_use_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") == "시차사용" and (l.get("status") or "approved") == "approved")
+        ot_min = sum(int(o.get("extra_minutes") or 0) for o in overtime if (o.get("employee_name") or "") == emp)
+        grants = _erp_fetch_table("app_leave_grants", {
+            "home_db_filename": current_db, "employee_name": emp, "year": int(s_year)
+        })
+        annual = float(grants[0].get("annual_days") or 0) if grants else 0
+        comp_remain = _erp_compute_remaining_comptime(current_db, emp)
+        rows.append({
+            "직원명": emp,
+            "소속매장": current_db,
+            "정상근무일": normal_days,
+            "연차": annual_used,
+            "반차": half_used,
+            "조퇴/지각(분)": early_late_min,
+            "시차사용(분)": comp_use_min,
+            "추가근무(분)": ot_min,
+            "잔여연차": annual - annual_used,
+            "잔여시차(분)": comp_remain,
+        })
+
+    if not rows:
+        st.info("표시할 데이터가 없습니다.")
+        return
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, width='stretch', hide_index=True)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="월말급여요약", index=False)
+    buf.seek(0)
+    st.download_button(
+        "📥 엑셀 다운로드",
+        data=buf.getvalue(),
+        file_name=f"근태_월말요약_{current_db}_{s_year}-{int(s_month):02d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="erp_sum_dl",
+    )
+
+
+# ---------- user 전용: 내 연차 현황 ----------
+
+def _erp_tab_my_leave_status(current_db: str, me_name: str):
+    st.subheader("🎫 내 연차 현황")
+    today = _today_kst()
+    year = today.year
+    grants = _erp_fetch_table("app_leave_grants", {
+        "home_db_filename": current_db, "employee_name": me_name, "year": int(year)
+    })
+    grant = grants[0] if grants else {}
+    annual = float(grant.get("annual_days") or 0)
+    hire = grant.get("hire_date")
+    year_start = date(year, 1, 1)
+    year_end = date(year, 12, 31)
+    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db, "log_date", year_start, year_end, extra_eq={"employee_name": me_name})
+    annual_used = sum(float(l.get("leave_deduction") or 0) for l in logs if l.get("work_type") == "연차")
+    half_used = sum(float(l.get("leave_deduction") or 0) for l in logs if l.get("work_type") == "반차")
+    monthly_accrued = _erp_compute_monthly_accrued(hire, today)
+    comp_remain = _erp_compute_remaining_comptime(current_db, me_name)
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("연차 부여", f"{annual:g}일")
+    with m2:
+        st.metric("연차 사용", f"{annual_used:g}일", delta=f"잔여 {annual - annual_used:g}일")
+    with m3:
+        st.metric("월차 적립 / 사용", f"{monthly_accrued} / {half_used:g}일", delta=f"잔여 {monthly_accrued - half_used:g}일")
+    with m4:
+        st.metric("잔여 시차", f"{comp_remain}분", delta=f"{comp_remain//60}h {comp_remain%60}m")
+    st.caption(f"입사일: {hire or '-'} (월차 적립은 입사일 기준 자동 계산, 최대 11일)")
+
+
+# ---------- superadmin: 통합 캘린더 & 매장별 현황 ----------
+
+def _erp_render_superadmin_view(today: date):
+    """superadmin: 매장 통합 캘린더, 매장별 현황, 추가근무 승인, 월말 요약."""
+    import calendar as _cal
+
+    stores_df = get_supabase_stores_dataframe_cached()
+    if stores_df is None or len(stores_df) == 0:
+        st.warning("등록된 매장이 없습니다.")
+        return
+    store_names = stores_df["store_name"].tolist()
+
+    sa_tabs = st.tabs(["통합 캘린더", "매장별 현황", "추가근무 승인", "월말 요약"])
+
+    with sa_tabs[0]:
+        col_y, col_m, col_s = st.columns([1, 1, 2])
+        with col_y:
+            sy = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_sa_cal_y")
+        with col_m:
+            sm = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="erp_sa_cal_m")
+        with col_s:
+            picked = st.selectbox("매장 필터", ["(전체)"] + store_names, key="erp_sa_cal_store")
+        last_d = _cal.monthrange(int(sy), int(sm))[1]
+        p_s, p_e = date(int(sy), int(sm), 1), date(int(sy), int(sm), last_d)
+
+        if picked == "(전체)":
+            target_dbs = stores_df["db_filename"].tolist()
+        else:
+            target_dbs = stores_df[stores_df["store_name"] == picked]["db_filename"].tolist()
+        store_color = {}
+        palette = ["#1565C0", "#43A047", "#FB8C00", "#8E24AA", "#00897B", "#5D4037", "#3949AB", "#D81B60"]
+        for i, dbf in enumerate(stores_df["db_filename"].tolist()):
+            store_color[dbf] = palette[i % len(palette)]
+
+        all_logs = []
+        all_shifts = []
+        rules_by_store_dow = {}
+        for dbf in target_dbs:
+            all_logs += _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_s, p_e)
+            all_shifts += _erp_fetch_range("app_shift_schedules", "db_filename", dbf, "shift_date", p_s, p_e)
+            for r in _erp_fetch_table("app_staffing_rules", {"db_filename": dbf}):
+                rules_by_store_dow.setdefault((dbf, int(r.get("day_of_week") or 0)), []).append(r)
+
+        shifts_by_store_date: dict = {}
+        for s in all_shifts:
+            shifts_by_store_date.setdefault((str(s.get("db_filename") or ""), str(s.get("shift_date") or "")[:10]), []).append(s)
+        logs_by_date: dict = {}
+        for l in all_logs:
+            logs_by_date.setdefault(str(l.get("log_date") or "")[:10], []).append(l)
+
+        shortage_dates = set()
+        for (dbf, d_iso), day_shifts in shifts_by_store_date.items():
+            try:
+                d = datetime.fromisoformat(d_iso).date()
+            except Exception:
+                continue
+            for rule in rules_by_store_dow.get((dbf, d.weekday()), []):
+                slot_s = _erp_parse_time(rule.get("slot_start"))
+                slot_e = _erp_parse_time(rule.get("slot_end"))
+                if not slot_s or not slot_e:
+                    continue
+                if _erp_count_active_at(day_shifts, slot_s, slot_e) < int(rule.get("min_staff") or 1):
+                    shortage_dates.add((dbf, d_iso))
+                    break
+
+        cal_obj = _cal.Calendar(firstweekday=6)
+        weeks = cal_obj.monthdayscalendar(int(sy), int(sm))
+        html = ["<table style='width:100%; border-collapse:collapse; font-size:0.78rem;'>"]
+        html.append("<thead><tr>")
+        for d_label in ["일", "월", "화", "수", "목", "금", "토"]:
+            color = "#E53935" if d_label == "일" else ("#1565C0" if d_label == "토" else "#37474F")
+            html.append(f"<th style='border:1px solid #ddd; padding:6px; background:#F5F5F5; color:{color};'>{d_label}</th>")
+        html.append("</tr></thead><tbody>")
+        for week in weeks:
+            html.append("<tr>")
+            for d_num in week:
+                if d_num == 0:
+                    html.append("<td style='border:1px solid #eee; height:120px;'></td>")
+                    continue
+                d_iso = date(int(sy), int(sm), d_num).isoformat()
+                has_shortage = any((dbf, d_iso) in shortage_dates for dbf in target_dbs)
+                bcolor = "#E53935" if has_shortage else "#ddd"
+                bw = "2px" if has_shortage else "1px"
+                cell = [f"<td style='border:{bw} solid {bcolor}; vertical-align:top; padding:3px; height:120px; min-width:100px;'>"]
+                cell.append(f"<div style='font-weight:bold;'>{d_num}</div>")
+                if has_shortage:
+                    cell.append("<div style='color:#E53935; font-size:0.65rem; font-weight:bold;'>⚠️ 인원 부족</div>")
+                for dbf in target_dbs:
+                    sn = stores_df[stores_df["db_filename"] == dbf]["store_name"].iloc[0] if (stores_df["db_filename"] == dbf).any() else dbf
+                    sc = store_color.get(dbf, "#666")
+                    day_shifts = shifts_by_store_date.get((dbf, d_iso), [])
+                    if day_shifts:
+                        cell.append(f"<div style='font-size:0.62rem; color:{sc}; font-weight:bold;'>● {sn} ({len(day_shifts)}명)</div>")
+                day_logs = logs_by_date.get(d_iso, [])
+                for lg in day_logs[:4]:
+                    wt = lg.get("work_type") or "정상"
+                    color = _ERP_BADGE_COLORS.get(wt, "#90A4AE")
+                    cell.append(
+                        f"<div><span style='background:{color}; color:white; padding:1px 4px; border-radius:2px; font-size:0.62rem;'>{wt}</span> "
+                        f"<span style='font-size:0.62rem;'>{lg.get('employee_name') or ''}</span></div>"
+                    )
+                if len(day_logs) > 4:
+                    cell.append(f"<div style='font-size:0.6rem; color:#999;'>+{len(day_logs)-4}건…</div>")
+                cell.append("</td>")
+                html.append("".join(cell))
+            html.append("</tr>")
+        html.append("</tbody></table>")
+        st.markdown("".join(html), unsafe_allow_html=True)
+
+        with st.expander("🎨 매장 색상"):
+            legend_parts = []
+            for _, sr in stores_df.iterrows():
+                col = store_color.get(sr["db_filename"], "#666")
+                legend_parts.append(f"<span style='color:{col}; font-weight:bold;'>● {sr['store_name']}</span>")
+            st.markdown(" &nbsp; ".join(legend_parts), unsafe_allow_html=True)
+
+    with sa_tabs[1]:
+        st.markdown("##### 📊 매장별 월별 근무 현황")
+        col_y2, col_m2 = st.columns(2)
+        with col_y2:
+            sy2 = st.number_input("연도 ", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_sa_sb_y")
+        with col_m2:
+            sm2 = st.number_input("월 ", min_value=1, max_value=12, value=today.month, step=1, key="erp_sa_sb_m")
+        last_d2 = _cal.monthrange(int(sy2), int(sm2))[1]
+        p_s2, p_e2 = date(int(sy2), int(sm2), 1), date(int(sy2), int(sm2), last_d2)
+
+        rows = []
+        for _, sr in stores_df.iterrows():
+            dbf = sr["db_filename"]
+            sn = sr["store_name"]
+            emps = _erp_get_employee_names_for_store(dbf)
+            logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_s2, p_e2)
+            ot = _erp_fetch_range("app_overtime_requests", "home_db_filename", dbf, "request_date", p_s2, p_e2, extra_eq={"status": "approved"})
+            for emp in emps:
+                emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
+                normal_days = sum(1 for l in emp_logs if (l.get("work_type") or "") in ("정상", "행사"))
+                annual_u = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
+                comp_u = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") == "시차사용" and (l.get("status") or "approved") == "approved")
+                ot_m = sum(int(o.get("extra_minutes") or 0) for o in ot if (o.get("employee_name") or "") == emp)
+                comp_remain = _erp_compute_remaining_comptime(dbf, emp)
+                rows.append({
+                    "매장명": sn,
+                    "직원명": emp,
+                    "근무일수": normal_days,
+                    "연차사용": annual_u,
+                    "시차사용(분)": comp_u,
+                    "잔여시차(분)": comp_remain,
+                    "추가근무(분)": ot_m,
+                })
+        if rows:
+            df = pd.DataFrame(rows).sort_values(["매장명", "직원명"])
+            st.dataframe(df, width='stretch', hide_index=True)
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="매장별근무현황", index=False)
+            buf.seek(0)
+            st.download_button("📥 엑셀 다운로드", data=buf.getvalue(),
+                               file_name=f"매장별근무현황_{sy2}-{int(sm2):02d}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="erp_sa_sb_dl")
+        else:
+            st.info("표시할 데이터가 없습니다.")
+
+    with sa_tabs[2]:
+        st.markdown("##### ✅ 전 매장 추가근무 승인 대기 (관리자 전용)")
+        all_pending = []
+        for _, sr in stores_df.iterrows():
+            dbf = sr["db_filename"]
+            rows = _erp_fetch_table("app_overtime_requests", {"home_db_filename": dbf, "status": "pending"})
+            for r in rows:
+                r["_store_name"] = sr["store_name"]
+                all_pending.append(r)
+        if not all_pending:
+            st.info("대기 중인 신청이 없습니다.")
+        else:
+            for req in all_pending:
+                rc = st.columns([2, 3, 1, 1])
+                with rc[0]:
+                    st.text(f"{req.get('_store_name')} / {req.get('request_date')} {req.get('employee_name')}")
+                with rc[1]:
+                    st.caption(f"{str(req.get('extra_start') or '')[:5]}~{str(req.get('extra_end') or '')[:5]} "
+                                f"({req.get('extra_minutes')}분) @ {req.get('work_location_name') or '-'} / 사유: {req.get('reason') or '-'}")
+                with rc[2]:
+                    if st.button("승인", key=f"erp_sa_ov_app_{req['id']}", type="primary"):
+                        _erp_update_row("app_overtime_requests", int(req["id"]), {
+                            "status": "approved",
+                            "reviewed_by": _get_current_user_display_name() or "superadmin",
+                            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        st.rerun()
+                with rc[3]:
+                    if st.button("반려", key=f"erp_sa_ov_rej_{req['id']}"):
+                        _erp_update_row("app_overtime_requests", int(req["id"]), {
+                            "status": "rejected",
+                            "reviewed_by": _get_current_user_display_name() or "superadmin",
+                            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        st.rerun()
+
+    with sa_tabs[3]:
+        st.markdown("##### 📊 전 매장 월말 급여 요약")
+        col_y3, col_m3 = st.columns(2)
+        with col_y3:
+            sy3 = st.number_input("연도  ", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_sa_sum_y")
+        with col_m3:
+            sm3 = st.number_input("월  ", min_value=1, max_value=12, value=today.month, step=1, key="erp_sa_sum_m")
+        last_d3 = _cal.monthrange(int(sy3), int(sm3))[1]
+        p_s3, p_e3 = date(int(sy3), int(sm3), 1), date(int(sy3), int(sm3), last_d3)
+        all_rows = []
+        for _, sr in stores_df.iterrows():
+            dbf = sr["db_filename"]
+            sn = sr["store_name"]
+            emps = _erp_get_employee_names_for_store(dbf)
+            logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_s3, p_e3)
+            ot = _erp_fetch_range("app_overtime_requests", "home_db_filename", dbf, "request_date", p_s3, p_e3, extra_eq={"status": "approved"})
+            for emp in emps:
+                emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
+                normal_days = sum(1 for l in emp_logs if (l.get("work_type") or "") in ("정상", "행사"))
+                annual_u = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
+                half_u = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
+                el_m = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") in ("조퇴", "지각"))
+                comp_u = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") == "시차사용" and (l.get("status") or "approved") == "approved")
+                ot_m = sum(int(o.get("extra_minutes") or 0) for o in ot if (o.get("employee_name") or "") == emp)
+                grants = _erp_fetch_table("app_leave_grants", {"home_db_filename": dbf, "employee_name": emp, "year": int(sy3)})
+                annual = float(grants[0].get("annual_days") or 0) if grants else 0
+                comp_remain = _erp_compute_remaining_comptime(dbf, emp)
+                all_rows.append({
+                    "직원명": emp,
+                    "소속매장": sn,
+                    "정상근무일": normal_days,
+                    "연차": annual_u,
+                    "반차": half_u,
+                    "조퇴/지각(분)": el_m,
+                    "시차사용(분)": comp_u,
+                    "추가근무(분)": ot_m,
+                    "잔여연차": annual - annual_u,
+                    "잔여시차(분)": comp_remain,
+                })
+        if all_rows:
+            df = pd.DataFrame(all_rows).sort_values(["소속매장", "직원명"])
+            st.dataframe(df, width='stretch', hide_index=True)
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="전매장월말요약", index=False)
+            buf.seek(0)
+            st.download_button("📥 엑셀 다운로드", data=buf.getvalue(),
+                               file_name=f"전매장근태요약_{sy3}-{int(sm3):02d}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="erp_sa_sum_dl")
+        else:
+            st.info("표시할 데이터가 없습니다.")
+
+
 def render_employee_management():
     """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + 직원/매장은 Supabase app_users·app_stores 우선. superadmin 전용."""
     st.header("👥 직원 계정 관리 및 발령")
@@ -15034,6 +16350,13 @@ def main():
     if role == "superadmin":
         if st.sidebar.button("👥 직원 관리", width='stretch'):
             st.session_state["active_admin_page"] = "employee_management"
+
+    # ERP 섹션 (전 역할 공통: 근태 관리)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**📋 ERP**")
+    if st.sidebar.button("🗓️ 근태 관리", width='stretch'):
+        st.session_state["active_admin_page"] = "erp_attendance"
+
     st.sidebar.markdown("---")
     if st.sidebar.button("🚪 로그아웃", width='stretch'):
         try:
@@ -15073,6 +16396,11 @@ def main():
     # 최고 관리자 전용: 직원 계정 관리 및 발령
     if role == "superadmin" and st.session_state.get("active_admin_page") == "employee_management":
         render_employee_management()
+        return
+
+    # ERP 근태 관리 화면 라우팅 (전 역할 공통)
+    if st.session_state.get("active_admin_page") == "erp_attendance":
+        render_erp_attendance()
         return
 
     # Superadmin: 5탭 최고 관리자 메뉴
