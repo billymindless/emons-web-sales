@@ -105,7 +105,45 @@ CREATE POLICY "Allow all app_attendance_logs" ON app_attendance_logs FOR ALL USI
 
 
 -- ============================================================
--- 5) app_overtime_requests - 추가근무 신청/승인
+-- 5) app_store_hours - 매장별 기본 근무시간 (주중/주말·공휴일 별)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS app_store_hours (
+  id BIGSERIAL PRIMARY KEY,
+  db_filename TEXT NOT NULL UNIQUE,
+  weekday_start TIME DEFAULT '09:00',
+  weekday_end TIME DEFAULT '18:00',
+  weekend_start TIME DEFAULT '10:00',
+  weekend_end TIME DEFAULT '19:00',
+  updated_by TEXT,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE app_store_hours ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_store_hours" ON app_store_hours;
+CREATE POLICY "Allow all app_store_hours" ON app_store_hours FOR ALL USING (true) WITH CHECK (true);
+
+-- 매장별 기본 근무시간 seed (이미 있으면 건너뜀)
+-- 학성점: 주중 10:00-19:00, 주말/공휴일 10:00-20:00
+INSERT INTO app_store_hours (db_filename, weekday_start, weekday_end, weekend_start, weekend_end)
+SELECT db_filename, '10:00'::TIME, '19:00'::TIME, '10:00'::TIME, '20:00'::TIME
+FROM app_stores WHERE store_name LIKE '%학성%'
+ON CONFLICT (db_filename) DO NOTHING;
+
+-- 삼산점: 주중 10:00-19:30, 주말/공휴일 10:00-20:00
+INSERT INTO app_store_hours (db_filename, weekday_start, weekday_end, weekend_start, weekend_end)
+SELECT db_filename, '10:00'::TIME, '19:30'::TIME, '10:00'::TIME, '20:00'::TIME
+FROM app_stores WHERE store_name LIKE '%삼산%'
+ON CONFLICT (db_filename) DO NOTHING;
+
+-- 양산점(=평산점): 주중 10:30-19:00, 주말/공휴일 10:30-19:30
+INSERT INTO app_store_hours (db_filename, weekday_start, weekday_end, weekend_start, weekend_end)
+SELECT db_filename, '10:30'::TIME, '19:00'::TIME, '10:30'::TIME, '19:30'::TIME
+FROM app_stores WHERE store_name LIKE '%양산%' OR store_name LIKE '%평산%'
+ON CONFLICT (db_filename) DO NOTHING;
+
+
+-- ============================================================
+-- 6) app_overtime_requests - 추가근무 신청/승인
 -- ============================================================
 CREATE TABLE IF NOT EXISTS app_overtime_requests (
   id BIGSERIAL PRIMARY KEY,

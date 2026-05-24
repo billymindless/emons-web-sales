@@ -8886,6 +8886,52 @@ _ERP_BADGE_COLORS = {
     "정상": "#90A4AE",
 }
 
+# 대시보드와 동일한 KR 공휴일 (주말·공휴일은 매장 기본근무시간 '주말' 기준으로 적용)
+_ERP_KR_HOLIDAYS = {
+    date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
+    date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6), date(2025, 6, 6), date(2025, 8, 15),
+    date(2025, 10, 3), date(2025, 10, 5), date(2025, 10, 6), date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9), date(2025, 12, 25),
+    date(2026, 1, 1), date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
+    date(2026, 3, 1), date(2026, 3, 2), date(2026, 5, 5), date(2026, 5, 24), date(2026, 6, 6), date(2026, 8, 15),
+    date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26), date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9), date(2026, 12, 25),
+}
+
+
+def _erp_is_weekend_or_holiday(d: date) -> bool:
+    if d is None:
+        return False
+    return d.weekday() >= 5 or d in _ERP_KR_HOLIDAYS
+
+
+def _erp_get_store_hours(db_filename: str) -> dict:
+    """매장 기본 근무시간(주중/주말·공휴일) 조회. 없으면 기본값(09-18 / 10-19)."""
+    default = {
+        "weekday_start": dt_time(9, 0),
+        "weekday_end": dt_time(18, 0),
+        "weekend_start": dt_time(10, 0),
+        "weekend_end": dt_time(19, 0),
+    }
+    if not db_filename:
+        return default
+    rows = _erp_fetch_table("app_store_hours", {"db_filename": db_filename})
+    if not rows:
+        return default
+    r = rows[0]
+    return {
+        "weekday_start": _erp_parse_time(r.get("weekday_start"), default["weekday_start"]),
+        "weekday_end": _erp_parse_time(r.get("weekday_end"), default["weekday_end"]),
+        "weekend_start": _erp_parse_time(r.get("weekend_start"), default["weekend_start"]),
+        "weekend_end": _erp_parse_time(r.get("weekend_end"), default["weekend_end"]),
+    }
+
+
+def _erp_default_times_for_date(db_filename: str, d: date) -> tuple[dt_time, dt_time]:
+    """해당 날짜의 매장 기본 출/퇴근 시각. 주말/공휴일이면 weekend, 아니면 weekday."""
+    h = _erp_get_store_hours(db_filename)
+    if _erp_is_weekend_or_holiday(d):
+        return h["weekend_start"], h["weekend_end"]
+    return h["weekday_start"], h["weekday_end"]
+
 
 def _erp_minutes_between(t_start, t_end) -> int:
     """time 객체 또는 'HH:MM[:SS]' 문자열 두 개의 분 차이. 음수면 0."""
@@ -9171,8 +9217,13 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         key = (str(row.get("employee_name") or ""), str(row.get("shift_date") or "")[:10])
         existing_by_key[key] = row
 
+    sh_hours = _erp_get_store_hours(current_db)
     st.markdown("##### ⬇️ 직원별 일정 입력")
-    st.caption("각 셀에 'HH:MM-HH:MM' 형식(예: 09:00-18:00)으로 입력하세요. 비우면 휴무입니다.")
+    st.caption(
+        f"각 셀에 'HH:MM-HH:MM' 형식으로 입력하세요. 비우면 휴무. "
+        f"매장 기본: 주중 {sh_hours['weekday_start'].strftime('%H:%M')}~{sh_hours['weekday_end'].strftime('%H:%M')} / "
+        f"주말·공휴일 {sh_hours['weekend_start'].strftime('%H:%M')}~{sh_hours['weekend_end'].strftime('%H:%M')}"
+    )
 
     with st.form("erp_shift_plan_form", clear_on_submit=False):
         edits = {}
@@ -9192,10 +9243,14 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                     ee = str(row.get("shift_end") or "")[:5]
                     if ss and ee:
                         default = f"{ss}-{ee}"
+                d_std_s, d_std_e = _erp_default_times_for_date(current_db, d)
+                ph = f"{d_std_s.strftime('%H:%M')}-{d_std_e.strftime('%H:%M')}"
                 with col:
-                    label = f"{d.month}/{d.day} ({_ERP_DOW_LABELS[d.weekday()]})"
+                    is_we = _erp_is_weekend_or_holiday(d)
+                    marker = "🟥" if is_we else ""
+                    label = f"{marker}{d.month}/{d.day} ({_ERP_DOW_LABELS[d.weekday()]})"
                     val = st.text_input(label, value=default, key=f"shift_{emp}_{d.isoformat()}",
-                                        placeholder="09:00-18:00")
+                                        placeholder=ph)
                     edits[key] = val.strip()
             st.divider()
 
@@ -9275,7 +9330,49 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
 # ---------- 탭 2: 최소 근무 인원 규칙 설정 (store_admin) ----------
 
 def _erp_tab_staffing_rules(current_db: str, me_name: str):
-    st.subheader("👥 최소 근무 인원 규칙 설정")
+    st.subheader("👥 매장 근무 기준 설정")
+
+    # ── 기본 근무시간 (주중 / 주말·공휴일) ─────────────────────
+    st.markdown("##### 🕘 기본 근무시간 설정")
+    st.caption("매장 표준 출퇴근 시각을 주중 / 주말·공휴일로 나누어 설정합니다. 근태 입력 폼에 자동 적용됩니다.")
+    cur_hours = _erp_get_store_hours(current_db)
+    existing_hours = _erp_fetch_table("app_store_hours", {"db_filename": current_db})
+    with st.form("erp_store_hours_form", clear_on_submit=False):
+        hc = st.columns(4)
+        with hc[0]:
+            wd_s = st.time_input("주중 출근", value=cur_hours["weekday_start"], key="erp_sh_wd_s")
+        with hc[1]:
+            wd_e = st.time_input("주중 퇴근", value=cur_hours["weekday_end"], key="erp_sh_wd_e")
+        with hc[2]:
+            we_s = st.time_input("주말/공휴일 출근", value=cur_hours["weekend_start"], key="erp_sh_we_s")
+        with hc[3]:
+            we_e = st.time_input("주말/공휴일 퇴근", value=cur_hours["weekend_end"], key="erp_sh_we_e")
+        sh_submit = st.form_submit_button("💾 기본 근무시간 저장", type="primary")
+    if sh_submit:
+        if wd_e <= wd_s or we_e <= we_s:
+            st.error("퇴근 시각이 출근 시각보다 늦어야 합니다.")
+        else:
+            row = {
+                "db_filename": current_db,
+                "weekday_start": wd_s.strftime("%H:%M:%S"),
+                "weekday_end": wd_e.strftime("%H:%M:%S"),
+                "weekend_start": we_s.strftime("%H:%M:%S"),
+                "weekend_end": we_e.strftime("%H:%M:%S"),
+                "updated_by": me_name,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if existing_hours:
+                ok, err = _erp_update_row("app_store_hours", int(existing_hours[0]["id"]), row)
+            else:
+                ok, err = _erp_insert_row("app_store_hours", row)
+            if ok:
+                st.success("✅ 기본 근무시간이 저장되었습니다.")
+                st.rerun()
+            else:
+                st.error(f"저장 실패: {err}")
+
+    st.divider()
+    st.markdown("##### 🧑‍🤝‍🧑 시간대별 최소 근무 인원 (요일별)")
     st.caption("요일별 시간대마다 최소 근무 인원을 정합니다. 근무 일정 저장 시 자동으로 검증됩니다.")
 
     rules = _erp_fetch_table("app_staffing_rules", {"db_filename": current_db}, order="day_of_week")
@@ -9455,28 +9552,33 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
     st.caption("실제 출퇴근·휴가·시차 등을 기록합니다. 다점포 근무 시 근무 장소를 표기하면 통합 집계됩니다.")
 
     today = _today_kst()
-    with st.form("erp_attendance_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            if role in ("store_admin", "superadmin"):
-                emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
-                target_emp = st.selectbox("직원", emp_opts, key="erp_att_emp")
-            else:
-                target_emp = me_name
-                st.text_input("직원", value=me_name, disabled=True)
-            log_date = st.date_input("날짜", value=today, key="erp_att_date")
-            work_type = st.selectbox("근태 유형", _ERP_WORK_TYPES, key="erp_att_type")
-        with col2:
-            start_time = st.time_input("실제 출근 시각", value=dt_time(9, 0), key="erp_att_start")
-            end_time = st.time_input("실제 퇴근 시각", value=dt_time(18, 0), key="erp_att_end")
-            work_loc = st.text_input("근무 장소 (다른 매장·행사장·백화점 등)", value="", key="erp_att_loc",
-                                      placeholder="예: 백화점 행사장 / 학성점 지원")
+    # 날짜·직원·유형 선택은 폼 밖에서 → 날짜 변경 시 매장 기본 근무시간이 즉시 반영되도록.
+    col1, col2 = st.columns(2)
+    with col1:
+        if role in ("store_admin", "superadmin"):
+            emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
+            target_emp = st.selectbox("직원", emp_opts, key="erp_att_emp")
+        else:
+            target_emp = me_name
+            st.text_input("직원", value=me_name, disabled=True, key="erp_att_emp_fixed")
+        log_date = st.date_input("날짜", value=today, key="erp_att_date")
+        work_type = st.selectbox("근태 유형", _ERP_WORK_TYPES, key="erp_att_type")
+    with col2:
+        std_s, std_e = _erp_default_times_for_date(current_db, log_date)
+        weekend_flag = _erp_is_weekend_or_holiday(log_date)
+        kind_label = "주말·공휴일" if weekend_flag else "주중"
+        st.caption(f"📅 {log_date.isoformat()} ({_ERP_DOW_LABELS[log_date.weekday()]}) — 매장 기본 ({kind_label}): "
+                    f"{std_s.strftime('%H:%M')} ~ {std_e.strftime('%H:%M')}")
+        start_time = st.time_input("실제 출근 시각", value=std_s, key=f"erp_att_start_{log_date.isoformat()}_{weekend_flag}")
+        end_time = st.time_input("실제 퇴근 시각", value=std_e, key=f"erp_att_end_{log_date.isoformat()}_{weekend_flag}")
+        work_loc = st.text_input("근무 장소 (다른 매장·행사장·백화점 등)", value="", key="erp_att_loc",
+                                  placeholder="예: 백화점 행사장 / 학성점 지원")
 
-        diff_min_input = 0
-        if work_type in ("시차적립", "시차사용"):
-            diff_min_input = st.number_input("시차 분수", min_value=0, max_value=1440, value=60, step=15, key="erp_att_diff")
-        note = st.text_input("비고", value="", key="erp_att_note")
-        submitted = st.form_submit_button("💾 저장", type="primary")
+    diff_min_input = 0
+    if work_type in ("시차적립", "시차사용"):
+        diff_min_input = st.number_input("시차 분수", min_value=0, max_value=1440, value=60, step=15, key="erp_att_diff")
+    note = st.text_input("비고", value="", key="erp_att_note")
+    submitted = st.button("💾 저장", type="primary", key="erp_att_save")
 
     if submitted:
         if work_type == "행사" and not (work_loc or "").strip():
@@ -9487,11 +9589,9 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
         if work_type in ("시차적립", "시차사용"):
             diff_minutes = int(diff_min_input)
         elif work_type in ("조퇴", "지각"):
-            std_e = dt_time(18, 0)
             if work_type == "조퇴" and end_time:
                 diff_minutes = max(0, (std_e.hour * 60 + std_e.minute) - (end_time.hour * 60 + end_time.minute))
             elif work_type == "지각" and start_time:
-                std_s = dt_time(9, 0)
                 diff_minutes = max(0, (start_time.hour * 60 + start_time.minute) - (std_s.hour * 60 + std_s.minute))
 
         status = "approved"
@@ -9514,6 +9614,8 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
             "diff_minutes": diff_minutes,
             "start_time": start_time.strftime("%H:%M:%S") if start_time else None,
             "end_time": end_time.strftime("%H:%M:%S") if end_time else None,
+            "standard_start": std_s.strftime("%H:%M:%S"),
+            "standard_end": std_e.strftime("%H:%M:%S"),
             "status": status,
             "note": (note or "").strip() or None,
             "created_by": me_name,
