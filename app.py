@@ -9106,6 +9106,21 @@ def _erp_compute_remaining_comptime(home_db: str, employee_name: str) -> int:
         return 0
 
 
+def _erp_compute_annual_days_for_hire(hire_date: date, year: int, full_days: float = 15.0) -> float:
+    """입사일 기준 해당 연도 비례 연차 자동 계산.
+    - 입사 연도: 남은 달 비례 (입사월 포함)
+    - 그 이후 연도: full_days 전액 부여
+    """
+    if hire_date.year < year:
+        return full_days
+    if hire_date.year > year:
+        return 0.0
+    # 입사 연도: 입사월부터 12월까지 개월 수 / 12 × full_days
+    months_remaining = 13 - hire_date.month   # 입사월 포함
+    raw = round(full_days * months_remaining / 12 * 2) / 2   # 0.5 단위 반올림
+    return max(0.0, raw)
+
+
 def _erp_compute_monthly_accrued(hire_date_str: str | None, as_of: date) -> int:
     """입사일 기반 월차 적립분: min(경과 개월, 11). hire_date가 없거나 미래면 0."""
     if not hire_date_str:
@@ -10078,45 +10093,85 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
     st.subheader("🎫 연차/월차 관리")
     today = _today_kst()
 
-    st.markdown("##### ✏️ 직원별 입사일·연차 부여")
+    st.markdown("##### ✏️ 직원별 입사일·연차 부여 및 수동 조정")
     employees = _erp_get_employee_names_for_store(current_db)
     if not employees:
         st.info("이 매장에 배정된 직원이 없습니다.")
         return
 
+    # 폼 외부에서 직원·연도 먼저 선택 → 기존 데이터 즉시 로드
+    _lg_col1, _lg_col2 = st.columns([2, 1])
+    with _lg_col1:
+        g_emp = st.selectbox("직원 선택", employees, key="erp_lg_emp")
+    with _lg_col2:
+        g_year = st.number_input("연도", min_value=2020, max_value=2100,
+                                 value=today.year, step=1, key="erp_lg_year")
+
+    # 기존 저장 데이터 로드
+    _existing_grants = _erp_fetch_table("app_leave_grants", {
+        "home_db_filename": current_db,
+        "employee_name": g_emp,
+        "year": int(g_year),
+    })
+    _existing = _existing_grants[0] if _existing_grants else {}
+    _saved_hire   = _existing.get("hire_date")
+    _saved_days   = float(_existing.get("annual_days") or 15.0)
+    _saved_note   = _existing.get("adjustment_note") or ""
+
+    _hire_default = date.fromisoformat(_saved_hire) if _saved_hire else today
+
+    # 입사일 입력 → 자동 계산 연차 참고값 즉시 표시 (폼 외부)
+    g_hire = st.date_input("입사일", value=_hire_default, key="erp_lg_hire")
+    _auto_days = _erp_compute_annual_days_for_hire(g_hire, int(g_year))
+    st.caption(
+        f"📌 입사일 기준 자동 계산: **{_auto_days:g}일** "
+        f"(입사 연도 비례 배분 기준) — 아래에서 최종 부여 일수를 직접 조정하세요."
+    )
+
     with st.form("erp_leave_grant_form", clear_on_submit=False):
-        gc = st.columns([2, 2, 1, 1])
-        with gc[0]:
-            g_emp = st.selectbox("직원", employees, key="erp_lg_emp")
-        with gc[1]:
-            g_hire = st.date_input("입사일", value=today, key="erp_lg_hire")
-        with gc[2]:
-            g_year = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_lg_year")
-        with gc[3]:
-            g_days = st.number_input("연차 일수", min_value=0.0, max_value=40.0, value=15.0, step=0.5, key="erp_lg_days")
-        g_submit = st.form_submit_button("💾 저장 (UPSERT)", type="primary")
+        st.markdown("**최종 연차 부여 설정**")
+        fc1, fc2 = st.columns([1, 2])
+        with fc1:
+            g_days = st.number_input(
+                "최종 연차 부여 일수",
+                min_value=0.0, max_value=40.0,
+                value=_saved_days, step=0.5,
+                key="erp_lg_days",
+                help=f"자동 계산값은 {_auto_days:g}일입니다. 이미 소진한 연차가 있는 경우 실제 잔여 기준으로 조정하세요.",
+            )
+        with fc2:
+            g_note = st.text_input(
+                "조정 사유 (선택)",
+                value=_saved_note,
+                key="erp_lg_note",
+                placeholder="예: 연중 입사로 인한 수동 조정 / 이월 연차 포함 15일 부여",
+            )
+        if _existing:
+            _adj_delta = g_days - _auto_days
+            _sign = "+" if _adj_delta >= 0 else ""
+            st.info(
+                f"ℹ️ 자동 계산 대비 **{_sign}{_adj_delta:g}일** 조정 "
+                f"(자동 {_auto_days:g}일 → 최종 {g_days:g}일)"
+            )
+        g_submit = st.form_submit_button("💾 저장", type="primary")
 
     if g_submit:
-        existing = _erp_fetch_table("app_leave_grants", {
-            "home_db_filename": current_db,
-            "employee_name": g_emp,
-            "year": int(g_year),
-        })
         row = {
             "home_db_filename": current_db,
             "employee_name": g_emp,
             "hire_date": g_hire.isoformat(),
             "year": int(g_year),
             "annual_days": float(g_days),
+            "adjustment_note": (g_note or "").strip() or None,
             "created_by": me_name,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        if existing:
-            ok, err = _erp_update_row("app_leave_grants", int(existing[0]["id"]), row)
+        if _existing:
+            ok, err = _erp_update_row("app_leave_grants", int(_existing["id"]), row)
         else:
             ok, err = _erp_insert_row("app_leave_grants", row)
         if ok:
-            st.success("저장 완료")
+            st.success(f"✅ {g_emp} / {int(g_year)}년 연차 {g_days:g}일 저장 완료")
             st.rerun()
         else:
             st.error(f"저장 실패: {err}")
