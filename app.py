@@ -9184,7 +9184,7 @@ def render_erp_attendance():
         tab_labels = ["근무 일정 계획", "최소 인원 설정", "캘린더", "근태 입력",
                       "추가근무·시차 관리", "연차/월차 관리", "월말 요약"]
     else:
-        tab_labels = ["캘린더", "근태 입력", "추가근무·시차 신청", "내 연차 현황"]
+        tab_labels = ["근무 일정 계획", "캘린더", "근태 입력", "추가근무·시차 신청", "내 연차 현황"]
 
     tabs = st.tabs(tab_labels)
 
@@ -9205,20 +9205,22 @@ def render_erp_attendance():
             _erp_tab_monthly_summary(current_db, today)
     else:
         with tabs[0]:
-            _erp_tab_calendar(current_db, role, me_name, today)
+            _erp_tab_shift_plan(current_db, me_name)
         with tabs[1]:
-            _erp_tab_attendance_input(current_db, role, me_name)
+            _erp_tab_calendar(current_db, role, me_name, today)
         with tabs[2]:
-            _erp_tab_comptime_overtime(current_db, role, me_name)
+            _erp_tab_attendance_input(current_db, role, me_name)
         with tabs[3]:
+            _erp_tab_comptime_overtime(current_db, role, me_name)
+        with tabs[4]:
             _erp_tab_my_leave_status(current_db, me_name)
 
 
 # ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
 
 def _erp_tab_shift_plan(current_db: str, me_name: str):
-    st.subheader("📅 근무 일정 계획 (사전 배정)")
-    st.caption("주/월 단위로 직원 근무 일정을 계획합니다. 저장 시 최소 인원 규칙 위반 여부를 검증합니다.")
+    st.subheader("📅 근무 일정 계획 (본인 일정 등록)")
+    st.caption("본인의 근무 예정 일정을 등록합니다. 'HH:MM-HH:MM' 형식으로 입력하고, 휴무일은 비워 두세요.")
 
     today = _today_kst()
     col_a, col_b = st.columns([1, 2])
@@ -9246,51 +9248,46 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         existing_by_key[key] = row
 
     sh_hours = _erp_get_store_hours(current_db)
-    st.markdown("##### ⬇️ 직원별 일정 입력")
-    st.caption(
-        f"각 셀에 'HH:MM-HH:MM' 형식으로 입력하세요. 비우면 휴무. "
+    st.info(
+        f"📌 **{me_name}** 님의 일정만 입력할 수 있습니다. "
         f"매장 기본: 주중 {sh_hours['weekday_start'].strftime('%H:%M')}~{sh_hours['weekday_end'].strftime('%H:%M')} / "
         f"주말·공휴일 {sh_hours['weekend_start'].strftime('%H:%M')}~{sh_hours['weekend_end'].strftime('%H:%M')}"
     )
 
+    # ── 본인 일정 입력 폼 (me_name만) ──────────────────────────────
+    st.markdown(f"##### ✏️ 내 근무 일정 — **{me_name}**")
     with st.form("erp_shift_plan_form", clear_on_submit=False):
         edits = {}
-        for emp in employees:
-            st.markdown(f"**{emp}**")
-            cols = st.columns(min(7, days_n))
-            for i, d in enumerate(date_list):
-                col = cols[i % len(cols)]
-                if i > 0 and i % len(cols) == 0:
-                    cols = st.columns(min(7, days_n))
-                    col = cols[0]
-                key = (emp, d.isoformat())
-                row = existing_by_key.get(key)
-                default = ""
-                if row:
-                    ss = str(row.get("shift_start") or "")[:5]
-                    ee = str(row.get("shift_end") or "")[:5]
-                    if ss and ee:
-                        default = f"{ss}-{ee}"
-                d_std_s, d_std_e = _erp_default_times_for_date(current_db, d)
-                ph = f"{d_std_s.strftime('%H:%M')}-{d_std_e.strftime('%H:%M')}"
-                with col:
-                    is_we = _erp_is_weekend_or_holiday(d)
-                    marker = "🟥" if is_we else ""
-                    label = f"{marker}{d.month}/{d.day} ({_ERP_DOW_LABELS[d.weekday()]})"
-                    val = st.text_input(label, value=default, key=f"shift_{emp}_{d.isoformat()}",
-                                        placeholder=ph)
-                    edits[key] = val.strip()
-            st.divider()
+        cols = st.columns(min(7, days_n))
+        for i, d in enumerate(date_list):
+            col = cols[i % len(cols)]
+            if i > 0 and i % len(cols) == 0:
+                cols = st.columns(min(7, days_n))
+                col = cols[0]
+            key = (me_name, d.isoformat())
+            row = existing_by_key.get(key)
+            default = ""
+            if row:
+                ss = str(row.get("shift_start") or "")[:5]
+                ee = str(row.get("shift_end") or "")[:5]
+                if ss and ee:
+                    default = f"{ss}-{ee}"
+            d_std_s, d_std_e = _erp_default_times_for_date(current_db, d)
+            ph = f"{d_std_s.strftime('%H:%M')}-{d_std_e.strftime('%H:%M')}"
+            with col:
+                is_we = _erp_is_weekend_or_holiday(d)
+                marker = "🟥" if is_we else ""
+                label = f"{marker}{d.month}/{d.day} ({_ERP_DOW_LABELS[d.weekday()]})"
+                val = st.text_input(label, value=default, key=f"shift_{me_name}_{d.isoformat()}", placeholder=ph)
+                edits[key] = val.strip()
 
-        loc_input = st.text_input("기본 근무 장소 (선택, 신규 행에만 적용)", value="", key="erp_shift_loc",
+        loc_input = st.text_input("근무 장소 (선택)", value="", key="erp_shift_loc",
                                    placeholder="예: 본점 / 백화점 / 행사장")
-        submitted = st.form_submit_button("💾 일정 저장 (최소 인원 검증)", type="primary")
+        submitted = st.form_submit_button("💾 내 일정 저장", type="primary")
 
     if submitted:
         planned_by_date: dict[date, list] = {}
-        new_rows = []
-        delete_ids = []
-        updates = []
+        new_rows, delete_ids, updates = [], [], []
         for (emp, d_str), val in edits.items():
             d = datetime.fromisoformat(d_str).date()
             existing_row = existing_by_key.get((emp, d_str))
@@ -9305,7 +9302,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 if not t1 or not t2:
                     raise ValueError()
             except Exception:
-                st.error(f"⛔ {emp} / {d_str}: '{val}' 형식이 올바르지 않습니다. (예: 09:00-18:00)")
+                st.error(f"⛔ {d_str}: '{val}' 형식이 올바르지 않습니다. (예: 09:00-18:00)")
                 return
             planned_by_date.setdefault(d, []).append({
                 "employee_name": emp,
@@ -9328,7 +9325,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
 
         violations = _erp_validate_shifts_against_rules(current_db, planned_by_date)
         if violations:
-            st.warning("⚠️ 최소 인원 미달 날짜가 있습니다. 일정은 저장되며, 캘린더에 빨간 경고가 표시됩니다.")
+            st.warning("⚠️ 최소 인원 미달 날짜가 있습니다. 일정은 저장되며, 캘린더에 경고가 표시됩니다.")
             for v in violations:
                 st.markdown(f"- {v}")
 
@@ -9351,6 +9348,32 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
             _erp_delete_row("app_shift_schedules", rid)
         st.success(f"✅ 일정 저장 완료. 처리 {ok_n}건 / 실패 {err_n}건")
         st.rerun()
+
+    # ── 다른 직원 일정 읽기 전용 ────────────────────────────────────
+    other_emps = [e for e in employees if e != me_name]
+    if other_emps:
+        st.divider()
+        st.markdown("##### 👥 다른 직원 근무 일정 (읽기 전용)")
+        table_rows = []
+        for emp in other_emps:
+            for d in date_list:
+                row = existing_by_key.get((emp, d.isoformat()))
+                if row:
+                    ss = str(row.get("shift_start") or "")[:5]
+                    ee = str(row.get("shift_end") or "")[:5]
+                    is_we = _erp_is_weekend_or_holiday(d)
+                    table_rows.append({
+                        "직원": emp,
+                        "날짜": d.isoformat(),
+                        "요일": _ERP_DOW_LABELS[d.weekday()],
+                        "주말/공휴일": "🟥" if is_we else "",
+                        "근무시간": f"{ss}~{ee}" if ss and ee else "-",
+                        "장소": row.get("work_location_name") or "",
+                    })
+        if table_rows:
+            st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True)
+        else:
+            st.info("다른 직원의 등록된 일정이 없습니다.")
 
 
 # ---------- 탭 2: 최소 근무 인원 규칙 설정 (store_admin) ----------
@@ -9632,6 +9655,9 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
                 st.warning(f"⚠️ 잔여 시차({remain}분) < 신청({diff_minutes}분). 관리자 승인 대기 상태로 저장됩니다.")
             else:
                 st.success(f"✅ 잔여 시차 {remain}분 확인 → 즉시 승인")
+        elif work_type in ("연차", "반차") and _erp_is_weekend_or_holiday(log_date):
+            status = "pending"
+            st.warning(f"⚠️ {log_date.isoformat()}({_ERP_DOW_LABELS[log_date.weekday()]})은 주말·공휴일입니다. 매장 관리자 승인 후 최종 처리됩니다.")
 
         row = {
             "home_db_filename": current_db,
@@ -9862,6 +9888,44 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
                         st.rerun()
                 with rc[4]:
                     if st.button("반려(삭제)", key=f"erp_cu_rej_{req['id']}"):
+                        _erp_delete_row("app_attendance_logs", int(req["id"]))
+                        st.rerun()
+
+        st.divider()
+        st.markdown("##### 🗓️ 주말·공휴일 연차/반차 승인 대기 목록 (관리자)")
+        st.caption("직원이 주말·공휴일에 연차 또는 반차를 기록하면 여기에 표시됩니다. 승인하면 연차 차감이 확정됩니다.")
+        all_att_logs = _erp_fetch_table("app_attendance_logs", {"home_db_filename": current_db})
+        leave_pending = [
+            r for r in all_att_logs
+            if r.get("work_type") in ("연차", "반차") and (r.get("status") or "approved") == "pending"
+        ]
+        if not leave_pending:
+            st.info("대기 중인 주말·공휴일 연차/반차 신청이 없습니다.")
+        else:
+            for req in leave_pending:
+                rc = st.columns([2, 2, 1, 1, 1])
+                with rc[0]:
+                    log_d = req.get("log_date", "")
+                    dow = ""
+                    try:
+                        _ld = date.fromisoformat(str(log_d)[:10])
+                        dow = f"({_ERP_DOW_LABELS[_ld.weekday()]})"
+                    except Exception:
+                        pass
+                    st.text(f"{log_d}{dow}  {req.get('employee_name')}")
+                with rc[1]:
+                    st.caption(f"유형: {req.get('work_type')}  |  차감: {req.get('leave_deduction')}일  |  사유: {req.get('note') or '-'}")
+                with rc[2]:
+                    st.caption(f"신청: {str(req.get('created_at') or '')[:10]}")
+                with rc[3]:
+                    if st.button("승인", key=f"erp_lv_app_{req['id']}", type="primary"):
+                        _erp_update_row("app_attendance_logs", int(req["id"]), {
+                            "status": "approved",
+                            "note": (req.get("note") or "") + f" [승인: {me_name}]",
+                        })
+                        st.rerun()
+                with rc[4]:
+                    if st.button("반려(삭제)", key=f"erp_lv_rej_{req['id']}"):
                         _erp_delete_row("app_attendance_logs", int(req["id"]))
                         st.rerun()
 
