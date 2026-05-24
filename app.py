@@ -9597,6 +9597,41 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         st.markdown(" ".join(legends), unsafe_allow_html=True)
         st.caption("📋 회색 텍스트 = 사전 계획된 근무 시각 / 빨간 테두리 = 해당 날짜 최소 인원 미달")
 
+    # ── 당일 근무표 ────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 👥 오늘의 근무표")
+    today_shifts = _erp_fetch_range("app_shift_schedules", "db_filename", current_db,
+                                    "shift_date", today, today)
+    today_logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db,
+                                  "log_date", today, today)
+    log_by_emp = {(l.get("employee_name") or ""): l for l in today_logs}
+    employees_today = _erp_get_employee_names_for_store(current_db)
+    today_rows = []
+    for emp in employees_today:
+        shift = next((s for s in today_shifts if (s.get("employee_name") or "") == emp), None)
+        log = log_by_emp.get(emp)
+        plan_time = ""
+        if shift:
+            ss = str(shift.get("shift_start") or "")[:5]
+            ee = str(shift.get("shift_end") or "")[:5]
+            plan_time = f"{ss}~{ee}" if ss and ee else ""
+        actual_wt = log.get("work_type") if log else ""
+        actual_time = ""
+        if log and log.get("start_time") and log.get("end_time"):
+            actual_time = f"{str(log['start_time'])[:5]}~{str(log['end_time'])[:5]}"
+        status_icon = "✅" if log else ("📋" if shift else "")
+        today_rows.append({
+            "직원": emp,
+            "근무계획": plan_time or "-",
+            "실제근무": actual_time or "-",
+            "근태유형": actual_wt or ("-" if log else ("미기록" if shift else "일정없음")),
+            "상태": status_icon,
+        })
+    if today_rows:
+        st.dataframe(pd.DataFrame(today_rows), width="stretch", hide_index=True)
+    else:
+        st.info("오늘 등록된 근무 일정 또는 근태 기록이 없습니다.")
+
 
 # ---------- 탭 4: 근태 입력 ----------
 
@@ -10231,6 +10266,62 @@ def _erp_render_superadmin_view(today: date):
                 col = store_color.get(sr["db_filename"], "#666")
                 legend_parts.append(f"<span style='color:{col}; font-weight:bold;'>● {sr['store_name']}</span>")
             st.markdown(" &nbsp; ".join(legend_parts), unsafe_allow_html=True)
+
+        # ── 당일 근무표 (선택 매장 기준) ───────────────────────────
+        st.divider()
+        _store_label = picked if picked != "(전체)" else "전체 매장"
+        st.markdown(f"#### 👥 오늘의 근무표 — {_store_label} ({today.isoformat()})")
+        today_all_shifts = []
+        today_all_logs = []
+        for dbf in target_dbs:
+            _ts = _erp_fetch_range("app_shift_schedules", "db_filename", dbf, "shift_date", today, today)
+            for s in _ts:
+                s["_db_filename"] = dbf
+            today_all_shifts += _ts
+            _tl = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", today, today)
+            for l in _tl:
+                l["_db_filename"] = dbf
+            today_all_logs += _tl
+
+        # db_filename → store_name 매핑
+        _dbf_to_sn = {row["db_filename"]: row["store_name"] for _, row in stores_df.iterrows()}
+        _log_by_dbf_emp = {}
+        for l in today_all_logs:
+            _log_by_dbf_emp[(l.get("_db_filename", ""), l.get("employee_name", ""))] = l
+
+        today_table_rows = []
+        for dbf in target_dbs:
+            sn = _dbf_to_sn.get(dbf, dbf)
+            employees_in_store = _erp_get_employee_names_for_store(dbf)
+            store_shifts = [s for s in today_all_shifts if s.get("_db_filename") == dbf]
+            shift_by_emp = {(s.get("employee_name") or ""): s for s in store_shifts}
+            for emp in employees_in_store:
+                shift = shift_by_emp.get(emp)
+                log = _log_by_dbf_emp.get((dbf, emp))
+                plan_time = ""
+                if shift:
+                    ss2 = str(shift.get("shift_start") or "")[:5]
+                    ee2 = str(shift.get("shift_end") or "")[:5]
+                    plan_time = f"{ss2}~{ee2}" if ss2 and ee2 else ""
+                actual_wt = log.get("work_type") if log else ""
+                actual_time = ""
+                if log and log.get("start_time") and log.get("end_time"):
+                    actual_time = f"{str(log['start_time'])[:5]}~{str(log['end_time'])[:5]}"
+                status_icon = "✅" if log else ("📋" if shift else "")
+                today_table_rows.append({
+                    "매장": sn,
+                    "직원": emp,
+                    "근무계획": plan_time or "-",
+                    "실제근무": actual_time or "-",
+                    "근태유형": actual_wt or ("-" if log else ("미기록" if shift else "일정없음")),
+                    "상태": status_icon,
+                })
+
+        if today_table_rows:
+            _df_today = pd.DataFrame(today_table_rows).sort_values(["매장", "직원"])
+            st.dataframe(_df_today, width="stretch", hide_index=True)
+        else:
+            st.info("오늘 등록된 근무 일정 또는 근태 기록이 없습니다.")
 
     with sa_tabs[1]:
         st.markdown("##### 📊 매장별 월별 근무 현황")
