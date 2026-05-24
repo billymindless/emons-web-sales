@@ -9281,8 +9281,27 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 val = st.text_input(label, value=default, key=f"shift_{me_name}_{d.isoformat()}", placeholder=ph)
                 edits[key] = val.strip()
 
-        loc_input = st.text_input("근무 장소 (선택)", value="", key="erp_shift_loc",
-                                   placeholder="예: 본점 / 백화점 / 행사장")
+        # 실제 근무 매장 선택
+        _sp_stores_df = get_supabase_stores_dataframe_cached()
+        _sp_store_opts = []   # (표시명, db_filename or None)
+        if _sp_stores_df is not None and len(_sp_stores_df) > 0:
+            for _, _sr in _sp_stores_df.iterrows():
+                _sp_store_opts.append((_sr["store_name"], _sr["db_filename"]))
+        _sp_store_opts.append(("기타 (외부/행사)", None))
+        _sp_store_labels = [s[0] for s in _sp_store_opts]
+        _sp_home_idx = next((i for i, s in enumerate(_sp_store_opts) if s[1] == current_db), 0)
+        _sp_sel_label = st.selectbox(
+            "📍 실제 근무 매장",
+            _sp_store_labels,
+            index=_sp_home_idx,
+            key="erp_shift_work_store",
+            help="소속 매장과 다른 곳에서 근무하는 경우 선택. 외부 행사·지원은 '기타'를 선택하세요.",
+        )
+        _sp_sel_idx = _sp_store_labels.index(_sp_sel_label)
+        _sp_work_db = _sp_store_opts[_sp_sel_idx][1]   # None = 기타
+
+        loc_input = st.text_input("근무 장소 상세 (선택)", value="", key="erp_shift_loc",
+                                   placeholder="예: 롯데백화점 행사장 / 3층 팝업스토어")
         submitted = st.form_submit_button("💾 내 일정 저장", type="primary")
 
     if submitted:
@@ -9309,13 +9328,22 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 "shift_start": t1.strftime("%H:%M:%S"),
                 "shift_end": t2.strftime("%H:%M:%S"),
             })
+            # work_location_name: 상세 텍스트 우선, 없으면 매장 선택값 사용
+            _loc_val = (loc_input or "").strip()
+            if not _loc_val:
+                if _sp_work_db is None:
+                    _loc_val = "기타 (외부/행사)"
+                elif _sp_work_db != current_db:
+                    _loc_val = _sp_sel_label
+                else:
+                    _loc_val = (existing_row.get("work_location_name") if existing_row else None) or ""
             new_row = {
                 "db_filename": current_db,
                 "employee_name": emp,
                 "shift_date": d_str,
                 "shift_start": t1.strftime("%H:%M:%S"),
                 "shift_end": t2.strftime("%H:%M:%S"),
-                "work_location_name": loc_input or (existing_row.get("work_location_name") if existing_row else None),
+                "work_location_name": _loc_val or None,
                 "created_by": me_name,
             }
             if existing_row:
