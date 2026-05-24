@@ -9486,142 +9486,176 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
 # ---------- 탭 3: 월별 캘린더 ----------
 
 def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
+    """전체 공개 월별 근무 캘린더 — 모든 유저가 모든 매장 근무 일정 열람 가능."""
     import calendar as _cal
-    st.subheader("🗓️ 캘린더 & 오늘의 근무표")
 
-    # ── 오늘의 근무표 (캘린더 상단에 고정) ────────────────────────
-    st.markdown(f"#### 👥 오늘의 근무표 — {today.strftime('%Y년 %m월 %d일 (%a)')}")
-    _today_shifts_top = _erp_fetch_range("app_shift_schedules", "db_filename", current_db,
-                                         "shift_date", today, today)
-    _today_logs_top = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db,
-                                       "log_date", today, today)
-    _log_by_emp_top = {(l.get("employee_name") or ""): l for l in _today_logs_top}
-    _shift_by_emp_top = {(s.get("employee_name") or ""): s for s in _today_shifts_top}
-    _all_emps_today = _erp_get_employee_names_for_store(current_db)
+    st.subheader("🗓️ 월별 근무 캘린더")
+    st.caption("매장·직원을 선택해 누가 언제 어디서 일하는지 한눈에 확인할 수 있습니다.")
 
-    if not _all_emps_today:
-        st.info("이 매장에 배정된 직원이 없습니다. [직원 관리]에서 직원을 등록해 주세요.")
+    # ── 전체 매장 목록 로드 ─────────────────────────────────────
+    stores_df = get_supabase_stores_dataframe_cached()
+    palette = ["#1565C0", "#2E7D32", "#E65100", "#6A1B9A", "#00695C", "#5D4037", "#283593", "#C62828"]
+    if stores_df is not None and len(stores_df) > 0:
+        all_store_names = stores_df["store_name"].tolist()
+        all_dbs = stores_df["db_filename"].tolist()
+        _sn_to_dbf = {row["store_name"]: row["db_filename"] for _, row in stores_df.iterrows()}
+        _dbf_to_sn = {row["db_filename"]: row["store_name"] for _, row in stores_df.iterrows()}
+        store_color = {dbf: palette[i % len(palette)] for i, dbf in enumerate(all_dbs)}
     else:
-        _today_table = []
-        for _emp in _all_emps_today:
-            _sh = _shift_by_emp_top.get(_emp)
-            _lg = _log_by_emp_top.get(_emp)
-            _plan = ""
-            if _sh:
-                _ps = str(_sh.get("shift_start") or "")[:5]
-                _pe = str(_sh.get("shift_end") or "")[:5]
-                _plan = f"{_ps}~{_pe}" if _ps and _pe else ""
-            _actual_wt = _lg.get("work_type") if _lg else ""
-            _actual_time = ""
-            if _lg and _lg.get("start_time") and _lg.get("end_time"):
-                _actual_time = f"{str(_lg['start_time'])[:5]}~{str(_lg['end_time'])[:5]}"
-            _status = "✅ 기록완료" if _lg else ("📋 계획있음" if _sh else "📭 미등록")
-            _today_table.append({
-                "직원": _emp,
-                "근무계획": _plan or "-",
-                "실제근무시간": _actual_time or "-",
-                "근태유형": _actual_wt or "-",
-                "상태": _status,
-            })
-        st.dataframe(pd.DataFrame(_today_table), width="stretch", hide_index=True)
-    st.divider()
+        all_store_names = []
+        all_dbs = [current_db]
+        _sn_to_dbf = {}
+        _dbf_to_sn = {current_db: "내 매장"}
+        store_color = {current_db: palette[0]}
 
-    # ── 월별 캘린더 ────────────────────────────────────────────
-    st.markdown("#### 📅 월별 캘린더")
-    col_y, col_m, col_emp = st.columns([1, 1, 2])
+    # ── 필터 컨트롤 (연도 / 월 / 매장 / 직원) — 전체 유저 공개 ──
+    col_y, col_m, col_store, col_emp = st.columns([1, 1, 2, 2])
     with col_y:
-        year = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_cal_year")
+        year = st.number_input("연도", min_value=2020, max_value=2100,
+                               value=today.year, step=1, key="erp_cal_year")
     with col_m:
-        month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="erp_cal_month")
-    with col_emp:
-        if role in ("store_admin", "superadmin"):
-            emp_opts = ["(전체)"] + _erp_get_employee_names_for_store(current_db)
-            selected_emp = st.selectbox("직원 필터", emp_opts, key="erp_cal_emp")
-        else:
-            selected_emp = me_name
-            st.text_input("직원", value=me_name, disabled=True, key="erp_cal_emp_fixed")
+        month = st.number_input("월", min_value=1, max_value=12,
+                                value=today.month, step=1, key="erp_cal_month")
+    with col_store:
+        sel_store = st.selectbox("📍 매장 선택",
+                                 ["전체 매장"] + all_store_names,
+                                 key="erp_cal_store")
+    if sel_store == "전체 매장":
+        target_dbs = all_dbs
+    else:
+        target_dbs = [_sn_to_dbf[sel_store]] if sel_store in _sn_to_dbf else [current_db]
+    show_store_tag = (sel_store == "전체 매장")
 
+    # 선택 매장 직원 목록 수집
+    all_emps: list[str] = []
+    for dbf in target_dbs:
+        all_emps += _erp_get_employee_names_for_store(dbf)
+    all_emps = sorted(set(all_emps))
+
+    with col_emp:
+        selected_emp = st.selectbox("👤 직원 필터",
+                                    ["(전체 직원)"] + all_emps,
+                                    key="erp_cal_emp")
+
+    # ── 데이터 로드 ─────────────────────────────────────────────
     last_day = _cal.monthrange(int(year), int(month))[1]
     period_start = date(int(year), int(month), 1)
-    period_end = date(int(year), int(month), last_day)
+    period_end   = date(int(year), int(month), last_day)
 
-    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db, "log_date", period_start, period_end)
-    shifts = _erp_fetch_range("app_shift_schedules", "db_filename", current_db, "shift_date", period_start, period_end)
-    if selected_emp and selected_emp != "(전체)":
-        logs = [l for l in logs if (l.get("employee_name") or "") == selected_emp]
-        shifts = [s for s in shifts if (s.get("employee_name") or "") == selected_emp]
+    all_shifts: list = []
+    all_logs:   list = []
+    rules_by_store_dow: dict = {}
+    for dbf in target_dbs:
+        _sh = _erp_fetch_range("app_shift_schedules", "db_filename", dbf,
+                               "shift_date", period_start, period_end)
+        for s in _sh:
+            s["_dbf"] = dbf
+        all_shifts += _sh
+        _lg = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf,
+                               "log_date", period_start, period_end)
+        for l in _lg:
+            l["_dbf"] = dbf
+        all_logs += _lg
+        for r in _erp_fetch_table("app_staffing_rules", {"db_filename": dbf}):
+            rules_by_store_dow.setdefault((dbf, int(r.get("day_of_week") or 0)), []).append(r)
 
-    rules_all = _erp_staffing_rules_cached(current_db)
-    rules_by_dow = {}
-    for r in rules_all:
-        rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
+    # 직원 필터 적용
+    if selected_emp and selected_emp != "(전체 직원)":
+        all_shifts = [s for s in all_shifts if (s.get("employee_name") or "") == selected_emp]
+        all_logs   = [l for l in all_logs   if (l.get("employee_name") or "") == selected_emp]
 
-    shifts_by_date: dict[str, list] = {}
-    for s in shifts:
+    # 날짜별 그룹핑
+    shifts_by_date: dict = {}
+    for s in all_shifts:
         shifts_by_date.setdefault(str(s.get("shift_date") or "")[:10], []).append(s)
-    logs_by_date: dict[str, list] = {}
-    for l in logs:
+    logs_by_date: dict = {}
+    for l in all_logs:
         logs_by_date.setdefault(str(l.get("log_date") or "")[:10], []).append(l)
 
-    shortage_dates = set()
-    for d_iso, day_shifts in shifts_by_date.items():
-        try:
-            d = datetime.fromisoformat(d_iso).date()
-        except Exception:
-            continue
-        for rule in rules_by_dow.get(d.weekday(), []):
-            slot_s = _erp_parse_time(rule.get("slot_start"))
-            slot_e = _erp_parse_time(rule.get("slot_end"))
-            if not slot_s or not slot_e:
+    # 인원 부족일 산출 (매장별)
+    shortage_dates: set = set()
+    for (dbf, dow), rules in rules_by_store_dow.items():
+        for d_iso, day_shifts in shifts_by_date.items():
+            try:
+                d = datetime.fromisoformat(d_iso).date()
+            except Exception:
                 continue
-            if _erp_count_active_at(day_shifts, slot_s, slot_e) < int(rule.get("min_staff") or 1):
-                shortage_dates.add(d_iso)
-                break
+            if d.weekday() != dow:
+                continue
+            store_day_shifts = [s for s in day_shifts if s.get("_dbf") == dbf]
+            for rule in rules:
+                slot_s = _erp_parse_time(rule.get("slot_start"))
+                slot_e = _erp_parse_time(rule.get("slot_end"))
+                if not slot_s or not slot_e:
+                    continue
+                if _erp_count_active_at(store_day_shifts, slot_s, slot_e) < int(rule.get("min_staff") or 1):
+                    shortage_dates.add(d_iso)
+                    break
 
+    # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
     cal_obj = _cal.Calendar(firstweekday=6)
     weeks = cal_obj.monthdayscalendar(int(year), int(month))
+    dow_labels = [("일", "#E53935"), ("월", "#37474F"), ("화", "#37474F"),
+                  ("수", "#37474F"), ("목", "#37474F"), ("금", "#37474F"), ("토", "#1565C0")]
 
-    html = ["<table style='width:100%; border-collapse: collapse; font-size: 0.85rem;'>"]
+    html = ["<table style='width:100%; border-collapse:collapse; font-size:0.82rem;'>"]
     html.append("<thead><tr>")
-    for d_label in ["일", "월", "화", "수", "목", "금", "토"]:
-        color = "#E53935" if d_label == "일" else ("#1565C0" if d_label == "토" else "#37474F")
-        html.append(f"<th style='border:1px solid #ddd; padding:6px; background:#F5F5F5; color:{color};'>{d_label}</th>")
+    for lbl, lc in dow_labels:
+        html.append(f"<th style='border:1px solid #ddd; padding:6px; background:#F5F5F5; color:{lc};'>{lbl}</th>")
     html.append("</tr></thead><tbody>")
+
     for week in weeks:
         html.append("<tr>")
         for d_num in week:
             if d_num == 0:
-                html.append("<td style='border:1px solid #eee; height: 110px;'></td>")
+                html.append("<td style='border:1px solid #eee; height:115px; background:#FAFAFA;'></td>")
                 continue
             d_iso = date(int(year), int(month), d_num).isoformat()
-            border_color = "#E53935" if d_iso in shortage_dates else "#ddd"
-            border_width = "2px" if d_iso in shortage_dates else "1px"
-            cell = [f"<td style='border:{border_width} solid {border_color}; vertical-align:top; padding:4px; height:110px; min-width:90px;'>"]
-            cell.append(f"<div style='font-weight:bold; font-size:0.9rem;'>{d_num}</div>")
+            is_today = (d_iso == today.isoformat())
+            bcolor = "#E53935" if d_iso in shortage_dates else ("#1976D2" if is_today else "#ddd")
+            bw = "2px" if (d_iso in shortage_dates or is_today) else "1px"
+            bg = "#E3F2FD" if is_today else "white"
+            cell = [f"<td style='border:{bw} solid {bcolor}; vertical-align:top; padding:4px; height:115px; min-width:90px; background:{bg};'>"]
+            day_label_color = "#E53935" if date(int(year), int(month), d_num).weekday() == 6 else \
+                              ("#1565C0" if date(int(year), int(month), d_num).weekday() == 5 else "#37474F")
+            cell.append(f"<div style='font-weight:bold; font-size:0.88rem; color:{day_label_color};'>{d_num}</div>")
             if d_iso in shortage_dates:
-                cell.append("<div style='color:#E53935; font-size:0.7rem; font-weight:bold;'>⚠️ 인원 부족</div>")
+                cell.append("<div style='color:#E53935; font-size:0.62rem; font-weight:bold;'>⚠️ 인원부족</div>")
+
+            # 근무 계획 (shift_schedules) — 매장 컬러 배경 바 스타일
             for sh in shifts_by_date.get(d_iso, []):
-                ss = str(sh.get("shift_start") or "")[:5]
-                ee = str(sh.get("shift_end") or "")[:5]
-                emp = sh.get("employee_name") or ""
-                loc = sh.get("work_location_name") or ""
-                txt = f"{emp} {ss}-{ee}"
-                if loc:
-                    txt += f" <i style='color:#777'>@{loc}</i>"
-                cell.append(f"<div style='color:#555; font-size:0.7rem;'>📋 {txt}</div>")
-            for lg in logs_by_date.get(d_iso, []):
-                wt = lg.get("work_type") or "정상"
-                color = _ERP_BADGE_COLORS.get(wt, "#90A4AE")
-                emp = lg.get("employee_name") or ""
-                extra = ""
-                if wt in ("시차적립", "시차사용"):
-                    extra = f" {lg.get('diff_minutes') or 0}분"
-                loc = lg.get("work_location_name") or ""
+                dbf  = sh.get("_dbf", current_db)
+                sc   = store_color.get(dbf, "#555")
+                emp  = sh.get("employee_name") or ""
+                ss   = str(sh.get("shift_start") or "")[:5]
+                ee   = str(sh.get("shift_end") or "")[:5]
+                time_txt = f" {ss}~{ee}" if ss and ee else ""
+                sn_badge = (f"<span style='background:{sc}; color:white; font-size:0.58rem;"
+                            f" padding:0px 3px; border-radius:2px; margin-right:2px;'>"
+                            f"{_dbf_to_sn.get(dbf,'')}</span> ") if show_store_tag else ""
                 cell.append(
-                    f"<div style='margin-top:2px;'><span style='background:{color}; color:white; padding:1px 5px; border-radius:3px; font-size:0.7rem;'>{wt}{extra}</span>"
-                    + (f" <span style='font-size:0.7rem; color:#555;'>{emp}</span>" if (role in ('store_admin','superadmin') and selected_emp == '(전체)') else "")
-                    + (f" <i style='color:#777; font-size:0.7rem;'>@{loc}</i>" if loc else "")
-                    + "</div>"
+                    f"<div style='margin-top:2px; border-left:3px solid {sc};"
+                    f" background:{sc}15; padding:1px 3px; border-radius:0 2px 2px 0;'>"
+                    f"{sn_badge}<span style='color:{sc}; font-weight:600; font-size:0.7rem;'>{emp}</span>"
+                    f"<span style='color:#666; font-size:0.65rem;'>{time_txt}</span></div>"
+                )
+
+            # 근태 기록 (attendance_logs) — 유형 배지 + 매장 컬러 이름
+            for lg in logs_by_date.get(d_iso, []):
+                dbf  = lg.get("_dbf", current_db)
+                sc   = store_color.get(dbf, "#555")
+                wt   = lg.get("work_type") or "정상"
+                bc   = _ERP_BADGE_COLORS.get(wt, "#90A4AE")
+                emp  = lg.get("employee_name") or ""
+                extra = f" {lg.get('diff_minutes') or 0}분" if wt in ("시차적립", "시차사용") else ""
+                sn_tag = (f" <span style='font-size:0.58rem; color:{sc};"
+                          f" font-weight:bold;'>({_dbf_to_sn.get(dbf,'')})</span>") if show_store_tag else ""
+                cell.append(
+                    f"<div style='margin-top:1px;'>"
+                    f"<span style='background:{bc}; color:white; padding:1px 4px;"
+                    f" border-radius:3px; font-size:0.65rem;'>{wt}{extra}</span>"
+                    f" <span style='font-size:0.68rem; color:{sc}; font-weight:600;'>{emp}</span>"
+                    f"{sn_tag}</div>"
                 )
             cell.append("</td>")
             html.append("".join(cell))
@@ -9629,12 +9663,29 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     html.append("</tbody></table>")
     st.markdown("".join(html), unsafe_allow_html=True)
 
-    with st.expander("🎨 범례"):
-        legends = []
-        for wt, col in _ERP_BADGE_COLORS.items():
-            legends.append(f"<span style='background:{col};color:white;padding:1px 6px;border-radius:3px;margin-right:4px;font-size:0.75rem;'>{wt}</span>")
-        st.markdown(" ".join(legends), unsafe_allow_html=True)
-        st.caption("📋 회색 텍스트 = 사전 계획된 근무 시각 / 빨간 테두리 = 해당 날짜 최소 인원 미달")
+    # ── 범례 ────────────────────────────────────────────────────
+    with st.expander("🎨 색상 범례"):
+        col_sc, col_wt = st.columns(2)
+        with col_sc:
+            st.markdown("**매장별 색상**")
+            parts = []
+            for dbf in all_dbs:
+                sc = store_color.get(dbf, "#666")
+                sn = _dbf_to_sn.get(dbf, dbf)
+                parts.append(
+                    f"<span style='background:{sc}20; border-left:4px solid {sc};"
+                    f" padding:2px 8px; border-radius:2px; color:{sc}; font-weight:bold;'>{sn}</span>"
+                )
+            st.markdown(" &nbsp; ".join(parts), unsafe_allow_html=True)
+        with col_wt:
+            st.markdown("**근태 유형 배지**")
+            wt_parts = [
+                f"<span style='background:{c}; color:white; padding:1px 6px;"
+                f" border-radius:3px; font-size:0.75rem;'>{wt}</span>"
+                for wt, c in _ERP_BADGE_COLORS.items()
+            ]
+            st.markdown(" ".join(wt_parts), unsafe_allow_html=True)
+        st.caption("컬러 바 = 근무 계획(shift) / 배지 = 실제 근태 기록 / 파란 테두리 = 오늘 / 빨간 테두리 = 최소 인원 미달")
 
 
 # ---------- 탭 4: 근태 입력 ----------
@@ -10170,164 +10221,9 @@ def _erp_render_superadmin_view(today: date):
     sa_tabs = st.tabs(["통합 캘린더", "매장별 현황", "추가근무 승인", "월말 요약"])
 
     with sa_tabs[0]:
-        # ── 매장 선택 드롭다운 (최상단 고정) ──────────────────────
-        _store_label = "전체 매장"
-        picked = st.selectbox(
-            "📍 매장 선택",
-            ["전체 매장"] + store_names,
-            key="erp_sa_cal_store",
-            help="매장을 선택하면 해당 매장의 오늘 근무자와 월별 캘린더를 표시합니다."
-        )
-        if picked == "전체 매장":
-            target_dbs = stores_df["db_filename"].tolist()
-            _store_label = "전체 매장"
-        else:
-            target_dbs = stores_df[stores_df["store_name"] == picked]["db_filename"].tolist()
-            _store_label = picked
-
-        store_color = {}
-        palette = ["#1565C0", "#43A047", "#FB8C00", "#8E24AA", "#00897B", "#5D4037", "#3949AB", "#D81B60"]
-        for i, dbf in enumerate(stores_df["db_filename"].tolist()):
-            store_color[dbf] = palette[i % len(palette)]
-        _dbf_to_sn = {row["db_filename"]: row["store_name"] for _, row in stores_df.iterrows()}
-
-        # ── 오늘의 근무표 (드롭다운 바로 아래) ─────────────────────
-        st.markdown(f"#### 👥 오늘의 근무표 — {_store_label} ({today.strftime('%Y년 %m월 %d일')})")
-        _sa_today_shifts, _sa_today_logs = [], []
-        for dbf in target_dbs:
-            _ts = _erp_fetch_range("app_shift_schedules", "db_filename", dbf, "shift_date", today, today)
-            for s in _ts:
-                s["_dbf"] = dbf
-            _sa_today_shifts += _ts
-            _tl = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", today, today)
-            for l in _tl:
-                l["_dbf"] = dbf
-            _sa_today_logs += _tl
-
-        _sa_log_key = {(l.get("_dbf", ""), l.get("employee_name", "")): l for l in _sa_today_logs}
-        _sa_shift_key = {(s.get("_dbf", ""), s.get("employee_name", "")): s for s in _sa_today_shifts}
-        _sa_today_table = []
-        for dbf in target_dbs:
-            sn = _dbf_to_sn.get(dbf, dbf)
-            for emp in _erp_get_employee_names_for_store(dbf):
-                _sh = _sa_shift_key.get((dbf, emp))
-                _lg = _sa_log_key.get((dbf, emp))
-                _plan = ""
-                if _sh:
-                    _ps = str(_sh.get("shift_start") or "")[:5]
-                    _pe = str(_sh.get("shift_end") or "")[:5]
-                    _plan = f"{_ps}~{_pe}" if _ps and _pe else ""
-                _actual_wt = _lg.get("work_type") if _lg else ""
-                _actual_time = ""
-                if _lg and _lg.get("start_time") and _lg.get("end_time"):
-                    _actual_time = f"{str(_lg['start_time'])[:5]}~{str(_lg['end_time'])[:5]}"
-                _status = "✅ 기록완료" if _lg else ("📋 계획있음" if _sh else "📭 미등록")
-                _sa_today_table.append({
-                    "매장": sn,
-                    "직원": emp,
-                    "근무계획": _plan or "-",
-                    "실제근무시간": _actual_time or "-",
-                    "근태유형": _actual_wt or "-",
-                    "상태": _status,
-                })
-        if _sa_today_table:
-            _df_sa_today = pd.DataFrame(_sa_today_table).sort_values(["매장", "직원"])
-            st.dataframe(_df_sa_today, width="stretch", hide_index=True)
-        else:
-            st.info("오늘 등록된 근무 일정 또는 근태 기록이 없습니다.")
-        st.divider()
-
-        # ── 월별 캘린더 ──────────────────────────────────────────
-        st.markdown("#### 📅 월별 캘린더")
-        col_y, col_m = st.columns(2)
-        with col_y:
-            sy = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="erp_sa_cal_y")
-        with col_m:
-            sm = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="erp_sa_cal_m")
-        last_d = _cal.monthrange(int(sy), int(sm))[1]
-        p_s, p_e = date(int(sy), int(sm), 1), date(int(sy), int(sm), last_d)
-
-        all_logs = []
-        all_shifts = []
-        rules_by_store_dow = {}
-        for dbf in target_dbs:
-            all_logs += _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_s, p_e)
-            all_shifts += _erp_fetch_range("app_shift_schedules", "db_filename", dbf, "shift_date", p_s, p_e)
-            for r in _erp_fetch_table("app_staffing_rules", {"db_filename": dbf}):
-                rules_by_store_dow.setdefault((dbf, int(r.get("day_of_week") or 0)), []).append(r)
-
-        shifts_by_store_date: dict = {}
-        for s in all_shifts:
-            shifts_by_store_date.setdefault((str(s.get("db_filename") or ""), str(s.get("shift_date") or "")[:10]), []).append(s)
-        logs_by_date: dict = {}
-        for l in all_logs:
-            logs_by_date.setdefault(str(l.get("log_date") or "")[:10], []).append(l)
-
-        shortage_dates = set()
-        for (dbf, d_iso), day_shifts in shifts_by_store_date.items():
-            try:
-                d = datetime.fromisoformat(d_iso).date()
-            except Exception:
-                continue
-            for rule in rules_by_store_dow.get((dbf, d.weekday()), []):
-                slot_s = _erp_parse_time(rule.get("slot_start"))
-                slot_e = _erp_parse_time(rule.get("slot_end"))
-                if not slot_s or not slot_e:
-                    continue
-                if _erp_count_active_at(day_shifts, slot_s, slot_e) < int(rule.get("min_staff") or 1):
-                    shortage_dates.add((dbf, d_iso))
-                    break
-
-        cal_obj = _cal.Calendar(firstweekday=6)
-        weeks = cal_obj.monthdayscalendar(int(sy), int(sm))
-        html = ["<table style='width:100%; border-collapse:collapse; font-size:0.78rem;'>"]
-        html.append("<thead><tr>")
-        for d_label in ["일", "월", "화", "수", "목", "금", "토"]:
-            color = "#E53935" if d_label == "일" else ("#1565C0" if d_label == "토" else "#37474F")
-            html.append(f"<th style='border:1px solid #ddd; padding:6px; background:#F5F5F5; color:{color};'>{d_label}</th>")
-        html.append("</tr></thead><tbody>")
-        for week in weeks:
-            html.append("<tr>")
-            for d_num in week:
-                if d_num == 0:
-                    html.append("<td style='border:1px solid #eee; height:120px;'></td>")
-                    continue
-                d_iso = date(int(sy), int(sm), d_num).isoformat()
-                has_shortage = any((dbf, d_iso) in shortage_dates for dbf in target_dbs)
-                bcolor = "#E53935" if has_shortage else "#ddd"
-                bw = "2px" if has_shortage else "1px"
-                cell = [f"<td style='border:{bw} solid {bcolor}; vertical-align:top; padding:3px; height:120px; min-width:100px;'>"]
-                cell.append(f"<div style='font-weight:bold;'>{d_num}</div>")
-                if has_shortage:
-                    cell.append("<div style='color:#E53935; font-size:0.65rem; font-weight:bold;'>⚠️ 인원 부족</div>")
-                for dbf in target_dbs:
-                    sn = stores_df[stores_df["db_filename"] == dbf]["store_name"].iloc[0] if (stores_df["db_filename"] == dbf).any() else dbf
-                    sc = store_color.get(dbf, "#666")
-                    day_shifts = shifts_by_store_date.get((dbf, d_iso), [])
-                    if day_shifts:
-                        cell.append(f"<div style='font-size:0.62rem; color:{sc}; font-weight:bold;'>● {sn} ({len(day_shifts)}명)</div>")
-                day_logs = logs_by_date.get(d_iso, [])
-                for lg in day_logs[:4]:
-                    wt = lg.get("work_type") or "정상"
-                    color = _ERP_BADGE_COLORS.get(wt, "#90A4AE")
-                    cell.append(
-                        f"<div><span style='background:{color}; color:white; padding:1px 4px; border-radius:2px; font-size:0.62rem;'>{wt}</span> "
-                        f"<span style='font-size:0.62rem;'>{lg.get('employee_name') or ''}</span></div>"
-                    )
-                if len(day_logs) > 4:
-                    cell.append(f"<div style='font-size:0.6rem; color:#999;'>+{len(day_logs)-4}건…</div>")
-                cell.append("</td>")
-                html.append("".join(cell))
-            html.append("</tr>")
-        html.append("</tbody></table>")
-        st.markdown("".join(html), unsafe_allow_html=True)
-
-        with st.expander("🎨 매장 색상"):
-            legend_parts = []
-            for _, sr in stores_df.iterrows():
-                col = store_color.get(sr["db_filename"], "#666")
-                legend_parts.append(f"<span style='color:{col}; font-weight:bold;'>● {sr['store_name']}</span>")
-            st.markdown(" &nbsp; ".join(legend_parts), unsafe_allow_html=True)
+        # 통합 캘린더 = 전체 공개 캘린더 함수 재사용 (superadmin current_db는 비워도 무관)
+        _first_db = stores_df["db_filename"].iloc[0] if len(stores_df) > 0 else ""
+        _erp_tab_calendar(_first_db, "superadmin", "", today)
 
     with sa_tabs[1]:
         st.markdown("##### 📊 매장별 월별 근무 현황")
