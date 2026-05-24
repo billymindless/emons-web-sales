@@ -532,6 +532,8 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_TABLES.sql",
         "SUPABASE_APP_EDIT_REQUESTS.sql",
         "SUPABASE_APP_ERP_ATTENDANCE.sql",
+        "SUPABASE_APP_USERS_HIREDATE.sql",
+        "SUPABASE_APP_EMPLOYEE_SALARIES.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -10303,6 +10305,680 @@ def _erp_render_superadmin_view(today: date):
             st.info("표시할 데이터가 없습니다.")
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  인력 효율 분석 모듈  (store_admin / superadmin 전용)
+# ═══════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=300)
+def _emp_analytics_load_users(db_filename: str) -> list:
+    """매장 직원 목록 + hire_date (app_users 조회, 300초 캐시)."""
+    store_id = _get_supabase_store_by_db_filename(db_filename)
+    if not store_id:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        us = client.table("app_user_stores").select("user_id").eq("store_id", store_id).execute()
+        user_ids = [x["user_id"] for x in (us.data or [])]
+        if not user_ids:
+            u_r = client.table("app_users").select("id").eq("store_id", store_id).execute()
+            user_ids = [x["id"] for x in (u_r.data or [])]
+        if not user_ids:
+            return []
+        r = client.table("app_users").select("id, name, username, role, hire_date").in_("id", user_ids).execute()
+        out = []
+        for u in (r.data or []):
+            if u.get("role") not in ("store_admin", "user"):
+                continue
+            name = (u.get("name") or u.get("username") or "").strip()
+            if not name:
+                continue
+            out.append({"id": u["id"], "name": name, "hire_date": u.get("hire_date"), "role": u.get("role")})
+        return out
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def _emp_analytics_load_salaries(db_filename: str) -> list:
+    """직원별 급여 정보 조회 (300초 캐시)."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_employee_salaries").select("*").eq("db_filename", db_filename).execute()
+        return r.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def _emp_analytics_worked_hours(db_filename: str, start_date_str: str, end_date_str: str) -> dict:
+    """직원별 실근무시간(h) dict. attendance_logs 우선, 없으면 shift_schedules 폴백."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return {}
+    emp_hours: dict = {}
+
+    try:
+        r = client.table("app_attendance_logs").select(
+            "employee_name, work_type, start_time, end_time, leave_deduction"
+        ).eq("home_db_filename", db_filename).gte("log_date", start_date_str).lte("log_date", end_date_str).execute()
+        logs = r.data or []
+    except Exception:
+        logs = []
+
+    if logs:
+        for log in logs:
+            emp = (log.get("employee_name") or "").strip()
+            if not emp:
+                continue
+            wt = log.get("work_type") or ""
+            if wt in ("결근", "시차적립", "시차사용"):
+                continue
+            st_s = log.get("start_time") or ""
+            en_s = log.get("end_time") or ""
+            if len(st_s) >= 5 and len(en_s) >= 5:
+                try:
+                    sh, sm = int(st_s[:2]), int(st_s[3:5])
+                    eh, em_i = int(en_s[:2]), int(en_s[3:5])
+                    wm = (eh * 60 + em_i) - (sh * 60 + sm) - 60
+                    ld = float(log.get("leave_deduction") or 0)
+                    if ld >= 1.0:
+                        wm = 0
+                    elif ld == 0.5:
+                        wm = max(0, wm // 2)
+                    emp_hours[emp] = emp_hours.get(emp, 0) + max(0, wm) / 60
+                except Exception:
+                    pass
+        if emp_hours:
+            return emp_hours
+
+    try:
+        r2 = client.table("app_shift_schedules").select(
+            "employee_name, shift_start, shift_end"
+        ).eq("db_filename", db_filename).gte("shift_date", start_date_str).lte("shift_date", end_date_str).execute()
+        shifts = r2.data or []
+    except Exception:
+        shifts = []
+
+    for s in shifts:
+        emp = (s.get("employee_name") or "").strip()
+        st_s = s.get("shift_start") or ""
+        en_s = s.get("shift_end") or ""
+        if emp and len(st_s) >= 5 and len(en_s) >= 5:
+            try:
+                sh, sm = int(st_s[:2]), int(st_s[3:5])
+                eh, em_i = int(en_s[:2]), int(en_s[3:5])
+                wm = max(0, (eh * 60 + em_i) - (sh * 60 + sm) - 60)
+                emp_hours[emp] = emp_hours.get(emp, 0) + wm / 60
+            except Exception:
+                pass
+    return emp_hours
+
+
+@st.cache_data(ttl=300)
+def _emp_analytics_overtime_data(db_filename: str, year: int, month: int) -> list:
+    """승인된 추가근무 내역 (300초 캐시)."""
+    import calendar as _cal
+    start_str = f"{year}-{month:02d}-01"
+    end_str = f"{year}-{month:02d}-{_cal.monthrange(year, month)[1]:02d}"
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_overtime_requests").select("*").eq(
+            "home_db_filename", db_filename
+        ).eq("status", "approved").gte("request_date", start_str).lte("request_date", end_str).execute()
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _payroll_split_night_minutes(extra_start: str, extra_end: str) -> tuple:
+    """(주간 분, 야간 분) 분리. 야간=22:00~06:00."""
+    try:
+        sh, sm = int(extra_start[:2]), int(extra_start[3:5])
+        eh, em = int(extra_end[:2]), int(extra_end[3:5])
+    except Exception:
+        return (0, 0)
+    total_min = (eh * 60 + em) - (sh * 60 + sm)
+    if total_min <= 0:
+        return (0, 0)
+    night_min = 0
+    day_min = 0
+    for i in range(total_min):
+        hh = (sh * 60 + sm + i) // 60
+        if hh >= 22 or hh < 6:
+            night_min += 1
+        else:
+            day_min += 1
+    return (day_min, night_min)
+
+
+def _payroll_compute_extra_pay_detail(db_filename: str, year: int, month: int, salaries: list) -> list:
+    """직원별 가산수당 계산 (근로기준법: 연장 0.5·야간 0.5·휴일 0.5/1.0배). 5인 이상 가정."""
+    overtime_records = _emp_analytics_overtime_data(db_filename, year, month)
+    salary_map = {s["employee_name"]: s for s in salaries}
+    emp_ot: dict = {}
+    for ot in overtime_records:
+        emp = ot.get("employee_name") or ""
+        emp_ot.setdefault(emp, []).append(ot)
+
+    rows = []
+    for emp, records in emp_ot.items():
+        sal = salary_map.get(emp)
+        total_extra_min = sum(int(r.get("extra_minutes") or 0) for r in records)
+        if not sal:
+            rows.append({
+                "직원": emp, "급여유형": "-", "통상시급(원)": 0,
+                "평일연장(분)": total_extra_min, "야간(분)": 0, "휴일(분)": 0,
+                "평일연장수당(원)": 0, "야간수당(원)": 0, "휴일수당(원)": 0, "가산수당합계(원)": 0,
+                "비고": "급여정보없음",
+            })
+            continue
+
+        salary_type = sal.get("salary_type") or "monthly"
+        if salary_type == "monthly":
+            hourly = round(float(sal.get("monthly_salary") or 0) / 209, 0)
+        else:
+            hourly = float(sal.get("hourly_wage") or 0)
+
+        weekday_ext_min = 0
+        night_min_total = 0
+        holiday_8h_min = 0
+        holiday_over8_min = 0
+        holiday_day_minutes: dict = {}
+
+        for ot in records:
+            r_date_str = str(ot.get("request_date") or "")[:10]
+            try:
+                r_date = date.fromisoformat(r_date_str)
+            except Exception:
+                continue
+            is_holiday = _erp_is_weekend_or_holiday(r_date)
+            extra_min = int(ot.get("extra_minutes") or 0)
+            es = ot.get("extra_start") or ""
+            ee = ot.get("extra_end") or ""
+            day_m, night_m = _payroll_split_night_minutes(es, ee)
+
+            if is_holiday:
+                existing = holiday_day_minutes.get(r_date_str, 0)
+                cap = 480
+                under = max(0, cap - existing)
+                holiday_8h_min += min(extra_min, under)
+                if extra_min > under:
+                    holiday_over8_min += extra_min - under
+                holiday_day_minutes[r_date_str] = existing + extra_min
+            else:
+                weekday_ext_min += day_m
+            night_min_total += night_m
+
+        weekday_pay = round(weekday_ext_min / 60 * hourly * 0.5)
+        night_pay = round(night_min_total / 60 * hourly * 0.5)
+        holiday_pay = round(holiday_8h_min / 60 * hourly * 0.5 + holiday_over8_min / 60 * hourly * 1.0)
+        total_extra = int(weekday_pay + night_pay + holiday_pay)
+
+        rows.append({
+            "직원": emp,
+            "급여유형": "월급" if salary_type == "monthly" else "시급",
+            "통상시급(원)": int(hourly),
+            "평일연장(분)": weekday_ext_min,
+            "야간(분)": night_min_total,
+            "휴일(분)": holiday_8h_min + holiday_over8_min,
+            "평일연장수당(원)": int(weekday_pay),
+            "야간수당(원)": int(night_pay),
+            "휴일수당(원)": int(holiday_pay),
+            "가산수당합계(원)": total_extra,
+            "비고": "",
+        })
+    return rows
+
+
+def render_employee_analytics():
+    """인력 효율 분석 — store_admin/superadmin 전용."""
+    import calendar as _cal
+    current_user = st.session_state.get("current_user") or {}
+    role = current_user.get("role", "")
+    me_name = (current_user.get("name") or current_user.get("username") or "").strip()
+
+    if role not in ("store_admin", "superadmin"):
+        st.error("접근 권한이 없습니다. 매장 관리자 이상만 이용 가능합니다.")
+        return
+
+    current_db = st.session_state.get("current_db") or ""
+    today = date.today()
+
+    if st.button("← 뒤로", key="ea_back"):
+        if "active_admin_page" in st.session_state:
+            del st.session_state["active_admin_page"]
+        st.rerun()
+
+    st.header("📈 인력 효율 분석")
+    st.caption("매장 관리자·최고 관리자 전용 | 인원 추이 · 요일별 상관관계 · 개인 ROI · 급여/가산수당")
+
+    tab_a, tab_b, tab_c, tab_d = st.tabs(["📊 인원 추이", "📅 요일별 상관관계", "🏆 개인 ROI", "💰 급여 & 수당"])
+
+    # ── 탭 A: 월별 인원·효율 추이 ─────────────────────────────────
+    with tab_a:
+        st.subheader("월별 재직인원 & 인당 실적 추이")
+        n_months = st.selectbox("기간", [6, 12, 24], index=1, format_func=lambda x: f"최근 {x}개월", key="ea_a_months")
+
+        months = []
+        for i in range(int(n_months) - 1, -1, -1):
+            m = today.month - i
+            y = today.year
+            while m <= 0:
+                m += 12
+                y -= 1
+            months.append((y, m))
+
+        users = _emp_analytics_load_users(current_db)
+        no_hd = [u["name"] for u in users if not u.get("hire_date")]
+        if no_hd:
+            st.info(f"⚠️ 입사일 미입력 직원: {', '.join(no_hd)} — 인원 카운트 제외. 직원 마스터에서 입력해 주세요.")
+
+        headcount_rows = []
+        for ym in months:
+            month_end = date(ym[0], ym[1], _cal.monthrange(ym[0], ym[1])[1])
+            ym_start = date(ym[0], ym[1], 1)
+            cnt, new_h = 0, 0
+            for u in users:
+                hd = u.get("hire_date")
+                if not hd:
+                    continue
+                try:
+                    hd_d = date.fromisoformat(str(hd)[:10])
+                except Exception:
+                    continue
+                if hd_d <= month_end:
+                    cnt += 1
+                if ym_start <= hd_d <= month_end:
+                    new_h += 1
+            headcount_rows.append({"연월": f"{ym[0]}-{ym[1]:02d}", "재직인원": cnt, "신규입사": new_h})
+        hc_df = pd.DataFrame(headcount_rows)
+
+        start_str_a = f"{months[0][0]}-{months[0][1]:02d}-01"
+        end_last_a = _cal.monthrange(months[-1][0], months[-1][1])[1]
+        end_str_a = f"{months[-1][0]}-{months[-1][1]:02d}-{end_last_a:02d}"
+        sales_df_a = load_sales_with_employees_cached(current_db, start_str_a, end_str_a)
+        orders_df_a = load_orders_cached(current_db, "id, order_date, employee_names, total_amount, actual_margin, display_sales_amount", limit=None, start_date=start_str_a, end_date=end_str_a)
+
+        monthly_perf = []
+        for ym in months:
+            ym_str = f"{ym[0]}-{ym[1]:02d}"
+            if not sales_df_a.empty and "transaction_date" in sales_df_a.columns:
+                s_sl = sales_df_a[pd.to_datetime(sales_df_a["transaction_date"], errors="coerce").dt.strftime("%Y-%m") == ym_str]
+            else:
+                s_sl = pd.DataFrame()
+            if not orders_df_a.empty and "order_date" in orders_df_a.columns:
+                o_sl = orders_df_a[pd.to_datetime(orders_df_a["order_date"], errors="coerce").dt.strftime("%Y-%m") == ym_str]
+            else:
+                o_sl = pd.DataFrame()
+            tot = _kpi_employee_totals_from_sales_slice(s_sl, o_sl) if not s_sl.empty else pd.DataFrame()
+            monthly_perf.append({
+                "연월": ym_str,
+                "총매출(원)": int(tot["revenue"].sum()) if not tot.empty else 0,
+                "총마진(원)": int(tot["margin"].sum()) if not tot.empty else 0,
+            })
+        perf_df_a = pd.DataFrame(monthly_perf)
+        merged_a = hc_df.merge(perf_df_a, on="연월", how="left").fillna(0)
+        merged_a["인당매출(원)"] = merged_a.apply(lambda r: int(r["총매출(원)"] / r["재직인원"]) if r["재직인원"] > 0 else 0, axis=1)
+        merged_a["인당마진(원)"] = merged_a.apply(lambda r: int(r["총마진(원)"] / r["재직인원"]) if r["재직인원"] > 0 else 0, axis=1)
+
+        st.dataframe(merged_a, hide_index=True, use_container_width=True)
+        if not merged_a.empty:
+            try:
+                import altair as alt
+                base_a = alt.Chart(merged_a).encode(x=alt.X("연월:N", sort=None))
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.altair_chart(
+                        base_a.mark_line(color="#3B82F6", point=True).encode(
+                            y=alt.Y("총매출(원):Q"), tooltip=["연월", "총매출(원)", "재직인원"]
+                        ).properties(title="월별 총매출", height=240),
+                        use_container_width=True,
+                    )
+                with c2:
+                    st.altair_chart(
+                        base_a.mark_bar(color="#F59E0B", opacity=0.8).encode(
+                            y=alt.Y("재직인원:Q"), tooltip=["연월", "재직인원", "신규입사"]
+                        ).properties(title="월별 재직인원", height=240),
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+            import io as _io
+            buf_a = _io.BytesIO()
+            merged_a.to_excel(buf_a, index=False)
+            st.download_button("📥 엑셀 다운로드", buf_a.getvalue(), file_name=f"인원추이_{current_db}_{today}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="ea_a_dl")
+
+    # ── 탭 B: 요일별 상관관계 ─────────────────────────────────────
+    with tab_b:
+        st.subheader("요일별 근무 인원 vs 매출 상관관계")
+        st.caption("⚠️ 주문 날짜 기준 요일 집계. 근태 데이터가 누적될수록 정확해집니다.")
+        col_by, col_bm = st.columns(2)
+        with col_by:
+            b_year = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="ea_b_year")
+        with col_bm:
+            b_month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="ea_b_month")
+
+        bm_last = _cal.monthrange(int(b_year), int(b_month))[1]
+        b_start = f"{b_year}-{b_month:02d}-01"
+        b_end = f"{b_year}-{b_month:02d}-{bm_last:02d}"
+
+        client_b, _ = get_supabase_client()
+        att_dow: dict = {i: [] for i in range(7)}
+        if client_b:
+            try:
+                r_att = client_b.table("app_attendance_logs").select(
+                    "log_date, employee_name, work_type"
+                ).eq("home_db_filename", current_db).gte("log_date", b_start).lte("log_date", b_end).execute()
+                day_emp: dict = {}
+                for log in (r_att.data or []):
+                    if (log.get("work_type") or "") == "결근":
+                        continue
+                    ld_str = str(log.get("log_date") or "")[:10]
+                    emp = (log.get("employee_name") or "").strip()
+                    if ld_str and emp:
+                        day_emp.setdefault(ld_str, set()).add(emp)
+                for day_str, emps in day_emp.items():
+                    try:
+                        att_dow[date.fromisoformat(day_str).weekday()].append(len(emps))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        b_orders = load_orders_cached(current_db, "id, order_date, total_amount", limit=None, start_date=b_start, end_date=b_end)
+        order_dow: dict = {i: [] for i in range(7)}
+        if not b_orders.empty and "order_date" in b_orders.columns:
+            b_orders = b_orders.copy()
+            b_orders["_d"] = pd.to_datetime(b_orders["order_date"], errors="coerce").dt.date
+            b_orders["_t"] = pd.to_numeric(b_orders["total_amount"], errors="coerce").fillna(0)
+            for d, rev in b_orders.dropna(subset=["_d"]).groupby("_d")["_t"].sum().items():
+                order_dow[d.weekday()].append(rev)
+
+        dow_labels = ["월", "화", "수", "목", "금", "토", "일"]
+        dow_rows = []
+        for i, lbl in enumerate(dow_labels):
+            avg_emp = round(sum(att_dow[i]) / len(att_dow[i]), 2) if att_dow[i] else 0
+            avg_rev = int(sum(order_dow[i]) / len(order_dow[i])) if order_dow[i] else 0
+            dow_rows.append({"요일": lbl, "평균근무인원": avg_emp, "평균매출(원)": avg_rev})
+        dow_df = pd.DataFrame(dow_rows)
+        st.dataframe(dow_df, hide_index=True, use_container_width=True)
+
+        has_att = any(att_dow[i] for i in range(7))
+        if has_att:
+            try:
+                import numpy as np
+                ev = dow_df["평균근무인원"].tolist()
+                rv = dow_df["평균매출(원)"].tolist()
+                if len(set(ev)) > 1 and len(set(rv)) > 1:
+                    corr = np.corrcoef(ev, rv)[0, 1]
+                    st.metric("요일별 인원-매출 피어슨 상관계수", f"{corr:.3f}",
+                              help="1에 가까울수록 인원이 많은 요일에 매출도 높음")
+            except Exception:
+                pass
+            try:
+                import altair as alt
+                base_b = alt.Chart(dow_df).encode(x=alt.X("요일:N", sort=dow_labels))
+                bar_b = base_b.mark_bar(color="#3B82F6", opacity=0.7).encode(y=alt.Y("평균매출(원):Q"))
+                line_b = base_b.mark_line(color="#EF4444", point=True).encode(y=alt.Y("평균근무인원:Q"))
+                st.altair_chart(
+                    alt.layer(bar_b, line_b).resolve_scale(y="independent")
+                    .properties(title="요일별 인원(빨간선) vs 매출(막대)", height=300),
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
+        else:
+            st.info("근태 로그 데이터가 없습니다. 근태 관리에서 출퇴근을 기록하면 분석이 가능해집니다.")
+
+    # ── 탭 C: 개인 ROI ────────────────────────────────────────────
+    with tab_c:
+        st.subheader("직원 개별 ROI & 매장 내 순위 (상대평가)")
+        col_cy, col_cm = st.columns(2)
+        with col_cy:
+            c_year = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="ea_c_year")
+        with col_cm:
+            c_month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="ea_c_month")
+
+        cm_last = _cal.monthrange(int(c_year), int(c_month))[1]
+        c_start = f"{c_year}-{c_month:02d}-01"
+        c_end = f"{c_year}-{c_month:02d}-{cm_last:02d}"
+        ym_c = f"{c_year}-{c_month:02d}"
+
+        c_sales = load_sales_with_employees_cached(current_db, c_start, c_end)
+        c_orders = load_orders_cached(current_db, "id, order_date, employee_names, total_amount, actual_margin, display_sales_amount", limit=None, start_date=c_start, end_date=c_end)
+
+        if not c_sales.empty and "transaction_date" in c_sales.columns:
+            s_sl_c = c_sales[pd.to_datetime(c_sales["transaction_date"], errors="coerce").dt.strftime("%Y-%m") == ym_c]
+        else:
+            s_sl_c = pd.DataFrame()
+        if not c_orders.empty and "order_date" in c_orders.columns:
+            o_sl_c = c_orders[pd.to_datetime(c_orders["order_date"], errors="coerce").dt.strftime("%Y-%m") == ym_c]
+        else:
+            o_sl_c = c_orders
+
+        perf_c = _kpi_employee_totals_from_sales_slice(s_sl_c, o_sl_c) if not s_sl_c.empty else pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
+        worked_c = _emp_analytics_worked_hours(current_db, c_start, c_end)
+
+        emp_aov: dict = {}
+        emp_mr: dict = {}
+        if not c_orders.empty and "employee_names" in c_orders.columns:
+            for _, orow in c_orders.iterrows():
+                emps = _kpi_parse_employee_list(orow.get("employee_names"))
+                if not emps:
+                    continue
+                amt = float(orow.get("total_amount") or 0)
+                mar = float(orow.get("actual_margin") or 0)
+                for e in emps:
+                    emp_aov.setdefault(e, []).append(amt)
+                    if amt > 0:
+                        emp_mr.setdefault(e, []).append(mar / amt * 100)
+
+        roi_rows = []
+        for _, row in perf_c.iterrows():
+            emp = row["employee"]
+            rev = float(row.get("revenue") or 0)
+            mar = float(row.get("margin") or 0)
+            hrs = worked_c.get(emp, 0)
+            aov_list = emp_aov.get(emp, [])
+            mr_list = emp_mr.get(emp, [])
+            roi_rows.append({
+                "직원": emp,
+                "매출(원)": int(rev),
+                "마진(원)": int(mar),
+                "객단가(원)": int(sum(aov_list) / len(aov_list)) if aov_list else 0,
+                "마진율(%)": round(sum(mr_list) / len(mr_list), 1) if mr_list else 0,
+                "실근무(h)": round(hrs, 1) if hrs else None,
+                "시간당매출(원)": int(rev / hrs) if hrs > 0 else None,
+                "시간당마진(원)": int(mar / hrs) if hrs > 0 else None,
+            })
+        roi_df = pd.DataFrame(roi_rows)
+        if not roi_df.empty:
+            roi_df["매출순위"] = roi_df["매출(원)"].rank(ascending=False, method="min").astype(int)
+            roi_df["마진율순위"] = roi_df["마진율(%)"].rank(ascending=False, method="min").astype(int)
+            st.dataframe(roi_df.sort_values("매출(원)", ascending=False), hide_index=True, use_container_width=True)
+
+            hrs_avail = roi_df["시간당매출(원)"].dropna()
+            if len(roi_df) > 1 and not hrs_avail.empty:
+                try:
+                    import altair as alt
+                    scatter_c = alt.Chart(roi_df.dropna(subset=["실근무(h)", "매출(원)"])).mark_circle(size=100).encode(
+                        x=alt.X("실근무(h):Q", title="실근무시간 (h)"),
+                        y=alt.Y("매출(원):Q", title="매출 (원)"),
+                        tooltip=["직원", "매출(원)", "마진율(%)", "실근무(h)", "시간당매출(원)"],
+                    )
+                    avg_rev_c = roi_df["매출(원)"].mean()
+                    avg_line_c = alt.Chart(pd.DataFrame({"y": [avg_rev_c]})).mark_rule(color="red", strokeDash=[4, 4]).encode(y="y:Q")
+                    st.altair_chart((scatter_c + avg_line_c).properties(title="실근무시간 vs 매출 (빨간선=매장평균)", height=300), use_container_width=True)
+                except Exception:
+                    pass
+
+            import io as _io
+            buf_c = _io.BytesIO()
+            roi_df.to_excel(buf_c, index=False)
+            st.download_button("📥 엑셀 다운로드", buf_c.getvalue(), file_name=f"개인ROI_{current_db}_{c_year}{c_month:02d}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="ea_c_dl")
+        else:
+            st.info("해당 기간 매출 데이터가 없습니다.")
+
+    # ── 탭 D: 급여 & 수당 ─────────────────────────────────────────
+    with tab_d:
+        st.subheader("💰 직원 급여 입력 & 추가근무 가산수당 계산")
+        st.caption(
+            "⚠️ 5인 이상 사업장 기준 — 연장 50%·야간(22~06시) 50%·휴일 50%(8h이내)/100%(8h초과) 가산 적용. "
+            "승인된 추가근무만 반영. 4대보험·세금 공제 전 총지급액 기준."
+        )
+
+        # D-1. 급여 입력
+        with st.expander("✏️ 직원 급여 입력·수정", expanded=True):
+            d_users = _emp_analytics_load_users(current_db)
+            d_salaries = _emp_analytics_load_salaries(current_db)
+            sal_map_d = {s["employee_name"]: s for s in d_salaries}
+            emp_names_d = [u["name"] for u in d_users if u.get("name")]
+
+            if not emp_names_d:
+                st.info("등록된 직원이 없습니다.")
+            else:
+                sal_rows = []
+                for emp in emp_names_d:
+                    s = sal_map_d.get(emp, {})
+                    sal_rows.append({
+                        "직원": emp,
+                        "급여유형": s.get("salary_type", "monthly"),
+                        "월급(원)": int(s.get("monthly_salary") or 0),
+                        "시급(원)": int(s.get("hourly_wage") or 0),
+                    })
+                edited = st.data_editor(
+                    pd.DataFrame(sal_rows),
+                    column_config={
+                        "직원": st.column_config.TextColumn("직원", disabled=True),
+                        "급여유형": st.column_config.SelectboxColumn("급여유형", options=["monthly", "hourly"]),
+                        "월급(원)": st.column_config.NumberColumn("월급(원)", min_value=0, step=10000),
+                        "시급(원)": st.column_config.NumberColumn("시급(원)", min_value=0, step=100),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    key="ea_d_salary_editor",
+                )
+                if st.button("💾 급여 저장", key="ea_d_save_sal"):
+                    client_d, err_d = get_supabase_client()
+                    if err_d or not client_d:
+                        st.error("Supabase 연결 실패")
+                    else:
+                        ok_n = 0
+                        for _, erow in edited.iterrows():
+                            row_data = {
+                                "db_filename": current_db,
+                                "employee_name": erow["직원"],
+                                "salary_type": erow["급여유형"],
+                                "monthly_salary": int(erow["월급(원)"] or 0),
+                                "hourly_wage": int(erow["시급(원)"] or 0),
+                                "effective_from": today.isoformat(),
+                                "updated_by": me_name,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            try:
+                                client_d.table("app_employee_salaries").upsert(
+                                    row_data, on_conflict="db_filename,employee_name"
+                                ).execute()
+                                ok_n += 1
+                            except Exception as e:
+                                st.error(f"{erow['직원']} 저장 실패: {e}")
+                        if ok_n:
+                            _emp_analytics_load_salaries.clear()
+                            st.success(f"✅ {ok_n}명 급여 저장 완료")
+                            st.rerun()
+
+        # D-2. 가산수당 계산
+        st.markdown("---")
+        st.markdown("##### 📋 월별 추가근무 가산수당 계산")
+        col_dy, col_dm_sel = st.columns(2)
+        with col_dy:
+            d_year = st.number_input("연도", min_value=2020, max_value=2100, value=today.year, step=1, key="ea_d_year")
+        with col_dm_sel:
+            d_month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="ea_d_month")
+
+        d_salaries_cur = _emp_analytics_load_salaries(current_db)
+        extra_pay_rows = _payroll_compute_extra_pay_detail(current_db, int(d_year), int(d_month), d_salaries_cur)
+
+        if extra_pay_rows:
+            ep_df = pd.DataFrame(extra_pay_rows)
+            st.dataframe(ep_df, hide_index=True, use_container_width=True)
+
+            dm_last = _cal.monthrange(int(d_year), int(d_month))[1]
+            dm_start = f"{d_year}-{d_month:02d}-01"
+            dm_end = f"{d_year}-{d_month:02d}-{dm_last:02d}"
+            dm_ym = f"{d_year}-{d_month:02d}"
+
+            d_sales = load_sales_with_employees_cached(current_db, dm_start, dm_end)
+            d_orders = load_orders_cached(current_db, "id, order_date, employee_names, total_amount, actual_margin, display_sales_amount", limit=None, start_date=dm_start, end_date=dm_end)
+            if not d_sales.empty and "transaction_date" in d_sales.columns:
+                s_sl_d = d_sales[pd.to_datetime(d_sales["transaction_date"], errors="coerce").dt.strftime("%Y-%m") == dm_ym]
+            else:
+                s_sl_d = pd.DataFrame()
+            o_sl_d = d_orders[pd.to_datetime(d_orders["order_date"], errors="coerce").dt.strftime("%Y-%m") == dm_ym] if (not d_orders.empty and "order_date" in d_orders.columns) else d_orders
+            perf_d = _kpi_employee_totals_from_sales_slice(s_sl_d, o_sl_d) if not s_sl_d.empty else pd.DataFrame(columns=["employee", "revenue", "margin"])
+            sal_map_d2 = {s["employee_name"]: s for s in d_salaries_cur}
+            worked_d = _emp_analytics_worked_hours(current_db, dm_start, dm_end)
+
+            lroi_rows = []
+            for _, ep_row in ep_df.iterrows():
+                emp = ep_row["직원"]
+                sal = sal_map_d2.get(emp, {})
+                extra_total = int(ep_row.get("가산수당합계(원)") or 0)
+                sal_type = sal.get("salary_type", "monthly")
+                if sal_type == "monthly":
+                    base_pay = int(sal.get("monthly_salary") or 0)
+                else:
+                    hrs_d2 = worked_d.get(emp, 0)
+                    base_pay = int(float(sal.get("hourly_wage") or 0) * hrs_d2)
+                total_labor = base_pay + extra_total
+                perf_row = perf_d[perf_d["employee"] == emp].iloc[0] if (not perf_d.empty and "employee" in perf_d.columns and emp in perf_d["employee"].values) else None
+                rev = int(perf_row["revenue"]) if perf_row is not None else 0
+                mar = int(perf_row["margin"]) if perf_row is not None else 0
+                lroi_rows.append({
+                    "직원": emp,
+                    "기본급(원)": base_pay,
+                    "가산수당(원)": extra_total,
+                    "총인건비(원)": total_labor,
+                    "매출(원)": rev,
+                    "마진(원)": mar,
+                    "LROI": round(rev / total_labor, 2) if total_labor > 0 else 0,
+                    "마진/인건비": round(mar / total_labor, 2) if total_labor > 0 else 0,
+                    "인건비율(%)": round(total_labor / rev * 100, 1) if rev > 0 else 0,
+                })
+
+            if lroi_rows:
+                lroi_df = pd.DataFrame(lroi_rows)
+                st.markdown("##### LROI (매출 ÷ 총인건비) & 인건비 효율")
+                st.dataframe(lroi_df, hide_index=True, use_container_width=True)
+                total_labor_all = lroi_df["총인건비(원)"].sum()
+                total_rev_all = lroi_df["매출(원)"].sum()
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("총 인건비", f"{total_labor_all:,}원")
+                mc2.metric("총 매출", f"{total_rev_all:,}원")
+                mc3.metric("인건비율", f"{round(total_labor_all/total_rev_all*100,1) if total_rev_all else 0}%")
+                mc4.metric("평균 LROI", f"{round(total_rev_all/total_labor_all,2) if total_labor_all else 0}")
+
+                import io as _io
+                buf_d = _io.BytesIO()
+                with pd.ExcelWriter(buf_d, engine="openpyxl") as writer:
+                    ep_df.to_excel(writer, sheet_name="가산수당", index=False)
+                    lroi_df.to_excel(writer, sheet_name="LROI", index=False)
+                st.download_button("📥 엑셀 다운로드", buf_d.getvalue(),
+                                   file_name=f"급여수당_{current_db}_{d_year}{d_month:02d}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   key="ea_d_dl")
+        else:
+            st.info("해당 월에 승인된 추가근무가 없거나 급여 정보가 없습니다. 위 섹션에서 급여를 입력하고, 근태 관리에서 추가근무를 승인해 주세요.")
+
+
 def render_employee_management():
     """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + 직원/매장은 Supabase app_users·app_stores 우선. superadmin 전용."""
     st.header("👥 직원 계정 관리 및 발령")
@@ -11435,7 +12111,7 @@ def render_store_admin_employees():
         if store_id not in store_ids and u.get("store_id") != store_id:
             continue
         name = (u.get("name") or u.get("username") or "").strip()
-        emp_rows.append({"id": u["id"], "username": u.get("username", ""), "name": name or "-", "role": u.get("role", "user")})
+        emp_rows.append({"id": u["id"], "username": u.get("username", ""), "name": name or "-", "role": u.get("role", "user"), "hire_date": u.get("hire_date")})
     df = pd.DataFrame(emp_rows)
 
     # ---------- 신규 직원 등록 ----------
@@ -11445,6 +12121,7 @@ def render_store_admin_employees():
         new_password = st.text_input("비밀번호", type="password", key="emp_new_password")
         new_name = st.text_input("이름(표시명)", key="emp_new_name")
         new_role = st.selectbox("역할", ["store_admin", "user"], key="emp_new_role")
+        new_hire_date = st.date_input("입사일 (선택)", value=None, key="emp_new_hire_date")
         if st.form_submit_button("추가"):
             if new_username and new_username.strip() and new_password:
                 pw_hash = hashlib.sha256(new_password.encode()).hexdigest()
@@ -11456,6 +12133,7 @@ def render_store_admin_employees():
                         "store_id": int(store_id),
                         "name": (new_name or "").strip() or None,
                         "email": None,
+                        "hire_date": new_hire_date.isoformat() if new_hire_date else None,
                     }).execute()
                     new_id = ins.data[0]["id"] if ins.data else None
                     if new_id:
@@ -11486,6 +12164,13 @@ def render_store_admin_employees():
                 with st.form(f"emp_{row['id']}"):
                     new_name = st.text_input("이름", value=row["name"], key=f"name_{row['id']}")
                     new_role = st.selectbox("역할", ["store_admin", "user"], index=0 if row.get("role") == "store_admin" else 1, key=f"role_{row['id']}")
+                    _hd_default = None
+                    try:
+                        if row.get("hire_date"):
+                            _hd_default = date.fromisoformat(str(row["hire_date"])[:10])
+                    except Exception:
+                        pass
+                    new_hire_date = st.date_input("입사일", value=_hd_default, key=f"hire_{row['id']}")
                     submitted_save = st.form_submit_button("저장")
                     submitted_del = st.form_submit_button("매장에서 제거")
                     if submitted_save:
@@ -11493,6 +12178,7 @@ def render_store_admin_employees():
                             client.table("app_users").update({
                                 "name": (new_name or "").strip() or None,
                                 "role": new_role,
+                                "hire_date": new_hire_date.isoformat() if new_hire_date else None,
                             }).eq("id", int(row["id"])).execute()
                             clear_data_cache()
                             st.success("수정되었습니다.")
@@ -16486,6 +17172,9 @@ def main():
     st.sidebar.markdown("**📋 ERP**")
     if st.sidebar.button("🗓️ 근태 관리", width='stretch'):
         st.session_state["active_admin_page"] = "erp_attendance"
+    if role in ("store_admin", "superadmin"):
+        if st.sidebar.button("📈 인력 효율 분석", width='stretch'):
+            st.session_state["active_admin_page"] = "employee_analytics"
 
     st.sidebar.markdown("---")
     if st.sidebar.button("🚪 로그아웃", width='stretch'):
@@ -16531,6 +17220,11 @@ def main():
     # ERP 근태 관리 화면 라우팅 (전 역할 공통)
     if st.session_state.get("active_admin_page") == "erp_attendance":
         render_erp_attendance()
+        return
+
+    # 인력 효율 분석 화면 라우팅 (store_admin / superadmin)
+    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "employee_analytics":
+        render_employee_analytics()
         return
 
     # Superadmin: 5탭 최고 관리자 메뉴
