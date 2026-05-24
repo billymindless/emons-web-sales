@@ -8913,7 +8913,7 @@ def _erp_get_store_hours(db_filename: str) -> dict:
     }
     if not db_filename:
         return default
-    rows = _erp_fetch_table("app_store_hours", {"db_filename": db_filename})
+    rows = _erp_store_hours_cached(db_filename)
     if not rows:
         return default
     r = rows[0]
@@ -8998,6 +8998,32 @@ def _erp_fetch_table(table: str, filters: dict | None = None, order: str | None 
         return []
 
 
+@st.cache_data(ttl=120)
+def _erp_staffing_rules_cached(db_filename: str) -> list:
+    """최소 인원 규칙 120초 캐시. 저장/삭제 후 _erp_staffing_rules_cached.clear() 호출."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_staffing_rules").select("*").eq("db_filename", db_filename).order("day_of_week").execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def _erp_store_hours_cached(db_filename: str) -> list:
+    """매장 기본 근무시간 300초 캐시. 저장 후 _erp_store_hours_cached.clear() 호출."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_store_hours").select("*").eq("db_filename", db_filename).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
 def _erp_fetch_range(table: str, db_col: str, db_filename: str, date_col: str, start: date, end: date, extra_eq: dict | None = None) -> list:
     """날짜 범위 조회 (start, end 포함). extra_eq: 추가 eq 조건."""
     client, err = get_supabase_client()
@@ -9037,7 +9063,7 @@ def _erp_validate_shifts_against_rules(db_filename: str, planned_shifts_by_date:
     planned_shifts_by_date: {date: [{employee_name, shift_start, shift_end}, ...]}
     반환: 위반 메시지 리스트 (빈 리스트 = OK)
     """
-    rules_all = _erp_fetch_table("app_staffing_rules", {"db_filename": db_filename})
+    rules_all = _erp_staffing_rules_cached(db_filename)
     rules_by_dow = {}
     for r in rules_all:
         rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
@@ -9334,7 +9360,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
     st.markdown("##### 🕘 기본 근무시간 설정")
     st.caption("매장 표준 출퇴근 시각을 주중 / 주말·공휴일로 나누어 설정합니다. 근태 입력 폼에 자동 적용됩니다.")
     cur_hours = _erp_get_store_hours(current_db)
-    existing_hours = _erp_fetch_table("app_store_hours", {"db_filename": current_db})
+    existing_hours = _erp_store_hours_cached(current_db)
     with st.form("erp_store_hours_form", clear_on_submit=False):
         hc = st.columns(4)
         with hc[0]:
@@ -9364,6 +9390,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
             else:
                 ok, err = _erp_insert_row("app_store_hours", row)
             if ok:
+                _erp_store_hours_cached.clear()
                 st.success("✅ 기본 근무시간이 저장되었습니다.")
                 st.rerun()
             else:
@@ -9373,7 +9400,8 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
     st.markdown("##### 🧑‍🤝‍🧑 시간대별 최소 근무 인원 (요일별)")
     st.caption("요일별 시간대마다 최소 근무 인원을 정합니다. 근무 일정 저장 시 자동으로 검증됩니다.")
 
-    rules = _erp_fetch_table("app_staffing_rules", {"db_filename": current_db}, order="day_of_week")
+    # 캐시된 조회 사용 (매 위젯 조작마다 Supabase 호출 방지)
+    rules = _erp_staffing_rules_cached(current_db)
     rules_by_dow = {}
     for r in rules:
         rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
@@ -9395,6 +9423,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                     with rc[3]:
                         if st.button("삭제", key=f"erp_rule_del_{rule['id']}"):
                             _erp_delete_row("app_staffing_rules", int(rule["id"]))
+                            _erp_staffing_rules_cached.clear()
                             st.rerun()
             else:
                 st.info(f"{_ERP_DOW_LABELS[dow_i]}요일에 설정된 규칙이 없습니다.")
@@ -9422,6 +9451,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                             "created_by": me_name,
                         })
                         if ok:
+                            _erp_staffing_rules_cached.clear()
                             st.success("규칙이 추가되었습니다.")
                             st.rerun()
                         else:
@@ -9457,7 +9487,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         logs = [l for l in logs if (l.get("employee_name") or "") == selected_emp]
         shifts = [s for s in shifts if (s.get("employee_name") or "") == selected_emp]
 
-    rules_all = _erp_fetch_table("app_staffing_rules", {"db_filename": current_db})
+    rules_all = _erp_staffing_rules_cached(current_db)
     rules_by_dow = {}
     for r in rules_all:
         rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
