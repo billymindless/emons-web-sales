@@ -9663,9 +9663,12 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             bw = "2px" if (d_iso in shortage_dates or is_today) else "1px"
             bg = "#E3F2FD" if is_today else "white"
             cell = [f"<td style='border:{bw} solid {bcolor}; vertical-align:top; padding:4px; height:115px; min-width:90px; background:{bg};'>"]
-            day_label_color = "#E53935" if date(int(year), int(month), d_num).weekday() == 6 else \
-                              ("#1565C0" if date(int(year), int(month), d_num).weekday() == 5 else "#37474F")
-            cell.append(f"<div style='font-weight:bold; font-size:0.88rem; color:{day_label_color};'>{d_num}</div>")
+            _cell_date = date(int(year), int(month), d_num)
+            _is_holiday_cell = _erp_is_weekend_or_holiday(_cell_date)
+            day_label_color = "#E53935" if (_cell_date.weekday() == 6 or _cell_date in _ERP_KR_HOLIDAYS) else \
+                              ("#1565C0" if _cell_date.weekday() == 5 else "#37474F")
+            _hol_tag = " 🔴" if (_cell_date in _ERP_KR_HOLIDAYS and _cell_date.weekday() < 5) else ""
+            cell.append(f"<div style='font-weight:bold; font-size:0.88rem; color:{day_label_color};'>{d_num}{_hol_tag}</div>")
             if d_iso in shortage_dates:
                 cell.append("<div style='color:#E53935; font-size:0.62rem; font-weight:bold;'>⚠️ 인원부족</div>")
 
