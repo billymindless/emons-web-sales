@@ -9428,7 +9428,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
             else:
                 st.info(f"{_ERP_DOW_LABELS[dow_i]}요일에 설정된 규칙이 없습니다.")
 
-            with st.form(f"erp_rule_add_{dow_i}", clear_on_submit=True):
+            with st.form(f"erp_rule_add_{dow_i}", clear_on_submit=False):
                 fc = st.columns([1, 1, 1, 1])
                 with fc[0]:
                     s_t = st.time_input("시작", value=dt_time(9, 0), key=f"erp_rule_s_{dow_i}")
