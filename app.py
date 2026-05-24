@@ -9300,11 +9300,9 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
 
         violations = _erp_validate_shifts_against_rules(current_db, planned_by_date)
         if violations:
-            st.error("⛔ 최소 인원 규칙 위반으로 저장이 중단되었습니다.")
+            st.warning("⚠️ 최소 인원 미달 날짜가 있습니다. 일정은 저장되며, 캘린더에 빨간 경고가 표시됩니다.")
             for v in violations:
                 st.markdown(f"- {v}")
-            st.caption("최소 인원 규칙을 조정하거나 일정을 다시 배정해 주세요.")
-            return
 
         ok_n, err_n = 0, 0
         for row in new_rows:
