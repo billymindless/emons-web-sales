@@ -9141,6 +9141,53 @@ def _erp_compute_monthly_accrued(hire_date_str: str | None, as_of: date) -> int:
     return max(0, min(months, 11))
 
 
+def _erp_calc_shift_hours(start_t: dt_time, end_t: dt_time) -> float:
+    """근무 시작/종료 시각으로 실근무 시간(시간) 계산. 8시간 초과 시 1시간 휴게 차감."""
+    if not start_t or not end_t:
+        return 0.0
+    s_min = start_t.hour * 60 + start_t.minute
+    e_min = end_t.hour * 60 + end_t.minute
+    total_min = max(0, e_min - s_min)
+    total_hours = total_min / 60.0
+    if total_hours > 8.0:
+        total_hours -= 1.0   # 8시간 초과 시 법정 휴게 1시간 차감
+    elif total_hours > 4.0:
+        total_hours -= 0.5   # 4시간 초과 시 30분 휴게 차감
+    return round(max(0.0, total_hours), 2)
+
+
+def _erp_compute_leave_status(current_db: str, employee_name: str, as_of: date) -> dict:
+    """직원의 연차/월차 잔여·소진 위험도 계산.
+    반환: {annual_total, annual_used, annual_remain, days_until_year_end, soak_risk}
+    """
+    year = as_of.year
+    grants = _erp_fetch_table("app_leave_grants", {
+        "home_db_filename": current_db,
+        "employee_name": employee_name,
+        "year": int(year),
+    })
+    grant = grants[0] if grants else {}
+    annual_total = float(grant.get("annual_days") or 0)
+    year_start = date(year, 1, 1)
+    year_end = date(year, 12, 31)
+    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db,
+                            "log_date", year_start, year_end,
+                            extra_eq={"employee_name": employee_name})
+    annual_used = sum(float(l.get("leave_deduction") or 0)
+                      for l in logs if l.get("work_type") == "연차")
+    annual_remain = max(0.0, annual_total - annual_used)
+    days_until_year_end = max(0, (year_end - as_of).days)
+    # 소멸 위험: 잔여 연차 > 연말까지 남은 평일 수의 절반
+    risk = annual_remain > 0 and days_until_year_end < (annual_remain * 14)
+    return {
+        "annual_total": annual_total,
+        "annual_used": annual_used,
+        "annual_remain": annual_remain,
+        "days_until_year_end": days_until_year_end,
+        "soak_risk": risk,
+    }
+
+
 def _erp_insert_row(table: str, row: dict) -> tuple[bool, str]:
     """단일 행 insert. (성공, 에러문) 반환."""
     client, err = get_supabase_client()
@@ -9239,9 +9286,11 @@ def render_erp_attendance():
 
 def _erp_tab_shift_plan(current_db: str, me_name: str):
     st.subheader("📅 근무 일정 계획 (본인 일정 등록)")
-    st.caption("본인의 근무 예정 일정을 등록합니다. 'HH:MM-HH:MM' 형식으로 입력하고, 휴무일은 비워 두세요.")
+    st.caption("출근일은 ✅ 체크하고, 휴무일은 체크 해제하세요. 시간은 매장 기본값이 자동 입력되며, 필요 시 수정 가능합니다.")
 
     today = _today_kst()
+
+    # ── 기간 선택 ────────────────────────────────────────────────
     col_a, col_b = st.columns([1, 2])
     with col_a:
         period_mode = st.radio("기간", ["1주", "2주", "1개월"], horizontal=True, key="erp_shift_period")
@@ -9260,94 +9309,222 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         st.info("이 매장에 배정된 직원이 없습니다. 먼저 [직원 관리]에서 직원을 등록·배정해 주세요.")
         return
 
-    existing = _erp_fetch_range("app_shift_schedules", "db_filename", current_db, "shift_date", date_list[0], date_list[-1])
+    existing = _erp_fetch_range("app_shift_schedules", "db_filename", current_db,
+                                "shift_date", date_list[0], date_list[-1])
     existing_by_key = {}
     for row in existing:
         key = (str(row.get("employee_name") or ""), str(row.get("shift_date") or "")[:10])
         existing_by_key[key] = row
 
     sh_hours = _erp_get_store_hours(current_db)
-    st.info(
-        f"📌 **{me_name}** 님의 일정만 입력할 수 있습니다. "
-        f"매장 기본: 주중 {sh_hours['weekday_start'].strftime('%H:%M')}~{sh_hours['weekday_end'].strftime('%H:%M')} / "
+
+    # ── 실시간 요약 + 연차 경고 (입력 위 상단) ──────────────────
+    leave_status = _erp_compute_leave_status(current_db, me_name, today)
+    _total_planned_hours = 0.0
+    _work_days_count = 0
+    for d in date_list:
+        ck = st.session_state.get(f"sp_chk_{d.isoformat()}", None)
+        if ck is None:
+            existing_row = existing_by_key.get((me_name, d.isoformat()))
+            ck = bool(existing_row and existing_row.get("shift_start") and existing_row.get("shift_end"))
+        if ck:
+            ss_val = st.session_state.get(f"sp_start_{d.isoformat()}")
+            ee_val = st.session_state.get(f"sp_end_{d.isoformat()}")
+            if not ss_val or not ee_val:
+                existing_row = existing_by_key.get((me_name, d.isoformat()))
+                if existing_row and existing_row.get("shift_start"):
+                    ss_val = _erp_parse_time(existing_row.get("shift_start"))
+                    ee_val = _erp_parse_time(existing_row.get("shift_end"))
+                else:
+                    ss_val, ee_val = _erp_default_times_for_date(current_db, d)
+            _total_planned_hours += _erp_calc_shift_hours(ss_val, ee_val)
+            _work_days_count += 1
+
+    # 주간 기준 근무시간 (한국 법정 주 40시간 기준)
+    _weeks = days_n / 7.0
+    _expected_hours = 40.0 * _weeks
+    _hour_diff = _total_planned_hours - _expected_hours
+
+    sumc1, sumc2, sumc3, sumc4 = st.columns(4)
+    with sumc1:
+        st.metric("출근 예정", f"{_work_days_count}일")
+    with sumc2:
+        st.metric("총 계획 근무", f"{_total_planned_hours:.1f}h",
+                  delta=f"{_hour_diff:+.1f}h vs 기준 {_expected_hours:.0f}h")
+    with sumc3:
+        st.metric("휴무 예정", f"{days_n - _work_days_count}일")
+    with sumc4:
+        st.metric("잔여 연차", f"{leave_status['annual_remain']:g}일",
+                  delta=f"올해 {int(leave_status['days_until_year_end'])}일 남음")
+
+    # 경고/안내 메시지
+    if leave_status["soak_risk"]:
+        st.error(
+            f"🔴 **연차 소멸 위험**: 잔여 연차 {leave_status['annual_remain']:g}일 / "
+            f"올해 {int(leave_status['days_until_year_end'])}일 남음. "
+            f"연차 신청을 서둘러 검토해 주세요."
+        )
+    elif leave_status["annual_remain"] > 0:
+        st.info(
+            f"💡 잔여 연차 **{leave_status['annual_remain']:g}일** — "
+            f"이번 기간에 연차 사용 계획이 없다면 [근태 입력]에서 연차를 신청할 수 있습니다."
+        )
+
+    if _hour_diff < -8:
+        st.warning(
+            f"⚠️ 계획 근무시간이 기준({_expected_hours:.0f}h) 대비 "
+            f"**{abs(_hour_diff):.1f}h 부족**합니다. 출근일 또는 근무시간을 늘려 주세요."
+        )
+    elif _hour_diff > 12:
+        st.warning(
+            f"⚠️ 계획 근무시간이 기준 대비 **{_hour_diff:.1f}h 초과**합니다. "
+            f"초과근무는 [추가근무·시차 관리]에서 신청해 주세요."
+        )
+
+    # 기간 내 공휴일 알림
+    holiday_dates_in_period = [d for d in date_list
+                                if d in _ERP_KR_HOLIDAYS and d.weekday() < 5]
+    if holiday_dates_in_period:
+        _h_str = ", ".join(d.strftime("%m/%d") for d in holiday_dates_in_period)
+        st.info(f"📅 기간 내 평일 공휴일: **{_h_str}** — 출근 시 공휴일 수당이 적용됩니다.")
+
+    st.divider()
+    st.caption(
+        f"📌 매장 기본 근무시간: "
+        f"주중 {sh_hours['weekday_start'].strftime('%H:%M')}~{sh_hours['weekday_end'].strftime('%H:%M')} / "
         f"주말·공휴일 {sh_hours['weekend_start'].strftime('%H:%M')}~{sh_hours['weekend_end'].strftime('%H:%M')}"
     )
 
-    # ── 본인 일정 입력 폼 (me_name만) ──────────────────────────────
+    # ── 입력 영역 ────────────────────────────────────────────────
     st.markdown(f"##### ✏️ 내 근무 일정 — **{me_name}**")
-    with st.form("erp_shift_plan_form", clear_on_submit=False):
-        edits = {}
-        cols = st.columns(min(7, days_n))
-        for i, d in enumerate(date_list):
-            col = cols[i % len(cols)]
-            if i > 0 and i % len(cols) == 0:
-                cols = st.columns(min(7, days_n))
-                col = cols[0]
-            key = (me_name, d.isoformat())
-            row = existing_by_key.get(key)
-            default = ""
-            if row:
-                ss = str(row.get("shift_start") or "")[:5]
-                ee = str(row.get("shift_end") or "")[:5]
-                if ss and ee:
-                    default = f"{ss}-{ee}"
-            d_std_s, d_std_e = _erp_default_times_for_date(current_db, d)
-            ph = f"{d_std_s.strftime('%H:%M')}-{d_std_e.strftime('%H:%M')}"
-            with col:
-                is_we = _erp_is_weekend_or_holiday(d)
-                marker = "🟥" if is_we else ""
-                label = f"{marker}{d.month}/{d.day} ({_ERP_DOW_LABELS[d.weekday()]})"
-                val = st.text_input(label, value=default, key=f"shift_{me_name}_{d.isoformat()}", placeholder=ph)
-                edits[key] = val.strip()
 
-        # 실제 근무 매장 선택
-        _sp_stores_df = get_supabase_stores_dataframe_cached()
-        _sp_store_opts = []   # (표시명, db_filename or None)
-        if _sp_stores_df is not None and len(_sp_stores_df) > 0:
-            for _, _sr in _sp_stores_df.iterrows():
-                _sp_store_opts.append((_sr["store_name"], _sr["db_filename"]))
-        _sp_store_opts.append(("기타 (외부/행사)", None))
-        _sp_store_labels = [s[0] for s in _sp_store_opts]
-        _sp_home_idx = next((i for i, s in enumerate(_sp_store_opts) if s[1] == current_db), 0)
+    # 매장 선택 (폼 외부)
+    _sp_stores_df = get_supabase_stores_dataframe_cached()
+    _sp_store_opts: list = []
+    if _sp_stores_df is not None and len(_sp_stores_df) > 0:
+        for _, _sr in _sp_stores_df.iterrows():
+            _sp_store_opts.append((_sr["store_name"], _sr["db_filename"]))
+    _sp_store_opts.append(("기타 (외부/행사)", None))
+    _sp_store_labels = [s[0] for s in _sp_store_opts]
+    _sp_home_idx = next((i for i, s in enumerate(_sp_store_opts) if s[1] == current_db), 0)
+
+    msc1, msc2 = st.columns([1, 2])
+    with msc1:
         _sp_sel_label = st.selectbox(
             "📍 실제 근무 매장",
             _sp_store_labels,
             index=_sp_home_idx,
             key="erp_shift_work_store",
-            help="소속 매장과 다른 곳에서 근무하는 경우 선택. 외부 행사·지원은 '기타'를 선택하세요.",
+            help="소속 매장과 다른 곳에서 근무하는 경우 선택.",
         )
-        _sp_sel_idx = _sp_store_labels.index(_sp_sel_label)
-        _sp_work_db = _sp_store_opts[_sp_sel_idx][1]   # None = 기타
+    with msc2:
+        loc_input = st.text_input(
+            "근무 장소 상세 (선택)", value="",
+            key="erp_shift_loc",
+            placeholder="예: 롯데백화점 행사장 / 3층 팝업스토어",
+        )
+    _sp_sel_idx = _sp_store_labels.index(_sp_sel_label)
+    _sp_work_db = _sp_store_opts[_sp_sel_idx][1]
 
-        loc_input = st.text_input("근무 장소 상세 (선택)", value="", key="erp_shift_loc",
-                                   placeholder="예: 롯데백화점 행사장 / 3층 팝업스토어")
-        submitted = st.form_submit_button("💾 내 일정 저장", type="primary")
+    # 일별 체크박스 + 시간 입력 (테이블 형태)
+    with st.container(border=True):
+        hdr = st.columns([1.2, 0.6, 1.2, 1.2, 1.4])
+        with hdr[0]:
+            st.markdown("**날짜**")
+        with hdr[1]:
+            st.markdown("**출근**")
+        with hdr[2]:
+            st.markdown("**출근시각**")
+        with hdr[3]:
+            st.markdown("**퇴근시각**")
+        with hdr[4]:
+            st.markdown("**근무시간**")
+        st.markdown("<hr style='margin:4px 0;'/>", unsafe_allow_html=True)
+
+        edits = {}
+        for d in date_list:
+            existing_row = existing_by_key.get((me_name, d.isoformat()))
+            has_existing = bool(existing_row and existing_row.get("shift_start") and existing_row.get("shift_end"))
+            d_std_s, d_std_e = _erp_default_times_for_date(current_db, d)
+
+            ex_start = _erp_parse_time(existing_row.get("shift_start")) if existing_row else None
+            ex_end = _erp_parse_time(existing_row.get("shift_end")) if existing_row else None
+            init_start = ex_start or d_std_s
+            init_end = ex_end or d_std_e
+
+            row = st.columns([1.2, 0.6, 1.2, 1.2, 1.4])
+            is_we = _erp_is_weekend_or_holiday(d)
+            is_holiday_weekday = (d in _ERP_KR_HOLIDAYS and d.weekday() < 5)
+            label_color = "color:#E53935;" if (d.weekday() == 6 or d in _ERP_KR_HOLIDAYS) else \
+                          ("color:#1565C0;" if d.weekday() == 5 else "")
+            hol_mark = " 🔴" if is_holiday_weekday else ("🟥" if is_we else "")
+            with row[0]:
+                st.markdown(
+                    f"<span style='{label_color} font-weight:600;'>"
+                    f"{d.month}/{d.day} ({_ERP_DOW_LABELS[d.weekday()]}){hol_mark}</span>",
+                    unsafe_allow_html=True,
+                )
+            with row[1]:
+                checked = st.checkbox(
+                    "출근", value=has_existing,
+                    key=f"sp_chk_{d.isoformat()}",
+                    label_visibility="collapsed",
+                )
+            with row[2]:
+                if checked:
+                    t_s = st.time_input(
+                        "출근시각", value=init_start,
+                        key=f"sp_start_{d.isoformat()}",
+                        label_visibility="collapsed", step=900,
+                    )
+                else:
+                    st.markdown("<span style='color:#999;'>— 휴무 —</span>", unsafe_allow_html=True)
+                    t_s = None
+            with row[3]:
+                if checked:
+                    t_e = st.time_input(
+                        "퇴근시각", value=init_end,
+                        key=f"sp_end_{d.isoformat()}",
+                        label_visibility="collapsed", step=900,
+                    )
+                else:
+                    t_e = None
+            with row[4]:
+                if checked and t_s and t_e:
+                    _h = _erp_calc_shift_hours(t_s, t_e)
+                    st.markdown(f"<span style='color:#2E7D32;'>{_h:.1f}h</span>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<span style='color:#bbb;'>-</span>", unsafe_allow_html=True)
+            edits[d.isoformat()] = (checked, t_s, t_e)
+
+    # 저장 버튼
+    sbtn_c1, sbtn_c2 = st.columns([1, 4])
+    with sbtn_c1:
+        submitted = st.button("💾 내 일정 저장", type="primary", key="erp_shift_save")
+    with sbtn_c2:
+        st.caption("저장 시 체크된 날짜는 등록·수정되고, 체크 해제된 날짜의 기존 일정은 삭제됩니다.")
 
     if submitted:
         planned_by_date: dict[date, list] = {}
         new_rows, delete_ids, updates = [], [], []
-        for (emp, d_str), val in edits.items():
+        for d_str, (chk, t1, t2) in edits.items():
             d = datetime.fromisoformat(d_str).date()
-            existing_row = existing_by_key.get((emp, d_str))
-            if not val:
+            existing_row = existing_by_key.get((me_name, d_str))
+            if not chk:
                 if existing_row:
                     delete_ids.append(int(existing_row["id"]))
                 continue
-            try:
-                a, b = val.split("-", 1)
-                t1 = _erp_parse_time(a.strip())
-                t2 = _erp_parse_time(b.strip())
-                if not t1 or not t2:
-                    raise ValueError()
-            except Exception:
-                st.error(f"⛔ {d_str}: '{val}' 형식이 올바르지 않습니다. (예: 09:00-18:00)")
+            if not t1 or not t2:
+                st.error(f"⛔ {d_str}: 출근/퇴근 시각이 비어 있습니다.")
+                return
+            if (t1.hour * 60 + t1.minute) >= (t2.hour * 60 + t2.minute):
+                st.error(f"⛔ {d_str}: 퇴근 시각이 출근 시각보다 빠를 수 없습니다.")
                 return
             planned_by_date.setdefault(d, []).append({
-                "employee_name": emp,
+                "employee_name": me_name,
                 "shift_start": t1.strftime("%H:%M:%S"),
                 "shift_end": t2.strftime("%H:%M:%S"),
             })
-            # work_location_name: 상세 텍스트 우선, 없으면 매장 선택값 사용
             _loc_val = (loc_input or "").strip()
             if not _loc_val:
                 if _sp_work_db is None:
@@ -9358,7 +9535,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                     _loc_val = (existing_row.get("work_location_name") if existing_row else None) or ""
             new_row = {
                 "db_filename": current_db,
-                "employee_name": emp,
+                "employee_name": me_name,
                 "shift_date": d_str,
                 "shift_start": t1.strftime("%H:%M:%S"),
                 "shift_end": t2.strftime("%H:%M:%S"),
@@ -9376,24 +9553,35 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
             for v in violations:
                 st.markdown(f"- {v}")
 
-        ok_n, err_n = 0, 0
+        ok_n, err_n, del_n = 0, 0, 0
+        err_msgs = []
         for row in new_rows:
             ok, e = _erp_insert_row("app_shift_schedules", row)
             if ok:
                 ok_n += 1
             else:
                 err_n += 1
-                st.caption(f"⚠️ 추가 실패: {e}")
+                err_msgs.append(f"추가 실패 ({row['shift_date']}): {e}")
         for rid, patch in updates:
             ok, e = _erp_update_row("app_shift_schedules", rid, patch)
             if ok:
                 ok_n += 1
             else:
                 err_n += 1
-                st.caption(f"⚠️ 수정 실패: {e}")
+                err_msgs.append(f"수정 실패 ({patch['shift_date']}): {e}")
         for rid in delete_ids:
             _erp_delete_row("app_shift_schedules", rid)
-        st.success(f"✅ 일정 저장 완료. 처리 {ok_n}건 / 실패 {err_n}건")
+            del_n += 1
+
+        if err_n == 0:
+            st.success(
+                f"✅ 저장 완료 — 신규/수정 **{ok_n}건**, 삭제 **{del_n}건**. "
+                f"총 계획 근무: **{_total_planned_hours:.1f}h** / 출근 {_work_days_count}일."
+            )
+        else:
+            st.error(f"⚠️ 일부 저장 실패: 성공 {ok_n}건 / 실패 {err_n}건 / 삭제 {del_n}건")
+            for m in err_msgs:
+                st.caption(f"- {m}")
         st.rerun()
 
     # ── 다른 직원 일정 읽기 전용 ────────────────────────────────────
