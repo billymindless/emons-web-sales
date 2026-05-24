@@ -9696,6 +9696,17 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
 
     today = _today_kst()
     # 날짜·직원·유형 선택은 폼 밖에서 → 날짜 변경 시 매장 기본 근무시간이 즉시 반영되도록.
+    # 전체 매장 목록 (실제 근무 매장 선택용)
+    _att_stores_df = get_supabase_stores_dataframe_cached()
+    _att_store_opts_raw = []   # (표시명, db_filename or None)
+    if _att_stores_df is not None and len(_att_stores_df) > 0:
+        for _, _sr in _att_stores_df.iterrows():
+            _att_store_opts_raw.append((_sr["store_name"], _sr["db_filename"]))
+    _att_store_opts_raw.append(("기타 (외부/행사)", None))   # 외부 근무 옵션
+    _att_store_labels = [s[0] for s in _att_store_opts_raw]
+    # 소속 매장 기본 선택 인덱스
+    _att_home_idx = next((i for i, s in enumerate(_att_store_opts_raw) if s[1] == current_db), 0)
+
     col1, col2 = st.columns(2)
     with col1:
         if role in ("store_admin", "superadmin"):
@@ -9706,6 +9717,19 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
             st.text_input("직원", value=me_name, disabled=True, key="erp_att_emp_fixed")
         log_date = st.date_input("날짜", value=today, key="erp_att_date")
         work_type = st.selectbox("근태 유형", _ERP_WORK_TYPES, key="erp_att_type")
+        _sel_store_label = st.selectbox(
+            "📍 실제 근무 매장",
+            _att_store_labels,
+            index=_att_home_idx,
+            key="erp_att_work_store",
+            help="소속 매장과 다른 곳에서 근무한 경우 선택. 외부 행사·지원 근무는 '기타'를 선택하세요.",
+        )
+        _sel_store_idx = _att_store_labels.index(_sel_store_label)
+        work_db = _att_store_opts_raw[_sel_store_idx][1]   # None = 기타(외부)
+        if work_db is None:
+            st.info("ℹ️ '기타(외부/행사)'로 기록됩니다. 소속 매장 근무 집계에서 제외됩니다.")
+        elif work_db != current_db:
+            st.info(f"ℹ️ '{_sel_store_label}' 지원 근무로 기록됩니다.")
     with col2:
         std_s, std_e = _erp_default_times_for_date(current_db, log_date)
         weekend_flag = _erp_is_weekend_or_holiday(log_date)
@@ -9714,8 +9738,8 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
                     f"{std_s.strftime('%H:%M')} ~ {std_e.strftime('%H:%M')}")
         start_time = st.time_input("실제 출근 시각", value=std_s, key=f"erp_att_start_{log_date.isoformat()}_{weekend_flag}")
         end_time = st.time_input("실제 퇴근 시각", value=std_e, key=f"erp_att_end_{log_date.isoformat()}_{weekend_flag}")
-        work_loc = st.text_input("근무 장소 (다른 매장·행사장·백화점 등)", value="", key="erp_att_loc",
-                                  placeholder="예: 백화점 행사장 / 학성점 지원")
+        work_loc = st.text_input("근무 장소 상세 (선택)", value="", key="erp_att_loc",
+                                  placeholder="예: 롯데백화점 행사장 / 3층 팝업스토어")
 
     diff_min_input = 0
     if work_type in ("시차적립", "시차사용"):
@@ -9751,8 +9775,8 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
 
         row = {
             "home_db_filename": current_db,
-            "work_db_filename": current_db,
-            "work_location_name": (work_loc or "").strip() or None,
+            "work_db_filename": work_db,           # None = 기타(외부/행사), 타 매장 db = 지원근무
+            "work_location_name": (work_loc or "").strip() or (_sel_store_label if work_db is None else None),
             "employee_name": target_emp,
             "log_date": log_date.isoformat(),
             "work_type": work_type,
