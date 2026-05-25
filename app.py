@@ -9247,10 +9247,10 @@ def render_erp_attendance():
         return
 
     if role == "store_admin":
-        tab_labels = ["근무 일정 계획", "최소 인원 설정", "캘린더", "근태 입력",
+        tab_labels = ["근무 일정 계획", "최소 인원 설정", "캘린더", "휴무·근태 입력",
                       "추가근무·시차 관리", "연차/월차 관리", "월말 요약"]
     else:
-        tab_labels = ["근무 일정 계획", "캘린더", "근태 입력", "추가근무·시차 신청", "내 연차 현황"]
+        tab_labels = ["근무 일정 계획", "캘린더", "휴무·근태 입력", "추가근무·시차 신청", "내 연차 현황"]
 
     tabs = st.tabs(tab_labels)
 
@@ -9367,7 +9367,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     elif leave_status["annual_remain"] > 0:
         st.info(
             f"💡 잔여 연차 **{leave_status['annual_remain']:g}일** — "
-            f"이번 기간에 연차 사용 계획이 없다면 [근태 입력]에서 연차를 신청할 수 있습니다."
+            f"이번 기간에 연차 사용 계획이 없다면 [휴무·근태 입력]에서 연차를 신청할 수 있습니다."
         )
 
     if _hour_diff < -8:
@@ -9925,69 +9925,126 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         st.caption("컬러 바 = 근무 계획(shift) / 배지 = 실제 근태 기록 / 파란 테두리 = 오늘 / 빨간 테두리 = 최소 인원 미달")
 
 
-# ---------- 탭 4: 근태 입력 ----------
+# ---------- 탭 4: 휴무·근태 입력 ----------
 
 def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
-    st.subheader("✏️ 근태 입력")
-    st.caption("실제 출퇴근·휴가·시차 등을 기록합니다. 다점포 근무 시 근무 장소를 표기하면 통합 집계됩니다.")
+    st.subheader("📝 휴무·근태 입력")
+    st.caption("연차·반차·시차 등 휴무, 또는 출퇴근·지각·조퇴 기록을 유형에 맞게 입력합니다.")
 
     today = _today_kst()
-    # 날짜·직원·유형 선택은 폼 밖에서 → 날짜 변경 시 매장 기본 근무시간이 즉시 반영되도록.
-    # 전체 매장 목록 (실제 근무 매장 선택용)
-    _att_stores_df = get_supabase_stores_dataframe_cached()
-    _att_store_opts_raw = []   # (표시명, db_filename or None)
-    if _att_stores_df is not None and len(_att_stores_df) > 0:
-        for _, _sr in _att_stores_df.iterrows():
-            _att_store_opts_raw.append((_sr["store_name"], _sr["db_filename"]))
-    _att_store_opts_raw.append(("기타 (외부/행사)", None))   # 외부 근무 옵션
-    _att_store_labels = [s[0] for s in _att_store_opts_raw]
-    # 소속 매장 기본 선택 인덱스
-    _att_home_idx = next((i for i, s in enumerate(_att_store_opts_raw) if s[1] == current_db), 0)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if role in ("store_admin", "superadmin"):
-            emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
-            target_emp = st.selectbox("직원", emp_opts, key="erp_att_emp")
-        else:
-            target_emp = me_name
-            st.text_input("직원", value=me_name, disabled=True, key="erp_att_emp_fixed")
+    # ── 공통: 직원 선택 ───────────────────────────────────────────
+    if role in ("store_admin", "superadmin"):
+        emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
+        target_emp = st.selectbox("직원", emp_opts, key="erp_att_emp")
+    else:
+        target_emp = me_name
+        st.text_input("직원", value=me_name, disabled=True, key="erp_att_emp_fixed")
+
+    col_d, col_t = st.columns([1, 2])
+    with col_d:
         log_date = st.date_input("날짜", value=today, key="erp_att_date")
-        work_type = st.selectbox("근태 유형", _ERP_WORK_TYPES, key="erp_att_type")
+    with col_t:
+        # 유형 순서: 휴무 계열 → 시차 계열 → 출근기록 계열
+        _ORDERED_TYPES = ["연차", "반차", "시차사용", "시차적립", "정상", "조퇴", "지각", "추가근무", "행사"]
+        work_type = st.selectbox(
+            "근태 유형",
+            _ORDERED_TYPES,
+            key="erp_att_type",
+            help="연차·반차: 연차 차감 | 시차사용·시차적립: 시차 분수 입력 | 정상·조퇴·지각: 출퇴근 시각 입력",
+        )
+
+    std_s, std_e = _erp_default_times_for_date(current_db, log_date)
+    weekend_flag = _erp_is_weekend_or_holiday(log_date)
+    kind_label = "주말·공휴일" if weekend_flag else "주중"
+
+    # 유형별 분기 – 기본값 초기화
+    start_time = None
+    end_time = None
+    diff_min_input = 0
+    work_loc = ""
+    work_db = current_db
+    _sel_store_label = ""
+
+    # ── 그룹 A: 연차 / 반차 ── 출퇴근 시각 불필요 ────────────────
+    if work_type in ("연차", "반차"):
+        ded = _ERP_LEAVE_DEDUCTION_MAP.get(work_type, 0)
+        st.info(
+            f"📅 **{log_date.isoformat()} ({_ERP_DOW_LABELS[log_date.weekday()]})** — {kind_label}  |  "
+            f"연차 차감: **{ded}일**"
+        )
+        if weekend_flag:
+            st.warning("⚠️ 주말·공휴일 연차·반차는 저장 시 관리자 승인 대기 상태로 처리됩니다.")
+
+    # ── 그룹 B: 시차적립 / 시차사용 ── 분수만 입력 ───────────────
+    elif work_type in ("시차적립", "시차사용"):
+        st.info(f"📅 **{log_date.isoformat()} ({_ERP_DOW_LABELS[log_date.weekday()]})** — {kind_label}")
+        label = "적립할 시차 분수" if work_type == "시차적립" else "사용할 시차 분수"
+        diff_min_input = st.number_input(label, min_value=0, max_value=480, value=60, step=15, key="erp_att_diff")
+        if work_type == "시차사용":
+            remain = _erp_compute_remaining_comptime(current_db, target_emp)
+            if diff_min_input > 0 and remain >= diff_min_input:
+                st.success(f"✅ 잔여 시차 {remain}분 — 분수 조건 충족, 즉시 승인 처리됩니다.")
+            elif diff_min_input > 0:
+                st.warning(f"⚠️ 잔여 시차 {remain}분 < 신청 {diff_min_input}분 — 관리자 승인 대기 처리됩니다.")
+            else:
+                st.caption(f"💡 현재 잔여 시차: {remain}분")
+
+    # ── 그룹 C: 정상·조퇴·지각·추가근무·행사 ── 출퇴근 시각 필요 ──
+    else:
+        st.caption(
+            f"📅 {log_date.isoformat()} ({_ERP_DOW_LABELS[log_date.weekday()]}) — "
+            f"매장 기본 ({kind_label}): {std_s.strftime('%H:%M')} ~ {std_e.strftime('%H:%M')}"
+        )
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            start_time = st.time_input("실제 출근 시각", value=std_s,
+                                       key=f"erp_att_start_{log_date.isoformat()}_{weekend_flag}")
+        with col_t2:
+            end_time = st.time_input("실제 퇴근 시각", value=std_e,
+                                     key=f"erp_att_end_{log_date.isoformat()}_{weekend_flag}")
+
+        # 근무 매장 선택
+        _att_stores_df = get_supabase_stores_dataframe_cached()
+        _att_store_opts_raw = []
+        if _att_stores_df is not None and len(_att_stores_df) > 0:
+            for _, _sr in _att_stores_df.iterrows():
+                _att_store_opts_raw.append((_sr["store_name"], _sr["db_filename"]))
+        _att_store_opts_raw.append(("기타 (외부/행사)", None))
+        _att_store_labels = [s[0] for s in _att_store_opts_raw]
+        _att_home_idx = next((i for i, s in enumerate(_att_store_opts_raw) if s[1] == current_db), 0)
+
         _sel_store_label = st.selectbox(
             "📍 실제 근무 매장",
             _att_store_labels,
             index=_att_home_idx,
             key="erp_att_work_store",
-            help="소속 매장과 다른 곳에서 근무한 경우 선택. 외부 행사·지원 근무는 '기타'를 선택하세요.",
+            help="소속 매장과 다른 곳에서 근무한 경우 선택. 외부 행사는 '기타'를 선택하세요.",
         )
         _sel_store_idx = _att_store_labels.index(_sel_store_label)
-        work_db = _att_store_opts_raw[_sel_store_idx][1]   # None = 기타(외부)
+        work_db = _att_store_opts_raw[_sel_store_idx][1]
         if work_db is None:
-            st.info("ℹ️ '기타(외부/행사)'로 기록됩니다. 소속 매장 근무 집계에서 제외됩니다.")
+            st.info("ℹ️ '기타(외부/행사)'로 기록됩니다. 소속 매장 집계에서 제외됩니다.")
         elif work_db != current_db:
             st.info(f"ℹ️ '{_sel_store_label}' 지원 근무로 기록됩니다.")
-    with col2:
-        std_s, std_e = _erp_default_times_for_date(current_db, log_date)
-        weekend_flag = _erp_is_weekend_or_holiday(log_date)
-        kind_label = "주말·공휴일" if weekend_flag else "주중"
-        st.caption(f"📅 {log_date.isoformat()} ({_ERP_DOW_LABELS[log_date.weekday()]}) — 매장 기본 ({kind_label}): "
-                    f"{std_s.strftime('%H:%M')} ~ {std_e.strftime('%H:%M')}")
-        start_time = st.time_input("실제 출근 시각", value=std_s, key=f"erp_att_start_{log_date.isoformat()}_{weekend_flag}")
-        end_time = st.time_input("실제 퇴근 시각", value=std_e, key=f"erp_att_end_{log_date.isoformat()}_{weekend_flag}")
-        work_loc = st.text_input("근무 장소 상세 (선택)", value="", key="erp_att_loc",
-                                  placeholder="예: 롯데백화점 행사장 / 3층 팝업스토어")
 
-    diff_min_input = 0
-    if work_type in ("시차적립", "시차사용"):
-        diff_min_input = st.number_input("시차 분수", min_value=0, max_value=1440, value=60, step=15, key="erp_att_diff")
-    note = st.text_input("비고", value="", key="erp_att_note")
+        _loc_required = work_type == "행사"
+        work_loc = st.text_input(
+            f"근무 장소 상세{'  (필수)' if _loc_required else ' (선택)'}",
+            value="",
+            key="erp_att_loc",
+            placeholder="예: 롯데백화점 행사장 / 3층 팝업스토어",
+        )
+
+    note = st.text_input("비고 / 사유", value="", key="erp_att_note",
+                         placeholder="사유나 특이사항을 입력하세요")
     submitted = st.button("💾 저장", type="primary", key="erp_att_save")
 
     if submitted:
         if work_type == "행사" and not (work_loc or "").strip():
             st.error("행사 유형은 '근무 장소'를 반드시 입력해 주세요.")
             return
+
         leave_ded = float(_ERP_LEAVE_DEDUCTION_MAP.get(work_type, 0))
         diff_minutes = 0
         if work_type in ("시차적립", "시차사용"):
@@ -10004,15 +10061,16 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
             if remain < diff_minutes:
                 status = "pending"
                 st.warning(f"⚠️ 잔여 시차({remain}분) < 신청({diff_minutes}분). 관리자 승인 대기 상태로 저장됩니다.")
-            else:
-                st.success(f"✅ 잔여 시차 {remain}분 확인 → 즉시 승인")
         elif work_type in ("연차", "반차") and _erp_is_weekend_or_holiday(log_date):
             status = "pending"
-            st.warning(f"⚠️ {log_date.isoformat()}({_ERP_DOW_LABELS[log_date.weekday()]})은 주말·공휴일입니다. 매장 관리자 승인 후 최종 처리됩니다.")
+            st.warning(
+                f"⚠️ {log_date.isoformat()}({_ERP_DOW_LABELS[log_date.weekday()]})은 주말·공휴일입니다. "
+                "매장 관리자 승인 후 최종 처리됩니다."
+            )
 
         row = {
             "home_db_filename": current_db,
-            "work_db_filename": work_db,           # None = 기타(외부/행사), 타 매장 db = 지원근무
+            "work_db_filename": work_db,
             "work_location_name": (work_loc or "").strip() or (_sel_store_label if work_db is None else None),
             "employee_name": target_emp,
             "log_date": log_date.isoformat(),
