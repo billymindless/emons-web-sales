@@ -9652,7 +9652,6 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
             if ok:
                 _erp_store_hours_cached.clear()
                 st.success("✅ 기본 근무시간이 저장되었습니다.")
-                st.rerun()
             else:
                 st.error(f"저장 실패: {err}")
 
