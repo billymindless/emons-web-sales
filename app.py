@@ -9381,12 +9381,6 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
             f"초과근무는 [추가근무·시차 관리]에서 신청해 주세요."
         )
 
-    # 기간 내 공휴일 알림
-    holiday_dates_in_period = [d for d in date_list
-                                if d in _ERP_KR_HOLIDAYS and d.weekday() < 5]
-    if holiday_dates_in_period:
-        _h_str = ", ".join(d.strftime("%m/%d") for d in holiday_dates_in_period)
-        st.info(f"📅 기간 내 평일 공휴일: **{_h_str}** — 출근 시 공휴일 수당이 적용됩니다.")
 
     st.divider()
     st.caption(
