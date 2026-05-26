@@ -46,7 +46,7 @@ function Push-Plans {
       Write-Host "[sync-plans] no plan changes to commit"
       return
     }
-    git commit -m "docs: Cursor plans 동기화"
+    git commit -m "docs: sync Cursor plans"
     git push
     Write-Host "[sync-plans] push complete"
   } finally {
