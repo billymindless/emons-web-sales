@@ -9030,6 +9030,29 @@ def _erp_store_hours_cached(db_filename: str) -> list:
         return []
 
 
+@st.cache_data(ttl=120)
+def _erp_employee_settings_cached(db_filename: str) -> list:
+    """직원별 근무 설정(주간 목표시간 등) 120초 캐시."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_employee_settings").select("*").eq("db_filename", db_filename).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+def _erp_get_employee_weekly_target(db_filename: str, employee_name: str,
+                                    default_hours: float = 40.0) -> float:
+    """직원의 주간 목표 근무시간. 미설정 시 default_hours 반환."""
+    rows = _erp_employee_settings_cached(db_filename)
+    for r in rows:
+        if (r.get("employee_name") or "") == employee_name:
+            return float(r.get("weekly_target_hours") or default_hours)
+    return default_hours
+
+
 def _erp_fetch_range(table: str, db_col: str, db_filename: str, date_col: str, start: date, end: date, extra_eq: dict | None = None) -> list:
     """날짜 범위 조회 (start, end 포함). extra_eq: 추가 eq 조건."""
     client, err = get_supabase_client()
@@ -9340,9 +9363,10 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
             _total_planned_hours += _erp_calc_shift_hours(ss_val, ee_val)
             _work_days_count += 1
 
-    # 주간 기준 근무시간 (한국 법정 주 40시간 기준)
+    # 직원별 주간 목표 근무시간 (관리자 설정값, 기본 40h)
+    _weekly_target = _erp_get_employee_weekly_target(current_db, me_name)
     _weeks = days_n / 7.0
-    _expected_hours = 40.0 * _weeks
+    _expected_hours = _weekly_target * _weeks
     _hour_diff = _total_planned_hours - _expected_hours
 
     sumc1, sumc2, sumc3, sumc4 = st.columns(4)
@@ -9350,7 +9374,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         st.metric("출근 예정", f"{_work_days_count}일")
     with sumc2:
         st.metric("총 계획 근무", f"{_total_planned_hours:.1f}h",
-                  delta=f"{_hour_diff:+.1f}h vs 기준 {_expected_hours:.0f}h")
+                  delta=f"{_hour_diff:+.1f}h (기준 {_expected_hours:.0f}h / 주{_weekly_target:g}h)")
     with sumc3:
         st.metric("휴무 예정", f"{days_n - _work_days_count}일")
     with sumc4:
@@ -9648,6 +9672,104 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                 st.success("✅ 기본 근무시간이 저장되었습니다.")
             else:
                 st.error(f"저장 실패: {err}")
+
+    st.divider()
+    # ── 직원별 주간 목표 근무시간 ────────────────────────────────
+    st.markdown("##### 🕐 직원별 주간 목표 근무시간")
+    st.caption("직원마다 주간 목표 근무시간(FT=40h, PT=다양)을 설정합니다. 근무 일정 계획 시 기준값으로 사용됩니다.")
+
+    _employees = _erp_get_employee_names_for_store(current_db)
+    if not _employees:
+        st.info("이 매장에 배정된 직원이 없습니다.")
+    else:
+        _emp_settings = _erp_employee_settings_cached(current_db)
+        _emp_map = {r.get("employee_name"): r for r in _emp_settings}
+
+        _emp_types = ["정규직 (40h)", "단시간 35h", "파트타임 30h", "파트타임 25h",
+                      "파트타임 20h", "파트타임 15h", "직접 입력"]
+        _emp_type_hours = {
+            "정규직 (40h)": 40.0, "단시간 35h": 35.0, "파트타임 30h": 30.0,
+            "파트타임 25h": 25.0, "파트타임 20h": 20.0, "파트타임 15h": 15.0,
+        }
+
+        with st.form("erp_emp_weekly_hours_form", clear_on_submit=False):
+            # 헤더
+            hdr = st.columns([2, 2, 2])
+            hdr[0].markdown("**직원명**")
+            hdr[1].markdown("**근무 유형**")
+            hdr[2].markdown("**주간 목표 (h)**")
+
+            _emp_edits: dict[str, float] = {}
+            for _emp in _employees:
+                _saved = _emp_map.get(_emp, {})
+                _saved_h = float(_saved.get("weekly_target_hours") or 40.0)
+                # 저장된 시간과 일치하는 유형 선택
+                _matched = next(
+                    (t for t, h in _emp_type_hours.items() if abs(h - _saved_h) < 0.1),
+                    "직접 입력"
+                )
+                rc = st.columns([2, 2, 2])
+                with rc[0]:
+                    st.markdown(f"**{_emp}**")
+                with rc[1]:
+                    _sel_type = st.selectbox(
+                        "유형", _emp_types,
+                        index=_emp_types.index(_matched),
+                        key=f"erp_emp_type_{_emp}",
+                        label_visibility="collapsed",
+                    )
+                with rc[2]:
+                    if _sel_type == "직접 입력":
+                        _h_val = st.number_input(
+                            "시간", min_value=1.0, max_value=60.0,
+                            value=_saved_h, step=0.5,
+                            key=f"erp_emp_h_{_emp}",
+                            label_visibility="collapsed",
+                        )
+                    else:
+                        _h_val = _emp_type_hours[_sel_type]
+                        st.markdown(f"`{_h_val:g}h`")
+                _emp_edits[_emp] = _h_val
+
+            _emp_submit = st.form_submit_button("💾 직원별 목표 근무시간 저장", type="primary")
+
+        if _emp_submit:
+            _ok_cnt, _err_cnt = 0, 0
+            for _emp, _h in _emp_edits.items():
+                _saved = _emp_map.get(_emp)
+                _row = {
+                    "db_filename": current_db,
+                    "employee_name": _emp,
+                    "weekly_target_hours": float(_h),
+                    "updated_by": me_name,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if _saved and _saved.get("id"):
+                    ok, _ = _erp_update_row("app_employee_settings", int(_saved["id"]), _row)
+                else:
+                    ok, _ = _erp_insert_row("app_employee_settings", _row)
+                if ok:
+                    _ok_cnt += 1
+                else:
+                    _err_cnt += 1
+            _erp_employee_settings_cached.clear()
+            if _err_cnt == 0:
+                st.success(f"✅ {_ok_cnt}명의 주간 목표 근무시간이 저장되었습니다.")
+            else:
+                st.warning(f"저장 완료 {_ok_cnt}명 / 실패 {_err_cnt}명. "
+                           f"Supabase에 `app_employee_settings` 테이블이 없으면 아래 SQL을 실행해 주세요.")
+                st.code(
+                    "CREATE TABLE app_employee_settings (\n"
+                    "  id BIGSERIAL PRIMARY KEY,\n"
+                    "  db_filename TEXT NOT NULL,\n"
+                    "  employee_name TEXT NOT NULL,\n"
+                    "  weekly_target_hours NUMERIC DEFAULT 40,\n"
+                    "  updated_by TEXT,\n"
+                    "  updated_at TIMESTAMPTZ DEFAULT now(),\n"
+                    "  UNIQUE (db_filename, employee_name)\n"
+                    ");",
+                    language="sql",
+                )
 
     st.divider()
     st.markdown("##### 🧑‍🤝‍🧑 시간대별 최소 근무 인원 (요일별)")
