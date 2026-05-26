@@ -6943,80 +6943,27 @@ def _superadmin_tab1_integrated_dashboard():
     # ── 1-2. 일별 매출 추이 (이번 달 vs 지난 달) ────────
     st.subheader("📈 일별 매출 추이 (이번 달 vs 지난 달)")
     try:
-        # 지난달 데이터 로드 (all_orders/sales_df에 포함 안 된 경우 대비)
-        _prev_o_parts = []
-        if is_all:
-            for _, _sr in stores.iterrows():
-                try:
-                    if _supabase_orders_payments_available():
-                        _lo = _load_orders_supabase(_sr["db_filename"], "id, order_date, total_amount", limit=None,
-                                                    start_date=last_month_start_dt.isoformat(), end_date=last_month_end_dt.isoformat())
-                    else:
-                        _conn = get_tenant_conn(_sr["db_filename"])
-                        if _conn:
-                            try:
-                                _lo = pd.read_sql("SELECT id, order_date, total_amount FROM Orders WHERE order_date >= ? AND order_date <= ?",
-                                                  _conn, params=(last_month_start_dt.isoformat(), last_month_end_dt.isoformat()))
-                            finally:
-                                _conn.close()
-                        else:
-                            _lo = pd.DataFrame()
-                    if not _lo.empty:
-                        _lo["_store"] = _sr["store_name"]
-                        _prev_o_parts.append(_lo)
-                except Exception:
-                    pass
-        else:
-            try:
-                if _supabase_orders_payments_available():
-                    _lo = _load_orders_supabase(db_filename, "id, order_date, total_amount", limit=None,
-                                                start_date=last_month_start_dt.isoformat(), end_date=last_month_end_dt.isoformat())
-                else:
-                    _conn = get_tenant_conn(db_filename)
-                    if _conn:
-                        try:
-                            _lo = pd.read_sql("SELECT id, order_date, total_amount FROM Orders WHERE order_date >= ? AND order_date <= ?",
-                                              _conn, params=(last_month_start_dt.isoformat(), last_month_end_dt.isoformat()))
-                        finally:
-                            _conn.close()
-                    else:
-                        _lo = pd.DataFrame()
-                if not _lo.empty:
-                    _lo["_store"] = sel_store
-                    _prev_o_parts.append(_lo)
-            except Exception:
-                pass
-
-        # 이번달 주문 + 지난달 주문 합산
-        # orders는 전 기간 데이터를 포함하므로 이번 달만 필터해야 _prev_o_parts(지난달)와 중복 없이 합산됨
-        _this_ym_str = today.strftime("%Y-%m")
-        if not orders.empty and "order_date" in orders.columns:
-            _o_this_month = orders[pd.to_datetime(orders["order_date"], errors="coerce").dt.strftime("%Y-%m") == _this_ym_str]
-            _this_o = _o_this_month[["order_date","total_amount","_store"]].copy() if "_store" in _o_this_month.columns else _o_this_month[["order_date","total_amount"]].assign(_store=sel_store if not is_all else "전체")
-        else:
-            _this_o = pd.DataFrame()
-        _chart_parts = ([_this_o] if not _this_o.empty else []) + _prev_o_parts
-        _chart_df = pd.concat(_chart_parts, ignore_index=True) if _chart_parts else pd.DataFrame()
-
-        if _chart_df.empty:
+        # sales_df 기반으로 차트 구성 (KPI "누적매출"과 동일한 실수납 기준으로 통일)
+        if sales_df.empty or "transaction_date" not in sales_df.columns:
             st.info("표시할 매출 데이터가 없습니다.")
         else:
-            _chart_df["order_date"] = pd.to_datetime(_chart_df["order_date"], errors="coerce")
-            _chart_df = _chart_df.dropna(subset=["order_date"])
-            _chart_df["total_amount"] = pd.to_numeric(_chart_df["total_amount"], errors="coerce").fillna(0)
-            _chart_df["_day"] = _chart_df["order_date"].dt.day
-            _chart_df["_ym"] = _chart_df["order_date"].dt.strftime("%Y-%m")
+            _sdf = sales_df.copy()
+            _sdf["transaction_date"] = pd.to_datetime(_sdf["transaction_date"], errors="coerce")
+            _sdf = _sdf.dropna(subset=["transaction_date"])
+            _sdf["amount"] = pd.to_numeric(_sdf["amount"], errors="coerce").fillna(0)
+            _sdf["_day"] = _sdf["transaction_date"].dt.day
+            _sdf["_ym"] = _sdf["transaction_date"].dt.strftime("%Y-%m")
 
             _this_ym = today.strftime("%Y-%m")
             _last_ym = last_month_end_dt.strftime("%Y-%m")
             _last_month_days = last_month_end_dt.day
 
-            _this_m = _chart_df[_chart_df["_ym"] == _this_ym].groupby("_day")["total_amount"].sum()
+            _this_m = _sdf[_sdf["_ym"] == _this_ym].groupby("_day")["amount"].sum()
             _this_days = list(range(1, today.day + 1))
             _this_values = [float(_this_m.get(d, 0)) for d in _this_days]
             _this_sum = sum(_this_values)
 
-            _last_m = _chart_df[_chart_df["_ym"] == _last_ym].groupby("_day")["total_amount"].sum()
+            _last_m = _sdf[_sdf["_ym"] == _last_ym].groupby("_day")["amount"].sum()
             _last_days = list(range(1, _last_month_days + 1))
             _last_values = [float(_last_m.get(d, 0)) for d in _last_days]
             _last_sum = sum(_last_values)
