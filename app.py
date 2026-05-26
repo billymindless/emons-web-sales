@@ -10695,12 +10695,28 @@ def _erp_render_superadmin_view(today: date):
         return
     store_names = stores_df["store_name"].tolist()
 
-    sa_tabs = st.tabs(["통합 캘린더", "매장별 현황", "추가근무 승인", "월말 요약"])
+    sa_tabs = st.tabs(["통합 캘린더", "매장별 현황", "최소 인원 설정", "추가근무 승인", "월말 요약"])
 
     with sa_tabs[0]:
         # 통합 캘린더 = 전체 공개 캘린더 함수 재사용 (superadmin current_db는 비워도 무관)
         _first_db = stores_df["db_filename"].iloc[0] if len(stores_df) > 0 else ""
         _erp_tab_calendar(_first_db, "superadmin", "", today)
+
+    with sa_tabs[2]:
+        st.markdown("#### ⚙️ 매장별 최소 인원 설정")
+        _sa_sr_store = st.selectbox(
+            "📍 설정할 매장 선택",
+            store_names,
+            key="erp_sa_staffing_store",
+            help="매장을 선택하면 해당 매장의 기본 근무시간 및 시간대별 최소 인원을 설정할 수 있습니다.",
+        )
+        _sa_sr_df = stores_df[stores_df["store_name"] == _sa_sr_store]
+        if not _sa_sr_df.empty:
+            _sa_sr_db = _sa_sr_df["db_filename"].iloc[0]
+            _sa_me = st.session_state.get("current_user", {}).get("username", "superadmin")
+            _erp_tab_staffing_rules(_sa_sr_db, _sa_me)
+        else:
+            st.warning("매장 정보를 찾을 수 없습니다.")
 
     with sa_tabs[1]:
         st.markdown("##### 📊 매장별 월별 근무 현황")
@@ -10749,7 +10765,7 @@ def _erp_render_superadmin_view(today: date):
         else:
             st.info("표시할 데이터가 없습니다.")
 
-    with sa_tabs[2]:
+    with sa_tabs[3]:
         st.markdown("##### ✅ 전 매장 추가근무 승인 대기 (관리자 전용)")
         all_pending = []
         for _, sr in stores_df.iterrows():
@@ -10785,7 +10801,7 @@ def _erp_render_superadmin_view(today: date):
                         })
                         st.rerun()
 
-    with sa_tabs[3]:
+    with sa_tabs[4]:
         st.markdown("##### 📊 전 매장 월말 급여 요약")
         col_y3, col_m3 = st.columns(2)
         with col_y3:
