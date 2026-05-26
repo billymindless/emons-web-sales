@@ -9685,55 +9685,56 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
         _emp_settings = _erp_employee_settings_cached(current_db)
         _emp_map = {r.get("employee_name"): r for r in _emp_settings}
 
-        _emp_types = ["정규직 (40h)", "단시간 35h", "파트타임 30h", "파트타임 25h",
-                      "파트타임 20h", "파트타임 15h", "직접 입력"]
         _emp_type_hours = {
             "정규직 (40h)": 40.0, "단시간 35h": 35.0, "파트타임 30h": 30.0,
             "파트타임 25h": 25.0, "파트타임 20h": 20.0, "파트타임 15h": 15.0,
+            "직접 입력": None,
         }
+        _emp_types = list(_emp_type_hours.keys())
 
-        with st.form("erp_emp_weekly_hours_form", clear_on_submit=False):
-            # 헤더
-            hdr = st.columns([2, 2, 2])
-            hdr[0].markdown("**직원명**")
-            hdr[1].markdown("**근무 유형**")
-            hdr[2].markdown("**주간 목표 (h)**")
+        # 폼 없이 위젯 직접 사용 → selectbox 변경 시 number_input 즉시 반응
+        hdr = st.columns([2, 2, 2])
+        hdr[0].markdown("**직원명**")
+        hdr[1].markdown("**근무 유형**")
+        hdr[2].markdown("**주간 목표 (h)**")
 
-            _emp_edits: dict[str, float] = {}
-            for _emp in _employees:
-                _saved = _emp_map.get(_emp, {})
-                _saved_h = float(_saved.get("weekly_target_hours") or 40.0)
-                # 저장된 시간과 일치하는 유형 선택
-                _matched = next(
-                    (t for t, h in _emp_type_hours.items() if abs(h - _saved_h) < 0.1),
-                    "직접 입력"
+        _emp_edits: dict[str, float] = {}
+        for _emp in _employees:
+            _saved = _emp_map.get(_emp, {})
+            _saved_h = float(_saved.get("weekly_target_hours") or 40.0)
+            _matched = next(
+                (t for t, h in _emp_type_hours.items() if h is not None and abs(h - _saved_h) < 0.1),
+                "직접 입력",
+            )
+            rc = st.columns([2, 2, 2])
+            with rc[0]:
+                st.markdown(f"**{_emp}**")
+            with rc[1]:
+                _sel_type = st.selectbox(
+                    "유형", _emp_types,
+                    index=_emp_types.index(_matched),
+                    key=f"erp_emp_type_{_emp}",
+                    label_visibility="collapsed",
                 )
-                rc = st.columns([2, 2, 2])
-                with rc[0]:
-                    st.markdown(f"**{_emp}**")
-                with rc[1]:
-                    _sel_type = st.selectbox(
-                        "유형", _emp_types,
-                        index=_emp_types.index(_matched),
-                        key=f"erp_emp_type_{_emp}",
-                        label_visibility="collapsed",
-                    )
-                with rc[2]:
-                    if _sel_type == "직접 입력":
-                        _h_val = st.number_input(
-                            "시간", min_value=1.0, max_value=60.0,
-                            value=_saved_h, step=0.5,
-                            key=f"erp_emp_h_{_emp}",
-                            label_visibility="collapsed",
-                        )
-                    else:
-                        _h_val = _emp_type_hours[_sel_type]
-                        st.markdown(f"`{_h_val:g}h`")
-                _emp_edits[_emp] = _h_val
+            with rc[2]:
+                # 프리셋 선택 시 해당 시간을 기본값으로 number_input 표시
+                # 항상 number_input을 렌더링해야 폼 밖에서도 즉각 반응함
+                _preset_h = _emp_type_hours.get(_sel_type)
+                _default_h = _preset_h if _preset_h is not None else _saved_h
+                _h_val = st.number_input(
+                    "주간 목표(h)",
+                    min_value=1.0, max_value=60.0,
+                    value=_default_h,
+                    step=0.5,
+                    key=f"erp_emp_h_{_emp}",
+                    label_visibility="collapsed",
+                    disabled=(_preset_h is not None),   # 프리셋 선택 시 비활성화, 직접입력만 활성
+                )
+            _emp_edits[_emp] = _h_val
 
-            _emp_submit = st.form_submit_button("💾 직원별 목표 근무시간 저장", type="primary")
+        st.caption("💡 '직접 입력'을 선택하면 주간 목표 시간을 자유롭게 입력할 수 있습니다.")
 
-        if _emp_submit:
+        if st.button("💾 직원별 목표 근무시간 저장", type="primary", key="erp_emp_weekly_save"):
             _ok_cnt, _err_cnt = 0, 0
             for _emp, _h in _emp_edits.items():
                 _saved = _emp_map.get(_emp)
@@ -9755,6 +9756,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
             _erp_employee_settings_cached.clear()
             if _err_cnt == 0:
                 st.success(f"✅ {_ok_cnt}명의 주간 목표 근무시간이 저장되었습니다.")
+                st.rerun()
             else:
                 st.warning(f"저장 완료 {_ok_cnt}명 / 실패 {_err_cnt}명. "
                            f"Supabase에 `app_employee_settings` 테이블이 없으면 아래 SQL을 실행해 주세요.")
