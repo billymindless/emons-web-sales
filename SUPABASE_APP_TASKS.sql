@@ -163,49 +163,41 @@ CREATE TABLE IF NOT EXISTS app_batch_runs (
 );
 
 -- ─────────────────────────────────────────────────────────────────────
--- Storage 버킷 (Supabase Storage)
+-- Storage 버킷: Supabase 대시보드 → Storage → New bucket → task-attachments (private)
+-- (storage.buckets INSERT는 권한 이슈로 자동 DDL에서 제외)
 -- ─────────────────────────────────────────────────────────────────────
-INSERT INTO storage.buckets (id, name, public)
-VALUES ('task-attachments', 'task-attachments', false)
-ON CONFLICT (id) DO NOTHING;
 
 -- ─────────────────────────────────────────────────────────────────────
--- RLS — 이 앱은 service_role/anon 단일 키로 접근하므로 정책은 단순화.
--- 실 운영에서 사용자별 jwt 도입 시 store_name·db_filename 기반 정책 추가.
+-- RLS (DO $$ 블록 대신 DROP/CREATE — psycopg2 세미콜론 분할 호환)
 -- ─────────────────────────────────────────────────────────────────────
 ALTER TABLE app_tasks ENABLE ROW LEVEL SECURITY;
-ALTER TABLE app_task_assignees ENABLE ROW LEVEL SECURITY;
-ALTER TABLE app_task_comments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE app_task_attachments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE app_task_activity ENABLE ROW LEVEL SECURITY;
-ALTER TABLE app_notifications ENABLE ROW LEVEL SECURITY;
-ALTER TABLE app_notification_templates ENABLE ROW LEVEL SECURITY;
-ALTER TABLE app_batch_runs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_tasks" ON app_tasks;
+CREATE POLICY "Allow all app_tasks" ON app_tasks FOR ALL USING (true) WITH CHECK (true);
 
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'app_tasks' AND policyname = 'app_tasks_all') THEN
-        CREATE POLICY app_tasks_all ON app_tasks FOR ALL USING (true) WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'app_task_assignees' AND policyname = 'app_task_assignees_all') THEN
-        CREATE POLICY app_task_assignees_all ON app_task_assignees FOR ALL USING (true) WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'app_task_comments' AND policyname = 'app_task_comments_all') THEN
-        CREATE POLICY app_task_comments_all ON app_task_comments FOR ALL USING (true) WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'app_task_attachments' AND policyname = 'app_task_attachments_all') THEN
-        CREATE POLICY app_task_attachments_all ON app_task_attachments FOR ALL USING (true) WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'app_task_activity' AND policyname = 'app_task_activity_all') THEN
-        CREATE POLICY app_task_activity_all ON app_task_activity FOR ALL USING (true) WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'app_notifications' AND policyname = 'app_notifications_all') THEN
-        CREATE POLICY app_notifications_all ON app_notifications FOR ALL USING (true) WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'app_notification_templates' AND policyname = 'app_notification_templates_all') THEN
-        CREATE POLICY app_notification_templates_all ON app_notification_templates FOR ALL USING (true) WITH CHECK (true);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'app_batch_runs' AND policyname = 'app_batch_runs_all') THEN
-        CREATE POLICY app_batch_runs_all ON app_batch_runs FOR ALL USING (true) WITH CHECK (true);
-    END IF;
-END $$;
+ALTER TABLE app_task_assignees ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_task_assignees" ON app_task_assignees;
+CREATE POLICY "Allow all app_task_assignees" ON app_task_assignees FOR ALL USING (true) WITH CHECK (true);
+
+ALTER TABLE app_task_comments ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_task_comments" ON app_task_comments;
+CREATE POLICY "Allow all app_task_comments" ON app_task_comments FOR ALL USING (true) WITH CHECK (true);
+
+ALTER TABLE app_task_attachments ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_task_attachments" ON app_task_attachments;
+CREATE POLICY "Allow all app_task_attachments" ON app_task_attachments FOR ALL USING (true) WITH CHECK (true);
+
+ALTER TABLE app_task_activity ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_task_activity" ON app_task_activity;
+CREATE POLICY "Allow all app_task_activity" ON app_task_activity FOR ALL USING (true) WITH CHECK (true);
+
+ALTER TABLE app_notifications ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_notifications" ON app_notifications;
+CREATE POLICY "Allow all app_notifications" ON app_notifications FOR ALL USING (true) WITH CHECK (true);
+
+ALTER TABLE app_notification_templates ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_notification_templates" ON app_notification_templates;
+CREATE POLICY "Allow all app_notification_templates" ON app_notification_templates FOR ALL USING (true) WITH CHECK (true);
+
+ALTER TABLE app_batch_runs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_batch_runs" ON app_batch_runs;
+CREATE POLICY "Allow all app_batch_runs" ON app_batch_runs FOR ALL USING (true) WITH CHECK (true);

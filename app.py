@@ -552,9 +552,63 @@ def ensure_supabase_app_tables():
     없으면 database_url로 자동 생성 시도. 성공 시 True, 아니면 False.
     """
     if _supabase_app_tables_available():
+        ensure_supabase_task_tables()
         return True
     if _supabase_run_app_tables_sql():
-        return _supabase_app_tables_available()
+        ok = _supabase_app_tables_available()
+        ensure_supabase_task_tables()
+        return ok
+    return False
+
+
+def _supabase_task_tables_available() -> bool:
+    """app_tasks 테이블 존재 여부 (사내 업무판)."""
+    _cache_key = "_supa_task_tables_avail"
+    if _cache_key in st.session_state:
+        return bool(st.session_state[_cache_key])
+    client, err = get_supabase_client()
+    if err or not client:
+        return False
+    try:
+        client.table("app_tasks").select("id").limit(1).execute()
+        st.session_state[_cache_key] = True
+        return True
+    except Exception:
+        st.session_state[_cache_key] = False
+        return False
+
+
+def _supabase_run_task_tables_sql() -> bool:
+    """사내 업무판 전용 DDL (phone 컬럼 + app_tasks 등)."""
+    secrets = (st.secrets.get("supabase") or {}) if "secrets" in dir(st) else {}
+    if not secrets:
+        try:
+            import streamlit as _st
+            secrets = _st.secrets.get("supabase") or {}
+        except Exception:
+            pass
+    db_url = (secrets.get("database_url") or secrets.get("db_url") or "").strip()
+    if not db_url:
+        return False
+    ok = False
+    for fname in ("SUPABASE_APP_USERS_PHONE.sql", "SUPABASE_APP_TASKS.sql"):
+        fpath = os.path.join(BASE_DIR, fname)
+        if os.path.isfile(fpath) and _supabase_run_sql_file(db_url, fpath):
+            ok = True
+    return ok
+
+
+def ensure_supabase_task_tables() -> bool:
+    """사내 업무판 테이블이 없으면 자동 생성 시도."""
+    _cache_key = "_supa_task_tables_avail"
+    if _supabase_task_tables_available():
+        return True
+    if _cache_key in st.session_state:
+        del st.session_state[_cache_key]
+    if _supabase_run_task_tables_sql():
+        if _cache_key in st.session_state:
+            del st.session_state[_cache_key]
+        return _supabase_task_tables_available()
     return False
 
 
@@ -11494,6 +11548,20 @@ def render_employee_analytics():
 def render_internal_work():
     """사내 업무판 — ERP 메뉴 하위. 업무 등록·할당·진행·댓글·첨부·알림."""
     import task_board as _tb  # noqa: WPS433
+
+    if not ensure_supabase_task_tables():
+        st.error(
+            "사내 업무 테이블(app_tasks)이 아직 생성되지 않았습니다. "
+            "`.streamlit/secrets.toml`에 `[supabase] database_url`이 설정되어 있으면 "
+            "앱을 새로고침하면 자동 생성됩니다. "
+            "그래도 안 되면 Supabase SQL Editor에서 `SUPABASE_APP_TASKS.sql`과 "
+            "`SUPABASE_APP_USERS_PHONE.sql`을 실행해 주세요."
+        )
+        if st.button("🔄 테이블 생성 다시 시도", key="retry_task_tables"):
+            if "_supa_task_tables_avail" in st.session_state:
+                del st.session_state["_supa_task_tables_avail"]
+            st.rerun()
+        return
 
     current_user = st.session_state.get("current_user") or {}
     role = (current_user.get("role") or "user").strip()
