@@ -530,6 +530,60 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
     return JSONResponse({"status": "success"}, status_code=200)
 
 
+# ──────────────────────────────────────────────
+# Solapi 카카오 친구추가 webhook (사내 업무판)
+# ──────────────────────────────────────────────
+
+@app.post("/webhook/solapi/friend-added", summary="Solapi 친구추가 이벤트 수신")
+@app.post("/webhook/solapi/friend_added", include_in_schema=False)
+async def solapi_friend_added_webhook(request: Request) -> JSONResponse:
+    """
+    Solapi가 카카오채널 친구추가 이벤트를 전달하면 phone으로 app_users 매칭 후
+    kakao_friend_added=true로 갱신.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    # Solapi 페이로드 형식이 변경될 수 있어 다양한 키 시도
+    phone = (
+        payload.get("phone")
+        or payload.get("phoneNumber")
+        or payload.get("to")
+        or (payload.get("data", {}) or {}).get("phone")
+        or ""
+    )
+    sender_key = (
+        payload.get("senderKey")
+        or payload.get("sender_key")
+        or (payload.get("data", {}) or {}).get("senderKey")
+        or ""
+    )
+
+    digits = "".join(c for c in str(phone) if c.isdigit())
+    updated = False
+    headers = _supa_headers()
+    if digits and headers:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.patch(
+                    _supa_url("app_users") + f"?phone=eq.{digits}",
+                    headers=headers,
+                    json={"kakao_friend_added": True},
+                )
+                updated = resp.status_code < 300
+        except Exception as e:
+            logger.warning("solapi_friend_added_webhook update failed: %s", e)
+
+    return JSONResponse({
+        "status": "ok",
+        "matched_by_phone": updated,
+        "phone_digits": digits or None,
+        "sender_key": sender_key or None,
+    }, status_code=200)
+
+
 @app.get("/health", summary="헬스체크")
 async def health() -> JSONResponse:
     return JSONResponse({

@@ -534,6 +534,8 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_ERP_ATTENDANCE.sql",
         "SUPABASE_APP_USERS_HIREDATE.sql",
         "SUPABASE_APP_EMPLOYEE_SALARIES.sql",
+        "SUPABASE_APP_USERS_PHONE.sql",
+        "SUPABASE_APP_TASKS.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -706,7 +708,9 @@ def _get_supabase_users_list():
     if err or not client:
         return []
     try:
-        r = client.table("app_users").select("id, username, email, role, name, store_id").order("username").execute()
+        r = client.table("app_users").select(
+            "id, username, email, role, name, store_id, hire_date, phone, kakao_friend_added, kakao_notify_enabled"
+        ).order("username").execute()
         return (r.data or []) if hasattr(r, "data") else []
     except Exception:
         return []
@@ -785,7 +789,7 @@ def _get_supabase_employee_list_with_stores():
     return out
 
 
-def _supabase_insert_app_user(username: str, email: str, role: str, store_id, name: str):
+def _supabase_insert_app_user(username: str, email: str, role: str, store_id, name: str, phone: str | None = None):
     """app_users에 한 행 삽입 (비밀번호는 Supabase Auth에서 관리하므로 placeholder 저장). 반환: (user_id, None) 또는 (None, error_msg)."""
     client, err = get_supabase_client()
     if err or not client:
@@ -800,6 +804,7 @@ def _supabase_insert_app_user(username: str, email: str, role: str, store_id, na
             "role": (role or "user").strip(),
             "store_id": int(store_id) if store_id is not None else None,
             "name": (name or "").strip() or None,
+            "phone": (phone or "").strip() or None,
         }
         r = client.table("app_users").insert(row).execute()
         data = (r.data if hasattr(r, "data") else None)
@@ -817,16 +822,22 @@ def _supabase_insert_app_user(username: str, email: str, role: str, store_id, na
         return None, str(e)
 
 
-def _supabase_update_app_user(user_id: int, name: str, role: str, store_id, store_ids: list):
+def _supabase_update_app_user(user_id: int, name: str, role: str, store_id, store_ids: list,
+                              phone: str | None = None, kakao_notify_enabled: bool | None = None):
     """app_users 한 행 수정 + app_user_stores 교체. 에러 시 예외."""
     client, err = get_supabase_client()
     if err or not client:
         raise RuntimeError(err or "Supabase 연결 불가")
-    client.table("app_users").update({
+    patch: dict = {
         "name": (name or "").strip() or None,
         "role": role,
         "store_id": store_id,
-    }).eq("id", user_id).execute()
+    }
+    if phone is not None:
+        patch["phone"] = (phone or "").strip() or None
+    if kakao_notify_enabled is not None:
+        patch["kakao_notify_enabled"] = bool(kakao_notify_enabled)
+    client.table("app_users").update(patch).eq("id", user_id).execute()
     client.table("app_user_stores").delete().eq("user_id", user_id).execute()
     for sid in (store_ids or []):
         client.table("app_user_stores").insert({"user_id": user_id, "store_id": sid}).execute()
@@ -11476,6 +11487,423 @@ def render_employee_analytics():
             st.info("해당 월에 승인된 추가근무가 없거나 급여 정보가 없습니다. 위 섹션에서 급여를 입력하고, 근태 관리에서 추가근무를 승인해 주세요.")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 📋 사내 업무판 (사내결제시스템)
+# ─────────────────────────────────────────────────────────────────────
+
+def render_internal_work():
+    """사내 업무판 — ERP 메뉴 하위. 업무 등록·할당·진행·댓글·첨부·알림."""
+    import task_board as _tb  # noqa: WPS433
+
+    current_user = st.session_state.get("current_user") or {}
+    role = (current_user.get("role") or "user").strip()
+    me_uname = (current_user.get("username") or current_user.get("email") or "").strip()
+    me_name = (current_user.get("name") or me_uname).strip()
+    store_id = (current_user.get("store_id") or st.session_state.get("current_store_id"))
+    current_db = st.session_state.get("current_db") or ""
+    store_name: str | None = None
+    if store_id:
+        try:
+            _sc, _se = get_supabase_client()
+            if _sc and not _se:
+                _sr = _sc.table("app_stores").select("store_name").eq("id", int(store_id)).maybe_single().execute()
+                _sd = _sr.data if isinstance(_sr.data, dict) else None
+                store_name = (_sd or {}).get("store_name")
+        except Exception:
+            store_name = None
+
+    # 마감 임박 lazy 배치 (멱등)
+    try:
+        _tb.maybe_run_due_soon_batch()
+    except Exception:
+        pass
+
+    # 야간 거부 재시도 (08시 이후 호출)
+    try:
+        kst = datetime.now(timezone.utc) + timedelta(hours=9)
+        if kst.hour >= 8 and kst.hour < 21 and st.session_state.get("_friendtalk_retry_done_date") != kst.date().isoformat():
+            _tb.retry_out_of_hours_notifications()
+            st.session_state["_friendtalk_retry_done_date"] = kst.date().isoformat()
+    except Exception:
+        pass
+
+    st.header("📋 사내 업무")
+    st.caption("상위·하위 업무를 등록하고 담당자에게 인앱 알림 + 카카오 친구톡으로 즉시 통보합니다.")
+
+    # 친구추가 미완료 직원 카드 (매장관리자 이상)
+    if role in ("store_admin", "superadmin"):
+        pending = _tb.load_friend_pending_users(store_id if role == "store_admin" else None)
+        if pending:
+            with st.container(border=True):
+                st.warning(f"⚠️ 카카오 채널 친구추가 미완료 직원 **{len(pending)}명**")
+                rows = [{
+                    "이름": (u.get("name") or u.get("username") or "-"),
+                    "사용자명": u.get("username"),
+                    "휴대폰": u.get("phone") or "(미입력)",
+                } for u in pending]
+                st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+                st.caption("위 직원들은 인앱 알림만 받습니다. 본인 카카오톡에서 회사 채널을 친구 추가해 주세요.")
+
+    # 알림 문구 편집 모달 (매장관리자 이상)
+    if role in ("store_admin", "superadmin"):
+        with st.expander("📝 알림 문구 편집 (관리자 전용)", expanded=False):
+            tmpls = _tb.load_templates_cached()
+            tmpl_labels = {
+                "task_assigned": "신규 업무 배정",
+                "status_changed": "상태 변경",
+                "comment_added": "새 댓글",
+                "due_soon": "마감 임박 (D-1)",
+            }
+            for k, label in tmpl_labels.items():
+                cur = tmpls.get(k, "")
+                with st.form(f"tmpl_form_{k}"):
+                    st.markdown(f"**{label}**")
+                    new_body = st.text_area(
+                        "본문",
+                        value=cur,
+                        height=140,
+                        key=f"tmpl_body_{k}",
+                        help="변수: {name} {title} {due_date} {requester} {link} {from_status} {to_status} {actor} {author} {preview}",
+                    )
+                    if st.form_submit_button(f"저장 ({label})"):
+                        ok, err = _tb.update_template(k, new_body, me_uname)
+                        if ok:
+                            st.success("저장되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"저장 실패: {err}")
+
+    st.divider()
+
+    # 알림 패널
+    with st.expander(f"🔔 내 알림 ({_tb.count_unread_notifications(me_uname)} 미확인)", expanded=False):
+        unread_only = st.checkbox("미확인만 보기", value=True, key="noti_unread_only")
+        notis = _tb.load_my_notifications_cached(me_uname, unread_only=unread_only, limit=50)
+        if not notis:
+            st.caption("알림이 없습니다.")
+        else:
+            cols = st.columns([1, 5, 2, 2, 1])
+            cols[0].markdown("**상태**")
+            cols[1].markdown("**내용**")
+            cols[2].markdown("**유형**")
+            cols[3].markdown("**시각**")
+            cols[4].markdown("")
+            for n in notis:
+                c = st.columns([1, 5, 2, 2, 1])
+                c[0].write("✅" if n.get("is_read") else "🔵")
+                c[1].write(n.get("message", ""))
+                c[2].write(n.get("type", ""))
+                c[3].caption(str(n.get("sent_at", ""))[:19])
+                if not n.get("is_read"):
+                    if c[4].button("읽음", key=f"noti_read_{n['id']}"):
+                        _tb.mark_notification_read(int(n["id"]))
+                        st.rerun()
+            if st.button("모두 읽음 처리", key="noti_mark_all"):
+                _tb.mark_all_read(me_uname)
+                st.rerun()
+
+    st.divider()
+
+    # 신규 업무 등록 폼
+    _render_new_task_form(me_uname, store_name, current_db, role, store_id)
+
+    st.divider()
+
+    # 업무 목록 (트리)
+    st.subheader("📌 업무 목록")
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 1])
+    with col_f1:
+        status_filter = st.multiselect(
+            "상태 필터",
+            options=_tb.TASK_STATUSES,
+            default=["requested", "in_progress", "feedback"],
+            format_func=lambda s: f"{_tb.TASK_STATUS_EMOJI.get(s, '')} {_tb.TASK_STATUS_LABELS.get(s, s)}",
+            key="task_status_filter",
+        )
+    with col_f2:
+        show_done = st.checkbox("완료·보류 포함", value=False, key="task_show_done")
+    with col_f3:
+        show_scope = "전체 매장" if role == "superadmin" else (store_name or "내 매장")
+        st.caption(f"조회 범위: **{show_scope}**")
+
+    tasks = _tb.load_tasks_cached(
+        store_name=None if role == "superadmin" else store_name,
+        include_done=show_done,
+    )
+    tasks = [t for t in tasks if (not status_filter) or t.get("status") in status_filter]
+
+    if not tasks:
+        st.info("표시할 업무가 없습니다. 위에서 새 업무를 등록해 주세요.")
+        return
+
+    # 트리 구성
+    task_ids = tuple(int(t["id"]) for t in tasks)
+    assignees_map = _tb.load_task_assignees_cached(task_ids)
+    by_parent: dict[int | None, list[dict]] = {}
+    by_id: dict[int, dict] = {}
+    for t in tasks:
+        by_id[int(t["id"])] = t
+        by_parent.setdefault(t.get("parent_task_id"), []).append(t)
+
+    roots = by_parent.get(None, [])
+    for root in roots:
+        _render_task_card(root, by_parent, assignees_map, me_uname, role, store_name, current_db, depth=0)
+
+
+def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str | None,
+                          role: str, store_id):
+    import task_board as _tb  # noqa: WPS433
+
+    with st.expander("➕ 새 업무 등록", expanded=False):
+        # 같은 매장 직원 목록
+        emp_options = _internal_work_employee_options(store_id, role)
+        emp_username_to_label = {u: lbl for u, lbl in emp_options}
+        with st.form("new_task_form", clear_on_submit=True):
+            title = st.text_input("제목 *", key="nt_title", placeholder="업무 제목")
+            description = st.text_area("설명", key="nt_desc", height=100, placeholder="상세 내용 / 요청 사항")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                start = st.date_input("시작일", value=None, key="nt_start")
+            with col_b:
+                due = st.date_input("마감일", value=None, key="nt_due")
+            with col_c:
+                priority = st.selectbox(
+                    "우선순위",
+                    options=_tb.TASK_PRIORITIES,
+                    index=1,
+                    format_func=lambda p: _tb.TASK_PRIORITY_LABELS.get(p, p),
+                    key="nt_priority",
+                )
+            assignees = st.multiselect(
+                "담당자 (첫 번째가 책임자)",
+                options=[u for u, _ in emp_options],
+                format_func=lambda u: emp_username_to_label.get(u, u),
+                key="nt_assignees",
+            )
+            parent_options = _internal_work_parent_options(store_name, role)
+            parent_label_to_id = {lbl: i for i, lbl in parent_options}
+            parent_label = st.selectbox(
+                "상위 업무 (선택)",
+                options=["(없음 - 상위 업무로 등록)"] + [lbl for _, lbl in parent_options],
+                key="nt_parent",
+            )
+            parent_task_id = parent_label_to_id.get(parent_label)
+
+            submitted = st.form_submit_button("등록", type="primary")
+            if submitted:
+                if not (title or "").strip():
+                    st.error("제목을 입력해 주세요.")
+                else:
+                    new_id, err = _tb.create_task(
+                        title=title,
+                        description=description,
+                        created_by=me_uname,
+                        store_name=store_name,
+                        db_filename=current_db,
+                        parent_task_id=parent_task_id,
+                        start_date=start,
+                        due_date=due,
+                        priority=priority,
+                        assignees=assignees,
+                    )
+                    if new_id:
+                        st.success(f"등록 완료 (#{new_id})")
+                        st.rerun()
+                    else:
+                        st.error(f"등록 실패: {err}")
+
+
+def _internal_work_employee_options(store_id, role: str) -> list[tuple[str, str]]:
+    """현재 매장 직원 (superadmin은 전 직원). [(username, label)]."""
+    users = _get_supabase_users_list() or []
+    out: list[tuple[str, str]] = []
+    for u in users:
+        if not u.get("username"):
+            continue
+        if role == "superadmin":
+            ok = True
+        else:
+            store_ids = _get_supabase_user_store_ids(u.get("id")) if u.get("id") else []
+            ok = (store_id is not None and (store_id in store_ids or u.get("store_id") == store_id))
+        if ok:
+            label = (u.get("name") or u.get("username")) + (f"  ({u.get('role')})" if u.get("role") else "")
+            out.append((u["username"], label))
+    # 중복 제거
+    seen = set()
+    uniq = []
+    for k, v in out:
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append((k, v))
+    return uniq
+
+
+def _internal_work_parent_options(store_name: str | None, role: str) -> list[tuple[int, str]]:
+    """상위 업무 후보 (현재 활성 업무 중 상위 업무인 것)."""
+    import task_board as _tb  # noqa: WPS433
+    tasks = _tb.load_tasks_cached(store_name=None if role == "superadmin" else store_name, include_done=False)
+    return [(int(t["id"]), f"#{t['id']} {t['title']}") for t in tasks if not t.get("parent_task_id")]
+
+
+def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
+                      me_uname: str, role: str, store_name: str | None,
+                      current_db: str | None, depth: int = 0):
+    import task_board as _tb  # noqa: WPS433
+
+    tid = int(task["id"])
+    title = task.get("title", "")
+    status = task.get("status", "requested")
+    indent = "&nbsp;" * 4 * depth
+    badge = f"{_tb.TASK_STATUS_EMOJI.get(status, '')} {_tb.TASK_STATUS_LABELS.get(status, status)}"
+    assignees = assignees_map.get(tid, [])
+    assignee_names = ", ".join((a.get("employee_username") or "") for a in assignees) or "(없음)"
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([5, 2, 2, 1])
+        c1.markdown(f"{indent}**#{tid} {title}**")
+        c2.markdown(badge)
+        c3.caption(f"담당: {assignee_names}")
+        c4.caption(f"마감: {task.get('due_date') or '-'}")
+
+        # 상세 expander
+        with st.expander("자세히 보기 / 수정", expanded=False):
+            _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
+
+    # 하위 업무
+    children = by_parent.get(tid, [])
+    for child in children:
+        _render_task_card(child, by_parent, assignees_map, me_uname, role, store_name, current_db, depth=depth + 1)
+
+
+def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
+                        role: str, store_name: str | None, current_db: str | None):
+    import task_board as _tb  # noqa: WPS433
+
+    tid = int(task["id"])
+    is_creator = task.get("created_by") == me_uname
+    is_assignee = any(a.get("employee_username") == me_uname for a in assignees)
+    can_edit = role in ("store_admin", "superadmin") or is_creator or is_assignee
+
+    # 상세 필드 편집
+    with st.form(f"task_edit_{tid}"):
+        new_title = st.text_input("제목", value=task.get("title", ""), key=f"et_title_{tid}", disabled=not can_edit)
+        new_desc = st.text_area("설명", value=task.get("description") or "", key=f"et_desc_{tid}", height=100, disabled=not can_edit)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            _sd_default = date.fromisoformat(task["start_date"]) if task.get("start_date") else None
+            new_start = st.date_input("시작일", value=_sd_default, key=f"et_start_{tid}", disabled=not can_edit)
+        with c2:
+            _dd_default = date.fromisoformat(task["due_date"]) if task.get("due_date") else None
+            new_due = st.date_input("마감일", value=_dd_default, key=f"et_due_{tid}", disabled=not can_edit)
+        with c3:
+            new_priority = st.selectbox(
+                "우선순위",
+                options=_tb.TASK_PRIORITIES,
+                index=_tb.TASK_PRIORITIES.index(task.get("priority", "normal")),
+                format_func=lambda p: _tb.TASK_PRIORITY_LABELS.get(p, p),
+                key=f"et_pri_{tid}",
+                disabled=not can_edit,
+            )
+
+        new_status = st.selectbox(
+            "상태",
+            options=_tb.TASK_STATUSES,
+            index=_tb.TASK_STATUSES.index(task.get("status", "requested")),
+            format_func=lambda s: f"{_tb.TASK_STATUS_EMOJI.get(s, '')} {_tb.TASK_STATUS_LABELS.get(s, s)}",
+            key=f"et_status_{tid}",
+            disabled=not can_edit,
+        )
+
+        _cu = st.session_state.get("current_user") or {}
+        _sid = _cu.get("store_id") or st.session_state.get("current_store_id")
+        emp_options = _internal_work_employee_options(_sid, role)
+        cur_users = [a.get("employee_username") for a in assignees if a.get("employee_username")]
+        new_assignees = st.multiselect(
+            "담당자",
+            options=[u for u, _ in emp_options],
+            default=[u for u in cur_users if u in [x for x, _ in emp_options]],
+            format_func=lambda u: dict(emp_options).get(u, u),
+            key=f"et_assign_{tid}",
+            disabled=not can_edit,
+        )
+
+        col_btn1, col_btn2 = st.columns(2)
+        save_clicked = col_btn1.form_submit_button("저장", disabled=not can_edit, type="primary")
+        if save_clicked:
+            # 변경된 필드 산출
+            if new_status != task.get("status"):
+                _tb.update_status(tid, new_status, me_uname)
+            field_patch: dict = {}
+            if new_title != task.get("title"):
+                field_patch["title"] = new_title
+            if (new_desc or "") != (task.get("description") or ""):
+                field_patch["description"] = new_desc
+            if (new_start.isoformat() if new_start else None) != task.get("start_date"):
+                field_patch["start_date"] = new_start
+            if (new_due.isoformat() if new_due else None) != task.get("due_date"):
+                field_patch["due_date"] = new_due
+            if new_priority != task.get("priority"):
+                field_patch["priority"] = new_priority
+            if field_patch:
+                _tb.update_task_fields(tid, me_uname, **field_patch)
+            if set(new_assignees) != set(cur_users):
+                _tb.assign_users(tid, new_assignees, me_uname)
+            st.success("저장되었습니다.")
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("**💬 댓글**")
+    comments = _tb.load_task_comments_cached(tid)
+    for cm in comments:
+        with st.container(border=True):
+            st.caption(f"**{cm.get('author')}** · {str(cm.get('created_at',''))[:19]}")
+            st.write(cm.get("body", ""))
+
+    # 댓글 입력 + 첨부
+    with st.form(f"comment_form_{tid}", clear_on_submit=True):
+        body = st.text_area("새 댓글", key=f"cm_body_{tid}", height=80, placeholder="댓글을 입력하세요. 이미지는 아래에서 첨부.")
+        files = st.file_uploader(
+            "📎 이미지 첨부 (다중 가능)",
+            type=["png", "jpg", "jpeg", "webp", "gif"],
+            accept_multiple_files=True,
+            key=f"cm_files_{tid}",
+        )
+        if st.form_submit_button("댓글 등록"):
+            new_cid, err = _tb.post_comment(tid, me_uname, body or "(첨부)")
+            if err and not files:
+                st.error(f"댓글 등록 실패: {err}")
+            else:
+                for f in files or []:
+                    row, ferr = _tb.attach_file(task_id=tid, comment_id=new_cid, uploaded_file=f, uploaded_by=me_uname)
+                    if ferr:
+                        st.warning(f"첨부 실패 ({f.name}): {ferr}")
+                st.success("등록되었습니다.")
+                st.rerun()
+
+    # 첨부 갤러리
+    atts = _tb.load_task_attachments_cached(tid)
+    if atts:
+        st.markdown("**🖼️ 첨부 이미지**")
+        cols = st.columns(4)
+        for i, a in enumerate(atts):
+            with cols[i % 4]:
+                data = _tb.download_attachment_bytes(a["storage_path"])
+                if data:
+                    st.image(data, caption=a.get("original_name", ""), width=160)
+                    with st.expander("크게 보기", expanded=False):
+                        st.image(data)
+                else:
+                    st.caption(f"📄 {a.get('original_name','')}")
+
+    # 활동 로그
+    activity = _tb.load_task_activity_cached(tid)
+    if activity:
+        with st.expander("📜 활동 로그", expanded=False):
+            for ev in activity:
+                st.caption(f"[{str(ev.get('created_at',''))[:19]}] {ev.get('actor','-')} → {ev.get('action','')} {ev.get('payload') or ''}")
+
+
 def render_employee_management():
     """직원 계정 관리 및 발령: Supabase Auth Admin API로 계정 생성 + 직원/매장은 Supabase app_users·app_stores 우선. superadmin 전용."""
     st.header("👥 직원 계정 관리 및 발령")
@@ -11501,6 +11929,12 @@ def render_employee_management():
         emp_email = st.text_input("이메일 (로그인 ID)", placeholder="예: employee@example.com", key="emp_email")
         emp_password = st.text_input("초기 비밀번호", type="password", key="emp_password")
         emp_name = st.text_input("직원 이름", placeholder="홍길동", key="emp_name")
+        emp_phone = st.text_input(
+            "휴대폰 번호 (카카오 친구톡 발송용)",
+            placeholder="01012345678",
+            key="emp_phone",
+            help="사내 업무 알림용 카카오 친구톡을 보낼 번호입니다. '-' 없이 숫자만 입력.",
+        )
         emp_stores = st.multiselect(
             "배정 매장 (여러 개 선택 가능)",
             store_options,
@@ -11554,11 +11988,15 @@ def render_employee_management():
                         try:
                             if existing:
                                 user_id = int(existing["id"])
-                                _supabase_update_app_user(user_id, emp_name_val, role, first_store_id, selected_store_ids)
-                                st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
+                                _supabase_update_app_user(user_id, emp_name_val, role, first_store_id, selected_store_ids,
+                                                         phone=(emp_phone or "").strip() or None)
+                                st.success("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장, 휴대폰)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
                                 clear_data_cache()
                             else:
-                                user_id, ins_err = _supabase_insert_app_user(username, str(emp_email).strip(), role, first_store_id, emp_name_val)
+                                user_id, ins_err = _supabase_insert_app_user(
+                                    username, str(emp_email).strip(), role, first_store_id, emp_name_val,
+                                    phone=(emp_phone or "").strip() or None,
+                                )
                                 if ins_err:
                                     st.error(f"직원 명부 등록 실패: {ins_err}")
                                     st.stop()
@@ -12608,7 +13046,13 @@ def render_store_admin_employees():
         if store_id not in store_ids and u.get("store_id") != store_id:
             continue
         name = (u.get("name") or u.get("username") or "").strip()
-        emp_rows.append({"id": u["id"], "username": u.get("username", ""), "name": name or "-", "role": u.get("role", "user"), "hire_date": u.get("hire_date")})
+        emp_rows.append({
+            "id": u["id"], "username": u.get("username", ""), "name": name or "-",
+            "role": u.get("role", "user"), "hire_date": u.get("hire_date"),
+            "phone": u.get("phone") or "",
+            "kakao_friend_added": bool(u.get("kakao_friend_added")),
+            "kakao_notify_enabled": bool(u.get("kakao_notify_enabled", True)),
+        })
     df = pd.DataFrame(emp_rows)
 
     # ---------- 신규 직원 등록 ----------
@@ -12617,6 +13061,12 @@ def render_store_admin_employees():
         new_username = st.text_input("사용자명(ID)", key="emp_new_username")
         new_password = st.text_input("비밀번호", type="password", key="emp_new_password")
         new_name = st.text_input("이름(표시명)", key="emp_new_name")
+        new_phone = st.text_input(
+            "휴대폰 번호 (카카오 친구톡 발송용)",
+            key="emp_new_phone",
+            placeholder="01012345678",
+            help="사내 업무 알림용 카카오 친구톡을 받을 번호입니다. '-' 없이 숫자만.",
+        )
         new_role = st.selectbox("역할", ["store_admin", "user"], key="emp_new_role")
         new_hire_date = st.date_input("입사일 (선택)", value=None, key="emp_new_hire_date")
         if st.form_submit_button("추가"):
@@ -12631,6 +13081,7 @@ def render_store_admin_employees():
                         "name": (new_name or "").strip() or None,
                         "email": None,
                         "hire_date": new_hire_date.isoformat() if new_hire_date else None,
+                        "phone": (new_phone or "").strip() or None,
                     }).execute()
                     new_id = ins.data[0]["id"] if ins.data else None
                     if new_id:
@@ -12660,6 +13111,20 @@ def render_store_admin_employees():
             with st.expander(f"{row['name']} ({row.get('username', '')})"):
                 with st.form(f"emp_{row['id']}"):
                     new_name = st.text_input("이름", value=row["name"], key=f"name_{row['id']}")
+                    new_phone = st.text_input(
+                        "휴대폰 번호",
+                        value=row.get("phone") or "",
+                        key=f"phone_{row['id']}",
+                        placeholder="01012345678",
+                        help="카카오 친구톡 발송 번호. '-' 없이 숫자만.",
+                    )
+                    _kfa = bool(row.get("kakao_friend_added"))
+                    st.caption(f"카카오 채널 친구추가: {'✅ 완료' if _kfa else '⚠️ 미완료'}")
+                    new_kakao_enable = st.checkbox(
+                        "카카오 친구톡 알림 받기",
+                        value=bool(row.get("kakao_notify_enabled", True)),
+                        key=f"knoti_{row['id']}",
+                    )
                     new_role = st.selectbox("역할", ["store_admin", "user"], index=0 if row.get("role") == "store_admin" else 1, key=f"role_{row['id']}")
                     _hd_default = None
                     try:
@@ -12676,6 +13141,8 @@ def render_store_admin_employees():
                                 "name": (new_name or "").strip() or None,
                                 "role": new_role,
                                 "hire_date": new_hire_date.isoformat() if new_hire_date else None,
+                                "phone": (new_phone or "").strip() or None,
+                                "kakao_notify_enabled": bool(new_kakao_enable),
                             }).eq("id", int(row["id"])).execute()
                             clear_data_cache()
                             st.success("수정되었습니다.")
@@ -17672,6 +18139,17 @@ def main():
     if role in ("store_admin", "superadmin"):
         if st.sidebar.button("📈 인력 효율 분석", width='stretch'):
             st.session_state["active_admin_page"] = "employee_analytics"
+    # 사내 업무판 (전 역할 노출)
+    try:
+        from task_board import count_unread_notifications as _count_unread  # noqa: WPS433
+        _cu = st.session_state.get("current_user") or {}
+        _me_uname = _cu.get("username") or _cu.get("email") or ""
+        _unread_n = _count_unread(_me_uname) if _me_uname else 0
+    except Exception:
+        _unread_n = 0
+    _badge = f"  🔔 {_unread_n}" if _unread_n > 0 else ""
+    if st.sidebar.button(f"📋 사내 업무{_badge}", width='stretch'):
+        st.session_state["active_admin_page"] = "internal_work"
 
     st.sidebar.markdown("---")
     if st.sidebar.button("🚪 로그아웃", width='stretch'):
@@ -17722,6 +18200,10 @@ def main():
     # 인력 효율 분석 화면 라우팅 (store_admin / superadmin)
     if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "employee_analytics":
         render_employee_analytics()
+        return
+
+    if st.session_state.get("active_admin_page") == "internal_work":
+        render_internal_work()
         return
 
     # Superadmin: 5탭 최고 관리자 메뉴
