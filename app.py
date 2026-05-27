@@ -747,7 +747,9 @@ def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
         r = client.table("app_users").select("name, username").in_("id", user_ids).execute()
         out = []
         for user_data in (r.data or []):
-            display = (str(user_data.get("name") or "").strip() or str(user_data.get("username") or "").strip()) or None
+            nm = str(user_data.get("name") or "").strip()
+            un = str(user_data.get("username") or "").strip()
+            display = nm or _email_local_part(un) or un or None
             if display and display not in out:
                 out.append(display)
         return out
@@ -866,7 +868,20 @@ def _supabase_insert_app_user(username: str, email: str, role: str, store_id, na
             "name": (name or "").strip() or None,
             "phone": (phone or "").strip() or None,
         }
-        r = client.table("app_users").insert(row).execute()
+
+        def _insert(_row: dict):
+            return client.table("app_users").insert(_row).execute()
+
+        try:
+            r = _insert(row)
+        except Exception as ie:
+            # phone 컬럼이 없는 경우(PGRST204) phone 제외 후 재시도
+            iemsg = str(ie)
+            if "PGRST204" in iemsg or "schema cache" in iemsg.lower() or "could not find" in iemsg.lower():
+                row.pop("phone", None)
+                r = _insert(row)
+            else:
+                raise
         data = (r.data if hasattr(r, "data") else None)
         if data is not None and len(data) > 0:
             row_data = data[0] if isinstance(data, list) else data
@@ -883,8 +898,10 @@ def _supabase_insert_app_user(username: str, email: str, role: str, store_id, na
 
 
 def _supabase_update_app_user(user_id: int, name: str, role: str, store_id, store_ids: list,
-                              phone: str | None = None, kakao_notify_enabled: bool | None = None):
-    """app_users 한 행 수정 + app_user_stores 교체. 에러 시 예외."""
+                              phone: str | None = None, kakao_notify_enabled: bool | None = None) -> list[str]:
+    """app_users 한 행 수정 + app_user_stores 교체.
+    반환: 저장되지 않은 컬럼 이름 목록(예: ['phone']). 컬럼 누락(PGRST204) 시 해당 컬럼 제외 후 재시도.
+    그 외 오류는 예외로 던짐."""
     client, err = get_supabase_client()
     if err or not client:
         raise RuntimeError(err or "Supabase 연결 불가")
@@ -897,18 +914,22 @@ def _supabase_update_app_user(user_id: int, name: str, role: str, store_id, stor
         patch["phone"] = (phone or "").strip() or None
     if kakao_notify_enabled is not None:
         patch["kakao_notify_enabled"] = bool(kakao_notify_enabled)
+    skipped: list[str] = []
     try:
         client.table("app_users").update(patch).eq("id", user_id).execute()
     except Exception as e:
-        # phone/kakao 컬럼이 아직 없는 경우(PGRST204) 해당 컬럼 제외 후 재시도
-        if "PGRST204" in str(e) or "column" in str(e).lower():
-            safe_patch = {k: v for k, v in patch.items() if k in ("name", "role", "store_id")}
+        emsg = str(e)
+        if "PGRST204" in emsg or "schema cache" in emsg.lower() or "could not find" in emsg.lower():
+            base_cols = {"name", "role", "store_id"}
+            safe_patch = {k: v for k, v in patch.items() if k in base_cols}
+            skipped = [k for k in patch.keys() if k not in base_cols]
             client.table("app_users").update(safe_patch).eq("id", user_id).execute()
         else:
             raise
     client.table("app_user_stores").delete().eq("user_id", user_id).execute()
     for sid in (store_ids or []):
         client.table("app_user_stores").insert({"user_id": user_id, "store_id": sid}).execute()
+    return skipped
 
 
 def _supabase_delete_app_user(user_id: int):
@@ -3349,15 +3370,27 @@ def _current_username() -> str:
     return user.get("username") or "unknown"
 
 
+def _email_local_part(value: str) -> str:
+    """이메일 형식이면 @ 앞부분을, 아니면 원문을 반환. 이름 fallback 표시용."""
+    v = (value or "").strip()
+    if not v or "@" not in v:
+        return v
+    return v.split("@", 1)[0] or v
+
+
 def _get_current_user_display_name() -> str:
-    """현재 로그인한 직원의 표시명(실명). app_users.name 우선, 없으면 username. To-Do 작성자 등에 사용."""
+    """현재 로그인한 직원의 표시명(실명).
+    우선순위: session name → app_users.name 캐시 매핑 → 이메일 username의 @ 앞부분 → username."""
     user = st.session_state.get("current_user") or {}
     name = user.get("name")
     if name and str(name).strip():
         return str(name).strip()
     username = user.get("username") or ""
     display_map = _get_app_user_display_name_map()
-    return display_map.get(str(username).strip()) or display_map.get(str(username).strip().lower()) or username or ""
+    mapped = display_map.get(str(username).strip()) or display_map.get(str(username).strip().lower())
+    if mapped and str(mapped).strip():
+        return str(mapped).strip()
+    return _email_local_part(username) or username or ""
 
 
 def _current_display_name_for_todo() -> str:
@@ -12099,9 +12132,16 @@ def render_employee_management():
                         try:
                             if existing:
                                 user_id = int(existing["id"])
-                                _supabase_update_app_user(user_id, emp_name_val, role, first_store_id, selected_store_ids,
-                                                         phone=(emp_phone or "").strip() or None)
+                                _skipped_new = _supabase_update_app_user(
+                                    user_id, emp_name_val, role, first_store_id, selected_store_ids,
+                                    phone=(emp_phone or "").strip() or None,
+                                )
                                 clear_data_cache()
+                                if _skipped_new:
+                                    st.warning(
+                                        "⚠️ `app_users`에 다음 컬럼이 없어 저장되지 않았습니다: "
+                                        f"**{', '.join(_skipped_new)}**. `SUPABASE_APP_USERS_PHONE.sql`을 실행해 주세요."
+                                    )
                                 flash("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장, 휴대폰)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
                             else:
                                 user_id, ins_err = _supabase_insert_app_user(
@@ -12290,7 +12330,7 @@ def render_employee_management():
                                 store_ids = [first_sid] + store_ids
                             try:
                                 if use_supabase:
-                                    _supabase_update_app_user(
+                                    _skipped = _supabase_update_app_user(
                                         edit_user_id,
                                         (edit_name or "").strip() or None,
                                         edit_role,
@@ -12299,6 +12339,25 @@ def render_employee_management():
                                         phone=(edit_phone or "").strip() or None,
                                     )
                                     clear_data_cache()
+                                    if _skipped:
+                                        st.warning(
+                                            "⚠️ Supabase `app_users` 테이블에 다음 컬럼이 없어 저장되지 않았습니다: "
+                                            f"**{', '.join(_skipped)}**. 아래 SQL을 Supabase SQL Editor에서 실행한 뒤 다시 저장해 주세요."
+                                        )
+                                        st.code(
+                                            "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS phone TEXT;\n"
+                                            "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS kakao_friend_added BOOLEAN DEFAULT false;\n"
+                                            "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS kakao_notify_enabled BOOLEAN DEFAULT true;",
+                                            language="sql",
+                                        )
+                                        st.stop()
+                                    # 본인 정보 수정 시 세션도 즉시 갱신 (캘린더·작성자 표시 등 즉각 반영)
+                                    _cu = st.session_state.get("current_user") or {}
+                                    if _cu.get("id") == edit_user_id:
+                                        _cu["name"] = (edit_name or "").strip() or None
+                                        if edit_phone is not None:
+                                            _cu["phone"] = (edit_phone or "").strip() or None
+                                        st.session_state["current_user"] = _cu
                                 else:
                                     conn = get_master_conn()
                                     try:
