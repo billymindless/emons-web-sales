@@ -897,7 +897,15 @@ def _supabase_update_app_user(user_id: int, name: str, role: str, store_id, stor
         patch["phone"] = (phone or "").strip() or None
     if kakao_notify_enabled is not None:
         patch["kakao_notify_enabled"] = bool(kakao_notify_enabled)
-    client.table("app_users").update(patch).eq("id", user_id).execute()
+    try:
+        client.table("app_users").update(patch).eq("id", user_id).execute()
+    except Exception as e:
+        # phone/kakao 컬럼이 아직 없는 경우(PGRST204) 해당 컬럼 제외 후 재시도
+        if "PGRST204" in str(e) or "column" in str(e).lower():
+            safe_patch = {k: v for k, v in patch.items() if k in ("name", "role", "store_id")}
+            client.table("app_users").update(safe_patch).eq("id", user_id).execute()
+        else:
+            raise
     client.table("app_user_stores").delete().eq("user_id", user_id).execute()
     for sid in (store_ids or []):
         client.table("app_user_stores").insert({"user_id": user_id, "store_id": sid}).execute()
