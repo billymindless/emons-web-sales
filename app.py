@@ -12138,9 +12138,10 @@ def render_employee_management():
                                 )
                                 clear_data_cache()
                                 if _skipped_new:
-                                    st.warning(
-                                        "⚠️ `app_users`에 다음 컬럼이 없어 저장되지 않았습니다: "
-                                        f"**{', '.join(_skipped_new)}**. `SUPABASE_APP_USERS_PHONE.sql`을 실행해 주세요."
+                                    flash(
+                                        "이름·권한·매장은 저장되었습니다. "
+                                        "전화번호 저장 실패 — phone 컬럼 없음. SUPABASE_APP_USERS_PHONE.sql 을 실행해 주세요.",
+                                        level="warning",
                                     )
                                 flash("이미 Supabase에 있는 이메일입니다. 직원 정보(이름, 권한, 배정 매장, 휴대폰)만 반영했습니다. 기존 비밀번호로 로그인할 수 있습니다.")
                             else:
@@ -12340,17 +12341,12 @@ def render_employee_management():
                                     )
                                     clear_data_cache()
                                     if _skipped:
-                                        st.warning(
-                                            "⚠️ Supabase `app_users` 테이블에 다음 컬럼이 없어 저장되지 않았습니다: "
-                                            f"**{', '.join(_skipped)}**. 아래 SQL을 Supabase SQL Editor에서 실행한 뒤 다시 저장해 주세요."
+                                        flash(
+                                            "이름·권한·매장은 저장되었습니다. "
+                                            "전화번호는 app_users 테이블에 phone 컬럼이 없어 저장되지 않았습니다. "
+                                            "Supabase SQL Editor에서 SUPABASE_APP_USERS_PHONE.sql 을 실행한 뒤 다시 저장해 주세요.",
+                                            level="warning",
                                         )
-                                        st.code(
-                                            "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS phone TEXT;\n"
-                                            "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS kakao_friend_added BOOLEAN DEFAULT false;\n"
-                                            "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS kakao_notify_enabled BOOLEAN DEFAULT true;",
-                                            language="sql",
-                                        )
-                                        st.stop()
                                     # 본인 정보 수정 시 세션도 즉시 갱신 (캘린더·작성자 표시 등 즉각 반영)
                                     _cu = st.session_state.get("current_user") or {}
                                     if _cu.get("id") == edit_user_id:
