@@ -761,13 +761,18 @@ def _get_supabase_users_list():
     client, err = get_supabase_client()
     if err or not client:
         return []
-    try:
-        r = client.table("app_users").select(
-            "id, username, email, role, name, store_id, hire_date, phone, kakao_friend_added, kakao_notify_enabled"
-        ).order("username").execute()
-        return (r.data or []) if hasattr(r, "data") else []
-    except Exception:
-        return []
+    # 확장 컬럼(hire_date, phone, kakao_*)은 마이그레이션 전에 없을 수 있으므로 폴백 처리
+    for cols in [
+        "id, username, email, role, name, store_id, hire_date, phone, kakao_friend_added, kakao_notify_enabled",
+        "id, username, email, role, name, store_id, hire_date, phone",
+        "id, username, email, role, name, store_id",
+    ]:
+        try:
+            r = client.table("app_users").select(cols).order("username").execute()
+            return (r.data or []) if hasattr(r, "data") else []
+        except Exception:
+            continue
+    return []
 
 
 def _get_app_user_display_name_map():
@@ -837,6 +842,7 @@ def _get_supabase_employee_list_with_stores():
             "username": u.get("username"),
             "name": u.get("name"),
             "role": u.get("role"),
+            "phone": u.get("phone") or "",
             "배정매장": 배정매장,
             "기본매장": 기본매장,
         })
@@ -12203,6 +12209,14 @@ def render_employee_management():
                             value=(row[3] or "").strip() or (row[0] or ""),
                             key=f"emp_update_name_{edit_user_id}",
                         )
+                        _cur_phone = (urow.get("phone") or "") if urow else ""
+                        edit_phone = st.text_input(
+                            "휴대폰 번호 (카카오 친구톡 발송용)",
+                            value=_cur_phone,
+                            placeholder="01012345678",
+                            key=f"emp_update_phone_{edit_user_id}",
+                            help="'-' 없이 숫자만 입력. 사내 업무 알림용 카카오 친구톡을 보낼 번호입니다.",
+                        )
                         edit_role = st.selectbox(
                             "권한",
                             options=[r[0] for r in EMPLOYEE_ROLE_OPTIONS],
@@ -12239,7 +12253,14 @@ def render_employee_management():
                                 store_ids = [first_sid] + store_ids
                             try:
                                 if use_supabase:
-                                    _supabase_update_app_user(edit_user_id, (edit_name or "").strip() or None, edit_role, first_sid, store_ids)
+                                    _supabase_update_app_user(
+                                        edit_user_id,
+                                        (edit_name or "").strip() or None,
+                                        edit_role,
+                                        first_sid,
+                                        store_ids,
+                                        phone=(edit_phone or "").strip() or None,
+                                    )
                                     clear_data_cache()
                                     st.success(f"직원 정보가 저장되었습니다. 기본 매장: {edit_primary_store}")
                                 else:
@@ -12544,13 +12565,14 @@ def render_employee_management():
     else:
         df_display["사용자명"] = df_display["username"]
     df_display["배정매장"] = df_display["배정매장"].fillna("")
+    df_display["전화번호"] = df_display["phone"].fillna("") if "phone" in df_display.columns else ""
     if "기본매장" in df_display.columns:
         df_display["기본매장"] = df_display["기본매장"].fillna("")
-        df_display = df_display[["id", "email", "사용자명", "권한", "기본매장", "배정매장"]]
-        df_display.columns = ["ID", "이메일", "사용자명", "권한", "기본 매장 (로그인 시)", "배정 매장 (전체)"]
+        df_display = df_display[["id", "email", "사용자명", "전화번호", "권한", "기본매장", "배정매장"]]
+        df_display.columns = ["ID", "이메일", "사용자명", "전화번호", "권한", "기본 매장 (로그인 시)", "배정 매장 (전체)"]
     else:
-        df_display = df_display[["id", "email", "사용자명", "권한", "배정매장"]]
-        df_display.columns = ["ID", "이메일", "사용자명", "권한", "배정 매장"]
+        df_display = df_display[["id", "email", "사용자명", "전화번호", "권한", "배정매장"]]
+        df_display.columns = ["ID", "이메일", "사용자명", "전화번호", "권한", "배정 매장"]
     st.dataframe(df_display, width='stretch')
 
 
