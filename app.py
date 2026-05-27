@@ -759,22 +759,22 @@ def _get_supabase_store_assigned_employee_names(db_filename: str) -> list:
 
 @st.cache_data(ttl=3600)
 def _get_supabase_users_list():
-    """Supabase app_users 전체 목록 캐시 (10분). 직원 추가/수정 후 clear_data_cache() 호출 시 갱신."""
+    """Supabase app_users 전체 목록 캐시 (10분). 직원 추가/수정 후 clear_data_cache() 호출 시 갱신.
+    select('*')로 실제 존재하는 모든 컬럼을 가져오므로, 마이그레이션 진행 상태와 무관하게
+    있는 컬럼(phone 등)은 항상 결과에 포함된다."""
     client, err = get_supabase_client()
     if err or not client:
         return []
-    # 확장 컬럼(hire_date, phone, kakao_*)은 마이그레이션 전에 없을 수 있으므로 폴백 처리
-    for cols in [
-        "id, username, email, role, name, store_id, hire_date, phone, kakao_friend_added, kakao_notify_enabled",
-        "id, username, email, role, name, store_id, hire_date, phone",
-        "id, username, email, role, name, store_id",
-    ]:
+    try:
+        r = client.table("app_users").select("*").order("username").execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        # 최후 폴백: 핵심 컬럼만
         try:
-            r = client.table("app_users").select(cols).order("username").execute()
+            r = client.table("app_users").select("id, username, email, role, name, store_id").order("username").execute()
             return (r.data or []) if hasattr(r, "data") else []
         except Exception:
-            continue
-    return []
+            return []
 
 
 def _get_app_user_display_name_map():
