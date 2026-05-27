@@ -9172,6 +9172,7 @@ def _erp_get_employee_monthly_target(db_filename: str, employee_name: str,
 @st.cache_data(ttl=120)
 def _erp_store_events_cached(db_filename: str, ym_key: str) -> list:
     """매장 공용 일정 120초 캐시. ym_key='YYYY-MM' 으로 월 단위 분리.
+    다일정(end_date 있는 행)이 해당 월에 한 부분이라도 걸치면 포함.
     저장/삭제 후 _erp_store_events_cached.clear() 호출."""
     if not db_filename or not ym_key:
         return []
@@ -9183,10 +9184,27 @@ def _erp_store_events_cached(db_filename: str, ym_key: str) -> list:
         start = date(int(y), int(m), 1)
         last_day = calendar.monthrange(int(y), int(m))[1]
         end = date(int(y), int(m), last_day)
+        # 시작일이 월말 이전인 모든 행을 가져온 뒤, 종료일 기준으로 클라이언트에서 필터
+        # (event_date <= 월말) AND (end_date IS NULL ? event_date >= 월초 : end_date >= 월초)
         r = client.table("app_store_events").select("*").eq("db_filename", db_filename)\
-            .gte("event_date", start.isoformat()).lte("event_date", end.isoformat())\
+            .lte("event_date", end.isoformat())\
             .order("event_date").execute()
-        return (r.data or []) if hasattr(r, "data") else []
+        rows = (r.data or []) if hasattr(r, "data") else []
+        # end_date 컬럼 누락(구 스키마) 환경에서도 안전하게 처리
+        out = []
+        for row in rows:
+            ev_start_s = str(row.get("event_date") or "")[:10]
+            ev_end_s = str(row.get("end_date") or "")[:10] if row.get("end_date") else ""
+            if not ev_start_s:
+                continue
+            # 월에 걸치는지 검사
+            try:
+                ev_end_date = date.fromisoformat(ev_end_s) if ev_end_s else date.fromisoformat(ev_start_s)
+            except Exception:
+                ev_end_date = date.fromisoformat(ev_start_s)
+            if ev_end_date >= start:
+                out.append(row)
+        return out
     except Exception:
         return []
 
@@ -10137,9 +10155,14 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
     if _events:
         st.caption(f"등록된 일정 {len(_events)}건")
         for _ev in _events:
-            _ec = st.columns([1.5, 2, 1.5, 3, 1])
+            _ec = st.columns([2, 2, 1.5, 3, 1])
+            _ev_start = str(_ev.get("event_date") or "")[:10]
+            _ev_end = str(_ev.get("end_date") or "")[:10] if _ev.get("end_date") else ""
             with _ec[0]:
-                st.markdown(f"**{_ev.get('event_date')}**")
+                if _ev_end and _ev_end != _ev_start:
+                    st.markdown(f"**{_ev_start} ~ {_ev_end}**")
+                else:
+                    st.markdown(f"**{_ev_start}**")
             with _ec[1]:
                 st.markdown(_ev.get("title") or "-")
             with _ec[2]:
@@ -10160,28 +10183,62 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
     else:
         st.info(f"{se_ym} 등록된 매장 공용 일정이 없습니다.")
 
+    # 기간/시간 유형은 폼 외부에서 라디오 선택 → 폼 내부 입력이 즉시 반응
+    sec_outer = st.columns([1, 1])
+    with sec_outer[0]:
+        se_span_mode = st.radio(
+            "기간 유형", ["하루", "여러 날"], horizontal=True, key="se_span_mode",
+            help="여러 날 선택 시 시작일~종료일 사이의 모든 날짜에 표시됩니다.",
+        )
+    with sec_outer[1]:
+        se_time_mode = st.radio(
+            "시간 유형", ["종일", "시간대 지정"], horizontal=True, key="se_time_mode",
+        )
+
     with st.form("erp_store_event_form", clear_on_submit=True):
         st.markdown("**신규 일정 등록**")
-        sec1, sec2 = st.columns([1, 3])
-        with sec1:
-            se_date = st.date_input("날짜", value=_today, key="se_date")
-        with sec2:
-            se_title = st.text_input("제목", placeholder="예: 매장 정기 회의 / 본사 점검 / 행사 준비", key="se_title")
-        sec3, sec4, sec5 = st.columns([1, 1, 3])
-        with sec3:
-            se_has_time = st.checkbox("시간 지정", value=False, key="se_has_time")
-        with sec4:
-            se_start = st.time_input("시작", value=dt_time(18, 0), key="se_start", disabled=not se_has_time)
-        with sec5:
-            se_end = st.time_input("종료", value=dt_time(20, 0), key="se_end", disabled=not se_has_time)
+        if se_span_mode == "하루":
+            sec1, sec2 = st.columns([1, 3])
+            with sec1:
+                se_date_start = st.date_input("날짜", value=_today, key="se_date_start")
+            with sec2:
+                se_title = st.text_input("제목", placeholder="예: 매장 정기 회의 / 본사 점검 / 행사 준비", key="se_title")
+            se_date_end = se_date_start
+        else:
+            sec1a, sec1b, sec2 = st.columns([1, 1, 3])
+            with sec1a:
+                se_date_start = st.date_input("시작일", value=_today, key="se_date_start_multi")
+            with sec1b:
+                se_date_end = st.date_input("종료일", value=_today + timedelta(days=1), key="se_date_end_multi")
+            with sec2:
+                se_title = st.text_input("제목", placeholder="예: 본사 점검 (3일간) / 신상품 전시 / 휴가", key="se_title")
+
+        if se_time_mode == "시간대 지정":
+            sec4, sec5 = st.columns(2)
+            with sec4:
+                se_start = st.time_input("시작 시각", value=dt_time(18, 0), key="se_start")
+            with sec5:
+                se_end = st.time_input("종료 시각", value=dt_time(20, 0), key="se_end")
+            se_has_time = True
+        else:
+            se_start = None
+            se_end = None
+            se_has_time = False
+
         se_note = st.text_input("메모 (선택)", placeholder="추가 설명", key="se_note")
         if st.form_submit_button("📌 매장 공용 일정 등록", type="primary"):
             if not (se_title or "").strip():
                 st.error("제목을 입력해 주세요.")
+            elif se_date_end < se_date_start:
+                st.error("종료일이 시작일보다 빠를 수 없습니다.")
+            elif se_has_time and (se_end.hour * 60 + se_end.minute) <= (se_start.hour * 60 + se_start.minute):
+                st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
             else:
+                _is_multi = (se_date_end != se_date_start)
                 _row = {
                     "db_filename": current_db,
-                    "event_date": se_date.isoformat(),
+                    "event_date": se_date_start.isoformat(),
+                    "end_date": se_date_end.isoformat() if _is_multi else None,
                     "title": se_title.strip(),
                     "start_time": se_start.strftime("%H:%M:%S") if se_has_time else None,
                     "end_time": se_end.strftime("%H:%M:%S") if se_has_time else None,
@@ -10189,9 +10246,25 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                     "created_by": me_name,
                 }
                 ok, e = _erp_insert_row("app_store_events", _row)
+                # end_date 컬럼이 없는 환경(구 스키마)이면 컬럼 빼고 재시도
+                if not ok and ("end_date" in str(e) or "PGRST204" in str(e) or "schema cache" in str(e).lower()):
+                    _row_legacy = {k: v for k, v in _row.items() if k != "end_date"}
+                    ok, e = _erp_insert_row("app_store_events", _row_legacy)
+                    if ok and _is_multi:
+                        flash(
+                            "일정 등록 완료. 단, app_store_events에 end_date 컬럼이 없어 시작일만 저장되었습니다. "
+                            "SUPABASE_APP_ATTENDANCE_COUNTER.sql 의 ALTER TABLE 문을 실행한 뒤 다시 등록해 주세요.",
+                            level="warning",
+                        )
+                        _erp_store_events_cached.clear()
+                        st.rerun()
                 if ok:
                     _erp_store_events_cached.clear()
-                    flash("매장 공용 일정이 등록되었습니다.")
+                    if _is_multi:
+                        _days = (se_date_end - se_date_start).days + 1
+                        flash(f"매장 공용 일정이 등록되었습니다. ({_days}일간: {se_date_start} ~ {se_date_end})")
+                    else:
+                        flash("매장 공용 일정이 등록되었습니다.")
                     st.rerun()
                 else:
                     st.error(f"등록 실패: {e}. `app_store_events` 테이블이 없으면 SUPABASE_APP_ATTENDANCE_COUNTER.sql 을 먼저 실행해 주세요.")
@@ -10329,9 +10402,32 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     logs_by_date: dict = {}
     for l in all_logs:
         logs_by_date.setdefault(str(l.get("log_date") or "")[:10], []).append(l)
+    # 다일정(end_date)이 있는 경우 시작일~종료일 사이 모든 날짜에 배지 표시
     events_by_date: dict = {}
     for ev in all_events:
-        events_by_date.setdefault(str(ev.get("event_date") or "")[:10], []).append(ev)
+        _ev_start_s = str(ev.get("event_date") or "")[:10]
+        _ev_end_s = str(ev.get("end_date") or "")[:10] if ev.get("end_date") else ""
+        if not _ev_start_s:
+            continue
+        try:
+            _ev_start_d = date.fromisoformat(_ev_start_s)
+            _ev_end_d = date.fromisoformat(_ev_end_s) if _ev_end_s else _ev_start_d
+        except Exception:
+            continue
+        if _ev_end_d < _ev_start_d:
+            _ev_end_d = _ev_start_d
+        # 현재 보고 있는 월(period_start~period_end)과 교집합 범위만 순회
+        _it_start = max(_ev_start_d, period_start)
+        _it_end = min(_ev_end_d, period_end)
+        _cur_d = _it_start
+        _total_days = (_ev_end_d - _ev_start_d).days + 1
+        while _cur_d <= _it_end:
+            _idx = (_cur_d - _ev_start_d).days + 1
+            _ev_copy = dict(ev)
+            _ev_copy["_day_idx"] = _idx
+            _ev_copy["_total_days"] = _total_days
+            events_by_date.setdefault(_cur_d.isoformat(), []).append(_ev_copy)
+            _cur_d += timedelta(days=1)
 
     # 인원 부족일 산출 (매장별)
     shortage_dates: set = set()
@@ -10386,18 +10482,19 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             if d_iso in shortage_dates:
                 cell.append("<div style='color:#E53935; font-size:0.62rem; font-weight:bold;'>⚠️ 인원부족</div>")
 
-            # 매장 공용 일정 (메모/표시 전용)
+            # 매장 공용 일정 (메모/표시 전용). 다일정은 N/M일 표시
             for ev in events_by_date.get(d_iso, []):
-                _ev_dbf = ev.get("_dbf", current_db)
-                _ev_sc = store_color.get(_ev_dbf, "#555")
                 _ev_title = (ev.get("title") or "").strip()
                 _ev_ss = str(ev.get("start_time") or "")[:5]
                 _ev_ee = str(ev.get("end_time") or "")[:5]
                 _ev_time = f" {_ev_ss}~{_ev_ee}" if _ev_ss and _ev_ee else ""
+                _ev_total = int(ev.get("_total_days") or 1)
+                _ev_idx = int(ev.get("_day_idx") or 1)
+                _ev_span = f" <span style='color:#FB8C00;'>({_ev_idx}/{_ev_total})</span>" if _ev_total > 1 else ""
                 cell.append(
                     f"<div style='margin-top:2px; background:#FFF8E1; border:1px dashed #FFB300;"
                     f" padding:1px 4px; border-radius:3px; font-size:0.62rem; color:#6D4C41;'>"
-                    f"📌 {_ev_title}<span style='color:#999;'>{_ev_time}</span></div>"
+                    f"📌 {_ev_title}{_ev_span}<span style='color:#999;'>{_ev_time}</span></div>"
                 )
 
             # 근무 계획 (shift_schedules) — 매장 컬러 배경 바 스타일
