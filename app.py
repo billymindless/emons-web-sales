@@ -3370,18 +3370,59 @@ def _current_username() -> str:
     return user.get("username") or "unknown"
 
 
+<<<<<<< Updated upstream
 def _email_local_part(value: str) -> str:
     """이메일 형식이면 @ 앞부분을, 아니면 원문을 반환. 이름 fallback 표시용."""
     v = (value or "").strip()
     if not v or "@" not in v:
         return v
     return v.split("@", 1)[0] or v
+=======
+def _looks_like_email(val: object) -> bool:
+    s = str(val or "").strip()
+    if not s or "@" not in s:
+        return False
+    local, _, domain = s.partition("@")
+    return bool(local and domain and "." in domain)
+
+
+def _resolve_app_user_display_name(
+    *,
+    user_id: int | None = None,
+    username: str | None = None,
+    email: str | None = None,
+    cached_name: str | None = None,
+) -> str:
+    """app_users.name 기준 표시명. 세션/캐시에 이메일이 들어 있어도 DB 실명으로 보정."""
+    display_map = _get_app_user_display_name_map()
+    for key in (username, email):
+        if not key:
+            continue
+        for candidate in (str(key).strip(), str(key).strip().lower()):
+            hit = display_map.get(candidate)
+            if hit and not _looks_like_email(hit):
+                return hit.strip()
+    if user_id:
+        for u in _get_supabase_users_list():
+            if u.get("id") == user_id:
+                nm = str(u.get("name") or "").strip()
+                if nm:
+                    return nm
+    cn = str(cached_name or "").strip()
+    if cn and not _looks_like_email(cn):
+        return cn
+    un = str(username or "").strip()
+    if un and not _looks_like_email(un):
+        return un
+    return ""
+>>>>>>> Stashed changes
 
 
 def _get_current_user_display_name() -> str:
     """현재 로그인한 직원의 표시명(실명).
     우선순위: session name → app_users.name 캐시 매핑 → 이메일 username의 @ 앞부분 → username."""
     user = st.session_state.get("current_user") or {}
+<<<<<<< Updated upstream
     name = user.get("name")
     if name and str(name).strip():
         return str(name).strip()
@@ -3391,6 +3432,29 @@ def _get_current_user_display_name() -> str:
     if mapped and str(mapped).strip():
         return str(mapped).strip()
     return _email_local_part(username) or username or ""
+=======
+    resolved = _resolve_app_user_display_name(
+        user_id=user.get("id"),
+        username=user.get("username"),
+        email=user.get("email"),
+        cached_name=user.get("name"),
+    )
+    if resolved and user and (user.get("name") or "").strip() != resolved:
+        user["name"] = resolved
+    return resolved or str(user.get("username") or "").strip()
+
+
+def _get_current_user_employee_aliases(display_name: str | None = None) -> list[str]:
+    """현재 로그인 직원의 ERP employee_name 별칭(실명·세션명·username·email)."""
+    user = st.session_state.get("current_user") or {}
+    display = (display_name or _get_current_user_display_name() or "").strip()
+    aliases: list[str] = []
+    for v in (display, user.get("name"), user.get("username"), user.get("email")):
+        s = str(v or "").strip()
+        if s and s not in aliases:
+            aliases.append(s)
+    return aliases
+>>>>>>> Stashed changes
 
 
 def _current_display_name_for_todo() -> str:
@@ -5316,6 +5380,10 @@ def _try_restore_from_query_params():
             user["allowed_stores"] = []
     else:
         user["allowed_stores"] = []
+    user["name"] = _resolve_app_user_display_name(
+        user_id=user.get("id"),
+        username=user.get("username"),
+    )
     st.session_state.logged_in = True
     st.session_state.current_user = user
     st.session_state.current_db = user.get("db_filename") if user.get("role") != "superadmin" else None
@@ -5828,8 +5896,11 @@ def render_login():
                                     else:
                                         # 기본 매장이 없거나 배정 목록과 불일치하면 첫 매장으로 fallback
                                         store_id, db_filename = allowed_stores[0][0], allowed_stores[0][1]
-                                display_map = _get_app_user_display_name_map()
-                                display_name = (display_map.get(str(uname).strip()) or display_map.get(str(uname).strip().lower()) or uname or "").strip()
+                                display_name = _resolve_app_user_display_name(
+                                    user_id=user_id,
+                                    username=uname,
+                                    email=str(email).strip(),
+                                )
                                 st.session_state.logged_in = True
                                 st.session_state.current_user = {
                                     "id": user_id, "username": uname, "name": display_name or None, "role": role,
@@ -9081,6 +9152,15 @@ def _erp_get_employee_names_for_store(db_filename: str) -> list:
         return []
 
 
+def _erp_lookup_existing_shift(existing_by_key: dict, me_name: str, date_str: str):
+    """employee_name이 이메일/username으로 저장된 과거 일정도 현재 로그인 직원 일정으로 조회."""
+    for alias in _get_current_user_employee_aliases(me_name):
+        row = existing_by_key.get((alias, date_str))
+        if row:
+            return row
+    return None
+
+
 def _erp_fetch_table(table: str, filters: dict | None = None, order: str | None = None) -> list:
     """범용 Supabase 단순 조회. filters는 단일 eq 조건들."""
     client, err = get_supabase_client()
@@ -9575,13 +9655,13 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     for d in date_list:
         ck = st.session_state.get(f"sp_chk_{d.isoformat()}", None)
         if ck is None:
-            existing_row = existing_by_key.get((me_name, d.isoformat()))
+            existing_row = _erp_lookup_existing_shift(existing_by_key, me_name, d.isoformat())
             ck = bool(existing_row and existing_row.get("shift_start") and existing_row.get("shift_end"))
         if ck:
             ss_val = st.session_state.get(f"sp_start_{d.isoformat()}")
             ee_val = st.session_state.get(f"sp_end_{d.isoformat()}")
             if not ss_val or not ee_val:
-                existing_row = existing_by_key.get((me_name, d.isoformat()))
+                existing_row = _erp_lookup_existing_shift(existing_by_key, me_name, d.isoformat())
                 if existing_row and existing_row.get("shift_start"):
                     ss_val = _erp_parse_time(existing_row.get("shift_start"))
                     ee_val = _erp_parse_time(existing_row.get("shift_end"))
@@ -9726,7 +9806,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
 
         edits = {}
         for d in date_list:
-            existing_row = existing_by_key.get((me_name, d.isoformat()))
+            existing_row = _erp_lookup_existing_shift(existing_by_key, me_name, d.isoformat())
             has_existing = bool(existing_row and existing_row.get("shift_start") and existing_row.get("shift_end"))
             d_std_s, d_std_e = _erp_default_times_for_date(current_db, d)
 
@@ -9792,7 +9872,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         new_rows, delete_ids, updates = [], [], []
         for d_str, (chk, t1, t2) in edits.items():
             d = datetime.fromisoformat(d_str).date()
-            existing_row = existing_by_key.get((me_name, d_str))
+            existing_row = _erp_lookup_existing_shift(existing_by_key, me_name, d_str)
             if not chk:
                 if existing_row:
                     delete_ids.append(int(existing_row["id"]))
@@ -11914,7 +11994,7 @@ def render_employee_analytics():
     import calendar as _cal
     current_user = st.session_state.get("current_user") or {}
     role = current_user.get("role", "")
-    me_name = (current_user.get("name") or current_user.get("username") or "").strip()
+    me_name = _get_current_user_display_name()
 
     if role not in ("store_admin", "superadmin"):
         st.error("접근 권한이 없습니다. 매장 관리자 이상만 이용 가능합니다.")
@@ -12376,8 +12456,7 @@ def render_internal_work():
 
     current_user = st.session_state.get("current_user") or {}
     role = (current_user.get("role") or "user").strip()
-    me_uname = (current_user.get("username") or current_user.get("email") or "").strip()
-    me_name = (current_user.get("name") or me_uname).strip()
+    me_name = _get_current_user_display_name()
     store_id = (current_user.get("store_id") or st.session_state.get("current_store_id"))
     current_db = st.session_state.get("current_db") or ""
     store_name: str | None = None
