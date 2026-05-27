@@ -9999,7 +9999,19 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         for r in _erp_fetch_table("app_staffing_rules", {"db_filename": dbf}):
             rules_by_store_dow.setdefault((dbf, int(r.get("day_of_week") or 0)), []).append(r)
 
-    # 직원 필터 적용
+    # 표시명 정규화: 기존 데이터의 employee_name이 이메일이어도 app_users.name(예: 김승찬)으로 표시
+    _name_map = _get_app_user_display_name_map()
+    def _resolve(emp_raw: str) -> str:
+        if not emp_raw:
+            return ""
+        key = str(emp_raw).strip()
+        return _name_map.get(key) or _name_map.get(key.lower()) or _email_local_part(key) or key
+    for s in all_shifts:
+        s["employee_name"] = _resolve(s.get("employee_name") or "")
+    for l in all_logs:
+        l["employee_name"] = _resolve(l.get("employee_name") or "")
+
+    # 직원 필터 적용 (정규화 후 비교)
     if selected_emp and selected_emp != "(전체 직원)":
         all_shifts = [s for s in all_shifts if (s.get("employee_name") or "") == selected_emp]
         all_logs   = [l for l in all_logs   if (l.get("employee_name") or "") == selected_emp]
