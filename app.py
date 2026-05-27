@@ -8961,7 +8961,7 @@ def _get_store_ids_by_display_names(display_names: list):
 # 직원 식별: home_db_filename + employee_name (표시명)
 # 다점포 근무: work_db_filename + work_location_name 으로 별도 기록
 
-_ERP_WORK_TYPES = ["정상", "연차", "반차", "조퇴", "지각", "시차적립", "시차사용", "행사", "추가근무"]
+_ERP_WORK_TYPES = ["정상", "연차", "반차", "조퇴", "지각", "시차적립", "시차사용", "행사", "추가근무", "포상시간"]
 _ERP_LEAVE_DEDUCTION_MAP = {"연차": 1.0, "반차": 0.5}
 _ERP_DOW_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
 _ERP_BADGE_COLORS = {
@@ -8974,6 +8974,14 @@ _ERP_BADGE_COLORS = {
     "행사": "#8E24AA",
     "추가근무": "#6D4C41",
     "정상": "#90A4AE",
+    "포상시간": "#D81B60",
+}
+
+# 추가근무 보상 방식 (app_overtime_claims.compensation_type)
+_ERP_COMP_TYPE_LABELS = {
+    "comp_time": "시차 적립",
+    "leave_swap": "연차로 대체",
+    "payment": "급여 청구",
 }
 
 # 대시보드와 동일한 KR 공휴일 (주말·공휴일은 매장 기본근무시간 '주말' 기준으로 적용)
@@ -9133,12 +9141,125 @@ def _erp_employee_settings_cached(db_filename: str) -> list:
 
 def _erp_get_employee_weekly_target(db_filename: str, employee_name: str,
                                     default_hours: float = 40.0) -> float:
-    """직원의 주간 목표 근무시간. 미설정 시 default_hours 반환."""
+    """직원의 주간 목표 근무시간. 미설정 시 default_hours 반환.
+    monthly_target_hours가 설정되어 있으면 월/4.33으로 파생 계산."""
     rows = _erp_employee_settings_cached(db_filename)
     for r in rows:
         if (r.get("employee_name") or "") == employee_name:
+            monthly = r.get("monthly_target_hours")
+            if monthly:
+                return round(float(monthly) / 4.33, 2)
             return float(r.get("weekly_target_hours") or default_hours)
     return default_hours
+
+
+def _erp_get_employee_monthly_target(db_filename: str, employee_name: str,
+                                     default_hours: float = 160.0) -> float:
+    """직원의 월간 목표 근무시간. monthly_target_hours 우선, 없으면 weekly*4.33, 둘 다 없으면 default."""
+    rows = _erp_employee_settings_cached(db_filename)
+    for r in rows:
+        if (r.get("employee_name") or "") == employee_name:
+            monthly = r.get("monthly_target_hours")
+            if monthly:
+                return float(monthly)
+            weekly = r.get("weekly_target_hours")
+            if weekly:
+                return round(float(weekly) * 4.33, 2)
+            return default_hours
+    return default_hours
+
+
+@st.cache_data(ttl=120)
+def _erp_store_events_cached(db_filename: str, ym_key: str) -> list:
+    """매장 공용 일정 120초 캐시. ym_key='YYYY-MM' 으로 월 단위 분리.
+    저장/삭제 후 _erp_store_events_cached.clear() 호출."""
+    if not db_filename or not ym_key:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        y, m = ym_key.split("-")
+        start = date(int(y), int(m), 1)
+        last_day = calendar.monthrange(int(y), int(m))[1]
+        end = date(int(y), int(m), last_day)
+        r = client.table("app_store_events").select("*").eq("db_filename", db_filename)\
+            .gte("event_date", start.isoformat()).lte("event_date", end.isoformat())\
+            .order("event_date").execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def _erp_overtime_claims_cached(db_filename: str, status: str | None = None) -> list:
+    """추가근무 보상 신청 목록 60초 캐시. status=None 이면 전체.
+    저장/승인 후 _erp_overtime_claims_cached.clear() 호출."""
+    if not db_filename:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        q = client.table("app_overtime_claims").select("*").eq("db_filename", db_filename)
+        if status:
+            q = q.eq("status", status)
+        r = q.order("created_at", desc=True).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+def _erp_compute_worked_minutes(db_filename: str, employee_name: str,
+                                period_start: date, period_end: date) -> int:
+    """기간 내 직원의 '인정 근무 분(minutes)' 합산. status='approved' 만 집계.
+    - 정상/추가근무/행사: end_time - start_time (정확)
+    - 지각/조퇴: 실제 근무한 분 (start_time, end_time 기반)
+    - 연차: 480분, 반차: 240분
+    - 시차사용: +diff_minutes (휴가 사용도 근무로 인정)
+    - 포상시간: +diff_minutes
+    """
+    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", db_filename,
+                            "log_date", period_start, period_end,
+                            extra_eq={"employee_name": employee_name})
+    total_min = 0
+    for l in logs:
+        if (l.get("status") or "approved") != "approved":
+            continue
+        wt = l.get("work_type") or ""
+        if wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+            ss = _erp_parse_time(l.get("start_time"))
+            ee = _erp_parse_time(l.get("end_time"))
+            if ss and ee:
+                m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
+                if m > 0:
+                    total_min += m
+        elif wt == "연차":
+            total_min += 480
+        elif wt == "반차":
+            total_min += 240
+        elif wt in ("시차사용", "포상시간"):
+            total_min += int(l.get("diff_minutes") or 0)
+    return total_min
+
+
+def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
+                                   year: int, month: int) -> dict:
+    """월 카운터 = 월 목표 - 누적 인정 시간. 반환: target_min, worked_min, remaining_min, percent."""
+    target_h = _erp_get_employee_monthly_target(db_filename, employee_name)
+    target_min = int(round(target_h * 60))
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    period_start = date(int(year), int(month), 1)
+    period_end = date(int(year), int(month), last_day)
+    worked_min = _erp_compute_worked_minutes(db_filename, employee_name, period_start, period_end)
+    remaining = target_min - worked_min
+    percent = (worked_min / target_min * 100.0) if target_min > 0 else 0.0
+    return {
+        "target_min": target_min,
+        "worked_min": worked_min,
+        "remaining_min": remaining,
+        "percent": round(percent, 1),
+    }
 
 
 def _erp_fetch_range(table: str, db_col: str, db_filename: str, date_col: str, start: date, end: date, extra_eq: dict | None = None) -> list:
@@ -9469,6 +9590,44 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         st.metric("잔여 연차", f"{leave_status['annual_remain']:g}일",
                   delta=f"올해 {int(leave_status['days_until_year_end'])}일 남음")
 
+    # ── 월간 근무 카운터 (목표 − 누적) ──────────────────────────
+    _ctr = _erp_compute_monthly_remaining(current_db, me_name, today.year, today.month)
+    _target_h = _ctr["target_min"] / 60.0
+    _worked_h = _ctr["worked_min"] / 60.0
+    _remain_h = _ctr["remaining_min"] / 60.0
+    _percent = _ctr["percent"]
+    _weekly_derived = round(_target_h / 4.33, 1)
+    if _percent >= 100:
+        _remain_color = "#E53935"   # 빨강: 초과
+        _remain_label = "초과 근무"
+    elif _percent >= 80:
+        _remain_color = "#FB8C00"   # 노랑: 임박
+        _remain_label = "달성 임박"
+    else:
+        _remain_color = "#2E7D32"   # 초록: 여유
+        _remain_label = "근무 가능"
+    st.markdown(
+        f"<div style='margin-top:6px; padding:10px 14px; background:#F5F5F5; "
+        f"border-left:5px solid {_remain_color}; border-radius:4px;'>"
+        f"<div style='font-size:0.85rem; color:#555; margin-bottom:4px;'>"
+        f"⏱️ <b>{today.year}년 {today.month}월 근무 카운터</b> ({_remain_label})</div>"
+        f"<div style='font-size:1.05rem;'>"
+        f"<span style='color:#666;'>목표</span> <b>{_target_h:.0f}h</b> "
+        f"<span style='color:#999;'>(주 환산 {_weekly_derived:g}h)</span>"
+        f"  &nbsp;|&nbsp;  "
+        f"<span style='color:#666;'>누적</span> <b>{_worked_h:.1f}h</b> "
+        f"<span style='color:#999;'>({_percent:g}%)</span>"
+        f"  &nbsp;|&nbsp;  "
+        f"<span style='color:#666;'>잔여(카운터)</span> "
+        f"<b style='color:{_remain_color}; font-size:1.2rem;'>{_remain_h:+.1f}h</b>"
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "💡 카운터는 실제 근태 기록(정상·연차·반차·시차사용·포상시간·추가근무 등)을 모두 합산합니다. "
+        "잔여가 음수면 목표 시간을 초과해 일한 것으로, [추가근무·시차 관리]에서 보상(시차/연차/급여)을 신청할 수 있습니다."
+    )
+
     # 경고/안내 메시지
     if leave_status["soak_risk"]:
         st.error(
@@ -9762,9 +9921,9 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                 st.error(f"저장 실패: {err}")
 
     st.divider()
-    # ── 직원별 주간 목표 근무시간 ────────────────────────────────
-    st.markdown("##### 🕐 직원별 주간 목표 근무시간")
-    st.caption("직원마다 주간 목표 근무시간(FT=40h, PT=다양)을 설정합니다. 근무 일정 계획 시 기준값으로 사용됩니다.")
+    # ── 직원별 월간 목표 근무시간 (주 환산 자동 표시) ─────────────
+    st.markdown("##### 🕐 직원별 월간 목표 근무시간")
+    st.caption("직원마다 월 목표 근무시간을 설정합니다. 주 환산은 자동(월 ÷ 4.33). 근무 카운터(목표−누적)의 기준값입니다.")
 
     _employees = _erp_get_employee_names_for_store(current_db)
     if not _employees:
@@ -9773,28 +9932,37 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
         _emp_settings = _erp_employee_settings_cached(current_db)
         _emp_map = {r.get("employee_name"): r for r in _emp_settings}
 
+        # 월 단위 프리셋 (주 단위 × 4.33 환산)
         _emp_type_hours = {
-            "정규직 (40h)": 40.0, "단시간 35h": 35.0, "파트타임 30h": 30.0,
-            "파트타임 25h": 25.0, "파트타임 20h": 20.0, "파트타임 15h": 15.0,
+            "정규직 (월 173h)": 173.0, "단시간 (월 152h)": 152.0,
+            "파트타임 (월 130h)": 130.0, "파트타임 (월 108h)": 108.0,
+            "파트타임 (월 87h)": 87.0, "파트타임 (월 65h)": 65.0,
             "직접 입력": None,
         }
         _emp_types = list(_emp_type_hours.keys())
 
-        # 폼 없이 위젯 직접 사용 → selectbox 변경 시 number_input 즉시 반응
-        hdr = st.columns([2, 2, 2])
+        hdr = st.columns([1.6, 2.2, 1.6, 1.3])
         hdr[0].markdown("**직원명**")
         hdr[1].markdown("**근무 유형**")
-        hdr[2].markdown("**주간 목표 (h)**")
+        hdr[2].markdown("**월 목표 (h)**")
+        hdr[3].markdown("**주 환산**")
 
         _emp_edits: dict[str, float] = {}
         for _emp in _employees:
             _saved = _emp_map.get(_emp, {})
-            _saved_h = float(_saved.get("weekly_target_hours") or 40.0)
+            # monthly 우선, 없으면 weekly*4.33 환산, 둘 다 없으면 173h 기본
+            _saved_monthly = _saved.get("monthly_target_hours")
+            if _saved_monthly:
+                _saved_h = float(_saved_monthly)
+            elif _saved.get("weekly_target_hours"):
+                _saved_h = round(float(_saved["weekly_target_hours"]) * 4.33, 1)
+            else:
+                _saved_h = 173.0
             _matched = next(
-                (t for t, h in _emp_type_hours.items() if h is not None and abs(h - _saved_h) < 0.1),
+                (t for t, h in _emp_type_hours.items() if h is not None and abs(h - _saved_h) < 0.5),
                 "직접 입력",
             )
-            rc = st.columns([2, 2, 2])
+            rc = st.columns([1.6, 2.2, 1.6, 1.3])
             with rc[0]:
                 st.markdown(f"**{_emp}**")
             with rc[1]:
@@ -9805,45 +9973,68 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                     label_visibility="collapsed",
                 )
             with rc[2]:
-                # 프리셋 선택 시 해당 시간을 기본값으로 number_input 표시
-                # 항상 number_input을 렌더링해야 폼 밖에서도 즉각 반응함
                 _preset_h = _emp_type_hours.get(_sel_type)
                 _default_h = _preset_h if _preset_h is not None else _saved_h
                 _h_val = st.number_input(
-                    "주간 목표(h)",
-                    min_value=1.0, max_value=60.0,
-                    value=_default_h,
-                    step=0.5,
+                    "월 목표(h)",
+                    min_value=10.0, max_value=300.0,
+                    value=float(_default_h),
+                    step=1.0,
                     key=f"erp_emp_h_{_emp}",
                     label_visibility="collapsed",
-                    disabled=(_preset_h is not None),   # 프리셋 선택 시 비활성화, 직접입력만 활성
+                    disabled=(_preset_h is not None),
                 )
+            with rc[3]:
+                _weekly = round(float(_h_val) / 4.33, 1)
+                st.markdown(f"<span style='color:#666;'>주 {_weekly:g}h</span>", unsafe_allow_html=True)
             _emp_edits[_emp] = _h_val
 
-        st.caption("💡 '직접 입력'을 선택하면 주간 목표 시간을 자유롭게 입력할 수 있습니다.")
+        st.caption("💡 '직접 입력'을 선택하면 자유롭게 입력할 수 있습니다. 주 환산은 표시용(저장값은 월 기준).")
 
         if st.button("💾 직원별 목표 근무시간 저장", type="primary", key="erp_emp_weekly_save"):
             _ok_cnt, _err_cnt = 0, 0
+            _skipped_monthly = False
             for _emp, _h in _emp_edits.items():
                 _saved = _emp_map.get(_emp)
+                _monthly_h = float(_h)
+                _weekly_h = round(_monthly_h / 4.33, 2)
                 _row = {
                     "db_filename": current_db,
                     "employee_name": _emp,
-                    "weekly_target_hours": float(_h),
+                    "monthly_target_hours": _monthly_h,
+                    "weekly_target_hours": _weekly_h,
                     "updated_by": me_name,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
-                if _saved and _saved.get("id"):
-                    ok, _ = _erp_update_row("app_employee_settings", int(_saved["id"]), _row)
+                _do_save = _erp_update_row if (_saved and _saved.get("id")) else _erp_insert_row
+                _target = int(_saved["id"]) if (_saved and _saved.get("id")) else None
+                if _target:
+                    ok, e = _erp_update_row("app_employee_settings", _target, _row)
                 else:
-                    ok, _ = _erp_insert_row("app_employee_settings", _row)
+                    ok, e = _erp_insert_row("app_employee_settings", _row)
+                # monthly_target_hours 컬럼이 없으면 weekly만 저장하도록 재시도
+                if not ok and ("monthly_target_hours" in str(e) or "PGRST204" in str(e) or "schema cache" in str(e).lower()):
+                    _row_legacy = {k: v for k, v in _row.items() if k != "monthly_target_hours"}
+                    if _target:
+                        ok, e = _erp_update_row("app_employee_settings", _target, _row_legacy)
+                    else:
+                        ok, e = _erp_insert_row("app_employee_settings", _row_legacy)
+                    if ok:
+                        _skipped_monthly = True
                 if ok:
                     _ok_cnt += 1
                 else:
                     _err_cnt += 1
             _erp_employee_settings_cached.clear()
             if _err_cnt == 0:
-                flash(f"{_ok_cnt}명의 주간 목표 근무시간이 저장되었습니다.")
+                if _skipped_monthly:
+                    flash(
+                        f"{_ok_cnt}명 저장 완료. monthly_target_hours 컬럼이 없어 주 단위만 저장되었습니다. "
+                        "SUPABASE_APP_ATTENDANCE_COUNTER.sql 의 ALTER TABLE 문을 실행해 주세요.",
+                        level="warning",
+                    )
+                else:
+                    flash(f"{_ok_cnt}명의 월간 목표 근무시간이 저장되었습니다.")
                 st.rerun()
             else:
                 st.warning(f"저장 완료 {_ok_cnt}명 / 실패 {_err_cnt}명. "
@@ -9854,6 +10045,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                     "  db_filename TEXT NOT NULL,\n"
                     "  employee_name TEXT NOT NULL,\n"
                     "  weekly_target_hours NUMERIC DEFAULT 40,\n"
+                    "  monthly_target_hours NUMERIC,\n"
                     "  updated_by TEXT,\n"
                     "  updated_at TIMESTAMPTZ DEFAULT now(),\n"
                     "  UNIQUE (db_filename, employee_name)\n"
@@ -9922,6 +10114,88 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                         else:
                             st.error(f"추가 실패: {err}")
 
+    # ── 매장 공용 일정 (메모/표시 전용) ───────────────────────────
+    st.divider()
+    st.markdown("##### 📌 매장 공용 일정 (회의·이벤트 등 메모)")
+    st.caption("매장 전체에 적용되는 일정을 등록합니다. 캘린더 상단에 배지로 표시되며, 개인 근무시간 계산에는 영향이 없습니다.")
+
+    _today = _today_kst()
+    se_ym = st.session_state.get("erp_se_ym", _today.strftime("%Y-%m"))
+    sec_y, sec_m = (int(x) for x in se_ym.split("-"))
+    cy1, cy2 = st.columns([1, 4])
+    with cy1:
+        _new_ym = st.text_input("조회 월(YYYY-MM)", value=se_ym, key="erp_se_ym_input")
+        if _new_ym != se_ym:
+            try:
+                _y, _m = (int(x) for x in _new_ym.split("-"))
+                st.session_state["erp_se_ym"] = _new_ym
+                sec_y, sec_m = _y, _m
+                se_ym = _new_ym
+            except Exception:
+                st.warning("YYYY-MM 형식으로 입력해 주세요.")
+    _events = _erp_store_events_cached(current_db, se_ym)
+    if _events:
+        st.caption(f"등록된 일정 {len(_events)}건")
+        for _ev in _events:
+            _ec = st.columns([1.5, 2, 1.5, 3, 1])
+            with _ec[0]:
+                st.markdown(f"**{_ev.get('event_date')}**")
+            with _ec[1]:
+                st.markdown(_ev.get("title") or "-")
+            with _ec[2]:
+                _ss = str(_ev.get("start_time") or "")[:5]
+                _ee = str(_ev.get("end_time") or "")[:5]
+                st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "종일")
+            with _ec[3]:
+                st.caption(_ev.get("note") or "")
+            with _ec[4]:
+                if st.button("🗑️", key=f"se_del_{_ev['id']}"):
+                    ok, e = _erp_delete_row("app_store_events", int(_ev["id"]))
+                    if ok:
+                        _erp_store_events_cached.clear()
+                        flash("매장 공용 일정이 삭제되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"삭제 실패: {e}")
+    else:
+        st.info(f"{se_ym} 등록된 매장 공용 일정이 없습니다.")
+
+    with st.form("erp_store_event_form", clear_on_submit=True):
+        st.markdown("**신규 일정 등록**")
+        sec1, sec2 = st.columns([1, 3])
+        with sec1:
+            se_date = st.date_input("날짜", value=_today, key="se_date")
+        with sec2:
+            se_title = st.text_input("제목", placeholder="예: 매장 정기 회의 / 본사 점검 / 행사 준비", key="se_title")
+        sec3, sec4, sec5 = st.columns([1, 1, 3])
+        with sec3:
+            se_has_time = st.checkbox("시간 지정", value=False, key="se_has_time")
+        with sec4:
+            se_start = st.time_input("시작", value=dt_time(18, 0), key="se_start", disabled=not se_has_time)
+        with sec5:
+            se_end = st.time_input("종료", value=dt_time(20, 0), key="se_end", disabled=not se_has_time)
+        se_note = st.text_input("메모 (선택)", placeholder="추가 설명", key="se_note")
+        if st.form_submit_button("📌 매장 공용 일정 등록", type="primary"):
+            if not (se_title or "").strip():
+                st.error("제목을 입력해 주세요.")
+            else:
+                _row = {
+                    "db_filename": current_db,
+                    "event_date": se_date.isoformat(),
+                    "title": se_title.strip(),
+                    "start_time": se_start.strftime("%H:%M:%S") if se_has_time else None,
+                    "end_time": se_end.strftime("%H:%M:%S") if se_has_time else None,
+                    "note": (se_note or "").strip() or None,
+                    "created_by": me_name,
+                }
+                ok, e = _erp_insert_row("app_store_events", _row)
+                if ok:
+                    _erp_store_events_cached.clear()
+                    flash("매장 공용 일정이 등록되었습니다.")
+                    st.rerun()
+                else:
+                    st.error(f"등록 실패: {e}. `app_store_events` 테이블이 없으면 SUPABASE_APP_ATTENDANCE_COUNTER.sql 을 먼저 실행해 주세요.")
+
 
 # ---------- 탭 3: 월별 캘린더 ----------
 
@@ -9977,6 +10251,33 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                                     ["(전체 직원)"] + all_emps,
                                     key="erp_cal_emp")
 
+    # ── 월 카운터 위젯 (필터된 직원 또는 본인 기준) ──────────────
+    _ctr_target_emp = selected_emp if (selected_emp and selected_emp != "(전체 직원)") else me_name
+    _ctr_target_db = target_dbs[0] if (sel_store != "전체 매장" and target_dbs) else current_db
+    if _ctr_target_emp:
+        _cal_ctr = _erp_compute_monthly_remaining(_ctr_target_db, _ctr_target_emp, int(year), int(month))
+        _ct_target_h = _cal_ctr["target_min"] / 60.0
+        _ct_worked_h = _cal_ctr["worked_min"] / 60.0
+        _ct_remain_h = _cal_ctr["remaining_min"] / 60.0
+        _ct_pct = _cal_ctr["percent"]
+        _ct_weekly = round(_ct_target_h / 4.33, 1)
+        if _ct_pct >= 100:
+            _cc = "#E53935"
+        elif _ct_pct >= 80:
+            _cc = "#FB8C00"
+        else:
+            _cc = "#2E7D32"
+        st.markdown(
+            f"<div style='margin:6px 0 10px 0; padding:8px 12px; background:#FAFAFA;"
+            f" border-left:4px solid {_cc}; border-radius:4px; font-size:0.88rem;'>"
+            f"⏱️ <b>{_ctr_target_emp}</b> · {int(year)}년 {int(month)}월 카운터 &nbsp;|&nbsp; "
+            f"목표 <b>{_ct_target_h:.0f}h</b> (주 {_ct_weekly:g}h) "
+            f"&nbsp;|&nbsp; 누적 <b>{_ct_worked_h:.1f}h</b> ({_ct_pct:g}%) "
+            f"&nbsp;|&nbsp; 잔여 <b style='color:{_cc}; font-size:1.1rem;'>{_ct_remain_h:+.1f}h</b>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
     # ── 데이터 로드 ─────────────────────────────────────────────
     last_day = _cal.monthrange(int(year), int(month))[1]
     period_start = date(int(year), int(month), 1)
@@ -9984,7 +10285,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
 
     all_shifts: list = []
     all_logs:   list = []
+    all_events: list = []
     rules_by_store_dow: dict = {}
+    _ym_key = f"{int(year):04d}-{int(month):02d}"
     for dbf in target_dbs:
         _sh = _erp_fetch_range("app_shift_schedules", "db_filename", dbf,
                                "shift_date", period_start, period_end)
@@ -9996,6 +10299,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         for l in _lg:
             l["_dbf"] = dbf
         all_logs += _lg
+        for _ev in _erp_store_events_cached(dbf, _ym_key):
+            _ev["_dbf"] = dbf
+            all_events.append(_ev)
         for r in _erp_fetch_table("app_staffing_rules", {"db_filename": dbf}):
             rules_by_store_dow.setdefault((dbf, int(r.get("day_of_week") or 0)), []).append(r)
 
@@ -10023,6 +10329,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     logs_by_date: dict = {}
     for l in all_logs:
         logs_by_date.setdefault(str(l.get("log_date") or "")[:10], []).append(l)
+    events_by_date: dict = {}
+    for ev in all_events:
+        events_by_date.setdefault(str(ev.get("event_date") or "")[:10], []).append(ev)
 
     # 인원 부족일 산출 (매장별)
     shortage_dates: set = set()
@@ -10076,6 +10385,20 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             cell.append(f"<div style='font-weight:bold; font-size:0.88rem; color:{day_label_color};'>{d_num}{_hol_tag}</div>")
             if d_iso in shortage_dates:
                 cell.append("<div style='color:#E53935; font-size:0.62rem; font-weight:bold;'>⚠️ 인원부족</div>")
+
+            # 매장 공용 일정 (메모/표시 전용)
+            for ev in events_by_date.get(d_iso, []):
+                _ev_dbf = ev.get("_dbf", current_db)
+                _ev_sc = store_color.get(_ev_dbf, "#555")
+                _ev_title = (ev.get("title") or "").strip()
+                _ev_ss = str(ev.get("start_time") or "")[:5]
+                _ev_ee = str(ev.get("end_time") or "")[:5]
+                _ev_time = f" {_ev_ss}~{_ev_ee}" if _ev_ss and _ev_ee else ""
+                cell.append(
+                    f"<div style='margin-top:2px; background:#FFF8E1; border:1px dashed #FFB300;"
+                    f" padding:1px 4px; border-radius:3px; font-size:0.62rem; color:#6D4C41;'>"
+                    f"📌 {_ev_title}<span style='color:#999;'>{_ev_time}</span></div>"
+                )
 
             # 근무 계획 (shift_schedules) — 매장 컬러 배경 바 스타일
             for sh in shifts_by_date.get(d_iso, []):
@@ -10514,7 +10837,20 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
             st.error(f"저장 실패: {err}")
 
     st.divider()
-    st.markdown("##### 📝 추가근무 신청")
+    st.markdown("##### 📝 추가근무 보상 신청")
+    st.caption("목표 근무시간 초과분에 대해 보상 방식을 선택할 수 있습니다. 시차/연차는 자동 반영, 급여 청구는 관리자 승인 필요.")
+
+    # 본인 잔여(시차/연차) 표시 — 선택 가이드
+    _me_for_balance = me_name if role == "user" else None
+    if role == "user":
+        _my_comp = _erp_compute_remaining_comptime(current_db, me_name)
+        _my_leave = _erp_compute_leave_status(current_db, me_name, today)
+        _bc1, _bc2 = st.columns(2)
+        with _bc1:
+            st.caption(f"💼 내 잔여 시차: **{_my_comp}분** ({_my_comp // 60}h {_my_comp % 60}m)")
+        with _bc2:
+            st.caption(f"🎫 내 잔여 연차: **{_my_leave['annual_remain']:g}일**")
+
     with st.form("erp_overtime_form", clear_on_submit=True):
         oc = st.columns(4)
         with oc[0]:
@@ -10530,14 +10866,25 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
         with oc[3]:
             ov_end = st.time_input("종료", value=dt_time(20, 0), key="erp_ov_end")
         ov_loc = st.text_input("근무 장소", value="", key="erp_ov_loc")
+        ov_comp_type = st.selectbox(
+            "💰 보상 방식 선택",
+            options=["comp_time", "leave_swap", "payment"],
+            format_func=lambda x: _ERP_COMP_TYPE_LABELS.get(x, x),
+            key="erp_ov_comp_type",
+            help="시차 적립: 잔여 시차에 즉시 추가 / 연차로 대체: 분수를 일수로 환산해 연차에 가산 / 급여 청구: 관리자 승인 후 급여 처리",
+        )
         ov_reason = st.text_input("사유", value="", key="erp_ov_reason")
-        ov_submit = st.form_submit_button("➡️ 신청")
+        ov_submit = st.form_submit_button("➡️ 신청", type="primary")
+
     if ov_submit:
         mins = _erp_minutes_between(ov_start, ov_end)
         if mins <= 0:
             st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
+        elif not (ov_reason or "").strip():
+            st.error("사유를 입력해 주세요.")
         else:
-            row = {
+            # 1) app_overtime_requests 에 기존대로 기록 (이력/감사용)
+            req_row = {
                 "home_db_filename": current_db,
                 "employee_name": ov_emp,
                 "request_date": ov_date.isoformat(),
@@ -10545,15 +10892,84 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
                 "extra_start": ov_start.strftime("%H:%M:%S"),
                 "extra_end": ov_end.strftime("%H:%M:%S"),
                 "extra_minutes": mins,
-                "reason": ov_reason,
-                "status": "pending",
+                "reason": f"[{_ERP_COMP_TYPE_LABELS.get(ov_comp_type, ov_comp_type)}] {ov_reason}",
+                "status": "approved" if ov_comp_type != "payment" else "pending",
                 "created_by": me_name,
             }
-            ok, err = _erp_insert_row("app_overtime_requests", row)
-            if ok:
-                st.success(f"✅ 추가근무 신청 완료 ({mins}분) — 관리자 승인 대기")
+            _erp_insert_row("app_overtime_requests", req_row)
+
+            # 2) 보상 방식별 처리
+            _claim_status = "pending" if ov_comp_type == "payment" else "approved"
+            _claim_row = {
+                "db_filename": current_db,
+                "employee_name": ov_emp,
+                "claim_date": ov_date.isoformat(),
+                "minutes": int(mins),
+                "compensation_type": ov_comp_type,
+                "reason": ov_reason.strip(),
+                "status": _claim_status,
+                "created_by": me_name,
+            }
+            if _claim_status == "approved":
+                _claim_row["approved_by"] = me_name
+                _claim_row["approved_at"] = datetime.now(timezone.utc).isoformat()
+
+            ok, err = _erp_insert_row("app_overtime_claims", _claim_row)
+            if not ok:
+                st.error(f"보상 신청 저장 실패: {err}. 'app_overtime_claims' 테이블이 없으면 SUPABASE_APP_ATTENDANCE_COUNTER.sql 을 먼저 실행해 주세요.")
             else:
-                st.error(f"신청 실패: {err}")
+                _erp_overtime_claims_cached.clear()
+                # 시차 적립: attendance_logs 에 '시차적립' approved 행 추가 → 잔여 시차 즉시 증가
+                if ov_comp_type == "comp_time":
+                    _erp_insert_row("app_attendance_logs", {
+                        "home_db_filename": current_db,
+                        "work_db_filename": current_db,
+                        "employee_name": ov_emp,
+                        "log_date": ov_date.isoformat(),
+                        "work_type": "시차적립",
+                        "leave_deduction": 0,
+                        "diff_minutes": int(mins),
+                        "status": "approved",
+                        "note": f"[추가근무 보상] {ov_reason}",
+                        "created_by": me_name,
+                    })
+                    flash(f"✅ 시차 {mins}분 적립 완료. 잔여 시차에 즉시 반영됩니다.")
+                # 연차로 대체: app_leave_grants 의 annual_days 에 (분/480) 일을 0.5 단위로 가산
+                elif ov_comp_type == "leave_swap":
+                    _days_add = round(mins / 480 * 2) / 2  # 0.5 단위 반올림
+                    if _days_add <= 0:
+                        flash(f"⚠️ 추가 분수({mins}분)가 0.25일 미만이라 연차로 반올림되지 않았습니다. 시차 적립을 권장합니다.", level="warning")
+                    else:
+                        _yr = ov_date.year
+                        _grants = _erp_fetch_table("app_leave_grants", {
+                            "home_db_filename": current_db,
+                            "employee_name": ov_emp,
+                            "year": _yr,
+                        })
+                        if _grants:
+                            _gr = _grants[0]
+                            _new_days = float(_gr.get("annual_days") or 0) + _days_add
+                            _erp_update_row("app_leave_grants", int(_gr["id"]), {
+                                "annual_days": _new_days,
+                                "adjustment_note": (_gr.get("adjustment_note") or "") + f" [+{_days_add:g}일: 추가근무 대체]",
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                        else:
+                            _erp_insert_row("app_leave_grants", {
+                                "home_db_filename": current_db,
+                                "employee_name": ov_emp,
+                                "hire_date": today.isoformat(),
+                                "year": _yr,
+                                "annual_days": _days_add,
+                                "adjustment_note": f"[추가근무 대체 +{_days_add:g}일]",
+                                "created_by": me_name,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                        flash(f"✅ 연차 {_days_add:g}일 가산 완료 ({mins}분 → {_days_add:g}일). 연차/월차 관리 탭에서 확인할 수 있습니다.")
+                # 급여 청구: pending. 관리자가 승인해야 처리됨
+                else:
+                    flash(f"💸 급여 청구 {mins}분이 접수되었습니다. 관리자 승인 후 처리됩니다.")
+                st.rerun()
 
     if role in ("store_admin", "superadmin"):
         st.divider()
@@ -10654,6 +11070,52 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
                     if st.button("반려(삭제)", key=f"erp_lv_rej_{req['id']}"):
                         _erp_delete_row("app_attendance_logs", int(req["id"]))
                         st.rerun()
+
+        # ── 급여 청구 승인 대기 ──────────────────────────────────
+        st.divider()
+        st.markdown("##### 💸 급여 청구 승인 대기 목록 (관리자)")
+        st.caption("직원이 추가근무 보상을 '급여 청구'로 신청한 건입니다. 승인하면 급여에 반영하실 수 있습니다.")
+        _all_claims = _erp_overtime_claims_cached(current_db, status="pending")
+        _pay_claims = [c for c in _all_claims if c.get("compensation_type") == "payment"]
+        if not _pay_claims:
+            st.info("대기 중인 급여 청구가 없습니다.")
+        else:
+            for cl in _pay_claims:
+                rc = st.columns([2, 2, 2, 1, 1])
+                _mins = int(cl.get("minutes") or 0)
+                _hh, _mm = divmod(_mins, 60)
+                with rc[0]:
+                    st.text(f"{cl.get('claim_date')}  {cl.get('employee_name')}")
+                with rc[1]:
+                    st.caption(f"추가근무: {_hh}h {_mm}m ({_mins}분)")
+                with rc[2]:
+                    st.caption(f"사유: {cl.get('reason') or '-'}  |  신청: {str(cl.get('created_at') or '')[:16]}")
+                with rc[3]:
+                    if st.button("승인", key=f"erp_pay_app_{cl['id']}", type="primary"):
+                        ok, e = _erp_update_row("app_overtime_claims", int(cl["id"]), {
+                            "status": "approved",
+                            "approved_by": me_name,
+                            "approved_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        if ok:
+                            _erp_overtime_claims_cached.clear()
+                            flash(f"💸 {cl.get('employee_name')} 님의 급여 청구 {_hh}h {_mm}m 이 승인되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"승인 실패: {e}")
+                with rc[4]:
+                    if st.button("반려", key=f"erp_pay_rej_{cl['id']}"):
+                        ok, e = _erp_update_row("app_overtime_claims", int(cl["id"]), {
+                            "status": "rejected",
+                            "approved_by": me_name,
+                            "approved_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        if ok:
+                            _erp_overtime_claims_cached.clear()
+                            flash(f"급여 청구가 반려되었습니다.", level="warning")
+                            st.rerun()
+                        else:
+                            st.error(f"반려 실패: {e}")
 
 
 # ---------- 탭 6: 연차/월차 관리 (store_admin) ----------
@@ -10783,6 +11245,71 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
         st.dataframe(df, width='stretch', hide_index=True)
     else:
         st.info("표시할 데이터가 없습니다.")
+
+    # ── 직원 포상시간 부여 (관리자) ────────────────────────────
+    st.divider()
+    st.markdown("##### 🏅 직원 포상시간 부여")
+    st.caption("관리자가 직원에게 보상으로 주는 시간입니다. 부여 즉시 직원의 월 근무 카운터에서 자동으로 차감됩니다(일한 것처럼 인정).")
+
+    with st.form("erp_bonus_hours_form", clear_on_submit=True):
+        bc1, bc2, bc3 = st.columns([2, 1, 1])
+        with bc1:
+            bh_emp = st.selectbox("직원", employees, key="erp_bh_emp")
+        with bc2:
+            bh_date = st.date_input("부여 날짜", value=today, key="erp_bh_date")
+        with bc3:
+            bh_minutes = st.number_input("분수", min_value=15, max_value=2880, value=240, step=15,
+                                         key="erp_bh_minutes",
+                                         help="포상으로 인정할 분수. 예: 4시간=240분, 1일=480분")
+        bh_note = st.text_input("사유", value="", key="erp_bh_note",
+                                placeholder="예: 우수 실적 포상 / 행사 지원 보상 / 휴일 출근 대체")
+        bh_submit = st.form_submit_button("🏅 포상시간 부여", type="primary")
+
+    if bh_submit:
+        if not (bh_note or "").strip():
+            st.error("사유를 입력해 주세요.")
+        else:
+            _bh_row = {
+                "home_db_filename": current_db,
+                "work_db_filename": current_db,
+                "employee_name": bh_emp,
+                "log_date": bh_date.isoformat(),
+                "work_type": "포상시간",
+                "leave_deduction": 0,
+                "diff_minutes": int(bh_minutes),
+                "status": "approved",
+                "note": bh_note.strip(),
+                "created_by": me_name,
+            }
+            ok, e = _erp_insert_row("app_attendance_logs", _bh_row)
+            if ok:
+                _hh, _mm = divmod(int(bh_minutes), 60)
+                flash(f"🏅 {bh_emp} 님에게 포상시간 {_hh}시간 {_mm}분이 부여되었습니다. 월 카운터에 즉시 반영됩니다.")
+                st.rerun()
+            else:
+                st.error(f"부여 실패: {e}")
+
+    # 부여 이력 조회
+    _bh_year = today.year
+    _bh_logs = _erp_fetch_range(
+        "app_attendance_logs", "home_db_filename", current_db,
+        "log_date", date(_bh_year, 1, 1), date(_bh_year, 12, 31),
+    )
+    _bh_history = [l for l in _bh_logs if l.get("work_type") == "포상시간"]
+    if _bh_history:
+        st.caption(f"올해 부여 이력: {len(_bh_history)}건")
+        _bh_history_sorted = sorted(_bh_history, key=lambda x: str(x.get("log_date") or ""), reverse=True)
+        _bh_df = pd.DataFrame([
+            {
+                "날짜": l.get("log_date"),
+                "직원": l.get("employee_name"),
+                "시간": f"{int(l.get('diff_minutes') or 0) // 60}h {int(l.get('diff_minutes') or 0) % 60}m",
+                "분수": int(l.get("diff_minutes") or 0),
+                "사유": l.get("note") or "",
+                "부여자": l.get("created_by") or "",
+            } for l in _bh_history_sorted[:30]
+        ])
+        st.dataframe(_bh_df, width='stretch', hide_index=True)
 
 
 # ---------- 탭 7: 월말 급여 요약 (store_admin) ----------
