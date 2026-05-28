@@ -20247,7 +20247,8 @@ def main():
             "5. 매장 관리자 메뉴",
             "6. 결제수단별 집계표",
             "7. 고객 CRM 자동화",
-            "8. FAQ (도움말)",
+            "8. 전시품 판매 검증",
+            "9. FAQ (도움말)",
         ]
     else:
         tab_labels = [
@@ -20256,7 +20257,8 @@ def main():
             "3. 새로운 매출 등록",
             "4. 고객 및 잔금 관리",
             "5. 결제수단별 집계표",
-            "6. FAQ (도움말)",
+            "6. 전시품 판매 검증",
+            "7. FAQ (도움말)",
         ]
     if "main_tab_idx" not in st.session_state:
         st.session_state["main_tab_idx"] = 0
@@ -20306,9 +20308,6 @@ def main():
         render_marketing_insights_tenant()
     elif idx == 2:
         render_new_sales()
-        st.divider()
-        with st.expander("🎁 전시품 판매 검증 (KPI '전시품 판매액' 옵션 A2 분배 검증 도구)", expanded=False):
-            render_display_sales_audit()
     elif idx == 3:
         render_customer_balance()
     elif role == "store_admin" and idx == 4:
@@ -20322,9 +20321,11 @@ def main():
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
-    elif role == "store_admin" and idx == 7:
+    elif (role == "store_admin" and idx == 7) or (role == "user" and idx == 5):
+        render_display_sales_audit()
+    elif role == "store_admin" and idx == 8:
         render_faq_page()
-    elif role == "user" and idx == 5:
+    elif role == "user" and idx == 6:
         render_faq_page()
 
 
