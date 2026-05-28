@@ -10152,34 +10152,156 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
             except Exception:
                 st.warning("YYYY-MM 형식으로 입력해 주세요.")
     _events = _erp_store_events_cached(current_db, se_ym)
+    _editing_id = st.session_state.get("se_editing_id")
     if _events:
         st.caption(f"등록된 일정 {len(_events)}건")
         for _ev in _events:
-            _ec = st.columns([2, 2, 1.5, 3, 1])
+            _ev_id = int(_ev["id"])
             _ev_start = str(_ev.get("event_date") or "")[:10]
             _ev_end = str(_ev.get("end_date") or "")[:10] if _ev.get("end_date") else ""
-            with _ec[0]:
-                if _ev_end and _ev_end != _ev_start:
-                    st.markdown(f"**{_ev_start} ~ {_ev_end}**")
-                else:
-                    st.markdown(f"**{_ev_start}**")
-            with _ec[1]:
-                st.markdown(_ev.get("title") or "-")
-            with _ec[2]:
-                _ss = str(_ev.get("start_time") or "")[:5]
-                _ee = str(_ev.get("end_time") or "")[:5]
-                st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "종일")
-            with _ec[3]:
-                st.caption(_ev.get("note") or "")
-            with _ec[4]:
-                if st.button("🗑️", key=f"se_del_{_ev['id']}"):
-                    ok, e = _erp_delete_row("app_store_events", int(_ev["id"]))
-                    if ok:
-                        _erp_store_events_cached.clear()
-                        flash("매장 공용 일정이 삭제되었습니다.")
+
+            if _editing_id == _ev_id:
+                # 인라인 수정 모드
+                try:
+                    _cur_start = date.fromisoformat(_ev_start)
+                except Exception:
+                    _cur_start = _today
+                try:
+                    _cur_end = date.fromisoformat(_ev_end) if _ev_end else _cur_start
+                except Exception:
+                    _cur_end = _cur_start
+                _cur_st_s = str(_ev.get("start_time") or "")[:5]
+                _cur_et_s = str(_ev.get("end_time") or "")[:5]
+                _is_multi_cur = bool(_ev_end) and (_ev_end != _ev_start)
+                _has_time_cur = bool(_cur_st_s and _cur_et_s)
+
+                with st.container(border=True):
+                    st.markdown(f"**✏️ 일정 수정 (#{_ev_id})**")
+                    _rc1, _rc2 = st.columns([1, 1])
+                    with _rc1:
+                        _edit_span = st.radio(
+                            "기간 유형", ["하루", "여러 날"],
+                            index=1 if _is_multi_cur else 0,
+                            horizontal=True, key=f"se_edit_span_{_ev_id}",
+                        )
+                    with _rc2:
+                        _edit_time_mode = st.radio(
+                            "시간 유형", ["종일", "시간대 지정"],
+                            index=1 if _has_time_cur else 0,
+                            horizontal=True, key=f"se_edit_time_mode_{_ev_id}",
+                        )
+
+                    with st.form(f"se_edit_form_{_ev_id}", clear_on_submit=False):
+                        if _edit_span == "하루":
+                            _ec1, _ec2 = st.columns([1, 3])
+                            with _ec1:
+                                _new_start = st.date_input("날짜", value=_cur_start, key=f"se_edit_dt_{_ev_id}")
+                            with _ec2:
+                                _new_title = st.text_input("제목", value=_ev.get("title") or "", key=f"se_edit_title_{_ev_id}")
+                            _new_end = _new_start
+                        else:
+                            _ec1a, _ec1b, _ec2 = st.columns([1, 1, 3])
+                            with _ec1a:
+                                _new_start = st.date_input("시작일", value=_cur_start, key=f"se_edit_dt_s_{_ev_id}")
+                            with _ec1b:
+                                _new_end = st.date_input(
+                                    "종료일",
+                                    value=_cur_end if _cur_end >= _cur_start else _cur_start,
+                                    key=f"se_edit_dt_e_{_ev_id}",
+                                )
+                            with _ec2:
+                                _new_title = st.text_input("제목", value=_ev.get("title") or "", key=f"se_edit_title_m_{_ev_id}")
+
+                        if _edit_time_mode == "시간대 지정":
+                            try:
+                                _st_default = dt_time(int(_cur_st_s.split(":")[0]), int(_cur_st_s.split(":")[1])) if _cur_st_s else dt_time(18, 0)
+                            except Exception:
+                                _st_default = dt_time(18, 0)
+                            try:
+                                _et_default = dt_time(int(_cur_et_s.split(":")[0]), int(_cur_et_s.split(":")[1])) if _cur_et_s else dt_time(20, 0)
+                            except Exception:
+                                _et_default = dt_time(20, 0)
+                            _ec4, _ec5 = st.columns(2)
+                            with _ec4:
+                                _new_st_t = st.time_input("시작 시각", value=_st_default, key=f"se_edit_st_{_ev_id}")
+                            with _ec5:
+                                _new_et_t = st.time_input("종료 시각", value=_et_default, key=f"se_edit_et_{_ev_id}")
+                            _new_has_time = True
+                        else:
+                            _new_st_t = None
+                            _new_et_t = None
+                            _new_has_time = False
+
+                        _new_note = st.text_input("메모 (선택)", value=_ev.get("note") or "", key=f"se_edit_note_{_ev_id}")
+
+                        _bc1, _bc2, _bc3 = st.columns([1, 1, 4])
+                        with _bc1:
+                            _save_btn = st.form_submit_button("💾 저장", type="primary")
+                        with _bc2:
+                            _cancel_btn = st.form_submit_button("취소")
+
+                    if _cancel_btn:
+                        st.session_state.pop("se_editing_id", None)
                         st.rerun()
+                    if _save_btn:
+                        if not (_new_title or "").strip():
+                            st.error("제목을 입력해 주세요.")
+                        elif _new_end < _new_start:
+                            st.error("종료일이 시작일보다 빠를 수 없습니다.")
+                        elif _new_has_time and (_new_et_t.hour * 60 + _new_et_t.minute) <= (_new_st_t.hour * 60 + _new_st_t.minute):
+                            st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
+                        else:
+                            _is_multi_new = (_new_end != _new_start)
+                            _patch = {
+                                "event_date": _new_start.isoformat(),
+                                "end_date": _new_end.isoformat() if _is_multi_new else None,
+                                "title": _new_title.strip(),
+                                "start_time": _new_st_t.strftime("%H:%M:%S") if _new_has_time else None,
+                                "end_time": _new_et_t.strftime("%H:%M:%S") if _new_has_time else None,
+                                "note": (_new_note or "").strip() or None,
+                            }
+                            ok, e = _erp_update_row("app_store_events", _ev_id, _patch)
+                            # end_date 컬럼이 없는 구 스키마 대응
+                            if not ok and ("end_date" in str(e) or "PGRST204" in str(e) or "schema cache" in str(e).lower()):
+                                _patch_legacy = {k: v for k, v in _patch.items() if k != "end_date"}
+                                ok, e = _erp_update_row("app_store_events", _ev_id, _patch_legacy)
+                            if ok:
+                                _erp_store_events_cached.clear()
+                                st.session_state.pop("se_editing_id", None)
+                                flash("매장 공용 일정이 수정되었습니다.")
+                                st.rerun()
+                            else:
+                                st.error(f"수정 실패: {e}")
+            else:
+                _ec = st.columns([2, 2, 1.5, 3, 0.6, 0.6])
+                with _ec[0]:
+                    if _ev_end and _ev_end != _ev_start:
+                        st.markdown(f"**{_ev_start} ~ {_ev_end}**")
                     else:
-                        st.error(f"삭제 실패: {e}")
+                        st.markdown(f"**{_ev_start}**")
+                with _ec[1]:
+                    st.markdown(_ev.get("title") or "-")
+                with _ec[2]:
+                    _ss = str(_ev.get("start_time") or "")[:5]
+                    _ee = str(_ev.get("end_time") or "")[:5]
+                    st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "종일")
+                with _ec[3]:
+                    st.caption(_ev.get("note") or "")
+                with _ec[4]:
+                    if st.button("✏️", key=f"se_edit_{_ev_id}", help="수정"):
+                        st.session_state["se_editing_id"] = _ev_id
+                        st.rerun()
+                with _ec[5]:
+                    if st.button("🗑️", key=f"se_del_{_ev_id}", help="삭제"):
+                        ok, e = _erp_delete_row("app_store_events", _ev_id)
+                        if ok:
+                            _erp_store_events_cached.clear()
+                            if st.session_state.get("se_editing_id") == _ev_id:
+                                st.session_state.pop("se_editing_id", None)
+                            flash("매장 공용 일정이 삭제되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"삭제 실패: {e}")
     else:
         st.info(f"{se_ym} 등록된 매장 공용 일정이 없습니다.")
 
