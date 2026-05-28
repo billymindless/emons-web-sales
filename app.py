@@ -7382,7 +7382,9 @@ def _superadmin_tab2_hr_store_employees():
         "※ **매출 점수(70)·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
         "**현금수금 점수(10)·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
         "**마진 점수(15)**: 동 기간 sales를 주문 비율로 배분. "
-        "**전시품 점수(5)·전시품 판매액**: 기간 내 sales가 1건이라도 있는 주문의 **전시판매가 × 1/n**(미수·부분결제 무관, 주문당 1회)."
+        "**전시품 점수(5)·전시품 판매액**: 옵션 A2 — **계약일(order_date)이 기간 내**인 주문의 **전시판매가 × 1/n** (주문당 1회). "
+        "다른 달 계약 + 단순 금액수정은 영향 없음. 다른 달 계약 + **이번 달에 총계약금액이 0원이 되면(전체 취소)** 전시판매가 차감. "
+        "주문 수정으로 전시판매가만 변경된 경우 변경 시점 월에 **차액(__dm_d)만 분리 반영**."
     )
 
     # 3) 매출·마진·전시: sales transaction_date 구간 | 현금수금: payment_date·KPI 수납 버킷 (집계만)
@@ -17178,6 +17180,7 @@ def render_customer_balance():
                                     if old_actual_margin != old_actual_margin:  # NaN 방지
                                         old_actual_margin = 0.0
                                     old_cost = float(orow.get("cost_price") or 0)
+                                    old_display_sales = float(orow.get("display_sales_amount") or 0)
                                     old_visit = orow.get("visit_reason") or ""
                                     old_purchase = orow.get("purchase_reason") or ""
                                     d_new = st.session_state.get(f"{edit_prefix}_delivery")
@@ -17207,9 +17210,15 @@ def render_customer_balance():
                                         st.warning(f"⚠️ 주의: 마진율이 {margin_pct:.1f}%입니다. 적정 범위(15%~25%)를 벗어났습니다.")
                                         
                                     # 감사 로그 및 매출 차액 반영
-                                    if old_total != new_total:
-                                        if conn: _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
-                                        delta = new_total - old_total
+                                    # total 또는 전시판매가가 변경되면 sales 행 1건 INSERT (amt = delta_total, note 에 __dm_d:{delta_display} 메타).
+                                    # KPI 옵션 A2: __dm_d 가 있으면 변경 시점 월 KPI 의 전시품 매출에 +delta_display/n 추가 분배 → 일반/전시 분리 반영.
+                                    _delta_total = new_total - old_total
+                                    _delta_display = new_display_sales - old_display_sales
+                                    if _delta_total != 0 or _delta_display != 0:
+                                        if conn and old_total != new_total:
+                                            _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
+                                        if conn and old_display_sales != new_display_sales:
+                                            _insert_audit_log(conn, "Order", sel_oid, "display_sales_amount", old_display_sales, new_display_sales, edit_reason)
                                         today_str = datetime.now(tz=KST).strftime("%Y-%m-%d")
                                         order_date_val = orow.get("order_date") or today_str
                                         if isinstance(order_date_val, str) and "-" in order_date_val:
@@ -17222,13 +17231,14 @@ def render_customer_balance():
                                         new_basic_margin = new_total - new_cost - new_display_cost
                                         _dm_kpi = new_basic_margin - old_basic_margin
                                         note = (
-                                            f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
+                                            f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if _delta_total < 0 else ('추가' if _delta_total > 0 else '전시판매가 변경')}"
                                             f"|__dm2:{int(round(_dm_kpi))}"
                                             f"|__dm:{int(round(_dm_kpi))}"
+                                            f"|__dm_d:{int(round(_delta_display))}"
                                         )
                                         # 담당 직원: 수정 후 직원명 우선, 없으면 기존 직원명 사용 (delta도 같은 직원에게 귀속)
                                         _delta_emp = new_employee_names if new_employee_names else old_employee_names
-                                        _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(delta), note, employee_names=_delta_emp or None)
+                                        _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(_delta_total), note, employee_names=_delta_emp or None)
                                         if margin_pct < 15 or margin_pct > 25:
                                             store_name = _get_store_name_by_db(db_filename)
                                             _insert_admin_alert(store_name, "margin", f"[{store_name}] 마진율 {margin_pct:.1f}% 건이 수정되었습니다.")
@@ -18401,10 +18411,27 @@ def _kpi_parse_delta_margin_from_sales_note(note: object) -> float | None:
         return None
 
 
+def _kpi_parse_delta_display_from_sales_note(note: object) -> float | None:
+    """sales note 에서 |__dm_d:{값}| 형태의 전시판매가 변경분(delta_display)을 파싱한다.
+    없으면 None. 주문 수정 시 일반판매가와 전시판매가 변경분을 분리해 KPI 에 반영하기 위한 메타."""
+    s = str(note or "").strip()
+    if "|__dm_d:" not in s:
+        return None
+    try:
+        tail = s.split("|__dm_d:", 1)[1].split("|", 1)[0].strip()
+        return float(tail)
+    except (ValueError, IndexError):
+        return None
+
+
 def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.DataFrame") -> "pd.DataFrame":
     """sales 원장 구간에서 직원별 순매출·마진·전시 배분.
     - 매출(revenue)·마진(margin): sales 행 단위로 amount/total_amount 비율을 곱해 1/n 분배(현행 유지).
-    - 전시품(display_sales): 주문 단위 1/n 분배. 미수·부분결제와 무관하게, KPI 기간에 해당 주문의 sales가 1건이라도 있으면 display_sales_amount × 1/n 을 1회만 분배(net amount sign 기준 ±).
+    - 전시품(display_sales): 옵션 A2 — 주문 단위 1/n 분배. 분배 트리거는 주문의 order_date.
+        a) order_date 가 KPI 기간 내 → +display_sales_amount × 1/n × 1회 (정상 신규 계약).
+        b) order_date 가 KPI 기간 외 + KPI 기간 내 sales 합이 -total_amount(=누적 sales 0원, 전체 취소) → -display_sales_amount × 1/n × 1회.
+        c) 그 외(다른 달 계약 + 단순 금액수정 delta) → 0 (영향 없음).
+        d) sales note 에 |__dm_d:{delta_display}| 가 있으면 해당 KPI 기간에 +delta_display × 1/n 을 추가 분배 (전시판매가 변경분만 분리 반영).
     1/n 분모는 주문의 최신 employee_names를 우선(sales 스냅샷보다 앞섬)."""
     if kpi_m.empty:
         return pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
@@ -18431,6 +18458,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
     _total_map: dict = {}
     _margin_map = {}
     _display_map = {}
+    _order_date_map: dict = {}
     if not orders.empty and "id" in orders.columns:
         if "total_amount" in orders.columns:
             _total_map = orders.set_index("id")["total_amount"].fillna(0).astype(float).to_dict()
@@ -18438,6 +18466,15 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
             _margin_map = orders.set_index("id")["actual_margin"].fillna(0).astype(float).to_dict()
         if "display_sales_amount" in orders.columns:
             _display_map = orders.set_index("id")["display_sales_amount"].fillna(0).astype(float).to_dict()
+        if "order_date" in orders.columns:
+            _od_series = pd.to_datetime(orders["order_date"], errors="coerce")
+            _id_series = orders["id"]
+            for _i in range(len(orders)):
+                _oid_i = _id_series.iloc[_i]
+                if pd.notna(_oid_i):
+                    _od_i = _od_series.iloc[_i]
+                    if pd.notna(_od_i):
+                        _order_date_map[int(_oid_i)] = _od_i.date()
     rows_md: list = []
     # 1) 매출(revenue)·마진(margin): sales 행 단위 ratio 분배 (display_sales는 0으로 채움)
     for _, r in km.iterrows():
@@ -18470,29 +18507,76 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
         for e in emps:
             rows_md.append({"employee": e, "revenue": per_amt, "margin": margin, "display_sales": 0.0})
 
-    # 2) 전시품(display_sales): 주문 단위 1/n 분배 (옵션 A)
-    #    KPI 기간 내 동일 order_id의 sales amount 합(net) sign 으로 ± 결정. 한 주문당 1회.
-    if "order_id" in km.columns and _display_map:
+    # 2) 전시품(display_sales): 옵션 A2 — 주문 단위 1/n 분배.
+    #    분배 트리거 = 주문의 order_date 가 KPI 기간(kpi_m transaction_date min/max) 내인지 여부.
+    #    a) order_date in KPI 기간 → +base_d/n × 1회 (정상 신규 계약).
+    #    b) order_date 외 + KPI 기간 내 net == -total_amount(=해당 월 누적 sales 0, 전체 취소) → -base_d/n × 1회.
+    #    c) 그 외(다른 달 계약 + 단순 금액수정 delta) → 0.
+    #    d) sales note 에 |__dm_d:{delta_display}| 가 있으면 +delta_display/n 추가 분배 (전시판매가 변경분만 분리 반영).
+    if "order_id" in km.columns and (_display_map or _order_date_map):
+        # KPI 기간 추정: kpi_m transaction_date min/max
+        kpi_start_dt = None
+        kpi_end_dt = None
+        if "transaction_date" in km.columns:
+            _td = pd.to_datetime(km["transaction_date"], errors="coerce").dropna()
+            if not _td.empty:
+                kpi_start_dt = _td.min().date()
+                kpi_end_dt = _td.max().date()
+
         km_oid = km.dropna(subset=["order_id"]).copy()
         if not km_oid.empty:
             km_oid["order_id"] = km_oid["order_id"].astype(int)
             km_oid["amount"] = km_oid["amount"].fillna(0).astype(float) if "amount" in km_oid.columns else 0.0
-            order_net = km_oid.groupby("order_id")["amount"].sum().to_dict()
             order_emp = km_oid.groupby("order_id")["employee_names"].first().to_dict()
-            for _oid_int, _net_amt in order_net.items():
+            order_net_in_kpi = km_oid.groupby("order_id")["amount"].sum().to_dict()
+
+            for _oid_int in km_oid["order_id"].unique():
+                _oid_int = int(_oid_int)
                 base_d = float(_display_map.get(_oid_int, 0) or 0)
-                if base_d == 0:
-                    continue
                 emps = _kpi_parse_employee_list(order_emp.get(_oid_int))
                 if not emps:
                     continue
                 n = len(emps)
-                if _net_amt > 0:
-                    disp_per = base_d / n
-                elif _net_amt < 0:
-                    disp_per = -base_d / n
-                else:
-                    disp_per = 0.0
+                order_date = _order_date_map.get(_oid_int)
+                net_amt = float(order_net_in_kpi.get(_oid_int, 0) or 0)
+                order_total = float(_total_map.get(_oid_int, 0) or 0)
+                in_kpi_range = (
+                    order_date is not None
+                    and kpi_start_dt is not None
+                    and kpi_end_dt is not None
+                    and kpi_start_dt <= order_date <= kpi_end_dt
+                )
+
+                disp_per = 0.0
+                if base_d > 0:
+                    if in_kpi_range:
+                        # 정상 신규 계약 (옵션 A2). 같은 달 전체 취소(net == -total)면 -base_d/n.
+                        if net_amt < 0 and order_total > 0 and abs(net_amt) >= order_total - 1:
+                            disp_per = -base_d / n
+                        else:
+                            disp_per = base_d / n
+                    else:
+                        # 다른 달 계약 + KPI 기간 내 sales 등장.
+                        # 전체 취소 판정: 해당 월 sales 반영 후 주문의 총계약금액이 0원이 되는 경우.
+                        #   ① net_amt + order_total == 0 : 이전 누적이 order_total 이고 해당 월 -order_total 차감으로 0
+                        #   ② order_total == 0          : 수정으로 total이 0이 된 직후 (그 차감분이 해당 월 음수 sales)
+                        if net_amt < 0 and (
+                            order_total == 0
+                            or (order_total > 0 and abs(net_amt + order_total) < 1)
+                        ):
+                            disp_per = -base_d / n
+                        # 그 외(단순 금액수정 delta) → 0
+
+                # __dm_d 메타: 전시판매가 변경분 추가 분배 (KPI 기간 내 sales 행만 영향)
+                _dm_d_sum = 0.0
+                _order_rows = km_oid[km_oid["order_id"] == _oid_int]
+                for _, _row in _order_rows.iterrows():
+                    _dm_d = _kpi_parse_delta_display_from_sales_note(_row.get("note"))
+                    if _dm_d is not None:
+                        _dm_d_sum += _dm_d
+                if _dm_d_sum != 0:
+                    disp_per += _dm_d_sum / n
+
                 if disp_per == 0:
                     continue
                 for e in emps:
@@ -18506,7 +18590,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
 
 @st.fragment
 def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_filename: str):
-    """월별 직원 판매 현황: 종합=매출70+마진15+전시5+현금수금10. 매출=sales 해당월 순액 1/n. 현금수금집계는 참고 열. 마진=sales·주문 비율 1/n. 전시=주문 단위 1/n(미수·부분결제 무관)."""
+    """월별 직원 판매 현황: 종합=매출70+마진15+전시5+현금수금10. 매출=sales 해당월 순액 1/n. 현금수금집계는 참고 열. 마진=sales·주문 비율 1/n. 전시=옵션 A2(계약일 in 해당월 → +base_d/n; 다른 달 계약 + 해당월 총계약금액 0원 → -base_d/n; 단순 금액수정 → 0; sales note __dm_d 가 있으면 변경 시점 월에 +delta/n 추가 분배)."""
     st.subheader("4. 월별 직원 판매 현황 및 평가")
     if not sales_df.empty and "transaction_date" in sales_df.columns:
         _kpi_sales = sales_df.copy()
@@ -18613,7 +18697,9 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                     "※ **종합 점수** = 매출 70 + 마진 15 + 전시품 5 + 현금수금 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
                     "**현금수금 점수(10)·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
                     "**마진 점수(15)**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영. "
-                    "**전시품 점수(5)·전시품 판매액**: 해당 월 sales가 1건이라도 있는 주문의 **전시판매가 × 1/n**(미수·부분결제 무관, 주문당 1회)."
+                    "**전시품 점수(5)·전시품 판매액**: 옵션 A2 — **계약일(order_date) in 해당 월** 주문의 **전시판매가 × 1/n**(주문당 1회). "
+                    "다른 달 계약 + 단순 금액수정은 0 (영향 없음). 다른 달 계약 + 해당월 **총계약금액이 0원(전체 취소)**이 되면 전시판매가 차감. "
+                    "주문 수정으로 전시판매가만 변경 시 변경 시점 월에 **차액(__dm_d)만 분리 반영**(KPI에서 마이너스 가능)."
                 )
             else:
                 st.info("선택한 월에 직원이 배정된 평가 데이터(매출·현금수금·마진·전시)가 없습니다.")
