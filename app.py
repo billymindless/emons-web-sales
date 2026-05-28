@@ -9472,6 +9472,222 @@ def _erp_delete_row(table: str, row_id: int) -> tuple[bool, str]:
         return False, str(e)
 
 
+# =====================================================================
+# v2 헬퍼 ─ 월·연 필수 근무시간 + 신청·승인 워크플로우
+# (스키마: SUPABASE_APP_ATTENDANCE_V2.sql)
+# =====================================================================
+
+_ERP_ADJ_KINDS = ("reward", "meeting", "summer_vacation", "overtime", "etc")
+_ERP_ADJ_KIND_LABEL = {
+    "reward": "포상",
+    "meeting": "회의",
+    "summer_vacation": "여름휴가",
+    "overtime": "추가근무",
+    "etc": "기타",
+}
+_ERP_ADJ_KIND_DEFAULT_SIGN = {
+    "reward": "-",
+    "meeting": "+",
+    "summer_vacation": "-",
+    "overtime": "+",
+    "etc": "+",
+}
+
+
+@st.cache_data(ttl=60)
+def _erp_get_monthly_target_row(db_filename: str, employee_name: str, ym: str) -> dict | None:
+    """app_monthly_work_targets 단일 행. (db, emp, ym) UNIQUE."""
+    if not (db_filename and employee_name and ym):
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        r = client.table("app_monthly_work_targets").select("*")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .eq("ym", ym).limit(1).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60)
+def _erp_get_yearly_target_row(db_filename: str, employee_name: str, year: int) -> dict | None:
+    """app_yearly_work_targets 단일 행. (db, emp, year) UNIQUE."""
+    if not (db_filename and employee_name and year):
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        r = client.table("app_yearly_work_targets").select("*")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .eq("year", int(year)).limit(1).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60)
+def _erp_list_monthly_targets(db_filename: str, ym: str) -> list:
+    """해당 매장·월 전체 행 (직원 행렬 입력 화면용)."""
+    if not (db_filename and ym):
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_monthly_work_targets").select("*")\
+            .eq("db_filename", db_filename).eq("ym", ym).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def _erp_list_yearly_targets(db_filename: str, year: int) -> list:
+    if not (db_filename and year):
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_yearly_work_targets").select("*")\
+            .eq("db_filename", db_filename).eq("year", int(year)).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def _erp_sum_approved_adjustments(db_filename: str, employee_name: str,
+                                  period_key: str, period_kind: str = "month") -> int:
+    """승인된 신청의 minutes 합계 (분).
+    period_kind='month' → period_key='YYYY-MM' / 'year' → 'YYYY'."""
+    if not (db_filename and employee_name and period_key):
+        return 0
+    client, err = get_supabase_client()
+    if err or not client:
+        return 0
+    try:
+        q = client.table("app_work_adjustments").select("minutes,target_date")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .eq("status", "approved")
+        if period_kind == "year":
+            start = f"{period_key}-01-01"
+            end = f"{period_key}-12-31"
+        else:
+            y, m = period_key.split("-")
+            last_day = calendar.monthrange(int(y), int(m))[1]
+            start = f"{period_key}-01"
+            end = f"{period_key}-{last_day:02d}"
+        q = q.gte("target_date", start).lte("target_date", end)
+        r = q.execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return sum(int(row.get("minutes") or 0) for row in rows)
+    except Exception:
+        return 0
+
+
+def _erp_compute_monthly_remaining_v2(db_filename: str, employee_name: str, ym: str) -> dict:
+    """월 잔여 = (월 입력 OR 연/12 fallback) - Σ승인.
+    반환 dict 키: required_min, approved_min, remaining_min, source ('month'/'year_div_12'/'none')."""
+    row_m = _erp_get_monthly_target_row(db_filename, employee_name, ym)
+    source = "none"
+    required_min = 0
+    if row_m and row_m.get("required_minutes") is not None:
+        required_min = int(row_m["required_minutes"])
+        source = "month"
+    else:
+        try:
+            year = int(ym.split("-")[0])
+        except Exception:
+            year = 0
+        row_y = _erp_get_yearly_target_row(db_filename, employee_name, year) if year else None
+        if row_y and row_y.get("required_minutes") is not None:
+            required_min = int(round(int(row_y["required_minutes"]) / 12))
+            source = "year_div_12"
+    approved_min = _erp_sum_approved_adjustments(db_filename, employee_name, ym, "month")
+    return {
+        "required_min": required_min,
+        "approved_min": approved_min,
+        "remaining_min": required_min - approved_min,
+        "source": source,
+    }
+
+
+def _erp_compute_yearly_remaining_v2(db_filename: str, employee_name: str, year: int) -> dict:
+    """연 잔여 = 연 입력 - Σ승인. 연 입력 없으면 required_min=0."""
+    row_y = _erp_get_yearly_target_row(db_filename, employee_name, year)
+    required_min = int(row_y["required_minutes"]) if (row_y and row_y.get("required_minutes") is not None) else 0
+    approved_min = _erp_sum_approved_adjustments(db_filename, employee_name, str(year), "year")
+    return {
+        "required_min": required_min,
+        "approved_min": approved_min,
+        "remaining_min": required_min - approved_min,
+    }
+
+
+@st.cache_data(ttl=30)
+def _erp_list_my_adjustments(db_filename: str, employee_name: str, ym: str) -> list:
+    """내 신청 내역 (해당 ym, 최신순)."""
+    if not (db_filename and employee_name and ym):
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        y, m = ym.split("-")
+        last_day = calendar.monthrange(int(y), int(m))[1]
+        start = f"{ym}-01"
+        end = f"{ym}-{last_day:02d}"
+        r = client.table("app_work_adjustments").select("*")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .gte("target_date", start).lte("target_date", end)\
+            .order("target_date", desc=True).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=30)
+def _erp_list_pending_adjustments(db_filename: str) -> list:
+    """매장 전체 pending 신청 (관리자 승인 큐)."""
+    if not db_filename:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_work_adjustments").select("*")\
+            .eq("db_filename", db_filename)\
+            .eq("status", "pending")\
+            .order("created_at", desc=False).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+def _erp_v2_clear_caches():
+    """v2 관련 모든 캐시 클리어 — 저장/승인/반려 직후 호출."""
+    try:
+        _erp_get_monthly_target_row.clear()
+        _erp_get_yearly_target_row.clear()
+        _erp_list_monthly_targets.clear()
+        _erp_list_yearly_targets.clear()
+        _erp_sum_approved_adjustments.clear()
+        _erp_list_my_adjustments.clear()
+        _erp_list_pending_adjustments.clear()
+    except Exception:
+        pass
+
+
 def render_erp_attendance():
     """ERP 근태 관리: 사전 일정·최소인원·캘린더·근태·시차·연차·월말요약 통합 화면."""
     user = st.session_state.get("current_user") or {}
@@ -9496,40 +9712,33 @@ def render_erp_attendance():
         st.warning("매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 선택해 주세요.")
         return
 
+    # v2 메뉴 단순화 (2026-05-28):
+    #   store_admin: 4탭 (내 근태 / 필수 시간 설정 / 신청 승인 / 캘린더 + 월말 요약)
+    #   user:        2탭 (내 근태 / 매장 캘린더)
+    # 기존 탭 함수 (_erp_tab_shift_plan 등)는 코드에 보존하나 라우팅에서 제외.
     if role == "store_admin":
-        tab_labels = ["근무 일정 계획", "최소 인원 설정", "캘린더", "휴무·근태 입력",
-                      "추가근무·시차 관리", "연차/월차 관리", "월말 요약"]
-    else:
-        tab_labels = ["근무 일정 계획", "캘린더", "휴무·근태 입력", "추가근무·시차 신청", "내 연차 현황"]
-
-    tabs = st.tabs(tab_labels)
-
-    if role == "store_admin":
+        tab_labels = ["내 근태", "필수 시간 설정", "신청 승인", "캘린더", "월말 요약"]
+        tabs = st.tabs(tab_labels)
         with tabs[0]:
-            _erp_tab_shift_plan(current_db, me_name)
+            _erp_tab_my_attendance(current_db, role, me_name)
         with tabs[1]:
-            _erp_tab_staffing_rules(current_db, me_name)
+            _erp_tab_period_targets(current_db, me_name)
         with tabs[2]:
-            _erp_tab_calendar(current_db, role, me_name, today)
+            _erp_tab_adjustment_approvals(current_db, me_name)
         with tabs[3]:
-            _erp_tab_attendance_input(current_db, role, me_name)
+            _erp_tab_calendar(current_db, role, me_name, today)
+            st.divider()
+            with st.expander("⚙️ 최소 인원 규칙 + 매장 공용 일정", expanded=False):
+                _erp_tab_staffing_rules(current_db, me_name)
         with tabs[4]:
-            _erp_tab_comptime_overtime(current_db, role, me_name)
-        with tabs[5]:
-            _erp_tab_leave_grants(current_db, me_name)
-        with tabs[6]:
             _erp_tab_monthly_summary(current_db, today)
     else:
+        tab_labels = ["내 근태", "매장 캘린더"]
+        tabs = st.tabs(tab_labels)
         with tabs[0]:
-            _erp_tab_shift_plan(current_db, me_name)
+            _erp_tab_my_attendance(current_db, role, me_name)
         with tabs[1]:
             _erp_tab_calendar(current_db, role, me_name, today)
-        with tabs[2]:
-            _erp_tab_attendance_input(current_db, role, me_name)
-        with tabs[3]:
-            _erp_tab_comptime_overtime(current_db, role, me_name)
-        with tabs[4]:
-            _erp_tab_my_leave_status(current_db, me_name)
 
 
 # ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
@@ -11626,6 +11835,422 @@ def _erp_tab_my_leave_status(current_db: str, me_name: str):
     with m4:
         st.metric("잔여 시차", f"{comp_remain}분", delta=f"{comp_remain//60}h {comp_remain%60}m")
     st.caption(f"입사일: {hire or '-'} (월차 적립은 입사일 기준 자동 계산, 최대 11일)")
+
+
+# =====================================================================
+# v2 화면 함수 ─ 매장관리자 2종 + 직원 1종
+# (메뉴 단순화: admin 7탭→4탭, user 5탭→1~2탭)
+# =====================================================================
+
+def _erp_tab_period_targets(current_db: str, me_name: str):
+    """매장관리자: 필수 시간 설정 (월·연 모드 토글, 직원×시간 입력)."""
+    st.subheader("⏰ 필수 시간 설정")
+    st.caption("직원별로 월 또는 연 단위 필수 근무시간을 한 숫자(시간)만 입력합니다. "
+               "월 입력이 없는 달은 연/12로 자동 환산됩니다.")
+
+    today = _today_kst()
+    mode = st.radio("입력 단위", ["월 단위", "연 단위"], horizontal=True, key="pt_mode")
+
+    emp_names = _erp_get_employee_names_for_store(current_db)
+    if not emp_names:
+        st.info("매장에 배정된 직원이 없습니다. 직원 관리에서 매장을 배정해 주세요.")
+        return
+
+    if mode == "월 단위":
+        cy, cm = st.columns(2)
+        with cy:
+            year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="pt_m_y")
+        with cm:
+            month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="pt_m_m")
+        ym = f"{int(year):04d}-{int(month):02d}"
+
+        rows = _erp_list_monthly_targets(current_db, ym)
+        by_emp = {r["employee_name"]: r for r in rows}
+        df_init = pd.DataFrame([
+            {
+                "직원": n,
+                "월 필수 시간(h)": round(int(by_emp[n]["required_minutes"]) / 60, 2) if n in by_emp else 0.0,
+                "메모": by_emp[n].get("note") or "" if n in by_emp else "",
+            }
+            for n in emp_names
+        ])
+        edited = st.data_editor(
+            df_init,
+            key=f"pt_m_editor_{ym}",
+            width='stretch',
+            hide_index=True,
+            disabled=["직원"],
+            column_config={
+                "직원": st.column_config.TextColumn("직원"),
+                "월 필수 시간(h)": st.column_config.NumberColumn("월 필수 시간(h)", min_value=0.0, max_value=744.0, step=0.5, format="%.2f"),
+                "메모": st.column_config.TextColumn("메모"),
+            },
+        )
+        if st.button("💾 월 단위 저장", key=f"pt_m_save_{ym}", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+            ok_count = 0
+            fail = []
+            for _, r in edited.iterrows():
+                emp = str(r["직원"]).strip()
+                hours = float(r["월 필수 시간(h)"] or 0)
+                note = str(r["메모"] or "").strip() or None
+                if not emp:
+                    continue
+                minutes = int(round(hours * 60))
+                payload = {
+                    "db_filename": current_db,
+                    "employee_name": emp,
+                    "ym": ym,
+                    "required_minutes": minutes,
+                    "note": note,
+                    "updated_by": me_name,
+                }
+                if emp not in by_emp:
+                    payload["created_by"] = me_name
+                try:
+                    client.table("app_monthly_work_targets")\
+                        .upsert(payload, on_conflict="db_filename,employee_name,ym").execute()
+                    ok_count += 1
+                except Exception as e:
+                    fail.append(f"{emp}: {e}")
+            _erp_v2_clear_caches()
+            if fail:
+                st.error("일부 저장 실패: " + " / ".join(fail))
+            else:
+                flash(f"월 단위 필수 시간 {ok_count}건 저장 완료 ({ym})")
+                st.rerun()
+
+    else:
+        year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="pt_y_y")
+        yr = int(year)
+        rows = _erp_list_yearly_targets(current_db, yr)
+        by_emp = {r["employee_name"]: r for r in rows}
+        df_init = pd.DataFrame([
+            {
+                "직원": n,
+                "연 필수 시간(h)": round(int(by_emp[n]["required_minutes"]) / 60, 2) if n in by_emp else 0.0,
+                "메모": by_emp[n].get("note") or "" if n in by_emp else "",
+            }
+            for n in emp_names
+        ])
+        edited = st.data_editor(
+            df_init,
+            key=f"pt_y_editor_{yr}",
+            width='stretch',
+            hide_index=True,
+            disabled=["직원"],
+            column_config={
+                "직원": st.column_config.TextColumn("직원"),
+                "연 필수 시간(h)": st.column_config.NumberColumn("연 필수 시간(h)", min_value=0.0, max_value=8760.0, step=1.0, format="%.2f"),
+                "메모": st.column_config.TextColumn("메모"),
+            },
+        )
+        if st.button("💾 연 단위 저장", key=f"pt_y_save_{yr}", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+            ok_count = 0
+            fail = []
+            for _, r in edited.iterrows():
+                emp = str(r["직원"]).strip()
+                hours = float(r["연 필수 시간(h)"] or 0)
+                note = str(r["메모"] or "").strip() or None
+                if not emp:
+                    continue
+                minutes = int(round(hours * 60))
+                payload = {
+                    "db_filename": current_db,
+                    "employee_name": emp,
+                    "year": yr,
+                    "required_minutes": minutes,
+                    "note": note,
+                    "updated_by": me_name,
+                }
+                if emp not in by_emp:
+                    payload["created_by"] = me_name
+                try:
+                    client.table("app_yearly_work_targets")\
+                        .upsert(payload, on_conflict="db_filename,employee_name,year").execute()
+                    ok_count += 1
+                except Exception as e:
+                    fail.append(f"{emp}: {e}")
+            _erp_v2_clear_caches()
+            if fail:
+                st.error("일부 저장 실패: " + " / ".join(fail))
+            else:
+                flash(f"연 단위 필수 시간 {ok_count}건 저장 완료 ({yr})")
+                st.rerun()
+
+
+def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
+    """매장관리자: 직원 신청 승인/반려 큐."""
+    st.subheader("📥 신청 승인")
+    st.caption("직원이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청을 검토합니다. 승인 시 해당 직원의 월·연 잔여 시간에 즉시 반영됩니다.")
+
+    pending = _erp_list_pending_adjustments(current_db)
+    if not pending:
+        st.info("대기 중인 신청이 없습니다.")
+        return
+
+    st.caption(f"대기 중 {len(pending)}건")
+    for adj in pending:
+        adj_id = int(adj["id"])
+        kind = adj.get("kind") or "etc"
+        sign = adj.get("sign") or "+"
+        minutes = int(adj.get("minutes") or 0)
+        hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
+        with st.container(border=True):
+            c = st.columns([1.3, 1, 0.4, 1.2, 3, 1, 1])
+            with c[0]:
+                st.markdown(f"**{adj.get('employee_name') or '-'}**")
+                st.caption(str(adj.get("created_at") or "")[:16])
+            with c[1]:
+                st.markdown(f"{str(adj.get('target_date') or '')[:10]}")
+            with c[2]:
+                st.markdown(f"### {sign}")
+            with c[3]:
+                st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {hours_display}")
+            with c[4]:
+                st.caption(adj.get("reason") or "")
+            with c[5]:
+                if st.button("✅ 승인", key=f"adj_ok_{adj_id}"):
+                    ok, e = _erp_update_row("app_work_adjustments", adj_id, {
+                        "status": "approved",
+                        "approved_by": me_name,
+                        "approved_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    if ok:
+                        _erp_v2_clear_caches()
+                        flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
+                        st.rerun()
+                    else:
+                        st.error(f"승인 실패: {e}")
+            with c[6]:
+                with st.popover("❌ 반려"):
+                    reject_reason = st.text_input("반려 사유", key=f"adj_rj_reason_{adj_id}")
+                    if st.button("반려 확정", key=f"adj_rj_btn_{adj_id}", type="primary"):
+                        ok, e = _erp_update_row("app_work_adjustments", adj_id, {
+                            "status": "rejected",
+                            "approved_by": me_name,
+                            "approved_at": datetime.now(timezone.utc).isoformat(),
+                            "reject_reason": (reject_reason or "").strip() or None,
+                        })
+                        if ok:
+                            _erp_v2_clear_caches()
+                            flash(f"반려: {adj.get('employee_name')}")
+                            st.rerun()
+                        else:
+                            st.error(f"반려 실패: {e}")
+
+
+def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
+    """직원·관리자 공용: 내 근태 (월·연 잔여 카드 + +/- 신청 + 내 신청 내역)."""
+    st.subheader("🧑‍💼 내 근태")
+    st.caption("이번 달과 올해의 필수 근무시간 대비 승인된 신청 합계, 잔여 시간을 확인하고 +/- 신청을 등록합니다.")
+
+    today = _today_kst()
+    cy, cm = st.columns(2)
+    with cy:
+        year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="my_y")
+    with cm:
+        month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="my_m")
+    ym = f"{int(year):04d}-{int(month):02d}"
+    yr = int(year)
+
+    m = _erp_compute_monthly_remaining_v2(current_db, me_name, ym)
+    y = _erp_compute_yearly_remaining_v2(current_db, me_name, yr)
+
+    def _h(mins: int) -> str:
+        h = abs(mins) // 60
+        mm = abs(mins) % 60
+        sgn = "-" if mins < 0 else ""
+        return f"{sgn}{h}h" if mm == 0 else f"{sgn}{h}h {mm}m"
+
+    card_l, card_r = st.columns(2)
+    with card_l:
+        with st.container(border=True):
+            st.markdown(f"##### 이번 달 ({ym})")
+            st.metric("필수", _h(m["required_min"]))
+            st.metric("승인 합계", _h(m["approved_min"]))
+            st.metric("잔여", _h(m["remaining_min"]))
+            if m["source"] == "year_div_12":
+                st.caption("ⓘ 월 입력이 없어 연 입력의 1/12로 환산되었습니다.")
+            elif m["source"] == "none":
+                st.caption("⚠️ 매장관리자가 필수 시간을 설정하지 않았습니다.")
+    with card_r:
+        with st.container(border=True):
+            st.markdown(f"##### 올해 ({yr})")
+            st.metric("필수", _h(y["required_min"]))
+            st.metric("승인 합계", _h(y["approved_min"]))
+            st.metric("잔여", _h(y["remaining_min"]))
+            if y["required_min"] == 0:
+                st.caption("ⓘ 연 단위 입력값이 없습니다.")
+
+    st.divider()
+
+    # ── +/- 신청 폼 ───────────────────────────────────────────────
+    st.markdown("##### ➕➖ 신청 등록")
+    fc1, fc2 = st.columns([1, 1])
+    with fc1:
+        new_kind = st.selectbox(
+            "유형",
+            options=list(_ERP_ADJ_KINDS),
+            format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "기타 (±)",
+            key="my_new_kind",
+        )
+    with fc2:
+        if new_kind == "etc":
+            new_sign = st.radio("부호", ["+", "-"], horizontal=True, key="my_new_sign")
+        else:
+            new_sign = _ERP_ADJ_KIND_DEFAULT_SIGN[new_kind]
+            st.markdown(f"**부호: {new_sign}** (고정)")
+
+    with st.form("my_new_adj_form", clear_on_submit=True):
+        gc1, gc2, gc3 = st.columns([1, 1, 3])
+        with gc1:
+            new_date = st.date_input("대상 일자", value=today, key="my_new_date")
+        with gc2:
+            new_hours = st.number_input("시간(h)", min_value=0.25, max_value=24.0, step=0.5, value=1.0, key="my_new_h")
+        with gc3:
+            placeholder_reason = "사유 (기타는 필수)"
+            new_reason = st.text_input("사유", placeholder=placeholder_reason, key="my_new_reason")
+        if st.form_submit_button("📤 신청 등록", type="primary"):
+            if new_kind == "etc" and not (new_reason or "").strip():
+                st.error("기타 유형은 사유를 입력해 주세요.")
+            else:
+                payload = {
+                    "db_filename": current_db,
+                    "employee_name": me_name,
+                    "target_date": new_date.isoformat(),
+                    "kind": new_kind,
+                    "sign": new_sign,
+                    "minutes": int(round(float(new_hours) * 60)),
+                    "reason": (new_reason or "").strip() or None,
+                    "status": "pending",
+                    "created_by": me_name,
+                }
+                ok, e = _erp_insert_row("app_work_adjustments", payload)
+                if ok:
+                    _erp_v2_clear_caches()
+                    flash("신청이 등록되었습니다. 매장관리자 승인 대기 중.")
+                    st.rerun()
+                else:
+                    st.error(f"등록 실패: {e}")
+
+    st.divider()
+
+    # ── 내 신청 내역 ──────────────────────────────────────────────
+    st.markdown(f"##### 📋 내 신청 내역 ({ym})")
+    my_list = _erp_list_my_adjustments(current_db, me_name, ym)
+    if not my_list:
+        st.info("이번 달에 등록한 신청이 없습니다.")
+        return
+
+    editing_id = st.session_state.get("my_adj_editing_id")
+    for adj in my_list:
+        adj_id = int(adj["id"])
+        kind = adj.get("kind") or "etc"
+        sign = adj.get("sign") or "+"
+        status = adj.get("status") or "pending"
+        minutes = int(adj.get("minutes") or 0)
+        hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
+        status_label = {"pending": "🟡 대기", "approved": "🟢 승인", "rejected": "🔴 반려"}.get(status, status)
+
+        if editing_id == adj_id and status == "pending":
+            with st.container(border=True):
+                st.markdown(f"**✏️ 신청 수정 (#{adj_id})**")
+                ec_kind = st.selectbox(
+                    "유형",
+                    options=list(_ERP_ADJ_KINDS),
+                    index=list(_ERP_ADJ_KINDS).index(kind) if kind in _ERP_ADJ_KINDS else 4,
+                    format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "기타 (±)",
+                    key=f"my_edit_kind_{adj_id}",
+                )
+                if ec_kind == "etc":
+                    ec_sign = st.radio("부호", ["+", "-"], horizontal=True,
+                                       index=0 if sign == "+" else 1, key=f"my_edit_sign_{adj_id}")
+                else:
+                    ec_sign = _ERP_ADJ_KIND_DEFAULT_SIGN[ec_kind]
+                    st.markdown(f"**부호: {ec_sign}** (유형 고정)")
+
+                with st.form(f"my_edit_form_{adj_id}", clear_on_submit=False):
+                    e1, e2, e3 = st.columns([1, 1, 3])
+                    with e1:
+                        try:
+                            cur_date = date.fromisoformat(str(adj.get("target_date") or "")[:10])
+                        except Exception:
+                            cur_date = today
+                        ec_date = st.date_input("대상 일자", value=cur_date, key=f"my_edit_date_{adj_id}")
+                    with e2:
+                        ec_hours = st.number_input("시간(h)", min_value=0.25, max_value=24.0, step=0.5,
+                                                   value=round(minutes / 60, 2), key=f"my_edit_h_{adj_id}")
+                    with e3:
+                        ec_reason = st.text_input("사유", value=adj.get("reason") or "", key=f"my_edit_reason_{adj_id}")
+                    bc1, bc2, _ = st.columns([1, 1, 4])
+                    with bc1:
+                        save_btn = st.form_submit_button("💾 저장", type="primary")
+                    with bc2:
+                        cancel_btn = st.form_submit_button("취소")
+                if cancel_btn:
+                    st.session_state.pop("my_adj_editing_id", None)
+                    st.rerun()
+                if save_btn:
+                    if ec_kind == "etc" and not (ec_reason or "").strip():
+                        st.error("기타 유형은 사유를 입력해 주세요.")
+                    else:
+                        patch = {
+                            "target_date": ec_date.isoformat(),
+                            "kind": ec_kind,
+                            "sign": ec_sign,
+                            "minutes": int(round(float(ec_hours) * 60)),
+                            "reason": (ec_reason or "").strip() or None,
+                        }
+                        ok, e = _erp_update_row("app_work_adjustments", adj_id, patch)
+                        if ok:
+                            _erp_v2_clear_caches()
+                            st.session_state.pop("my_adj_editing_id", None)
+                            flash("신청이 수정되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"수정 실패: {e}")
+        else:
+            cols = st.columns([1, 1.3, 0.4, 1, 3, 1, 0.5, 0.5])
+            with cols[0]:
+                st.markdown(str(adj.get("target_date") or "")[:10])
+            with cols[1]:
+                st.markdown(_ERP_ADJ_KIND_LABEL.get(kind, kind))
+            with cols[2]:
+                st.markdown(f"**{sign}**")
+            with cols[3]:
+                st.markdown(hours_display)
+            with cols[4]:
+                msg = adj.get("reason") or ""
+                if status == "rejected" and adj.get("reject_reason"):
+                    msg += f"  ▸ 반려 사유: {adj['reject_reason']}"
+                st.caption(msg)
+            with cols[5]:
+                st.markdown(status_label)
+            with cols[6]:
+                if status == "pending":
+                    if st.button("✏️", key=f"my_adj_edit_{adj_id}", help="수정"):
+                        st.session_state["my_adj_editing_id"] = adj_id
+                        st.rerun()
+            with cols[7]:
+                if status == "pending":
+                    if st.button("🗑️", key=f"my_adj_del_{adj_id}", help="취소(삭제)"):
+                        ok, e = _erp_delete_row("app_work_adjustments", adj_id)
+                        if ok:
+                            _erp_v2_clear_caches()
+                            if st.session_state.get("my_adj_editing_id") == adj_id:
+                                st.session_state.pop("my_adj_editing_id", None)
+                            flash("신청이 취소되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"취소 실패: {e}")
 
 
 # ---------- superadmin: 통합 캘린더 & 매장별 현황 ----------
