@@ -7381,7 +7381,8 @@ def _superadmin_tab2_hr_store_employees():
     st.caption(
         "※ **매출 점수(70)·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
         "**현금수금 점수(10)·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-        "**마진 점수(15)·전시품 점수(5)**: 동 기간 sales를 주문 비율로 배분(경영 대시보드 월별 KPI와 동일)."
+        "**마진 점수(15)**: 동 기간 sales를 주문 비율로 배분. "
+        "**전시품 점수(5)·전시품 판매액**: 기간 내 sales가 1건이라도 있는 주문의 **전시판매가 × 1/n**(미수·부분결제 무관, 주문당 1회)."
     )
 
     # 3) 매출·마진·전시: sales transaction_date 구간 | 현금수금: payment_date·KPI 수납 버킷 (집계만)
@@ -18401,7 +18402,10 @@ def _kpi_parse_delta_margin_from_sales_note(note: object) -> float | None:
 
 
 def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.DataFrame") -> "pd.DataFrame":
-    """sales 원장 구간에서 직원별 순매출·마진·전시 배분. 1/n 분모는 주문의 최신 employee_names를 우선(sales 스냅샷보다 앞섬). amount 음수·note|__dm 동일."""
+    """sales 원장 구간에서 직원별 순매출·마진·전시 배분.
+    - 매출(revenue)·마진(margin): sales 행 단위로 amount/total_amount 비율을 곱해 1/n 분배(현행 유지).
+    - 전시품(display_sales): 주문 단위 1/n 분배. 미수·부분결제와 무관하게, KPI 기간에 해당 주문의 sales가 1건이라도 있으면 display_sales_amount × 1/n 을 1회만 분배(net amount sign 기준 ±).
+    1/n 분모는 주문의 최신 employee_names를 우선(sales 스냅샷보다 앞섬)."""
     if kpi_m.empty:
         return pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
     km = kpi_m.copy()
@@ -18435,6 +18439,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
         if "display_sales_amount" in orders.columns:
             _display_map = orders.set_index("id")["display_sales_amount"].fillna(0).astype(float).to_dict()
     rows_md: list = []
+    # 1) 매출(revenue)·마진(margin): sales 행 단위 ratio 분배 (display_sales는 0으로 채움)
     for _, r in km.iterrows():
         emps = _kpi_parse_employee_list(r.get("employee_names"))
         n = len(emps) if emps else 1
@@ -18445,30 +18450,54 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
         oid_int = int(oid) if oid is not None and pd.notna(oid) else None
         if oid_int is None:
             margin = 0.0
-            display_amt = 0.0
             per_amt = amt / n
         else:
             tot = float(_total_map.get(oid_int, 0) or 0)
             base_m = float(_margin_map.get(oid_int, 0) or 0)
-            base_d = float(_display_map.get(oid_int, 0) or 0)
             _dm_note = _kpi_parse_delta_margin_from_sales_note(r.get("note"))
             if _dm_note is not None:
                 margin = _dm_note / n
-                display_amt = 0.0
                 per_amt = amt / n
             elif tot == 0:
                 margin = 0.0
-                display_amt = 0.0
                 per_amt = amt / n
             else:
                 _ratio = amt / tot
                 margin = (base_m * _ratio) / n
-                display_amt = (base_d * _ratio) / n
                 per_amt = amt / n
-        if per_amt == 0 and margin == 0 and display_amt == 0:
+        if per_amt == 0 and margin == 0:
             continue
         for e in emps:
-            rows_md.append({"employee": e, "revenue": per_amt, "margin": margin, "display_sales": display_amt})
+            rows_md.append({"employee": e, "revenue": per_amt, "margin": margin, "display_sales": 0.0})
+
+    # 2) 전시품(display_sales): 주문 단위 1/n 분배 (옵션 A)
+    #    KPI 기간 내 동일 order_id의 sales amount 합(net) sign 으로 ± 결정. 한 주문당 1회.
+    if "order_id" in km.columns and _display_map:
+        km_oid = km.dropna(subset=["order_id"]).copy()
+        if not km_oid.empty:
+            km_oid["order_id"] = km_oid["order_id"].astype(int)
+            km_oid["amount"] = km_oid["amount"].fillna(0).astype(float) if "amount" in km_oid.columns else 0.0
+            order_net = km_oid.groupby("order_id")["amount"].sum().to_dict()
+            order_emp = km_oid.groupby("order_id")["employee_names"].first().to_dict()
+            for _oid_int, _net_amt in order_net.items():
+                base_d = float(_display_map.get(_oid_int, 0) or 0)
+                if base_d == 0:
+                    continue
+                emps = _kpi_parse_employee_list(order_emp.get(_oid_int))
+                if not emps:
+                    continue
+                n = len(emps)
+                if _net_amt > 0:
+                    disp_per = base_d / n
+                elif _net_amt < 0:
+                    disp_per = -base_d / n
+                else:
+                    disp_per = 0.0
+                if disp_per == 0:
+                    continue
+                for e in emps:
+                    rows_md.append({"employee": e, "revenue": 0.0, "margin": 0.0, "display_sales": disp_per})
+
     if not rows_md:
         return pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
     df_md = pd.DataFrame(rows_md)
@@ -18477,7 +18506,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
 
 @st.fragment
 def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_filename: str):
-    """월별 직원 판매 현황: 종합=매출70+마진20+전시10. 매출=sales 해당월 순액 1/n. 현금수금집계는 참고 열. 마진·전시=sales·주문 비율."""
+    """월별 직원 판매 현황: 종합=매출70+마진15+전시5+현금수금10. 매출=sales 해당월 순액 1/n. 현금수금집계는 참고 열. 마진=sales·주문 비율 1/n. 전시=주문 단위 1/n(미수·부분결제 무관)."""
     st.subheader("4. 월별 직원 판매 현황 및 평가")
     if not sales_df.empty and "transaction_date" in sales_df.columns:
         _kpi_sales = sales_df.copy()
@@ -18583,7 +18612,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                 st.caption(
                     "※ **종합 점수** = 매출 70 + 마진 15 + 전시품 5 + 현금수금 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
                     "**현금수금 점수(10)·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-                    "**마진·전시 점수**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영."
+                    "**마진 점수(15)**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영. "
+                    "**전시품 점수(5)·전시품 판매액**: 해당 월 sales가 1건이라도 있는 주문의 **전시판매가 × 1/n**(미수·부분결제 무관, 주문당 1회)."
                 )
             else:
                 st.info("선택한 월에 직원이 배정된 평가 데이터(매출·현금수금·마진·전시)가 없습니다.")
