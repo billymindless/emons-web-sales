@@ -991,193 +991,6 @@ def _get_customers_by_ids_supabase(db_filename: str, customer_ids: list) -> dict
     except Exception:
         return {}
 
-# ========== 채널톡(Channel Talk) Open API 헬퍼 ==========
-CHANNEL_TALK_BASE_URL = "https://api.channel.io/open/v5"
-
-
-def _get_channel_talk_secrets():
-    """st.secrets에서 채널톡 API 키 로드. 없으면 None 반환."""
-    try:
-        api_key = st.secrets.get("CHANNEL_TALK_API_KEY") or st.secrets.get("channel_talk", {}).get("CHANNEL_TALK_API_KEY")
-        access_secret = st.secrets.get("CHANNEL_TALK_ACCESS_SECRET") or st.secrets.get("channel_talk", {}).get("CHANNEL_TALK_ACCESS_SECRET")
-        if api_key and access_secret:
-            return {"api_key": api_key, "access_secret": access_secret}
-    except Exception:
-        pass
-    return None
-
-
-def _channel_talk_headers():
-    """채널톡 API 요청용 헤더 (x-access-key, x-access-secret)."""
-    secrets = _get_channel_talk_secrets()
-    if not secrets:
-        return None
-    return {
-        "Content-Type": "application/json",
-        "x-access-key": secrets["api_key"],
-        "x-access-secret": secrets["access_secret"],
-    }
-
-
-def _get_channel_talk_sync_cutoff_date():
-    """
-    st.secrets의 CHANNEL_TALK_SYNC_CUTOFF_DATE(YYYY-MM-DD)를 date 객체로 반환.
-    미설정 또는 파싱 실패 시 None. 기준일 이후 등록 고객만 채널톡 동기화 시 사용.
-    """
-    try:
-        raw = st.secrets.get("CHANNEL_TALK_SYNC_CUTOFF_DATE") or st.secrets.get("channel_talk", {}).get("CHANNEL_TALK_SYNC_CUTOFF_DATE")
-        if not raw or not str(raw).strip():
-            return None
-        return datetime.strptime(str(raw).strip()[:10], "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-
-def sync_channel_talk_customer(
-    customer_name: str,
-    phone_number: str,
-    purchase_amount: int | float,
-    item_category: str,
-    purchase_date,
-    store_tag_key: str | None = None,
-    is_returning: bool = False,
-    unpaid_balance: float = 0.0,
-) -> bool:
-    """
-    오프라인 결제 고객 정보를 채널톡에 PUSH.
-    - 기존 태그 유지 + 새 구매 태그 추가
-    - 재구매 시 '재구매_{매장키}' 태그 추가
-    - 미수금 있으면 '미수금_{매장키}' 태그 추가, 완납이면 제거
-    - 태그 형식: '{매장키}구매/{품목}' (예: 삼산구매/옷장)
-    실패 시 False, 성공 시 True. 예외는 호출부에서 처리.
-    """
-    headers = _channel_talk_headers()
-    if not headers or not phone_number or not str(phone_number).strip():
-        return False
-    member_id = re.sub(r"\D", "", str(phone_number).strip())
-    if not member_id:
-        return False
-    category_clean = (re.sub(r"\s+", "", (item_category or "").strip()) or "기타")
-    sk = str(store_tag_key).strip() if store_tag_key and str(store_tag_key).strip() else ""
-    tag_purchase = f"{sk}구매/{category_clean}" if sk else f"{category_clean}_구매"
-    tag_returning = f"재구매_{sk}" if sk else "재구매"
-    tag_unpaid = f"미수금_{sk}" if sk else "미수금"
-    purchase_date_str = purchase_date.isoformat() if hasattr(purchase_date, "isoformat") else str(purchase_date)
-
-    # 1) GET 기존 유저 (태그 병합 + 재구매 여부 판단)
-    existing_tags = []
-    is_existing_user = False
-    try:
-        r_get = requests.get(
-            f"{CHANNEL_TALK_BASE_URL}/users/@{member_id}",
-            headers=headers,
-            timeout=10,
-        )
-        if r_get.status_code == 200:
-            data = r_get.json()
-            if isinstance(data, dict):
-                existing_tags = list(data.get("tags") or [])
-                is_existing_user = True
-    except Exception:
-        pass
-
-    # 2) 태그 로직
-    # 구매 태그 추가
-    if tag_purchase not in existing_tags:
-        existing_tags.append(tag_purchase)
-    # 재구매 태그: 기존 채널톡 사용자이거나 is_returning 플래그가 True인 경우
-    if (is_returning or is_existing_user) and tag_returning not in existing_tags:
-        existing_tags.append(tag_returning)
-    # 미수금 태그: 잔금 있으면 추가, 완납이면 제거
-    if unpaid_balance > 0:
-        if tag_unpaid not in existing_tags:
-            existing_tags.append(tag_unpaid)
-    else:
-        existing_tags = [t for t in existing_tags if t != tag_unpaid]
-
-    # 3) 프로필 + 태그로 PUT
-    profile = {
-        "name": (customer_name or "").strip() or "고객",
-        "mobileNumber": (phone_number or "").strip(),
-        "오프라인_최근구매액": int(purchase_amount),
-        "오프라인_최근구매일": purchase_date_str[:10],
-        "오프라인_구매품목": (item_category or "").strip() or "-",
-        "오프라인_누적구매횟수": len([t for t in existing_tags if "구매/" in t or t.endswith("_구매")]),
-    }
-    body = {"profile": profile, "tags": existing_tags}
-    try:
-        r_put = requests.put(
-            f"{CHANNEL_TALK_BASE_URL}/users/@{member_id}",
-            headers=headers,
-            json=body,
-            timeout=10,
-        )
-        return 200 <= r_put.status_code < 300
-    except Exception:
-        return False
-
-
-def fetch_channel_talk_customer_by_phone_raw(phone_number: str) -> dict | None:
-    """
-    전화번호(memberId) 기준으로 채널톡 사용자 1명을 조회 (내부 헬퍼, UI 출력 없음).
-    성공 시 user dict, 실패/404 시 None.
-    """
-    headers = _channel_talk_headers()
-    if not headers or not phone_number:
-        return None
-    member_id = re.sub(r"\D", "", str(phone_number).strip())
-    if not member_id:
-        return None
-    try:
-        r = requests.get(
-            f"{CHANNEL_TALK_BASE_URL}/users/@{member_id}",
-            headers=headers,
-            timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            return data if isinstance(data, dict) else None
-        return None
-    except Exception:
-        return None
-
-
-def fetch_channel_talk_customer_by_phone(phone_number: str) -> dict | None:
-    """
-    전화번호(=memberId) 기준으로 채널톡 사용자 1명을 조회 (UI 메시지 포함).
-    성공 시 user dict, 실패/404 시 None 반환.
-    """
-    headers = _channel_talk_headers()
-    if not headers:
-        st.error("채널톡 API 키가 설정되지 않았습니다. st.secrets 설정을 확인하세요.")
-        return None
-    if not phone_number or not str(phone_number).strip():
-        st.error("조회할 전화번호를 입력하세요.")
-        return None
-    member_id = re.sub(r"\D", "", str(phone_number).strip())
-    if not member_id:
-        st.error("전화번호 형식이 올바르지 않습니다.")
-        return None
-    try:
-        r = requests.get(
-            f"{CHANNEL_TALK_BASE_URL}/users/@{member_id}",
-            headers=headers,
-            timeout=10,
-        )
-        if r.status_code == 404:
-            st.info("채널톡에 해당 전화번호로 등록된 고객이 없습니다.")
-            return None
-        if r.status_code != 200:
-            st.error(f"채널톡에서 고객 정보를 가져오지 못했습니다. 상태 코드: {r.status_code}")
-            return None
-        data = r.json()
-        if not isinstance(data, dict):
-            st.error("채널톡 응답 형식이 예상과 다릅니다.")
-            return None
-        return data
-    except Exception as e:
-        st.error(f"채널톡 고객 단건 조회 중 에러 발생: {e}")
-        return None
 
 
 def _format_number_comma(s):
@@ -1582,17 +1395,6 @@ def init_master_db():
                 message TEXT NOT NULL,
                 seen INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE IF NOT EXISTS ChannelTalkWebhookLog (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                store_key TEXT,
-                phone TEXT,
-                name TEXT,
-                status TEXT NOT NULL,
-                message TEXT,
-                db_filename TEXT,
-                customer_id INTEGER
-            );
         """)
         # 비밀번호 1234를 해시하여 저장 (단방향)
         pw_hash = hashlib.sha256("1234".encode()).hexdigest()
@@ -1643,22 +1445,6 @@ def ensure_master_schema(conn: sqlite3.Connection):
                 alert_type TEXT NOT NULL,
                 message TEXT NOT NULL,
                 seen INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        conn.commit()
-    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ChannelTalkWebhookLog'")
-    if cur.fetchone() is None:
-        conn.execute("""
-            CREATE TABLE ChannelTalkWebhookLog (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                store_key TEXT,
-                phone TEXT,
-                name TEXT,
-                status TEXT NOT NULL,
-                message TEXT,
-                db_filename TEXT,
-                customer_id INTEGER
             )
         """)
         conn.commit()
@@ -1735,27 +1521,6 @@ def get_store_assigned_employee_names(db_filename: str) -> list[str]:
     return _get_supabase_store_assigned_employee_names(db_filename)
 
 
-def _get_store_tag_key(store_name: str) -> str:
-    """
-    채널톡 태그용 매장 키 추출. 예: '울산삼산점' -> '삼산', '학성점' -> '학성'.
-    st.secrets에 CHANNEL_TALK_STORE_TAG_KEYS = "삼산,학성,평산" 형태로 매장명 포함 시 사용할 키 목록 지정 가능.
-    """
-    if not store_name or not str(store_name).strip():
-        return "기타"
-    name = str(store_name).strip()
-    try:
-        raw = st.secrets.get("CHANNEL_TALK_STORE_TAG_KEYS") or st.secrets.get("channel_talk", {}).get("CHANNEL_TALK_STORE_TAG_KEYS")
-        if raw:
-            for key in [k.strip() for k in str(raw).split(",") if k.strip()]:
-                if key in name:
-                    return key
-    except Exception:
-        pass
-    if "삼산" in name:
-        return "삼산"
-    if "학성" in name:
-        return "학성"
-    return name.replace("점", "").strip() or "기타"
 
 
 def get_tenant_conn(db_filename: str):
@@ -2365,7 +2130,7 @@ def _ensure_tenant_schema(conn: sqlite3.Connection):
     # 잔금 상태(완납/미납 등) 표시용
     if "balance_status" not in cols:
         conn.execute("ALTER TABLE Orders ADD COLUMN balance_status TEXT")
-    # Customers 가입경로(채널톡 등)용 source 컬럼
+    # Customers 가입경로 source 컬럼
     cur = conn.execute("PRAGMA table_info(Customers)")
     cust_cols = [row[1] for row in cur.fetchall()]
     if "source" not in cust_cols:
@@ -3370,14 +3135,14 @@ def _current_username() -> str:
     return user.get("username") or "unknown"
 
 
-<<<<<<< Updated upstream
 def _email_local_part(value: str) -> str:
     """이메일 형식이면 @ 앞부분을, 아니면 원문을 반환. 이름 fallback 표시용."""
     v = (value or "").strip()
     if not v or "@" not in v:
         return v
     return v.split("@", 1)[0] or v
-=======
+
+
 def _looks_like_email(val: object) -> bool:
     s = str(val or "").strip()
     if not s or "@" not in s:
@@ -3415,24 +3180,12 @@ def _resolve_app_user_display_name(
     if un and not _looks_like_email(un):
         return un
     return ""
->>>>>>> Stashed changes
 
 
 def _get_current_user_display_name() -> str:
     """현재 로그인한 직원의 표시명(실명).
     우선순위: session name → app_users.name 캐시 매핑 → 이메일 username의 @ 앞부분 → username."""
     user = st.session_state.get("current_user") or {}
-<<<<<<< Updated upstream
-    name = user.get("name")
-    if name and str(name).strip():
-        return str(name).strip()
-    username = user.get("username") or ""
-    display_map = _get_app_user_display_name_map()
-    mapped = display_map.get(str(username).strip()) or display_map.get(str(username).strip().lower())
-    if mapped and str(mapped).strip():
-        return str(mapped).strip()
-    return _email_local_part(username) or username or ""
-=======
     resolved = _resolve_app_user_display_name(
         user_id=user.get("id"),
         username=user.get("username"),
@@ -3454,7 +3207,6 @@ def _get_current_user_employee_aliases(display_name: str | None = None) -> list[
         if s and s not in aliases:
             aliases.append(s)
     return aliases
->>>>>>> Stashed changes
 
 
 def _current_display_name_for_todo() -> str:
@@ -7452,7 +7204,10 @@ def _superadmin_tab2_hr_store_employees():
     st.caption(
         "※ **매출 점수(70)·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
         "**현금수금 점수(10)·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-        "**마진 점수(15)·전시품 점수(5)**: 동 기간 sales를 주문 비율로 배분(경영 대시보드 월별 KPI와 동일)."
+        "**마진 점수(15)**: 동 기간 sales를 주문 비율로 배분. "
+        "**전시품 점수(5)·전시품 판매액**: 옵션 A2 — **계약일(order_date)이 기간 내**인 주문의 **전시판매가 × 1/n** (주문당 1회). "
+        "다른 달 계약 + 단순 금액수정은 영향 없음. 다른 달 계약 + **이번 달에 총계약금액이 0원이 되면(전체 취소)** 전시판매가 차감. "
+        "주문 수정으로 전시판매가만 변경된 경우 변경 시점 월에 **차액(__dm_d)만 분리 반영**."
     )
 
     # 3) 매출·마진·전시: sales transaction_date 구간 | 현금수금: payment_date·KPI 수납 버킷 (집계만)
@@ -9552,6 +9307,222 @@ def _erp_delete_row(table: str, row_id: int) -> tuple[bool, str]:
         return False, str(e)
 
 
+# =====================================================================
+# v2 헬퍼 ─ 월·연 필수 근무시간 + 신청·승인 워크플로우
+# (스키마: SUPABASE_APP_ATTENDANCE_V2.sql)
+# =====================================================================
+
+_ERP_ADJ_KINDS = ("reward", "meeting", "summer_vacation", "overtime", "etc")
+_ERP_ADJ_KIND_LABEL = {
+    "reward": "포상",
+    "meeting": "회의",
+    "summer_vacation": "여름휴가",
+    "overtime": "추가근무",
+    "etc": "기타",
+}
+_ERP_ADJ_KIND_DEFAULT_SIGN = {
+    "reward": "-",
+    "meeting": "+",
+    "summer_vacation": "-",
+    "overtime": "+",
+    "etc": "+",
+}
+
+
+@st.cache_data(ttl=60)
+def _erp_get_monthly_target_row(db_filename: str, employee_name: str, ym: str) -> dict | None:
+    """app_monthly_work_targets 단일 행. (db, emp, ym) UNIQUE."""
+    if not (db_filename and employee_name and ym):
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        r = client.table("app_monthly_work_targets").select("*")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .eq("ym", ym).limit(1).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60)
+def _erp_get_yearly_target_row(db_filename: str, employee_name: str, year: int) -> dict | None:
+    """app_yearly_work_targets 단일 행. (db, emp, year) UNIQUE."""
+    if not (db_filename and employee_name and year):
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        r = client.table("app_yearly_work_targets").select("*")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .eq("year", int(year)).limit(1).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60)
+def _erp_list_monthly_targets(db_filename: str, ym: str) -> list:
+    """해당 매장·월 전체 행 (직원 행렬 입력 화면용)."""
+    if not (db_filename and ym):
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_monthly_work_targets").select("*")\
+            .eq("db_filename", db_filename).eq("ym", ym).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def _erp_list_yearly_targets(db_filename: str, year: int) -> list:
+    if not (db_filename and year):
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_yearly_work_targets").select("*")\
+            .eq("db_filename", db_filename).eq("year", int(year)).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def _erp_sum_approved_adjustments(db_filename: str, employee_name: str,
+                                  period_key: str, period_kind: str = "month") -> int:
+    """승인된 신청의 minutes 합계 (분).
+    period_kind='month' → period_key='YYYY-MM' / 'year' → 'YYYY'."""
+    if not (db_filename and employee_name and period_key):
+        return 0
+    client, err = get_supabase_client()
+    if err or not client:
+        return 0
+    try:
+        q = client.table("app_work_adjustments").select("minutes,target_date")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .eq("status", "approved")
+        if period_kind == "year":
+            start = f"{period_key}-01-01"
+            end = f"{period_key}-12-31"
+        else:
+            y, m = period_key.split("-")
+            last_day = calendar.monthrange(int(y), int(m))[1]
+            start = f"{period_key}-01"
+            end = f"{period_key}-{last_day:02d}"
+        q = q.gte("target_date", start).lte("target_date", end)
+        r = q.execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return sum(int(row.get("minutes") or 0) for row in rows)
+    except Exception:
+        return 0
+
+
+def _erp_compute_monthly_remaining_v2(db_filename: str, employee_name: str, ym: str) -> dict:
+    """월 잔여 = (월 입력 OR 연/12 fallback) - Σ승인.
+    반환 dict 키: required_min, approved_min, remaining_min, source ('month'/'year_div_12'/'none')."""
+    row_m = _erp_get_monthly_target_row(db_filename, employee_name, ym)
+    source = "none"
+    required_min = 0
+    if row_m and row_m.get("required_minutes") is not None:
+        required_min = int(row_m["required_minutes"])
+        source = "month"
+    else:
+        try:
+            year = int(ym.split("-")[0])
+        except Exception:
+            year = 0
+        row_y = _erp_get_yearly_target_row(db_filename, employee_name, year) if year else None
+        if row_y and row_y.get("required_minutes") is not None:
+            required_min = int(round(int(row_y["required_minutes"]) / 12))
+            source = "year_div_12"
+    approved_min = _erp_sum_approved_adjustments(db_filename, employee_name, ym, "month")
+    return {
+        "required_min": required_min,
+        "approved_min": approved_min,
+        "remaining_min": required_min - approved_min,
+        "source": source,
+    }
+
+
+def _erp_compute_yearly_remaining_v2(db_filename: str, employee_name: str, year: int) -> dict:
+    """연 잔여 = 연 입력 - Σ승인. 연 입력 없으면 required_min=0."""
+    row_y = _erp_get_yearly_target_row(db_filename, employee_name, year)
+    required_min = int(row_y["required_minutes"]) if (row_y and row_y.get("required_minutes") is not None) else 0
+    approved_min = _erp_sum_approved_adjustments(db_filename, employee_name, str(year), "year")
+    return {
+        "required_min": required_min,
+        "approved_min": approved_min,
+        "remaining_min": required_min - approved_min,
+    }
+
+
+@st.cache_data(ttl=30)
+def _erp_list_my_adjustments(db_filename: str, employee_name: str, ym: str) -> list:
+    """내 신청 내역 (해당 ym, 최신순)."""
+    if not (db_filename and employee_name and ym):
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        y, m = ym.split("-")
+        last_day = calendar.monthrange(int(y), int(m))[1]
+        start = f"{ym}-01"
+        end = f"{ym}-{last_day:02d}"
+        r = client.table("app_work_adjustments").select("*")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .gte("target_date", start).lte("target_date", end)\
+            .order("target_date", desc=True).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=30)
+def _erp_list_pending_adjustments(db_filename: str) -> list:
+    """매장 전체 pending 신청 (관리자 승인 큐)."""
+    if not db_filename:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_work_adjustments").select("*")\
+            .eq("db_filename", db_filename)\
+            .eq("status", "pending")\
+            .order("created_at", desc=False).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+def _erp_v2_clear_caches():
+    """v2 관련 모든 캐시 클리어 — 저장/승인/반려 직후 호출."""
+    try:
+        _erp_get_monthly_target_row.clear()
+        _erp_get_yearly_target_row.clear()
+        _erp_list_monthly_targets.clear()
+        _erp_list_yearly_targets.clear()
+        _erp_sum_approved_adjustments.clear()
+        _erp_list_my_adjustments.clear()
+        _erp_list_pending_adjustments.clear()
+    except Exception:
+        pass
+
+
 def render_erp_attendance():
     """ERP 근태 관리: 사전 일정·최소인원·캘린더·근태·시차·연차·월말요약 통합 화면."""
     user = st.session_state.get("current_user") or {}
@@ -9576,40 +9547,33 @@ def render_erp_attendance():
         st.warning("매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 선택해 주세요.")
         return
 
+    # v2 메뉴 단순화 (2026-05-28):
+    #   store_admin: 4탭 (내 근태 / 필수 시간 설정 / 신청 승인 / 캘린더 + 월말 요약)
+    #   user:        2탭 (내 근태 / 매장 캘린더)
+    # 기존 탭 함수 (_erp_tab_shift_plan 등)는 코드에 보존하나 라우팅에서 제외.
     if role == "store_admin":
-        tab_labels = ["근무 일정 계획", "최소 인원 설정", "캘린더", "휴무·근태 입력",
-                      "추가근무·시차 관리", "연차/월차 관리", "월말 요약"]
-    else:
-        tab_labels = ["근무 일정 계획", "캘린더", "휴무·근태 입력", "추가근무·시차 신청", "내 연차 현황"]
-
-    tabs = st.tabs(tab_labels)
-
-    if role == "store_admin":
+        tab_labels = ["내 근태", "필수 시간 설정", "신청 승인", "캘린더", "월말 요약"]
+        tabs = st.tabs(tab_labels)
         with tabs[0]:
-            _erp_tab_shift_plan(current_db, me_name)
+            _erp_tab_my_attendance(current_db, role, me_name)
         with tabs[1]:
-            _erp_tab_staffing_rules(current_db, me_name)
+            _erp_tab_period_targets(current_db, me_name)
         with tabs[2]:
-            _erp_tab_calendar(current_db, role, me_name, today)
+            _erp_tab_adjustment_approvals(current_db, me_name)
         with tabs[3]:
-            _erp_tab_attendance_input(current_db, role, me_name)
+            _erp_tab_calendar(current_db, role, me_name, today)
+            st.divider()
+            with st.expander("⚙️ 최소 인원 규칙 + 매장 공용 일정", expanded=False):
+                _erp_tab_staffing_rules(current_db, me_name)
         with tabs[4]:
-            _erp_tab_comptime_overtime(current_db, role, me_name)
-        with tabs[5]:
-            _erp_tab_leave_grants(current_db, me_name)
-        with tabs[6]:
             _erp_tab_monthly_summary(current_db, today)
     else:
+        tab_labels = ["내 근태", "매장 캘린더"]
+        tabs = st.tabs(tab_labels)
         with tabs[0]:
-            _erp_tab_shift_plan(current_db, me_name)
+            _erp_tab_my_attendance(current_db, role, me_name)
         with tabs[1]:
             _erp_tab_calendar(current_db, role, me_name, today)
-        with tabs[2]:
-            _erp_tab_attendance_input(current_db, role, me_name)
-        with tabs[3]:
-            _erp_tab_comptime_overtime(current_db, role, me_name)
-        with tabs[4]:
-            _erp_tab_my_leave_status(current_db, me_name)
 
 
 # ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
@@ -10232,34 +10196,156 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
             except Exception:
                 st.warning("YYYY-MM 형식으로 입력해 주세요.")
     _events = _erp_store_events_cached(current_db, se_ym)
+    _editing_id = st.session_state.get("se_editing_id")
     if _events:
         st.caption(f"등록된 일정 {len(_events)}건")
         for _ev in _events:
-            _ec = st.columns([2, 2, 1.5, 3, 1])
+            _ev_id = int(_ev["id"])
             _ev_start = str(_ev.get("event_date") or "")[:10]
             _ev_end = str(_ev.get("end_date") or "")[:10] if _ev.get("end_date") else ""
-            with _ec[0]:
-                if _ev_end and _ev_end != _ev_start:
-                    st.markdown(f"**{_ev_start} ~ {_ev_end}**")
-                else:
-                    st.markdown(f"**{_ev_start}**")
-            with _ec[1]:
-                st.markdown(_ev.get("title") or "-")
-            with _ec[2]:
-                _ss = str(_ev.get("start_time") or "")[:5]
-                _ee = str(_ev.get("end_time") or "")[:5]
-                st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "종일")
-            with _ec[3]:
-                st.caption(_ev.get("note") or "")
-            with _ec[4]:
-                if st.button("🗑️", key=f"se_del_{_ev['id']}"):
-                    ok, e = _erp_delete_row("app_store_events", int(_ev["id"]))
-                    if ok:
-                        _erp_store_events_cached.clear()
-                        flash("매장 공용 일정이 삭제되었습니다.")
+
+            if _editing_id == _ev_id:
+                # 인라인 수정 모드
+                try:
+                    _cur_start = date.fromisoformat(_ev_start)
+                except Exception:
+                    _cur_start = _today
+                try:
+                    _cur_end = date.fromisoformat(_ev_end) if _ev_end else _cur_start
+                except Exception:
+                    _cur_end = _cur_start
+                _cur_st_s = str(_ev.get("start_time") or "")[:5]
+                _cur_et_s = str(_ev.get("end_time") or "")[:5]
+                _is_multi_cur = bool(_ev_end) and (_ev_end != _ev_start)
+                _has_time_cur = bool(_cur_st_s and _cur_et_s)
+
+                with st.container(border=True):
+                    st.markdown(f"**✏️ 일정 수정 (#{_ev_id})**")
+                    _rc1, _rc2 = st.columns([1, 1])
+                    with _rc1:
+                        _edit_span = st.radio(
+                            "기간 유형", ["하루", "여러 날"],
+                            index=1 if _is_multi_cur else 0,
+                            horizontal=True, key=f"se_edit_span_{_ev_id}",
+                        )
+                    with _rc2:
+                        _edit_time_mode = st.radio(
+                            "시간 유형", ["종일", "시간대 지정"],
+                            index=1 if _has_time_cur else 0,
+                            horizontal=True, key=f"se_edit_time_mode_{_ev_id}",
+                        )
+
+                    with st.form(f"se_edit_form_{_ev_id}", clear_on_submit=False):
+                        if _edit_span == "하루":
+                            _ec1, _ec2 = st.columns([1, 3])
+                            with _ec1:
+                                _new_start = st.date_input("날짜", value=_cur_start, key=f"se_edit_dt_{_ev_id}")
+                            with _ec2:
+                                _new_title = st.text_input("제목", value=_ev.get("title") or "", key=f"se_edit_title_{_ev_id}")
+                            _new_end = _new_start
+                        else:
+                            _ec1a, _ec1b, _ec2 = st.columns([1, 1, 3])
+                            with _ec1a:
+                                _new_start = st.date_input("시작일", value=_cur_start, key=f"se_edit_dt_s_{_ev_id}")
+                            with _ec1b:
+                                _new_end = st.date_input(
+                                    "종료일",
+                                    value=_cur_end if _cur_end >= _cur_start else _cur_start,
+                                    key=f"se_edit_dt_e_{_ev_id}",
+                                )
+                            with _ec2:
+                                _new_title = st.text_input("제목", value=_ev.get("title") or "", key=f"se_edit_title_m_{_ev_id}")
+
+                        if _edit_time_mode == "시간대 지정":
+                            try:
+                                _st_default = dt_time(int(_cur_st_s.split(":")[0]), int(_cur_st_s.split(":")[1])) if _cur_st_s else dt_time(18, 0)
+                            except Exception:
+                                _st_default = dt_time(18, 0)
+                            try:
+                                _et_default = dt_time(int(_cur_et_s.split(":")[0]), int(_cur_et_s.split(":")[1])) if _cur_et_s else dt_time(20, 0)
+                            except Exception:
+                                _et_default = dt_time(20, 0)
+                            _ec4, _ec5 = st.columns(2)
+                            with _ec4:
+                                _new_st_t = st.time_input("시작 시각", value=_st_default, key=f"se_edit_st_{_ev_id}")
+                            with _ec5:
+                                _new_et_t = st.time_input("종료 시각", value=_et_default, key=f"se_edit_et_{_ev_id}")
+                            _new_has_time = True
+                        else:
+                            _new_st_t = None
+                            _new_et_t = None
+                            _new_has_time = False
+
+                        _new_note = st.text_input("메모 (선택)", value=_ev.get("note") or "", key=f"se_edit_note_{_ev_id}")
+
+                        _bc1, _bc2, _bc3 = st.columns([1, 1, 4])
+                        with _bc1:
+                            _save_btn = st.form_submit_button("💾 저장", type="primary")
+                        with _bc2:
+                            _cancel_btn = st.form_submit_button("취소")
+
+                    if _cancel_btn:
+                        st.session_state.pop("se_editing_id", None)
                         st.rerun()
+                    if _save_btn:
+                        if not (_new_title or "").strip():
+                            st.error("제목을 입력해 주세요.")
+                        elif _new_end < _new_start:
+                            st.error("종료일이 시작일보다 빠를 수 없습니다.")
+                        elif _new_has_time and (_new_et_t.hour * 60 + _new_et_t.minute) <= (_new_st_t.hour * 60 + _new_st_t.minute):
+                            st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
+                        else:
+                            _is_multi_new = (_new_end != _new_start)
+                            _patch = {
+                                "event_date": _new_start.isoformat(),
+                                "end_date": _new_end.isoformat() if _is_multi_new else None,
+                                "title": _new_title.strip(),
+                                "start_time": _new_st_t.strftime("%H:%M:%S") if _new_has_time else None,
+                                "end_time": _new_et_t.strftime("%H:%M:%S") if _new_has_time else None,
+                                "note": (_new_note or "").strip() or None,
+                            }
+                            ok, e = _erp_update_row("app_store_events", _ev_id, _patch)
+                            # end_date 컬럼이 없는 구 스키마 대응
+                            if not ok and ("end_date" in str(e) or "PGRST204" in str(e) or "schema cache" in str(e).lower()):
+                                _patch_legacy = {k: v for k, v in _patch.items() if k != "end_date"}
+                                ok, e = _erp_update_row("app_store_events", _ev_id, _patch_legacy)
+                            if ok:
+                                _erp_store_events_cached.clear()
+                                st.session_state.pop("se_editing_id", None)
+                                flash("매장 공용 일정이 수정되었습니다.")
+                                st.rerun()
+                            else:
+                                st.error(f"수정 실패: {e}")
+            else:
+                _ec = st.columns([2, 2, 1.5, 3, 0.6, 0.6])
+                with _ec[0]:
+                    if _ev_end and _ev_end != _ev_start:
+                        st.markdown(f"**{_ev_start} ~ {_ev_end}**")
                     else:
-                        st.error(f"삭제 실패: {e}")
+                        st.markdown(f"**{_ev_start}**")
+                with _ec[1]:
+                    st.markdown(_ev.get("title") or "-")
+                with _ec[2]:
+                    _ss = str(_ev.get("start_time") or "")[:5]
+                    _ee = str(_ev.get("end_time") or "")[:5]
+                    st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "종일")
+                with _ec[3]:
+                    st.caption(_ev.get("note") or "")
+                with _ec[4]:
+                    if st.button("✏️", key=f"se_edit_{_ev_id}", help="수정"):
+                        st.session_state["se_editing_id"] = _ev_id
+                        st.rerun()
+                with _ec[5]:
+                    if st.button("🗑️", key=f"se_del_{_ev_id}", help="삭제"):
+                        ok, e = _erp_delete_row("app_store_events", _ev_id)
+                        if ok:
+                            _erp_store_events_cached.clear()
+                            if st.session_state.get("se_editing_id") == _ev_id:
+                                st.session_state.pop("se_editing_id", None)
+                            flash("매장 공용 일정이 삭제되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"삭제 실패: {e}")
     else:
         st.info(f"{se_ym} 등록된 매장 공용 일정이 없습니다.")
 
@@ -11584,6 +11670,422 @@ def _erp_tab_my_leave_status(current_db: str, me_name: str):
     with m4:
         st.metric("잔여 시차", f"{comp_remain}분", delta=f"{comp_remain//60}h {comp_remain%60}m")
     st.caption(f"입사일: {hire or '-'} (월차 적립은 입사일 기준 자동 계산, 최대 11일)")
+
+
+# =====================================================================
+# v2 화면 함수 ─ 매장관리자 2종 + 직원 1종
+# (메뉴 단순화: admin 7탭→4탭, user 5탭→1~2탭)
+# =====================================================================
+
+def _erp_tab_period_targets(current_db: str, me_name: str):
+    """매장관리자: 필수 시간 설정 (월·연 모드 토글, 직원×시간 입력)."""
+    st.subheader("⏰ 필수 시간 설정")
+    st.caption("직원별로 월 또는 연 단위 필수 근무시간을 한 숫자(시간)만 입력합니다. "
+               "월 입력이 없는 달은 연/12로 자동 환산됩니다.")
+
+    today = _today_kst()
+    mode = st.radio("입력 단위", ["월 단위", "연 단위"], horizontal=True, key="pt_mode")
+
+    emp_names = _erp_get_employee_names_for_store(current_db)
+    if not emp_names:
+        st.info("매장에 배정된 직원이 없습니다. 직원 관리에서 매장을 배정해 주세요.")
+        return
+
+    if mode == "월 단위":
+        cy, cm = st.columns(2)
+        with cy:
+            year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="pt_m_y")
+        with cm:
+            month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="pt_m_m")
+        ym = f"{int(year):04d}-{int(month):02d}"
+
+        rows = _erp_list_monthly_targets(current_db, ym)
+        by_emp = {r["employee_name"]: r for r in rows}
+        df_init = pd.DataFrame([
+            {
+                "직원": n,
+                "월 필수 시간(h)": round(int(by_emp[n]["required_minutes"]) / 60, 2) if n in by_emp else 0.0,
+                "메모": by_emp[n].get("note") or "" if n in by_emp else "",
+            }
+            for n in emp_names
+        ])
+        edited = st.data_editor(
+            df_init,
+            key=f"pt_m_editor_{ym}",
+            width='stretch',
+            hide_index=True,
+            disabled=["직원"],
+            column_config={
+                "직원": st.column_config.TextColumn("직원"),
+                "월 필수 시간(h)": st.column_config.NumberColumn("월 필수 시간(h)", min_value=0.0, max_value=744.0, step=0.5, format="%.2f"),
+                "메모": st.column_config.TextColumn("메모"),
+            },
+        )
+        if st.button("💾 월 단위 저장", key=f"pt_m_save_{ym}", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+            ok_count = 0
+            fail = []
+            for _, r in edited.iterrows():
+                emp = str(r["직원"]).strip()
+                hours = float(r["월 필수 시간(h)"] or 0)
+                note = str(r["메모"] or "").strip() or None
+                if not emp:
+                    continue
+                minutes = int(round(hours * 60))
+                payload = {
+                    "db_filename": current_db,
+                    "employee_name": emp,
+                    "ym": ym,
+                    "required_minutes": minutes,
+                    "note": note,
+                    "updated_by": me_name,
+                }
+                if emp not in by_emp:
+                    payload["created_by"] = me_name
+                try:
+                    client.table("app_monthly_work_targets")\
+                        .upsert(payload, on_conflict="db_filename,employee_name,ym").execute()
+                    ok_count += 1
+                except Exception as e:
+                    fail.append(f"{emp}: {e}")
+            _erp_v2_clear_caches()
+            if fail:
+                st.error("일부 저장 실패: " + " / ".join(fail))
+            else:
+                flash(f"월 단위 필수 시간 {ok_count}건 저장 완료 ({ym})")
+                st.rerun()
+
+    else:
+        year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="pt_y_y")
+        yr = int(year)
+        rows = _erp_list_yearly_targets(current_db, yr)
+        by_emp = {r["employee_name"]: r for r in rows}
+        df_init = pd.DataFrame([
+            {
+                "직원": n,
+                "연 필수 시간(h)": round(int(by_emp[n]["required_minutes"]) / 60, 2) if n in by_emp else 0.0,
+                "메모": by_emp[n].get("note") or "" if n in by_emp else "",
+            }
+            for n in emp_names
+        ])
+        edited = st.data_editor(
+            df_init,
+            key=f"pt_y_editor_{yr}",
+            width='stretch',
+            hide_index=True,
+            disabled=["직원"],
+            column_config={
+                "직원": st.column_config.TextColumn("직원"),
+                "연 필수 시간(h)": st.column_config.NumberColumn("연 필수 시간(h)", min_value=0.0, max_value=8760.0, step=1.0, format="%.2f"),
+                "메모": st.column_config.TextColumn("메모"),
+            },
+        )
+        if st.button("💾 연 단위 저장", key=f"pt_y_save_{yr}", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+            ok_count = 0
+            fail = []
+            for _, r in edited.iterrows():
+                emp = str(r["직원"]).strip()
+                hours = float(r["연 필수 시간(h)"] or 0)
+                note = str(r["메모"] or "").strip() or None
+                if not emp:
+                    continue
+                minutes = int(round(hours * 60))
+                payload = {
+                    "db_filename": current_db,
+                    "employee_name": emp,
+                    "year": yr,
+                    "required_minutes": minutes,
+                    "note": note,
+                    "updated_by": me_name,
+                }
+                if emp not in by_emp:
+                    payload["created_by"] = me_name
+                try:
+                    client.table("app_yearly_work_targets")\
+                        .upsert(payload, on_conflict="db_filename,employee_name,year").execute()
+                    ok_count += 1
+                except Exception as e:
+                    fail.append(f"{emp}: {e}")
+            _erp_v2_clear_caches()
+            if fail:
+                st.error("일부 저장 실패: " + " / ".join(fail))
+            else:
+                flash(f"연 단위 필수 시간 {ok_count}건 저장 완료 ({yr})")
+                st.rerun()
+
+
+def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
+    """매장관리자: 직원 신청 승인/반려 큐."""
+    st.subheader("📥 신청 승인")
+    st.caption("직원이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청을 검토합니다. 승인 시 해당 직원의 월·연 잔여 시간에 즉시 반영됩니다.")
+
+    pending = _erp_list_pending_adjustments(current_db)
+    if not pending:
+        st.info("대기 중인 신청이 없습니다.")
+        return
+
+    st.caption(f"대기 중 {len(pending)}건")
+    for adj in pending:
+        adj_id = int(adj["id"])
+        kind = adj.get("kind") or "etc"
+        sign = adj.get("sign") or "+"
+        minutes = int(adj.get("minutes") or 0)
+        hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
+        with st.container(border=True):
+            c = st.columns([1.3, 1, 0.4, 1.2, 3, 1, 1])
+            with c[0]:
+                st.markdown(f"**{adj.get('employee_name') or '-'}**")
+                st.caption(str(adj.get("created_at") or "")[:16])
+            with c[1]:
+                st.markdown(f"{str(adj.get('target_date') or '')[:10]}")
+            with c[2]:
+                st.markdown(f"### {sign}")
+            with c[3]:
+                st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {hours_display}")
+            with c[4]:
+                st.caption(adj.get("reason") or "")
+            with c[5]:
+                if st.button("✅ 승인", key=f"adj_ok_{adj_id}"):
+                    ok, e = _erp_update_row("app_work_adjustments", adj_id, {
+                        "status": "approved",
+                        "approved_by": me_name,
+                        "approved_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    if ok:
+                        _erp_v2_clear_caches()
+                        flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
+                        st.rerun()
+                    else:
+                        st.error(f"승인 실패: {e}")
+            with c[6]:
+                with st.popover("❌ 반려"):
+                    reject_reason = st.text_input("반려 사유", key=f"adj_rj_reason_{adj_id}")
+                    if st.button("반려 확정", key=f"adj_rj_btn_{adj_id}", type="primary"):
+                        ok, e = _erp_update_row("app_work_adjustments", adj_id, {
+                            "status": "rejected",
+                            "approved_by": me_name,
+                            "approved_at": datetime.now(timezone.utc).isoformat(),
+                            "reject_reason": (reject_reason or "").strip() or None,
+                        })
+                        if ok:
+                            _erp_v2_clear_caches()
+                            flash(f"반려: {adj.get('employee_name')}")
+                            st.rerun()
+                        else:
+                            st.error(f"반려 실패: {e}")
+
+
+def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
+    """직원·관리자 공용: 내 근태 (월·연 잔여 카드 + +/- 신청 + 내 신청 내역)."""
+    st.subheader("🧑‍💼 내 근태")
+    st.caption("이번 달과 올해의 필수 근무시간 대비 승인된 신청 합계, 잔여 시간을 확인하고 +/- 신청을 등록합니다.")
+
+    today = _today_kst()
+    cy, cm = st.columns(2)
+    with cy:
+        year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="my_y")
+    with cm:
+        month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="my_m")
+    ym = f"{int(year):04d}-{int(month):02d}"
+    yr = int(year)
+
+    m = _erp_compute_monthly_remaining_v2(current_db, me_name, ym)
+    y = _erp_compute_yearly_remaining_v2(current_db, me_name, yr)
+
+    def _h(mins: int) -> str:
+        h = abs(mins) // 60
+        mm = abs(mins) % 60
+        sgn = "-" if mins < 0 else ""
+        return f"{sgn}{h}h" if mm == 0 else f"{sgn}{h}h {mm}m"
+
+    card_l, card_r = st.columns(2)
+    with card_l:
+        with st.container(border=True):
+            st.markdown(f"##### 이번 달 ({ym})")
+            st.metric("필수", _h(m["required_min"]))
+            st.metric("승인 합계", _h(m["approved_min"]))
+            st.metric("잔여", _h(m["remaining_min"]))
+            if m["source"] == "year_div_12":
+                st.caption("ⓘ 월 입력이 없어 연 입력의 1/12로 환산되었습니다.")
+            elif m["source"] == "none":
+                st.caption("⚠️ 매장관리자가 필수 시간을 설정하지 않았습니다.")
+    with card_r:
+        with st.container(border=True):
+            st.markdown(f"##### 올해 ({yr})")
+            st.metric("필수", _h(y["required_min"]))
+            st.metric("승인 합계", _h(y["approved_min"]))
+            st.metric("잔여", _h(y["remaining_min"]))
+            if y["required_min"] == 0:
+                st.caption("ⓘ 연 단위 입력값이 없습니다.")
+
+    st.divider()
+
+    # ── +/- 신청 폼 ───────────────────────────────────────────────
+    st.markdown("##### ➕➖ 신청 등록")
+    fc1, fc2 = st.columns([1, 1])
+    with fc1:
+        new_kind = st.selectbox(
+            "유형",
+            options=list(_ERP_ADJ_KINDS),
+            format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "기타 (±)",
+            key="my_new_kind",
+        )
+    with fc2:
+        if new_kind == "etc":
+            new_sign = st.radio("부호", ["+", "-"], horizontal=True, key="my_new_sign")
+        else:
+            new_sign = _ERP_ADJ_KIND_DEFAULT_SIGN[new_kind]
+            st.markdown(f"**부호: {new_sign}** (고정)")
+
+    with st.form("my_new_adj_form", clear_on_submit=True):
+        gc1, gc2, gc3 = st.columns([1, 1, 3])
+        with gc1:
+            new_date = st.date_input("대상 일자", value=today, key="my_new_date")
+        with gc2:
+            new_hours = st.number_input("시간(h)", min_value=0.25, max_value=24.0, step=0.5, value=1.0, key="my_new_h")
+        with gc3:
+            placeholder_reason = "사유 (기타는 필수)"
+            new_reason = st.text_input("사유", placeholder=placeholder_reason, key="my_new_reason")
+        if st.form_submit_button("📤 신청 등록", type="primary"):
+            if new_kind == "etc" and not (new_reason or "").strip():
+                st.error("기타 유형은 사유를 입력해 주세요.")
+            else:
+                payload = {
+                    "db_filename": current_db,
+                    "employee_name": me_name,
+                    "target_date": new_date.isoformat(),
+                    "kind": new_kind,
+                    "sign": new_sign,
+                    "minutes": int(round(float(new_hours) * 60)),
+                    "reason": (new_reason or "").strip() or None,
+                    "status": "pending",
+                    "created_by": me_name,
+                }
+                ok, e = _erp_insert_row("app_work_adjustments", payload)
+                if ok:
+                    _erp_v2_clear_caches()
+                    flash("신청이 등록되었습니다. 매장관리자 승인 대기 중.")
+                    st.rerun()
+                else:
+                    st.error(f"등록 실패: {e}")
+
+    st.divider()
+
+    # ── 내 신청 내역 ──────────────────────────────────────────────
+    st.markdown(f"##### 📋 내 신청 내역 ({ym})")
+    my_list = _erp_list_my_adjustments(current_db, me_name, ym)
+    if not my_list:
+        st.info("이번 달에 등록한 신청이 없습니다.")
+        return
+
+    editing_id = st.session_state.get("my_adj_editing_id")
+    for adj in my_list:
+        adj_id = int(adj["id"])
+        kind = adj.get("kind") or "etc"
+        sign = adj.get("sign") or "+"
+        status = adj.get("status") or "pending"
+        minutes = int(adj.get("minutes") or 0)
+        hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
+        status_label = {"pending": "🟡 대기", "approved": "🟢 승인", "rejected": "🔴 반려"}.get(status, status)
+
+        if editing_id == adj_id and status == "pending":
+            with st.container(border=True):
+                st.markdown(f"**✏️ 신청 수정 (#{adj_id})**")
+                ec_kind = st.selectbox(
+                    "유형",
+                    options=list(_ERP_ADJ_KINDS),
+                    index=list(_ERP_ADJ_KINDS).index(kind) if kind in _ERP_ADJ_KINDS else 4,
+                    format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "기타 (±)",
+                    key=f"my_edit_kind_{adj_id}",
+                )
+                if ec_kind == "etc":
+                    ec_sign = st.radio("부호", ["+", "-"], horizontal=True,
+                                       index=0 if sign == "+" else 1, key=f"my_edit_sign_{adj_id}")
+                else:
+                    ec_sign = _ERP_ADJ_KIND_DEFAULT_SIGN[ec_kind]
+                    st.markdown(f"**부호: {ec_sign}** (유형 고정)")
+
+                with st.form(f"my_edit_form_{adj_id}", clear_on_submit=False):
+                    e1, e2, e3 = st.columns([1, 1, 3])
+                    with e1:
+                        try:
+                            cur_date = date.fromisoformat(str(adj.get("target_date") or "")[:10])
+                        except Exception:
+                            cur_date = today
+                        ec_date = st.date_input("대상 일자", value=cur_date, key=f"my_edit_date_{adj_id}")
+                    with e2:
+                        ec_hours = st.number_input("시간(h)", min_value=0.25, max_value=24.0, step=0.5,
+                                                   value=round(minutes / 60, 2), key=f"my_edit_h_{adj_id}")
+                    with e3:
+                        ec_reason = st.text_input("사유", value=adj.get("reason") or "", key=f"my_edit_reason_{adj_id}")
+                    bc1, bc2, _ = st.columns([1, 1, 4])
+                    with bc1:
+                        save_btn = st.form_submit_button("💾 저장", type="primary")
+                    with bc2:
+                        cancel_btn = st.form_submit_button("취소")
+                if cancel_btn:
+                    st.session_state.pop("my_adj_editing_id", None)
+                    st.rerun()
+                if save_btn:
+                    if ec_kind == "etc" and not (ec_reason or "").strip():
+                        st.error("기타 유형은 사유를 입력해 주세요.")
+                    else:
+                        patch = {
+                            "target_date": ec_date.isoformat(),
+                            "kind": ec_kind,
+                            "sign": ec_sign,
+                            "minutes": int(round(float(ec_hours) * 60)),
+                            "reason": (ec_reason or "").strip() or None,
+                        }
+                        ok, e = _erp_update_row("app_work_adjustments", adj_id, patch)
+                        if ok:
+                            _erp_v2_clear_caches()
+                            st.session_state.pop("my_adj_editing_id", None)
+                            flash("신청이 수정되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"수정 실패: {e}")
+        else:
+            cols = st.columns([1, 1.3, 0.4, 1, 3, 1, 0.5, 0.5])
+            with cols[0]:
+                st.markdown(str(adj.get("target_date") or "")[:10])
+            with cols[1]:
+                st.markdown(_ERP_ADJ_KIND_LABEL.get(kind, kind))
+            with cols[2]:
+                st.markdown(f"**{sign}**")
+            with cols[3]:
+                st.markdown(hours_display)
+            with cols[4]:
+                msg = adj.get("reason") or ""
+                if status == "rejected" and adj.get("reject_reason"):
+                    msg += f"  ▸ 반려 사유: {adj['reject_reason']}"
+                st.caption(msg)
+            with cols[5]:
+                st.markdown(status_label)
+            with cols[6]:
+                if status == "pending":
+                    if st.button("✏️", key=f"my_adj_edit_{adj_id}", help="수정"):
+                        st.session_state["my_adj_editing_id"] = adj_id
+                        st.rerun()
+            with cols[7]:
+                if status == "pending":
+                    if st.button("🗑️", key=f"my_adj_del_{adj_id}", help="취소(삭제)"):
+                        ok, e = _erp_delete_row("app_work_adjustments", adj_id)
+                        if ok:
+                            _erp_v2_clear_caches()
+                            if st.session_state.get("my_adj_editing_id") == adj_id:
+                                st.session_state.pop("my_adj_editing_id", None)
+                            flash("신청이 취소되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"취소 실패: {e}")
 
 
 # ---------- superadmin: 통합 캘린더 & 매장별 현황 ----------
@@ -15324,28 +15826,7 @@ def render_new_sales():
                 "is_today_first": is_today_first,
                 "monthly_max_before": monthly_max_before,
             }
-            # 채널톡 PUSH: 백그라운드 스레드로 전송 (UI 블로킹 방지)
-            def _channel_talk_sync_supa():
-                try:
-                    if not _get_channel_talk_secrets():
-                        return
-                    store_name_ct = _get_store_name_by_db(db_filename)
-                    store_tag_key_ct = _get_store_tag_key(store_name_ct)
-                    unpaid_ct = float(remaining) if remaining > 0 else 0.0
-                    sync_channel_talk_customer(
-                        customer_name=cust_name.strip(),
-                        phone_number=phone1.strip(),
-                        purchase_amount=final_sales_save,
-                        item_category=category or "",
-                        purchase_date=order_date,
-                        store_tag_key=store_tag_key_ct,
-                        is_returning=(not is_new_customer),
-                        unpaid_balance=unpaid_ct,
-                    )
-                except Exception:
-                    pass
-            threading.Thread(target=_channel_talk_sync_supa, daemon=True).start()
-            st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
+            st.toast("등록이 완료되었습니다.", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             st.session_state["_cust_search_panel_open"] = False
             # 반복 등록 시 금액이 이전 건과 동일하게 남는 현상 방지: 비위젯 상태 초기화 후 위젯 키는 삭제
@@ -15456,29 +15937,7 @@ def render_new_sales():
             if margin_out_of_range:
                 store_name = _get_store_name_by_db(db_filename)
                 _insert_admin_alert(store_name, "margin", f"{store_name}에서 실질 마진율 {net_margin_rate_save:.1f}% 건이 등록되었습니다.")
-            # 채널톡 PUSH: 백그라운드 스레드로 전송해 UI 블로킹 방지
-            _sqlite_remaining = remaining  # 클로저에서 사용할 변수 캡처
-            def _channel_talk_sync():
-                try:
-                    if not _get_channel_talk_secrets():
-                        return
-                    store_name_ct = _get_store_name_by_db(db_filename)
-                    store_tag_key_ct = _get_store_tag_key(store_name_ct)
-                    unpaid_ct = float(_sqlite_remaining) if _sqlite_remaining > 0 else 0.0
-                    sync_channel_talk_customer(
-                        customer_name=cust_name.strip(),
-                        phone_number=phone1.strip(),
-                        purchase_amount=final_sales_save,
-                        item_category=category or "",
-                        purchase_date=order_date,
-                        store_tag_key=store_tag_key_ct,
-                        is_returning=(not is_new_customer),
-                        unpaid_balance=unpaid_ct,
-                    )
-                except Exception:
-                    pass
-            threading.Thread(target=_channel_talk_sync, daemon=True).start()
-            st.toast("등록이 완료되었습니다. (채널톡 동기화는 백그라운드에서 진행됩니다.)", icon="✅")
+            st.toast("등록이 완료되었습니다.", icon="✅")
             st.session_state["_new_sales_form_reset"] = st.session_state.get("_new_sales_form_reset", 0) + 1
             st.session_state["_cust_search_panel_open"] = False
             # 반복 등록 시 금액이 이전 건과 동일하게 남는 현상 방지: 비위젯 상태 초기화 후 위젯 키는 삭제
@@ -15971,9 +16430,9 @@ def render_customer_balance():
 
     # ---------- 탭 1: 일반 고객 및 데이터 수정 ----------
     with tab_gen:
-        # 고객 엑셀 일괄 등록 (기준일 이전 고객용, 채널톡 동기화 없음)
+        # 고객 엑셀 일괄 등록 (기준일 이전 고객용)
         with st.expander("📤 고객 엑셀 일괄 등록 (기존 고객)"):
-            st.caption("엑셀 파일로 고객을 일괄 등록합니다. 채널톡에는 등록되지 않습니다. 컬럼: 이름(또는 name), 전화번호1(또는 phone1), 전화번호2(또는 phone2), 주소(또는 address). UTF-8 인코딩 권장.")
+            st.caption("엑셀 파일로 고객을 일괄 등록합니다. 컬럼: 이름(또는 name), 전화번호1(또는 phone1), 전화번호2(또는 phone2), 주소(또는 address). UTF-8 인코딩 권장.")
             # 현재 app_customers 스키마에 맞는 샘플 CSV 다운로드
             sample_rows = [
                 {
@@ -16073,118 +16532,6 @@ def render_customer_balance():
                                     st.error(f"엑셀 등록 중 오류: {detail}")
                 except Exception as e:
                     st.error(f"엑셀 파일을 읽을 수 없습니다: {e}")
-
-        # 채널톡 PUSH + PULL 연동
-        with st.expander("📤 채널톡 연동 (PUSH 자동 / PULL 단건 조회)"):
-            st.caption(
-                "**PUSH**: '새로운 매출 등록' 저장 시 해당 고객 정보가 채널톡에 자동 전송됩니다. "
-                "태그 형식: `매장키구매/품목` (예: 삼산구매/옷장). "
-                "재구매 시 `재구매_매장키`, 미수금 있을 시 `미수금_매장키` 태그도 자동 추가됩니다.\n\n"
-                "**PULL**: 아래에서 전화번호로 채널톡 고객 정보를 단건 조회할 수 있습니다."
-            )
-            ct_secrets_ok = bool(_get_channel_talk_secrets())
-            if not ct_secrets_ok:
-                st.warning("채널톡 API 키가 설정되지 않았습니다. `.streamlit/secrets.toml`의 `[channel_talk]` 항목을 설정해 주세요.")
-            else:
-                st.success("채널톡 API 키가 설정되어 있습니다.")
-
-            st.markdown("---")
-            st.markdown("**📥 채널톡 고객 단건 조회 (PULL)**")
-            col_ph, col_btn = st.columns([3, 1])
-            with col_ph:
-                ct_pull_phone = st.text_input(
-                    "조회할 전화번호 입력",
-                    placeholder="01012345678",
-                    key="ct_pull_phone_input",
-                    label_visibility="collapsed",
-                )
-            with col_btn:
-                ct_pull_btn = st.button("채널톡 조회", key="ct_pull_btn", width='stretch')
-            if ct_pull_btn and ct_pull_phone and ct_pull_phone.strip():
-                if not ct_secrets_ok:
-                    st.error("채널톡 API 키를 먼저 설정해 주세요.")
-                else:
-                    with st.spinner("채널톡에서 고객 정보를 조회 중..."):
-                        ct_user = fetch_channel_talk_customer_by_phone(ct_pull_phone.strip())
-                    if ct_user:
-                        profile = ct_user.get("profile") or {}
-                        tags_ct = ct_user.get("tags") or []
-                        st.success("채널톡에서 고객 정보를 찾았습니다.")
-                        info_cols = st.columns(3)
-                        info_cols[0].metric("이름", profile.get("name") or ct_user.get("name") or "-")
-                        info_cols[1].metric("연락처", profile.get("mobileNumber") or ct_pull_phone.strip())
-                        info_cols[2].metric("최근 구매액", f"{int(profile.get('오프라인_최근구매액') or 0):,}원")
-                        st.write("**태그:**", ", ".join(tags_ct) if tags_ct else "없음")
-                        st.write("**최근 구매일:**", profile.get("오프라인_최근구매일") or "-")
-                        st.write("**최근 구매 품목:**", profile.get("오프라인_구매품목") or "-")
-                        st.write("**누적 구매 횟수:**", profile.get("오프라인_누적구매횟수") or "-")
-
-        # 채널톡 웹훅 수신 로그
-        with st.expander("📋 채널톡 웹훅 수신 로그"):
-            st.caption("채널톡에서 웹훅이 들어왔을 때 우리 DB에 등록된 기록입니다.")
-            log_df = pd.DataFrame()
-            try:
-                sc_log, _ = get_supabase_client()
-                if sc_log:
-                    role = (st.session_state.get("current_user") or {}).get("role", "")
-                    store_name_log = _get_current_store_name_for_customers(db_filename)
-                    q_log = sc_log.table("channel_talk_webhook_log").select(
-                        "id, created_at, store_key, phone, name, status, message, store_name, customer_id"
-                    ).order("id", desc=True).limit(100)
-                    if role != "superadmin" and store_name_log:
-                        q_log = q_log.eq("store_name", store_name_log)
-                    r_log = q_log.execute()
-                    log_df = pd.DataFrame(r_log.data) if r_log.data else pd.DataFrame()
-            except Exception:
-                pass
-            if log_df.empty:
-                conn_m = get_master_conn()
-                try:
-                    role = (st.session_state.get("current_user") or {}).get("role", "")
-                    if role == "superadmin":
-                        log_df = pd.read_sql(
-                            "SELECT id, created_at, store_key, phone, name, status, message, db_filename, customer_id FROM ChannelTalkWebhookLog ORDER BY id DESC LIMIT 100",
-                            conn_m,
-                        )
-                    else:
-                        log_df = pd.read_sql(
-                            "SELECT id, created_at, store_key, phone, name, status, message, db_filename, customer_id FROM ChannelTalkWebhookLog WHERE db_filename = ? ORDER BY id DESC LIMIT 100",
-                            conn_m,
-                            params=(db_filename,),
-                        )
-                except Exception:
-                    log_df = pd.DataFrame()
-                finally:
-                    conn_m.close()
-            if len(log_df) > 0:
-                log_disp = log_df.rename(columns={
-                    "created_at": "수신 시각", "store_key": "매장키", "phone": "연락처", "name": "고객명",
-                    "status": "상태", "message": "메시지", "store_name": "매장명",
-                    "db_filename": "저장DB", "customer_id": "고객ID"
-                })
-                st.dataframe(log_disp, width='stretch')
-            else:
-                st.info("아직 채널톡 웹훅 수신 로그가 없습니다. 웹훅 수신 서버를 설정하면 여기에 표시됩니다.")
-            st.write("**채널톡으로 등록된 고객 (본 매장)**")
-            try:
-                sc, _ = get_supabase_client()
-                if sc:
-                    store_name = _get_current_store_name_for_customers(db_filename)
-                    if store_name:
-                        qct = sc.table("app_customers").select("id, name, phone1, phone2, address, source").eq("store_name", store_name).in_("source", ["채널톡", "채널톡_웹훅"])
-                        r = qct.order("id", desc=True).limit(100).execute()
-                    else:
-                        r = type("R", (), {"data": None})()
-                        r.data = None
-                    ct_customers = pd.DataFrame(r.data) if r.data else pd.DataFrame()
-                else:
-                    ct_customers = pd.DataFrame()
-            except Exception:
-                ct_customers = pd.DataFrame()
-            if len(ct_customers) > 0:
-                st.dataframe(ct_customers.rename(columns={"id": "ID", "name": "고객명", "phone1": "연락처1", "phone2": "연락처2", "address": "주소", "source": "가입경로"}), width='stretch')
-            else:
-                st.info("채널톡(또는 푸시)으로 등록된 고객이 없습니다.")
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")
@@ -16509,6 +16856,7 @@ def render_customer_balance():
                                     if old_actual_margin != old_actual_margin:  # NaN 방지
                                         old_actual_margin = 0.0
                                     old_cost = float(orow.get("cost_price") or 0)
+                                    old_display_sales = float(orow.get("display_sales_amount") or 0)
                                     old_visit = orow.get("visit_reason") or ""
                                     old_purchase = orow.get("purchase_reason") or ""
                                     d_new = st.session_state.get(f"{edit_prefix}_delivery")
@@ -16538,9 +16886,15 @@ def render_customer_balance():
                                         st.warning(f"⚠️ 주의: 마진율이 {margin_pct:.1f}%입니다. 적정 범위(15%~25%)를 벗어났습니다.")
                                         
                                     # 감사 로그 및 매출 차액 반영
-                                    if old_total != new_total:
-                                        if conn: _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
-                                        delta = new_total - old_total
+                                    # total 또는 전시판매가가 변경되면 sales 행 1건 INSERT (amt = delta_total, note 에 __dm_d:{delta_display} 메타).
+                                    # KPI 옵션 A2: __dm_d 가 있으면 변경 시점 월 KPI 의 전시품 매출에 +delta_display/n 추가 분배 → 일반/전시 분리 반영.
+                                    _delta_total = new_total - old_total
+                                    _delta_display = new_display_sales - old_display_sales
+                                    if _delta_total != 0 or _delta_display != 0:
+                                        if conn and old_total != new_total:
+                                            _insert_audit_log(conn, "Order", sel_oid, "total_amount", old_total, new_total, edit_reason)
+                                        if conn and old_display_sales != new_display_sales:
+                                            _insert_audit_log(conn, "Order", sel_oid, "display_sales_amount", old_display_sales, new_display_sales, edit_reason)
                                         today_str = datetime.now(tz=KST).strftime("%Y-%m-%d")
                                         order_date_val = orow.get("order_date") or today_str
                                         if isinstance(order_date_val, str) and "-" in order_date_val:
@@ -16553,13 +16907,14 @@ def render_customer_balance():
                                         new_basic_margin = new_total - new_cost - new_display_cost
                                         _dm_kpi = new_basic_margin - old_basic_margin
                                         note = (
-                                            f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if delta < 0 else '추가'}"
+                                            f"{order_date_label} 주문 건 금액 변경에 따른 {'차감' if _delta_total < 0 else ('추가' if _delta_total > 0 else '전시판매가 변경')}"
                                             f"|__dm2:{int(round(_dm_kpi))}"
                                             f"|__dm:{int(round(_dm_kpi))}"
+                                            f"|__dm_d:{int(round(_delta_display))}"
                                         )
                                         # 담당 직원: 수정 후 직원명 우선, 없으면 기존 직원명 사용 (delta도 같은 직원에게 귀속)
                                         _delta_emp = new_employee_names if new_employee_names else old_employee_names
-                                        _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(delta), note, employee_names=_delta_emp or None)
+                                        _insert_sales_transaction(db_filename, int(sel_oid), today_str, float(_delta_total), note, employee_names=_delta_emp or None)
                                         if margin_pct < 15 or margin_pct > 25:
                                             store_name = _get_store_name_by_db(db_filename)
                                             _insert_admin_alert(store_name, "margin", f"[{store_name}] 마진율 {margin_pct:.1f}% 건이 수정되었습니다.")
@@ -17732,8 +18087,28 @@ def _kpi_parse_delta_margin_from_sales_note(note: object) -> float | None:
         return None
 
 
+def _kpi_parse_delta_display_from_sales_note(note: object) -> float | None:
+    """sales note 에서 |__dm_d:{값}| 형태의 전시판매가 변경분(delta_display)을 파싱한다.
+    없으면 None. 주문 수정 시 일반판매가와 전시판매가 변경분을 분리해 KPI 에 반영하기 위한 메타."""
+    s = str(note or "").strip()
+    if "|__dm_d:" not in s:
+        return None
+    try:
+        tail = s.split("|__dm_d:", 1)[1].split("|", 1)[0].strip()
+        return float(tail)
+    except (ValueError, IndexError):
+        return None
+
+
 def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.DataFrame") -> "pd.DataFrame":
-    """sales 원장 구간에서 직원별 순매출·마진·전시 배분. 1/n 분모는 주문의 최신 employee_names를 우선(sales 스냅샷보다 앞섬). amount 음수·note|__dm 동일."""
+    """sales 원장 구간에서 직원별 순매출·마진·전시 배분.
+    - 매출(revenue)·마진(margin): sales 행 단위로 amount/total_amount 비율을 곱해 1/n 분배(현행 유지).
+    - 전시품(display_sales): 옵션 A2 — 주문 단위 1/n 분배. 분배 트리거는 주문의 order_date.
+        a) order_date 가 KPI 기간 내 → +display_sales_amount × 1/n × 1회 (정상 신규 계약).
+        b) order_date 가 KPI 기간 외 + KPI 기간 내 sales 합이 -total_amount(=누적 sales 0원, 전체 취소) → -display_sales_amount × 1/n × 1회.
+        c) 그 외(다른 달 계약 + 단순 금액수정 delta) → 0 (영향 없음).
+        d) sales note 에 |__dm_d:{delta_display}| 가 있으면 해당 KPI 기간에 +delta_display × 1/n 을 추가 분배 (전시판매가 변경분만 분리 반영).
+    1/n 분모는 주문의 최신 employee_names를 우선(sales 스냅샷보다 앞섬)."""
     if kpi_m.empty:
         return pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
     km = kpi_m.copy()
@@ -17759,6 +18134,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
     _total_map: dict = {}
     _margin_map = {}
     _display_map = {}
+    _order_date_map: dict = {}
     if not orders.empty and "id" in orders.columns:
         if "total_amount" in orders.columns:
             _total_map = orders.set_index("id")["total_amount"].fillna(0).astype(float).to_dict()
@@ -17766,7 +18142,17 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
             _margin_map = orders.set_index("id")["actual_margin"].fillna(0).astype(float).to_dict()
         if "display_sales_amount" in orders.columns:
             _display_map = orders.set_index("id")["display_sales_amount"].fillna(0).astype(float).to_dict()
+        if "order_date" in orders.columns:
+            _od_series = pd.to_datetime(orders["order_date"], errors="coerce")
+            _id_series = orders["id"]
+            for _i in range(len(orders)):
+                _oid_i = _id_series.iloc[_i]
+                if pd.notna(_oid_i):
+                    _od_i = _od_series.iloc[_i]
+                    if pd.notna(_od_i):
+                        _order_date_map[int(_oid_i)] = _od_i.date()
     rows_md: list = []
+    # 1) 매출(revenue)·마진(margin): sales 행 단위 ratio 분배 (display_sales는 0으로 채움)
     for _, r in km.iterrows():
         emps = _kpi_parse_employee_list(r.get("employee_names"))
         n = len(emps) if emps else 1
@@ -17777,30 +18163,101 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
         oid_int = int(oid) if oid is not None and pd.notna(oid) else None
         if oid_int is None:
             margin = 0.0
-            display_amt = 0.0
             per_amt = amt / n
         else:
             tot = float(_total_map.get(oid_int, 0) or 0)
             base_m = float(_margin_map.get(oid_int, 0) or 0)
-            base_d = float(_display_map.get(oid_int, 0) or 0)
             _dm_note = _kpi_parse_delta_margin_from_sales_note(r.get("note"))
             if _dm_note is not None:
                 margin = _dm_note / n
-                display_amt = 0.0
                 per_amt = amt / n
             elif tot == 0:
                 margin = 0.0
-                display_amt = 0.0
                 per_amt = amt / n
             else:
                 _ratio = amt / tot
                 margin = (base_m * _ratio) / n
-                display_amt = (base_d * _ratio) / n
                 per_amt = amt / n
-        if per_amt == 0 and margin == 0 and display_amt == 0:
+        if per_amt == 0 and margin == 0:
             continue
         for e in emps:
-            rows_md.append({"employee": e, "revenue": per_amt, "margin": margin, "display_sales": display_amt})
+            rows_md.append({"employee": e, "revenue": per_amt, "margin": margin, "display_sales": 0.0})
+
+    # 2) 전시품(display_sales): 옵션 A2 — 주문 단위 1/n 분배.
+    #    분배 트리거 = 주문의 order_date 가 KPI 기간(kpi_m transaction_date min/max) 내인지 여부.
+    #    a) order_date in KPI 기간 → +base_d/n × 1회 (정상 신규 계약).
+    #    b) order_date 외 + KPI 기간 내 net == -total_amount(=해당 월 누적 sales 0, 전체 취소) → -base_d/n × 1회.
+    #    c) 그 외(다른 달 계약 + 단순 금액수정 delta) → 0.
+    #    d) sales note 에 |__dm_d:{delta_display}| 가 있으면 +delta_display/n 추가 분배 (전시판매가 변경분만 분리 반영).
+    if "order_id" in km.columns and (_display_map or _order_date_map):
+        # KPI 기간 추정: kpi_m transaction_date min/max
+        kpi_start_dt = None
+        kpi_end_dt = None
+        if "transaction_date" in km.columns:
+            _td = pd.to_datetime(km["transaction_date"], errors="coerce").dropna()
+            if not _td.empty:
+                kpi_start_dt = _td.min().date()
+                kpi_end_dt = _td.max().date()
+
+        km_oid = km.dropna(subset=["order_id"]).copy()
+        if not km_oid.empty:
+            km_oid["order_id"] = km_oid["order_id"].astype(int)
+            km_oid["amount"] = km_oid["amount"].fillna(0).astype(float) if "amount" in km_oid.columns else 0.0
+            order_emp = km_oid.groupby("order_id")["employee_names"].first().to_dict()
+            order_net_in_kpi = km_oid.groupby("order_id")["amount"].sum().to_dict()
+
+            for _oid_int in km_oid["order_id"].unique():
+                _oid_int = int(_oid_int)
+                base_d = float(_display_map.get(_oid_int, 0) or 0)
+                emps = _kpi_parse_employee_list(order_emp.get(_oid_int))
+                if not emps:
+                    continue
+                n = len(emps)
+                order_date = _order_date_map.get(_oid_int)
+                net_amt = float(order_net_in_kpi.get(_oid_int, 0) or 0)
+                order_total = float(_total_map.get(_oid_int, 0) or 0)
+                in_kpi_range = (
+                    order_date is not None
+                    and kpi_start_dt is not None
+                    and kpi_end_dt is not None
+                    and kpi_start_dt <= order_date <= kpi_end_dt
+                )
+
+                disp_per = 0.0
+                if base_d > 0:
+                    if in_kpi_range:
+                        # 정상 신규 계약 (옵션 A2). 같은 달 전체 취소(net == -total)면 -base_d/n.
+                        if net_amt < 0 and order_total > 0 and abs(net_amt) >= order_total - 1:
+                            disp_per = -base_d / n
+                        else:
+                            disp_per = base_d / n
+                    else:
+                        # 다른 달 계약 + KPI 기간 내 sales 등장.
+                        # 전체 취소 판정: 해당 월 sales 반영 후 주문의 총계약금액이 0원이 되는 경우.
+                        #   ① net_amt + order_total == 0 : 이전 누적이 order_total 이고 해당 월 -order_total 차감으로 0
+                        #   ② order_total == 0          : 수정으로 total이 0이 된 직후 (그 차감분이 해당 월 음수 sales)
+                        if net_amt < 0 and (
+                            order_total == 0
+                            or (order_total > 0 and abs(net_amt + order_total) < 1)
+                        ):
+                            disp_per = -base_d / n
+                        # 그 외(단순 금액수정 delta) → 0
+
+                # __dm_d 메타: 전시판매가 변경분 추가 분배 (KPI 기간 내 sales 행만 영향)
+                _dm_d_sum = 0.0
+                _order_rows = km_oid[km_oid["order_id"] == _oid_int]
+                for _, _row in _order_rows.iterrows():
+                    _dm_d = _kpi_parse_delta_display_from_sales_note(_row.get("note"))
+                    if _dm_d is not None:
+                        _dm_d_sum += _dm_d
+                if _dm_d_sum != 0:
+                    disp_per += _dm_d_sum / n
+
+                if disp_per == 0:
+                    continue
+                for e in emps:
+                    rows_md.append({"employee": e, "revenue": 0.0, "margin": 0.0, "display_sales": disp_per})
+
     if not rows_md:
         return pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
     df_md = pd.DataFrame(rows_md)
@@ -17809,7 +18266,7 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
 
 @st.fragment
 def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_filename: str):
-    """월별 직원 판매 현황: 종합=매출70+마진20+전시10. 매출=sales 해당월 순액 1/n. 현금수금집계는 참고 열. 마진·전시=sales·주문 비율."""
+    """월별 직원 판매 현황: 종합=매출70+마진15+전시5+현금수금10. 매출=sales 해당월 순액 1/n. 현금수금집계는 참고 열. 마진=sales·주문 비율 1/n. 전시=옵션 A2(계약일 in 해당월 → +base_d/n; 다른 달 계약 + 해당월 총계약금액 0원 → -base_d/n; 단순 금액수정 → 0; sales note __dm_d 가 있으면 변경 시점 월에 +delta/n 추가 분배)."""
     st.subheader("4. 월별 직원 판매 현황 및 평가")
     if not sales_df.empty and "transaction_date" in sales_df.columns:
         _kpi_sales = sales_df.copy()
@@ -17915,7 +18372,10 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                 st.caption(
                     "※ **종합 점수** = 매출 70 + 마진 15 + 전시품 5 + 현금수금 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
                     "**현금수금 점수(10)·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-                    "**마진·전시 점수**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영."
+                    "**마진 점수(15)**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영. "
+                    "**전시품 점수(5)·전시품 판매액**: 옵션 A2 — **계약일(order_date) in 해당 월** 주문의 **전시판매가 × 1/n**(주문당 1회). "
+                    "다른 달 계약 + 단순 금액수정은 0 (영향 없음). 다른 달 계약 + 해당월 **총계약금액이 0원(전체 취소)**이 되면 전시판매가 차감. "
+                    "주문 수정으로 전시판매가만 변경 시 변경 시점 월에 **차액(__dm_d)만 분리 반영**(KPI에서 마이너스 가능)."
                 )
             else:
                 st.info("선택한 월에 직원이 배정된 평가 데이터(매출·현금수금·마진·전시)가 없습니다.")
@@ -17923,6 +18383,255 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
             st.info("판매 데이터가 없어 월별 집계를 할 수 없습니다.")
     else:
         st.info("판매 데이터가 없어 직원 평가를 할 수 없습니다.")
+
+
+def render_display_sales_audit():
+    """전시품 판매 검증 — 옵션 A2 분배의 주문별 명세 + 직원별 합계 + CSV 다운로드.
+    KPI '전시품 판매액' 점수 산출 로직(_kpi_employee_totals_from_sales_slice)과 동일한 옵션 A2 규칙을 사용해
+    직원이 자기 보고와 1:1 대조할 수 있도록 주문 단위까지 풀어 보여준다."""
+    from calendar import monthrange as _mrange
+
+    user = st.session_state.get("current_user") or {}
+    role = user.get("role") or "user"
+
+    st.subheader("🎁 전시품 판매 검증")
+    st.caption(
+        "기간을 정하면 KPI '전시품 판매액(5점)' 점수와 동일한 옵션 A2 분배의 주문별 명세·직원별 합계를 보여줍니다. "
+        "각 행에 옵션 A2 케이스(a/b/c/d)가 표시되어 왜 그 금액으로 잡혔는지 직접 검증할 수 있습니다."
+    )
+
+    if role == "superadmin":
+        stores = get_supabase_stores_dataframe_cached()
+        if stores.empty:
+            st.warning("매장 데이터가 없습니다.")
+            return
+        store_opts = stores["store_name"].tolist()
+        sel_store = st.selectbox("📍 매장", store_opts, key="dsa_store_sel")
+        db_filename = stores[stores["store_name"] == sel_store].iloc[0]["db_filename"]
+    else:
+        db_filename = st.session_state.get("current_db")
+        if not db_filename:
+            st.warning("매장에 로그인한 후 이용하세요.")
+            return
+        sel_store = _get_store_name_by_db(db_filename)
+        st.markdown(f"📍 **매장**: {sel_store}")
+
+    today = _today_kst()
+    default_start = today.replace(day=1)
+    default_end = date(today.year, today.month, _mrange(today.year, today.month)[1])
+    col1, col2 = st.columns(2)
+    with col1:
+        start_d = st.date_input("시작일", value=default_start, key="dsa_start")
+    with col2:
+        end_d = st.date_input("종료일", value=default_end, key="dsa_end")
+    if start_d > end_d:
+        st.error("시작일이 종료일보다 큽니다.")
+        return
+
+    with st.spinner("데이터 불러오는 중..."):
+        orders = load_orders_cached(
+            db_filename,
+            "id, customer_id, order_date, employee_names, total_amount, display_sales_amount, balance_status, category",
+            limit=None,
+        )
+        sales_df = load_sales_with_employees_cached(db_filename, start_d.isoformat(), end_d.isoformat())
+        customers = load_customers_cached(db_filename, limit=None, col_list="id, name, phone1")
+
+    if orders.empty:
+        st.info("주문 데이터가 없습니다.")
+        return
+    if sales_df.empty:
+        st.info(f"{start_d}~{end_d} 기간에 매출 거래가 없습니다.")
+        return
+
+    # 매장 격리 방어 (sales_tenant_column 미설정 시)
+    if "order_id" in sales_df.columns and _sales_tenant_column() is None:
+        _valid_oids = set(orders["id"].dropna().astype(int).tolist())
+        sales_df = sales_df[sales_df["order_id"].isin(_valid_oids)].copy()
+
+    sales_df = sales_df.copy()
+    sales_df["transaction_date"] = pd.to_datetime(sales_df["transaction_date"], errors="coerce")
+    sales_df = sales_df.dropna(subset=["transaction_date"])
+    sales_df = sales_df[
+        (sales_df["transaction_date"].dt.date >= start_d)
+        & (sales_df["transaction_date"].dt.date <= end_d)
+    ]
+    if sales_df.empty:
+        st.info(f"{start_d}~{end_d} 기간에 매출 거래가 없습니다.")
+        return
+
+    orders = orders.copy()
+    orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
+    total_map = orders.set_index("id")["total_amount"].fillna(0).astype(float).to_dict()
+    disp_map = orders.set_index("id")["display_sales_amount"].fillna(0).astype(float).to_dict()
+    od_map: dict = {}
+    _od_idx = orders.set_index("id")["order_date"]
+    for _id, _od in _od_idx.items():
+        if pd.notna(_id) and pd.notna(_od):
+            od_map[int(_id)] = _od.date()
+    emp_order_map = orders.set_index("id")["employee_names"].to_dict()
+    cat_map = orders.set_index("id")["category"].to_dict() if "category" in orders.columns else {}
+    cust_id_map = orders.set_index("id")["customer_id"].to_dict() if "customer_id" in orders.columns else {}
+    cust_name_map = customers.set_index("id")["name"].to_dict() if not customers.empty else {}
+
+    # 주문 최신 employee_names 우선 적용
+    sales_df["order_id_int"] = sales_df["order_id"].astype("Int64")
+
+    def _emp_for_oid(oid):
+        if pd.isna(oid):
+            return ""
+        v = emp_order_map.get(int(oid))
+        return _kpi_sanitize_employee_label(v)
+
+    sales_df["employee_names_eff"] = sales_df["order_id_int"].map(_emp_for_oid)
+    blank_mask = sales_df["employee_names_eff"].astype(str).str.strip() == ""
+    sales_df.loc[blank_mask, "employee_names_eff"] = sales_df.loc[blank_mask, "employee_names"].fillna("")
+
+    sales_df["amount"] = sales_df["amount"].fillna(0).astype(float)
+    order_net = sales_df.groupby("order_id_int")["amount"].sum().to_dict()
+    order_emp = sales_df.groupby("order_id_int")["employee_names_eff"].first().to_dict()
+
+    # KPI 함수와 동일한 in_kpi 판정 — sales 슬라이스 transaction_date 의 실제 min/max 를 사용
+    _td_dates = sales_df["transaction_date"].dt.date
+    kpi_start_eff = _td_dates.min() if len(_td_dates) else start_d
+    kpi_end_eff = _td_dates.max() if len(_td_dates) else end_d
+
+    # 주문별 |__dm_d:| 합 (전시판매가 변경분)
+    order_dm_d_sum: dict[int, float] = {}
+    for _, _row in sales_df.iterrows():
+        _v = _kpi_parse_delta_display_from_sales_note(_row.get("note"))
+        if _v is not None:
+            _oid_v = _row.get("order_id_int")
+            if pd.notna(_oid_v):
+                _oi = int(_oid_v)
+                order_dm_d_sum[_oi] = order_dm_d_sum.get(_oi, 0.0) + _v
+
+    rows: list[dict] = []
+    for oid in sales_df["order_id_int"].dropna().unique():
+        oid = int(oid)
+        base_d = float(disp_map.get(oid, 0) or 0)
+        if base_d <= 0 and order_dm_d_sum.get(oid, 0) == 0:
+            continue
+        emps_str = order_emp.get(oid, "") or ""
+        emps = _kpi_parse_employee_list(emps_str)
+        n = len(emps) if emps else 0
+        if n == 0:
+            continue
+        order_total = float(total_map.get(oid, 0) or 0)
+        net_amt = float(order_net.get(oid, 0) or 0)
+        order_date = od_map.get(oid)
+        in_kpi = order_date is not None and kpi_start_eff <= order_date <= kpi_end_eff
+
+        case_label = ""
+        disp_per = 0.0
+        if base_d > 0:
+            if in_kpi:
+                if net_amt < 0 and order_total > 0 and abs(net_amt) >= order_total - 1:
+                    disp_per = -base_d / n
+                    case_label = "(a) 같은 달 전체취소"
+                else:
+                    disp_per = base_d / n
+                    case_label = "(a) 정상 신규"
+            else:
+                if net_amt < 0 and (
+                    order_total == 0 or (order_total > 0 and abs(net_amt + order_total) < 1)
+                ):
+                    disp_per = -base_d / n
+                    case_label = "(b) 다른 달 계약 + 전체취소"
+                else:
+                    case_label = "(c) 다른 달 계약 + 단순수정 → 0"
+        dm_d = order_dm_d_sum.get(oid, 0.0)
+        if dm_d != 0:
+            disp_per += dm_d / n
+            extra = f"(d) 전시판매가 변경분 {int(round(dm_d)):+,}"
+            case_label = f"{case_label} + {extra}" if case_label else extra
+
+        cust_id = cust_id_map.get(oid)
+        cust_name = ""
+        if cust_id is not None and pd.notna(cust_id):
+            cust_name = cust_name_map.get(int(cust_id), "") or ""
+
+        rows.append({
+            "주문ID": oid,
+            "계약일": order_date.isoformat() if order_date else "",
+            "고객": cust_name,
+            "카테고리": cat_map.get(oid) or "",
+            "담당직원": emps_str,
+            "n": n,
+            "일반판매가": int(round(order_total - base_d)),
+            "전시판매가": int(round(base_d)),
+            "기간내 net sales": int(round(net_amt)),
+            "옵션 A2 케이스": case_label,
+            "1인당 전시 분배액": int(round(disp_per)),
+            "총 전시 분배액(=1인×n)": int(round(disp_per * n)),
+        })
+
+    if not rows:
+        st.info(f"{start_d}~{end_d} 기간에 전시품 매출이 잡힌 주문이 없습니다.")
+        return
+
+    df_orders = pd.DataFrame(rows).sort_values(["계약일", "주문ID"]).reset_index(drop=True)
+
+    # 직원별 합계 (옵션 A2 분배)
+    emp_share: dict[str, dict] = {}
+    for r in rows:
+        for e in _kpi_parse_employee_list(r["담당직원"]):
+            slot = emp_share.setdefault(e, {"전시품 판매액": 0, "참여 주문 수": 0})
+            slot["전시품 판매액"] += r["1인당 전시 분배액"]
+            slot["참여 주문 수"] += 1
+    df_emp = pd.DataFrame(
+        [
+            {"직원명": k, "전시품 판매액": int(v["전시품 판매액"]), "참여 주문 수": v["참여 주문 수"]}
+            for k, v in sorted(emp_share.items(), key=lambda x: -x[1]["전시품 판매액"])
+        ]
+    )
+
+    st.markdown("### 직원별 전시품 판매 합계")
+    if df_emp.empty:
+        st.info("해당 기간에 분배된 전시품 판매가 없습니다.")
+    else:
+        emp_disp = df_emp.copy()
+        emp_disp["전시품 판매액"] = emp_disp["전시품 판매액"].apply(lambda x: f"{x:,}원")
+        st.dataframe(emp_disp, width="stretch", hide_index=True)
+        st.metric("기간 내 전시품 판매 총액", f"{int(df_emp['전시품 판매액'].sum()):,}원")
+
+    st.markdown("### 주문별 명세")
+    df_show = df_orders.copy()
+    for _c in ("일반판매가", "전시판매가", "기간내 net sales", "1인당 전시 분배액", "총 전시 분배액(=1인×n)"):
+        df_show[_c] = df_show[_c].apply(lambda x: f"{int(x):,}")
+    st.dataframe(df_show, width="stretch", hide_index=True)
+
+    csv_orders = df_orders.to_csv(index=False).encode("utf-8-sig")
+    csv_emp = df_emp.to_csv(index=False).encode("utf-8-sig") if not df_emp.empty else b""
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "📥 주문별 명세 CSV",
+            data=csv_orders,
+            file_name=f"전시품판매_주문명세_{sel_store}_{start_d}_{end_d}.csv",
+            mime="text/csv",
+            key="dsa_csv_orders",
+            width="stretch",
+        )
+    with dl2:
+        st.download_button(
+            "📥 직원별 합계 CSV",
+            data=csv_emp,
+            file_name=f"전시품판매_직원합계_{sel_store}_{start_d}_{end_d}.csv",
+            mime="text/csv",
+            key="dsa_csv_emp",
+            disabled=df_emp.empty,
+            width="stretch",
+        )
+
+    with st.expander("📖 옵션 A2 케이스 가이드"):
+        st.markdown(
+            "- **(a) 정상 신규**: 계약일이 조회 기간 내 → 전시판매가 × 1/n 분배.\n"
+            "- **(a) 같은 달 전체취소**: 같은 달 계약 + 같은 달 총금액 0원이 됨 → 전시판매가 × 1/n 차감.\n"
+            "- **(b) 다른 달 계약 + 전체취소**: 이전 달 계약된 건이 이번 달에 총금액 0원이 됨 → 전시판매가 × 1/n 차감.\n"
+            "- **(c) 다른 달 계약 + 단순수정**: 단순 금액 수정만 발생 → 영향 없음 (0원).\n"
+            "- **(d) 전시판매가 변경분**: 주문 수정 시 전시판매가만 변경된 경우 변경 시점 월에 그 차액(`__dm_d`) × 1/n 만 분리 반영. KPI에서 마이너스도 가능."
+        )
 
 
 @st.fragment
@@ -19214,7 +19923,8 @@ def main():
             "5. 매장 관리자 메뉴",
             "6. 결제수단별 집계표",
             "7. 고객 CRM 자동화",
-            "8. FAQ (도움말)",
+            "8. 전시품 판매 검증",
+            "9. FAQ (도움말)",
         ]
     else:
         tab_labels = [
@@ -19223,7 +19933,8 @@ def main():
             "3. 새로운 매출 등록",
             "4. 고객 및 잔금 관리",
             "5. 결제수단별 집계표",
-            "6. FAQ (도움말)",
+            "6. 전시품 판매 검증",
+            "7. FAQ (도움말)",
         ]
     if "main_tab_idx" not in st.session_state:
         st.session_state["main_tab_idx"] = 0
@@ -19286,9 +19997,11 @@ def main():
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
-    elif role == "store_admin" and idx == 7:
+    elif (role == "store_admin" and idx == 7) or (role == "user" and idx == 5):
+        render_display_sales_audit()
+    elif role == "store_admin" and idx == 8:
         render_faq_page()
-    elif role == "user" and idx == 5:
+    elif role == "user" and idx == 6:
         render_faq_page()
 
 
