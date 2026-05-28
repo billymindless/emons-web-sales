@@ -18709,6 +18709,255 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
         st.info("판매 데이터가 없어 직원 평가를 할 수 없습니다.")
 
 
+def render_display_sales_audit():
+    """전시품 판매 검증 — 옵션 A2 분배의 주문별 명세 + 직원별 합계 + CSV 다운로드.
+    KPI '전시품 판매액' 점수 산출 로직(_kpi_employee_totals_from_sales_slice)과 동일한 옵션 A2 규칙을 사용해
+    직원이 자기 보고와 1:1 대조할 수 있도록 주문 단위까지 풀어 보여준다."""
+    from calendar import monthrange as _mrange
+
+    user = st.session_state.get("current_user") or {}
+    role = user.get("role") or "user"
+
+    st.subheader("🎁 전시품 판매 검증")
+    st.caption(
+        "기간을 정하면 KPI '전시품 판매액(5점)' 점수와 동일한 옵션 A2 분배의 주문별 명세·직원별 합계를 보여줍니다. "
+        "각 행에 옵션 A2 케이스(a/b/c/d)가 표시되어 왜 그 금액으로 잡혔는지 직접 검증할 수 있습니다."
+    )
+
+    if role == "superadmin":
+        stores = get_supabase_stores_dataframe_cached()
+        if stores.empty:
+            st.warning("매장 데이터가 없습니다.")
+            return
+        store_opts = stores["store_name"].tolist()
+        sel_store = st.selectbox("📍 매장", store_opts, key="dsa_store_sel")
+        db_filename = stores[stores["store_name"] == sel_store].iloc[0]["db_filename"]
+    else:
+        db_filename = st.session_state.get("current_db")
+        if not db_filename:
+            st.warning("매장에 로그인한 후 이용하세요.")
+            return
+        sel_store = _get_store_name_by_db(db_filename)
+        st.markdown(f"📍 **매장**: {sel_store}")
+
+    today = _today_kst()
+    default_start = today.replace(day=1)
+    default_end = date(today.year, today.month, _mrange(today.year, today.month)[1])
+    col1, col2 = st.columns(2)
+    with col1:
+        start_d = st.date_input("시작일", value=default_start, key="dsa_start")
+    with col2:
+        end_d = st.date_input("종료일", value=default_end, key="dsa_end")
+    if start_d > end_d:
+        st.error("시작일이 종료일보다 큽니다.")
+        return
+
+    with st.spinner("데이터 불러오는 중..."):
+        orders = load_orders_cached(
+            db_filename,
+            "id, customer_id, order_date, employee_names, total_amount, display_sales_amount, balance_status, category",
+            limit=None,
+        )
+        sales_df = load_sales_with_employees_cached(db_filename, start_d.isoformat(), end_d.isoformat())
+        customers = load_customers_cached(db_filename, limit=None, col_list="id, name, phone1")
+
+    if orders.empty:
+        st.info("주문 데이터가 없습니다.")
+        return
+    if sales_df.empty:
+        st.info(f"{start_d}~{end_d} 기간에 매출 거래가 없습니다.")
+        return
+
+    # 매장 격리 방어 (sales_tenant_column 미설정 시)
+    if "order_id" in sales_df.columns and _sales_tenant_column() is None:
+        _valid_oids = set(orders["id"].dropna().astype(int).tolist())
+        sales_df = sales_df[sales_df["order_id"].isin(_valid_oids)].copy()
+
+    sales_df = sales_df.copy()
+    sales_df["transaction_date"] = pd.to_datetime(sales_df["transaction_date"], errors="coerce")
+    sales_df = sales_df.dropna(subset=["transaction_date"])
+    sales_df = sales_df[
+        (sales_df["transaction_date"].dt.date >= start_d)
+        & (sales_df["transaction_date"].dt.date <= end_d)
+    ]
+    if sales_df.empty:
+        st.info(f"{start_d}~{end_d} 기간에 매출 거래가 없습니다.")
+        return
+
+    orders = orders.copy()
+    orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
+    total_map = orders.set_index("id")["total_amount"].fillna(0).astype(float).to_dict()
+    disp_map = orders.set_index("id")["display_sales_amount"].fillna(0).astype(float).to_dict()
+    od_map: dict = {}
+    _od_idx = orders.set_index("id")["order_date"]
+    for _id, _od in _od_idx.items():
+        if pd.notna(_id) and pd.notna(_od):
+            od_map[int(_id)] = _od.date()
+    emp_order_map = orders.set_index("id")["employee_names"].to_dict()
+    cat_map = orders.set_index("id")["category"].to_dict() if "category" in orders.columns else {}
+    cust_id_map = orders.set_index("id")["customer_id"].to_dict() if "customer_id" in orders.columns else {}
+    cust_name_map = customers.set_index("id")["name"].to_dict() if not customers.empty else {}
+
+    # 주문 최신 employee_names 우선 적용
+    sales_df["order_id_int"] = sales_df["order_id"].astype("Int64")
+
+    def _emp_for_oid(oid):
+        if pd.isna(oid):
+            return ""
+        v = emp_order_map.get(int(oid))
+        return _kpi_sanitize_employee_label(v)
+
+    sales_df["employee_names_eff"] = sales_df["order_id_int"].map(_emp_for_oid)
+    blank_mask = sales_df["employee_names_eff"].astype(str).str.strip() == ""
+    sales_df.loc[blank_mask, "employee_names_eff"] = sales_df.loc[blank_mask, "employee_names"].fillna("")
+
+    sales_df["amount"] = sales_df["amount"].fillna(0).astype(float)
+    order_net = sales_df.groupby("order_id_int")["amount"].sum().to_dict()
+    order_emp = sales_df.groupby("order_id_int")["employee_names_eff"].first().to_dict()
+
+    # KPI 함수와 동일한 in_kpi 판정 — sales 슬라이스 transaction_date 의 실제 min/max 를 사용
+    _td_dates = sales_df["transaction_date"].dt.date
+    kpi_start_eff = _td_dates.min() if len(_td_dates) else start_d
+    kpi_end_eff = _td_dates.max() if len(_td_dates) else end_d
+
+    # 주문별 |__dm_d:| 합 (전시판매가 변경분)
+    order_dm_d_sum: dict[int, float] = {}
+    for _, _row in sales_df.iterrows():
+        _v = _kpi_parse_delta_display_from_sales_note(_row.get("note"))
+        if _v is not None:
+            _oid_v = _row.get("order_id_int")
+            if pd.notna(_oid_v):
+                _oi = int(_oid_v)
+                order_dm_d_sum[_oi] = order_dm_d_sum.get(_oi, 0.0) + _v
+
+    rows: list[dict] = []
+    for oid in sales_df["order_id_int"].dropna().unique():
+        oid = int(oid)
+        base_d = float(disp_map.get(oid, 0) or 0)
+        if base_d <= 0 and order_dm_d_sum.get(oid, 0) == 0:
+            continue
+        emps_str = order_emp.get(oid, "") or ""
+        emps = _kpi_parse_employee_list(emps_str)
+        n = len(emps) if emps else 0
+        if n == 0:
+            continue
+        order_total = float(total_map.get(oid, 0) or 0)
+        net_amt = float(order_net.get(oid, 0) or 0)
+        order_date = od_map.get(oid)
+        in_kpi = order_date is not None and kpi_start_eff <= order_date <= kpi_end_eff
+
+        case_label = ""
+        disp_per = 0.0
+        if base_d > 0:
+            if in_kpi:
+                if net_amt < 0 and order_total > 0 and abs(net_amt) >= order_total - 1:
+                    disp_per = -base_d / n
+                    case_label = "(a) 같은 달 전체취소"
+                else:
+                    disp_per = base_d / n
+                    case_label = "(a) 정상 신규"
+            else:
+                if net_amt < 0 and (
+                    order_total == 0 or (order_total > 0 and abs(net_amt + order_total) < 1)
+                ):
+                    disp_per = -base_d / n
+                    case_label = "(b) 다른 달 계약 + 전체취소"
+                else:
+                    case_label = "(c) 다른 달 계약 + 단순수정 → 0"
+        dm_d = order_dm_d_sum.get(oid, 0.0)
+        if dm_d != 0:
+            disp_per += dm_d / n
+            extra = f"(d) 전시판매가 변경분 {int(round(dm_d)):+,}"
+            case_label = f"{case_label} + {extra}" if case_label else extra
+
+        cust_id = cust_id_map.get(oid)
+        cust_name = ""
+        if cust_id is not None and pd.notna(cust_id):
+            cust_name = cust_name_map.get(int(cust_id), "") or ""
+
+        rows.append({
+            "주문ID": oid,
+            "계약일": order_date.isoformat() if order_date else "",
+            "고객": cust_name,
+            "카테고리": cat_map.get(oid) or "",
+            "담당직원": emps_str,
+            "n": n,
+            "일반판매가": int(round(order_total - base_d)),
+            "전시판매가": int(round(base_d)),
+            "기간내 net sales": int(round(net_amt)),
+            "옵션 A2 케이스": case_label,
+            "1인당 전시 분배액": int(round(disp_per)),
+            "총 전시 분배액(=1인×n)": int(round(disp_per * n)),
+        })
+
+    if not rows:
+        st.info(f"{start_d}~{end_d} 기간에 전시품 매출이 잡힌 주문이 없습니다.")
+        return
+
+    df_orders = pd.DataFrame(rows).sort_values(["계약일", "주문ID"]).reset_index(drop=True)
+
+    # 직원별 합계 (옵션 A2 분배)
+    emp_share: dict[str, dict] = {}
+    for r in rows:
+        for e in _kpi_parse_employee_list(r["담당직원"]):
+            slot = emp_share.setdefault(e, {"전시품 판매액": 0, "참여 주문 수": 0})
+            slot["전시품 판매액"] += r["1인당 전시 분배액"]
+            slot["참여 주문 수"] += 1
+    df_emp = pd.DataFrame(
+        [
+            {"직원명": k, "전시품 판매액": int(v["전시품 판매액"]), "참여 주문 수": v["참여 주문 수"]}
+            for k, v in sorted(emp_share.items(), key=lambda x: -x[1]["전시품 판매액"])
+        ]
+    )
+
+    st.markdown("### 직원별 전시품 판매 합계")
+    if df_emp.empty:
+        st.info("해당 기간에 분배된 전시품 판매가 없습니다.")
+    else:
+        emp_disp = df_emp.copy()
+        emp_disp["전시품 판매액"] = emp_disp["전시품 판매액"].apply(lambda x: f"{x:,}원")
+        st.dataframe(emp_disp, width="stretch", hide_index=True)
+        st.metric("기간 내 전시품 판매 총액", f"{int(df_emp['전시품 판매액'].sum()):,}원")
+
+    st.markdown("### 주문별 명세")
+    df_show = df_orders.copy()
+    for _c in ("일반판매가", "전시판매가", "기간내 net sales", "1인당 전시 분배액", "총 전시 분배액(=1인×n)"):
+        df_show[_c] = df_show[_c].apply(lambda x: f"{int(x):,}")
+    st.dataframe(df_show, width="stretch", hide_index=True)
+
+    csv_orders = df_orders.to_csv(index=False).encode("utf-8-sig")
+    csv_emp = df_emp.to_csv(index=False).encode("utf-8-sig") if not df_emp.empty else b""
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "📥 주문별 명세 CSV",
+            data=csv_orders,
+            file_name=f"전시품판매_주문명세_{sel_store}_{start_d}_{end_d}.csv",
+            mime="text/csv",
+            key="dsa_csv_orders",
+            width="stretch",
+        )
+    with dl2:
+        st.download_button(
+            "📥 직원별 합계 CSV",
+            data=csv_emp,
+            file_name=f"전시품판매_직원합계_{sel_store}_{start_d}_{end_d}.csv",
+            mime="text/csv",
+            key="dsa_csv_emp",
+            disabled=df_emp.empty,
+            width="stretch",
+        )
+
+    with st.expander("📖 옵션 A2 케이스 가이드"):
+        st.markdown(
+            "- **(a) 정상 신규**: 계약일이 조회 기간 내 → 전시판매가 × 1/n 분배.\n"
+            "- **(a) 같은 달 전체취소**: 같은 달 계약 + 같은 달 총금액 0원이 됨 → 전시판매가 × 1/n 차감.\n"
+            "- **(b) 다른 달 계약 + 전체취소**: 이전 달 계약된 건이 이번 달에 총금액 0원이 됨 → 전시판매가 × 1/n 차감.\n"
+            "- **(c) 다른 달 계약 + 단순수정**: 단순 금액 수정만 발생 → 영향 없음 (0원).\n"
+            "- **(d) 전시판매가 변경분**: 주문 수정 시 전시판매가만 변경된 경우 변경 시점 월에 그 차액(`__dm_d`) × 1/n 만 분리 반영. KPI에서 마이너스도 가능."
+        )
+
+
 @st.fragment
 def _render_dashboard_todos_only(db_filename: str):
     """To-Do 섹션 fragment: 등록·완료·삭제 시 이 섹션만 rerun (전체 대시보드 재로딩 없음)."""
@@ -20057,6 +20306,9 @@ def main():
         render_marketing_insights_tenant()
     elif idx == 2:
         render_new_sales()
+        st.divider()
+        with st.expander("🎁 전시품 판매 검증 (KPI '전시품 판매액' 옵션 A2 분배 검증 도구)", expanded=False):
+            render_display_sales_audit()
     elif idx == 3:
         render_customer_balance()
     elif role == "store_admin" and idx == 4:
