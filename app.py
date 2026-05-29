@@ -11953,7 +11953,8 @@ def _erp_period_target_editor(current_db: str, me_name: str, emp_names: list, to
     """기간 목표 등록/수정/삭제 UI. 직원별 임의 기간(YYYY-MM~YYYY-MM) + 총 시간."""
     st.markdown("##### 🎯 기간 목표 관리")
     st.caption("직원과 기간(시작월~종료월), 기간 총 필수시간을 입력합니다. "
-               "예: 김승찬 2026-06 ~ 2026-07, 200시간. 한 직원에게 여러 기간을 등록할 수 있습니다.")
+               "예: 김승찬 2026-06 ~ 2026-07, 200시간. "
+               "직원당 기간 목표는 1개만 유지되며, 다시 입력하면 기존 값을 덮어씁니다(추가되지 않음).")
 
     _ym_opts = [_erp_ym_add(f"{today.year:04d}-01", i) for i in range(0, 36)]  # 올해 1월부터 3년치
     _def_start = f"{today.year:04d}-{today.month:02d}"
@@ -11972,28 +11973,41 @@ def _erp_period_target_editor(current_db: str, me_name: str, emp_names: list, to
             p_hours = st.number_input("총 시간(h)", min_value=0.0, max_value=20000.0,
                                       value=0.0, step=10.0, key="pt_period_hours")
         p_note = st.text_input("메모 (선택)", key="pt_period_note")
-        if st.form_submit_button("➕ 기간 목표 추가", type="primary"):
+        if st.form_submit_button("💾 기간 목표 저장 (덮어쓰기)", type="primary"):
             if p_start > p_end:
                 st.error("종료월이 시작월보다 빠를 수 없습니다.")
             elif p_hours <= 0:
                 st.error("총 시간은 0보다 커야 합니다.")
             else:
-                ok, e = _erp_insert_row("app_period_work_targets", {
-                    "db_filename": current_db,
-                    "employee_name": p_emp,
+                # 직원당 1개만 유지: 기존 행이 있으면 첫 행 update, 나머지 삭제. 없으면 insert.
+                _existing = _erp_list_period_targets(current_db, p_emp)
+                _payload = {
                     "start_ym": p_start,
                     "end_ym": p_end,
                     "required_minutes": int(round(p_hours * 60)),
                     "note": (p_note or "").strip() or None,
-                    "created_by": me_name,
                     "updated_by": me_name,
-                })
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if _existing:
+                    ok, e = _erp_update_row("app_period_work_targets", int(_existing[0]["id"]), _payload)
+                    for _dup in _existing[1:]:
+                        _erp_delete_row("app_period_work_targets", int(_dup["id"]))
+                    _verb = "덮어쓰기"
+                else:
+                    ok, e = _erp_insert_row("app_period_work_targets", {
+                        "db_filename": current_db,
+                        "employee_name": p_emp,
+                        "created_by": me_name,
+                        **_payload,
+                    })
+                    _verb = "저장"
                 if ok:
                     _erp_list_period_targets.clear()
-                    flash(f"기간 목표 추가 완료 — {p_emp} {p_start}~{p_end} {p_hours:g}h")
+                    flash(f"기간 목표 {_verb} 완료 — {p_emp} {p_start}~{p_end} {p_hours:g}h")
                     st.rerun()
                 else:
-                    st.error(f"추가 실패: {e}")
+                    st.error(f"저장 실패: {e}")
 
     st.divider()
 
