@@ -10647,8 +10647,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             _cur_d += timedelta(days=1)
 
     # 인원 부족일 산출 (매장별)
-    shortage_dates: set = set()
+    shortage_dates: dict[str, list[str]] = {}  # {d_iso: [부족_매장명, ...]}
     for (dbf, dow), rules in rules_by_store_dow.items():
+        _sname = _dbf_to_sn.get(dbf) or dbf
         for d_iso, day_shifts in shifts_by_date.items():
             try:
                 d = datetime.fromisoformat(d_iso).date()
@@ -10663,7 +10664,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 if not slot_s or not slot_e:
                     continue
                 if _erp_count_active_at(store_day_shifts, slot_s, slot_e) < int(rule.get("min_staff") or 1):
-                    shortage_dates.add(d_iso)
+                    shortage_dates.setdefault(d_iso, [])
+                    if _sname not in shortage_dates[d_iso]:
+                        shortage_dates[d_iso].append(_sname)
                     break
 
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
@@ -10697,7 +10700,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             _hol_tag = " 🔴" if (_cell_date in _ERP_KR_HOLIDAYS and _cell_date.weekday() < 5) else ""
             cell.append(f"<div style='font-weight:bold; font-size:0.88rem; color:{day_label_color};'>{d_num}{_hol_tag}</div>")
             if d_iso in shortage_dates:
-                cell.append("<div style='color:#E53935; font-size:0.62rem; font-weight:bold;'>⚠️ 인원부족</div>")
+                _short_stores = shortage_dates[d_iso]
+                _short_label = " · ".join(_short_stores) if _short_stores else "인원부족"
+                cell.append(f"<div style='color:#E53935; font-size:0.62rem; font-weight:bold;'>⚠️ {_short_label} 인원부족</div>")
 
             # 매장 공용 일정 (메모/표시 전용). 다일정은 N/M일 표시
             for ev in events_by_date.get(d_iso, []):
