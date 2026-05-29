@@ -9586,10 +9586,10 @@ def render_erp_attendance():
         return
 
     # v2 메뉴 (2026-05-29 근무 일정 계획 탭 복원):
-    #   store_admin: 6탭 (근무 일정 계획 / 내 근태 / 필수 시간 설정 / 신청 승인 / 캘린더 / 월말 요약)
+    #   store_admin: 6탭 (근무 일정 계획 / 내 근태 / 근무시간 설정 / 신청 승인 / 캘린더 / 월말 요약)
     #   user:        3탭 (근무 일정 계획 / 내 근태 / 매장 캘린더)
     if role == "store_admin":
-        tab_labels = ["근무 일정 계획", "내 근태", "필수 시간 설정", "신청 승인", "캘린더", "월말 요약"]
+        tab_labels = ["근무 일정 계획", "내 근태", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
         tabs = st.tabs(tab_labels)
         with tabs[0]:
             _erp_tab_shift_plan(current_db, me_name)
@@ -11698,8 +11698,8 @@ def _erp_tab_my_leave_status(current_db: str, me_name: str):
 # =====================================================================
 
 def _erp_tab_period_targets(current_db: str, me_name: str):
-    """매장관리자: 필수 시간 설정 (월·연 모드 토글, 직원×시간 입력)."""
-    st.subheader("⏰ 필수 시간 설정")
+    """매장관리자: 근무시간 설정 (월·연 모드 토글, 직원×시간 입력)."""
+    st.subheader("⏰ 근무시간 설정")
     st.caption("직원별로 월 또는 연 단위 필수 근무시간을 한 숫자(시간)만 입력합니다. "
                "월 입력이 없는 달은 연/12로 자동 환산됩니다.")
 
