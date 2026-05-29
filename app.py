@@ -9585,32 +9585,35 @@ def render_erp_attendance():
         st.warning("매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 선택해 주세요.")
         return
 
-    # v2 메뉴 단순화 (2026-05-28):
-    #   store_admin: 4탭 (내 근태 / 필수 시간 설정 / 신청 승인 / 캘린더 + 월말 요약)
-    #   user:        2탭 (내 근태 / 매장 캘린더)
-    # 기존 탭 함수 (_erp_tab_shift_plan 등)는 코드에 보존하나 라우팅에서 제외.
+    # v2 메뉴 (2026-05-29 근무 일정 계획 탭 복원):
+    #   store_admin: 6탭 (근무 일정 계획 / 내 근태 / 필수 시간 설정 / 신청 승인 / 캘린더 / 월말 요약)
+    #   user:        3탭 (근무 일정 계획 / 내 근태 / 매장 캘린더)
     if role == "store_admin":
-        tab_labels = ["내 근태", "필수 시간 설정", "신청 승인", "캘린더", "월말 요약"]
+        tab_labels = ["근무 일정 계획", "내 근태", "필수 시간 설정", "신청 승인", "캘린더", "월말 요약"]
         tabs = st.tabs(tab_labels)
         with tabs[0]:
-            _erp_tab_my_attendance(current_db, role, me_name)
+            _erp_tab_shift_plan(current_db, me_name)
         with tabs[1]:
-            _erp_tab_period_targets(current_db, me_name)
+            _erp_tab_my_attendance(current_db, role, me_name)
         with tabs[2]:
-            _erp_tab_adjustment_approvals(current_db, me_name)
+            _erp_tab_period_targets(current_db, me_name)
         with tabs[3]:
+            _erp_tab_adjustment_approvals(current_db, me_name)
+        with tabs[4]:
             _erp_tab_calendar(current_db, role, me_name, today)
             st.divider()
             with st.expander("⚙️ 최소 인원 규칙 + 매장 공용 일정", expanded=False):
                 _erp_tab_staffing_rules(current_db, me_name)
-        with tabs[4]:
+        with tabs[5]:
             _erp_tab_monthly_summary(current_db, today)
     else:
-        tab_labels = ["내 근태", "매장 캘린더"]
+        tab_labels = ["근무 일정 계획", "내 근태", "매장 캘린더"]
         tabs = st.tabs(tab_labels)
         with tabs[0]:
-            _erp_tab_my_attendance(current_db, role, me_name)
+            _erp_tab_shift_plan(current_db, me_name)
         with tabs[1]:
+            _erp_tab_my_attendance(current_db, role, me_name)
+        with tabs[2]:
             _erp_tab_calendar(current_db, role, me_name, today)
 
 
