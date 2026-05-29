@@ -10712,9 +10712,14 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 ss   = str(sh.get("shift_start") or "")[:5]
                 ee   = str(sh.get("shift_end") or "")[:5]
                 time_txt = f" {ss}~{ee}" if ss and ee else ""
-                sn_badge = (f"<span style='background:{sc}; color:white; font-size:0.58rem;"
+                _wloc = (sh.get("work_location_name") or "").strip()
+                _store_label = _dbf_to_sn.get(dbf, "")
+                # 장소 배지: work_location_name이 있으면 그것을, 없으면 매장명을 표시
+                _badge_label = _wloc if _wloc else _store_label
+                _badge_color = "#607D8B" if _wloc else sc
+                sn_badge = (f"<span style='background:{_badge_color}; color:white; font-size:0.58rem;"
                             f" padding:0px 3px; border-radius:2px; margin-right:2px;'>"
-                            f"{_dbf_to_sn.get(dbf,'')}</span> ") if show_store_tag else ""
+                            f"{_badge_label}</span> ") if show_store_tag or _wloc else ""
                 cell.append(
                     f"<div style='margin-top:2px; border-left:3px solid {sc};"
                     f" background:{sc}15; padding:1px 3px; border-radius:0 2px 2px 0;'>"
