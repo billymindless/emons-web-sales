@@ -11949,7 +11949,7 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
         with gc1:
             new_date = st.date_input("대상 일자", value=today, key="my_new_date")
         with gc2:
-            new_hours = st.number_input("시간(h)", min_value=0.25, max_value=24.0, step=0.5, value=1.0, key="my_new_h")
+            new_hours = st.number_input("시간(h)", min_value=0.25, max_value=744.0, step=0.5, value=1.0, key="my_new_h")
         with gc3:
             placeholder_reason = "사유 (기타는 필수)"
             new_reason = st.text_input("사유", placeholder=placeholder_reason, key="my_new_reason")
@@ -12021,7 +12021,7 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                             cur_date = today
                         ec_date = st.date_input("대상 일자", value=cur_date, key=f"my_edit_date_{adj_id}")
                     with e2:
-                        ec_hours = st.number_input("시간(h)", min_value=0.25, max_value=24.0, step=0.5,
+                        ec_hours = st.number_input("시간(h)", min_value=0.25, max_value=744.0, step=0.5,
                                                    value=round(minutes / 60, 2), key=f"my_edit_h_{adj_id}")
                     with e3:
                         ec_reason = st.text_input("사유", value=adj.get("reason") or "", key=f"my_edit_reason_{adj_id}")
