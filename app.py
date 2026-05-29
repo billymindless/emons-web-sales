@@ -9456,6 +9456,58 @@ def _erp_list_yearly_targets(db_filename: str, year: int) -> list:
         return []
 
 
+# ── 기간 목표 (app_period_work_targets) CRUD ────────────────────────────
+@st.cache_data(ttl=60)
+def _erp_list_period_targets(db_filename: str, employee_name: str | None = None) -> list:
+    """매장(+직원)의 기간 목표 목록. employee_name=None이면 매장 전체."""
+    if not db_filename:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        q = client.table("app_period_work_targets").select("*").eq("db_filename", db_filename)
+        if employee_name:
+            q = q.eq("employee_name", employee_name)
+        r = q.order("start_ym").execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+def _erp_ym_add(ym: str, months: int) -> str:
+    """'YYYY-MM' 에 months 더한 'YYYY-MM' 반환."""
+    y, m = (int(x) for x in ym.split("-"))
+    total = (y * 12 + (m - 1)) + months
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
+def _erp_ym_range_bounds(start_ym: str, end_ym: str) -> tuple[date, date]:
+    """start_ym 1일 ~ end_ym 말일 의 date 경계 반환."""
+    sy, sm = (int(x) for x in start_ym.split("-"))
+    ey, em = (int(x) for x in end_ym.split("-"))
+    start = date(sy, sm, 1)
+    end = date(ey, em, calendar.monthrange(ey, em)[1])
+    return start, end
+
+
+def _erp_find_active_period_target(db_filename: str, employee_name: str,
+                                   ref: date) -> dict | None:
+    """ref 날짜가 속한 기간 목표를 반환. 여러 개면 가장 먼저 시작하는 것.
+    속한 게 없으면 ref 이후 가장 가까운(다가오는) 기간을 반환, 그것도 없으면 None."""
+    rows = _erp_list_period_targets(db_filename, employee_name)
+    if not rows:
+        return None
+    ref_ym = f"{ref.year:04d}-{ref.month:02d}"
+    covering = [r for r in rows if (r.get("start_ym") or "") <= ref_ym <= (r.get("end_ym") or "")]
+    if covering:
+        return sorted(covering, key=lambda r: r.get("start_ym") or "")[0]
+    upcoming = [r for r in rows if (r.get("start_ym") or "") > ref_ym]
+    if upcoming:
+        return sorted(upcoming, key=lambda r: r.get("start_ym") or "")[0]
+    return sorted(rows, key=lambda r: r.get("end_ym") or "")[-1]
+
+
 @st.cache_data(ttl=60)
 def _erp_sum_approved_adjustments(db_filename: str, employee_name: str,
                                   period_key: str, period_kind: str = "month") -> int:
@@ -9812,6 +9864,48 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         "💡 카운터는 실제 근태 기록(정상·연차·반차·시차사용·포상시간·추가근무 등)을 모두 합산합니다. "
         "잔여가 음수면 목표 시간을 초과해 일한 것으로, [추가근무·시차 관리]에서 보상(시차/연차/급여)을 신청할 수 있습니다."
     )
+
+    # ── 기간 목표 카운터 (매장관리자가 지정한 임의 기간) ────────────
+    _ptgt = _erp_find_active_period_target(current_db, me_name, today)
+    if _ptgt:
+        _p_start_ym = _ptgt.get("start_ym") or ""
+        _p_end_ym = _ptgt.get("end_ym") or ""
+        _p_target_min = int(_ptgt.get("required_minutes") or 0)
+        try:
+            _p_start_d, _p_end_d = _erp_ym_range_bounds(_p_start_ym, _p_end_ym)
+            _p_worked_min = _erp_compute_worked_minutes(current_db, me_name, _p_start_d, _p_end_d)
+        except Exception:
+            _p_worked_min = 0
+        _p_target_h = _p_target_min / 60.0
+        _p_worked_h = _p_worked_min / 60.0
+        _p_remain_h = (_p_target_min - _p_worked_min) / 60.0
+        _p_percent = round(_p_worked_min / _p_target_min * 100.0, 1) if _p_target_min > 0 else 0.0
+        if _p_percent >= 100:
+            _p_color, _p_label = "#E53935", "초과 달성"
+        elif _p_percent >= 80:
+            _p_color, _p_label = "#FB8C00", "달성 임박"
+        else:
+            _p_color, _p_label = "#1565C0", "진행 중"
+        st.markdown(
+            f"<div style='margin-top:6px; padding:10px 14px; background:#E8F0FE; "
+            f"border-left:5px solid {_p_color}; border-radius:4px;'>"
+            f"<div style='font-size:0.85rem; color:#555; margin-bottom:4px;'>"
+            f"🎯 <b>기간 목표 카운터</b> ({_p_start_ym} ~ {_p_end_ym}, {_p_label})</div>"
+            f"<div style='font-size:1.05rem;'>"
+            f"<span style='color:#666;'>기간 목표</span> <b>{_p_target_h:.0f}h</b>"
+            f"  &nbsp;|&nbsp;  "
+            f"<span style='color:#666;'>기간 누적</span> <b>{_p_worked_h:.1f}h</b> "
+            f"<span style='color:#999;'>({_p_percent:g}%)</span>"
+            f"  &nbsp;|&nbsp;  "
+            f"<span style='color:#666;'>기간 잔여</span> "
+            f"<b style='color:{_p_color}; font-size:1.2rem;'>{_p_remain_h:+.1f}h</b>"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "🎯 기간 목표는 매장관리자가 [근무시간 설정 → 기간 목표]에서 지정한 임의 기간의 총 필수시간입니다. "
+            "기간 누적은 해당 기간(시작월~종료월)의 실제 근태를 합산합니다."
+        )
 
     # 경고/안내 메시지
     if leave_status["soak_risk"]:
@@ -11855,18 +11949,150 @@ def _erp_tab_my_leave_status(current_db: str, me_name: str):
 # (메뉴 단순화: admin 7탭→4탭, user 5탭→1~2탭)
 # =====================================================================
 
+def _erp_period_target_editor(current_db: str, me_name: str, emp_names: list, today: date):
+    """기간 목표 등록/수정/삭제 UI. 직원별 임의 기간(YYYY-MM~YYYY-MM) + 총 시간."""
+    st.markdown("##### 🎯 기간 목표 관리")
+    st.caption("직원과 기간(시작월~종료월), 기간 총 필수시간을 입력합니다. "
+               "예: 김승찬 2026-06 ~ 2026-07, 200시간. 한 직원에게 여러 기간을 등록할 수 있습니다.")
+
+    _ym_opts = [_erp_ym_add(f"{today.year:04d}-01", i) for i in range(0, 36)]  # 올해 1월부터 3년치
+    _def_start = f"{today.year:04d}-{today.month:02d}"
+    _def_start_idx = _ym_opts.index(_def_start) if _def_start in _ym_opts else 0
+
+    # ── 신규 등록 ──────────────────────────────────────────────
+    with st.form("pt_period_add", clear_on_submit=True):
+        pc = st.columns([2, 1.3, 1.3, 1.2])
+        with pc[0]:
+            p_emp = st.selectbox("직원", emp_names, key="pt_period_emp")
+        with pc[1]:
+            p_start = st.selectbox("시작월", _ym_opts, index=_def_start_idx, key="pt_period_start")
+        with pc[2]:
+            p_end = st.selectbox("종료월", _ym_opts, index=_def_start_idx, key="pt_period_end")
+        with pc[3]:
+            p_hours = st.number_input("총 시간(h)", min_value=0.0, max_value=20000.0,
+                                      value=0.0, step=10.0, key="pt_period_hours")
+        p_note = st.text_input("메모 (선택)", key="pt_period_note")
+        if st.form_submit_button("➕ 기간 목표 추가", type="primary"):
+            if p_start > p_end:
+                st.error("종료월이 시작월보다 빠를 수 없습니다.")
+            elif p_hours <= 0:
+                st.error("총 시간은 0보다 커야 합니다.")
+            else:
+                ok, e = _erp_insert_row("app_period_work_targets", {
+                    "db_filename": current_db,
+                    "employee_name": p_emp,
+                    "start_ym": p_start,
+                    "end_ym": p_end,
+                    "required_minutes": int(round(p_hours * 60)),
+                    "note": (p_note or "").strip() or None,
+                    "created_by": me_name,
+                    "updated_by": me_name,
+                })
+                if ok:
+                    _erp_list_period_targets.clear()
+                    flash(f"기간 목표 추가 완료 — {p_emp} {p_start}~{p_end} {p_hours:g}h")
+                    st.rerun()
+                else:
+                    st.error(f"추가 실패: {e}")
+
+    st.divider()
+
+    # ── 등록된 기간 목표 목록 (수정/삭제) ──────────────────────
+    rows = _erp_list_period_targets(current_db)
+    if not rows:
+        st.info("등록된 기간 목표가 없습니다.")
+        return
+
+    st.markdown("**등록된 기간 목표**")
+    _edit_id = st.session_state.get("pt_period_edit_id")
+    for r in sorted(rows, key=lambda x: (x.get("employee_name") or "", x.get("start_ym") or "")):
+        rid = int(r["id"])
+        _hours = round(int(r.get("required_minutes") or 0) / 60, 1)
+        if _edit_id == rid:
+            with st.container(border=True):
+                st.markdown(f"**✏️ 수정 (#{rid}) — {r.get('employee_name')}**")
+                with st.form(f"pt_period_edit_{rid}", clear_on_submit=False):
+                    ec = st.columns([1.3, 1.3, 1.2])
+                    _si = _ym_opts.index(r["start_ym"]) if r.get("start_ym") in _ym_opts else 0
+                    _ei = _ym_opts.index(r["end_ym"]) if r.get("end_ym") in _ym_opts else 0
+                    with ec[0]:
+                        e_start = st.selectbox("시작월", _ym_opts, index=_si, key=f"pt_pe_s_{rid}")
+                    with ec[1]:
+                        e_end = st.selectbox("종료월", _ym_opts, index=_ei, key=f"pt_pe_e_{rid}")
+                    with ec[2]:
+                        e_hours = st.number_input("총 시간(h)", min_value=0.0, max_value=20000.0,
+                                                  value=float(_hours), step=10.0, key=f"pt_pe_h_{rid}")
+                    e_note = st.text_input("메모", value=r.get("note") or "", key=f"pt_pe_n_{rid}")
+                    bc = st.columns([1, 1, 4])
+                    with bc[0]:
+                        _save = st.form_submit_button("💾 저장", type="primary")
+                    with bc[1]:
+                        _cancel = st.form_submit_button("취소")
+                if _cancel:
+                    st.session_state.pop("pt_period_edit_id", None)
+                    st.rerun()
+                if _save:
+                    if e_start > e_end:
+                        st.error("종료월이 시작월보다 빠를 수 없습니다.")
+                    elif e_hours <= 0:
+                        st.error("총 시간은 0보다 커야 합니다.")
+                    else:
+                        ok, e = _erp_update_row("app_period_work_targets", rid, {
+                            "start_ym": e_start,
+                            "end_ym": e_end,
+                            "required_minutes": int(round(e_hours * 60)),
+                            "note": (e_note or "").strip() or None,
+                            "updated_by": me_name,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        if ok:
+                            _erp_list_period_targets.clear()
+                            st.session_state.pop("pt_period_edit_id", None)
+                            flash("기간 목표가 수정되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"수정 실패: {e}")
+        else:
+            lc = st.columns([2, 2.4, 1.3, 2.5, 0.7, 0.7])
+            with lc[0]:
+                st.markdown(f"**{r.get('employee_name')}**")
+            with lc[1]:
+                st.text(f"{r.get('start_ym')} ~ {r.get('end_ym')}")
+            with lc[2]:
+                st.text(f"{_hours:g}h")
+            with lc[3]:
+                st.caption(r.get("note") or "")
+            with lc[4]:
+                if st.button("✏️", key=f"pt_pedit_{rid}", help="수정"):
+                    st.session_state["pt_period_edit_id"] = rid
+                    st.rerun()
+            with lc[5]:
+                if st.button("🗑️", key=f"pt_pdel_{rid}", help="삭제"):
+                    ok, e = _erp_delete_row("app_period_work_targets", rid)
+                    if ok:
+                        _erp_list_period_targets.clear()
+                        flash("기간 목표가 삭제되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"삭제 실패: {e}")
+
+
 def _erp_tab_period_targets(current_db: str, me_name: str):
-    """매장관리자: 근무시간 설정 (월·연 모드 토글, 직원×시간 입력)."""
+    """매장관리자: 근무시간 설정 (월·연·기간 모드 토글, 직원×시간 입력)."""
     st.subheader("⏰ 근무시간 설정")
-    st.caption("직원별로 월 또는 연 단위 필수 근무시간을 한 숫자(시간)만 입력합니다. "
+    st.caption("직원별로 월·연 단위 필수 근무시간, 또는 임의 기간(예: 6~7월 200h) 목표를 입력합니다. "
                "월 입력이 없는 달은 연/12로 자동 환산됩니다.")
 
     today = _today_kst()
-    mode = st.radio("입력 단위", ["월 단위", "연 단위"], horizontal=True, key="pt_mode")
+    mode = st.radio("입력 단위", ["월 단위", "연 단위", "기간 목표"], horizontal=True, key="pt_mode")
 
     emp_names = _erp_get_employee_names_for_store(current_db)
     if not emp_names:
         st.info("매장에 배정된 직원이 없습니다. 직원 관리에서 매장을 배정해 주세요.")
+        return
+
+    if mode == "기간 목표":
+        _erp_period_target_editor(current_db, me_name, emp_names, today)
         return
 
     if mode == "월 단위":
