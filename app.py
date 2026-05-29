@@ -9603,7 +9603,23 @@ def render_erp_attendance():
             _erp_tab_calendar(current_db, role, me_name, today)
             st.divider()
             with st.expander("⚙️ 최소 인원 규칙 + 매장 공용 일정", expanded=False):
-                _erp_tab_staffing_rules(current_db, me_name)
+                _stores_list_sr = _get_supabase_stores_list()
+                if _stores_list_sr:
+                    _sr_store_names = [s["store_name"] for s in _stores_list_sr]
+                    _sr_dbf_map = {s["store_name"]: s["db_filename"] for s in _stores_list_sr}
+                    _sr_home_name = next((s["store_name"] for s in _stores_list_sr if s["db_filename"] == current_db), _sr_store_names[0])
+                    _sr_home_idx = _sr_store_names.index(_sr_home_name) if _sr_home_name in _sr_store_names else 0
+                    _sr_selected = st.selectbox(
+                        "📍 설정할 매장 선택",
+                        _sr_store_names,
+                        index=_sr_home_idx,
+                        key="erp_sa_staffing_store_admin",
+                        help="매장을 선택하면 해당 매장의 기본 근무시간 및 시간대별 최소 인원을 설정합니다.",
+                    )
+                    _sr_db = _sr_dbf_map.get(_sr_selected, current_db)
+                else:
+                    _sr_db = current_db
+                _erp_tab_staffing_rules(_sr_db, me_name)
         with tabs[5]:
             _erp_tab_monthly_summary(current_db, today)
     else:
@@ -10093,7 +10109,8 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                     with rc[0]:
                         st.text(f"{str(rule.get('slot_start') or '')[:5]} ~ {str(rule.get('slot_end') or '')[:5]}")
                     with rc[1]:
-                        st.text(f"최소 {rule.get('min_staff')}명")
+                        _ms = rule.get('min_staff')
+                        st.text(f"최소 {_ms}명" if _ms else "제한 없음 (0명)")
                     with rc[2]:
                         st.caption(f"수정: {str(rule.get('updated_at') or '')[:16]}")
                     with rc[3]:
@@ -10111,7 +10128,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                 with fc[1]:
                     e_t = st.time_input("종료", value=dt_time(18, 0), key=f"erp_rule_e_{dow_i}")
                 with fc[2]:
-                    n = st.number_input("최소 인원", min_value=1, max_value=20, value=1, step=1, key=f"erp_rule_n_{dow_i}")
+                    n = st.number_input("최소 인원", min_value=0, max_value=20, value=1, step=1, key=f"erp_rule_n_{dow_i}")
                 with fc[3]:
                     add = st.form_submit_button("➕ 추가")
                 if add:
