@@ -11609,52 +11609,85 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
     p_start = date(int(s_year), int(s_month), 1)
     p_end = date(int(s_year), int(s_month), last_day)
 
-    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db, "log_date", p_start, p_end)
-    overtime = _erp_fetch_range("app_overtime_requests", "home_db_filename", current_db, "request_date", p_start, p_end, extra_eq={"status": "approved"})
     employees = _erp_get_employee_names_for_store(current_db)
+    if not employees:
+        st.info("매장에 배정된 직원이 없습니다.")
+        return
 
-    rows = []
+    # 전 매장 목록 (db_filename → 매장명 매핑)
+    all_stores = _get_supabase_stores_list()
+    dbf_to_name = {s["db_filename"]: (s.get("store_name") or s["db_filename"]) for s in all_stores}
+    home_store_name = dbf_to_name.get(current_db, current_db)
+
+    # 매장별로 근태 로그를 한 번씩 가져와서 현재 매장 직원에 해당하는 건만 수집
+    emp_set = set(employees)
+    detail_rows = []  # {"직원명", "근무매장", 각 집계 컬럼들}
+    for store in all_stores:
+        dbf = store["db_filename"]
+        sn = store.get("store_name") or dbf
+        logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_start, p_end)
+        overtime = _erp_fetch_range("app_overtime_requests", "home_db_filename", dbf, "request_date", p_start, p_end, extra_eq={"status": "approved"})
+        for emp in employees:
+            emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
+            if not emp_logs:
+                continue
+            normal_days = sum(1 for l in emp_logs if (l.get("work_type") or "") in ("정상", "행사"))
+            annual_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
+            half_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
+            early_late_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") in ("조퇴", "지각"))
+            comp_use_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") == "시차사용" and (l.get("status") or "approved") == "approved")
+            ot_min = sum(int(o.get("extra_minutes") or 0) for o in overtime if (o.get("employee_name") or "") == emp)
+            detail_rows.append({
+                "직원명": emp,
+                "근무매장": sn,
+                "정상근무일": normal_days,
+                "연차": annual_used,
+                "반차": half_used,
+                "조퇴/지각(분)": early_late_min,
+                "시차사용(분)": comp_use_min,
+                "추가근무(분)": ot_min,
+            })
+
+    # 직원별 합계 (화면 표시용)
+    summary_rows = []
     for emp in employees:
-        emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
-        normal_days = sum(1 for l in emp_logs if (l.get("work_type") or "") in ("정상", "행사"))
-        annual_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
-        half_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
-        early_late_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") in ("조퇴", "지각"))
-        comp_use_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") == "시차사용" and (l.get("status") or "approved") == "approved")
-        ot_min = sum(int(o.get("extra_minutes") or 0) for o in overtime if (o.get("employee_name") or "") == emp)
+        emp_details = [r for r in detail_rows if r["직원명"] == emp]
+        stores_worked = sorted({r["근무매장"] for r in emp_details})
         grants = _erp_fetch_table("app_leave_grants", {
             "home_db_filename": current_db, "employee_name": emp, "year": int(s_year)
         })
         annual = float(grants[0].get("annual_days") or 0) if grants else 0
         comp_remain = _erp_compute_remaining_comptime(current_db, emp)
-        rows.append({
+        total_annual_used = sum(r["연차"] for r in emp_details)
+        summary_rows.append({
             "직원명": emp,
-            "소속매장": current_db,
-            "정상근무일": normal_days,
-            "연차": annual_used,
-            "반차": half_used,
-            "조퇴/지각(분)": early_late_min,
-            "시차사용(분)": comp_use_min,
-            "추가근무(분)": ot_min,
-            "잔여연차": annual - annual_used,
+            "소속매장": home_store_name,
+            "근무매장": ", ".join(stores_worked) if stores_worked else "-",
+            "정상근무일": sum(r["정상근무일"] for r in emp_details),
+            "연차": total_annual_used,
+            "반차": sum(r["반차"] for r in emp_details),
+            "조퇴/지각(분)": sum(r["조퇴/지각(분)"] for r in emp_details),
+            "시차사용(분)": sum(r["시차사용(분)"] for r in emp_details),
+            "추가근무(분)": sum(r["추가근무(분)"] for r in emp_details),
+            "잔여연차": annual - total_annual_used,
             "잔여시차(분)": comp_remain,
         })
 
-    if not rows:
-        st.info("표시할 데이터가 없습니다.")
-        return
-
-    df = pd.DataFrame(rows)
-    st.dataframe(df, width='stretch', hide_index=True)
+    df_summary = pd.DataFrame(summary_rows)
+    st.caption("화면에는 직원별 전체 근무 합계가 표시됩니다. 매장별 세부 내역은 엑셀 다운로드에서 확인하세요.")
+    st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="월말급여요약", index=False)
+        df_summary.to_excel(writer, sheet_name="합계", index=False)
+        if detail_rows:
+            df_detail = pd.DataFrame(detail_rows).sort_values(["직원명", "근무매장"], ignore_index=True)
+            df_detail.to_excel(writer, sheet_name="매장별세부내역", index=False)
     buf.seek(0)
     st.download_button(
         "📥 엑셀 다운로드",
         data=buf.getvalue(),
-        file_name=f"근태_월말요약_{current_db}_{s_year}-{int(s_month):02d}.xlsx",
+        file_name=f"근태_월말요약_{home_store_name}_{s_year}-{int(s_month):02d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="erp_sum_dl",
     )
