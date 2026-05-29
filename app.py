@@ -9509,6 +9509,43 @@ def _erp_list_pending_adjustments(db_filename: str) -> list:
         return []
 
 
+@st.cache_data(ttl=600)
+def _erp_store_admin_names(db_filename: str) -> list:
+    """해당 매장 store_admin 직원의 표시명 목록.
+    store_admin 본인의 근태 신청은 매장 자가 승인이 아니라 superadmin 승인 대상으로 분기하기 위해 사용."""
+    if not db_filename:
+        return []
+    store_id = _get_supabase_store_by_db_filename(db_filename)
+    if not store_id:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        user_ids = set()
+        us = client.table("app_user_stores").select("user_id").eq("store_id", store_id).execute()
+        for x in (us.data or []):
+            user_ids.add(x["user_id"])
+        u = client.table("app_users").select("id").eq("store_id", store_id).execute()
+        for x in (u.data or []):
+            user_ids.add(x["id"])
+        if not user_ids:
+            return []
+        r = client.table("app_users").select("name, username, role").in_("id", list(user_ids)).execute()
+        out = []
+        for ud in (r.data or []):
+            if str(ud.get("role") or "").strip() != "store_admin":
+                continue
+            nm = str(ud.get("name") or "").strip()
+            un = str(ud.get("username") or "").strip()
+            display = nm or _email_local_part(un) or un or None
+            if display and display not in out:
+                out.append(display)
+        return out
+    except Exception:
+        return []
+
+
 def _erp_v2_clear_caches():
     """v2 관련 모든 캐시 클리어 — 저장/승인/반려 직후 호출."""
     try:
@@ -9519,6 +9556,7 @@ def _erp_v2_clear_caches():
         _erp_sum_approved_adjustments.clear()
         _erp_list_my_adjustments.clear()
         _erp_list_pending_adjustments.clear()
+        _erp_store_admin_names.clear()
     except Exception:
         pass
 
@@ -11825,8 +11863,13 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
     """매장관리자: 직원 신청 승인/반려 큐."""
     st.subheader("📥 신청 승인")
     st.caption("직원이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청을 검토합니다. 승인 시 해당 직원의 월·연 잔여 시간에 즉시 반영됩니다.")
+    st.caption("ⓘ 매장 관리자 본인의 신청은 이 큐에 표시되지 않으며 통합관리자(superadmin) 승인 대상입니다.")
 
-    pending = _erp_list_pending_adjustments(current_db)
+    _admin_names = set(_erp_store_admin_names(current_db))
+    pending = [
+        p for p in _erp_list_pending_adjustments(current_db)
+        if str(p.get("employee_name") or "").strip() not in _admin_names
+    ]
     if not pending:
         st.info("대기 중인 신청이 없습니다.")
         return
@@ -12171,6 +12214,72 @@ def _erp_render_superadmin_view(today: date):
             st.info("표시할 데이터가 없습니다.")
 
     with sa_tabs[3]:
+        st.markdown("##### 🧑‍💼 전 매장 매장관리자 근태 신청 승인 (superadmin 전용)")
+        st.caption("매장 관리자 본인이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청입니다. 승인 시 해당 매장관리자의 월·연 잔여 시간에 반영됩니다.")
+        sa_adj_pending = []
+        for _, sr in stores_df.iterrows():
+            dbf = sr["db_filename"]
+            _admin_names = set(_erp_store_admin_names(dbf))
+            if not _admin_names:
+                continue
+            for adj in _erp_list_pending_adjustments(dbf):
+                if str(adj.get("employee_name") or "").strip() in _admin_names:
+                    adj["_store_name"] = sr["store_name"]
+                    sa_adj_pending.append(adj)
+        if not sa_adj_pending:
+            st.info("대기 중인 매장관리자 신청이 없습니다.")
+        else:
+            st.caption(f"대기 중 {len(sa_adj_pending)}건")
+            for adj in sa_adj_pending:
+                adj_id = int(adj["id"])
+                kind = adj.get("kind") or "etc"
+                sign = adj.get("sign") or "+"
+                minutes = int(adj.get("minutes") or 0)
+                hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
+                with st.container(border=True):
+                    c = st.columns([1.6, 1.2, 0.4, 1.4, 3, 1, 1])
+                    with c[0]:
+                        st.markdown(f"**{adj.get('_store_name') or '-'}**")
+                        st.caption(adj.get("employee_name") or "-")
+                    with c[1]:
+                        st.markdown(f"{str(adj.get('target_date') or '')[:10]}")
+                    with c[2]:
+                        st.markdown(f"### {sign}")
+                    with c[3]:
+                        st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {hours_display}")
+                    with c[4]:
+                        st.caption(adj.get("reason") or "")
+                    with c[5]:
+                        if st.button("✅ 승인", key=f"sa_adj_ok_{adj_id}", type="primary"):
+                            ok, e = _erp_update_row("app_work_adjustments", adj_id, {
+                                "status": "approved",
+                                "approved_by": _get_current_user_display_name() or "superadmin",
+                                "approved_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                            if ok:
+                                _erp_v2_clear_caches()
+                                flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
+                                st.rerun()
+                            else:
+                                st.error(f"승인 실패: {e}")
+                    with c[6]:
+                        with st.popover("❌ 반려"):
+                            sa_rej_reason = st.text_input("반려 사유", key=f"sa_adj_rj_reason_{adj_id}")
+                            if st.button("반려 확정", key=f"sa_adj_rj_btn_{adj_id}", type="primary"):
+                                ok, e = _erp_update_row("app_work_adjustments", adj_id, {
+                                    "status": "rejected",
+                                    "approved_by": _get_current_user_display_name() or "superadmin",
+                                    "approved_at": datetime.now(timezone.utc).isoformat(),
+                                    "reject_reason": (sa_rej_reason or "").strip() or None,
+                                })
+                                if ok:
+                                    _erp_v2_clear_caches()
+                                    flash(f"반려: {adj.get('employee_name')}")
+                                    st.rerun()
+                                else:
+                                    st.error(f"반려 실패: {e}")
+
+        st.divider()
         st.markdown("##### ✅ 전 매장 추가근무 승인 대기 (관리자 전용)")
         all_pending = []
         for _, sr in stores_df.iterrows():
