@@ -10802,101 +10802,120 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     # ── ✏️ 특정 날짜만 빠른 수정 (다른 날짜에 영향 없음) ────────
     st.divider()
     with st.expander("✏️ 특정 날짜만 빠른 수정 / 삭제", expanded=False):
-        st.caption("선택한 날짜의 근무 일정 1건만 등록·수정·삭제합니다. 다른 날짜에는 절대 영향이 없습니다.")
-        if sel_store == "전체 매장":
-            st.info("💡 위의 '📍 매장 선택'에서 수정할 매장을 1곳 골라 주세요.")
-        else:
-            edit_dbf = _sn_to_dbf.get(sel_store, current_db)
-            emp_pool = _erp_get_employee_names_for_store(edit_dbf) or [me_name]
-            ec1, ec2 = st.columns([2, 2])
-            with ec1:
-                if role in ("store_admin", "superadmin"):
-                    qe_emp = st.selectbox("직원", emp_pool, key="qe_emp_calendar")
-                else:
-                    qe_emp = me_name
-                    st.text_input("직원", value=me_name, disabled=True, key="qe_emp_fixed_calendar")
-            with ec2:
-                qe_date = st.date_input(
-                    "수정할 날짜", value=today if period_start <= today <= period_end else period_start,
-                    min_value=period_start, max_value=period_end, key="qe_date_calendar",
-                )
-            # 기존 일정 조회 (id 보존을 위해 raw 데이터에서 직접 조회 — 정규화 매핑으로 이름도 비교)
-            _ex_row = None
-            try:
-                _client, _err = get_supabase_client()
-                if not _err and _client:
-                    _r = _client.table("app_shift_schedules").select("*").eq(
-                        "db_filename", edit_dbf
-                    ).eq("shift_date", qe_date.isoformat()).execute()
-                    for _row in (_r.data or []):
-                        _raw = _row.get("employee_name") or ""
-                        _disp = _name_map.get(str(_raw).strip()) or _name_map.get(str(_raw).strip().lower()) or _email_local_part(str(_raw).strip()) or str(_raw).strip()
-                        if _disp == qe_emp:
-                            _ex_row = _row
-                            break
-            except Exception:
-                _ex_row = None
-
-            _std_s, _std_e = _erp_default_times_for_date(edit_dbf, qe_date)
-            _ex_s = _erp_parse_time(_ex_row.get("shift_start")) if _ex_row else None
-            _ex_e = _erp_parse_time(_ex_row.get("shift_end")) if _ex_row else None
-
-            if _ex_row:
-                st.success(
-                    f"📌 현재 등록된 일정: **{_ex_s.strftime('%H:%M') if _ex_s else '-'} ~ "
-                    f"{_ex_e.strftime('%H:%M') if _ex_e else '-'}**"
-                    + (f" / 장소: {_ex_row.get('work_location_name')}" if _ex_row.get('work_location_name') else "")
-                )
+        st.caption("아래에서 매장(또는 기타 근무지)·직원·날짜를 직접 골라 해당 일정 1건만 등록·수정·삭제합니다. 다른 날짜에는 절대 영향이 없습니다.")
+        # 이 섹션 자체 매장 선택 (상단 필터와 독립). '기타 (외부/행사)'는 내 매장 db에 저장.
+        _qe_store_opts = all_store_names + ["기타 (외부/행사)"]
+        _qe_default_store = sel_store if sel_store in all_store_names else (
+            _dbf_to_sn.get(current_db) or (all_store_names[0] if all_store_names else "기타 (외부/행사)")
+        )
+        try:
+            _qe_store_idx = _qe_store_opts.index(_qe_default_store)
+        except ValueError:
+            _qe_store_idx = 0
+        ec0, ec1, ec2 = st.columns([2, 2, 2])
+        with ec0:
+            qe_store_sel = st.selectbox("📍 매장 / 근무지", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
+        _qe_is_etc = (qe_store_sel == "기타 (외부/행사)")
+        edit_dbf = current_db if _qe_is_etc else _sn_to_dbf.get(qe_store_sel, current_db)
+        emp_pool = _erp_get_employee_names_for_store(edit_dbf) or [me_name]
+        with ec1:
+            if role in ("store_admin", "superadmin"):
+                qe_emp = st.selectbox("직원", emp_pool, key="qe_emp_calendar")
             else:
-                st.info("📭 이 날짜에 등록된 일정이 없습니다. (저장 시 신규 추가)")
-
-            tc1, tc2 = st.columns(2)
-            with tc1:
-                qe_start = st.time_input(
-                    "출근 시각", value=_ex_s or _std_s, key=f"qe_start_{qe_date.isoformat()}_{qe_emp}", step=900,
-                )
-            with tc2:
-                qe_end = st.time_input(
-                    "퇴근 시각", value=_ex_e or _std_e, key=f"qe_end_{qe_date.isoformat()}_{qe_emp}", step=900,
-                )
-            qe_loc = st.text_input(
-                "근무 장소 (선택)",
-                value=(_ex_row.get("work_location_name") if _ex_row else "") or "",
-                key=f"qe_loc_{qe_date.isoformat()}_{qe_emp}",
-                placeholder="예: 본점 / 행사장",
+                qe_emp = me_name
+                st.text_input("직원", value=me_name, disabled=True, key="qe_emp_fixed_calendar")
+        with ec2:
+            qe_date = st.date_input(
+                "수정할 날짜", value=today if period_start <= today <= period_end else period_start,
+                min_value=period_start, max_value=period_end, key="qe_date_calendar",
             )
-
-            bc1, bc2, _ = st.columns([1, 1, 3])
-            with bc1:
-                if st.button("💾 이 날짜만 저장", type="primary", key="qe_save_calendar"):
-                    if (qe_start.hour * 60 + qe_start.minute) >= (qe_end.hour * 60 + qe_end.minute):
-                        st.error("퇴근 시각이 출근 시각보다 늦어야 합니다.")
+        # 기존 일정 조회 (id 보존을 위해 raw 데이터에서 직접 조회 — 정규화 매핑으로 이름도 비교).
+        # 기타 근무지 선택 시: work_location_name 이 있는 행(외부 근무)을 우선 매칭.
+        _ex_row = None
+        try:
+            _client, _err = get_supabase_client()
+            if not _err and _client:
+                _r = _client.table("app_shift_schedules").select("*").eq(
+                    "db_filename", edit_dbf
+                ).eq("shift_date", qe_date.isoformat()).execute()
+                _matched = []
+                for _row in (_r.data or []):
+                    _raw = _row.get("employee_name") or ""
+                    _disp = _name_map.get(str(_raw).strip()) or _name_map.get(str(_raw).strip().lower()) or _email_local_part(str(_raw).strip()) or str(_raw).strip()
+                    if _disp == qe_emp:
+                        _matched.append(_row)
+                if _matched:
+                    if _qe_is_etc:
+                        _ex_row = next((m for m in _matched if (m.get("work_location_name") or "").strip()), _matched[0])
                     else:
-                        patch = {
-                            "db_filename": edit_dbf,
-                            "employee_name": qe_emp,
-                            "shift_date": qe_date.isoformat(),
-                            "shift_start": qe_start.strftime("%H:%M:%S"),
-                            "shift_end": qe_end.strftime("%H:%M:%S"),
-                            "work_location_name": (qe_loc or "").strip() or None,
-                            "created_by": me_name,
-                        }
-                        if _ex_row:
-                            ok, e = _erp_update_row("app_shift_schedules", int(_ex_row["id"]), patch)
-                            msg = f"✅ {qe_date.isoformat()} {qe_emp} 일정이 수정되었습니다."
-                        else:
-                            ok, e = _erp_insert_row("app_shift_schedules", patch)
-                            msg = f"✅ {qe_date.isoformat()} {qe_emp} 일정이 등록되었습니다."
-                        if ok:
-                            flash(msg)
-                            st.rerun()
-                        else:
-                            st.error(f"저장 실패: {e}")
-            with bc2:
-                if _ex_row and st.button("🗑️ 이 날짜 삭제", key="qe_del_calendar"):
-                    _erp_delete_row("app_shift_schedules", int(_ex_row["id"]))
-                    flash(f"🗑️ {qe_date.isoformat()} {qe_emp} 일정이 삭제되었습니다.")
-                    st.rerun()
+                        _ex_row = _matched[0]
+        except Exception:
+            _ex_row = None
+
+        _std_s, _std_e = _erp_default_times_for_date(edit_dbf, qe_date)
+        _ex_s = _erp_parse_time(_ex_row.get("shift_start")) if _ex_row else None
+        _ex_e = _erp_parse_time(_ex_row.get("shift_end")) if _ex_row else None
+
+        if _ex_row:
+            st.success(
+                f"📌 현재 등록된 일정: **{_ex_s.strftime('%H:%M') if _ex_s else '-'} ~ "
+                f"{_ex_e.strftime('%H:%M') if _ex_e else '-'}**"
+                + (f" / 장소: {_ex_row.get('work_location_name')}" if _ex_row.get('work_location_name') else "")
+            )
+        else:
+            st.info("📭 이 날짜에 등록된 일정이 없습니다. (저장 시 신규 추가)")
+
+        tc1, tc2 = st.columns(2)
+        with tc1:
+            qe_start = st.time_input(
+                "출근 시각", value=_ex_s or _std_s, key=f"qe_start_{qe_date.isoformat()}_{qe_emp}", step=900,
+            )
+        with tc2:
+            qe_end = st.time_input(
+                "퇴근 시각", value=_ex_e or _std_e, key=f"qe_end_{qe_date.isoformat()}_{qe_emp}", step=900,
+            )
+        # 기타 근무지일 때 장소 입력을 기본 노출/기본값 채움
+        _qe_loc_default = (_ex_row.get("work_location_name") if _ex_row else "") or ""
+        if _qe_is_etc and not _qe_loc_default:
+            _qe_loc_default = "기타 (외부/행사)"
+        qe_loc = st.text_input(
+            "근무 장소 (기타 근무지면 상세 입력)",
+            value=_qe_loc_default,
+            key=f"qe_loc_{qe_date.isoformat()}_{qe_emp}",
+            placeholder="예: 동부산예술 / 롯데백화점 행사장",
+        )
+
+        bc1, bc2, _ = st.columns([1, 1, 3])
+        with bc1:
+            if st.button("💾 이 날짜만 저장", type="primary", key="qe_save_calendar"):
+                if (qe_start.hour * 60 + qe_start.minute) >= (qe_end.hour * 60 + qe_end.minute):
+                    st.error("퇴근 시각이 출근 시각보다 늦어야 합니다.")
+                else:
+                    patch = {
+                        "db_filename": edit_dbf,
+                        "employee_name": qe_emp,
+                        "shift_date": qe_date.isoformat(),
+                        "shift_start": qe_start.strftime("%H:%M:%S"),
+                        "shift_end": qe_end.strftime("%H:%M:%S"),
+                        "work_location_name": (qe_loc or "").strip() or None,
+                        "created_by": me_name,
+                    }
+                    if _ex_row:
+                        ok, e = _erp_update_row("app_shift_schedules", int(_ex_row["id"]), patch)
+                        msg = f"{qe_date.isoformat()} {qe_emp} 일정이 수정되었습니다."
+                    else:
+                        ok, e = _erp_insert_row("app_shift_schedules", patch)
+                        msg = f"{qe_date.isoformat()} {qe_emp} 일정이 등록되었습니다."
+                    if ok:
+                        flash(msg)
+                        st.rerun()
+                    else:
+                        st.error(f"저장 실패: {e}")
+        with bc2:
+            if _ex_row and st.button("🗑️ 이 날짜 삭제", key="qe_del_calendar"):
+                _erp_delete_row("app_shift_schedules", int(_ex_row["id"]))
+                flash(f"{qe_date.isoformat()} {qe_emp} 일정이 삭제되었습니다.")
+                st.rerun()
 
     # ── 범례 ────────────────────────────────────────────────────
     with st.expander("🎨 색상 범례"):
