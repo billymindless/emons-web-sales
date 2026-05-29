@@ -9622,6 +9622,7 @@ def render_erp_attendance():
 def _erp_tab_shift_plan(current_db: str, me_name: str):
     st.subheader("📅 근무 일정 계획 (본인 일정 등록)")
     st.caption("출근일은 ✅ 체크하고, 휴무일은 체크 해제하세요. 시간은 매장 기본값이 자동 입력되며, 필요 시 수정 가능합니다.")
+    role = (st.session_state.get("current_user") or {}).get("role") or "user"
 
     today = _today_kst()
 
