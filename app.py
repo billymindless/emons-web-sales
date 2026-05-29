@@ -9622,6 +9622,7 @@ def render_erp_attendance():
 def _erp_tab_shift_plan(current_db: str, me_name: str):
     st.subheader("📅 근무 일정 계획 (본인 일정 등록)")
     st.caption("출근일은 ✅ 체크하고, 휴무일은 체크 해제하세요. 시간은 매장 기본값이 자동 입력되며, 필요 시 수정 가능합니다.")
+    st.caption("ⓘ 기간을 1주/2주로 선택하면 주 단위·일 단위로 나눠 저장할 수 있습니다. 같은 날짜를 다시 저장하면 최신 내용으로 덮어쓰기됩니다.")
     role = (st.session_state.get("current_user") or {}).get("role") or "user"
 
     today = _today_kst()
@@ -9651,6 +9652,12 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     for row in existing:
         key = (str(row.get("employee_name") or ""), str(row.get("shift_date") or "")[:10])
         existing_by_key[key] = row
+    # 같은 날짜에 중복 저장된 과거 행까지 모두 모아 둔다(별칭 기준). 저장 시 overwrite + 중복 정리에 사용.
+    _my_aliases = set(_get_current_user_employee_aliases(me_name))
+    existing_rows_by_date: dict[str, list] = {}
+    for row in existing:
+        if str(row.get("employee_name") or "").strip() in _my_aliases:
+            existing_rows_by_date.setdefault(str(row.get("shift_date") or "")[:10], []).append(row)
 
     sh_hours = _erp_get_store_hours(current_db)
 
@@ -9871,17 +9878,22 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     with sbtn_c1:
         submitted = st.button("💾 내 일정 저장", type="primary", key="erp_shift_save")
     with sbtn_c2:
-        st.caption("저장 시 체크된 날짜는 등록·수정되고, 체크 해제된 날짜의 기존 일정은 삭제됩니다.")
+        st.caption("체크된 날짜는 등록·덮어쓰기되고, 체크 해제된 날짜의 기존 일정은 삭제됩니다. 저장 후 완료 알림이 표시됩니다.")
 
     if submitted:
         planned_by_date: dict[date, list] = {}
-        new_rows, delete_ids, updates = [], [], []
+        # (existing_id|None, new_row) 튜플 + 중복정리 대상 id 목록
+        new_rows: list = []          # 신규 INSERT
+        updates: list = []           # (id, patch) — 같은 날짜 기존행 overwrite
+        delete_ids: list = []        # 체크 해제(휴무)된 날짜 삭제
+        dedup_ids: list = []         # 같은 날짜에 2건 이상 있던 중복행 정리
         for d_str, (chk, t1, t2) in edits.items():
             d = datetime.fromisoformat(d_str).date()
-            existing_row = _erp_lookup_existing_shift(existing_by_key, me_name, d_str)
+            _ex_rows = existing_rows_by_date.get(d_str, [])
             if not chk:
-                if existing_row:
-                    delete_ids.append(int(existing_row["id"]))
+                # 휴무: 해당 날짜 내 모든 기존행 삭제
+                for _er in _ex_rows:
+                    delete_ids.append(int(_er["id"]))
                 continue
             if not t1 or not t2:
                 st.error(f"⛔ {d_str}: 출근/퇴근 시각이 비어 있습니다.")
@@ -9901,7 +9913,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 elif _sp_work_db != current_db:
                     _loc_val = _sp_sel_label
                 else:
-                    _loc_val = (existing_row.get("work_location_name") if existing_row else None) or ""
+                    _loc_val = (_ex_rows[0].get("work_location_name") if _ex_rows else None) or ""
             new_row = {
                 "db_filename": current_db,
                 "employee_name": me_name,
@@ -9911,18 +9923,20 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 "work_location_name": _loc_val or None,
                 "created_by": me_name,
             }
-            if existing_row:
-                updates.append((int(existing_row["id"]), new_row))
+            if _ex_rows:
+                # 같은 날짜 기존행이 있으면 첫 행은 overwrite, 나머지(중복)는 삭제
+                updates.append((int(_ex_rows[0]["id"]), new_row))
+                for _dup in _ex_rows[1:]:
+                    dedup_ids.append(int(_dup["id"]))
             else:
                 new_rows.append(new_row)
 
         violations = _erp_validate_shifts_against_rules(current_db, planned_by_date)
+        violation_note = ""
         if violations:
-            st.warning("⚠️ 최소 인원 미달 날짜가 있습니다. 일정은 저장되며, 캘린더에 경고가 표시됩니다.")
-            for v in violations:
-                st.markdown(f"- {v}")
+            violation_note = f" ⚠️ 최소 인원 미달 {len(violations)}건(저장됨, 캘린더에 경고 표시)."
 
-        ok_n, err_n, del_n = 0, 0, 0
+        ok_n, ow_n, err_n, del_n = 0, 0, 0, 0
         err_msgs = []
         for row in new_rows:
             ok, e = _erp_insert_row("app_shift_schedules", row)
@@ -9934,23 +9948,30 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         for rid, patch in updates:
             ok, e = _erp_update_row("app_shift_schedules", rid, patch)
             if ok:
-                ok_n += 1
+                ow_n += 1
             else:
                 err_n += 1
-                err_msgs.append(f"수정 실패 ({patch['shift_date']}): {e}")
+                err_msgs.append(f"덮어쓰기 실패 ({patch['shift_date']}): {e}")
         for rid in delete_ids:
             _erp_delete_row("app_shift_schedules", rid)
             del_n += 1
+        # 같은 날짜 중복행 정리(overwrite 외 잔여분 제거)
+        for rid in dedup_ids:
+            _erp_delete_row("app_shift_schedules", rid)
 
         if err_n == 0:
-            st.success(
-                f"✅ 저장 완료 — 신규/수정 **{ok_n}건**, 삭제 **{del_n}건**. "
-                f"총 계획 근무: **{_total_planned_hours:.1f}h** / 출근 {_work_days_count}일."
+            _dup_note = f" 중복 {len(dedup_ids)}건 정리." if dedup_ids else ""
+            flash(
+                f"근무 일정 저장 완료 — 신규 {ok_n}건 · 덮어쓰기 {ow_n}건 · 휴무 삭제 {del_n}건."
+                f"{_dup_note} 총 계획 근무 {_total_planned_hours:.1f}h / 출근 {_work_days_count}일.{violation_note}",
+                level="success",
             )
         else:
-            st.error(f"⚠️ 일부 저장 실패: 성공 {ok_n}건 / 실패 {err_n}건 / 삭제 {del_n}건")
-            for m in err_msgs:
-                st.caption(f"- {m}")
+            flash(
+                f"일부 저장 실패 — 성공 {ok_n + ow_n}건 / 실패 {err_n}건 / 삭제 {del_n}건. "
+                + " / ".join(err_msgs[:3]),
+                level="error",
+            )
         st.rerun()
 
     # ── 매장관리자 전용: 월간 근무 내역 엑셀 다운로드 ─────────────
