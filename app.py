@@ -9952,31 +9952,58 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 st.caption(f"- {m}")
         st.rerun()
 
-    # ── 다른 직원 일정 읽기 전용 ────────────────────────────────────
-    other_emps = [e for e in employees if e != me_name]
-    if other_emps:
+    # ── 매장관리자 전용: 월간 근무 내역 엑셀 다운로드 ─────────────
+    if role == "store_admin":
         st.divider()
-        st.markdown("##### 👥 다른 직원 근무 일정 (읽기 전용)")
-        table_rows = []
-        for emp in other_emps:
-            for d in date_list:
-                row = existing_by_key.get((emp, d.isoformat()))
-                if row:
-                    ss = str(row.get("shift_start") or "")[:5]
-                    ee = str(row.get("shift_end") or "")[:5]
-                    is_we = _erp_is_weekend_or_holiday(d)
-                    table_rows.append({
-                        "직원": emp,
-                        "날짜": d.isoformat(),
-                        "요일": _ERP_DOW_LABELS[d.weekday()],
-                        "주말/공휴일": "🟥" if is_we else "",
-                        "근무시간": f"{ss}~{ee}" if ss and ee else "-",
-                        "장소": row.get("work_location_name") or "",
+        st.markdown("##### 📥 월간 근무 내역 다운로드 (매장관리자 전용)")
+        from calendar import monthrange as _mrange
+        today_kst = _today_kst()
+        _dl_c1, _dl_c2, _dl_c3 = st.columns([1, 1, 2])
+        with _dl_c1:
+            _dl_year = st.number_input("연도", min_value=2020, max_value=2099,
+                                       value=today_kst.year, step=1, key="shift_dl_year")
+        with _dl_c2:
+            _dl_month = st.number_input("월", min_value=1, max_value=12,
+                                        value=today_kst.month, step=1, key="shift_dl_month")
+        with _dl_c3:
+            st.markdown("")  # 버튼 높이 맞춤
+        _dl_start = date(int(_dl_year), int(_dl_month), 1)
+        _dl_end   = date(int(_dl_year), int(_dl_month), _mrange(int(_dl_year), int(_dl_month))[1])
+        if st.button("📊 엑셀 데이터 생성", key="shift_dl_btn"):
+            _dl_rows = _erp_fetch_range("app_shift_schedules", "db_filename", current_db,
+                                        "shift_date", _dl_start, _dl_end)
+            if not _dl_rows:
+                st.warning(f"{int(_dl_year)}년 {int(_dl_month)}월에 등록된 근무 일정이 없습니다.")
+            else:
+                _dl_table = []
+                for _r in sorted(_dl_rows, key=lambda x: (x.get("employee_name",""), x.get("shift_date",""))):
+                    _d = date.fromisoformat(str(_r.get("shift_date") or "")[:10])
+                    _ss = str(_r.get("shift_start") or "")[:5]
+                    _ee = str(_r.get("shift_end") or "")[:5]
+                    _h = _erp_calc_shift_hours(
+                        _erp_parse_time(_r.get("shift_start")),
+                        _erp_parse_time(_r.get("shift_end")),
+                    ) if _r.get("shift_start") and _r.get("shift_end") else 0.0
+                    _dl_table.append({
+                        "직원": _r.get("employee_name") or "",
+                        "날짜": _d.isoformat(),
+                        "요일": _ERP_DOW_LABELS[_d.weekday()],
+                        "주말/공휴일": "Y" if _erp_is_weekend_or_holiday(_d) else "",
+                        "출근": _ss,
+                        "퇴근": _ee,
+                        "근무시간(h)": round(_h, 2),
+                        "장소": _r.get("work_location_name") or "",
                     })
-        if table_rows:
-            st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True)
-        else:
-            st.info("다른 직원의 등록된 일정이 없습니다.")
+                _dl_df = pd.DataFrame(_dl_table)
+                _csv_bytes = _dl_df.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    label=f"⬇️ {int(_dl_year)}년 {int(_dl_month)}월 근무 내역 CSV 다운로드",
+                    data=_csv_bytes,
+                    file_name=f"근무내역_{int(_dl_year)}{int(_dl_month):02d}.csv",
+                    mime="text/csv",
+                    key="shift_dl_csv",
+                )
+                st.caption(f"총 {len(_dl_table)}건 · Excel에서 열면 한글 깨짐 없이 바로 사용 가능합니다 (UTF-8 BOM).")
 
 
 # ---------- 탭 2: 최소 근무 인원 규칙 설정 (store_admin) ----------
