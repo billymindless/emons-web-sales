@@ -9149,7 +9149,65 @@ def _erp_count_active_at(shifts: list, slot_start: dt_time, slot_end: dt_time) -
     return cnt
 
 
-def _erp_validate_shifts_against_rules(db_filename: str, planned_shifts_by_date: dict) -> list:
+def _erp_check_cross_store_conflicts(
+    emp_name: str,
+    current_db: str,
+    edits: dict,
+) -> list[str]:
+    """
+    저장 예정 일정(edits)에서 타 매장의 기존 일정과 시간 겹침이 있는지 검사.
+    edits: {date_str: (chk, start_time|None, end_time|None)}
+    반환: 충돌 메시지 리스트 (빈 리스트 = OK)
+    """
+    # 체크된 날짜만 추출
+    check_dates = [d for d, (chk, _, _) in edits.items() if chk]
+    if not check_dates:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+
+    aliases = _get_current_user_employee_aliases(emp_name)
+    conflicts = []
+
+    try:
+        # 모든 매장의 해당 날짜 일정을 한 번에 조회 (db_filename 필터 없이)
+        q = (
+            client.table("app_shift_schedules")
+            .select("db_filename, shift_date, shift_start, shift_end, work_location_name")
+            .in_("shift_date", check_dates)
+            .in_("employee_name", aliases)
+            .execute()
+        )
+        others = [r for r in (q.data or []) if (r.get("db_filename") or "") != current_db]
+    except Exception:
+        return []
+
+    for d_str, (chk, t1, t2) in edits.items():
+        if not chk or not t1 or not t2:
+            continue
+        new_s = t1.hour * 60 + t1.minute
+        new_e = t2.hour * 60 + t2.minute
+        for rec in others:
+            if str(rec.get("shift_date") or "")[:10] != d_str:
+                continue
+            ex_s_t = _erp_parse_time(rec.get("shift_start"))
+            ex_e_t = _erp_parse_time(rec.get("shift_end"))
+            if not ex_s_t or not ex_e_t:
+                continue
+            ex_s = ex_s_t.hour * 60 + ex_s_t.minute
+            ex_e = ex_e_t.hour * 60 + ex_e_t.minute
+            # 겹침 조건: new_s < ex_e AND ex_s < new_e
+            if new_s < ex_e and ex_s < new_e:
+                loc = rec.get("work_location_name") or rec.get("db_filename") or "타 매장"
+                conflicts.append(
+                    f"{d_str}: {t1.strftime('%H:%M')}~{t2.strftime('%H:%M')} 가 "
+                    f"[{loc}] {str(rec.get('shift_start',''))[:5]}~{str(rec.get('shift_end',''))[:5]} 와 겹칩니다."
+                )
+    return conflicts
+
+
+
     """
     planned_shifts_by_date: {date: [{employee_name, shift_start, shift_end}, ...]}
     반환: 위반 메시지 리스트 (빈 리스트 = OK)
@@ -9897,6 +9955,12 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         st.caption("체크된 날짜는 등록·덮어쓰기되고, 체크 해제된 날짜의 기존 일정은 삭제됩니다. 저장 후 완료 알림이 표시됩니다.")
 
     if submitted:
+        # 타 매장 중복 시간대 사전 검사
+        _cross_conflicts = _erp_check_cross_store_conflicts(me_name, current_db, edits)
+        if _cross_conflicts:
+            st.error("⛔ 타 매장 일정과 시간이 겹쳐 저장할 수 없습니다:\n\n" + "\n\n".join(_cross_conflicts))
+            return
+
         planned_by_date: dict[date, list] = {}
         # (existing_id|None, new_row) 튜플 + 중복정리 대상 id 목록
         new_rows: list = []          # 신규 INSERT
@@ -11642,6 +11706,16 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
     dbf_to_name = {s["db_filename"]: (s.get("store_name") or s["db_filename"]) for s in all_stores}
     home_store_name = dbf_to_name.get(current_db, current_db)
 
+    # 직원별 기본 매장 매핑 (app_users.store_id 기준)
+    _all_emp_data = _get_supabase_employee_list_with_stores()
+    _emp_home_store: dict[str, str] = {}
+    _emp_all_stores: dict[str, str] = {}
+    for _eu in _all_emp_data:
+        _key = (_eu.get("name") or _eu.get("username") or "").strip()
+        if _key:
+            _emp_home_store[_key] = _eu.get("기본매장") or home_store_name
+            _emp_all_stores[_key] = _eu.get("배정매장") or home_store_name
+
     # 매장별로 근태 로그를 한 번씩 가져와서 현재 매장 직원에 해당하는 건만 수집
     emp_set = set(employees)
     detail_rows = []  # {"직원명", "근무매장", 각 집계 컬럼들}
@@ -11682,9 +11756,10 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
         annual = float(grants[0].get("annual_days") or 0) if grants else 0
         comp_remain = _erp_compute_remaining_comptime(current_db, emp)
         total_annual_used = sum(r["연차"] for r in emp_details)
+        _emp_home = _emp_home_store.get(emp) or home_store_name
         summary_rows.append({
             "직원명": emp,
-            "소속매장": home_store_name,
+            "소속매장": _emp_home,
             "근무매장": ", ".join(stores_worked) if stores_worked else "-",
             "정상근무일": sum(r["정상근무일"] for r in emp_details),
             "연차": total_annual_used,
