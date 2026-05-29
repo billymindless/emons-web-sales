@@ -10175,15 +10175,18 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                 if day_rules:
                     st.markdown(f"**현재 {_ERP_DOW_LABELS[dow_i]}요일 규칙**")
                     for rule in day_rules:
-                        rc = st.columns([2, 2, 2, 1])
+                        rc = st.columns([2, 2, 2, 2, 1])
                         with rc[0]:
                             st.text(f"{str(rule.get('slot_start') or '')[:5]} ~ {str(rule.get('slot_end') or '')[:5]}")
                         with rc[1]:
                             _ms = rule.get('min_staff')
                             st.text(f"최소 {_ms}명" if _ms else "제한 없음 (0명)")
                         with rc[2]:
-                            st.caption(f"수정: {str(rule.get('updated_at') or '')[:16]}")
+                            _opt = rule.get('optimal_staff')
+                            st.text(f"적정 {_opt}명" if _opt else "적정 미설정")
                         with rc[3]:
+                            st.caption(f"수정: {str(rule.get('updated_at') or '')[:16]}")
+                        with rc[4]:
                             if st.button("삭제", key=f"erp_rule_del_{rule['id']}"):
                                 _erp_delete_row("app_staffing_rules", int(rule["id"]))
                                 _erp_staffing_rules_cached.clear()
@@ -10192,7 +10195,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                     st.info(f"{_ERP_DOW_LABELS[dow_i]}요일에 설정된 규칙이 없습니다.")
 
                 with st.form(f"erp_rule_add_{dow_i}", clear_on_submit=False):
-                    fc = st.columns([1, 1, 1, 1])
+                    fc = st.columns([1, 1, 1, 1, 1])
                     with fc[0]:
                         s_t = st.time_input("시작", value=dt_time(9, 0), key=f"erp_rule_s_{dow_i}")
                     with fc[1]:
@@ -10200,6 +10203,10 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                     with fc[2]:
                         n = st.number_input("최소 인원", min_value=0, max_value=20, value=1, step=1, key=f"erp_rule_n_{dow_i}")
                     with fc[3]:
+                        opt_n = st.number_input("적정 인원", min_value=0, max_value=20, value=0, step=1,
+                                                help="0이면 적정 인원 미설정 (과다 근무 체크 안 함)",
+                                                key=f"erp_rule_opt_{dow_i}")
+                    with fc[4]:
                         add = st.form_submit_button("➕ 추가")
                     if add:
                         if e_t <= s_t:
@@ -10211,6 +10218,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                                 "slot_start": s_t.strftime("%H:%M:%S"),
                                 "slot_end": e_t.strftime("%H:%M:%S"),
                                 "min_staff": int(n),
+                                "optimal_staff": int(opt_n) if opt_n else None,
                                 "created_by": me_name,
                             })
                         if ok:
@@ -10648,6 +10656,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
 
     # 인원 부족일 산출 (매장별)
     shortage_dates: dict[str, list[str]] = {}  # {d_iso: [부족_매장명, ...]}
+    overstaff_dates: dict[str, list[str]] = {}  # {d_iso: [과다_매장명, ...]}
     for (dbf, dow), rules in rules_by_store_dow.items():
         _sname = _dbf_to_sn.get(dbf) or dbf
         for d_iso, day_shifts in shifts_by_date.items():
@@ -10663,10 +10672,19 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 slot_e = _erp_parse_time(rule.get("slot_end"))
                 if not slot_s or not slot_e:
                     continue
-                if _erp_count_active_at(store_day_shifts, slot_s, slot_e) < int(rule.get("min_staff") or 1):
+                actual_cnt = _erp_count_active_at(store_day_shifts, slot_s, slot_e)
+                # 인원 부족 체크
+                if actual_cnt < int(rule.get("min_staff") or 1):
                     shortage_dates.setdefault(d_iso, [])
                     if _sname not in shortage_dates[d_iso]:
                         shortage_dates[d_iso].append(_sname)
+                    break
+                # 과다 근무 체크 (optimal_staff 설정된 경우만)
+                _opt = rule.get("optimal_staff")
+                if _opt and actual_cnt > int(_opt):
+                    overstaff_dates.setdefault(d_iso, [])
+                    if _sname not in overstaff_dates[d_iso]:
+                        overstaff_dates[d_iso].append(_sname)
                     break
 
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
@@ -10689,9 +10707,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 continue
             d_iso = date(int(year), int(month), d_num).isoformat()
             is_today = (d_iso == today.isoformat())
-            bcolor = "#E53935" if d_iso in shortage_dates else ("#1976D2" if is_today else "#ddd")
-            bw = "2px" if (d_iso in shortage_dates or is_today) else "1px"
-            bg = "#E3F2FD" if is_today else "white"
+            bcolor = "#E53935" if d_iso in shortage_dates else ("#FB8C00" if d_iso in overstaff_dates else ("#1976D2" if is_today else "#ddd"))
+            bw = "2px" if (d_iso in shortage_dates or d_iso in overstaff_dates or is_today) else "1px"
+            bg = "#E3F2FD" if is_today else ("white")
             cell = [f"<td style='border:{bw} solid {bcolor}; vertical-align:top; padding:4px; height:115px; min-width:90px; background:{bg};'>"]
             _cell_date = date(int(year), int(month), d_num)
             _is_holiday_cell = _erp_is_weekend_or_holiday(_cell_date)
@@ -10703,6 +10721,10 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 _short_stores = shortage_dates[d_iso]
                 _short_label = " · ".join(_short_stores) if _short_stores else "인원부족"
                 cell.append(f"<div style='color:#E53935; font-size:0.62rem; font-weight:bold;'>⚠️ {_short_label} 인원부족</div>")
+            if d_iso in overstaff_dates:
+                _over_stores = overstaff_dates[d_iso]
+                _over_label = " · ".join(_over_stores) if _over_stores else "과다근무"
+                cell.append(f"<div style='color:#FB8C00; font-size:0.62rem; font-weight:bold;'>🔶 {_over_label} 과다근무</div>")
 
             # 매장 공용 일정 (메모/표시 전용). 다일정은 N/M일 표시
             for ev in events_by_date.get(d_iso, []):
