@@ -10395,12 +10395,19 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
 
 # ---------- 탭 3: 월별 캘린더 ----------
 
+@st.fragment
 def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
-    """전체 공개 월별 근무 캘린더 — 모든 유저가 모든 매장 근무 일정 열람 가능."""
+    """전체 공개 월별 근무 캘린더 — 모든 유저가 모든 매장 근무 일정 열람 가능.
+    @st.fragment: 빠른 수정/삭제 시 이 캘린더만 부분 재실행하여 상위 탭(근무 일정 계획 등)으로 복귀하지 않게 한다."""
     import calendar as _cal
 
     st.subheader("🗓️ 월별 근무 캘린더")
     st.caption("매장·직원을 선택해 누가 언제 어디서 일하는지 한눈에 확인할 수 있습니다.")
+    # 빠른 수정/삭제 직후 부분 재실행으로 전달된 완료 알림 (전체 rerun 아님 → 탭 유지)
+    _cal_flash = st.session_state.pop("_erp_cal_flash", None)
+    if _cal_flash:
+        st.toast(f"✅ {_cal_flash}", icon="✅")
+        st.success(_cal_flash)
 
     # ── 전체 매장 목록 로드 ─────────────────────────────────────
     stores_df = get_supabase_stores_dataframe_cached()
@@ -10774,15 +10781,15 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         ok, e = _erp_insert_row("app_shift_schedules", patch)
                         msg = f"{qe_date.isoformat()} {qe_emp} 일정이 등록되었습니다."
                     if ok:
-                        flash(msg)
-                        st.rerun()
+                        st.session_state["_erp_cal_flash"] = msg
+                        st.rerun(scope="fragment")
                     else:
                         st.error(f"저장 실패: {e}")
         with bc2:
             if _ex_row and st.button("🗑️ 이 날짜 삭제", key="qe_del_calendar"):
                 _erp_delete_row("app_shift_schedules", int(_ex_row["id"]))
-                flash(f"{qe_date.isoformat()} {qe_emp} 일정이 삭제되었습니다.")
-                st.rerun()
+                st.session_state["_erp_cal_flash"] = f"{qe_date.isoformat()} {qe_emp} 일정이 삭제되었습니다."
+                st.rerun(scope="fragment")
 
     # ── 범례 ────────────────────────────────────────────────────
     with st.expander("🎨 색상 범례"):
