@@ -9589,7 +9589,7 @@ def render_erp_attendance():
     #   store_admin: 6탭 (근무 일정 계획 / 내 근태 / 근무시간 설정 / 신청 승인 / 캘린더 / 월말 요약)
     #   user:        3탭 (근무 일정 계획 / 내 근태 / 매장 캘린더)
     if role == "store_admin":
-        tab_labels = ["근무 일정 계획", "내 근태", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
+        tab_labels = ["근무 일정 계획", "근무시간 관리", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
         tabs = st.tabs(tab_labels)
         with tabs[0]:
             _erp_tab_shift_plan(current_db, me_name)
@@ -9607,7 +9607,7 @@ def render_erp_attendance():
         with tabs[5]:
             _erp_tab_monthly_summary(current_db, today)
     else:
-        tab_labels = ["근무 일정 계획", "내 근태", "매장 캘린더"]
+        tab_labels = ["근무 일정 계획", "근무시간 관리", "매장 캘린더"]
         tabs = st.tabs(tab_labels)
         with tabs[0]:
             _erp_tab_shift_plan(current_db, me_name)
@@ -11909,7 +11909,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
 
 def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
     """직원·관리자 공용: 내 근태 (월·연 잔여 카드 + +/- 신청 + 내 신청 내역)."""
-    st.subheader("🧑‍💼 내 근태")
+    st.subheader("🧑‍💼 근무시간 관리")
     st.caption("이번 달과 올해의 필수 근무시간 대비 승인된 신청 합계, 잔여 시간을 확인하고 +/- 신청을 등록합니다.")
 
     today = _today_kst()
