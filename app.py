@@ -11968,19 +11968,24 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
             _emp_home_store[_key] = _eu.get("기본매장") or home_store_name
             _emp_all_stores[_key] = _eu.get("배정매장") or home_store_name
 
-    # 매장별로 근태 로그를 한 번씩 가져와서 현재 매장 직원에 해당하는 건만 수집
+    # 매장별로 근태 로그와 근무 계획을 가져와서 현재 매장 직원에 해당하는 건만 수집
+    # 정상근무일: app_shift_schedules(근무계획) 우선 집계
+    # 연차/반차/조퇴 등 예외항목: app_attendance_logs에서 집계
     emp_set = set(employees)
     detail_rows = []  # {"직원명", "근무매장", 각 집계 컬럼들}
     for store in all_stores:
         dbf = store["db_filename"]
         sn = store.get("store_name") or dbf
+        shifts = _erp_fetch_range("app_shift_schedules", "db_filename", dbf, "shift_date", p_start, p_end)
         logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_start, p_end)
         overtime = _erp_fetch_range("app_overtime_requests", "home_db_filename", dbf, "request_date", p_start, p_end, extra_eq={"status": "approved"})
         for emp in employees:
+            emp_shifts = [s for s in shifts if (s.get("employee_name") or "") == emp]
             emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
-            if not emp_logs:
+            if not emp_shifts and not emp_logs:
                 continue
-            normal_days = sum(1 for l in emp_logs if (l.get("work_type") or "") in ("정상", "행사"))
+            # 정상근무일: 근무계획(shift_schedules) 건수 기준
+            normal_days = len(emp_shifts)
             annual_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
             half_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
             early_late_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") in ("조퇴", "지각"))
@@ -12706,11 +12711,13 @@ def _erp_render_superadmin_view(today: date):
             dbf = sr["db_filename"]
             sn = sr["store_name"]
             emps = _erp_get_employee_names_for_store(dbf)
+            shifts = _erp_fetch_range("app_shift_schedules", "db_filename", dbf, "shift_date", p_s3, p_e3)
             logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_s3, p_e3)
             ot = _erp_fetch_range("app_overtime_requests", "home_db_filename", dbf, "request_date", p_s3, p_e3, extra_eq={"status": "approved"})
             for emp in emps:
+                emp_shifts = [s for s in shifts if (s.get("employee_name") or "") == emp]
                 emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
-                normal_days = sum(1 for l in emp_logs if (l.get("work_type") or "") in ("정상", "행사"))
+                normal_days = len(emp_shifts)
                 annual_u = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
                 half_u = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
                 el_m = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") in ("조퇴", "지각"))
