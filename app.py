@@ -11053,17 +11053,13 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 qe_emp = me_name
                 st.text_input("직원", value=me_name, disabled=True, key="qe_emp_fixed_calendar")
 
-        # 이번 달 해당 직원의 등록 일정 목록
-        # 직원 근무 기록은 등록 당시 컨텍스트 매장의 db_filename으로 저장되므로,
-        # 소속 매장 db뿐 아니라 해당 직원이 배정된 모든 매장 db를 조회해야 누락이 없음.
+        # 이번 달 해당 직원의 등록 일정 목록 (id 보존 위해 직접 조회 — 정규화 매핑으로 이름 비교)
         _my_shifts: list = []
         try:
             _client, _err = get_supabase_client()
             if not _err and _client:
-                # 조회 대상 db_filename 목록: 선택한 매장 + 전 매장 (직원 이름으로 필터)
-                _all_dbfs = list({row["db_filename"] for _, row in stores_df.iterrows()}) if not stores_df.empty else [edit_dbf]
-                _r = _client.table("app_shift_schedules").select("*").in_(
-                    "db_filename", _all_dbfs
+                _r = _client.table("app_shift_schedules").select("*").eq(
+                    "db_filename", edit_dbf
                 ).gte("shift_date", period_start.isoformat()).lte(
                     "shift_date", period_end.isoformat()
                 ).order("shift_date").execute()
