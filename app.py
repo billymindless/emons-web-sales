@@ -11081,9 +11081,59 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     st.error(
                         "🔴 표시된 행은 같은 매장·요일·시간대에 row가 여러 개 존재합니다. "
                         "사이드바 ERP 룰 설정 화면은 1줄로만 보이지만 카운팅은 모든 row를 평가하므로, "
-                        "그 중 적정값이 다른 옛 row가 있으면 화면과 다른 결과가 나옵니다. "
-                        "사이드바 → 매장 인력 기준 설정에서 슬롯을 삭제 후 재추가해 정리하세요."
+                        "그 중 적정값이 다른 옛 row가 있으면 화면과 다른 결과가 나옵니다."
                     )
+
+                    # ── 🧹 자동 정리 도구 (각 그룹에서 가장 작은 row_id만 남기고 나머지 삭제)
+                    _dup_df = df_diag[dup_mask].copy()
+                    _keep_ids: set[int] = set()
+                    _delete_ids: list[int] = []
+                    for _key, _g in _dup_df.groupby(
+                        ["매장", "요일", "시작", "종료"], dropna=False
+                    ):
+                        _ids_sorted = sorted(int(x) for x in _g["row_id"].tolist())
+                        _keep_ids.add(_ids_sorted[0])
+                        _delete_ids.extend(_ids_sorted[1:])
+
+                    st.markdown("---")
+                    st.markdown("#### 🧹 중복 룰 자동 정리")
+                    st.write(
+                        f"각 (매장·요일·슬롯) 그룹에서 **가장 작은 row_id를 1개씩 보존**하고 "
+                        f"나머지 **{len(_delete_ids)}건**을 영구 삭제합니다."
+                    )
+                    st.write({
+                        "보존(keep)": sorted(_keep_ids),
+                        "삭제(delete)": sorted(_delete_ids),
+                    })
+                    _confirm = st.checkbox(
+                        "위 row_id들을 영구 삭제하는 데 동의합니다. (되돌릴 수 없음)",
+                        key="erp_rule_dedup_confirm",
+                    )
+                    if st.button(
+                        "🧹 중복 룰 자동 정리 실행",
+                        disabled=not _confirm,
+                        key="erp_rule_dedup_run",
+                        type="primary",
+                    ):
+                        _ok_cnt = 0
+                        _fails: list[tuple[int, str]] = []
+                        for _did in _delete_ids:
+                            r_ok, r_err = _erp_delete_row("app_staffing_rules", int(_did))
+                            if r_ok:
+                                _ok_cnt += 1
+                            else:
+                                _fails.append((int(_did), r_err))
+                        try:
+                            _erp_staffing_rules_cached.clear()
+                        except Exception:
+                            pass
+                        if _fails:
+                            st.error(
+                                f"{_ok_cnt}건 삭제, {len(_fails)}건 실패. 실패 상세: {_fails}"
+                            )
+                        else:
+                            st.success(f"{_ok_cnt}건 정리 완료. 페이지를 새로고침합니다.")
+                            st.rerun()
                 # 시프트 중복 검증
                 _shift_dup_rows = []
                 for d_iso2, day_shifts2 in all_shifts_by_date_for_rules.items():
