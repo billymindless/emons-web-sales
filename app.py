@@ -13775,9 +13775,119 @@ def render_internal_work():
         by_id[int(t["id"])] = t
         by_parent.setdefault(t.get("parent_task_id"), []).append(t)
 
-    roots = by_parent.get(None, [])
-    for root in roots:
-        _render_task_card(root, by_parent, assignees_map, me_uname, role, store_name, current_db, depth=0)
+    # 필터에서 빠진 상위업무가 있어도 자식이 보이도록 가상 root 보강
+    visible_ids = set(by_id.keys())
+    extra_roots: list[dict] = []
+    for t in tasks:
+        pid = t.get("parent_task_id")
+        if pid is not None and pid not in visible_ids:
+            extra_roots.append(t)
+    roots = list(by_parent.get(None, [])) + extra_roots
+
+    tab_list, tab_gantt = st.tabs(["📋 목록", "📊 간트차트"])
+    with tab_list:
+        if not roots:
+            st.info("표시할 업무가 없습니다.")
+        for root in roots:
+            _render_task_card(root, by_parent, assignees_map, me_uname, role, store_name, current_db, depth=0)
+    with tab_gantt:
+        _render_task_gantt(tasks, assignees_map)
+
+
+def _render_task_gantt(tasks: list[dict], assignees_map: dict):
+    """전체 업무를 plotly timeline 간트차트로 시각화. 시작·마감 둘 다 없는 업무는 제외."""
+    import task_board as _tb  # noqa: WPS433
+
+    rows = []
+    for t in tasks:
+        s = t.get("start_date")
+        d = t.get("due_date")
+        if not s and not d:
+            continue
+        try:
+            s_dt = pd.to_datetime(s) if s else pd.to_datetime(d) - pd.Timedelta(days=1)
+            d_dt = pd.to_datetime(d) if d else pd.to_datetime(s) + pd.Timedelta(days=1)
+        except Exception:
+            continue
+        if d_dt <= s_dt:
+            d_dt = s_dt + pd.Timedelta(days=1)
+        tid = int(t["id"])
+        title = t.get("title", "")
+        status = t.get("status", "requested")
+        names = ", ".join(_uname_to_display(a.get("employee_username")) for a in assignees_map.get(tid, [])) or "(없음)"
+        label = f"#{tid} {title}"
+        if len(label) > 45:
+            label = label[:42] + "..."
+        rows.append({
+            "업무": label,
+            "Start": s_dt,
+            "Finish": d_dt,
+            "상태": _tb.TASK_STATUS_LABELS.get(status, status),
+            "담당자": names,
+        })
+
+    if not rows:
+        st.info("시작일·마감일이 입력된 업무가 없어 간트차트를 그릴 수 없습니다. 업무 편집에서 일정을 입력해 주세요.")
+        return
+
+    df = pd.DataFrame(rows)
+    color_map = {
+        "요청": "#facc15",
+        "진행": "#3b82f6",
+        "피드백": "#a855f7",
+        "완료": "#22c55e",
+        "보류": "#94a3b8",
+    }
+    fig = px.timeline(
+        df,
+        x_start="Start",
+        x_end="Finish",
+        y="업무",
+        color="상태",
+        color_discrete_map=color_map,
+        hover_data={"담당자": True, "Start": "|%Y-%m-%d", "Finish": "|%Y-%m-%d"},
+    )
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(
+        height=max(320, 30 * len(df) + 120),
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _uname_to_display(uname: str | None) -> str:
+    """username/email → 등록된 이름. 매핑 없으면 username의 @ 앞부분."""
+    if not uname:
+        return "-"
+    u = str(uname).strip()
+    if not u:
+        return "-"
+    try:
+        name_map = _get_app_user_display_name_map() or {}
+    except Exception:
+        name_map = {}
+    return (
+        name_map.get(u)
+        or name_map.get(u.lower())
+        or (u.split("@")[0] if "@" in u else u)
+    )
+
+
+def _count_descendants(by_parent: dict, parent_id: int) -> int:
+    """후손(자손) 업무 개수 재귀 카운트."""
+    children = by_parent.get(parent_id, [])
+    total = len(children)
+    for c in children:
+        total += _count_descendants(by_parent, int(c["id"]))
+    return total
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_attachment_bytes_cached(storage_path: str) -> bytes | None:
+    """첨부 파일 바이트를 10분 캐시. rerun마다 재다운로드 방지."""
+    import task_board as _tb  # noqa: WPS433
+    return _tb.download_attachment_bytes(storage_path)
 
 
 def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str | None,
@@ -13879,31 +13989,69 @@ def _internal_work_parent_options(store_name: str | None, role: str) -> list[tup
 def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                       me_uname: str, role: str, store_name: str | None,
                       current_db: str | None, depth: int = 0):
+    """depth==0이면 큰 상위업무 카드, 그 외에는 컴팩트한 하위업무 행."""
     import task_board as _tb  # noqa: WPS433
 
     tid = int(task["id"])
     title = task.get("title", "")
     status = task.get("status", "requested")
-    indent = "&nbsp;" * 4 * depth
     badge = f"{_tb.TASK_STATUS_EMOJI.get(status, '')} {_tb.TASK_STATUS_LABELS.get(status, status)}"
     assignees = assignees_map.get(tid, [])
-    assignee_names = ", ".join((a.get("employee_username") or "") for a in assignees) or "(없음)"
-
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([5, 2, 2, 1])
-        c1.markdown(f"{indent}**#{tid} {title}**")
-        c2.markdown(badge)
-        c3.caption(f"담당: {assignee_names}")
-        c4.caption(f"마감: {task.get('due_date') or '-'}")
-
-        # 상세 expander
-        with st.expander("자세히 보기 / 수정", expanded=False):
-            _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
-
-    # 하위 업무
+    assignee_names = ", ".join(_uname_to_display(a.get("employee_username")) for a in assignees) or "(없음)"
+    due = task.get("due_date") or "-"
     children = by_parent.get(tid, [])
-    for child in children:
-        _render_task_card(child, by_parent, assignees_map, me_uname, role, store_name, current_db, depth=depth + 1)
+
+    if depth == 0:
+        # ── 상위업무 카드 ─────────────────────────────────────
+        sub_count = _count_descendants(by_parent, tid)
+        with st.container(border=True):
+            h1, h2 = st.columns([7, 3])
+            h1.markdown(f"### #{tid} {title}")
+            h2.markdown(
+                f"<div style='text-align:right; font-size:0.95rem;'>"
+                f"<span style='padding:4px 10px; border-radius:12px; "
+                f"background:#f1f5f9; font-weight:600;'>{badge}</span></div>",
+                unsafe_allow_html=True,
+            )
+            m1, m2, m3 = st.columns([4, 3, 3])
+            m1.markdown(f"👤 **담당** &nbsp; {assignee_names}")
+            m2.markdown(f"📅 **마감** &nbsp; {due}")
+            m3.caption(f"작성: {_uname_to_display(task.get('created_by'))}  ·  하위업무 {sub_count}")
+
+            desc = (task.get("description") or "").strip()
+            if desc:
+                preview = desc if len(desc) <= 140 else desc[:137] + "..."
+                st.caption(f"📝 {preview}")
+
+            with st.expander(f"📋 자세히 보기 / 수정 · 하위업무 {sub_count}개", expanded=False):
+                _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
+                if children:
+                    st.markdown("---")
+                    st.markdown(f"**↳ 하위업무 {len(children)}**")
+                    for child in children:
+                        _render_task_card(child, by_parent, assignees_map,
+                                          me_uname, role, store_name, current_db, depth=depth + 1)
+    else:
+        # ── 하위업무 행 (컴팩트) ─────────────────────────────
+        indent = "&nbsp;" * (4 * (depth - 1))
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([1.4, 5.6, 2.5, 1.5])
+            c1.markdown(
+                f"<span style='padding:2px 8px; border-radius:10px; "
+                f"background:#f1f5f9; font-size:0.85rem;'>{badge}</span>",
+                unsafe_allow_html=True,
+            )
+            c2.markdown(f"{indent}↳ **#{tid} {title}**", unsafe_allow_html=True)
+            c3.caption(f"👤 {assignee_names}")
+            c4.caption(f"📅 {due}")
+            with st.expander("자세히 보기 / 수정", expanded=False):
+                _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
+                if children:
+                    st.markdown("---")
+                    st.markdown(f"**↳ 하위업무 {len(children)}**")
+                    for child in children:
+                        _render_task_card(child, by_parent, assignees_map,
+                                          me_uname, role, store_name, current_db, depth=depth + 1)
 
 
 def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
@@ -13987,7 +14135,7 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     comments = _tb.load_task_comments_cached(tid)
     for cm in comments:
         with st.container(border=True):
-            st.caption(f"**{cm.get('author')}** · {str(cm.get('created_at',''))[:19]}")
+            st.caption(f"**{_uname_to_display(cm.get('author'))}** · {str(cm.get('created_at',''))[:19]}")
             st.write(cm.get("body", ""))
 
     # 댓글 입력 + 첨부
@@ -14011,27 +14159,28 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                 flash("댓글이 등록되었습니다.")
                 st.rerun()
 
-    # 첨부 갤러리
+    # 첨부 갤러리 — 다운로드 없이 인라인 표시 (10분 캐시)
     atts = _tb.load_task_attachments_cached(tid)
     if atts:
         st.markdown("**🖼️ 첨부 이미지**")
-        cols = st.columns(4)
+        cols = st.columns(3)
         for i, a in enumerate(atts):
-            with cols[i % 4]:
-                data = _tb.download_attachment_bytes(a["storage_path"])
+            with cols[i % 3]:
+                data = _fetch_attachment_bytes_cached(a["storage_path"])
                 if data:
-                    st.image(data, caption=a.get("original_name", ""), width=160)
-                    with st.expander("크게 보기", expanded=False):
-                        st.image(data)
+                    st.image(data, caption=a.get("original_name", ""), use_container_width=True)
+                    with st.expander("🔍 원본 크기로 보기", expanded=False):
+                        st.image(data, use_container_width=True)
                 else:
-                    st.caption(f"📄 {a.get('original_name','')}")
+                    st.caption(f"📄 {a.get('original_name','')} (로드 실패)")
 
     # 활동 로그
     activity = _tb.load_task_activity_cached(tid)
     if activity:
         with st.expander("📜 활동 로그", expanded=False):
             for ev in activity:
-                st.caption(f"[{str(ev.get('created_at',''))[:19]}] {ev.get('actor','-')} → {ev.get('action','')} {ev.get('payload') or ''}")
+                actor_disp = _uname_to_display(ev.get('actor'))
+                st.caption(f"[{str(ev.get('created_at',''))[:19]}] {actor_disp} → {ev.get('action','')} {ev.get('payload') or ''}")
 
     # 하위 업무 추가
     st.markdown("---")
