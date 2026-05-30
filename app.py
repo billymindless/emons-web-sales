@@ -13795,34 +13795,80 @@ def render_internal_work():
 
 
 def _render_task_gantt(tasks: list[dict], assignees_map: dict):
-    """전체 업무를 plotly timeline 간트차트로 시각화. 시작·마감 둘 다 없는 업무는 제외."""
+    """첨부 이미지 스타일의 간트차트.
+    - 트리 순서 (상위 → 하위) 유지, 들여쓰기 + ▼/↳ 마커
+    - Y축 라벨에 monospace 컬럼 표시(업무명 │ 상태 │ 시작 │ 마감)
+    - 상단 날짜축(月/日(요일)), 주말 음영, 오늘 세로선
+    - 상태별 파스텔 색상 칩
+    """
     import task_board as _tb  # noqa: WPS433
 
-    rows = []
+    # 트리 구성 + 표시 순서(DFS, 상위→하위)
+    by_parent: dict = {}
+    by_id: dict[int, dict] = {}
     for t in tasks:
+        by_id[int(t["id"])] = t
+        by_parent.setdefault(t.get("parent_task_id"), []).append(t)
+    visible_ids = set(by_id.keys())
+    roots = list(by_parent.get(None, []))
+    for t in tasks:
+        pid = t.get("parent_task_id")
+        if pid is not None and pid not in visible_ids:
+            roots.append(t)
+
+    ordered: list[tuple[dict, int]] = []
+
+    def _walk(node: dict, depth: int):
+        ordered.append((node, depth))
+        for c in by_parent.get(int(node["id"]), []):
+            _walk(c, depth + 1)
+
+    for r in roots:
+        _walk(r, 0)
+
+    def _truncate(s: str, n: int) -> str:
+        s = s or ""
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    rows = []
+    y_labels_ordered: list[str] = []
+    for t, depth in ordered:
         s = t.get("start_date")
         d = t.get("due_date")
         if not s and not d:
-            continue
+            continue  # 일정이 없는 업무는 간트차트에서 제외
         try:
-            s_dt = pd.to_datetime(s) if s else pd.to_datetime(d) - pd.Timedelta(days=1)
-            d_dt = pd.to_datetime(d) if d else pd.to_datetime(s) + pd.Timedelta(days=1)
+            s_dt = pd.to_datetime(s) if s else pd.to_datetime(d)
+            d_dt = pd.to_datetime(d) if d else pd.to_datetime(s)
         except Exception:
             continue
         if d_dt <= s_dt:
             d_dt = s_dt + pd.Timedelta(days=1)
+
         tid = int(t["id"])
         title = t.get("title", "")
         status = t.get("status", "requested")
-        names = ", ".join(_uname_to_display(a.get("employee_username")) for a in assignees_map.get(tid, [])) or "(없음)"
-        label = f"#{tid} {title}"
-        if len(label) > 45:
-            label = label[:42] + "..."
+        status_kr = _tb.TASK_STATUS_LABELS.get(status, status)
+        is_group = bool(by_parent.get(tid))
+        if depth == 0:
+            marker = "▼" if is_group else "•"
+        else:
+            marker = "↳"
+        title_part = f"{'  ' * depth}{marker} {_truncate(title, 26)}"
+        # monospace 정렬 ─ 업무(34) │ 상태(5) │ 시작(10) │ 마감(10)
+        label_core = f"{title_part:<34} │ {status_kr:<5} │ {(s or '-'):<10} │ {(d or '-'):<10}"
+        label_unique = f"{label_core}  ⌗{tid}"
+        y_labels_ordered.append(label_unique)
+
+        names = ", ".join(
+            _uname_to_display(a.get("employee_username"))
+            for a in assignees_map.get(tid, [])
+        ) or "(없음)"
         rows.append({
-            "업무": label,
+            "업무": label_unique,
             "Start": s_dt,
             "Finish": d_dt,
-            "상태": _tb.TASK_STATUS_LABELS.get(status, status),
+            "상태": status_kr,
             "담당자": names,
         })
 
@@ -13832,11 +13878,11 @@ def _render_task_gantt(tasks: list[dict], assignees_map: dict):
 
     df = pd.DataFrame(rows)
     color_map = {
-        "요청": "#facc15",
-        "진행": "#3b82f6",
-        "피드백": "#a855f7",
-        "완료": "#22c55e",
-        "보류": "#94a3b8",
+        "요청": "#fde68a",
+        "진행": "#93c5fd",
+        "피드백": "#d8b4fe",
+        "완료": "#a7f3d0",
+        "보류": "#cbd5e1",
     }
     fig = px.timeline(
         df,
@@ -13847,13 +13893,72 @@ def _render_task_gantt(tasks: list[dict], assignees_map: dict):
         color_discrete_map=color_map,
         hover_data={"담당자": True, "Start": "|%Y-%m-%d", "Finish": "|%Y-%m-%d"},
     )
-    fig.update_yaxes(autorange="reversed")
-    fig.update_layout(
-        height=max(320, 30 * len(df) + 120),
-        margin=dict(l=10, r=10, t=30, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+
+    # 오늘 세로선 + 라벨 (보라)
+    today_ts = pd.Timestamp(_today_kst_safe())
+    fig.add_vline(x=today_ts, line_width=2, line_color="#a855f7")
+    fig.add_annotation(
+        x=today_ts, y=1.02, xref="x", yref="paper",
+        text="오늘", showarrow=False,
+        font=dict(color="#a855f7", size=11, family="sans-serif"),
+        bgcolor="#ffffff", bordercolor="#a855f7", borderwidth=1, borderpad=2,
     )
+
+    # 주말 음영
+    min_d = pd.to_datetime(df["Start"].min()).normalize()
+    max_d = pd.to_datetime(df["Finish"].max()).normalize()
+    span_days = int((max_d - min_d).days)
+    if 0 <= span_days <= 730:  # 2년 초과는 주말 음영 생략(성능)
+        cur = min_d
+        while cur <= max_d:
+            if cur.weekday() >= 5:
+                fig.add_vrect(
+                    x0=cur, x1=cur + pd.Timedelta(days=1),
+                    fillcolor="#f1f5f9", opacity=0.45,
+                    layer="below", line_width=0,
+                )
+            cur += pd.Timedelta(days=1)
+
+    fig.update_yaxes(
+        categoryorder="array",
+        categoryarray=y_labels_ordered,
+        autorange="reversed",
+        tickfont=dict(family="Consolas, 'Courier New', monospace", size=12, color="#374151"),
+        showgrid=True,
+        gridcolor="#f1f5f9",
+        title=None,
+    )
+    fig.update_xaxes(
+        type="date",
+        side="top",
+        tickformat="%m/%d (%a)",
+        showgrid=True,
+        gridcolor="#e5e7eb",
+        zeroline=False,
+        title=None,
+    )
+    fig.update_traces(marker_line_width=0)
+    fig.update_layout(
+        height=max(360, 30 * len(y_labels_ordered) + 140),
+        margin=dict(l=10, r=10, t=50, b=10),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        bargap=0.35,
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.06,
+            xanchor="right", x=1, title="",
+        ),
+    )
+
     st.plotly_chart(fig, use_container_width=True)
+
+
+def _today_kst_safe() -> date:
+    """간트차트 '오늘' 기준 KST. timezone 미설정 환경에서도 안전."""
+    try:
+        return (datetime.now(timezone.utc) + timedelta(hours=9)).date()
+    except Exception:
+        return date.today()
 
 
 def _uname_to_display(uname: str | None) -> str:
