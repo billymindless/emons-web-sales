@@ -13870,10 +13870,10 @@ def _internal_work_employee_options(store_id, role: str) -> list[tuple[str, str]
 
 
 def _internal_work_parent_options(store_name: str | None, role: str) -> list[tuple[int, str]]:
-    """상위 업무 후보 (현재 활성 업무 중 상위 업무인 것)."""
+    """상위 업무 후보 (현재 활성 업무 전체 — 하위에 하위를 달 수 있도록 모두 포함)."""
     import task_board as _tb  # noqa: WPS433
     tasks = _tb.load_tasks_cached(store_name=None if role == "superadmin" else store_name, include_done=False)
-    return [(int(t["id"]), f"#{t['id']} {t['title']}") for t in tasks if not t.get("parent_task_id")]
+    return [(int(t["id"]), f"#{t['id']} {t['title']}") for t in tasks]
 
 
 def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
@@ -14032,6 +14032,57 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
         with st.expander("📜 활동 로그", expanded=False):
             for ev in activity:
                 st.caption(f"[{str(ev.get('created_at',''))[:19]}] {ev.get('actor','-')} → {ev.get('action','')} {ev.get('payload') or ''}")
+
+    # 하위 업무 추가
+    st.markdown("---")
+    with st.expander("➕ 하위 업무 추가", expanded=False):
+        _cu2 = st.session_state.get("current_user") or {}
+        _sid2 = _cu2.get("store_id") or st.session_state.get("current_store_id")
+        sub_emp_opts = _internal_work_employee_options(_sid2, role)
+        sub_emp_label = dict(sub_emp_opts)
+        with st.form(f"sub_task_form_{tid}", clear_on_submit=True):
+            sub_title = st.text_input("제목 *", key=f"st_title_{tid}", placeholder="하위 업무 제목")
+            sub_desc = st.text_area("설명", key=f"st_desc_{tid}", height=80)
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                sub_start = st.date_input("시작일", value=None, key=f"st_start_{tid}")
+            with sc2:
+                sub_due = st.date_input("마감일", value=None, key=f"st_due_{tid}")
+            with sc3:
+                sub_pri = st.selectbox(
+                    "우선순위",
+                    options=_tb.TASK_PRIORITIES,
+                    index=1,
+                    format_func=lambda p: _tb.TASK_PRIORITY_LABELS.get(p, p),
+                    key=f"st_pri_{tid}",
+                )
+            sub_assignees = st.multiselect(
+                "담당자 (첫 번째가 책임자)",
+                options=[u for u, _ in sub_emp_opts],
+                format_func=lambda u: sub_emp_label.get(u, u),
+                key=f"st_assign_{tid}",
+            )
+            if st.form_submit_button("하위 업무 등록", type="primary"):
+                if not (sub_title or "").strip():
+                    st.error("제목을 입력해 주세요.")
+                else:
+                    new_sub_id, sub_err = _tb.create_task(
+                        title=sub_title,
+                        description=sub_desc,
+                        created_by=me_uname,
+                        store_name=store_name,
+                        db_filename=current_db,
+                        parent_task_id=tid,
+                        start_date=sub_start,
+                        due_date=sub_due,
+                        priority=sub_pri,
+                        assignees=sub_assignees,
+                    )
+                    if new_sub_id:
+                        flash(f"하위 업무가 등록되었습니다. (#{new_sub_id})")
+                        st.rerun()
+                    else:
+                        st.error(f"등록 실패: {sub_err}")
 
 
 def render_employee_management():
