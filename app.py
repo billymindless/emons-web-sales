@@ -12254,151 +12254,17 @@ def _erp_period_target_editor(current_db: str, me_name: str, emp_names: list, to
 
 
 def _erp_tab_period_targets(current_db: str, me_name: str):
-    """매장관리자: 근무시간 설정 (월·연·기간 모드 토글, 직원×시간 입력)."""
+    """매장관리자: 근무시간 설정 (기간 목표 입력)."""
     st.subheader("⏰ 근무시간 설정")
-    st.caption("직원별로 월·연 단위 필수 근무시간, 또는 임의 기간(예: 6~7월 200h) 목표를 입력합니다. "
-               "월 입력이 없는 달은 연/12로 자동 환산됩니다.")
+    st.caption("직원별로 임의 기간(예: 6~7월 200h)의 필수 근무시간 목표를 입력합니다.")
 
     today = _today_kst()
-    mode = st.radio("입력 단위", ["월 단위", "연 단위", "기간 목표"], horizontal=True, key="pt_mode")
-
     emp_names = _erp_get_employee_names_for_store(current_db)
     if not emp_names:
         st.info("매장에 배정된 직원이 없습니다. 직원 관리에서 매장을 배정해 주세요.")
         return
 
-    if mode == "기간 목표":
-        _erp_period_target_editor(current_db, me_name, emp_names, today)
-        return
-
-    if mode == "월 단위":
-        cy, cm = st.columns(2)
-        with cy:
-            year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="pt_m_y")
-        with cm:
-            month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="pt_m_m")
-        ym = f"{int(year):04d}-{int(month):02d}"
-
-        rows = _erp_list_monthly_targets(current_db, ym)
-        by_emp = {r["employee_name"]: r for r in rows}
-        df_init = pd.DataFrame([
-            {
-                "직원": n,
-                "월 필수 시간(h)": round(int(by_emp[n]["required_minutes"]) / 60, 2) if n in by_emp else 0.0,
-                "메모": by_emp[n].get("note") or "" if n in by_emp else "",
-            }
-            for n in emp_names
-        ])
-        edited = st.data_editor(
-            df_init,
-            key=f"pt_m_editor_{ym}",
-            width='stretch',
-            hide_index=True,
-            disabled=["직원"],
-            column_config={
-                "직원": st.column_config.TextColumn("직원"),
-                "월 필수 시간(h)": st.column_config.NumberColumn("월 필수 시간(h)", min_value=0.0, max_value=744.0, step=0.5, format="%.2f"),
-                "메모": st.column_config.TextColumn("메모"),
-            },
-        )
-        if st.button("💾 월 단위 저장", key=f"pt_m_save_{ym}", type="primary"):
-            client, err = get_supabase_client()
-            if err or not client:
-                st.error(f"Supabase 연결 실패: {err}")
-                return
-            ok_count = 0
-            fail = []
-            for _, r in edited.iterrows():
-                emp = str(r["직원"]).strip()
-                hours = float(r["월 필수 시간(h)"] or 0)
-                note = str(r["메모"] or "").strip() or None
-                if not emp:
-                    continue
-                minutes = int(round(hours * 60))
-                payload = {
-                    "db_filename": current_db,
-                    "employee_name": emp,
-                    "ym": ym,
-                    "required_minutes": minutes,
-                    "note": note,
-                    "updated_by": me_name,
-                }
-                if emp not in by_emp:
-                    payload["created_by"] = me_name
-                try:
-                    client.table("app_monthly_work_targets")\
-                        .upsert(payload, on_conflict="db_filename,employee_name,ym").execute()
-                    ok_count += 1
-                except Exception as e:
-                    fail.append(f"{emp}: {e}")
-            _erp_v2_clear_caches()
-            if fail:
-                st.error("일부 저장 실패: " + " / ".join(fail))
-            else:
-                flash(f"월 단위 필수 시간 {ok_count}건 저장 완료 ({ym})")
-                st.rerun()
-
-    else:
-        year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="pt_y_y")
-        yr = int(year)
-        rows = _erp_list_yearly_targets(current_db, yr)
-        by_emp = {r["employee_name"]: r for r in rows}
-        df_init = pd.DataFrame([
-            {
-                "직원": n,
-                "연 필수 시간(h)": round(int(by_emp[n]["required_minutes"]) / 60, 2) if n in by_emp else 0.0,
-                "메모": by_emp[n].get("note") or "" if n in by_emp else "",
-            }
-            for n in emp_names
-        ])
-        edited = st.data_editor(
-            df_init,
-            key=f"pt_y_editor_{yr}",
-            width='stretch',
-            hide_index=True,
-            disabled=["직원"],
-            column_config={
-                "직원": st.column_config.TextColumn("직원"),
-                "연 필수 시간(h)": st.column_config.NumberColumn("연 필수 시간(h)", min_value=0.0, max_value=8760.0, step=1.0, format="%.2f"),
-                "메모": st.column_config.TextColumn("메모"),
-            },
-        )
-        if st.button("💾 연 단위 저장", key=f"pt_y_save_{yr}", type="primary"):
-            client, err = get_supabase_client()
-            if err or not client:
-                st.error(f"Supabase 연결 실패: {err}")
-                return
-            ok_count = 0
-            fail = []
-            for _, r in edited.iterrows():
-                emp = str(r["직원"]).strip()
-                hours = float(r["연 필수 시간(h)"] or 0)
-                note = str(r["메모"] or "").strip() or None
-                if not emp:
-                    continue
-                minutes = int(round(hours * 60))
-                payload = {
-                    "db_filename": current_db,
-                    "employee_name": emp,
-                    "year": yr,
-                    "required_minutes": minutes,
-                    "note": note,
-                    "updated_by": me_name,
-                }
-                if emp not in by_emp:
-                    payload["created_by"] = me_name
-                try:
-                    client.table("app_yearly_work_targets")\
-                        .upsert(payload, on_conflict="db_filename,employee_name,year").execute()
-                    ok_count += 1
-                except Exception as e:
-                    fail.append(f"{emp}: {e}")
-            _erp_v2_clear_caches()
-            if fail:
-                st.error("일부 저장 실패: " + " / ".join(fail))
-            else:
-                flash(f"연 단위 필수 시간 {ok_count}건 저장 완료 ({yr})")
-                st.rerun()
+    _erp_period_target_editor(current_db, me_name, emp_names, today)
 
 
 def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
