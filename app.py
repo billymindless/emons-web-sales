@@ -12631,6 +12631,59 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                         else:
                             st.error(f"취소 실패: {e}")
 
+    # ── 관리자 전용: 근태 기록 검색 / 삭제 ───────────────────────────────
+    if role in ("store_admin", "superadmin"):
+        st.divider()
+        with st.expander("🗑️ 근태 기록 검색 / 삭제 (관리자 전용)", expanded=False):
+            st.caption("특정 직원·기간의 근태 기록을 조회하고 잘못 입력된 기록을 삭제할 수 있습니다.")
+            _del_emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
+            _dc1, _dc2, _dc3 = st.columns([2, 1, 1])
+            with _dc1:
+                _del_emp = st.selectbox("직원", _del_emp_opts, key="erp_attdel_emp")
+            with _dc2:
+                _del_from = st.date_input("시작일", value=today.replace(day=1), key="erp_attdel_from")
+            with _dc3:
+                _del_to = st.date_input("종료일", value=today, key="erp_attdel_to")
+            if st.button("🔍 조회", key="erp_attdel_search"):
+                _fetched = _erp_fetch_range(
+                    "app_attendance_logs", "home_db_filename", current_db,
+                    "log_date", _del_from, _del_to
+                )
+                st.session_state["erp_attdel_rows"] = [
+                    r for r in _fetched if (r.get("employee_name") or "") == _del_emp
+                ]
+            _del_rows = st.session_state.get("erp_attdel_rows", [])
+            if _del_rows:
+                st.caption(f"{len(_del_rows)}건 조회됨")
+                for _dr in _del_rows:
+                    _dr_id = int(_dr["id"])
+                    _dr_cols = st.columns([1.5, 1.2, 1.5, 2, 3, 1])
+                    with _dr_cols[0]:
+                        st.markdown(f"**{str(_dr.get('log_date') or '')[:10]}**")
+                    with _dr_cols[1]:
+                        st.caption(_dr.get("work_type") or "-")
+                    with _dr_cols[2]:
+                        _ts = str(_dr.get("start_time") or "")[:5]
+                        _te = str(_dr.get("end_time") or "")[:5]
+                        st.caption(f"{_ts}~{_te}" if _ts else "-")
+                    with _dr_cols[3]:
+                        st.caption(_dr.get("work_location_name") or "-")
+                    with _dr_cols[4]:
+                        st.caption(_dr.get("note") or "-")
+                    with _dr_cols[5]:
+                        if st.button("🗑️", key=f"erp_attdel_btn_{_dr_id}", help="이 기록 삭제"):
+                            ok, e = _erp_delete_row("app_attendance_logs", _dr_id)
+                            if ok:
+                                st.session_state["erp_attdel_rows"] = [
+                                    r for r in _del_rows if int(r["id"]) != _dr_id
+                                ]
+                                st.toast(f"근태 기록 삭제 완료 ({str(_dr.get('log_date') or '')[:10]})", icon="✅")
+                                st.rerun()
+                            else:
+                                st.error(f"삭제 실패: {e}")
+            elif "erp_attdel_rows" in st.session_state:
+                st.info("조회된 기록이 없습니다.")
+
 
 # ---------- superadmin: 통합 캘린더 & 매장별 현황 ----------
 
