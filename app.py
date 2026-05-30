@@ -10977,11 +10977,36 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         except Exception:
             _my_shifts = []
 
+        _qe_chk_key = f"qe_bulk_chk_{qe_emp}_{int(year)}{int(month):02d}"
         st.markdown(f"**📋 {int(year)}년 {int(month)}월 · {qe_emp} 등록 근무일 ({len(_my_shifts)}건)**")
         if not _my_shifts:
             st.info("이번 달 등록된 근무일이 없습니다. 아래에서 새 날짜를 추가하세요.")
         else:
+            # 일괄 삭제용 체크 상태
+            _checked_ids: set = st.session_state.get(_qe_chk_key, set())
             _qe_edit_id = st.session_state.get("qe_edit_id")
+
+            # 전체 선택 / 해제 + 일괄 삭제 버튼
+            _ba, _bb, _bc = st.columns([1, 1, 4])
+            with _ba:
+                if st.button("☑️ 전체 선택", key="qe_sel_all"):
+                    st.session_state[_qe_chk_key] = {int(s["id"]) for s in _my_shifts}
+                    st.rerun(scope="fragment")
+            with _bb:
+                if st.button("⬜ 전체 해제", key="qe_sel_none"):
+                    st.session_state[_qe_chk_key] = set()
+                    st.rerun(scope="fragment")
+            _checked_ids = st.session_state.get(_qe_chk_key, set())
+            if _checked_ids:
+                with _bc:
+                    if st.button(f"🗑️ 선택 {len(_checked_ids)}건 삭제", type="primary", key="qe_bulk_del"):
+                        for _did in list(_checked_ids):
+                            _erp_delete_row("app_shift_schedules", _did)
+                        st.session_state[_qe_chk_key] = set()
+                        st.session_state.pop("qe_edit_id", None)
+                        st.session_state["_erp_cal_flash"] = f"{qe_emp} 근무일 {len(_checked_ids)}건이 삭제되었습니다."
+                        st.rerun(scope="fragment")
+
             for _sh in _my_shifts:
                 _sid = int(_sh["id"])
                 try:
@@ -11024,22 +11049,36 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                                 st.session_state.pop("qe_edit_id", None)
                                 st.rerun(scope="fragment")
                 else:
-                    rc = st.columns([1.6, 1.8, 3, 0.9, 0.9])
+                    _is_chk = _sid in _checked_ids
+                    rc = st.columns([0.4, 1.6, 1.8, 3, 0.9, 0.9])
                     with rc[0]:
+                        _new_chk = st.checkbox("", value=_is_chk, key=f"qe_chk_{_sid}", label_visibility="collapsed")
+                        if _new_chk != _is_chk:
+                            _cur = st.session_state.get(_qe_chk_key, set())
+                            if _new_chk:
+                                _cur.add(_sid)
+                            else:
+                                _cur.discard(_sid)
+                            st.session_state[_qe_chk_key] = _cur
+                            st.rerun(scope="fragment")
+                    with rc[1]:
                         _dow_c = "#E53935" if _sd.weekday() == 6 else ("#1565C0" if _sd.weekday() == 5 else "#37474F")
                         st.markdown(f"<span style='color:{_dow_c}; font-weight:600;'>{_sd.month}/{_sd.day} ({_ERP_DOW_LABELS[_sd.weekday()]})</span>", unsafe_allow_html=True)
-                    with rc[1]:
-                        st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "-")
                     with rc[2]:
-                        st.markdown(f"<span style='color:#607D8B;'>{_loc}</span>" if _loc else "<span style='color:#bbb;'>-</span>", unsafe_allow_html=True)
+                        st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "-")
                     with rc[3]:
+                        st.markdown(f"<span style='color:#607D8B;'>{_loc}</span>" if _loc else "<span style='color:#bbb;'>-</span>", unsafe_allow_html=True)
+                    with rc[4]:
                         if st.button("✏️", key=f"qe_edit_btn_{_sid}", help="수정"):
                             st.session_state["qe_edit_id"] = _sid
                             st.rerun(scope="fragment")
-                    with rc[4]:
+                    with rc[5]:
                         if st.button("🗑️", key=f"qe_del_btn_{_sid}", help="삭제"):
                             _erp_delete_row("app_shift_schedules", _sid)
                             st.session_state.pop("qe_edit_id", None)
+                            _cur = st.session_state.get(_qe_chk_key, set())
+                            _cur.discard(_sid)
+                            st.session_state[_qe_chk_key] = _cur
                             st.session_state["_erp_cal_flash"] = f"{_sd.isoformat()} {qe_emp} 일정이 삭제되었습니다."
                             st.rerun(scope="fragment")
 
