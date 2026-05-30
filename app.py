@@ -9790,10 +9790,7 @@ def render_erp_attendance():
 
     st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
     st.header("🗓️ 근태 관리 (ERP)")
-    if st.button("← 첫화면(대시보드)", key="erp_back_btn"):
-        if "active_admin_page" in st.session_state:
-            del st.session_state["active_admin_page"]
-        st.rerun()
+
     st.markdown("</div>", unsafe_allow_html=True)
 
     if role == "superadmin":
