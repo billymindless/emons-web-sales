@@ -14017,6 +14017,132 @@ def _open_attachment_lightbox(img_bytes: bytes, name: str | None = None):
         st.image(img_bytes, use_container_width=True)
 
 
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg")
+
+
+def _humansize(n) -> str:
+    """바이트 단위 사람이 읽기 좋은 표기."""
+    try:
+        n = float(n or 0)
+    except Exception:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{int(n)}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def _is_image_attachment(a: dict) -> bool:
+    """DB 첨부 row가 이미지인지(mime 우선, 없으면 확장자)."""
+    mime = (a.get("mime_type") or "").lower()
+    if mime.startswith("image/"):
+        return True
+    name = (a.get("original_name") or "").lower()
+    return any(name.endswith(ext) for ext in _IMAGE_EXTS)
+
+
+def _is_image_upload(f) -> bool:
+    """업로드 직전 Streamlit UploadedFile이 이미지인지."""
+    t = (getattr(f, "type", "") or "").lower()
+    if t.startswith("image/"):
+        return True
+    name = (getattr(f, "name", "") or "").lower()
+    return any(name.endswith(ext) for ext in _IMAGE_EXTS)
+
+
+def _render_attachment_inline(a: dict, key_suffix: str):
+    """이미지면 인라인 + 라이트박스, 그 외는 아이콘 + 다운로드 버튼."""
+    name = a.get("original_name", "")
+    data = _fetch_attachment_bytes_cached(a["storage_path"])
+    if not data:
+        st.caption(f"📄 {name} (로드 실패)")
+        return
+    aid = a.get("id", "")
+    if _is_image_attachment(a):
+        st.image(data, caption=name, use_container_width=True)
+        if st.button("🔍 크게 보기", key=f"open_img_{aid}_{key_suffix}"):
+            _open_attachment_lightbox(data, name)
+    else:
+        st.markdown(f"📄 **{name}**")
+        st.caption(_humansize(a.get("byte_size")))
+        st.download_button(
+            "⬇ 다운로드",
+            data=data,
+            file_name=name or "download",
+            mime=a.get("mime_type") or "application/octet-stream",
+            key=f"dl_att_{aid}_{key_suffix}",
+        )
+
+
+def _render_upload_preview(files: list, cols_per_row: int = 4):
+    """업로드 직전 파일들의 썸네일/메타 표시. 이미지는 미리보기, 그 외는 아이콘."""
+    if not files:
+        return
+    st.caption(f"📁 첨부 미리보기 ({len(files)}개)")
+    cols = st.columns(min(len(files), cols_per_row) or 1)
+    for i, f in enumerate(files):
+        with cols[i % len(cols)]:
+            if _is_image_upload(f):
+                st.image(f, caption=f.name, use_container_width=True)
+            else:
+                st.markdown(f"📄 **{f.name}**")
+                size = getattr(f, "size", None)
+                st.caption(_humansize(size))
+            try:
+                f.seek(0)
+            except Exception:
+                pass
+
+
+def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_prefix: str):
+    """댓글/답글 + 파일 첨부 입력 위젯. file_uploader는 form 밖에서 즉시 미리보기."""
+    import task_board as _tb  # noqa: WPS433
+
+    ver_key = f"{key_prefix}_files_ver"
+    ver = int(st.session_state.get(ver_key, 0))
+    files_key = f"{key_prefix}_files_{ver}"
+    files = st.file_uploader(
+        "📎 파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
+        accept_multiple_files=True,
+        key=files_key,
+    )
+    _render_upload_preview(files)
+
+    with st.form(f"{key_prefix}_form", clear_on_submit=True):
+        body = st.text_area(
+            "내용",
+            key=f"{key_prefix}_body",
+            height=80,
+            placeholder="내용을 입력하세요. (첨부만 등록하려면 비워둬도 됩니다)",
+        )
+        label = "↪ 답글 등록" if parent_cid else "💬 댓글 등록"
+        if st.form_submit_button(label, type="primary"):
+            if not (body or "").strip() and not files:
+                st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
+            else:
+                new_cid, err = _tb.post_comment(
+                    tid, me_uname, body or "(첨부)", parent_comment_id=parent_cid
+                )
+                if err and not files:
+                    st.error(f"등록 실패: {err}")
+                else:
+                    for f in files or []:
+                        try:
+                            f.seek(0)
+                        except Exception:
+                            pass
+                        _row, ferr = _tb.attach_file(
+                            task_id=tid, comment_id=new_cid,
+                            uploaded_file=f, uploaded_by=me_uname,
+                        )
+                        if ferr:
+                            st.warning(f"첨부 실패 ({f.name}): {ferr}")
+                    flash("등록되었습니다.")
+                    st.session_state[ver_key] = ver + 1
+                    st.rerun()
+
+
 def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str | None,
                           role: str, store_id):
     import task_board as _tb  # noqa: WPS433
@@ -14025,6 +14151,17 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
         # 같은 매장 직원 목록
         emp_options = _internal_work_employee_options(store_id, role)
         emp_username_to_label = {u: lbl for u, lbl in emp_options}
+
+        # 파일 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
+        nt_ver = int(st.session_state.get("nt_files_ver", 0))
+        nt_files_key = f"nt_files_{nt_ver}"
+        nt_files = st.file_uploader(
+            "📎 파일 첨부 (선택, 이미지·문서 등 모든 종류 다중 가능)",
+            accept_multiple_files=True,
+            key=nt_files_key,
+        )
+        _render_upload_preview(nt_files)
+
         with st.form("new_task_form", clear_on_submit=True):
             title = st.text_input("제목 *", key="nt_title", placeholder="업무 제목")
             description = st.text_area("설명", key="nt_desc", height=100, placeholder="상세 내용 / 요청 사항")
@@ -14074,6 +14211,19 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
                         assignees=assignees,
                     )
                     if new_id:
+                        # 업무 생성 후 첨부 파일 업로드 (task 레벨, comment_id=None)
+                        for f in nt_files or []:
+                            try:
+                                f.seek(0)
+                            except Exception:
+                                pass
+                            _row, ferr = _tb.attach_file(
+                                task_id=new_id, comment_id=None,
+                                uploaded_file=f, uploaded_by=me_uname,
+                            )
+                            if ferr:
+                                st.warning(f"첨부 실패 ({f.name}): {ferr}")
+                        st.session_state["nt_files_ver"] = nt_ver + 1  # uploader 위젯 리셋
                         flash(f"업무가 등록되었습니다. (#{new_id})")
                         st.rerun()
                     else:
@@ -14258,69 +14408,80 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
             st.rerun()
 
     st.markdown("---")
+
+    # 업무 직속 첨부 (어느 댓글에도 속하지 않는 task 레벨 파일)
+    all_atts = _tb.load_task_attachments_cached(tid)
+    atts_by_comment: dict[int, list[dict]] = {}
+    atts_for_task: list[dict] = []
+    for a in all_atts:
+        cid_raw = a.get("comment_id")
+        if cid_raw:
+            atts_by_comment.setdefault(int(cid_raw), []).append(a)
+        else:
+            atts_for_task.append(a)
+
+    if atts_for_task:
+        st.markdown("**📎 업무 첨부**")
+        a_cols = st.columns(3)
+        for i, a in enumerate(atts_for_task):
+            with a_cols[i % 3]:
+                _render_attachment_inline(a, key_suffix=f"task{tid}")
+        st.markdown("---")
+
+    # 댓글 트리
     st.markdown("**💬 댓글**")
     comments = _tb.load_task_comments_cached(tid)
+    cm_by_parent: dict = {}
     for cm in comments:
-        with st.container(border=True):
-            st.caption(f"**{_uname_to_display(cm.get('author'))}** · {str(cm.get('created_at',''))[:19]}")
-            st.write(cm.get("body", ""))
+        cm_by_parent.setdefault(cm.get("parent_comment_id"), []).append(cm)
 
-    # 첨부 파일은 form 밖에 둬야 사용자가 파일 선택 즉시 썸네일이 표시됨.
-    # 등록 후 위젯을 비우기 위해 버전 카운터(key)를 사용한다.
-    file_ver_key = f"cm_files_ver_{tid}"
-    file_ver = int(st.session_state.get(file_ver_key, 0))
-    files_key = f"cm_files_{tid}_{file_ver}"
-    files = st.file_uploader(
-        "📎 이미지 첨부 (다중 가능) — 선택 즉시 아래에 미리보기 표시",
-        type=["png", "jpg", "jpeg", "webp", "gif"],
-        accept_multiple_files=True,
-        key=files_key,
-    )
-    if files:
-        st.caption(f"🖼️ 첨부 미리보기 ({len(files)}장)")
-        prev_cols = st.columns(min(len(files), 4) or 1)
-        for i, f in enumerate(files):
-            with prev_cols[i % len(prev_cols)]:
-                st.image(f, caption=f.name, use_container_width=True)
-                try:
-                    f.seek(0)  # st.image가 읽은 스트림 포인터를 다시 0으로
-                except Exception:
-                    pass
+    def _render_cm(cm: dict, depth: int):
+        cm_id = int(cm["id"])
+        if depth > 0:
+            spacer, body_col = st.columns([max(depth, 1) * 0.4, 10])
+            holder = body_col
+            with spacer:
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+        else:
+            holder = st.container()
+        with holder:
+            with st.container(border=True):
+                head = f"**{_uname_to_display(cm.get('author'))}** · {str(cm.get('created_at',''))[:19]}"
+                if depth > 0:
+                    head += "  ·  ↪ 답글"
+                st.caption(head)
+                st.write(cm.get("body", ""))
 
-    # 댓글 입력 (본문만 form 안)
-    with st.form(f"comment_form_{tid}", clear_on_submit=True):
-        body = st.text_area("새 댓글", key=f"cm_body_{tid}", height=80, placeholder="댓글을 입력하세요. 이미지는 위에서 첨부.")
-        if st.form_submit_button("댓글 등록"):
-            new_cid, err = _tb.post_comment(tid, me_uname, body or "(첨부)")
-            if err and not files:
-                st.error(f"댓글 등록 실패: {err}")
-            else:
-                for f in files or []:
-                    try:
-                        f.seek(0)
-                    except Exception:
-                        pass
-                    row, ferr = _tb.attach_file(task_id=tid, comment_id=new_cid, uploaded_file=f, uploaded_by=me_uname)
-                    if ferr:
-                        st.warning(f"첨부 실패 ({f.name}): {ferr}")
-                flash("댓글이 등록되었습니다.")
-                st.session_state[file_ver_key] = file_ver + 1  # uploader 위젯 리셋
-                st.rerun()
+                # 이 댓글에 달린 첨부
+                cm_atts = atts_by_comment.get(cm_id, [])
+                if cm_atts:
+                    n_cols = min(len(cm_atts), 3)
+                    a_cols = st.columns(n_cols)
+                    for i, a in enumerate(cm_atts):
+                        with a_cols[i % n_cols]:
+                            _render_attachment_inline(a, key_suffix=f"cm{cm_id}")
 
-    # 첨부 갤러리 — 다운로드 없이 인라인 표시 (10분 캐시) + 클릭 시 라이트박스 모달
-    atts = _tb.load_task_attachments_cached(tid)
-    if atts:
-        st.markdown("**🖼️ 첨부 이미지**")
-        cols = st.columns(3)
-        for i, a in enumerate(atts):
-            with cols[i % 3]:
-                data = _fetch_attachment_bytes_cached(a["storage_path"])
-                if data:
-                    st.image(data, caption=a.get("original_name", ""), use_container_width=True)
-                    if st.button("🔍 크게 보기", key=f"open_img_{a.get('id', i)}_{tid}"):
-                        _open_attachment_lightbox(data, a.get("original_name"))
-                else:
-                    st.caption(f"📄 {a.get('original_name','')} (로드 실패)")
+                # 답글 작성 폼
+                with st.expander("↪ 답글 달기", expanded=False):
+                    _render_comment_input(
+                        tid, me_uname,
+                        parent_cid=cm_id,
+                        key_prefix=f"reply_{tid}_{cm_id}",
+                    )
+
+        # 자식 댓글 (재귀)
+        for child in cm_by_parent.get(cm_id, []):
+            _render_cm(child, depth + 1)
+
+    root_comments = cm_by_parent.get(None, [])
+    if not root_comments:
+        st.caption("아직 댓글이 없습니다. 아래에서 첫 댓글을 남겨 보세요.")
+    for r in root_comments:
+        _render_cm(r, 0)
+
+    # 새 댓글 작성 (최상위)
+    st.markdown("**✍ 새 댓글 작성**")
+    _render_comment_input(tid, me_uname, parent_cid=None, key_prefix=f"new_{tid}")
 
     # 활동 로그
     activity = _tb.load_task_activity_cached(tid)

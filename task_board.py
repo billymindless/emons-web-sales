@@ -380,7 +380,8 @@ def assign_users(task_id: int, usernames: list[str], actor: str) -> tuple[bool, 
         return False, str(e)
 
 
-def post_comment(task_id: int, author: str, body: str) -> tuple[int | None, str | None]:
+def post_comment(task_id: int, author: str, body: str,
+                 parent_comment_id: int | None = None) -> tuple[int | None, str | None]:
     body = (body or "").strip()
     if not body:
         return None, "내용이 비어 있습니다."
@@ -392,6 +393,7 @@ def post_comment(task_id: int, author: str, body: str) -> tuple[int | None, str 
             "task_id": task_id,
             "author": author,
             "body": body,
+            "parent_comment_id": int(parent_comment_id) if parent_comment_id else None,
         }).execute()
         new_id = int(r.data[0]["id"]) if r.data else None
         task_row = client.table("app_tasks").select("title").eq("id", task_id).single().execute()
