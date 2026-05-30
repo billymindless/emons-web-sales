@@ -9734,31 +9734,30 @@ def render_erp_attendance():
             _erp_tab_shift_plan(current_db, me_name)
         with tabs[1]:
             _erp_tab_my_attendance(current_db, role, me_name)
+            st.divider()
+            _stores_list_sr = _get_supabase_stores_list()
+            if _stores_list_sr:
+                _sr_store_names = [s["store_name"] for s in _stores_list_sr]
+                _sr_dbf_map = {s["store_name"]: s["db_filename"] for s in _stores_list_sr}
+                _sr_home_name = next((s["store_name"] for s in _stores_list_sr if s["db_filename"] == current_db), _sr_store_names[0])
+                _sr_home_idx = _sr_store_names.index(_sr_home_name) if _sr_home_name in _sr_store_names else 0
+                _sr_selected = st.selectbox(
+                    "📍 설정할 매장 선택",
+                    _sr_store_names,
+                    index=_sr_home_idx,
+                    key="erp_sa_staffing_store_admin",
+                    help="매장을 선택하면 해당 매장의 기본 근무시간 및 시간대별 최소 인원을 설정합니다.",
+                )
+                _sr_db = _sr_dbf_map.get(_sr_selected, current_db)
+            else:
+                _sr_db = current_db
+            _erp_tab_staffing_rules(_sr_db, me_name)
         with tabs[2]:
             _erp_tab_period_targets(current_db, me_name)
         with tabs[3]:
             _erp_tab_adjustment_approvals(current_db, me_name)
         with tabs[4]:
             _erp_tab_calendar(current_db, role, me_name, today)
-            st.divider()
-            with st.expander("⚙️ 최소 인원 규칙 + 매장 공용 일정", expanded=False):
-                _stores_list_sr = _get_supabase_stores_list()
-                if _stores_list_sr:
-                    _sr_store_names = [s["store_name"] for s in _stores_list_sr]
-                    _sr_dbf_map = {s["store_name"]: s["db_filename"] for s in _stores_list_sr}
-                    _sr_home_name = next((s["store_name"] for s in _stores_list_sr if s["db_filename"] == current_db), _sr_store_names[0])
-                    _sr_home_idx = _sr_store_names.index(_sr_home_name) if _sr_home_name in _sr_store_names else 0
-                    _sr_selected = st.selectbox(
-                        "📍 설정할 매장 선택",
-                        _sr_store_names,
-                        index=_sr_home_idx,
-                        key="erp_sa_staffing_store_admin",
-                        help="매장을 선택하면 해당 매장의 기본 근무시간 및 시간대별 최소 인원을 설정합니다.",
-                    )
-                    _sr_db = _sr_dbf_map.get(_sr_selected, current_db)
-                else:
-                    _sr_db = current_db
-                _erp_tab_staffing_rules(_sr_db, me_name)
         with tabs[5]:
             _erp_tab_monthly_summary(current_db, today)
     else:
