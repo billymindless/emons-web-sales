@@ -10323,7 +10323,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                             if st.button("삭제", key=f"erp_rule_del_{rule['id']}"):
                                 _erp_delete_row("app_staffing_rules", int(rule["id"]))
                                 _erp_staffing_rules_cached.clear()
-                                st.rerun()
+                                st.toast("규칙이 삭제되었습니다.")
                 else:
                     st.info(f"{_ERP_DOW_LABELS[dow_i]}요일에 설정된 규칙이 없습니다.")
 
@@ -10356,8 +10356,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                             })
                         if ok:
                             _erp_staffing_rules_cached.clear()
-                            flash("최소 인원 규칙이 추가되었습니다.")
-                            st.rerun()
+                            st.toast("최소 인원 규칙이 추가되었습니다.")
                         else:
                             st.error(f"추가 실패: {err}")
 
