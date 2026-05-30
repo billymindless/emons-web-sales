@@ -10292,72 +10292,98 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
         st.info("기타(외부/행사) 매장은 최소 근무 인원 규칙을 설정하지 않습니다.")
     else:
         st.markdown("##### 🧑‍🤝‍🧑 시간대별 최소 근무 인원 (요일별)")
-        st.caption("요일별 시간대마다 최소 근무 인원을 정합니다. 근무 일정 저장 시 자동으로 검증됩니다.")
+        st.caption("주중(월~금)과 주말·공휴일(토·일)로 나누어 시간대별 최소·적정 근무 인원을 설정합니다. 근무 일정 저장 시 자동으로 검증됩니다.")
 
         # 캐시된 조회 사용 (매 위젯 조작마다 Supabase 호출 방지)
         rules = _erp_staffing_rules_cached(current_db)
-        rules_by_dow = {}
-        for r in rules:
-            rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
 
-        dow_tabs = st.tabs([f"{lbl}({i})" for i, lbl in enumerate(_ERP_DOW_LABELS)])
-        for dow_i, tab in enumerate(dow_tabs):
-            with tab:
-                day_rules = sorted(rules_by_dow.get(dow_i, []), key=lambda x: str(x.get("slot_start") or ""))
-                if day_rules:
-                    st.markdown(f"**현재 {_ERP_DOW_LABELS[dow_i]}요일 규칙**")
-                    for rule in day_rules:
-                        rc = st.columns([2, 2, 2, 2, 1])
-                        with rc[0]:
-                            st.text(f"{str(rule.get('slot_start') or '')[:5]} ~ {str(rule.get('slot_end') or '')[:5]}")
-                        with rc[1]:
-                            _ms = rule.get('min_staff')
-                            st.text(f"최소 {_ms}명" if _ms else "제한 없음 (0명)")
-                        with rc[2]:
-                            _opt = rule.get('optimal_staff')
-                            st.text(f"적정 {_opt}명" if _opt else "적정 미설정")
-                        with rc[3]:
-                            st.caption(f"수정: {str(rule.get('updated_at') or '')[:16]}")
-                        with rc[4]:
-                            if st.button("삭제", key=f"erp_rule_del_{rule['id']}"):
-                                _erp_delete_row("app_staffing_rules", int(rule["id"]))
-                                _erp_staffing_rules_cached.clear()
-                                st.toast("규칙이 삭제되었습니다.")
+        # (slot_start, slot_end) 기준 그룹핑: 동일 슬롯은 대표 rule 1개 + 관련 id 전체 수집
+        def _group_slots(rule_list: list) -> list:
+            slot_map: dict = {}
+            for r in sorted(rule_list, key=lambda x: str(x.get("slot_start") or "")):
+                key = (str(r.get("slot_start") or "")[:5], str(r.get("slot_end") or "")[:5])
+                if key not in slot_map:
+                    slot_map[key] = {"rule": r, "ids": [int(r["id"])]}
                 else:
-                    st.info(f"{_ERP_DOW_LABELS[dow_i]}요일에 설정된 규칙이 없습니다.")
+                    slot_map[key]["ids"].append(int(r["id"]))
+            return list(slot_map.values())
 
-                with st.form(f"erp_rule_add_{dow_i}", clear_on_submit=False):
-                    fc = st.columns([1, 1, 1, 1, 1])
-                    with fc[0]:
-                        s_t = st.time_input("시작", value=dt_time(9, 0), key=f"erp_rule_s_{dow_i}")
-                    with fc[1]:
-                        e_t = st.time_input("종료", value=dt_time(18, 0), key=f"erp_rule_e_{dow_i}")
-                    with fc[2]:
-                        n = st.number_input("최소 인원", min_value=0, max_value=20, value=1, step=1, key=f"erp_rule_n_{dow_i}")
-                    with fc[3]:
-                        opt_n = st.number_input("적정 인원", min_value=0, max_value=20, value=0, step=1,
-                                                help="0이면 적정 인원 미설정 (과다 근무 체크 안 함)",
-                                                key=f"erp_rule_opt_{dow_i}")
-                    with fc[4]:
-                        add = st.form_submit_button("➕ 추가")
-                    if add:
-                        if e_t <= s_t:
-                            st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
-                        else:
+        _wd_rules = [r for r in rules if int(r.get("day_of_week") or 0) <= 4]
+        _we_rules = [r for r in rules if int(r.get("day_of_week") or 0) >= 5]
+        wd_slots = _group_slots(_wd_rules)
+        we_slots = _group_slots(_we_rules)
+
+        def _render_slot_section(slots, form_key, dow_targets, label):
+            """slots: _group_slots 결과, dow_targets: 저장 대상 day_of_week 리스트"""
+            if slots:
+                hdr = st.columns([2, 2, 2, 1])
+                hdr[0].markdown("**시간대**")
+                hdr[1].markdown("**최소 인원**")
+                hdr[2].markdown("**적정 인원**")
+                for slot_info in slots:
+                    rule = slot_info["rule"]
+                    all_ids = slot_info["ids"]
+                    rc = st.columns([2, 2, 2, 1])
+                    with rc[0]:
+                        st.text(f"{str(rule.get('slot_start') or '')[:5]} ~ {str(rule.get('slot_end') or '')[:5]}")
+                    with rc[1]:
+                        _ms = rule.get("min_staff")
+                        st.text(f"최소 {_ms}명" if _ms else "제한 없음")
+                    with rc[2]:
+                        _opt = rule.get("optimal_staff")
+                        st.text(f"적정 {_opt}명" if _opt else "미설정")
+                    with rc[3]:
+                        if st.button("삭제", key=f"erp_rule_del_{form_key}_{rule['id']}"):
+                            for _did in all_ids:
+                                _erp_delete_row("app_staffing_rules", _did)
+                            _erp_staffing_rules_cached.clear()
+                            st.toast(f"{label} 규칙이 삭제되었습니다.")
+            else:
+                st.info(f"설정된 {label} 규칙이 없습니다.")
+
+            with st.form(f"erp_rule_add_{form_key}", clear_on_submit=False):
+                fc = st.columns([1.2, 1.2, 1, 1, 1])
+                with fc[0]:
+                    s_t = st.time_input("시작", value=dt_time(9, 0), key=f"erp_rule_s_{form_key}")
+                with fc[1]:
+                    e_t = st.time_input("종료", value=dt_time(18, 0), key=f"erp_rule_e_{form_key}")
+                with fc[2]:
+                    n = st.number_input("최소 인원", min_value=0, max_value=20, value=1, step=1, key=f"erp_rule_n_{form_key}")
+                with fc[3]:
+                    opt_n = st.number_input("적정 인원", min_value=0, max_value=20, value=0, step=1,
+                                            help="0이면 미설정", key=f"erp_rule_opt_{form_key}")
+                with fc[4]:
+                    add = st.form_submit_button("➕ 추가")
+                if add:
+                    if e_t <= s_t:
+                        st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
+                    else:
+                        all_ok = True
+                        for _dow in dow_targets:
                             ok, err = _erp_insert_row("app_staffing_rules", {
                                 "db_filename": current_db,
-                                "day_of_week": dow_i,
+                                "day_of_week": _dow,
                                 "slot_start": s_t.strftime("%H:%M:%S"),
                                 "slot_end": e_t.strftime("%H:%M:%S"),
                                 "min_staff": int(n),
                                 "optimal_staff": int(opt_n) if opt_n else None,
                                 "created_by": me_name,
                             })
-                        if ok:
+                            if not ok:
+                                st.error(f"추가 실패: {err}")
+                                all_ok = False
+                                break
+                        if all_ok:
                             _erp_staffing_rules_cached.clear()
-                            st.toast("최소 인원 규칙이 추가되었습니다.")
-                        else:
-                            st.error(f"추가 실패: {err}")
+                            st.toast(f"{label} 규칙이 추가되었습니다.")
+
+        wd_col, we_col = st.columns(2)
+        with wd_col:
+            st.markdown("**🗓️ 주중 (월 ~ 금)**")
+            _render_slot_section(wd_slots, "wd", list(range(5)), "주중")
+        with we_col:
+            st.markdown("**🏖️ 주말·공휴일 (토·일)**")
+            _render_slot_section(we_slots, "we", [5, 6], "주말·공휴일")
 
     # ── 매장 공용 일정 (메모/표시 전용) ───────────────────────────
     st.divider()
