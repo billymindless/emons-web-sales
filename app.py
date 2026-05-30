@@ -13627,6 +13627,7 @@ def render_internal_work():
 
     current_user = st.session_state.get("current_user") or {}
     role = (current_user.get("role") or "user").strip()
+    me_uname = (current_user.get("username") or current_user.get("email") or "").strip()
     me_name = _get_current_user_display_name()
     store_id = (current_user.get("store_id") or st.session_state.get("current_store_id"))
     current_db = st.session_state.get("current_db") or ""
