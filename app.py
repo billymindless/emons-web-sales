@@ -8946,14 +8946,15 @@ def _erp_lookup_existing_shift(existing_by_key: dict, me_name: str, date_str: st
     return None
 
 
-def _erp_fetch_table(table: str, filters: dict | None = None, order: str | None = None) -> list:
-    """범용 Supabase 단순 조회. filters는 단일 eq 조건들."""
+@st.cache_data(ttl=60, show_spinner=False)
+def _erp_fetch_table_cached(table: str, filters_key: tuple, order: str | None) -> list:
+    """캐시 본체. filters_key=tuple((k,v),...)로 직렬화 가능한 키."""
     client, err = get_supabase_client()
     if err or not client:
         return []
     try:
         q = client.table(table).select("*")
-        for k, v in (filters or {}).items():
+        for k, v in filters_key:
             if v is not None:
                 q = q.eq(k, v)
         if order:
@@ -8963,6 +8964,13 @@ def _erp_fetch_table(table: str, filters: dict | None = None, order: str | None 
     except Exception as e:
         st.caption(f"⚠️ {table} 조회 실패: {e}")
         return []
+
+
+def _erp_fetch_table(table: str, filters: dict | None = None, order: str | None = None) -> list:
+    """범용 Supabase 단순 조회 (60초 캐시). filters는 단일 eq 조건들.
+    동일 인자 반복 호출 시 캐시 히트. 쓰기 직후엔 _erp_insert/update/delete_row에서 자동 무효화."""
+    filters_key = tuple(sorted((filters or {}).items(), key=lambda x: x[0]))
+    return _erp_fetch_table_cached(table, filters_key, order)
 
 
 @st.cache_data(ttl=120)
@@ -9145,14 +9153,16 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
     }
 
 
-def _erp_fetch_range(table: str, db_col: str, db_filename: str, date_col: str, start: date, end: date, extra_eq: dict | None = None) -> list:
-    """날짜 범위 조회 (start, end 포함). extra_eq: 추가 eq 조건."""
+@st.cache_data(ttl=60, show_spinner=False)
+def _erp_fetch_range_cached(table: str, db_col: str, db_filename: str, date_col: str,
+                            start_iso: str, end_iso: str, extra_key: tuple) -> list:
+    """범위 조회 캐시 본체."""
     client, err = get_supabase_client()
     if err or not client:
         return []
     try:
-        q = client.table(table).select("*").eq(db_col, db_filename).gte(date_col, start.isoformat()).lte(date_col, end.isoformat())
-        for k, v in (extra_eq or {}).items():
+        q = client.table(table).select("*").eq(db_col, db_filename).gte(date_col, start_iso).lte(date_col, end_iso)
+        for k, v in extra_key:
             if v is not None:
                 q = q.eq(k, v)
         r = q.order(date_col).execute()
@@ -9160,6 +9170,14 @@ def _erp_fetch_range(table: str, db_col: str, db_filename: str, date_col: str, s
     except Exception as e:
         st.caption(f"⚠️ {table} 범위 조회 실패: {e}")
         return []
+
+
+def _erp_fetch_range(table: str, db_col: str, db_filename: str, date_col: str, start: date, end: date, extra_eq: dict | None = None) -> list:
+    """날짜 범위 조회 (start, end 포함, 60초 캐시). extra_eq: 추가 eq 조건.
+    쓰기 직후엔 _erp_insert/update/delete_row에서 자동 무효화."""
+    extra_key = tuple(sorted((extra_eq or {}).items(), key=lambda x: x[0]))
+    return _erp_fetch_range_cached(table, db_col, db_filename, date_col,
+                                   start.isoformat(), end.isoformat(), extra_key)
 
 
 def _erp_count_active_at(shifts: list, slot_start: dt_time, slot_end: dt_time) -> int:
@@ -9296,8 +9314,10 @@ def _erp_check_cross_store_conflicts(
     return violations
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _erp_compute_remaining_comptime(home_db: str, employee_name: str) -> int:
-    """잔여 시차(분) = SUM(시차적립.diff_minutes) - SUM(시차사용.diff_minutes). approved 만 집계."""
+    """잔여 시차(분) = SUM(시차적립.diff_minutes) - SUM(시차사용.diff_minutes). approved 만 집계.
+    60초 캐시. 쓰기 직후엔 _erp_insert/update/delete_row에서 자동 무효화."""
     client, err = get_supabase_client()
     if err or not client:
         return 0
@@ -9390,13 +9410,41 @@ def _erp_compute_leave_status(current_db: str, employee_name: str, as_of: date) 
     }
 
 
+_ERP_CACHED_TABLES = {
+    "app_attendance_logs", "app_shift_schedules", "app_overtime_requests",
+    "app_overtime_claims", "app_leave_grants", "app_staffing_rules",
+    "app_store_events", "app_store_hours", "app_employee_settings",
+    "app_work_adjustments", "app_monthly_work_targets", "app_yearly_work_targets",
+}
+
+
+def _erp_invalidate_fetch_caches(table: str) -> None:
+    """ERP 테이블 쓰기 후 관련 캐시 자동 무효화. 정확한 무효화보다 안전 우선."""
+    if table not in _ERP_CACHED_TABLES:
+        return
+    try:
+        _erp_fetch_table_cached.clear()
+    except Exception:
+        pass
+    try:
+        _erp_fetch_range_cached.clear()
+    except Exception:
+        pass
+    if table == "app_attendance_logs":
+        try:
+            _erp_compute_remaining_comptime.clear()
+        except Exception:
+            pass
+
+
 def _erp_insert_row(table: str, row: dict) -> tuple[bool, str]:
-    """단일 행 insert. (성공, 에러문) 반환."""
+    """단일 행 insert. (성공, 에러문) 반환. 성공 시 관련 캐시 자동 무효화."""
     client, err = get_supabase_client()
     if err or not client:
         return False, err or "Supabase 클라이언트 없음"
     try:
         client.table(table).insert(row).execute()
+        _erp_invalidate_fetch_caches(table)
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -9408,6 +9456,7 @@ def _erp_update_row(table: str, row_id: int, patch: dict) -> tuple[bool, str]:
         return False, err or "Supabase 클라이언트 없음"
     try:
         client.table(table).update(patch).eq("id", row_id).execute()
+        _erp_invalidate_fetch_caches(table)
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -9419,6 +9468,7 @@ def _erp_delete_row(table: str, row_id: int) -> tuple[bool, str]:
         return False, err or "Supabase 클라이언트 없음"
     try:
         client.table(table).delete().eq("id", row_id).execute()
+        _erp_invalidate_fetch_caches(table)
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -12002,15 +12052,19 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
                 "추가근무(분)": ot_min,
             })
 
+    # leave_grants: 매장당 1쿼리로 일괄 조회 후 직원별 dict화 (N+1 쿼리 제거)
+    _grants_rows = _erp_fetch_table("app_leave_grants", {
+        "home_db_filename": current_db, "year": int(s_year)
+    })
+    _grants_by_emp = {(r.get("employee_name") or ""): r for r in _grants_rows}
+
     # 직원별 합계 (화면 표시용)
     summary_rows = []
     for emp in employees:
         emp_details = [r for r in detail_rows if r["직원명"] == emp]
         stores_worked = sorted({r["근무매장"] for r in emp_details})
-        grants = _erp_fetch_table("app_leave_grants", {
-            "home_db_filename": current_db, "employee_name": emp, "year": int(s_year)
-        })
-        annual = float(grants[0].get("annual_days") or 0) if grants else 0
+        _gr = _grants_by_emp.get(emp)
+        annual = float(_gr.get("annual_days") or 0) if _gr else 0
         comp_remain = _erp_compute_remaining_comptime(current_db, emp)
         total_annual_used = sum(r["연차"] for r in emp_details)
         _emp_home = _emp_home_store.get(emp) or home_store_name
@@ -12714,6 +12768,9 @@ def _erp_render_superadmin_view(today: date):
             shifts = _erp_fetch_range("app_shift_schedules", "db_filename", dbf, "shift_date", p_s3, p_e3)
             logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_s3, p_e3)
             ot = _erp_fetch_range("app_overtime_requests", "home_db_filename", dbf, "request_date", p_s3, p_e3, extra_eq={"status": "approved"})
+            # leave_grants: 매장당 1쿼리로 일괄 조회 (N+1 쿼리 제거)
+            _grants_rows = _erp_fetch_table("app_leave_grants", {"home_db_filename": dbf, "year": int(sy3)})
+            _grants_by_emp = {(r.get("employee_name") or ""): r for r in _grants_rows}
             for emp in emps:
                 emp_shifts = [s for s in shifts if (s.get("employee_name") or "") == emp]
                 emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
@@ -12723,8 +12780,8 @@ def _erp_render_superadmin_view(today: date):
                 el_m = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") in ("조퇴", "지각"))
                 comp_u = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") == "시차사용" and (l.get("status") or "approved") == "approved")
                 ot_m = sum(int(o.get("extra_minutes") or 0) for o in ot if (o.get("employee_name") or "") == emp)
-                grants = _erp_fetch_table("app_leave_grants", {"home_db_filename": dbf, "employee_name": emp, "year": int(sy3)})
-                annual = float(grants[0].get("annual_days") or 0) if grants else 0
+                _gr = _grants_by_emp.get(emp)
+                annual = float(_gr.get("annual_days") or 0) if _gr else 0
                 comp_remain = _erp_compute_remaining_comptime(dbf, emp)
                 all_rows.append({
                     "직원명": emp,
