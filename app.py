@@ -9149,6 +9149,35 @@ def _erp_count_active_at(shifts: list, slot_start: dt_time, slot_end: dt_time) -
     return cnt
 
 
+def _erp_validate_shifts_against_rules(db_filename: str, planned_shifts_by_date: dict) -> list:
+    """planned_shifts_by_date: {date: [{employee_name, shift_start, shift_end}, ...]}
+    각 날짜의 요일에 해당하는 최소 인원 규칙을 슬롯 단위로 검사.
+    반환: 위반 메시지 리스트 (빈 리스트 = OK)."""
+    rules_all = _erp_staffing_rules_cached(db_filename)
+    rules_by_dow: dict[int, list] = {}
+    for r in rules_all:
+        rules_by_dow.setdefault(int(r.get("day_of_week") or 0), []).append(r)
+    violations: list[str] = []
+    for d, shifts in sorted(planned_shifts_by_date.items()):
+        dow = d.weekday()
+        rules = rules_by_dow.get(dow, [])
+        if not rules:
+            continue
+        for rule in rules:
+            slot_s = _erp_parse_time(rule.get("slot_start"))
+            slot_e = _erp_parse_time(rule.get("slot_end"))
+            min_n = int(rule.get("min_staff") or 1)
+            if not slot_s or not slot_e:
+                continue
+            cnt = _erp_count_active_at(shifts, slot_s, slot_e)
+            if cnt < min_n:
+                violations.append(
+                    f"{d.isoformat()}({_ERP_DOW_LABELS[dow]}) {rule.get('slot_start')}~{rule.get('slot_end')} "
+                    f"구간 {min_n - cnt}명 부족 (배정 {cnt}명 / 최소 {min_n}명)"
+                )
+    return violations
+
+
 def _erp_check_cross_store_conflicts(
     emp_name: str,
     current_db: str,
