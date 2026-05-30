@@ -13943,13 +13943,17 @@ def _render_task_gantt(tasks: list[dict], assignees_map: dict):
         bgcolor="#ffffff", bordercolor="#a855f7", borderwidth=1, borderpad=2,
     )
 
-    # 주말 음영
-    min_d = pd.to_datetime(df["Start"].min()).normalize()
-    max_d = pd.to_datetime(df["Finish"].max()).normalize()
-    span_days = int((max_d - min_d).days)
-    if 0 <= span_days <= 730:  # 2년 초과는 주말 음영 생략(성능)
-        cur = min_d
-        while cur <= max_d:
+    # x축 표시 범위: 데이터 + (최소 6개월 미래) 확보 → 가로 스크롤로 길게 보기
+    data_min = pd.to_datetime(df["Start"].min()).normalize()
+    data_max = pd.to_datetime(df["Finish"].max()).normalize()
+    range_start = (min(data_min, today_ts) - pd.Timedelta(days=7)).normalize()
+    range_end = (max(data_max, today_ts + pd.Timedelta(days=180))).normalize()
+    span_days = int((range_end - range_start).days) + 1
+
+    # 주말 음영 (성능 보호용 730일 상한)
+    if 0 <= span_days <= 730:
+        cur = range_start
+        while cur <= range_end:
             if cur.weekday() >= 5:
                 fig.add_vrect(
                     x0=cur, x1=cur + pd.Timedelta(days=1),
@@ -13957,6 +13961,21 @@ def _render_task_gantt(tasks: list[dict], assignees_map: dict):
                     layer="below", line_width=0,
                 )
             cur += pd.Timedelta(days=1)
+
+    # 완료된 업무: 크로스 해치 패턴 + 반투명으로 시각적 구분
+    fig.update_traces(marker_line_width=0)
+    try:
+        fig.update_traces(
+            marker=dict(
+                pattern=dict(shape="x", size=8, solidity=0.35, fgcolor="#16a34a"),
+                line=dict(color="#16a34a", width=1),
+            ),
+            opacity=0.55,
+            selector={"name": "완료"},
+        )
+    except Exception:
+        # 구버전 plotly: pattern 미지원 환경 fallback
+        fig.update_traces(opacity=0.5, selector={"name": "완료"})
 
     fig.update_yaxes(
         categoryorder="array",
@@ -13970,15 +13989,20 @@ def _render_task_gantt(tasks: list[dict], assignees_map: dict):
     fig.update_xaxes(
         type="date",
         side="top",
+        range=[range_start, range_end],
         tickformat="%m/%d (%a)",
+        dtick=86400000.0,            # 1일 단위 grid
         showgrid=True,
         gridcolor="#e5e7eb",
         zeroline=False,
         title=None,
     )
-    fig.update_traces(marker_line_width=0)
+
+    # 일자당 32px로 폭 강제 → 6개월 이상 가로 스크롤
+    chart_width = max(span_days * 32, 1400)
     fig.update_layout(
         height=max(360, 30 * len(y_labels_ordered) + 140),
+        width=chart_width,
         margin=dict(l=10, r=10, t=50, b=10),
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -13989,7 +14013,9 @@ def _render_task_gantt(tasks: list[dict], assignees_map: dict):
         ),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.caption("💡 차트를 좌우로 드래그하거나, 하단/브라우저 가로 스크롤로 6개월 이상 일정을 확인할 수 있습니다. 완료된 업무는 크로스 해치(╳) 패턴으로 표시됩니다.")
+    # use_container_width=False → 위에서 강제한 width(일자×32px)로 그려져 브라우저 가로 스크롤 활성화
+    st.plotly_chart(fig, use_container_width=False)
 
 
 def _today_kst_safe() -> date:
