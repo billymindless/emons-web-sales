@@ -3102,6 +3102,36 @@ def _consume_flash():
             st.info(msg)
 
 
+def notify(message: str, level: str = "success"):
+    """저장/수정/삭제 직후 안정적 알림 표시 (이중 보장).
+
+    Root cause of "alert appearing/disappearing inconsistently":
+      - Streamlit은 위젯 조작마다 스크립트를 처음부터 재실행(rerun)함.
+      - 분기 내부에서 호출한 st.success / st.toast / st.error 등은 그 rerun에서만 표시됨.
+      - 사용자가 이후 다른 위젯을 만지면 새 rerun 발생 → 분기에 다시 진입하지 않으므로 알림이 사라짐.
+
+    해결책 (이 함수의 책임):
+      1) 현재 분기 안에서 즉시 한 번 표시 (클릭 직후 즉시 피드백)
+      2) flash 큐에도 적재 → 다음 자연 rerun 시 _consume_flash 가 한 번 더 표시 (보험)
+      3) st.rerun() 을 호출하지 않음 → 탭/하위 상태 리셋 부작용 없음
+
+    저장/수정/삭제 후에는 반드시 이 함수를 사용할 것. st.success/st.toast 직접 호출 금지.
+    """
+    if level == "success":
+        st.toast(f"✅ {message}", icon="✅")
+        st.success(message)
+    elif level == "error":
+        st.toast(f"❌ {message}", icon="❌")
+        st.error(message)
+    elif level == "warning":
+        st.toast(f"⚠️ {message}", icon="⚠️")
+        st.warning(message)
+    else:
+        st.toast(str(message))
+        st.info(str(message))
+    flash(message, level)
+
+
 # ========== 로그인 상태 유지 (localStorage + query_params) ==========
 # [토큰 삭제] 다음 두 경우에만 수행. 그 외에는 삭제하지 않음.
 #  1) 로그아웃 버튼 클릭 (logout=1) → _inject_js_clear_auth_on_logout
@@ -10279,9 +10309,9 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                 ok, err = _erp_insert_row("app_store_hours", row)
             if ok:
                 _erp_store_hours_cached.clear()
-                st.success("✅ 기본 근무시간이 저장되었습니다.")
+                notify("기본 근무시간이 저장되었습니다.")
             else:
-                st.error(f"저장 실패: {err}")
+                notify(f"저장 실패: {err}", level="error")
 
     st.divider()
     if _is_gita_store:
@@ -10333,7 +10363,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                             for _did in all_ids:
                                 _erp_delete_row("app_staffing_rules", _did)
                             _erp_staffing_rules_cached.clear()
-                            st.toast(f"{label} 규칙이 삭제되었습니다.")
+                            notify(f"{label} 규칙이 삭제되었습니다.")
             else:
                 st.info(f"설정된 {label} 규칙이 없습니다.")
 
@@ -10371,7 +10401,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                                 break
                         if all_ok:
                             _erp_staffing_rules_cached.clear()
-                            st.toast(f"{label} 규칙이 추가되었습니다.")
+                            notify(f"{label} 규칙이 추가되었습니다.")
 
         wd_col, we_col = st.columns(2)
         with wd_col:
@@ -11349,9 +11379,9 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
         }
         ok, err = _erp_insert_row("app_attendance_logs", row)
         if ok:
-            st.success("✅ 근태 기록이 저장되었습니다.")
+            notify("근태 기록이 저장되었습니다.")
         else:
-            st.error(f"저장 실패: {err}")
+            notify(f"저장 실패: {err}", level="error")
 
     st.divider()
     st.markdown("##### 📋 최근 7일 내 본인/관리 근태 기록")
@@ -11412,7 +11442,8 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
                         ok_n += 1
                     else:
                         err_n += 1
-                st.success(f"✅ 일괄 등록 완료: {ok_n}건 / 실패 {err_n}건")
+                notify(f"일괄 등록 완료: {ok_n}건 / 실패 {err_n}건",
+                       level=("success" if err_n == 0 else "warning"))
         st.divider()
 
     st.markdown("##### 🕒 시차 사용 신청")
