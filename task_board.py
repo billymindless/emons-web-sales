@@ -443,11 +443,18 @@ def attach_file(
             return None, "파일이 너무 큽니다 (최대 20MB)"
 
         storage_path = f"{task_id or 'orphan'}/{uuid.uuid4().hex}.{ext}"
-        admin.storage.from_(ATTACHMENT_BUCKET).upload(
+        up_res = admin.storage.from_(ATTACHMENT_BUCKET).upload(
             path=storage_path,
             file=data,
             file_options={"content-type": mime, "upsert": "false"},
         )
+        # SDK 버전에 따라 예외 대신 .error 속성으로 오류를 반환하는 경우 방어
+        _up_err = getattr(up_res, "error", None)
+        if _up_err:
+            return None, (
+                f"Storage 업로드 실패: {_up_err}. "
+                "Supabase 대시보드 → Storage → 'task-attachments' 버킷이 존재하는지 확인하세요."
+            )
 
         client, _ = _client()
         if client:

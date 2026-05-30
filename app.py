@@ -13660,6 +13660,33 @@ def render_internal_work():
     st.header("📋 사내 업무")
     st.caption("상위·하위 업무를 등록하고 담당자에게 인앱 알림 + 카카오 친구톡으로 즉시 통보합니다.")
 
+    # Storage 버킷 진단 (세션당 1회)
+    _bucket_key = "_task_bucket_ok"
+    if not st.session_state.get(_bucket_key):
+        try:
+            _adm, _adm_err = get_supabase_admin_client()
+            _bucket_ok = False
+            if _adm and not _adm_err:
+                _blist = _adm.storage.list_buckets()
+                _bucket_names = [
+                    (b.name if hasattr(b, "name") else b.get("name", ""))
+                    for b in (_blist or [])
+                ]
+                _bucket_ok = "task-attachments" in _bucket_names
+            st.session_state[_bucket_key] = _bucket_ok
+        except Exception:
+            st.session_state[_bucket_key] = None  # 진단 자체 실패 — 경고 생략
+
+    if st.session_state.get(_bucket_key) is False:
+        st.warning(
+            "⚠️ **첨부 파일 Storage 버킷이 없습니다.** 이미지·파일 첨부 기능이 작동하지 않습니다.\n\n"
+            "Supabase 대시보드 → **Storage** → **New bucket** → 이름: `task-attachments` (Private) 으로 생성해 주세요.\n"
+            "생성 후 아래 버튼을 눌러 확인하세요."
+        )
+        if st.button("🔄 버킷 재확인", key="recheck_bucket"):
+            st.session_state.pop(_bucket_key, None)
+            st.rerun()
+
     # 친구추가 미완료 직원 카드 (매장관리자 이상)
     if role in ("store_admin", "superadmin"):
         pending = _tb.load_friend_pending_users(store_id if role == "store_admin" else None)
@@ -14100,8 +14127,14 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
     import task_board as _tb  # noqa: WPS433
 
     ver_key = f"{key_prefix}_files_ver"
+    err_key = f"{key_prefix}_att_errs"
     ver = int(st.session_state.get(ver_key, 0))
     files_key = f"{key_prefix}_files_{ver}"
+
+    # 이전 rerun에서 저장된 첨부 에러 표시
+    for _prev_err in st.session_state.pop(err_key, []):
+        st.error(_prev_err)
+
     files = st.file_uploader(
         "📎 파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
         accept_multiple_files=True,
@@ -14120,27 +14153,35 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
         if st.form_submit_button(label, type="primary"):
             if not (body or "").strip() and not files:
                 st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
-            else:
-                new_cid, err = _tb.post_comment(
-                    tid, me_uname, body or "(첨부)", parent_comment_id=parent_cid
+                return
+            new_cid, cm_err = _tb.post_comment(
+                tid, me_uname, body or "(첨부)", parent_comment_id=parent_cid
+            )
+            if cm_err:
+                st.error(f"댓글 등록 실패: {cm_err}")
+                return
+            # 첨부 업로드 — 실패 수집 후 rerun 전에 session_state에 보존
+            att_errors: list[str] = []
+            for f in files or []:
+                try:
+                    f.seek(0)
+                except Exception:
+                    pass
+                _row, ferr = _tb.attach_file(
+                    task_id=tid, comment_id=new_cid,
+                    uploaded_file=f, uploaded_by=me_uname,
                 )
-                if err and not files:
-                    st.error(f"등록 실패: {err}")
-                else:
-                    for f in files or []:
-                        try:
-                            f.seek(0)
-                        except Exception:
-                            pass
-                        _row, ferr = _tb.attach_file(
-                            task_id=tid, comment_id=new_cid,
-                            uploaded_file=f, uploaded_by=me_uname,
-                        )
-                        if ferr:
-                            st.warning(f"첨부 실패 ({f.name}): {ferr}")
-                    flash("등록되었습니다.")
-                    st.session_state[ver_key] = ver + 1
-                    st.rerun()
+                if ferr:
+                    att_errors.append(f"⚠️ 첨부 실패 [{f.name}]: {ferr}")
+            if att_errors:
+                # rerun 후에도 에러가 보이도록 session_state에 저장
+                st.session_state[err_key] = att_errors
+                st.session_state[ver_key] = ver + 1
+                flash("댓글은 등록됐지만 일부 첨부에 실패했습니다. 자세한 내용은 아래 오류를 확인하세요.")
+            else:
+                st.session_state[ver_key] = ver + 1
+                flash("등록되었습니다.")
+            st.rerun()
 
 
 def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str | None,
