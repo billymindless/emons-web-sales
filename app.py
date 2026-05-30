@@ -10656,15 +10656,16 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                                  ["전체 매장"] + all_store_names + ["기타 (외부/행사)"],
                                  key="erp_cal_store")
     _sel_is_etc = (sel_store == "기타 (외부/행사)")
-    if sel_store == "전체 매장" or _sel_is_etc:
-        target_dbs = all_dbs
-    else:
-        target_dbs = [_sn_to_dbf[sel_store]] if sel_store in _sn_to_dbf else [current_db]
+    # 특정 매장 선택이어도 타 매장 직원이 해당 매장에서 근무한 기록은
+    # 그 직원 소속 db 에 work_location_name 으로 저장됨 → 전체 db 조회 후 필터링
+    target_dbs = all_dbs  # 항상 전체 조회
+    _sel_dbf = _sn_to_dbf.get(sel_store) if (sel_store not in ("전체 매장", "기타 (외부/행사)")) else None
     show_store_tag = (sel_store == "전체 매장")
 
-    # 선택 매장 직원 목록 수집
+    # 직원 목록: 전체/기타 → 전체 매장 직원, 특정 매장 → 해당 매장 소속 직원만
+    _emp_list_dbs = [_sel_dbf] if _sel_dbf else all_dbs
     all_emps: list[str] = []
-    for dbf in target_dbs:
+    for dbf in _emp_list_dbs:
         all_emps += _erp_get_employee_names_for_store(dbf)
     all_emps = sorted(set(all_emps))
 
@@ -10675,7 +10676,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
 
     # ── 월 카운터 위젯 (필터된 직원 또는 본인 기준) ──────────────
     _ctr_target_emp = selected_emp if (selected_emp and selected_emp != "(전체 직원)") else me_name
-    _ctr_target_db = target_dbs[0] if (sel_store not in ("전체 매장", "기타 (외부/행사)") and target_dbs) else current_db
+    _ctr_target_db = _sel_dbf if _sel_dbf else current_db
     if _ctr_target_emp:
         _cal_ctr = _erp_compute_monthly_remaining(_ctr_target_db, _ctr_target_emp, int(year), int(month))
         _ct_target_h = _cal_ctr["target_min"] / 60.0
@@ -10739,12 +10740,26 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     for l in all_logs:
         l["employee_name"] = _resolve(l.get("employee_name") or "")
 
-    # "기타 (외부/행사)" 선택 시 해당 work_location_name 항목만 표시
-    _ETC_LOC_KEY = "기타 (외부/행사)"
+    # 매장 필터 적용
+    # - 특정 매장 선택: db_filename 일치 OR work_location_name 이 해당 매장명과 일치하는 항목
+    # - 기타 선택: work_location_name 이 있고, 등록된 매장명/db 목록에 해당하지 않는 항목
+    # - 전체: 필터 없음
+    _known_store_names = set(all_store_names)
+    _known_store_dbfs  = set(all_dbs)
     if _sel_is_etc:
+        # 기타: work_location_name 이 채워져 있고, 등록된 매장명과 다른 항목
         all_shifts = [s for s in all_shifts
-                      if (s.get("work_location_name") or "").strip() == _ETC_LOC_KEY]
+                      if (s.get("work_location_name") or "").strip()
+                      and (s.get("work_location_name") or "").strip() not in _known_store_names]
         all_logs = []  # 근태 로그는 work_location_name 없으므로 기타 선택 시 제외
+    elif _sel_dbf:
+        # 특정 매장: 소속 db 이거나, work_location_name 이 해당 매장명과 일치
+        _sel_store_name = sel_store
+        all_shifts = [s for s in all_shifts
+                      if s.get("_dbf") == _sel_dbf
+                      or (s.get("work_location_name") or "").strip() == _sel_store_name]
+        # 근태 로그는 소속 db 기준으로만 존재
+        all_logs = [l for l in all_logs if l.get("_dbf") == _sel_dbf]
 
     # 직원 필터 적용 (정규화 후 비교)
     if selected_emp and selected_emp != "(전체 직원)":
