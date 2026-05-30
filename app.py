@@ -14723,13 +14723,44 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
         else:
             atts_for_task.append(a)
 
+    # 업무 본문 파일 첨부 업로드 (task 레벨, comment_id=None)
+    st.markdown("**📎 업무 첨부**")
+    _task_file_ver_key = f"task_files_ver_{tid}"
+    _task_file_ver = int(st.session_state.get(_task_file_ver_key, 0))
+    _task_files = st.file_uploader(
+        "파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
+        accept_multiple_files=True,
+        key=f"task_files_{tid}_{_task_file_ver}",
+    )
+    _render_upload_preview(_task_files)
+    if _task_files and can_edit:
+        if st.button("📤 첨부 업로드", key=f"task_upload_btn_{tid}", type="primary"):
+            _att_errs = []
+            for _f in _task_files:
+                try:
+                    _f.seek(0)
+                except Exception:
+                    pass
+                _, _ferr = _tb.attach_file(task_id=tid, comment_id=None,
+                                           uploaded_file=_f, uploaded_by=me_uname)
+                if _ferr:
+                    _att_errs.append(f"{_f.name}: {_ferr}")
+            st.session_state[_task_file_ver_key] = _task_file_ver + 1
+            if _att_errs:
+                st.warning("일부 첨부 실패: " + "; ".join(_att_errs))
+            else:
+                flash("파일이 업로드되었습니다.")
+            st.rerun()
+
+    # 기존 업무 직속 첨부 갤러리
     if atts_for_task:
-        st.markdown("**📎 업무 첨부**")
-        a_cols = st.columns(3)
+        cols = st.columns(3)
         for i, a in enumerate(atts_for_task):
-            with a_cols[i % 3]:
+            with cols[i % 3]:
                 _render_attachment_inline(a, key_suffix=f"task{tid}")
-        st.markdown("---")
+    elif not _task_files:
+        st.caption("아직 업무에 첨부된 파일이 없습니다.")
+    st.markdown("---")
 
     # 댓글 트리
     st.markdown("**💬 댓글**")
