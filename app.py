@@ -10383,6 +10383,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                                 _erp_delete_row("app_staffing_rules", _did)
                             _erp_staffing_rules_cached.clear()
                             notify(f"{label} 규칙이 삭제되었습니다.")
+                            st.rerun()
             else:
                 st.info(f"설정된 {label} 규칙이 없습니다.")
 
@@ -10421,6 +10422,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                         if all_ok:
                             _erp_staffing_rules_cached.clear()
                             notify(f"{label} 규칙이 추가되었습니다.")
+                            st.rerun()
 
         wd_col, we_col = st.columns(2)
         with wd_col:
