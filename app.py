@@ -10653,9 +10653,10 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                                 value=today.month, step=1, key="erp_cal_month")
     with col_store:
         sel_store = st.selectbox("📍 매장 선택",
-                                 ["전체 매장"] + all_store_names,
+                                 ["전체 매장"] + all_store_names + ["기타 (외부/행사)"],
                                  key="erp_cal_store")
-    if sel_store == "전체 매장":
+    _sel_is_etc = (sel_store == "기타 (외부/행사)")
+    if sel_store == "전체 매장" or _sel_is_etc:
         target_dbs = all_dbs
     else:
         target_dbs = [_sn_to_dbf[sel_store]] if sel_store in _sn_to_dbf else [current_db]
@@ -10674,7 +10675,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
 
     # ── 월 카운터 위젯 (필터된 직원 또는 본인 기준) ──────────────
     _ctr_target_emp = selected_emp if (selected_emp and selected_emp != "(전체 직원)") else me_name
-    _ctr_target_db = target_dbs[0] if (sel_store != "전체 매장" and target_dbs) else current_db
+    _ctr_target_db = target_dbs[0] if (sel_store not in ("전체 매장", "기타 (외부/행사)") and target_dbs) else current_db
     if _ctr_target_emp:
         _cal_ctr = _erp_compute_monthly_remaining(_ctr_target_db, _ctr_target_emp, int(year), int(month))
         _ct_target_h = _cal_ctr["target_min"] / 60.0
@@ -10737,6 +10738,13 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         s["employee_name"] = _resolve(s.get("employee_name") or "")
     for l in all_logs:
         l["employee_name"] = _resolve(l.get("employee_name") or "")
+
+    # "기타 (외부/행사)" 선택 시 해당 work_location_name 항목만 표시
+    _ETC_LOC_KEY = "기타 (외부/행사)"
+    if _sel_is_etc:
+        all_shifts = [s for s in all_shifts
+                      if (s.get("work_location_name") or "").strip() == _ETC_LOC_KEY]
+        all_logs = []  # 근태 로그는 work_location_name 없으므로 기타 선택 시 제외
 
     # 직원 필터 적용 (정규화 후 비교)
     if selected_emp and selected_emp != "(전체 직원)":
