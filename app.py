@@ -9757,41 +9757,62 @@ def render_erp_attendance():
     # v2 메뉴 (2026-05-29 근무 일정 계획 탭 복원):
     #   store_admin: 6탭 (근무 일정 계획 / 내 근태 / 근무시간 설정 / 신청 승인 / 캘린더 / 월말 요약)
     #   user:        3탭 (근무 일정 계획 / 내 근태 / 매장 캘린더)
+    # st.tabs 대신 segmented_control 사용: st.rerun() 호출 후에도 활성 탭 유지
+    # (st.tabs는 stateless라 rerun 시 항상 첫 번째 탭으로 리셋되어 저장/수정 후 화면 이탈)
     if role == "store_admin":
         tab_labels = ["근무 일정 계획", "근무시간 관리", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
-        tabs = st.tabs(tab_labels)
-        with tabs[0]:
+    else:
+        tab_labels = ["근무 일정 계획", "근무시간 관리", "매장 캘린더"]
+
+    _tab_key = "erp_main_tab_label"
+    if _tab_key not in st.session_state or st.session_state[_tab_key] not in tab_labels:
+        st.session_state[_tab_key] = tab_labels[0]
+    selected_tab = st.segmented_control(
+        "메뉴", tab_labels, key=_tab_key, label_visibility="collapsed",
+    )
+    if not selected_tab:
+        selected_tab = tab_labels[0]
+    st.markdown("---")
+
+    if role == "store_admin":
+        if selected_tab == "근무 일정 계획":
             _erp_tab_shift_plan(current_db, me_name)
-        with tabs[1]:
+        elif selected_tab == "근무시간 관리":
             _erp_tab_my_attendance(current_db, role, me_name)
             st.divider()
             st.subheader("⚙️ 매장별 근무 기준 설정")
             _stores_list_sr = _get_supabase_stores_list()
             if _stores_list_sr:
-                # 매장 탭: 신규 매장 추가 시 자동 반영
                 _sr_tab_labels = [s["store_name"] for s in _stores_list_sr]
-                _sr_tabs = st.tabs(_sr_tab_labels)
-                for _si, _sr_tab in enumerate(_sr_tabs):
-                    with _sr_tab:
-                        _erp_tab_staffing_rules(_stores_list_sr[_si]["db_filename"], me_name)
+                _sr_key = "erp_staffing_store_tab"
+                if _sr_key not in st.session_state or st.session_state[_sr_key] not in _sr_tab_labels:
+                    st.session_state[_sr_key] = _sr_tab_labels[0]
+                _sr_selected = st.segmented_control(
+                    "매장", _sr_tab_labels, key=_sr_key, label_visibility="collapsed",
+                )
+                if not _sr_selected:
+                    _sr_selected = _sr_tab_labels[0]
+                _sr_db = next(
+                    (s["db_filename"] for s in _stores_list_sr if s["store_name"] == _sr_selected),
+                    _stores_list_sr[0]["db_filename"],
+                )
+                _erp_tab_staffing_rules(_sr_db, me_name)
             else:
                 _erp_tab_staffing_rules(current_db, me_name)
-        with tabs[2]:
+        elif selected_tab == "근무시간 설정":
             _erp_tab_period_targets(current_db, me_name)
-        with tabs[3]:
+        elif selected_tab == "신청 승인":
             _erp_tab_adjustment_approvals(current_db, me_name)
-        with tabs[4]:
+        elif selected_tab == "캘린더":
             _erp_tab_calendar(current_db, role, me_name, today)
-        with tabs[5]:
+        elif selected_tab == "월말 요약":
             _erp_tab_monthly_summary(current_db, today)
     else:
-        tab_labels = ["근무 일정 계획", "근무시간 관리", "매장 캘린더"]
-        tabs = st.tabs(tab_labels)
-        with tabs[0]:
+        if selected_tab == "근무 일정 계획":
             _erp_tab_shift_plan(current_db, me_name)
-        with tabs[1]:
+        elif selected_tab == "근무시간 관리":
             _erp_tab_my_attendance(current_db, role, me_name)
-        with tabs[2]:
+        elif selected_tab == "매장 캘린더":
             _erp_tab_calendar(current_db, role, me_name, today)
 
 
