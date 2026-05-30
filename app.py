@@ -10838,18 +10838,26 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         # 근태 로그는 소속 db 기준으로만 존재
         all_logs = [l for l in all_logs if l.get("_dbf") == _sel_dbf]
 
-    # 직원 필터 적용 (정규화 후 비교)
+    # 인원 충족 체크용 전체 데이터 (직원 필터 적용 전) — 항상 전 직원 기준으로 판단
+    all_shifts_for_rules = all_shifts[:]
+
+    # 직원 필터 적용 (정규화 후 비교) — 화면 표시용에만 적용
     if selected_emp and selected_emp != "(전체 직원)":
         all_shifts = [s for s in all_shifts if (s.get("employee_name") or "") == selected_emp]
         all_logs   = [l for l in all_logs   if (l.get("employee_name") or "") == selected_emp]
 
-    # 날짜별 그룹핑
+    # 날짜별 그룹핑 (표시용)
     shifts_by_date: dict = {}
     for s in all_shifts:
         shifts_by_date.setdefault(str(s.get("shift_date") or "")[:10], []).append(s)
     logs_by_date: dict = {}
     for l in all_logs:
         logs_by_date.setdefault(str(l.get("log_date") or "")[:10], []).append(l)
+
+    # 인원 체크용 전체 날짜별 그룹핑 (직원 필터 무관)
+    all_shifts_by_date_for_rules: dict = {}
+    for s in all_shifts_for_rules:
+        all_shifts_by_date_for_rules.setdefault(str(s.get("shift_date") or "")[:10], []).append(s)
     # 다일정(end_date)이 있는 경우 시작일~종료일 사이 모든 날짜에 배지 표시
     events_by_date: dict = {}
     for ev in all_events:
@@ -10877,12 +10885,12 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             events_by_date.setdefault(_cur_d.isoformat(), []).append(_ev_copy)
             _cur_d += timedelta(days=1)
 
-    # 인원 부족일 산출 (매장별)
+    # 인원 부족/과다 산출 — 항상 전 직원 데이터 기준으로 판단 (직원 필터 무관)
     shortage_dates: dict[str, list[str]] = {}  # {d_iso: [부족_매장명, ...]}
     overstaff_dates: dict[str, list[str]] = {}  # {d_iso: [과다_매장명, ...]}
     for (dbf, dow), rules in rules_by_store_dow.items():
         _sname = _dbf_to_sn.get(dbf) or dbf
-        for d_iso, day_shifts in shifts_by_date.items():
+        for d_iso, day_shifts in all_shifts_by_date_for_rules.items():
             try:
                 d = datetime.fromisoformat(d_iso).date()
             except Exception:
