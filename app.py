@@ -13995,6 +13995,28 @@ def _fetch_attachment_bytes_cached(storage_path: str) -> bytes | None:
     return _tb.download_attachment_bytes(storage_path)
 
 
+def _open_attachment_lightbox(img_bytes: bytes, name: str | None = None):
+    """첨부 이미지를 다이얼로그(라이트박스)로 표시. dialog 미지원 환경은 expander로 fallback."""
+    title = name or "첨부 이미지"
+    if hasattr(st, "dialog"):
+        try:
+            try:
+                dialog_dec = st.dialog(title, width="large")
+            except TypeError:
+                dialog_dec = st.dialog(title)
+
+            @dialog_dec
+            def _dlg():
+                st.image(img_bytes, use_container_width=True)
+
+            _dlg()
+            return
+        except Exception:
+            pass
+    with st.expander(f"🔍 {title}", expanded=True):
+        st.image(img_bytes, use_container_width=True)
+
+
 def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str | None,
                           role: str, store_id):
     import task_board as _tb  # noqa: WPS433
@@ -14243,28 +14265,49 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
             st.caption(f"**{_uname_to_display(cm.get('author'))}** · {str(cm.get('created_at',''))[:19]}")
             st.write(cm.get("body", ""))
 
-    # 댓글 입력 + 첨부
+    # 첨부 파일은 form 밖에 둬야 사용자가 파일 선택 즉시 썸네일이 표시됨.
+    # 등록 후 위젯을 비우기 위해 버전 카운터(key)를 사용한다.
+    file_ver_key = f"cm_files_ver_{tid}"
+    file_ver = int(st.session_state.get(file_ver_key, 0))
+    files_key = f"cm_files_{tid}_{file_ver}"
+    files = st.file_uploader(
+        "📎 이미지 첨부 (다중 가능) — 선택 즉시 아래에 미리보기 표시",
+        type=["png", "jpg", "jpeg", "webp", "gif"],
+        accept_multiple_files=True,
+        key=files_key,
+    )
+    if files:
+        st.caption(f"🖼️ 첨부 미리보기 ({len(files)}장)")
+        prev_cols = st.columns(min(len(files), 4) or 1)
+        for i, f in enumerate(files):
+            with prev_cols[i % len(prev_cols)]:
+                st.image(f, caption=f.name, use_container_width=True)
+                try:
+                    f.seek(0)  # st.image가 읽은 스트림 포인터를 다시 0으로
+                except Exception:
+                    pass
+
+    # 댓글 입력 (본문만 form 안)
     with st.form(f"comment_form_{tid}", clear_on_submit=True):
-        body = st.text_area("새 댓글", key=f"cm_body_{tid}", height=80, placeholder="댓글을 입력하세요. 이미지는 아래에서 첨부.")
-        files = st.file_uploader(
-            "📎 이미지 첨부 (다중 가능)",
-            type=["png", "jpg", "jpeg", "webp", "gif"],
-            accept_multiple_files=True,
-            key=f"cm_files_{tid}",
-        )
+        body = st.text_area("새 댓글", key=f"cm_body_{tid}", height=80, placeholder="댓글을 입력하세요. 이미지는 위에서 첨부.")
         if st.form_submit_button("댓글 등록"):
             new_cid, err = _tb.post_comment(tid, me_uname, body or "(첨부)")
             if err and not files:
                 st.error(f"댓글 등록 실패: {err}")
             else:
                 for f in files or []:
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
                     row, ferr = _tb.attach_file(task_id=tid, comment_id=new_cid, uploaded_file=f, uploaded_by=me_uname)
                     if ferr:
                         st.warning(f"첨부 실패 ({f.name}): {ferr}")
                 flash("댓글이 등록되었습니다.")
+                st.session_state[file_ver_key] = file_ver + 1  # uploader 위젯 리셋
                 st.rerun()
 
-    # 첨부 갤러리 — 다운로드 없이 인라인 표시 (10분 캐시)
+    # 첨부 갤러리 — 다운로드 없이 인라인 표시 (10분 캐시) + 클릭 시 라이트박스 모달
     atts = _tb.load_task_attachments_cached(tid)
     if atts:
         st.markdown("**🖼️ 첨부 이미지**")
@@ -14274,8 +14317,8 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                 data = _fetch_attachment_bytes_cached(a["storage_path"])
                 if data:
                     st.image(data, caption=a.get("original_name", ""), use_container_width=True)
-                    with st.expander("🔍 원본 크기로 보기", expanded=False):
-                        st.image(data, use_container_width=True)
+                    if st.button("🔍 크게 보기", key=f"open_img_{a.get('id', i)}_{tid}"):
+                        _open_attachment_lightbox(data, a.get("original_name"))
                 else:
                     st.caption(f"📄 {a.get('original_name','')} (로드 실패)")
 
