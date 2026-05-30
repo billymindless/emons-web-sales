@@ -10091,11 +10091,12 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     _sp_work_db = _sp_store_opts[_sp_sel_idx][1]
 
     # 매장이 변경되면 체크박스 상태 초기화 (오입력 방지)
+    # pop() 대신 False로 명시 설정: has_existing=True인 날짜도 체크 해제되도록
     _sp_prev_store_key = "erp_shift_work_store_prev"
     if st.session_state.get(_sp_prev_store_key) != _sp_sel_label:
         if st.session_state.get(_sp_prev_store_key) is not None:
             for _d in date_list:
-                st.session_state.pop(f"sp_chk_{_d.isoformat()}", None)
+                st.session_state[f"sp_chk_{_d.isoformat()}"] = False
                 st.session_state.pop(f"sp_start_{_d.isoformat()}", None)
                 st.session_state.pop(f"sp_end_{_d.isoformat()}", None)
         st.session_state[_sp_prev_store_key] = _sp_sel_label
