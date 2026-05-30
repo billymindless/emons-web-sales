@@ -10936,7 +10936,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     # ── ✏️ 등록된 근무일 목록 수정 / 삭제 ────────
     st.divider()
     with st.expander("✏️ 등록된 근무일 수정 / 삭제", expanded=False):
-        st.caption("매장(또는 기타 근무지)·직원을 고르면 이번 달 등록된 근무일 목록이 나옵니다. 각 행에서 바로 수정/삭제하거나, 맨 아래에서 새 날짜를 추가하세요.")
+        st.caption("직원 **소속 매장**을 선택하면 해당 직원의 이번 달 등록 근무일 목록이 나옵니다. 메종근무·외부행사 등 다른 장소에서 일한 기록도 소속 매장을 선택해야 조회됩니다.")
         # 이 섹션 자체 매장 선택 (상단 필터와 독립). '기타 (외부/행사)'는 내 매장 db에 저장.
         _qe_store_opts = all_store_names + ["기타 (외부/행사)"]
         _qe_default_store = sel_store if sel_store in all_store_names else (
@@ -10948,7 +10948,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             _qe_store_idx = 0
         ec0, ec1 = st.columns([2, 2])
         with ec0:
-            qe_store_sel = st.selectbox("📍 매장 / 근무지", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
+            qe_store_sel = st.selectbox("📍 직원 소속 매장", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
         _qe_is_etc = (qe_store_sel == "기타 (외부/행사)")
         edit_dbf = current_db if _qe_is_etc else _sn_to_dbf.get(qe_store_sel, current_db)
         emp_pool = _erp_get_employee_names_for_store(edit_dbf) or [me_name]
