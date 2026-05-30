@@ -11045,6 +11045,80 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     html.append("</tbody></table>")
     st.markdown("".join(html), unsafe_allow_html=True)
 
+    # ── 🔍 인력 기준 룰 진단 ────────
+    if shortage_dates or overstaff_dates:
+        with st.expander("🔍 인력 기준 룰 진단 — 화면 표시와 실제 DB row 비교", expanded=False):
+            st.caption(
+                "캘린더에 인원부족/과다근무가 표시되는데 룰 설정값과 안 맞는다면, "
+                "DB에 옛 row가 남아있거나 같은 (요일·슬롯)에 row가 중복 저장됐을 수 있습니다. "
+                "아래 raw row가 사이드바 룰 화면에 그대로 반영되어 있는지 비교해보세요."
+            )
+            _DOW_LBL_FULL = ["월(0)", "화(1)", "수(2)", "목(3)", "금(4)", "토(5)", "일(6)"]
+            _diag_rows = []
+            for (dbf2, dow2), rules_list in sorted(rules_by_store_dow.items()):
+                sn = _dbf_to_sn.get(dbf2) or dbf2
+                for r in rules_list:
+                    _diag_rows.append({
+                        "매장": sn,
+                        "요일": _DOW_LBL_FULL[dow2] if 0 <= dow2 <= 6 else str(dow2),
+                        "시작": str(r.get("slot_start") or "")[:5],
+                        "종료": str(r.get("slot_end") or "")[:5],
+                        "최소": r.get("min_staff"),
+                        "적정": r.get("optimal_staff"),
+                        "row_id": r.get("id"),
+                    })
+            if _diag_rows:
+                df_diag = pd.DataFrame(_diag_rows).sort_values(
+                    ["매장", "요일", "시작"], kind="stable"
+                )
+                # 중복(매장·요일·시작·종료) 표시
+                dup_mask = df_diag.duplicated(
+                    subset=["매장", "요일", "시작", "종료"], keep=False
+                )
+                df_diag["⚠ 중복"] = dup_mask.map(lambda x: "🔴" if x else "")
+                st.dataframe(df_diag, use_container_width=True, hide_index=True)
+                if dup_mask.any():
+                    st.error(
+                        "🔴 표시된 행은 같은 매장·요일·시간대에 row가 여러 개 존재합니다. "
+                        "사이드바 ERP 룰 설정 화면은 1줄로만 보이지만 카운팅은 모든 row를 평가하므로, "
+                        "그 중 적정값이 다른 옛 row가 있으면 화면과 다른 결과가 나옵니다. "
+                        "사이드바 → 매장 인력 기준 설정에서 슬롯을 삭제 후 재추가해 정리하세요."
+                    )
+                # 시프트 중복 검증
+                _shift_dup_rows = []
+                for d_iso2, day_shifts2 in all_shifts_by_date_for_rules.items():
+                    by_key: dict = {}
+                    for s in day_shifts2:
+                        k = (
+                            s.get("_dbf"),
+                            (s.get("employee_name") or "").strip(),
+                            str(s.get("shift_start") or "")[:5],
+                            str(s.get("shift_end") or "")[:5],
+                        )
+                        by_key.setdefault(k, []).append(s)
+                    for k, lst in by_key.items():
+                        if len(lst) > 1:
+                            _shift_dup_rows.append({
+                                "날짜": d_iso2,
+                                "소속(_dbf)": _dbf_to_sn.get(k[0]) or k[0],
+                                "직원": k[1],
+                                "시작": k[2],
+                                "종료": k[3],
+                                "중복수": len(lst),
+                                "row_ids": ", ".join(str(x.get("id")) for x in lst),
+                            })
+                if _shift_dup_rows:
+                    st.warning(
+                        "동일 (날짜·소속·직원·시간)에 시프트 row가 중복 저장된 항목이 있습니다. "
+                        "카운트가 부풀어 과다근무로 잡힐 수 있습니다."
+                    )
+                    st.dataframe(
+                        pd.DataFrame(_shift_dup_rows),
+                        use_container_width=True, hide_index=True,
+                    )
+            else:
+                st.info("등록된 룰이 없습니다.")
+
     # ── ✏️ 등록된 근무일 목록 수정 / 삭제 ────────
     st.divider()
     _is_admin = role in ("store_admin", "superadmin")
