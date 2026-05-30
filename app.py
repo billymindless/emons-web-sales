@@ -11084,11 +11084,17 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             _ba, _bb, _bc = st.columns([1, 1, 4])
             with _ba:
                 if st.button("☑️ 전체 선택", key="qe_sel_all"):
-                    st.session_state[_qe_chk_key] = {int(s["id"]) for s in _my_shifts}
+                    _all_ids = {int(s["id"]) for s in _my_shifts}
+                    st.session_state[_qe_chk_key] = _all_ids
+                    # 개별 체크박스 위젯 상태도 직접 업데이트 (Streamlit은 key가 있으면 value보다 session_state를 우선)
+                    for _s in _my_shifts:
+                        st.session_state[f"qe_chk_{int(_s['id'])}"] = True
                     st.rerun(scope="fragment")
             with _bb:
                 if st.button("⬜ 전체 해제", key="qe_sel_none"):
                     st.session_state[_qe_chk_key] = set()
+                    for _s in _my_shifts:
+                        st.session_state[f"qe_chk_{int(_s['id'])}"] = False
                     st.rerun(scope="fragment")
             _checked_ids = st.session_state.get(_qe_chk_key, set())
             if _checked_ids:
