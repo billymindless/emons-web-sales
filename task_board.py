@@ -60,6 +60,17 @@ ASSIGNEE_ROLES = ["owner", "assignee", "watcher"]
 ATTACHMENT_BUCKET = "task-attachments"
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 
+# 결제변경 검증(사후 검증) 연동
+PAYMENT_CHANGE_TASK_TYPE = "payment_change_request"
+PAYMENT_CHANGE_TYPES = ["refund", "cancel_card", "cancel_transfer", "method_change", "onnuri_change"]
+PAYMENT_CHANGE_TYPE_LABELS = {
+    "refund": "환불/반품",
+    "cancel_card": "신용카드 취소",
+    "cancel_transfer": "계좌이체 취소/반환",
+    "method_change": "결제수단 변경",
+    "onnuri_change": "온누리 결제 변경",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 캐시된 로더
@@ -870,3 +881,214 @@ def _now_iso() -> str:
 
 def _today_kst() -> date:
     return (datetime.now(timezone.utc) + timedelta(hours=9)).date()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 결제변경 사내 검증(사후 검증) 연동
+#   결제 자체는 매출관리 기존 로직이 즉시 반영. 여기서는 검증 태스크만 다룬다.
+# ─────────────────────────────────────────────────────────────────────
+
+def create_payment_change_task(
+    sale_id: int,
+    payment_id: int | None,
+    customer_name: str | None,
+    change_type: str,
+    original_payment: dict | None,
+    new_payment: dict | None,
+    reason: str,
+    created_by: str,
+    store_name: str | None,
+    db_filename: str | None,
+    assignees: list[str] | None = None,
+) -> tuple[int | None, str | None]:
+    """결제변경 사후 검증 태스크 생성 + 메타 저장 + 검증자 알림.
+    결제 반영은 호출 측(매출관리)에서 이미 완료된 상태로 들어온다."""
+    client, err = _client()
+    if err or not client:
+        return None, err or "Supabase 연결 불가"
+
+    change_label = PAYMENT_CHANGE_TYPE_LABELS.get(change_type, change_type)
+    title = f"[결제변경 검증] {customer_name or '-'} · {change_label}"
+    op = original_payment or {}
+    npd = new_payment or {}
+
+    def _fmt(p: dict) -> str:
+        amt = p.get("amount")
+        amt_s = f"{int(amt):,}원" if amt not in (None, "") else "-"
+        parts = [amt_s, p.get("method") or "-"]
+        if p.get("onnuri"):
+            parts.append(f"온누리:{p.get('onnuri')}")
+        return " / ".join(parts)
+
+    description = (
+        f"결제변경 유형: {change_label}\n"
+        f"고객: {customer_name or '-'}\n"
+        f"원본 결제: {_fmt(op)}\n"
+        f"변경 결제: {_fmt(npd)}\n"
+        f"사유: {reason or '-'}\n"
+        f"(결제는 매출관리에서 즉시 반영됨 — 본 건은 증빙 확인 후 완료 처리)"
+    )
+
+    try:
+        row = {
+            "title": title,
+            "description": description,
+            "status": "requested",
+            "priority": "high",
+            "created_by": created_by,
+            "store_name": store_name,
+            "db_filename": db_filename,
+            "parent_task_id": None,
+            "task_type": PAYMENT_CHANGE_TASK_TYPE,
+            "verify_status": "pending",
+        }
+        r = client.table("app_tasks").insert(row).execute()
+        task_id = int(r.data[0]["id"]) if r.data else None
+        if not task_id:
+            return None, "검증 태스크 생성 실패 (id 없음)"
+
+        # 메타 저장
+        try:
+            client.table("app_payment_change_requests").insert({
+                "task_id": task_id,
+                "db_filename": db_filename,
+                "sale_id": int(sale_id),
+                "payment_id": int(payment_id) if payment_id else None,
+                "customer_name": customer_name,
+                "change_type": change_type,
+                "original_amount": _to_int_or_none(op.get("amount")),
+                "original_method": op.get("method"),
+                "original_onnuri": op.get("onnuri"),
+                "new_amount": _to_int_or_none(npd.get("amount")),
+                "new_method": npd.get("method"),
+                "new_onnuri": npd.get("onnuri"),
+                "reason": reason,
+                "created_by": created_by,
+            }).execute()
+        except Exception as e:
+            # 메타 실패해도 태스크는 유지 — 활동 로그에 남김
+            log_activity(task_id, created_by, "pcr_meta_failed", {"error": str(e)[:200]})
+
+        # 담당자(검증자) 등록 + 알림
+        recipients = [u for u in (assignees or []) if u and u != created_by]
+        for idx, uname in enumerate(recipients):
+            try:
+                client.table("app_task_assignees").insert({
+                    "task_id": task_id,
+                    "employee_username": uname,
+                    "role": "assignee",
+                    "assigned_by": created_by,
+                }).execute()
+            except Exception:
+                pass
+
+        log_activity(task_id, created_by, "payment_change_created", {
+            "change_type": change_type, "sale_id": sale_id, "payment_id": payment_id,
+        })
+        notify_recipients(
+            task_id=task_id,
+            recipients=recipients,
+            event_type="task_assigned",
+            template_vars={
+                "name": "", "title": title, "due_date": "-",
+                "requester": created_by, "link": _task_link(task_id),
+            },
+            in_app_message=f"결제변경 검증 요청: {title}",
+        )
+        clear_task_caches()
+        return task_id, None
+    except Exception as e:
+        return None, str(e)
+
+
+def resolve_payment_change(task_id: int, verifier: str, note: str | None = None) -> tuple[bool, str | None]:
+    """결제변경 검증 완료 처리. verify_status='resolved' + 검증자/시각/비고 기록."""
+    client, err = _client()
+    if err or not client:
+        return False, err
+    try:
+        client.table("app_tasks").update({
+            "verify_status": "resolved",
+            "verified_by": verifier,
+            "verified_at": _now_iso(),
+            "verify_note": (note or "").strip() or None,
+            "status": "done",
+            "closed_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }).eq("id", task_id).execute()
+        log_activity(task_id, verifier, "payment_change_resolved", {"note": (note or "")[:200]})
+
+        # 요청자에게 완료 알림
+        try:
+            t_r = client.table("app_tasks").select("created_by, title").eq("id", task_id).maybe_single().execute()
+            creator = (t_r.data or {}).get("created_by")
+            title = (t_r.data or {}).get("title", "")
+            if creator and creator != verifier:
+                notify_recipients(
+                    task_id=task_id,
+                    recipients=[creator],
+                    event_type="status_changed",
+                    template_vars={
+                        "title": title, "from_status": "미결", "to_status": "검증 완료",
+                        "actor": verifier, "link": _task_link(task_id),
+                    },
+                    in_app_message=f"결제변경 검증 완료: {title}",
+                )
+        except Exception:
+            pass
+        clear_task_caches()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def load_payment_change_meta(task_id: int) -> dict | None:
+    """task_id로 결제변경 메타 1건 조회."""
+    client, err = _client()
+    if err or not client:
+        return None
+    try:
+        r = client.table("app_payment_change_requests").select("*").eq("task_id", task_id).maybe_single().execute()
+        return r.data if isinstance(r.data, dict) else None
+    except Exception:
+        return None
+
+
+def load_payment_verify_state(task_id: int) -> dict:
+    """app_tasks의 검증 상태 컬럼만 조회 (컬럼 미존재 환경에서도 안전)."""
+    client, err = _client()
+    if err or not client:
+        return {}
+    try:
+        r = client.table("app_tasks").select(
+            "verify_status, verified_by, verified_at, verify_note"
+        ).eq("id", task_id).maybe_single().execute()
+        return r.data if isinstance(r.data, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_pending_payment_verifications(store_name: str | None, role: str) -> list[dict]:
+    """미결(pending) 결제변경 검증 태스크 목록. superadmin이면 전 매장."""
+    client, err = _client()
+    if err or not client:
+        return []
+    try:
+        q = client.table("app_tasks").select(
+            "id, title, store_name, created_by, created_at, verify_status"
+        ).eq("task_type", PAYMENT_CHANGE_TASK_TYPE).eq("verify_status", "pending")
+        if role != "superadmin" and store_name:
+            q = q.eq("store_name", store_name)
+        r = q.order("created_at", desc=True).execute()
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _to_int_or_none(v):
+    try:
+        if v in (None, ""):
+            return None
+        return int(round(float(v)))
+    except Exception:
+        return None

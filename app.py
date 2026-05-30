@@ -536,6 +536,7 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_EMPLOYEE_SALARIES.sql",
         "SUPABASE_APP_USERS_PHONE.sql",
         "SUPABASE_APP_TASKS.sql",
+        "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -591,7 +592,8 @@ def _supabase_run_task_tables_sql() -> bool:
     if not db_url:
         return False
     ok = False
-    for fname in ("SUPABASE_APP_USERS_PHONE.sql", "SUPABASE_APP_TASKS.sql"):
+    for fname in ("SUPABASE_APP_USERS_PHONE.sql", "SUPABASE_APP_TASKS.sql",
+                  "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql"):
         fpath = os.path.join(BASE_DIR, fname)
         if os.path.isfile(fpath) and _supabase_run_sql_file(db_url, fpath):
             ok = True
@@ -13660,6 +13662,16 @@ def render_internal_work():
     st.header("📋 사내 업무")
     st.caption("상위·하위 업무를 등록하고 담당자에게 인앱 알림 + 카카오 친구톡으로 즉시 통보합니다.")
 
+    # 결제변경 미결 검증 뱃지 (관리자만 검증 가능)
+    try:
+        _pending_pcr = _tb.load_pending_payment_verifications(store_name, role)
+        if _pending_pcr:
+            st.warning(
+                f"💳 결제변경 미결 검증 {len(_pending_pcr)}건 — 아래 업무 목록에서 증빙 확인 후 '검증 완료' 처리해 주세요."
+            )
+    except Exception:
+        pass
+
     # Storage 버킷 진단 (세션당 1회)
     _bucket_key = "_task_bucket_ok"
     if not st.session_state.get(_bucket_key):
@@ -14184,6 +14196,169 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
             st.rerun()
 
 
+def _render_payment_change_verify_entry(db_filename: str, order_id: int,
+                                        customer_name: str, pay_list):
+    """매출관리 결제 섹션에 들어가는 '사내 결제변경 검증 요청' 격리 위젯.
+    기존 결제 저장/상계 로직과 완전히 분리. 결제는 이미 매출관리에서 즉시 반영된 상태이고,
+    여기서는 사후 검증용 사내 업무 태스크만 생성한다."""
+    import task_board as _tb  # noqa: WPS433
+
+    toggle_key = f"pcr_open_{order_id}"
+    if st.button("💳 사내 결제변경 검증 요청", key=f"pcr_btn_{order_id}",
+                 help="결제변경 내역을 사내 업무로 올려 관리자/담당자가 증빙을 검증합니다."):
+        st.session_state[toggle_key] = not st.session_state.get(toggle_key, False)
+    if not st.session_state.get(toggle_key):
+        return
+
+    me_uname = _current_username()
+    store_name = _get_current_store_name_for_customers(db_filename)
+    cur_user = st.session_state.get("current_user") or {}
+    role = (cur_user.get("role") or "user").strip()
+    store_id = cur_user.get("store_id") or st.session_state.get("current_store_id")
+
+    # 결제 행 선택지
+    pay_options = {}
+    try:
+        for _, prow in pay_list.iterrows():
+            pid = int(prow["id"])
+            amt = float(prow.get("amount") or 0)
+            meth = prow.get("payment_method") or "-"
+            pay_options[pid] = f"결제ID {pid} · {meth} · {amt:,.0f}원"
+    except Exception:
+        pay_options = {}
+
+    with st.container(border=True):
+        st.markdown("##### 💳 결제변경 검증 요청 작성")
+        st.caption("결제는 이미 매출관리에서 반영되었습니다. 아래 내용은 관리자 검증(완료/미결)을 위해 사내 업무로 등록됩니다.")
+
+        sel_pid = None
+        if pay_options:
+            sel_pid = st.selectbox(
+                "대상 결제",
+                options=list(pay_options.keys()),
+                format_func=lambda p: pay_options.get(p, str(p)),
+                key=f"pcr_pid_{order_id}",
+            )
+        orig = {}
+        if sel_pid is not None:
+            try:
+                _r = pay_list[pay_list["id"] == sel_pid].iloc[0]
+                _cc = str(_r.get("card_company") or "").strip()
+                _cc = "" if _cc in ("None", "nan", "none") else _cc
+                orig = {
+                    "amount": float(_r.get("amount") or 0),
+                    "method": _r.get("payment_method") or "",
+                    "onnuri": _r.get("onnuri_approval_code") or _cc or "",
+                }
+            except Exception:
+                orig = {}
+
+        change_type = st.selectbox(
+            "변경 유형",
+            options=_tb.PAYMENT_CHANGE_TYPES,
+            format_func=lambda c: _tb.PAYMENT_CHANGE_TYPE_LABELS.get(c, c),
+            key=f"pcr_type_{order_id}",
+        )
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            new_amount = st.number_input("변경 후 금액(원)", min_value=0, step=1000,
+                                         value=int(orig.get("amount") or 0), key=f"pcr_amt_{order_id}")
+        with cc2:
+            new_method = st.text_input("변경 후 수단", value=str(orig.get("method") or ""),
+                                       key=f"pcr_meth_{order_id}")
+        with cc3:
+            new_onnuri = st.text_input("온누리/승인번호(선택)", value="",
+                                       key=f"pcr_onnuri_{order_id}")
+        reason = st.text_area("변경 사유 *", key=f"pcr_reason_{order_id}", height=70,
+                              placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제")
+
+        # 증빙 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
+        ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0))
+        files = st.file_uploader(
+            "📎 증빙 사진/파일 첨부 * (과거 결제본·신규 오프라인 결제본 등)",
+            accept_multiple_files=True,
+            key=f"pcr_files_{order_id}_{ver}",
+        )
+        _render_upload_preview(files)
+
+        # 부정 방지: 환불/취소 금액이 원본 초과 시 경고
+        if change_type in ("refund", "cancel_card", "cancel_transfer") and orig:
+            if float(orig.get("amount") or 0) > 0 and new_amount > float(orig.get("amount") or 0):
+                st.warning("⚠️ 변경 후 금액이 원본 결제 금액보다 큽니다. 환불/취소 금액을 다시 확인하세요.")
+
+        can_submit = bool((reason or "").strip()) and bool(files)
+        if not can_submit:
+            st.caption("사유 입력과 증빙 첨부가 모두 있어야 요청할 수 있습니다.")
+        if st.button("📤 검증 요청 등록", key=f"pcr_submit_{order_id}",
+                     type="primary", disabled=not can_submit):
+            # 검증자(담당자): 같은 매장 관리자 + superadmin (요청자 본인 제외)
+            verifier_unames = _payment_change_verifier_usernames(store_id, role, me_uname)
+            new_payment = {
+                "amount": new_amount,
+                "method": (new_method or "").strip(),
+                "onnuri": (new_onnuri or "").strip(),
+            }
+            task_id, err = _tb.create_payment_change_task(
+                sale_id=order_id,
+                payment_id=sel_pid,
+                customer_name=customer_name,
+                change_type=change_type,
+                original_payment=orig,
+                new_payment=new_payment,
+                reason=reason,
+                created_by=me_uname,
+                store_name=store_name,
+                db_filename=db_filename,
+                assignees=verifier_unames,
+            )
+            if task_id:
+                # 증빙 첨부 업로드
+                att_errors = []
+                for f in files or []:
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
+                    _row, ferr = _tb.attach_file(task_id=task_id, comment_id=None,
+                                                 uploaded_file=f, uploaded_by=me_uname)
+                    if ferr:
+                        att_errors.append(f"{f.name}: {ferr}")
+                st.session_state[f"pcr_files_ver_{order_id}"] = ver + 1
+                st.session_state[toggle_key] = False
+                if att_errors:
+                    st.warning("검증 요청은 등록됐지만 일부 첨부 실패: " + "; ".join(att_errors))
+                flash(f"결제변경 검증 요청이 사내 업무로 등록되었습니다. (#{task_id})")
+                st.rerun()
+            else:
+                st.error(f"요청 등록 실패: {err}")
+
+
+def _payment_change_verifier_usernames(store_id, role: str, exclude_uname: str) -> list[str]:
+    """결제변경 검증 알림 대상: 같은 매장 관리자 + superadmin (요청자 본인 제외)."""
+    users = _get_supabase_users_list() or []
+    out: list[str] = []
+    for u in users:
+        uname = u.get("username")
+        urole = (u.get("role") or "").strip()
+        if not uname or uname == exclude_uname:
+            continue
+        if urole == "superadmin":
+            out.append(uname)
+            continue
+        if urole == "store_admin":
+            store_ids = _get_supabase_user_store_ids(u.get("id")) if u.get("id") else []
+            if store_id is not None and (store_id in store_ids or u.get("store_id") == store_id):
+                out.append(uname)
+    # 중복 제거
+    seen = set()
+    uniq = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
 def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str | None,
                           role: str, store_id):
     import task_board as _tb  # noqa: WPS433
@@ -14372,6 +14547,90 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                                           me_uname, role, store_name, current_db, depth=depth + 1)
 
 
+def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_creator: bool):
+    """결제변경 검증 태스크면 원본/변경 메타 + 검증 상태 + 완료 결재 버튼을 표시.
+    메타가 없으면(일반 업무) 아무것도 그리지 않음."""
+    import task_board as _tb  # noqa: WPS433
+
+    meta = _tb.load_payment_change_meta(tid)
+    if not meta:
+        return
+
+    state = _tb.load_payment_verify_state(tid) or {}
+    vstatus = state.get("verify_status")
+    change_label = _tb.PAYMENT_CHANGE_TYPE_LABELS.get(meta.get("change_type"), meta.get("change_type") or "-")
+
+    with st.container(border=True):
+        head_l, head_r = st.columns([6, 4])
+        head_l.markdown(f"#### 💳 결제변경 검증 · {change_label}")
+        if vstatus == "resolved":
+            head_r.markdown(
+                f"<div style='text-align:right;'><span style='padding:4px 12px; border-radius:12px; "
+                f"background:#dcfce7; color:#166534; font-weight:700;'>✅ 검증 완료</span></div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            head_r.markdown(
+                f"<div style='text-align:right;'><span style='padding:4px 12px; border-radius:12px; "
+                f"background:#fef9c3; color:#854d0e; font-weight:700;'>🕒 미결</span></div>",
+                unsafe_allow_html=True,
+            )
+
+        def _fmt_amt(v):
+            try:
+                return f"{int(v):,}원" if v not in (None, "") else "-"
+            except Exception:
+                return "-"
+
+        # 원본 vs 변경 비교 표
+        comp = pd.DataFrame([
+            {"항목": "금액", "원본": _fmt_amt(meta.get("original_amount")), "변경 후": _fmt_amt(meta.get("new_amount"))},
+            {"항목": "결제수단", "원본": meta.get("original_method") or "-", "변경 후": meta.get("new_method") or "-"},
+            {"항목": "온누리/승인번호", "원본": meta.get("original_onnuri") or "-", "변경 후": meta.get("new_onnuri") or "-"},
+        ])
+        st.dataframe(comp, width='stretch', hide_index=True)
+
+        m1, m2 = st.columns(2)
+        m1.caption(f"고객: {meta.get('customer_name') or '-'}  ·  주문ID: {meta.get('sale_id')}  ·  결제ID: {meta.get('payment_id') or '신규'}")
+        m2.caption(f"요청자: {_uname_to_display(meta.get('created_by'))}")
+        st.markdown(f"**사유:** {meta.get('reason') or '-'}")
+
+        # 부정 방지 경고
+        try:
+            oa = float(meta.get("original_amount") or 0)
+            na = float(meta.get("new_amount") or 0)
+            if meta.get("change_type") in ("refund", "cancel_card", "cancel_transfer") and na > oa > 0:
+                st.warning("⚠️ 변경 후 금액이 원본 결제 금액을 초과합니다. 환불/취소 금액을 재확인하세요.")
+        except Exception:
+            pass
+
+        if vstatus == "resolved":
+            st.success(
+                f"검증 완료 — {_uname_to_display(state.get('verified_by'))} "
+                f"· {str(state.get('verified_at',''))[:19]}"
+            )
+            if state.get("verify_note"):
+                st.caption(f"비고: {state.get('verify_note')}")
+        else:
+            can_resolve = (role in ("store_admin", "superadmin")) and (not is_creator)
+            if not can_resolve:
+                if is_creator:
+                    st.caption("본인이 요청한 건은 직접 검증 완료할 수 없습니다. (셀프 검증 방지)")
+                else:
+                    st.caption("검증 완료 처리는 매장관리자/최고관리자만 가능합니다.")
+            else:
+                with st.form(f"pcr_resolve_{tid}"):
+                    note = st.text_input("검증 비고 (선택)", key=f"pcr_note_{tid}",
+                                         placeholder="예: 증빙 확인 완료, 카드 취소 영수증 일치")
+                    if st.form_submit_button("✅ 검증 완료 처리", type="primary"):
+                        ok, err = _tb.resolve_payment_change(tid, me_uname, note)
+                        if ok:
+                            flash("결제변경 검증이 완료 처리되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"처리 실패: {err}")
+
+
 def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                         role: str, store_name: str | None, current_db: str | None):
     import task_board as _tb  # noqa: WPS433
@@ -14380,6 +14639,9 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     is_creator = task.get("created_by") == me_uname
     is_assignee = any(a.get("employee_username") == me_uname for a in assignees)
     can_edit = role in ("store_admin", "superadmin") or is_creator or is_assignee
+
+    # 결제변경 검증 전용 카드 (메타가 있으면 표시)
+    _render_payment_change_verify_panel(tid, me_uname, role, is_creator)
 
     # 상세 필드 편집
     with st.form(f"task_edit_{tid}"):
@@ -18394,6 +18656,11 @@ def render_customer_balance():
                                         pay_display.loc[empty_card & ~card_method_mask, "card_company"] = pay_display.loc[empty_card & ~card_method_mask, "payment_method"].fillna("-")
                                         pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료"})
                                         st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료"]], width='stretch')
+                                        # 사내 결제변경 검증 요청 (격리된 기능 — 기존 결제 저장 로직과 무관)
+                                        _render_payment_change_verify_entry(
+                                            db_filename, int(_order_id_pay),
+                                            customer_name_for_receipt, pay_list,
+                                        )
                                         for _, prow in pay_list.iterrows():
                                             _prow_cc = str(prow.get("card_company") or "").strip()
                                             _prow_cc = "" if _prow_cc in ("None", "nan", "none") else _prow_cc
