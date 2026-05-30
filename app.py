@@ -10241,22 +10241,24 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
 
     _store_display_name = _get_store_name_by_db(current_db) if current_db else "기타"
     _is_gita_store = not current_db or "기타" in _store_display_name
+    # 매장별 호출 시 위젯 키 충돌 방지용 접두어
+    _kp = (current_db or "none").replace(".", "_").replace("/", "_")
 
     # ── 기본 근무시간 (주중 / 주말·공휴일) ─────────────────────
     st.markdown("##### 🕘 기본 근무시간 설정")
     st.caption("매장 표준 출퇴근 시각을 주중 / 주말·공휴일로 나누어 설정합니다. 근태 입력 폼에 자동 적용됩니다.")
     cur_hours = _erp_get_store_hours(current_db)
     existing_hours = _erp_store_hours_cached(current_db)
-    with st.form("erp_store_hours_form", clear_on_submit=False):
+    with st.form(f"erp_store_hours_form_{_kp}", clear_on_submit=False):
         hc = st.columns(4)
         with hc[0]:
-            wd_s = st.time_input("주중 출근", value=cur_hours["weekday_start"], key="erp_sh_wd_s")
+            wd_s = st.time_input("주중 출근", value=cur_hours["weekday_start"], key=f"erp_sh_wd_s_{_kp}")
         with hc[1]:
-            wd_e = st.time_input("주중 퇴근", value=cur_hours["weekday_end"], key="erp_sh_wd_e")
+            wd_e = st.time_input("주중 퇴근", value=cur_hours["weekday_end"], key=f"erp_sh_wd_e_{_kp}")
         with hc[2]:
-            we_s = st.time_input("주말/공휴일 출근", value=cur_hours["weekend_start"], key="erp_sh_we_s")
+            we_s = st.time_input("주말/공휴일 출근", value=cur_hours["weekend_start"], key=f"erp_sh_we_s_{_kp}")
         with hc[3]:
-            we_e = st.time_input("주말/공휴일 퇴근", value=cur_hours["weekend_end"], key="erp_sh_we_e")
+            we_e = st.time_input("주말/공휴일 퇴근", value=cur_hours["weekend_end"], key=f"erp_sh_we_e_{_kp}")
         sh_submit = st.form_submit_button("💾 기본 근무시간 저장", type="primary")
     if sh_submit:
         if wd_e <= wd_s or we_e <= we_s:
@@ -10374,10 +10376,10 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
         wd_col, we_col = st.columns(2)
         with wd_col:
             st.markdown("**🗓️ 주중 (월 ~ 금)**")
-            _render_slot_section(wd_slots, "wd", list(range(5)), "주중")
+            _render_slot_section(wd_slots, f"wd_{_kp}", list(range(5)), "주중")
         with we_col:
             st.markdown("**🏖️ 주말·공휴일 (토·일)**")
-            _render_slot_section(we_slots, "we", [5, 6], "주말·공휴일")
+            _render_slot_section(we_slots, f"we_{_kp}", [5, 6], "주말·공휴일")
 
     # ── 매장 공용 일정 (메모/표시 전용) ───────────────────────────
     st.divider()
@@ -10385,15 +10387,16 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
     st.caption("매장 전체에 적용되는 일정을 등록합니다. 캘린더 상단에 배지로 표시되며, 개인 근무시간 계산에는 영향이 없습니다.")
 
     _today = _today_kst()
-    se_ym = st.session_state.get("erp_se_ym", _today.strftime("%Y-%m"))
+    _se_ym_sk = f"erp_se_ym_{_kp}"
+    se_ym = st.session_state.get(_se_ym_sk, _today.strftime("%Y-%m"))
     sec_y, sec_m = (int(x) for x in se_ym.split("-"))
     cy1, cy2 = st.columns([1, 4])
     with cy1:
-        _new_ym = st.text_input("조회 월(YYYY-MM)", value=se_ym, key="erp_se_ym_input")
+        _new_ym = st.text_input("조회 월(YYYY-MM)", value=se_ym, key=f"erp_se_ym_input_{_kp}")
         if _new_ym != se_ym:
             try:
                 _y, _m = (int(x) for x in _new_ym.split("-"))
-                st.session_state["erp_se_ym"] = _new_ym
+                st.session_state[_se_ym_sk] = _new_ym
                 sec_y, sec_m = _y, _m
                 se_ym = _new_ym
             except Exception:
@@ -10556,45 +10559,45 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
     sec_outer = st.columns([1, 1])
     with sec_outer[0]:
         se_span_mode = st.radio(
-            "기간 유형", ["하루", "여러 날"], horizontal=True, key="se_span_mode",
+            "기간 유형", ["하루", "여러 날"], horizontal=True, key=f"se_span_mode_{_kp}",
             help="여러 날 선택 시 시작일~종료일 사이의 모든 날짜에 표시됩니다.",
         )
     with sec_outer[1]:
         se_time_mode = st.radio(
-            "시간 유형", ["종일", "시간대 지정"], horizontal=True, key="se_time_mode",
+            "시간 유형", ["종일", "시간대 지정"], horizontal=True, key=f"se_time_mode_{_kp}",
         )
 
-    with st.form("erp_store_event_form", clear_on_submit=True):
+    with st.form(f"erp_store_event_form_{_kp}", clear_on_submit=True):
         st.markdown("**신규 일정 등록**")
         if se_span_mode == "하루":
             sec1, sec2 = st.columns([1, 3])
             with sec1:
-                se_date_start = st.date_input("날짜", value=_today, key="se_date_start")
+                se_date_start = st.date_input("날짜", value=_today, key=f"se_date_start_{_kp}")
             with sec2:
-                se_title = st.text_input("제목", placeholder="예: 매장 정기 회의 / 본사 점검 / 행사 준비", key="se_title")
+                se_title = st.text_input("제목", placeholder="예: 매장 정기 회의 / 본사 점검 / 행사 준비", key=f"se_title_{_kp}")
             se_date_end = se_date_start
         else:
             sec1a, sec1b, sec2 = st.columns([1, 1, 3])
             with sec1a:
-                se_date_start = st.date_input("시작일", value=_today, key="se_date_start_multi")
+                se_date_start = st.date_input("시작일", value=_today, key=f"se_date_start_multi_{_kp}")
             with sec1b:
-                se_date_end = st.date_input("종료일", value=_today + timedelta(days=1), key="se_date_end_multi")
+                se_date_end = st.date_input("종료일", value=_today + timedelta(days=1), key=f"se_date_end_multi_{_kp}")
             with sec2:
-                se_title = st.text_input("제목", placeholder="예: 본사 점검 (3일간) / 신상품 전시 / 휴가", key="se_title")
+                se_title = st.text_input("제목", placeholder="예: 본사 점검 (3일간) / 신상품 전시 / 휴가", key=f"se_title_m_{_kp}")
 
         if se_time_mode == "시간대 지정":
             sec4, sec5 = st.columns(2)
             with sec4:
-                se_start = st.time_input("시작 시각", value=dt_time(18, 0), key="se_start")
+                se_start = st.time_input("시작 시각", value=dt_time(18, 0), key=f"se_start_{_kp}")
             with sec5:
-                se_end = st.time_input("종료 시각", value=dt_time(20, 0), key="se_end")
+                se_end = st.time_input("종료 시각", value=dt_time(20, 0), key=f"se_end_{_kp}")
             se_has_time = True
         else:
             se_start = None
             se_end = None
             se_has_time = False
 
-        se_note = st.text_input("메모 (선택)", placeholder="추가 설명", key="se_note")
+        se_note = st.text_input("메모 (선택)", placeholder="추가 설명", key=f"se_note_{_kp}")
         if st.form_submit_button("📌 매장 공용 일정 등록", type="primary"):
             if not (se_title or "").strip():
                 st.error("제목을 입력해 주세요.")
