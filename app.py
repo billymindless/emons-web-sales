@@ -14414,31 +14414,7 @@ def render_internal_work():
                 _seen_ids.add(int(_ct["id"]))
     tasks = [t for t in tasks if (not status_filter) or t.get("status") in status_filter]
 
-    # 키워드 + 태그 검색
-    _all_task_tags: list[str] = []
-    for t in tasks:
-        for _tg in _tb.split_tags(t.get("tags")):
-            if _tg not in _all_task_tags:
-                _all_task_tags.append(_tg)
-    sr1, sr2 = st.columns([3, 2])
-    with sr1:
-        task_kw = st.text_input("🔍 검색 (제목·설명·태그)", key="task_search_kw", placeholder="키워드 입력")
-    with sr2:
-        task_sel_tags = st.multiselect("태그 필터", options=sorted(_all_task_tags), key="task_search_tags")
-
-    _kw = (task_kw or "").strip().lower()
-    if _kw or task_sel_tags:
-        _matched = []
-        for t in tasks:
-            _ttags = _tb.split_tags(t.get("tags"))
-            if task_sel_tags and not any(x in _ttags for x in task_sel_tags):
-                continue
-            if _kw:
-                _hay = f"{t.get('title','')} {t.get('description','') or ''} {t.get('tags','') or ''}".lower()
-                if _kw not in _hay:
-                    continue
-            _matched.append(t)
-        tasks = _matched
+    # 키워드/태그 검색은 상단 통합 검색창에서 처리
 
     if not tasks:
         st.info("표시할 업무가 없습니다. 위에서 새 업무를 등록해 주세요.")
@@ -15991,34 +15967,11 @@ def _render_board_posts_section(me_uname: str, store_name: str | None, role: str
 
     st.divider()
 
-    # ── 검색 / 태그 필터 ───────────────────────────────────────
+    # ── 목록 (검색은 상단 통합 검색창에서) ─────────────────────
     posts = _pb.load_posts_cached(store_name, is_superadmin=(role == "superadmin"))
+    filtered = list(posts)
 
-    all_tags: list[str] = []
-    for p in posts:
-        for t in _pb.split_tags(p.get("tags")):
-            if t not in all_tags:
-                all_tags.append(t)
-
-    sc1, sc2 = st.columns([3, 2])
-    with sc1:
-        keyword = st.text_input("🔍 검색 (제목·내용·태그)", key="post_search_kw", placeholder="키워드 입력")
-    with sc2:
-        sel_tags = st.multiselect("태그 필터", options=sorted(all_tags), key="post_search_tags")
-
-    kw = (keyword or "").strip().lower()
-    filtered = []
-    for p in posts:
-        p_tags = _pb.split_tags(p.get("tags"))
-        if sel_tags and not any(t in p_tags for t in sel_tags):
-            continue
-        if kw:
-            hay = f"{p.get('title','')} {p.get('content','') or ''} {p.get('tags','') or ''}".lower()
-            if kw not in hay:
-                continue
-        filtered.append(p)
-
-    # 고정 우선 정렬 (load 단계에서 이미 정렬되었지만 필터 후 재보장)
+    # 고정 우선 정렬 (load 단계에서 이미 정렬되었지만 재보장)
     filtered.sort(key=lambda x: (not bool(x.get("is_pinned")), str(x.get("created_at", ""))), reverse=False)
     filtered.sort(key=lambda x: bool(x.get("is_pinned")), reverse=True)
 
