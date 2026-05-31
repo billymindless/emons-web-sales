@@ -6546,6 +6546,167 @@ def render_marketing_insights_superadmin():
 
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
 
+def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", key_prefix: str):
+    """일별 매출 추이 — 기준 월 1개(실선) + 비교 월 최대 12개(점선) 비교.
+    sales_df 의 transaction_date·amount 기준 일별 집계. DB/로직 변경 없음, 표시 전용."""
+    import calendar as _cal
+    try:
+        if sales_df is None or sales_df.empty or "transaction_date" not in sales_df.columns or "amount" not in sales_df.columns:
+            st.info("표시할 매출 데이터가 없습니다.")
+            return
+        _sdf = sales_df[["transaction_date", "amount"]].copy()
+        _sdf["transaction_date"] = pd.to_datetime(_sdf["transaction_date"], errors="coerce")
+        _sdf = _sdf.dropna(subset=["transaction_date"])
+        _sdf["amount"] = pd.to_numeric(_sdf["amount"], errors="coerce").fillna(0)
+        _sdf["_day"] = _sdf["transaction_date"].dt.day
+        _sdf["_ym"] = _sdf["transaction_date"].dt.strftime("%Y-%m")
+
+        # 사용 가능 월: 매출이 있는 월 + 이번 달(데이터가 없어도 선택 가능)
+        _avail_set = set(_sdf["_ym"].dropna().unique().tolist())
+        _avail_set.add(today.strftime("%Y-%m"))
+        _avail_yms = sorted(_avail_set, reverse=True)
+        if not _avail_yms:
+            st.info("표시할 매출 데이터가 없습니다.")
+            return
+
+        # 기준 월 / 비교 월 선택 UI
+        _default_base = today.strftime("%Y-%m")
+        if _default_base not in _avail_yms:
+            _default_base = _avail_yms[0]
+        _ui_c1, _ui_c2 = st.columns([1, 3])
+        with _ui_c1:
+            _base_ym = st.selectbox(
+                "기준 월",
+                _avail_yms,
+                index=_avail_yms.index(_default_base),
+                key=f"{key_prefix}_base_ym",
+            )
+        _other_yms = [m for m in _avail_yms if m != _base_ym]
+        try:
+            _base_dt = datetime.strptime(_base_ym, "%Y-%m").date()
+            _prev_ym = (_base_dt.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+            _default_compare = [_prev_ym] if _prev_ym in _other_yms else (_other_yms[:1])
+        except Exception:
+            _default_compare = _other_yms[:1]
+        with _ui_c2:
+            _compare_yms = st.multiselect(
+                "비교 월 (최대 12개 · 점선 표시)",
+                _other_yms,
+                default=_default_compare,
+                max_selections=12,
+                key=f"{key_prefix}_compare_yms",
+            )
+
+        # 기준 월 일별 데이터
+        _base_dt = datetime.strptime(_base_ym, "%Y-%m").date()
+        _base_year, _base_month = _base_dt.year, _base_dt.month
+        _base_last_day = _cal.monthrange(_base_year, _base_month)[1]
+        _is_current_month = (_base_ym == today.strftime("%Y-%m"))
+        _base_max_day = today.day if _is_current_month else _base_last_day
+        _base_days = list(range(1, _base_max_day + 1))
+        _base_grp = _sdf[_sdf["_ym"] == _base_ym].groupby("_day")["amount"].sum()
+        _base_values = [float(_base_grp.get(d, 0)) for d in _base_days]
+        _base_sum = sum(_base_values)
+
+        _KR_HOLIDAYS = {
+            date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
+            date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6),
+            date(2025, 6, 6), date(2025, 8, 15),
+            date(2025, 10, 3), date(2025, 10, 5), date(2025, 10, 6),
+            date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
+            date(2025, 12, 25),
+            date(2026, 1, 1),
+            date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
+            date(2026, 3, 1), date(2026, 3, 2),
+            date(2026, 5, 5), date(2026, 5, 24),
+            date(2026, 6, 3), date(2026, 6, 6), date(2026, 8, 15),
+            date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26), date(2026, 9, 28),
+            date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9),
+            date(2026, 12, 25),
+        }
+        def _base_marker(d):
+            try:
+                _d = date(_base_year, _base_month, d); _dw = _d.weekday()
+                if _d in _KR_HOLIDAYS or _dw == 6: return ("#E53935", 10)
+                if _dw == 5: return ("#1565C0", 10)
+                return ("#1B3A6B", 7)
+            except Exception:
+                return ("#1B3A6B", 7)
+        _base_mc = [_base_marker(d)[0] for d in _base_days]
+        _base_ms = [_base_marker(d)[1] for d in _base_days]
+
+        _PALETTE = [
+            "#9E9E9E", "#42A5F5", "#66BB6A", "#FFA726", "#AB47BC",
+            "#26C6DA", "#EC407A", "#8D6E63", "#7E57C2", "#26A69A",
+            "#FF7043", "#5C6BC0",
+        ]
+
+        fig = go.Figure()
+        _comp_rows = []
+        for i, cm in enumerate(_compare_yms):
+            try:
+                _cm_dt = datetime.strptime(cm, "%Y-%m").date()
+            except Exception:
+                continue
+            _cm_last_day = _cal.monthrange(_cm_dt.year, _cm_dt.month)[1]
+            _cm_days = list(range(1, _cm_last_day + 1))
+            _cm_grp = _sdf[_sdf["_ym"] == cm].groupby("_day")["amount"].sum()
+            _cm_values = [float(_cm_grp.get(d, 0)) for d in _cm_days]
+            _cm_color = _PALETTE[i % len(_PALETTE)]
+            fig.add_trace(go.Scatter(
+                x=_cm_days, y=_cm_values, mode="lines+markers",
+                name=cm,
+                line=dict(color=_cm_color, width=2, dash="dot"),
+                marker=dict(size=5, color=_cm_color),
+                hovertemplate="%{x}일<br>%{y:,.0f}원<extra>" + cm + "</extra>",
+            ))
+            _comp_rows.append({
+                "비교 월": cm,
+                "동기간 누적": sum(_cm_values[:_base_max_day]),
+                "전체 누적": sum(_cm_values),
+            })
+
+        fig.add_trace(go.Scatter(
+            x=_base_days, y=_base_values, mode="lines+markers",
+            name=f"{_base_ym} (기준)",
+            line=dict(color="#1B3A6B", width=3),
+            marker=dict(size=_base_ms, color=_base_mc),
+            hovertemplate="%{x}일<br>%{y:,.0f}원<extra>" + _base_ym + " (기준)</extra>",
+        ))
+
+        fig.update_layout(
+            height=360, margin=dict(l=10, r=10, t=10, b=10),
+            xaxis=dict(title="일(Day)", dtick=1 if _base_last_day <= 16 else 2,
+                       tickfont=dict(size=11), gridcolor="#EEEEEE"),
+            yaxis=dict(title="매출(원)", tickformat=",", tickfont=dict(size=11), gridcolor="#EEEEEE"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
+            plot_bgcolor="white", hovermode="x unified",
+        )
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+        st.markdown(
+            f"**기준 월 ({_base_ym}) {_base_max_day}일까지 누적: "
+            f"{_base_sum:,.0f}원**"
+        )
+        if _comp_rows:
+            _rows = []
+            for r in _comp_rows:
+                _same = r["동기간 누적"]; _all = r["전체 누적"]
+                _diff = _base_sum - _same
+                _pct = f"{(_diff / _same * 100):+.1f}%" if _same > 0 else "-"
+                _rows.append({
+                    "비교 월": r["비교 월"],
+                    f"동기간({_base_max_day}일)까지 누적": f"{_same:,.0f}원",
+                    "기준월 대비 차액": f"{_diff:+,.0f}원",
+                    "기준월 대비 %": _pct,
+                    "비교월 전체 누적": f"{_all:,.0f}원",
+                })
+            st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
+        st.caption("💡 기준 월은 실선, 비교 월은 점선으로 표시됩니다. 비교 월은 최대 12개까지 동시 선택 가능합니다.")
+    except Exception as _e_chart:
+        st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_chart}")
+
+
 def _render_main_kpi_section(orders: "pd.DataFrame", payments: "pd.DataFrame", sales_df: "pd.DataFrame",
                              today: "date", month_start: "date", month_end: "date",
                              db_filename: str | None = None):
@@ -6936,88 +7097,9 @@ def _superadmin_tab1_integrated_dashboard():
 
     st.divider()
 
-    # ── 1-2. 일별 매출 추이 (이번 달 vs 지난 달) ────────
-    st.subheader("📈 일별 매출 추이 (이번 달 vs 지난 달)")
-    try:
-        # sales_df 기반으로 차트 구성 (KPI "누적매출"과 동일한 실수납 기준으로 통일)
-        if sales_df.empty or "transaction_date" not in sales_df.columns:
-            st.info("표시할 매출 데이터가 없습니다.")
-        else:
-            _sdf = sales_df.copy()
-            _sdf["transaction_date"] = pd.to_datetime(_sdf["transaction_date"], errors="coerce")
-            _sdf = _sdf.dropna(subset=["transaction_date"])
-            _sdf["amount"] = pd.to_numeric(_sdf["amount"], errors="coerce").fillna(0)
-            _sdf["_day"] = _sdf["transaction_date"].dt.day
-            _sdf["_ym"] = _sdf["transaction_date"].dt.strftime("%Y-%m")
-
-            _this_ym = today.strftime("%Y-%m")
-            _last_ym = last_month_end_dt.strftime("%Y-%m")
-            _last_month_days = last_month_end_dt.day
-
-            _this_m = _sdf[_sdf["_ym"] == _this_ym].groupby("_day")["amount"].sum()
-            _this_days = list(range(1, today.day + 1))
-            _this_values = [float(_this_m.get(d, 0)) for d in _this_days]
-            _this_sum = sum(_this_values)
-
-            _last_m = _sdf[_sdf["_ym"] == _last_ym].groupby("_day")["amount"].sum()
-            _last_days = list(range(1, _last_month_days + 1))
-            _last_values = [float(_last_m.get(d, 0)) for d in _last_days]
-            _last_sum = sum(_last_values)
-            _has_last = any(v != 0 for v in _last_values)
-            _last_same_period_sum = sum(_last_values[:today.day]) if _has_last else 0.0
-
-            _KR_HOLIDAYS = {
-                date(2025,1,1),date(2025,1,28),date(2025,1,29),date(2025,1,30),
-                date(2025,3,1),date(2025,5,5),date(2025,5,6),date(2025,6,6),date(2025,8,15),
-                date(2025,10,3),date(2025,10,5),date(2025,10,6),date(2025,10,7),date(2025,10,8),date(2025,10,9),date(2025,12,25),
-                date(2026,1,1),date(2026,2,17),date(2026,2,18),date(2026,2,19),
-                date(2026,3,1),date(2026,3,2),date(2026,5,5),date(2026,5,24),date(2026,6,3),date(2026,6,6),date(2026,8,15),
-                date(2026,9,24),date(2026,9,25),date(2026,9,26),date(2026,9,28),date(2026,10,3),date(2026,10,5),date(2026,10,9),date(2026,12,25),
-            }
-            def _sa2_marker(year, month, day, holidays, is_this):
-                try:
-                    _d = date(year, month, day); dow = _d.weekday()
-                    if _d in holidays or dow == 6: return ("#E53935",10) if is_this else ("#EF9A9A",7)
-                    if dow == 5: return ("#1565C0",10) if is_this else ("#90CAF9",7)
-                    return ("#1B3A6B",7) if is_this else ("#B0BEC5",5)
-                except Exception:
-                    return ("#1B3A6B",7) if is_this else ("#B0BEC5",5)
-
-            _tmc = [_sa2_marker(today.year, today.month, d, _KR_HOLIDAYS, True)[0] for d in _this_days]
-            _tms = [_sa2_marker(today.year, today.month, d, _KR_HOLIDAYS, True)[1] for d in _this_days]
-            _lmc = [_sa2_marker(last_month_end_dt.year, last_month_end_dt.month, d, _KR_HOLIDAYS, False)[0] for d in _last_days]
-            _lms = [_sa2_marker(last_month_end_dt.year, last_month_end_dt.month, d, _KR_HOLIDAYS, False)[1] for d in _last_days]
-
-            _fig = go.Figure()
-            if _has_last:
-                _fig.add_trace(go.Scatter(x=_last_days, y=_last_values, mode="lines+markers",
-                    name=f"지난 달 ({_last_ym})", line=dict(color="#B0BEC5", width=2, dash="dot"),
-                    marker=dict(size=_lms, color=_lmc),
-                    hovertemplate="%{x}일<br>%{y:,.0f}원<extra>지난 달</extra>"))
-            _fig.add_trace(go.Scatter(x=_this_days, y=_this_values, mode="lines+markers",
-                name=f"이번 달 ({_this_ym})", line=dict(color="#1B3A6B", width=3),
-                marker=dict(size=_tms, color=_tmc),
-                hovertemplate="%{x}일<br>%{y:,.0f}원<extra>이번 달</extra>"))
-            _fig.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10),
-                xaxis=dict(title="일(Day)", dtick=1 if _last_month_days<=16 else 2, tickfont=dict(size=11), gridcolor="#EEEEEE"),
-                yaxis=dict(title="매출(원)", tickformat=",", tickfont=dict(size=11), gridcolor="#EEEEEE"),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
-                plot_bgcolor="white", hovermode="x unified")
-            st.plotly_chart(_fig, width="stretch", config={"displayModeBar": False})
-
-            _ca, _cb, _cc = st.columns(3)
-            with _ca: st.metric("이번 달 누적", f"{_this_sum:,.0f}원")
-            with _cb: st.metric("지난 달 동기간", f"{_last_same_period_sum:,.0f}원" if _has_last else "-")
-            with _cc:
-                if _has_last and _last_same_period_sum > 0:
-                    _dp = (_this_sum - _last_same_period_sum) / _last_same_period_sum * 100
-                    st.metric("전월 대비", f"{_dp:+.1f}%", delta=f"{(_this_sum-_last_same_period_sum):,.0f}원")
-                else:
-                    st.metric("전월 대비", "-")
-            if _has_last:
-                st.caption(f"💡 이번 달 {today.day}일까지 vs 지난 달 같은 기간 비교. 지난 달 전체 누적: {_last_sum:,.0f}원")
-    except Exception as _e_chart:
-        st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_chart}")
+    # ── 1-2. 일별 매출 추이 (기준 월 vs 비교 월 최대 12개) ────────
+    st.subheader("📈 일별 매출 추이 (월별 비교)")
+    _render_daily_sales_multi_compare(sales_df, today, key_prefix="superadmin_daily_cmp")
 
     st.divider()
 
@@ -21246,165 +21328,11 @@ def render_dashboard():
                 except Exception as e:
                     st.error(f"보정 중 오류가 발생했습니다: {e}")
 
-    # ---------- 1-2. 일별 매출 추이 (이번 달 vs 지난 달 꺾은선) ----------
+    # ---------- 1-2. 일별 매출 추이 (기준 월 vs 비교 월 최대 12개) ----------
     # sales 원장 transaction_date·amount 기준으로 일별 집계 (기존 DB/로직 변경 없음, 표시 전용)
-    # - 지난 달 데이터가 없어도 에러 없이 이번 달만 표시
-    # - 모바일 반응형: plotly config use_container_width=True + 높이 320px
-    st.subheader("📈 일별 매출 추이 (이번 달 vs 지난 달)")
-    try:
-        if sales_df.empty or "transaction_date" not in sales_df.columns or "amount" not in sales_df.columns:
-            st.info("표시할 매출 데이터가 없습니다. 매출이 등록되면 일별 추이가 나타납니다.")
-        else:
-            _sdf = sales_df[["transaction_date", "amount"]].copy()
-            _sdf["transaction_date"] = pd.to_datetime(_sdf["transaction_date"], errors="coerce")
-            _sdf = _sdf.dropna(subset=["transaction_date"])
-            _sdf["amount"] = pd.to_numeric(_sdf["amount"], errors="coerce").fillna(0)
-            _sdf["_date"] = _sdf["transaction_date"].dt.date
-            _sdf["_day"] = _sdf["transaction_date"].dt.day
-            _sdf["_ym"] = _sdf["transaction_date"].dt.strftime("%Y-%m")
-
-            # 이번 달 / 지난 달 기간 계산
-            _this_ym = today.strftime("%Y-%m")
-            _last_month_end = month_start - timedelta(days=1)
-            _last_ym = _last_month_end.strftime("%Y-%m")
-            _last_month_days = _last_month_end.day
-
-            # 이번 달 일별 매출 (1일 ~ 오늘)
-            _this_m = _sdf[_sdf["_ym"] == _this_ym].groupby("_day")["amount"].sum()
-            _this_days = list(range(1, today.day + 1))
-            _this_values = [float(_this_m.get(d, 0)) for d in _this_days]
-            _this_sum = sum(_this_values)
-
-            # 지난 달 일별 매출 (1일 ~ 말일)
-            _last_m = _sdf[_sdf["_ym"] == _last_ym].groupby("_day")["amount"].sum()
-            _last_days = list(range(1, _last_month_days + 1))
-            _last_values = [float(_last_m.get(d, 0)) for d in _last_days]
-            _last_sum = sum(_last_values)
-            _has_last = any(v != 0 for v in _last_values)
-
-            # 동일 기간(이번달 1~오늘과 지난달 1~오늘일)까지의 지난달 누적 — 비교 요약용
-            _last_same_period_sum = sum(_last_values[:today.day]) if _has_last else 0.0
-
-            # 요일·공휴일 판별: 마커 색상 배열 계산 (토→파랑, 일·공휴일→빨강, 평일→기본색)
-            # 한국 공휴일 2025~2026 (대체공휴일 포함, 표시 전용이므로 로직/DB 무관)
-            _KR_HOLIDAYS = {
-                date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
-                date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6),
-                date(2025, 6, 6), date(2025, 8, 15),
-                date(2025, 10, 3), date(2025, 10, 5), date(2025, 10, 6),
-                date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
-                date(2025, 12, 25),
-                date(2026, 1, 1),
-                date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
-                date(2026, 3, 1), date(2026, 3, 2),
-                date(2026, 5, 5), date(2026, 5, 24),
-                date(2026, 6, 3), date(2026, 6, 6), date(2026, 8, 15),
-                date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26), date(2026, 9, 28),
-                date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9),
-                date(2026, 12, 25),
-            }
-
-            def _marker_style(year, month, day, holidays, is_this):
-                """(color, size) 반환: 토→파랑, 일·공휴일→빨강, 평일→기본색."""
-                try:
-                    d = date(year, month, day)
-                    dow = d.weekday()  # 0=월 … 5=토 6=일
-                    if d in holidays or dow == 6:
-                        return ("#E53935", 10) if is_this else ("#EF9A9A", 7)
-                    if dow == 5:
-                        return ("#1565C0", 10) if is_this else ("#90CAF9", 7)
-                    return ("#1B3A6B", 7) if is_this else ("#B0BEC5", 5)
-                except Exception:
-                    return ("#1B3A6B", 7) if is_this else ("#B0BEC5", 5)
-
-            # 이번 달 마커 색/크기 배열
-            _this_year = today.year
-            _this_month_num = today.month
-            _this_marker_colors = [_marker_style(_this_year, _this_month_num, d, _KR_HOLIDAYS, True)[0] for d in _this_days]
-            _this_marker_sizes  = [_marker_style(_this_year, _this_month_num, d, _KR_HOLIDAYS, True)[1] for d in _this_days]
-
-            # 지난 달 마커 색/크기 배열
-            _last_year  = _last_month_end.year
-            _last_month_num = _last_month_end.month
-            _last_marker_colors = [_marker_style(_last_year, _last_month_num, d, _KR_HOLIDAYS, False)[0] for d in _last_days]
-            _last_marker_sizes  = [_marker_style(_last_year, _last_month_num, d, _KR_HOLIDAYS, False)[1] for d in _last_days]
-
-            # 꺾은선 차트 생성 (plotly)
-            fig_daily = go.Figure()
-            # 지난 달 선 (흐린 색, 점선) — 데이터 있을 때만
-            if _has_last:
-                fig_daily.add_trace(go.Scatter(
-                    x=_last_days,
-                    y=_last_values,
-                    mode="lines+markers",
-                    name=f"지난 달 ({_last_ym})",
-                    line=dict(color="#B0BEC5", width=2, dash="dot"),
-                    marker=dict(size=_last_marker_sizes, color=_last_marker_colors),
-                    hovertemplate="%{x}일<br>%{y:,.0f}원<extra>지난 달</extra>",
-                ))
-            # 이번 달 선 (진한 네이비 블루 선 + 요일별 마커 색상)
-            fig_daily.add_trace(go.Scatter(
-                x=_this_days,
-                y=_this_values,
-                mode="lines+markers",
-                name=f"이번 달 ({_this_ym})",
-                line=dict(color="#1B3A6B", width=3),
-                marker=dict(size=_this_marker_sizes, color=_this_marker_colors),
-                hovertemplate="%{x}일<br>%{y:,.0f}원<extra>이번 달</extra>",
-            ))
-            fig_daily.update_layout(
-                height=320,
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis=dict(
-                    title="일(Day)",
-                    dtick=1 if _last_month_days <= 16 else 2,  # 모바일 가독성
-                    tickfont=dict(size=11),
-                    gridcolor="#EEEEEE",
-                ),
-                yaxis=dict(
-                    title="매출(원)",
-                    tickformat=",",
-                    tickfont=dict(size=11),
-                    gridcolor="#EEEEEE",
-                ),
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1,
-                    font=dict(size=11),
-                ),
-                plot_bgcolor="white",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_daily, width='stretch', config={"displayModeBar": False})
-
-            # 비교 요약 카드 (모바일 친화: columns 자동 세로 배치)
-            _col_a, _col_b, _col_c = st.columns(3)
-            with _col_a:
-                st.metric("이번 달 누적", f"{_this_sum:,.0f}원")
-            with _col_b:
-                if _has_last:
-                    st.metric("지난 달 동기간", f"{_last_same_period_sum:,.0f}원")
-                else:
-                    st.metric("지난 달 동기간", "-")
-            with _col_c:
-                if _has_last and _last_same_period_sum > 0:
-                    _diff_pct = (_this_sum - _last_same_period_sum) / _last_same_period_sum * 100
-                    _delta_str = f"{_diff_pct:+.1f}%"
-                    st.metric("전월 대비", _delta_str, delta=f"{(_this_sum - _last_same_period_sum):,.0f}원")
-                elif not _has_last:
-                    st.metric("전월 대비", "비교 불가", help="지난 달 매출 데이터가 없어 비교할 수 없습니다.")
-                else:
-                    st.metric("전월 대비", "-")
-            if not _has_last:
-                st.caption("💡 지난 달 매출 데이터가 없어 이번 달만 표시됩니다.")
-            else:
-                st.caption(f"💡 이번 달 {today.day}일까지 vs 지난 달 같은 기간 비교. 지난 달 전체 누적: {_last_sum:,.0f}원")
-    except Exception as _e_daily_chart:
-        # 일별 매출 차트는 부가 표시용이므로 예외 발생 시에도 대시보드 전체가 중단되지 않도록 처리
-        st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_daily_chart}")
+    # 기준 월 1개(실선) + 비교 월 최대 12개(점선)
+    st.subheader("📈 일별 매출 추이 (월별 비교)")
+    _render_daily_sales_multi_compare(sales_df, today, key_prefix="dashboard_daily_cmp")
 
     st.divider()
 
