@@ -11096,21 +11096,33 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 )
 
             # 근무 계획 (shift_schedules) — 실근무지(work_location_name) 기준 매장 컬러 사용
-            #   소속(_dbf)이 아닌 실근무지 색으로 통일 → 같은 매장 캘린더 안 직원들은 모두 같은 색
+            # 외부 행사(등록 매장 아님): 별도 색 사용 (보라 계열 #7C3AED)
+            _EXT_COLOR = "#7C3AED"  # 외부 행사·박람회 등 고정 색
             for sh in shifts_by_date.get(d_iso, []):
-                _eff_dbf = _shift_effective_dbf(sh) or sh.get("_dbf") or current_db
-                _eff_sn  = _dbf_to_sn.get(_eff_dbf, "")
-                sc = store_color.get(_eff_dbf, "#FB8C00")  # 등록 매장이 아니면 외부 행사 — 주황
+                _wloc = (sh.get("work_location_name") or "").strip()
+                _eff_dbf_raw = _shift_effective_dbf(sh)  # 외부 행사면 None
+                _is_external = bool(_wloc) and (_eff_dbf_raw is None)
+                if _is_external:
+                    sc = _EXT_COLOR
+                    _eff_sn = _wloc  # 배지 라벨 = 행사명 그대로
+                else:
+                    _eff_dbf = _eff_dbf_raw or sh.get("_dbf") or current_db
+                    _eff_sn  = _dbf_to_sn.get(_eff_dbf, "")
+                    sc = store_color.get(_eff_dbf, "#607D8B")
                 emp  = sh.get("employee_name") or ""
                 ss   = str(sh.get("shift_start") or "")[:5]
                 ee   = str(sh.get("shift_end") or "")[:5]
                 time_txt = f" {ss}~{ee}" if ss and ee else ""
-                _wloc = (sh.get("work_location_name") or "").strip()
                 # 배지 라벨: 실근무지(wloc 우선, 비면 실효 매장명)
                 _badge_label = _wloc if _wloc else _eff_sn
-                # 필터 뷰에서 자명한 정보(선택 매장과 같은 배지)는 생략
-                _badge_redundant = (not show_store_tag) and (not _sel_is_etc) and (_badge_label == sel_store)
-                _show_badge = (show_store_tag or _wloc) and not _badge_redundant and _badge_label
+                # 필터 뷰에서 자명한 정보(선택 매장과 같은 배지)는 생략 — 단 외부 행사는 항상 표시
+                _badge_redundant = (
+                    not _is_external
+                    and (not show_store_tag)
+                    and (not _sel_is_etc)
+                    and (_badge_label == sel_store)
+                )
+                _show_badge = (show_store_tag or _wloc or _is_external) and not _badge_redundant and _badge_label
                 sn_badge = (
                     f"<span style='background:{sc}; color:white; font-size:0.58rem;"
                     f" padding:0px 3px; border-radius:2px; margin-right:2px;'>"
@@ -11687,6 +11699,11 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     f"<span style='background:{sc}20; border-left:4px solid {sc};"
                     f" padding:2px 8px; border-radius:2px; color:{sc}; font-weight:bold;'>{sn}</span>"
                 )
+            # 외부 행사 색 추가
+            parts.append(
+                f"<span style='background:#7C3AED20; border-left:4px solid #7C3AED;"
+                f" padding:2px 8px; border-radius:2px; color:#7C3AED; font-weight:bold;'>외부 행사·박람회</span>"
+            )
             st.markdown(" &nbsp; ".join(parts), unsafe_allow_html=True)
         with col_wt:
             st.markdown("**근태 유형 배지**")
@@ -11696,7 +11713,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 for wt, c in _ERP_BADGE_COLORS.items()
             ]
             st.markdown(" ".join(wt_parts), unsafe_allow_html=True)
-        st.caption("컬러 바 = 근무 계획(shift) / 배지 = 실제 근태 기록 / 파란 테두리 = 오늘 / 빨간 테두리 = 최소 인원 미달")
+        st.caption("컬러 바 = 근무 계획(shift) / 보라 = 외부 행사·박람회 / 배지 = 실제 근태 기록 / 파란 테두리 = 오늘 / 빨간 테두리 = 최소 인원 미달")
 
 
 # ---------- 탭 4: 휴무·근태 입력 ----------
