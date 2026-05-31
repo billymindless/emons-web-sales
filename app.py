@@ -15854,6 +15854,7 @@ def render_internal_board():
     role = (current_user.get("role") or "user").strip()
     me_uname = (current_user.get("username") or current_user.get("email") or "").strip()
     store_id = (current_user.get("store_id") or st.session_state.get("current_store_id"))
+    current_db = st.session_state.get("current_db") or ""
     store_name: str | None = None
     if store_id:
         try:
@@ -15865,7 +15866,16 @@ def render_internal_board():
         except Exception:
             store_name = None
 
-    st.header("📋 사내 게시판")
+    st.header("📋 사내업무/게시판")
+
+    # ── 통합 검색 (사내업무·게시판·투표 등 모든 컨텐츠) ──────────
+    gkw = st.text_input(
+        "🔍 통합 검색", key="board_global_search",
+        placeholder="키워드 입력 — 사내업무·게시판 글 등 모든 컨텐츠 검색",
+    )
+    if (gkw or "").strip():
+        _render_board_unified_search((gkw or "").strip(), me_uname, store_name, role, current_db)
+        return
 
     labels = [lbl for _, lbl, _ in BOARD_SECTIONS]
     if st.session_state.get("board_section_label") not in labels:
@@ -15892,6 +15902,69 @@ def render_internal_board():
         render_internal_work()
     else:
         st.info(f"'{choice}' 기능은 준비 중입니다.")
+
+
+def _render_board_unified_search(keyword: str, me_uname: str, store_name: str | None,
+                                 role: str, current_db: str | None):
+    """통합 검색 — 게시판 글 + 사내 업무를 키워드(제목·내용·태그)로 가로질러 검색.
+    투표/할일은 기능 추가 시 여기에 검색 소스를 합치면 된다."""
+    import post_board as _pb  # noqa: WPS433
+    import task_board as _tb  # noqa: WPS433
+
+    kw = keyword.lower()
+
+    # 게시판 글
+    matched_posts: list[dict] = []
+    if ensure_supabase_post_tables():
+        try:
+            for p in _pb.load_posts_cached(store_name, is_superadmin=(role == "superadmin")):
+                hay = f"{p.get('title','')} {p.get('content','') or ''} {p.get('tags','') or ''}".lower()
+                if kw in hay:
+                    matched_posts.append(p)
+        except Exception:
+            matched_posts = []
+
+    # 사내 업무 (보안 업무는 작성자/담당자만)
+    matched_tasks: list[dict] = []
+    if ensure_supabase_task_tables():
+        try:
+            tasks = _tb.load_tasks_cached(
+                store_name=None if role == "superadmin" else store_name,
+                include_done=True,
+            )
+            _seen = {int(t["id"]) for t in tasks}
+            for _ct in _tb.load_my_confidential_tasks_cached(me_uname, include_done=True):
+                if int(_ct["id"]) not in _seen:
+                    tasks.append(_ct)
+                    _seen.add(int(_ct["id"]))
+            for t in tasks:
+                hay = f"{t.get('title','')} {t.get('description','') or ''} {t.get('tags','') or ''}".lower()
+                if kw in hay:
+                    matched_tasks.append(t)
+        except Exception:
+            matched_tasks = []
+
+    st.subheader(f"🔎 통합 검색 결과 · '{keyword}'")
+    st.caption(
+        f"사내 업무 {len(matched_tasks)}건 · 게시판 글 {len(matched_posts)}건 "
+        "(투표·할일은 준비 중)"
+    )
+
+    if not matched_tasks and not matched_posts:
+        st.info("일치하는 컨텐츠가 없습니다.")
+        return
+
+    if matched_tasks:
+        st.markdown("#### ✅ 사내 업무")
+        _ids = tuple(int(t["id"]) for t in matched_tasks)
+        _amap = _tb.load_task_assignees_cached(_ids)
+        for t in matched_tasks:
+            _render_task_card(t, {}, _amap, me_uname, role, store_name, current_db, depth=0)
+
+    if matched_posts:
+        st.markdown("#### 📝 게시판 글")
+        for p in matched_posts:
+            _render_post_card(p, me_uname, role)
 
 
 def _render_board_posts_section(me_uname: str, store_name: str | None, role: str, store_id):
@@ -22353,7 +22426,7 @@ def main():
     except Exception:
         _unread_n = 0
     _badge = f"  🔔 {_unread_n}" if _unread_n > 0 else ""
-    if st.sidebar.button(f"📝 게시판{_badge}", width='stretch'):
+    if st.sidebar.button(f"📋 사내업무/게시판{_badge}", width='stretch'):
         st.session_state["active_admin_page"] = "internal_board"
 
     st.sidebar.markdown("---")
