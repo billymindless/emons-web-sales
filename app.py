@@ -539,6 +539,7 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql",
         "SUPABASE_APP_TASKS_CATEGORY.sql",
         "SUPABASE_APP_TASKS_TAGS.sql",
+        "SUPABASE_APP_TASKS_SCOPE.sql",
         "SUPABASE_APP_POSTS.sql",
     ]
     ok = False
@@ -599,6 +600,7 @@ def _supabase_run_task_tables_sql() -> bool:
                   "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql",
                   "SUPABASE_APP_TASKS_CATEGORY.sql",
                   "SUPABASE_APP_TASKS_TAGS.sql",
+                  "SUPABASE_APP_TASKS_SCOPE.sql",
                   "SUPABASE_APP_POSTS.sql"):
         fpath = os.path.join(BASE_DIR, fname)
         if os.path.isfile(fpath) and _supabase_run_sql_file(db_url, fpath):
@@ -15029,6 +15031,17 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
         )
         parent_task_id = parent_label_to_id.get(parent_label)
 
+        nt_scope = st.radio(
+            "공개 범위",
+            options=_tb.TASK_SCOPES,
+            format_func=lambda s: _tb.TASK_SCOPE_LABELS.get(s, s),
+            horizontal=True,
+            index=0,
+            key=f"nt_scope_{_vk}",
+        )
+        if nt_scope == "company":
+            st.caption("🌐 전체 공개: 다른 매장에서도 이 업무를 볼 수 있습니다. 담당자를 다른 매장 직원으로 지정하면 교차 매장 업무 요청이 됩니다.")
+
         tcol1, tcol2 = st.columns([3, 1])
         with tcol1:
             nt_tags = st.text_input("태그 (쉼표로 구분)", key=f"nt_tags_{_vk}", placeholder="예: 핀즈, 2026, 입고일정")
@@ -15053,6 +15066,7 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
                     category=_tb.CONFIDENTIAL_CATEGORY if is_confidential else None,
                     tags=nt_tags,
                     is_pinned=nt_pin,
+                    scope=nt_scope,
                 )
                 if new_id:
                     for f in nt_files or []:
@@ -15150,10 +15164,13 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 )
             if task_tags:
                 _render_tag_chips(task_tags)
+            _task_scope = task.get("scope") or "store"
+            _scope_badge = "🌐" if _task_scope == "company" else "🏪"
             h2.markdown(
                 f"<div style='text-align:right; font-size:0.95rem;'>"
                 f"<span style='padding:4px 10px; border-radius:12px; "
-                f"background:#f1f5f9; font-weight:600;'>{badge}</span></div>",
+                f"background:#f1f5f9; font-weight:600;'>{badge}</span>"
+                f"&nbsp;<span style='font-size:0.8rem; color:#64748b;'>{_scope_badge}</span></div>",
                 unsafe_allow_html=True,
             )
             m1, m2, m3 = st.columns([4, 3, 3])
@@ -15368,6 +15385,18 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
             disabled=not can_edit,
         )
 
+        cur_scope = task.get("scope") or "store"
+        _scope_idx = _tb.TASK_SCOPES.index(cur_scope) if cur_scope in _tb.TASK_SCOPES else 0
+        new_scope = st.selectbox(
+            "공개 범위",
+            options=_tb.TASK_SCOPES,
+            index=_scope_idx,
+            format_func=lambda s: _tb.TASK_SCOPE_LABELS.get(s, s),
+            key=f"et_scope_{tid}",
+            disabled=not can_edit,
+            help="'전체 공개'로 변경하면 다른 매장에서도 이 업무를 볼 수 있습니다.",
+        )
+
         col_btn1, col_btn2 = st.columns(2)
         save_clicked = col_btn1.form_submit_button("저장", disabled=not can_edit, type="primary")
         if save_clicked:
@@ -15385,6 +15414,8 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                 field_patch["due_date"] = new_due
             if new_priority != task.get("priority"):
                 field_patch["priority"] = new_priority
+            if new_scope != cur_scope:
+                field_patch["scope"] = new_scope
             if field_patch:
                 _tb.update_task_fields(tid, me_uname, **field_patch)
             if set(new_assignees) != set(cur_users):
@@ -15731,9 +15762,18 @@ def _render_post_card(post: dict, me_uname: str, role: str):
                         "태그 (쉼표로 구분)", value=",".join(tags), key=f"pe_tags_{pid}",
                         placeholder="예: 참고사이트, ID&PW, 2026",
                     )
+                    _cur_scope = post.get("scope") or "store"
+                    _scope_idx = _pb.POST_SCOPES.index(_cur_scope) if _cur_scope in _pb.POST_SCOPES else 0
+                    e_scope = st.selectbox(
+                        "열람 범위",
+                        options=_pb.POST_SCOPES,
+                        index=_scope_idx,
+                        format_func=lambda s: _pb.POST_SCOPE_LABELS.get(s, s),
+                        key=f"pe_scope_{pid}",
+                    )
                     if st.form_submit_button("저장", type="primary"):
                         _ok, _err = _pb.update_post(
-                            pid, title=e_title, content=e_content, tags=e_tags,
+                            pid, title=e_title, content=e_content, tags=e_tags, scope=e_scope,
                         )
                         if _ok:
                             st.session_state.pop(_post_edit_key, None)

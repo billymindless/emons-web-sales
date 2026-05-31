@@ -99,23 +99,32 @@ PAYMENT_CHANGE_TYPE_LABELS = {
 # 캐시된 로더
 # ─────────────────────────────────────────────────────────────────────
 
+TASK_SCOPES = ["store", "company"]
+TASK_SCOPE_LABELS = {"store": "🏪 내 매장 전용", "company": "🌐 전체 공개 (교차 매장 가능)"}
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_tasks_cached(store_name: str | None = None, include_done: bool = False) -> list[dict]:
     """매장별 일반 업무 목록. None이면 전 매장 (superadmin용).
-    보안(회사 경영) 업무는 여기서 제외하고 load_my_confidential_tasks_cached로만 노출."""
+    - scope='store': store_name 일치하는 매장만
+    - scope='company': 전체 공개 → 모든 매장에서 노출
+    보안(회사 경영) 업무는 여기서 제외."""
     client, err = _client()
     if err or not client:
         return []
 
     def _run(select_cols: str):
         q = client.table("app_tasks").select(select_cols)
-        if store_name:
-            q = q.eq("store_name", store_name)
         if not include_done:
             q = q.not_.in_("status", ["done", "on_hold"])
         return (q.order("created_at", desc=True).execute().data or [])
 
     _cols_full = (
+        "id, parent_task_id, title, description, status, priority, "
+        "start_date, due_date, created_by, store_name, db_filename, "
+        "scope, category, tags, is_pinned, created_at, updated_at, closed_at"
+    )
+    _cols_no_scope = (
         "id, parent_task_id, title, description, status, priority, "
         "start_date, due_date, created_by, store_name, db_filename, "
         "category, tags, is_pinned, created_at, updated_at, closed_at"
@@ -125,19 +134,27 @@ def load_tasks_cached(store_name: str | None = None, include_done: bool = False)
         "start_date, due_date, created_by, store_name, db_filename, "
         "created_at, updated_at, closed_at"
     )
-    try:
-        rows = _run(_cols_full)
-    except Exception as e:
-        # 구 스키마 호환: 신규 컬럼(category/tags/is_pinned) 미존재 시 legacy로 재시도
-        if any(c in str(e) for c in ("category", "tags", "is_pinned")):
-            try:
-                rows = _run(_cols_legacy)
-            except Exception:
-                return []
-        else:
+    rows = []
+    for cols in (_cols_full, _cols_no_scope, _cols_legacy):
+        try:
+            rows = _run(cols)
+            break
+        except Exception as e:
+            if any(c in str(e) for c in ("scope", "category", "tags", "is_pinned")):
+                continue
             return []
-    # 보안 업무는 일반 목록에서 완전 제외 (superadmin 포함)
-    return [t for t in rows if t.get("category") != CONFIDENTIAL_CATEGORY]
+
+    # 보안 업무 제외
+    rows = [t for t in rows if t.get("category") != CONFIDENTIAL_CATEGORY]
+
+    # scope 필터링 (superadmin / scope 미설정 시 전체 허용)
+    if store_name:
+        rows = [
+            t for t in rows
+            if t.get("scope", "store") == "company"
+            or t.get("store_name") == store_name
+        ]
+    return rows
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -316,6 +333,7 @@ def create_task(
     category: str | None = None,
     tags: str | None = None,
     is_pinned: bool = False,
+    scope: str = "store",
 ) -> tuple[int | None, str | None]:
     """업무 생성. assignees는 owner+assignees를 묶은 username 리스트.
     category가 CONFIDENTIAL_CATEGORY면 보안(회사 경영) 업무로 작성자·담당자에게만 노출."""
@@ -337,9 +355,10 @@ def create_task(
             "category": (category or None),
             "tags": normalize_tags(tags),
             "is_pinned": bool(is_pinned),
+            "scope": scope if scope in TASK_SCOPES else "store",
         }
-        # 구 스키마 호환: 신규 컬럼(category/tags/is_pinned) 미존재 시 제외 후 재시도
-        _optional_cols = ["category", "tags", "is_pinned"]
+        # 구 스키마 호환: 신규 컬럼 미존재 시 제외 후 재시도
+        _optional_cols = ["scope", "category", "tags", "is_pinned"]
         for _attempt in range(len(_optional_cols) + 1):
             try:
                 r = client.table("app_tasks").insert(row).execute()
@@ -432,7 +451,7 @@ def update_status(task_id: int, new_status: str, actor: str) -> tuple[bool, str 
 
 def update_task_fields(task_id: int, actor: str, **fields) -> tuple[bool, str | None]:
     """제목·설명·일정·우선순위·태그·상단고정 변경."""
-    allowed = {"title", "description", "start_date", "due_date", "priority", "tags", "is_pinned"}
+    allowed = {"title", "description", "start_date", "due_date", "priority", "tags", "is_pinned", "scope"}
     patch = {k: v for k, v in fields.items() if k in allowed}
     if "tags" in patch:
         patch["tags"] = normalize_tags(patch["tags"])
