@@ -10966,6 +10966,8 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     overstaff_dates: dict[str, list[str]] = {}  # {d_iso: [과다_매장명, ...]}
     overstaff_details: dict[tuple[str, str], str] = {}
     shortage_details: dict[tuple[str, str], str] = {}
+    # 부족 슬롯 목록: {(d_iso, 매장명): ["10:00~12:00 (1/2명)", ...]}  — 근무자가 0명인 슬롯은 제외
+    shortage_slots: dict[tuple[str, str], list[str]] = {}
     # 진단용: 각 (d_iso, 매장) 의 실제 카운트된 직원 목록
     contributing_emps: dict[tuple[str, str], list[dict]] = {}
     _DOW_LBL = ["월", "화", "수", "목", "금", "토", "일"]
@@ -10991,7 +10993,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     continue
                 actual_cnt = _erp_count_active_at(store_day_shifts, slot_s, slot_e)
                 _slot_lbl = f"{str(rule.get('slot_start') or '')[:5]}~{str(rule.get('slot_end') or '')[:5]}"
-                # 인원 부족 체크
+                # 인원 부족 체크 (break 없이 모든 슬롯 검사)
                 _min_n = int(rule.get("min_staff") or 1)
                 if actual_cnt < _min_n:
                     shortage_dates.setdefault(d_iso, [])
@@ -11002,7 +11004,13 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         f"({_DOW_LBL[dow]}요일, 근무지(work_location_name) 우선 기준)"
                     )
                     contributing_emps[(d_iso, _sname)] = store_day_shifts
-                    break
+                    # 근무자가 1명 이상 있는데 최소 미달인 슬롯만 시간대 표시 (0명은 미등록으로 간주)
+                    if actual_cnt > 0:
+                        _slot_tag = f"{_slot_lbl} ({actual_cnt}/{_min_n}명)"
+                        shortage_slots.setdefault((d_iso, _sname), [])
+                        if _slot_tag not in shortage_slots[(d_iso, _sname)]:
+                            shortage_slots[(d_iso, _sname)].append(_slot_tag)
+                    continue  # 다음 슬롯도 계속 검사
                 # 과다 근무 체크 (optimal_staff 설정된 경우만)
                 _opt = rule.get("optimal_staff")
                 if _opt and actual_cnt > int(_opt):
@@ -11014,7 +11022,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         f"({_DOW_LBL[dow]}요일, 근무지(work_location_name) 우선 기준)"
                     )
                     contributing_emps[(d_iso, _sname)] = store_day_shifts
-                    break
 
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
     cal_obj = _cal.Calendar(firstweekday=6)
@@ -11055,6 +11062,14 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 cell.append(
                     f"<div title=\"{_short_tip}\" style='color:#E53935; font-size:0.62rem; font-weight:bold; cursor:help;'>⚠️ {_short_label} 인원부족</div>"
                 )
+                # 근무자가 일부 있는데 최소 미달인 슬롯의 시간대를 한 줄씩 표시
+                for _sn in _short_stores:
+                    _slots = shortage_slots.get((d_iso, _sn), [])
+                    for _sl in _slots:
+                        cell.append(
+                            f"<div style='color:#E53935; font-size:0.58rem; padding-left:8px;'>"
+                            f"└ {_sl}</div>"
+                        )
             if d_iso in overstaff_dates:
                 _over_stores = overstaff_dates[d_iso]
                 _over_label = " · ".join(_over_stores) if _over_stores else "과다근무"
