@@ -10362,7 +10362,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
             """slots: _group_slots 결과, dow_targets: 저장 대상 day_of_week 리스트"""
             _edit_key = f"erp_rule_edit_{form_key}"  # session_state: 현재 수정 중인 rule['id']
             if slots:
-                hdr = st.columns([2, 2, 2, 1, 1])
+                hdr = st.columns([2, 2, 2, 1])
                 hdr[0].markdown("**시간대**")
                 hdr[1].markdown("**최소 인원**")
                 hdr[2].markdown("**적정 인원**")
@@ -10397,7 +10397,8 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                             with _ed:
                                 _sa, _sb = st.columns(2)
                                 with _sa:
-                                    if st.button("💾", key=f"erp_rule_save_{rid}", help="저장"):
+                                    if st.button("저장", key=f"erp_rule_save_{rid}",
+                                                 type="primary", use_container_width=True):
                                         patch = {
                                             "min_staff": int(_new_min),
                                             "optimal_staff": int(_new_opt) if _new_opt else None,
@@ -10415,12 +10416,13 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                                             notify(f"{label} {_slot_label} 규칙이 수정되었습니다.")
                                             st.rerun()
                                 with _sb:
-                                    if st.button("✕", key=f"erp_rule_cancel_{rid}", help="취소"):
+                                    if st.button("취소", key=f"erp_rule_cancel_{rid}",
+                                                 use_container_width=True):
                                         st.session_state.pop(_edit_key, None)
                                         st.rerun()
                     else:
-                        # ── 일반 표시 행
-                        rc = st.columns([2, 2, 2, 1, 1])
+                        # ── 일반 표시 행 (버튼을 HTML로 렌더링해 한 줄 유지)
+                        rc = st.columns([2, 2, 2, 1])
                         with rc[0]:
                             st.text(_slot_label)
                         with rc[1]:
@@ -10428,17 +10430,21 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                         with rc[2]:
                             st.text(f"적정 {_cur_opt}명" if _cur_opt else "미설정")
                         with rc[3]:
-                            if st.button("✏️ 수정", key=f"erp_rule_edit_btn_{form_key}_{rid}"):
-                                st.session_state[_edit_key] = rid
-                                st.rerun()
-                        with rc[4]:
-                            if st.button("삭제", key=f"erp_rule_del_{form_key}_{rid}"):
-                                for _did in all_ids:
-                                    _erp_delete_row("app_staffing_rules", _did)
-                                st.session_state.pop(_edit_key, None)
-                                _erp_staffing_rules_cached.clear()
-                                notify(f"{label} 규칙이 삭제되었습니다.")
-                                st.rerun()
+                            _btn_col_a, _btn_col_b = st.columns(2)
+                            with _btn_col_a:
+                                if st.button("수정", key=f"erp_rule_edit_btn_{form_key}_{rid}",
+                                             use_container_width=True):
+                                    st.session_state[_edit_key] = rid
+                                    st.rerun()
+                            with _btn_col_b:
+                                if st.button("삭제", key=f"erp_rule_del_{form_key}_{rid}",
+                                             use_container_width=True):
+                                    for _did in all_ids:
+                                        _erp_delete_row("app_staffing_rules", _did)
+                                    st.session_state.pop(_edit_key, None)
+                                    _erp_staffing_rules_cached.clear()
+                                    notify(f"{label} 규칙이 삭제되었습니다.")
+                                    st.rerun()
             else:
                 st.info(f"설정된 {label} 규칙이 없습니다.")
 
