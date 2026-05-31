@@ -61,6 +61,25 @@ ASSIGNEE_ROLES = ["owner", "assignee", "watcher"]
 CONFIDENTIAL_CATEGORY = "company_mgmt"
 CATEGORY_LABELS = {"company_mgmt": "회사 경영(보안)"}
 
+
+def normalize_tags(raw: str | None) -> str | None:
+    """쉼표/공백 구분 입력을 정규화: 공백·중복 제거. '#a, b' → 'a,b'."""
+    if not raw:
+        return None
+    parts: list[str] = []
+    for chunk in str(raw).replace("#", " ").replace("\n", ",").split(","):
+        for t in chunk.split():
+            tag = t.strip()
+            if tag and tag not in parts:
+                parts.append(tag)
+    return ",".join(parts) if parts else None
+
+
+def split_tags(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [t.strip() for t in str(raw).replace("#", " ").replace("\n", ",").split(",") if t.strip()]
+
 ATTACHMENT_BUCKET = "task-attachments"
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 
@@ -99,7 +118,7 @@ def load_tasks_cached(store_name: str | None = None, include_done: bool = False)
     _cols_full = (
         "id, parent_task_id, title, description, status, priority, "
         "start_date, due_date, created_by, store_name, db_filename, "
-        "category, created_at, updated_at, closed_at"
+        "category, tags, is_pinned, created_at, updated_at, closed_at"
     )
     _cols_legacy = (
         "id, parent_task_id, title, description, status, priority, "
@@ -109,8 +128,8 @@ def load_tasks_cached(store_name: str | None = None, include_done: bool = False)
     try:
         rows = _run(_cols_full)
     except Exception as e:
-        # 구 스키마 호환: category 컬럼 미존재 시 제외 후 재시도
-        if "category" in str(e):
+        # 구 스키마 호환: 신규 컬럼(category/tags/is_pinned) 미존재 시 legacy로 재시도
+        if any(c in str(e) for c in ("category", "tags", "is_pinned")):
             try:
                 rows = _run(_cols_legacy)
             except Exception:
@@ -136,14 +155,29 @@ def load_my_confidential_tasks_cached(me_username: str, include_done: bool = Fal
         ).execute()
         my_assigned_ids = {int(row["task_id"]) for row in (ar.data or []) if row.get("task_id") is not None}
 
-        q = client.table("app_tasks").select(
+        _cols = (
             "id, parent_task_id, title, description, status, priority, "
             "start_date, due_date, created_by, store_name, db_filename, "
-            "category, created_at, updated_at, closed_at"
-        ).eq("category", CONFIDENTIAL_CATEGORY)
-        if not include_done:
-            q = q.not_.in_("status", ["done", "on_hold"])
-        r = q.order("created_at", desc=True).execute()
+            "category, tags, is_pinned, created_at, updated_at, closed_at"
+        )
+        try:
+            q = client.table("app_tasks").select(_cols).eq("category", CONFIDENTIAL_CATEGORY)
+            if not include_done:
+                q = q.not_.in_("status", ["done", "on_hold"])
+            r = q.order("created_at", desc=True).execute()
+        except Exception as _e:
+            if any(c in str(_e) for c in ("tags", "is_pinned")):
+                _cols2 = (
+                    "id, parent_task_id, title, description, status, priority, "
+                    "start_date, due_date, created_by, store_name, db_filename, "
+                    "category, created_at, updated_at, closed_at"
+                )
+                q = client.table("app_tasks").select(_cols2).eq("category", CONFIDENTIAL_CATEGORY)
+                if not include_done:
+                    q = q.not_.in_("status", ["done", "on_hold"])
+                r = q.order("created_at", desc=True).execute()
+            else:
+                raise
         rows = r.data or []
         # 가시성: 작성자 본인이거나 담당자인 경우만
         return [
@@ -280,6 +314,8 @@ def create_task(
     priority: str = "normal",
     assignees: list[str] | None = None,
     category: str | None = None,
+    tags: str | None = None,
+    is_pinned: bool = False,
 ) -> tuple[int | None, str | None]:
     """업무 생성. assignees는 owner+assignees를 묶은 username 리스트.
     category가 CONFIDENTIAL_CATEGORY면 보안(회사 경영) 업무로 작성자·담당자에게만 노출."""
@@ -299,17 +335,25 @@ def create_task(
             "db_filename": db_filename,
             "parent_task_id": int(parent_task_id) if parent_task_id else None,
             "category": (category or None),
+            "tags": normalize_tags(tags),
+            "is_pinned": bool(is_pinned),
         }
-        try:
-            r = client.table("app_tasks").insert(row).execute()
-        except Exception as _ins_e:
-            # 구 스키마 호환: category 컬럼 미존재 시(PGRST204) 제외 후 재시도
-            _msg = str(_ins_e)
-            if "category" in _msg and ("PGRST204" in _msg or "schema cache" in _msg or "column" in _msg):
-                row.pop("category", None)
+        # 구 스키마 호환: 신규 컬럼(category/tags/is_pinned) 미존재 시 제외 후 재시도
+        _optional_cols = ["category", "tags", "is_pinned"]
+        for _attempt in range(len(_optional_cols) + 1):
+            try:
                 r = client.table("app_tasks").insert(row).execute()
-            else:
-                raise
+                break
+            except Exception as _ins_e:
+                _msg = str(_ins_e)
+                _dropped = False
+                for _c in _optional_cols:
+                    if _c in row and _c in _msg and ("PGRST204" in _msg or "schema cache" in _msg or "column" in _msg):
+                        row.pop(_c, None)
+                        _dropped = True
+                        break
+                if not _dropped:
+                    raise
         new_id = int(r.data[0]["id"]) if r.data else None
         if not new_id:
             return None, "insert 후 id를 가져오지 못했습니다."
@@ -387,9 +431,11 @@ def update_status(task_id: int, new_status: str, actor: str) -> tuple[bool, str 
 
 
 def update_task_fields(task_id: int, actor: str, **fields) -> tuple[bool, str | None]:
-    """제목·설명·일정·우선순위 변경."""
-    allowed = {"title", "description", "start_date", "due_date", "priority"}
+    """제목·설명·일정·우선순위·태그·상단고정 변경."""
+    allowed = {"title", "description", "start_date", "due_date", "priority", "tags", "is_pinned"}
     patch = {k: v for k, v in fields.items() if k in allowed}
+    if "tags" in patch:
+        patch["tags"] = normalize_tags(patch["tags"])
     if not patch:
         return True, None
     for k in ("start_date", "due_date"):

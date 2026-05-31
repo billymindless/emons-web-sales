@@ -538,6 +538,8 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_TASKS.sql",
         "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql",
         "SUPABASE_APP_TASKS_CATEGORY.sql",
+        "SUPABASE_APP_TASKS_TAGS.sql",
+        "SUPABASE_APP_POSTS.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -595,7 +597,9 @@ def _supabase_run_task_tables_sql() -> bool:
     ok = False
     for fname in ("SUPABASE_APP_USERS_PHONE.sql", "SUPABASE_APP_TASKS.sql",
                   "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql",
-                  "SUPABASE_APP_TASKS_CATEGORY.sql"):
+                  "SUPABASE_APP_TASKS_CATEGORY.sql",
+                  "SUPABASE_APP_TASKS_TAGS.sql",
+                  "SUPABASE_APP_POSTS.sql"):
         fpath = os.path.join(BASE_DIR, fname)
         if os.path.isfile(fpath) and _supabase_run_sql_file(db_url, fpath):
             ok = True
@@ -613,6 +617,57 @@ def ensure_supabase_task_tables() -> bool:
         if _cache_key in st.session_state:
             del st.session_state[_cache_key]
         return _supabase_task_tables_available()
+    return False
+
+
+def _supabase_post_tables_available() -> bool:
+    """app_posts 테이블 존재 여부 (사내 게시판)."""
+    _cache_key = "_supa_post_tables_avail"
+    if _cache_key in st.session_state:
+        return bool(st.session_state[_cache_key])
+    client, err = get_supabase_client()
+    if err or not client:
+        return False
+    try:
+        client.table("app_posts").select("id").limit(1).execute()
+        st.session_state[_cache_key] = True
+        return True
+    except Exception:
+        st.session_state[_cache_key] = False
+        return False
+
+
+def _supabase_run_post_tables_sql() -> bool:
+    """사내 게시판 전용 DDL (app_posts 등)."""
+    secrets = (st.secrets.get("supabase") or {}) if "secrets" in dir(st) else {}
+    if not secrets:
+        try:
+            import streamlit as _st
+            secrets = _st.secrets.get("supabase") or {}
+        except Exception:
+            pass
+    db_url = (secrets.get("database_url") or secrets.get("db_url") or "").strip()
+    if not db_url:
+        return False
+    ok = False
+    for fname in ("SUPABASE_APP_POSTS.sql", "SUPABASE_APP_TASKS_TAGS.sql"):
+        fpath = os.path.join(BASE_DIR, fname)
+        if os.path.isfile(fpath) and _supabase_run_sql_file(db_url, fpath):
+            ok = True
+    return ok
+
+
+def ensure_supabase_post_tables() -> bool:
+    """사내 게시판 테이블이 없으면 자동 생성 시도."""
+    _cache_key = "_supa_post_tables_avail"
+    if _supabase_post_tables_available():
+        return True
+    if _cache_key in st.session_state:
+        del st.session_state[_cache_key]
+    if _supabase_run_post_tables_sql():
+        if _cache_key in st.session_state:
+            del st.session_state[_cache_key]
+        return _supabase_post_tables_available()
     return False
 
 
@@ -14359,6 +14414,32 @@ def render_internal_work():
                 _seen_ids.add(int(_ct["id"]))
     tasks = [t for t in tasks if (not status_filter) or t.get("status") in status_filter]
 
+    # 키워드 + 태그 검색
+    _all_task_tags: list[str] = []
+    for t in tasks:
+        for _tg in _tb.split_tags(t.get("tags")):
+            if _tg not in _all_task_tags:
+                _all_task_tags.append(_tg)
+    sr1, sr2 = st.columns([3, 2])
+    with sr1:
+        task_kw = st.text_input("🔍 검색 (제목·설명·태그)", key="task_search_kw", placeholder="키워드 입력")
+    with sr2:
+        task_sel_tags = st.multiselect("태그 필터", options=sorted(_all_task_tags), key="task_search_tags")
+
+    _kw = (task_kw or "").strip().lower()
+    if _kw or task_sel_tags:
+        _matched = []
+        for t in tasks:
+            _ttags = _tb.split_tags(t.get("tags"))
+            if task_sel_tags and not any(x in _ttags for x in task_sel_tags):
+                continue
+            if _kw:
+                _hay = f"{t.get('title','')} {t.get('description','') or ''} {t.get('tags','') or ''}".lower()
+                if _kw not in _hay:
+                    continue
+            _matched.append(t)
+        tasks = _matched
+
     if not tasks:
         st.info("표시할 업무가 없습니다. 위에서 새 업무를 등록해 주세요.")
         return
@@ -14380,6 +14461,8 @@ def render_internal_work():
         if pid is not None and pid not in visible_ids:
             extra_roots.append(t)
     roots = list(by_parent.get(None, [])) + extra_roots
+    # 상단 고정(📌) 업무를 먼저 노출
+    roots.sort(key=lambda x: bool(x.get("is_pinned")), reverse=True)
 
     tab_list, tab_gantt = st.tabs(["📋 목록", "📊 간트차트"])
     with tab_list:
@@ -15008,6 +15091,12 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
             )
             parent_task_id = parent_label_to_id.get(parent_label)
 
+            tcol1, tcol2 = st.columns([3, 1])
+            with tcol1:
+                nt_tags = st.text_input("태그 (쉼표로 구분)", key="nt_tags", placeholder="예: 핀즈, 2026, 입고일정")
+            with tcol2:
+                nt_pin = st.checkbox("📌 상단 고정", value=False, key="nt_pin")
+
             submitted = st.form_submit_button("등록", type="primary")
             if submitted:
                 if not (title or "").strip():
@@ -15025,6 +15114,8 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
                         priority=priority,
                         assignees=assignees,
                         category=_tb.CONFIDENTIAL_CATEGORY if is_confidential else None,
+                        tags=nt_tags,
+                        is_pinned=nt_pin,
                     )
                     if new_id:
                         # 업무 생성 후 첨부 파일 업로드 (task 레벨, comment_id=None)
@@ -15098,6 +15189,9 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
     status = task.get("status", "requested")
     badge = f"{_tb.TASK_STATUS_EMOJI.get(status, '')} {_tb.TASK_STATUS_LABELS.get(status, status)}"
     is_confidential = task.get("category") == _tb.CONFIDENTIAL_CATEGORY
+    is_pinned = bool(task.get("is_pinned"))
+    task_tags = _tb.split_tags(task.get("tags"))
+    is_admin = role in ("store_admin", "superadmin")
     assignees = assignees_map.get(tid, [])
     assignee_names = ", ".join(_uname_to_display(a.get("employee_username")) for a in assignees) or "(없음)"
     due = task.get("due_date") or "-"
@@ -15109,7 +15203,8 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
         with st.container(border=True):
             h1, h2 = st.columns([7, 3])
             _lock = "🔒 " if is_confidential else ""
-            h1.markdown(f"### {_lock}#{tid} {title}")
+            _pin = "📌 " if is_pinned else ""
+            h1.markdown(f"### {_pin}{_lock}#{tid} {title}")
             if is_confidential:
                 h1.markdown(
                     "<span style='padding:2px 8px; border-radius:10px; "
@@ -15117,6 +15212,8 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                     "🔒 회사 경영(보안)</span>",
                     unsafe_allow_html=True,
                 )
+            if task_tags:
+                _render_tag_chips(task_tags)
             h2.markdown(
                 f"<div style='text-align:right; font-size:0.95rem;'>"
                 f"<span style='padding:4px 10px; border-radius:12px; "
@@ -15127,6 +15224,12 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
             m1.markdown(f"👤 **담당** &nbsp; {assignee_names}")
             m2.markdown(f"📅 **마감** &nbsp; {due}")
             m3.caption(f"작성: {_uname_to_display(task.get('created_by'))}  ·  하위업무 {sub_count}")
+
+            if is_admin:
+                _pin_label = "📌 고정 해제" if is_pinned else "📌 상단 고정"
+                if st.button(_pin_label, key=f"task_pin_{tid}"):
+                    _tb.update_task_fields(tid, me_uname, is_pinned=not is_pinned)
+                    st.rerun()
 
             desc = (task.get("description") or "").strip()
             if desc:
@@ -15152,7 +15255,8 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 unsafe_allow_html=True,
             )
             _lock = "🔒 " if is_confidential else ""
-            c2.markdown(f"{indent}↳ **{_lock}#{tid} {title}**", unsafe_allow_html=True)
+            _pin = "📌 " if is_pinned else ""
+            c2.markdown(f"{indent}↳ **{_pin}{_lock}#{tid} {title}**", unsafe_allow_html=True)
             c3.caption(f"👤 {assignee_names}")
             c4.caption(f"📅 {due}")
             with st.expander("자세히 보기 / 수정", expanded=False):
@@ -15498,6 +15602,384 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                         st.rerun()
                     else:
                         st.error(f"등록 실패: {sub_err}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 📝 사내 게시판 (게시물)
+# ─────────────────────────────────────────────────────────────────────
+
+def _render_tag_chips(tags: list[str]):
+    """태그를 칩 형태로 표시."""
+    if not tags:
+        return
+    chips = "".join(
+        f"<span style='display:inline-block; padding:1px 8px; margin:1px 3px 1px 0; "
+        f"border-radius:10px; background:#eef2ff; color:#3730a3; font-size:0.72rem;'>#{t}</span>"
+        for t in tags
+    )
+    st.markdown(chips, unsafe_allow_html=True)
+
+
+def _render_post_comment_input(post_id: int, me_uname: str, parent_cid: int | None, key_prefix: str):
+    """게시판용 댓글/답글 + 파일 첨부 입력. _render_comment_input(task용)의 게시판 버전."""
+    import post_board as _pb  # noqa: WPS433
+
+    ver_key = f"{key_prefix}_files_ver"
+    err_key = f"{key_prefix}_att_errs"
+    ver = int(st.session_state.get(ver_key, 0))
+    files_key = f"{key_prefix}_files_{ver}"
+
+    for _prev_err in st.session_state.pop(err_key, []):
+        st.error(_prev_err)
+
+    files = st.file_uploader(
+        "📎 파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
+        accept_multiple_files=True,
+        key=files_key,
+    )
+    _render_upload_preview(files)
+
+    with st.form(f"{key_prefix}_form", clear_on_submit=True):
+        body = st.text_area(
+            "내용",
+            key=f"{key_prefix}_body",
+            height=80,
+            placeholder="내용을 입력하세요. (첨부만 등록하려면 비워둬도 됩니다)",
+        )
+        label = "↪ 답글 등록" if parent_cid else "💬 댓글 등록"
+        if st.form_submit_button(label, type="primary"):
+            if not (body or "").strip() and not files:
+                st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
+                return
+            new_cid, cm_err = _pb.post_comment(
+                post_id, me_uname, body or "(첨부)", parent_comment_id=parent_cid
+            )
+            if cm_err:
+                st.error(f"댓글 등록 실패: {cm_err}")
+                return
+            att_errors: list[str] = []
+            for f in files or []:
+                try:
+                    f.seek(0)
+                except Exception:
+                    pass
+                _row, ferr = _pb.attach_file(
+                    post_id=post_id, comment_id=new_cid,
+                    uploaded_file=f, uploaded_by=me_uname,
+                )
+                if ferr:
+                    att_errors.append(f"{f.name}: {ferr}")
+            st.session_state[ver_key] = ver + 1
+            if att_errors:
+                st.session_state[err_key] = ["첨부 실패: " + e for e in att_errors]
+            flash("댓글이 등록되었습니다.")
+            st.rerun()
+
+
+def _render_post_card(post: dict, me_uname: str, role: str):
+    """게시물 1건 카드: 본문·태그·첨부 갤러리·댓글 트리·수정/삭제/핀."""
+    import post_board as _pb  # noqa: WPS433
+
+    pid = int(post["id"])
+    title = post.get("title", "")
+    is_pinned = bool(post.get("is_pinned"))
+    scope = post.get("scope") or "store"
+    tags = _pb.split_tags(post.get("tags"))
+    is_admin = role in ("store_admin", "superadmin")
+    is_author = post.get("author") == me_uname
+    can_edit = is_admin or is_author
+
+    pin_mark = "📌 " if is_pinned else ""
+    scope_badge = "🌐 전체공용" if scope == "company" else "🏪 매장별"
+
+    with st.container(border=True):
+        h1, h2 = st.columns([8, 2])
+        h1.markdown(f"### {pin_mark}{title}")
+        h2.markdown(
+            f"<div style='text-align:right; font-size:0.78rem; color:#64748b;'>{scope_badge}</div>",
+            unsafe_allow_html=True,
+        )
+        _render_tag_chips(tags)
+        st.caption(
+            f"작성: {_uname_to_display(post.get('author'))} · {str(post.get('created_at',''))[:19]}"
+        )
+
+        content = (post.get("content") or "").strip()
+        if content:
+            st.write(content)
+
+        # 첨부 (게시물 직속)
+        all_atts = _pb.load_post_attachments_cached(pid)
+        atts_by_comment: dict[int, list[dict]] = {}
+        atts_for_post: list[dict] = []
+        for a in all_atts:
+            cid_raw = a.get("comment_id")
+            if cid_raw:
+                atts_by_comment.setdefault(int(cid_raw), []).append(a)
+            else:
+                atts_for_post.append(a)
+        if atts_for_post:
+            n_cols = min(len(atts_for_post), 3)
+            a_cols = st.columns(n_cols)
+            for i, a in enumerate(atts_for_post):
+                with a_cols[i % n_cols]:
+                    _render_attachment_inline(a, key_suffix=f"post{pid}")
+
+        # 관리/편집 도구
+        with st.expander("💬 댓글 · 첨부 · 관리", expanded=False):
+            if can_edit:
+                ec1, ec2, ec3 = st.columns([2, 2, 6])
+                if is_admin:
+                    _pin_label = "📌 고정 해제" if is_pinned else "📌 상단 고정"
+                    if ec1.button(_pin_label, key=f"post_pin_{pid}"):
+                        _pb.toggle_post_pin(pid, not is_pinned)
+                        st.rerun()
+                if ec2.button("🗑️ 삭제", key=f"post_del_{pid}"):
+                    _ok, _err = _pb.delete_post(pid)
+                    if _ok:
+                        flash("게시물이 삭제되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"삭제 실패: {_err}")
+
+                # 인라인 수정 폼
+                with st.expander("✏️ 게시물 수정", expanded=False):
+                    with st.form(f"post_edit_{pid}"):
+                        e_title = st.text_input("제목", value=title, key=f"pe_title_{pid}")
+                        e_content = st.text_area("내용", value=content, key=f"pe_content_{pid}", height=120)
+                        e_tags = st.text_input(
+                            "태그 (쉼표로 구분)", value=",".join(tags), key=f"pe_tags_{pid}",
+                            placeholder="예: 참고사이트, ID&PW, 2026",
+                        )
+                        if st.form_submit_button("저장", type="primary"):
+                            _ok, _err = _pb.update_post(
+                                pid, title=e_title, content=e_content, tags=e_tags,
+                            )
+                            if _ok:
+                                flash("게시물이 수정되었습니다.")
+                                st.rerun()
+                            else:
+                                st.error(f"수정 실패: {_err}")
+
+            # 게시물 본문에 파일 추가 첨부
+            _post_file_ver_key = f"post_files_ver_{pid}"
+            _post_file_ver = int(st.session_state.get(_post_file_ver_key, 0))
+            _post_files = st.file_uploader(
+                "📎 게시물에 파일 첨부 (다중 가능)",
+                accept_multiple_files=True,
+                key=f"post_files_{pid}_{_post_file_ver}",
+            )
+            _render_upload_preview(_post_files)
+            if _post_files:
+                if st.button("📤 첨부 업로드", key=f"post_upload_btn_{pid}", type="primary"):
+                    _errs = []
+                    for _f in _post_files:
+                        try:
+                            _f.seek(0)
+                        except Exception:
+                            pass
+                        _, _ferr = _pb.attach_file(post_id=pid, comment_id=None,
+                                                   uploaded_file=_f, uploaded_by=me_uname)
+                        if _ferr:
+                            _errs.append(f"{_f.name}: {_ferr}")
+                    st.session_state[_post_file_ver_key] = _post_file_ver + 1
+                    if _errs:
+                        st.warning("일부 첨부 실패: " + "; ".join(_errs))
+                    else:
+                        flash("파일이 업로드되었습니다.")
+                    st.rerun()
+
+            st.markdown("---")
+            st.markdown("**💬 댓글**")
+            comments = _pb.load_post_comments_cached(pid)
+            cm_by_parent: dict = {}
+            for cm in comments:
+                cm_by_parent.setdefault(cm.get("parent_comment_id"), []).append(cm)
+
+            def _render_cm(cm: dict, depth: int):
+                cm_id = int(cm["id"])
+                if depth > 0:
+                    spacer, body_col = st.columns([max(depth, 1) * 0.4, 10])
+                    holder = body_col
+                    with spacer:
+                        st.markdown("&nbsp;", unsafe_allow_html=True)
+                else:
+                    holder = st.container()
+                with holder:
+                    with st.container(border=True):
+                        head = f"**{_uname_to_display(cm.get('author'))}** · {str(cm.get('created_at',''))[:19]}"
+                        if depth > 0:
+                            head += "  ·  ↪ 답글"
+                        st.caption(head)
+                        st.write(cm.get("body", ""))
+                        cm_atts = atts_by_comment.get(cm_id, [])
+                        if cm_atts:
+                            n_cols = min(len(cm_atts), 3)
+                            a_cols = st.columns(n_cols)
+                            for i, a in enumerate(cm_atts):
+                                with a_cols[i % n_cols]:
+                                    _render_attachment_inline(a, key_suffix=f"pcm{cm_id}")
+                        with st.expander("↪ 답글 달기", expanded=False):
+                            _render_post_comment_input(
+                                pid, me_uname, parent_cid=cm_id,
+                                key_prefix=f"preply_{pid}_{cm_id}",
+                            )
+                for child in cm_by_parent.get(cm_id, []):
+                    _render_cm(child, depth + 1)
+
+            root_comments = cm_by_parent.get(None, [])
+            if not root_comments:
+                st.caption("아직 댓글이 없습니다. 아래에서 첫 댓글을 남겨 보세요.")
+            for r in root_comments:
+                _render_cm(r, 0)
+
+            st.markdown("**✍ 새 댓글 작성**")
+            _render_post_comment_input(pid, me_uname, parent_cid=None, key_prefix=f"pnew_{pid}")
+
+
+def render_internal_board():
+    """사내 게시판 — ERP 메뉴 하위. 글 작성·댓글·첨부·태그·검색·상단고정."""
+    import post_board as _pb  # noqa: WPS433
+
+    if not ensure_supabase_post_tables():
+        st.error(
+            "사내 게시판 테이블(app_posts)이 아직 생성되지 않았습니다. "
+            "`.streamlit/secrets.toml`에 `[supabase] database_url`이 설정되어 있으면 "
+            "앱을 새로고침하면 자동 생성됩니다. "
+            "그래도 안 되면 Supabase SQL Editor에서 `SUPABASE_APP_POSTS.sql`을 실행해 주세요."
+        )
+        if st.button("🔄 테이블 생성 다시 시도", key="retry_post_tables"):
+            st.session_state.pop("_supa_post_tables_avail", None)
+            st.rerun()
+        return
+
+    current_user = st.session_state.get("current_user") or {}
+    role = (current_user.get("role") or "user").strip()
+    me_uname = (current_user.get("username") or current_user.get("email") or "").strip()
+    store_id = (current_user.get("store_id") or st.session_state.get("current_store_id"))
+    store_name: str | None = None
+    if store_id:
+        try:
+            _sc, _se = get_supabase_client()
+            if _sc and not _se:
+                _sr = _sc.table("app_stores").select("store_name").eq("id", int(store_id)).maybe_single().execute()
+                _sd = _sr.data if isinstance(_sr.data, dict) else None
+                store_name = (_sd or {}).get("store_name")
+        except Exception:
+            store_name = None
+
+    st.header("📝 게시물")
+    st.caption("사내 게시판 — 참고자료·과거 업무·계정 정보 등을 글로 남기고 댓글·첨부로 공유합니다.")
+
+    # ── 작성 영역 (첨부 이미지 스타일 탭) ──────────────────────
+    with st.expander("✍️ 게시물 작성", expanded=False):
+        tab_post, tab_task, tab_sched, tab_todo, tab_vote = st.tabs(
+            ["📝 글", "✅ 업무", "📅 일정", "☑️ 할일", "🗳️ 투표"]
+        )
+        with tab_post:
+            _render_new_post_form(me_uname, store_name, role, store_id)
+        for _t, _label in ((tab_task, "업무"), (tab_sched, "일정"), (tab_todo, "할일"), (tab_vote, "투표")):
+            with _t:
+                st.info(f"'{_label}' 기능은 준비 중입니다. 현재는 '글' 게시물 작성만 지원합니다.")
+
+    st.divider()
+
+    # ── 검색 / 태그 필터 ───────────────────────────────────────
+    posts = _pb.load_posts_cached(store_name, is_superadmin=(role == "superadmin"))
+
+    all_tags: list[str] = []
+    for p in posts:
+        for t in _pb.split_tags(p.get("tags")):
+            if t not in all_tags:
+                all_tags.append(t)
+
+    sc1, sc2 = st.columns([3, 2])
+    with sc1:
+        keyword = st.text_input("🔍 검색 (제목·내용·태그)", key="post_search_kw", placeholder="키워드 입력")
+    with sc2:
+        sel_tags = st.multiselect("태그 필터", options=sorted(all_tags), key="post_search_tags")
+
+    kw = (keyword or "").strip().lower()
+    filtered = []
+    for p in posts:
+        p_tags = _pb.split_tags(p.get("tags"))
+        if sel_tags and not any(t in p_tags for t in sel_tags):
+            continue
+        if kw:
+            hay = f"{p.get('title','')} {p.get('content','') or ''} {p.get('tags','') or ''}".lower()
+            if kw not in hay:
+                continue
+        filtered.append(p)
+
+    # 고정 우선 정렬 (load 단계에서 이미 정렬되었지만 필터 후 재보장)
+    filtered.sort(key=lambda x: (not bool(x.get("is_pinned")), str(x.get("created_at", ""))), reverse=False)
+    filtered.sort(key=lambda x: bool(x.get("is_pinned")), reverse=True)
+
+    pinned_n = sum(1 for p in filtered if p.get("is_pinned"))
+    st.subheader(f"📌 게시물 목록 ({len(filtered)}건 · 고정 {pinned_n})")
+    if not filtered:
+        st.info("표시할 게시물이 없습니다. 위에서 새 게시물을 작성해 주세요.")
+        return
+
+    for p in filtered:
+        _render_post_card(p, me_uname, role)
+
+
+def _render_new_post_form(me_uname: str, store_name: str | None, role: str, store_id):
+    """새 게시물 작성 폼 ('글' 탭)."""
+    import post_board as _pb  # noqa: WPS433
+
+    np_ver = int(st.session_state.get("np_files_ver", 0))
+    np_files_key = f"np_files_{np_ver}"
+    np_files = st.file_uploader(
+        "📎 파일 첨부 (선택, 이미지·문서 등 모든 종류 다중 가능)",
+        accept_multiple_files=True,
+        key=np_files_key,
+    )
+    _render_upload_preview(np_files)
+
+    with st.form("new_post_form", clear_on_submit=True):
+        title = st.text_input("제목 *", key="np_title", placeholder="제목을 입력하세요")
+        content = st.text_area("내용", key="np_content", height=160, placeholder="여기에 내용을 작성해 주세요")
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            scope = st.selectbox(
+                "열람 범위",
+                options=_pb.POST_SCOPES,
+                index=0,
+                format_func=lambda s: _pb.POST_SCOPE_LABELS.get(s, s),
+                key="np_scope",
+            )
+        with pc2:
+            tags = st.text_input("태그 (쉼표로 구분)", key="np_tags", placeholder="예: 참고사이트, ID&PW, 2026")
+        is_pinned = st.checkbox("📌 상단 고정", value=False, key="np_pin")
+        st.caption("⚠️ 계정·비밀번호 등 민감정보는 열람 범위와 태그를 신중히 설정해 저장하세요. (본문은 평문 저장됩니다)")
+
+        if st.form_submit_button("등록", type="primary"):
+            if not (title or "").strip():
+                st.error("제목을 입력해 주세요.")
+            else:
+                new_id, err = _pb.create_post(
+                    title=title, content=content, author=me_uname,
+                    store_name=store_name, scope=scope, tags=tags, is_pinned=is_pinned,
+                )
+                if new_id:
+                    for f in np_files or []:
+                        try:
+                            f.seek(0)
+                        except Exception:
+                            pass
+                        _row, ferr = _pb.attach_file(
+                            post_id=new_id, comment_id=None,
+                            uploaded_file=f, uploaded_by=me_uname,
+                        )
+                        if ferr:
+                            st.warning(f"첨부 실패 ({f.name}): {ferr}")
+                    st.session_state["np_files_ver"] = np_ver + 1
+                    flash(f"게시물이 등록되었습니다. (#{new_id})")
+                    st.rerun()
+                else:
+                    st.error(f"등록 실패: {err}")
 
 
 def render_employee_management():
@@ -21839,6 +22321,8 @@ def main():
     _badge = f"  🔔 {_unread_n}" if _unread_n > 0 else ""
     if st.sidebar.button(f"📋 사내 업무{_badge}", width='stretch'):
         st.session_state["active_admin_page"] = "internal_work"
+    if st.sidebar.button("📝 게시물", width='stretch'):
+        st.session_state["active_admin_page"] = "internal_board"
 
     st.sidebar.markdown("---")
     if st.sidebar.button("🚪 로그아웃", width='stretch'):
@@ -21893,6 +22377,10 @@ def main():
 
     if st.session_state.get("active_admin_page") == "internal_work":
         render_internal_work()
+        return
+
+    if st.session_state.get("active_admin_page") == "internal_board":
+        render_internal_board()
         return
 
     # Superadmin: 5탭 최고 관리자 메뉴
