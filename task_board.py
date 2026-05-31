@@ -57,6 +57,10 @@ TASK_PRIORITY_LABELS = {"low": "낮음", "normal": "보통", "high": "높음", "
 
 ASSIGNEE_ROLES = ["owner", "assignee", "watcher"]
 
+# 보안(회사 경영) 카테고리: 작성자 + 지정 담당자에게만 보이는 업무
+CONFIDENTIAL_CATEGORY = "company_mgmt"
+CATEGORY_LABELS = {"company_mgmt": "회사 경영(보안)"}
+
 ATTACHMENT_BUCKET = "task-attachments"
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 
@@ -78,22 +82,74 @@ PAYMENT_CHANGE_TYPE_LABELS = {
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_tasks_cached(store_name: str | None = None, include_done: bool = False) -> list[dict]:
-    """매장별 업무 목록. None이면 전 매장 (superadmin용)."""
+    """매장별 일반 업무 목록. None이면 전 매장 (superadmin용).
+    보안(회사 경영) 업무는 여기서 제외하고 load_my_confidential_tasks_cached로만 노출."""
     client, err = _client()
     if err or not client:
         return []
-    try:
-        q = client.table("app_tasks").select(
-            "id, parent_task_id, title, description, status, priority, "
-            "start_date, due_date, created_by, store_name, db_filename, "
-            "created_at, updated_at, closed_at"
-        )
+
+    def _run(select_cols: str):
+        q = client.table("app_tasks").select(select_cols)
         if store_name:
             q = q.eq("store_name", store_name)
         if not include_done:
             q = q.not_.in_("status", ["done", "on_hold"])
+        return (q.order("created_at", desc=True).execute().data or [])
+
+    _cols_full = (
+        "id, parent_task_id, title, description, status, priority, "
+        "start_date, due_date, created_by, store_name, db_filename, "
+        "category, created_at, updated_at, closed_at"
+    )
+    _cols_legacy = (
+        "id, parent_task_id, title, description, status, priority, "
+        "start_date, due_date, created_by, store_name, db_filename, "
+        "created_at, updated_at, closed_at"
+    )
+    try:
+        rows = _run(_cols_full)
+    except Exception as e:
+        # 구 스키마 호환: category 컬럼 미존재 시 제외 후 재시도
+        if "category" in str(e):
+            try:
+                rows = _run(_cols_legacy)
+            except Exception:
+                return []
+        else:
+            return []
+    # 보안 업무는 일반 목록에서 완전 제외 (superadmin 포함)
+    return [t for t in rows if t.get("category") != CONFIDENTIAL_CATEGORY]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_my_confidential_tasks_cached(me_username: str, include_done: bool = False) -> list[dict]:
+    """내가 작성했거나 담당자로 지정된 보안(회사 경영) 업무만 반환. 매장 무관."""
+    if not me_username:
+        return []
+    client, err = _client()
+    if err or not client:
+        return []
+    try:
+        # 내가 담당자로 지정된 task_id 수집
+        ar = client.table("app_task_assignees").select("task_id").eq(
+            "employee_username", me_username
+        ).execute()
+        my_assigned_ids = {int(row["task_id"]) for row in (ar.data or []) if row.get("task_id") is not None}
+
+        q = client.table("app_tasks").select(
+            "id, parent_task_id, title, description, status, priority, "
+            "start_date, due_date, created_by, store_name, db_filename, "
+            "category, created_at, updated_at, closed_at"
+        ).eq("category", CONFIDENTIAL_CATEGORY)
+        if not include_done:
+            q = q.not_.in_("status", ["done", "on_hold"])
         r = q.order("created_at", desc=True).execute()
-        return r.data or []
+        rows = r.data or []
+        # 가시성: 작성자 본인이거나 담당자인 경우만
+        return [
+            t for t in rows
+            if t.get("created_by") == me_username or int(t["id"]) in my_assigned_ids
+        ]
     except Exception:
         return []
 
@@ -195,6 +251,7 @@ def load_templates_cached() -> dict[str, str]:
 def clear_task_caches():
     """업무·알림·템플릿 관련 모든 캐시를 무효화."""
     load_tasks_cached.clear()
+    load_my_confidential_tasks_cached.clear()
     load_task_assignees_cached.clear()
     load_task_comments_cached.clear()
     load_task_attachments_cached.clear()
@@ -222,8 +279,10 @@ def create_task(
     due_date: date | None = None,
     priority: str = "normal",
     assignees: list[str] | None = None,
+    category: str | None = None,
 ) -> tuple[int | None, str | None]:
-    """업무 생성. assignees는 owner+assignees를 묶은 username 리스트."""
+    """업무 생성. assignees는 owner+assignees를 묶은 username 리스트.
+    category가 CONFIDENTIAL_CATEGORY면 보안(회사 경영) 업무로 작성자·담당자에게만 노출."""
     client, err = _client()
     if err or not client:
         return None, err or "Supabase 연결 불가"
@@ -239,8 +298,18 @@ def create_task(
             "store_name": store_name,
             "db_filename": db_filename,
             "parent_task_id": int(parent_task_id) if parent_task_id else None,
+            "category": (category or None),
         }
-        r = client.table("app_tasks").insert(row).execute()
+        try:
+            r = client.table("app_tasks").insert(row).execute()
+        except Exception as _ins_e:
+            # 구 스키마 호환: category 컬럼 미존재 시(PGRST204) 제외 후 재시도
+            _msg = str(_ins_e)
+            if "category" in _msg and ("PGRST204" in _msg or "schema cache" in _msg or "column" in _msg):
+                row.pop("category", None)
+                r = client.table("app_tasks").insert(row).execute()
+            else:
+                raise
         new_id = int(r.data[0]["id"]) if r.data else None
         if not new_id:
             return None, "insert 후 id를 가져오지 못했습니다."

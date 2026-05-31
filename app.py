@@ -537,6 +537,7 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_USERS_PHONE.sql",
         "SUPABASE_APP_TASKS.sql",
         "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql",
+        "SUPABASE_APP_TASKS_CATEGORY.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -593,7 +594,8 @@ def _supabase_run_task_tables_sql() -> bool:
         return False
     ok = False
     for fname in ("SUPABASE_APP_USERS_PHONE.sql", "SUPABASE_APP_TASKS.sql",
-                  "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql"):
+                  "SUPABASE_APP_PAYMENT_CHANGE_REQUESTS.sql",
+                  "SUPABASE_APP_TASKS_CATEGORY.sql"):
         fpath = os.path.join(BASE_DIR, fname)
         if os.path.isfile(fpath) and _supabase_run_sql_file(db_url, fpath):
             ok = True
@@ -14347,6 +14349,14 @@ def render_internal_work():
         store_name=None if role == "superadmin" else store_name,
         include_done=show_done,
     )
+    # 보안(회사 경영) 업무: 작성자/담당자인 것만 별도로 합치고 id 기준 중복 제거
+    _conf_tasks = _tb.load_my_confidential_tasks_cached(me_uname, include_done=show_done)
+    if _conf_tasks:
+        _seen_ids = {int(t["id"]) for t in tasks}
+        for _ct in _conf_tasks:
+            if int(_ct["id"]) not in _seen_ids:
+                tasks.append(_ct)
+                _seen_ids.add(int(_ct["id"]))
     tasks = [t for t in tasks if (not status_filter) or t.get("status") in status_filter]
 
     if not tasks:
@@ -14938,8 +14948,21 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
     import task_board as _tb  # noqa: WPS433
 
     with st.expander("➕ 새 업무 등록", expanded=False):
-        # 같은 매장 직원 목록
-        emp_options = _internal_work_employee_options(store_id, role)
+        # 카테고리 선택 (관리자 전용) — form 밖에 두어 선택 즉시 담당자/상위 후보가 갱신됨
+        is_confidential = False
+        if role in ("store_admin", "superadmin"):
+            _cat_choice = st.radio(
+                "업무 구분",
+                options=["(일반 업무)", _tb.CATEGORY_LABELS[_tb.CONFIDENTIAL_CATEGORY]],
+                horizontal=True,
+                key="nt_category",
+            )
+            is_confidential = (_cat_choice == _tb.CATEGORY_LABELS[_tb.CONFIDENTIAL_CATEGORY])
+            if is_confidential:
+                st.caption("🔒 회사 경영(보안) 업무: 작성자와 지정한 담당자에게만 보입니다. 다른 매장 직원도 담당자로 지정할 수 있습니다.")
+
+        # 직원 목록 — 보안 업무면 교차 매장 전체, 아니면 현재 매장
+        emp_options = _internal_work_employee_options(store_id, role, cross_store=is_confidential)
         emp_username_to_label = {u: lbl for u, lbl in emp_options}
 
         # 파일 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
@@ -14974,7 +14997,9 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
                 format_func=lambda u: emp_username_to_label.get(u, u),
                 key="nt_assignees",
             )
-            parent_options = _internal_work_parent_options(store_name, role)
+            parent_options = _internal_work_parent_options(
+                store_name, role, confidential=is_confidential, me_uname=me_uname,
+            )
             parent_label_to_id = {lbl: i for i, lbl in parent_options}
             parent_label = st.selectbox(
                 "상위 업무 (선택)",
@@ -14999,6 +15024,7 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
                         due_date=due,
                         priority=priority,
                         assignees=assignees,
+                        category=_tb.CONFIDENTIAL_CATEGORY if is_confidential else None,
                     )
                     if new_id:
                         # 업무 생성 후 첨부 파일 업로드 (task 레벨, comment_id=None)
@@ -15020,14 +15046,16 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
                         st.error(f"등록 실패: {err}")
 
 
-def _internal_work_employee_options(store_id, role: str) -> list[tuple[str, str]]:
-    """현재 매장 직원 (superadmin은 전 직원). [(username, label)]."""
+def _internal_work_employee_options(store_id, role: str, cross_store: bool = False) -> list[tuple[str, str]]:
+    """현재 매장 직원 (superadmin은 전 직원). [(username, label)].
+    cross_store=True이고 관리자급(store_admin/superadmin)이면 전 직원 반환 (보안 업무 교차 지정용)."""
     users = _get_supabase_users_list() or []
+    _all_users = cross_store and role in ("store_admin", "superadmin")
     out: list[tuple[str, str]] = []
     for u in users:
         if not u.get("username"):
             continue
-        if role == "superadmin":
+        if role == "superadmin" or _all_users:
             ok = True
         else:
             store_ids = _get_supabase_user_store_ids(u.get("id")) if u.get("id") else []
@@ -15046,10 +15074,16 @@ def _internal_work_employee_options(store_id, role: str) -> list[tuple[str, str]
     return uniq
 
 
-def _internal_work_parent_options(store_name: str | None, role: str) -> list[tuple[int, str]]:
-    """상위 업무 후보 (현재 활성 업무 전체 — 하위에 하위를 달 수 있도록 모두 포함)."""
+def _internal_work_parent_options(store_name: str | None, role: str,
+                                  confidential: bool = False,
+                                  me_uname: str | None = None) -> list[tuple[int, str]]:
+    """상위 업무 후보 (현재 활성 업무 전체 — 하위에 하위를 달 수 있도록 모두 포함).
+    confidential=True면 내가 볼 수 있는 보안 업무만 후보로 (타인 보안 업무 제목 누출 방지)."""
     import task_board as _tb  # noqa: WPS433
-    tasks = _tb.load_tasks_cached(store_name=None if role == "superadmin" else store_name, include_done=False)
+    if confidential:
+        tasks = _tb.load_my_confidential_tasks_cached(me_uname or "", include_done=False)
+    else:
+        tasks = _tb.load_tasks_cached(store_name=None if role == "superadmin" else store_name, include_done=False)
     return [(int(t["id"]), f"#{t['id']} {t['title']}") for t in tasks]
 
 
@@ -15063,6 +15097,7 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
     title = task.get("title", "")
     status = task.get("status", "requested")
     badge = f"{_tb.TASK_STATUS_EMOJI.get(status, '')} {_tb.TASK_STATUS_LABELS.get(status, status)}"
+    is_confidential = task.get("category") == _tb.CONFIDENTIAL_CATEGORY
     assignees = assignees_map.get(tid, [])
     assignee_names = ", ".join(_uname_to_display(a.get("employee_username")) for a in assignees) or "(없음)"
     due = task.get("due_date") or "-"
@@ -15073,7 +15108,15 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
         sub_count = _count_descendants(by_parent, tid)
         with st.container(border=True):
             h1, h2 = st.columns([7, 3])
-            h1.markdown(f"### #{tid} {title}")
+            _lock = "🔒 " if is_confidential else ""
+            h1.markdown(f"### {_lock}#{tid} {title}")
+            if is_confidential:
+                h1.markdown(
+                    "<span style='padding:2px 8px; border-radius:10px; "
+                    "background:#fee2e2; color:#991b1b; font-size:0.78rem; font-weight:700;'>"
+                    "🔒 회사 경영(보안)</span>",
+                    unsafe_allow_html=True,
+                )
             h2.markdown(
                 f"<div style='text-align:right; font-size:0.95rem;'>"
                 f"<span style='padding:4px 10px; border-radius:12px; "
@@ -15108,7 +15151,8 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 f"background:#f1f5f9; font-size:0.85rem;'>{badge}</span>",
                 unsafe_allow_html=True,
             )
-            c2.markdown(f"{indent}↳ **#{tid} {title}**", unsafe_allow_html=True)
+            _lock = "🔒 " if is_confidential else ""
+            c2.markdown(f"{indent}↳ **{_lock}#{tid} {title}**", unsafe_allow_html=True)
             c3.caption(f"👤 {assignee_names}")
             c4.caption(f"📅 {due}")
             with st.expander("자세히 보기 / 수정", expanded=False):
@@ -15213,6 +15257,7 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     is_creator = task.get("created_by") == me_uname
     is_assignee = any(a.get("employee_username") == me_uname for a in assignees)
     can_edit = role in ("store_admin", "superadmin") or is_creator or is_assignee
+    is_confidential = task.get("category") == _tb.CONFIDENTIAL_CATEGORY
 
     # 결제변경 검증 전용 카드 (메타가 있으면 표시)
     _render_payment_change_verify_panel(tid, me_uname, role, is_creator)
@@ -15249,7 +15294,7 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
 
         _cu = st.session_state.get("current_user") or {}
         _sid = _cu.get("store_id") or st.session_state.get("current_store_id")
-        emp_options = _internal_work_employee_options(_sid, role)
+        emp_options = _internal_work_employee_options(_sid, role, cross_store=is_confidential)
         cur_users = [a.get("employee_username") for a in assignees if a.get("employee_username")]
         new_assignees = st.multiselect(
             "담당자",
@@ -15404,8 +15449,11 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     with st.expander("➕ 하위 업무 추가", expanded=False):
         _cu2 = st.session_state.get("current_user") or {}
         _sid2 = _cu2.get("store_id") or st.session_state.get("current_store_id")
-        sub_emp_opts = _internal_work_employee_options(_sid2, role)
+        # 보안 업무의 하위 업무는 카테고리를 상속 → 담당자도 교차 매장 후보 사용
+        sub_emp_opts = _internal_work_employee_options(_sid2, role, cross_store=is_confidential)
         sub_emp_label = dict(sub_emp_opts)
+        if is_confidential:
+            st.caption("🔒 보안(회사 경영) 업무의 하위 업무도 작성자·담당자에게만 보입니다.")
         with st.form(f"sub_task_form_{tid}", clear_on_submit=True):
             sub_title = st.text_input("제목 *", key=f"st_title_{tid}", placeholder="하위 업무 제목")
             sub_desc = st.text_area("설명", key=f"st_desc_{tid}", height=80)
@@ -15443,6 +15491,7 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                         due_date=sub_due,
                         priority=sub_pri,
                         assignees=sub_assignees,
+                        category=_tb.CONFIDENTIAL_CATEGORY if is_confidential else None,
                     )
                     if new_sub_id:
                         flash(f"하위 업무가 등록되었습니다. (#{new_sub_id})")
