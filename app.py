@@ -10822,6 +10822,10 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     for l in all_logs:
         l["employee_name"] = _resolve(l.get("employee_name") or "")
 
+    # 인원 충족 체크용 전체 데이터 (매장/직원 필터 적용 전) — 항상 전 매장·전 직원 기준으로 산출
+    # ⚠️ 매장 필터 후에 스냅샷하면, 다른 매장의 룰 평가 시 0명으로 계산되어 모든 매장이 인원부족으로 잡히는 버그.
+    all_shifts_for_rules = all_shifts[:]
+
     # 매장 필터 적용
     # - 특정 매장 선택: db_filename 일치 OR work_location_name 이 해당 매장명과 일치하는 항목
     # - 기타 선택: work_location_name 이 있고, 등록된 매장명/db 목록에 해당하지 않는 항목
@@ -10842,9 +10846,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                       or (s.get("work_location_name") or "").strip() == _sel_store_name]
         # 근태 로그는 소속 db 기준으로만 존재
         all_logs = [l for l in all_logs if l.get("_dbf") == _sel_dbf]
-
-    # 인원 충족 체크용 전체 데이터 (직원 필터 적용 전) — 항상 전 직원 기준으로 판단
-    all_shifts_for_rules = all_shifts[:]
 
     # 직원 필터 적용 (정규화 후 비교) — 화면 표시용에만 적용
     if selected_emp and selected_emp != "(전체 직원)":
@@ -10908,6 +10909,11 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     contributing_emps: dict[tuple[str, str], list[dict]] = {}
     _DOW_LBL = ["월", "화", "수", "목", "금", "토", "일"]
     for (dbf, dow), rules in rules_by_store_dow.items():
+        # 매장 필터가 활성이면 선택된 매장만 평가 (다른 매장의 부족/과다는 사용자가 보고 있지 않음)
+        if _sel_is_etc:
+            continue  # 외부 행사 뷰에서는 매장 인원 룰 평가 의미 없음
+        if _sel_dbf and dbf != _sel_dbf:
+            continue
         _sname = _dbf_to_sn.get(dbf) or dbf
         for d_iso, day_shifts in all_shifts_by_date_for_rules.items():
             try:
