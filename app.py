@@ -11019,22 +11019,27 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     f"📌 {_ev_title}{_ev_span}<span style='color:#999;'>{_ev_time}</span></div>"
                 )
 
-            # 근무 계획 (shift_schedules) — 매장 컬러 배경 바 스타일
+            # 근무 계획 (shift_schedules) — 실근무지(work_location_name) 기준 매장 컬러 사용
+            #   소속(_dbf)이 아닌 실근무지 색으로 통일 → 같은 매장 캘린더 안 직원들은 모두 같은 색
             for sh in shifts_by_date.get(d_iso, []):
-                dbf  = sh.get("_dbf", current_db)
-                sc   = store_color.get(dbf, "#555")
+                _eff_dbf = _shift_effective_dbf(sh) or sh.get("_dbf") or current_db
+                _eff_sn  = _dbf_to_sn.get(_eff_dbf, "")
+                sc = store_color.get(_eff_dbf, "#FB8C00")  # 등록 매장이 아니면 외부 행사 — 주황
                 emp  = sh.get("employee_name") or ""
                 ss   = str(sh.get("shift_start") or "")[:5]
                 ee   = str(sh.get("shift_end") or "")[:5]
                 time_txt = f" {ss}~{ee}" if ss and ee else ""
                 _wloc = (sh.get("work_location_name") or "").strip()
-                _store_label = _dbf_to_sn.get(dbf, "")
-                # 장소 배지: work_location_name이 있으면 그것을, 없으면 매장명을 표시
-                _badge_label = _wloc if _wloc else _store_label
-                _badge_color = "#607D8B" if _wloc else sc
-                sn_badge = (f"<span style='background:{_badge_color}; color:white; font-size:0.58rem;"
-                            f" padding:0px 3px; border-radius:2px; margin-right:2px;'>"
-                            f"{_badge_label}</span> ") if show_store_tag or _wloc else ""
+                # 배지 라벨: 실근무지(wloc 우선, 비면 실효 매장명)
+                _badge_label = _wloc if _wloc else _eff_sn
+                # 필터 뷰에서 자명한 정보(선택 매장과 같은 배지)는 생략
+                _badge_redundant = (not show_store_tag) and (not _sel_is_etc) and (_badge_label == sel_store)
+                _show_badge = (show_store_tag or _wloc) and not _badge_redundant and _badge_label
+                sn_badge = (
+                    f"<span style='background:{sc}; color:white; font-size:0.58rem;"
+                    f" padding:0px 3px; border-radius:2px; margin-right:2px;'>"
+                    f"{_badge_label}</span> "
+                ) if _show_badge else ""
                 cell.append(
                     f"<div style='margin-top:2px; border-left:3px solid {sc};"
                     f" background:{sc}15; padding:1px 3px; border-radius:0 2px 2px 0;'>"
@@ -11042,10 +11047,11 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     f"<span style='color:#666; font-size:0.65rem;'>{time_txt}</span></div>"
                 )
 
-            # 근태 기록 (attendance_logs) — 유형 배지 + 매장 컬러 이름
+            # 근태 기록 (attendance_logs) — 실근무지 기준 컬러 (work_location_name 컬럼이 있으면 우선)
             for lg in logs_by_date.get(d_iso, []):
-                dbf  = lg.get("_dbf", current_db)
-                sc   = store_color.get(dbf, "#555")
+                _eff_dbf = _shift_effective_dbf(lg) or lg.get("_dbf") or current_db
+                dbf = _eff_dbf  # 배지 라벨용 호환 변수 유지
+                sc = store_color.get(_eff_dbf, "#555")
                 wt   = lg.get("work_type") or "정상"
                 bc   = _ERP_BADGE_COLORS.get(wt, "#90A4AE")
                 emp  = lg.get("employee_name") or ""
