@@ -10891,11 +10891,21 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             _cur_d += timedelta(days=1)
 
     # 인원 부족/과다 산출 — 항상 전 직원 데이터 기준으로 판단 (직원 필터 무관)
+    # ⚠️ 카운팅 기준: work_location_name (파견 근무지) 우선, 비어있으면 _dbf (소속 매장).
+    #   - 배지 표시 로직과 일치시킴: 박성진 소속=A, 근무지=B면 B의 인원에 합산
+    #   - 외부 행사(유에코임주박람회 등 등록 매장 아님)면 어떤 매장에도 합산 X
+    def _shift_effective_dbf(s: dict):
+        wloc = (s.get("work_location_name") or "").strip()
+        if wloc:
+            return _sn_to_dbf.get(wloc)  # 외부 행사면 None
+        return s.get("_dbf")
+
     shortage_dates: dict[str, list[str]] = {}  # {d_iso: [부족_매장명, ...]}
     overstaff_dates: dict[str, list[str]] = {}  # {d_iso: [과다_매장명, ...]}
-    # 진단용: {(d_iso, store): "10:00~20:00 슬롯 실제 2명 / 적정 1명 (수요일, 소속기준)"}
     overstaff_details: dict[tuple[str, str], str] = {}
     shortage_details: dict[tuple[str, str], str] = {}
+    # 진단용: 각 (d_iso, 매장) 의 실제 카운트된 직원 목록
+    contributing_emps: dict[tuple[str, str], list[dict]] = {}
     _DOW_LBL = ["월", "화", "수", "목", "금", "토", "일"]
     for (dbf, dow), rules in rules_by_store_dow.items():
         _sname = _dbf_to_sn.get(dbf) or dbf
@@ -10906,7 +10916,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 continue
             if d.weekday() != dow:
                 continue
-            store_day_shifts = [s for s in day_shifts if s.get("_dbf") == dbf]
+            store_day_shifts = [s for s in day_shifts if _shift_effective_dbf(s) == dbf]
             for rule in rules:
                 slot_s = _erp_parse_time(rule.get("slot_start"))
                 slot_e = _erp_parse_time(rule.get("slot_end"))
@@ -10922,8 +10932,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         shortage_dates[d_iso].append(_sname)
                     shortage_details[(d_iso, _sname)] = (
                         f"{_slot_lbl} 슬롯 실제 {actual_cnt}명 / 최소 {_min_n}명 "
-                        f"({_DOW_LBL[dow]}요일, 소속(_dbf) 기준)"
+                        f"({_DOW_LBL[dow]}요일, 근무지(work_location_name) 우선 기준)"
                     )
+                    contributing_emps[(d_iso, _sname)] = store_day_shifts
                     break
                 # 과다 근무 체크 (optimal_staff 설정된 경우만)
                 _opt = rule.get("optimal_staff")
@@ -10933,8 +10944,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         overstaff_dates[d_iso].append(_sname)
                     overstaff_details[(d_iso, _sname)] = (
                         f"{_slot_lbl} 슬롯 실제 {actual_cnt}명 / 적정 {int(_opt)}명 "
-                        f"({_DOW_LBL[dow]}요일, 소속(_dbf) 기준 — work_location_name 파견은 미합산)"
+                        f"({_DOW_LBL[dow]}요일, 근무지(work_location_name) 우선 기준)"
                     )
+                    contributing_emps[(d_iso, _sname)] = store_day_shifts
                     break
 
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
@@ -11167,6 +11179,56 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     st.dataframe(
                         pd.DataFrame(_shift_dup_rows),
                         use_container_width=True, hide_index=True,
+                    )
+
+                # ── 🔬 부족/과다 사유 상세: 카운트에 합산된 직원 목록
+                st.markdown("---")
+                st.markdown("#### 🔬 부족/과다 사유 상세 — 매장별 합산된 직원")
+                st.caption(
+                    "카운팅은 **근무지(work_location_name) 우선** 기준입니다. "
+                    "work_location_name 이 비어있으면 직원의 소속 매장(_dbf)으로 합산되고, "
+                    "외부 행사(등록 매장이 아닌 곳)면 어떤 매장에도 합산되지 않습니다."
+                )
+                _flag_rows = []
+                for (d_iso2, sn2), shifts_list in sorted(contributing_emps.items()):
+                    label = "부족" if (d_iso2, sn2) in shortage_details else "과다"
+                    detail = shortage_details.get((d_iso2, sn2)) or overstaff_details.get((d_iso2, sn2)) or ""
+                    if shifts_list:
+                        for s in shifts_list:
+                            _flag_rows.append({
+                                "날짜": d_iso2,
+                                "유형": label,
+                                "매장(카운트 대상)": sn2,
+                                "사유": detail,
+                                "직원": s.get("employee_name") or "",
+                                "소속(_dbf)": _dbf_to_sn.get(s.get("_dbf")) or s.get("_dbf"),
+                                "근무지(wloc)": (s.get("work_location_name") or "").strip() or "(=소속)",
+                                "시작": str(s.get("shift_start") or "")[:5],
+                                "종료": str(s.get("shift_end") or "")[:5],
+                                "shift_id": s.get("id"),
+                            })
+                    else:
+                        _flag_rows.append({
+                            "날짜": d_iso2,
+                            "유형": label,
+                            "매장(카운트 대상)": sn2,
+                            "사유": detail,
+                            "직원": "(합산된 직원 없음)",
+                            "소속(_dbf)": "",
+                            "근무지(wloc)": "",
+                            "시작": "",
+                            "종료": "",
+                            "shift_id": "",
+                        })
+                if _flag_rows:
+                    df_flag = pd.DataFrame(_flag_rows).sort_values(
+                        ["날짜", "매장(카운트 대상)", "직원"], kind="stable"
+                    )
+                    st.dataframe(df_flag, use_container_width=True, hide_index=True)
+                    st.caption(
+                        "🔎 박성진 등 특정 직원이 보이지 않는다면: 그 직원의 시프트의 "
+                        "**`work_location_name`이 다른 매장 또는 외부 행사로 지정**되어 해당 매장에 합산되지 않은 것입니다. "
+                        "근무지를 비우거나 올바른 매장명으로 수정하면 카운트에 포함됩니다."
                     )
             else:
                 st.info("등록된 룰이 없습니다.")
