@@ -11244,7 +11244,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     _is_admin = role in ("store_admin", "superadmin")
     with st.expander("✏️ 등록된 근무일 수정 / 삭제", expanded=False):
         if _is_admin:
-            st.caption("직원 **소속 매장**을 선택하면 해당 직원의 이번 달 등록 근무일 목록이 나옵니다. 메종근무·외부행사 등 다른 장소에서 일한 기록도 소속 매장을 선택해야 조회됩니다.")
+            st.caption("**근무 매장**(실제 일한 곳)을 선택하면 해당 매장에서 일한 모든 직원(소속+파견)의 이번 달 근무일이 나옵니다. 외부 행사는 '기타 (외부/행사)' 선택.")
         else:
             st.caption("내 이번 달 등록 근무일 목록입니다. 각 행에서 수정하거나 삭제할 수 있습니다.")
         # 이 섹션 자체 매장 선택 (상단 필터와 독립). '기타 (외부/행사)'는 내 매장 db에 저장.
@@ -11259,14 +11259,61 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         ec0, ec1 = st.columns([2, 2])
         with ec0:
             if _is_admin:
-                qe_store_sel = st.selectbox("📍 직원 소속 매장", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
+                qe_store_sel = st.selectbox("📍 근무 매장 (실제 일한 곳)", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
             else:
                 # 일반 직원은 본인 소속 매장 고정
                 qe_store_sel = _dbf_to_sn.get(current_db) or (_qe_store_opts[0] if _qe_store_opts else "기타 (외부/행사)")
-                st.text_input("📍 직원 소속 매장", value=qe_store_sel, disabled=True, key="qe_store_fixed_calendar")
+                st.text_input("📍 근무 매장 (실제 일한 곳)", value=qe_store_sel, disabled=True, key="qe_store_fixed_calendar")
         _qe_is_etc = (qe_store_sel == "기타 (외부/행사)")
         edit_dbf = current_db if _qe_is_etc else _sn_to_dbf.get(qe_store_sel, current_db)
-        emp_pool = _erp_get_employee_names_for_store(edit_dbf) or [me_name]
+
+        # 직원 → 소속(_dbf) 역방향 인덱스 (새 시프트 추가 시 db_filename 결정용)
+        _emp_home_dbf: dict[str, str] = {}
+        for _dbf_x in all_dbs:
+            for _emp_x in _erp_get_employee_names_for_store(_dbf_x):
+                _emp_home_dbf.setdefault(_emp_x, _dbf_x)
+
+        def _resolve_home_dbf(emp_name: str, fallback: str) -> str:
+            """직원 소속 매장 dbf 추정 — 마스터 매핑 우선, 없으면 이번 달 시프트 최다 _dbf, 최후 fallback."""
+            if emp_name in _emp_home_dbf:
+                return _emp_home_dbf[emp_name]
+            cnt: dict = {}
+            for s in all_shifts_for_rules:
+                if (s.get("employee_name") or "") == emp_name and s.get("_dbf"):
+                    cnt[s["_dbf"]] = cnt.get(s["_dbf"], 0) + 1
+            if cnt:
+                return max(cnt.items(), key=lambda x: x[1])[0]
+            return fallback
+
+        # ── emp_pool: 선택한 근무 매장에서 일한 모든 직원 (소속 + 파견)
+        #   소속 직원 + 이번 달 work_location_name 이 그 매장인 직원 합집합
+        _pool_set: set[str] = set()
+        if not _qe_is_etc:
+            for _e in _erp_get_employee_names_for_store(edit_dbf) or []:
+                _pool_set.add(_e)
+            for _s in all_shifts_for_rules:
+                _wloc = (_s.get("work_location_name") or "").strip()
+                if _wloc == qe_store_sel:
+                    _en = (_s.get("employee_name") or "").strip()
+                    if _en:
+                        _pool_set.add(_en)
+            # 추가: db_filename 이 그 매장인 시프트의 직원도 포함 (마스터 매핑 누락 대비)
+            for _s in all_shifts_for_rules:
+                if _s.get("_dbf") == edit_dbf:
+                    _en = (_s.get("employee_name") or "").strip()
+                    if _en and not (_s.get("work_location_name") or "").strip():
+                        _pool_set.add(_en)
+        else:
+            # 기타(외부행사): work_location_name 이 등록 매장과 다른 모든 시프트의 직원
+            _known_names = set(all_store_names)
+            for _s in all_shifts_for_rules:
+                _wloc = (_s.get("work_location_name") or "").strip()
+                if _wloc and _wloc not in _known_names:
+                    _en = (_s.get("employee_name") or "").strip()
+                    if _en:
+                        _pool_set.add(_en)
+        emp_pool = sorted(_pool_set) or [me_name]
+
         with ec1:
             if _is_admin:
                 qe_emp = st.selectbox("직원", emp_pool, key="qe_emp_calendar")
@@ -11274,21 +11321,52 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 qe_emp = me_name
                 st.text_input("직원", value=me_name, disabled=True, key="qe_emp_fixed_calendar")
 
-        # 이번 달 해당 직원의 등록 일정 목록 (id 보존 위해 직접 조회 — 정규화 매핑으로 이름 비교)
+        # 이번 달 해당 직원이 선택한 근무 매장에서 일한 시프트 (db_filename == edit_dbf OR work_location_name == 매장명)
         _my_shifts: list = []
         try:
             _client, _err = get_supabase_client()
             if not _err and _client:
-                _r = _client.table("app_shift_schedules").select("*").eq(
+                # 1) db_filename = edit_dbf (소속 매장 = 선택 매장 케이스)
+                _r1 = _client.table("app_shift_schedules").select("*").eq(
                     "db_filename", edit_dbf
                 ).gte("shift_date", period_start.isoformat()).lte(
                     "shift_date", period_end.isoformat()
                 ).order("shift_date").execute()
-                for _row in (_r.data or []):
+                _rows = list(_r1.data or [])
+                # 2) work_location_name = 선택 매장명 (파견 케이스) — 등록 매장 선택 시에만
+                if not _qe_is_etc:
+                    _r2 = _client.table("app_shift_schedules").select("*").eq(
+                        "work_location_name", qe_store_sel
+                    ).gte("shift_date", period_start.isoformat()).lte(
+                        "shift_date", period_end.isoformat()
+                    ).order("shift_date").execute()
+                    _rows += list(_r2.data or [])
+                # id 중복 제거
+                _seen: set = set()
+                for _row in _rows:
+                    _rid = _row.get("id")
+                    if _rid in _seen:
+                        continue
+                    _seen.add(_rid)
                     _raw = _row.get("employee_name") or ""
                     _disp = _name_map.get(str(_raw).strip()) or _name_map.get(str(_raw).strip().lower()) or _email_local_part(str(_raw).strip()) or str(_raw).strip()
-                    if _disp == qe_emp:
-                        _my_shifts.append(_row)
+                    if _disp != qe_emp:
+                        continue
+                    # 등록 매장 선택 시: 실근무지가 그 매장인지(또는 매장 소속·파견 비어있는지) 추가 검증
+                    if not _qe_is_etc:
+                        _wloc = (_row.get("work_location_name") or "").strip()
+                        if _wloc and _wloc != qe_store_sel:
+                            continue  # 다른 매장으로 파견된 건은 제외 (해당 매장에서 일한 게 아님)
+                        # _wloc 비어있고 _dbf != edit_dbf 인 경우: 다른 매장 소속이 wloc 미지정 → 그 매장 일 아님
+                        if not _wloc and _row.get("db_filename") != edit_dbf:
+                            continue
+                    else:
+                        # 기타: work_location_name 이 등록 매장과 다른(외부) 행만
+                        _wloc = (_row.get("work_location_name") or "").strip()
+                        if not _wloc or _wloc in set(all_store_names):
+                            continue
+                    _my_shifts.append(_row)
+                _my_shifts.sort(key=lambda r: str(r.get("shift_date") or ""))
         except Exception:
             _my_shifts = []
 
@@ -11417,10 +11495,25 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             qe_new_start = st.time_input("출근 시각", value=_add_def_s, key="qe_new_start_calendar", step=900)
         with _add_c3:
             qe_new_end = st.time_input("퇴근 시각", value=_add_def_e, key="qe_new_end_calendar", step=900)
-        _new_loc_default = "기타 (외부/행사)" if _qe_is_etc else ""
+        # 새 일정 추가 시 db_filename / work_location_name 결정 규칙
+        #   1) 기타(외부/행사) 뷰: db_filename=직원 소속(추정), work_location=사용자 입력값 (필수)
+        #   2) 등록 매장 뷰:
+        #      - 직원 소속 = 그 매장 → db_filename=매장, work_location=비움(또는 사용자가 명시 입력)
+        #      - 직원 소속 ≠ 그 매장 → db_filename=직원 소속, work_location=매장명(파견 기록)
+        _add_home_dbf = _resolve_home_dbf(qe_emp, edit_dbf)
+        if _qe_is_etc:
+            _new_loc_default = "기타 (외부/행사)"
+            _loc_help = "외부 행사면 행사명을 정확히 입력하세요. (예: 유에코임주박람회)"
+        elif _add_home_dbf == edit_dbf:
+            _new_loc_default = ""
+            _loc_help = "본인 소속 매장 근무는 비워두면 됩니다. 같은 매장 안의 특정 장소를 표시하고 싶을 때만 입력."
+        else:
+            _new_loc_default = qe_store_sel
+            _loc_help = f"이 직원의 소속은 [{_dbf_to_sn.get(_add_home_dbf, _add_home_dbf)}] 이고 지금 추가하는 일정은 [{qe_store_sel}] 파견 근무로 저장됩니다."
         qe_new_loc = st.text_input(
             "근무 장소 (기타 근무지면 상세 입력)", value=_new_loc_default,
             key="qe_new_loc_calendar", placeholder="예: 동부산예술 / 롯데백화점 행사장",
+            help=_loc_help,
         )
         if st.button("➕ 이 날짜 추가", type="primary", key="qe_add_calendar"):
             if (qe_new_start.hour * 60 + qe_new_start.minute) >= (qe_new_end.hour * 60 + qe_new_end.minute):
@@ -11429,7 +11522,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 st.warning("이미 이 날짜에 등록된 일정이 있습니다. 위 목록에서 수정해 주세요.")
             else:
                 ok, e = _erp_insert_row("app_shift_schedules", {
-                    "db_filename": edit_dbf,
+                    "db_filename": _add_home_dbf,  # 직원 본래 소속 매장
                     "employee_name": qe_emp,
                     "shift_date": qe_new_date.isoformat(),
                     "shift_start": qe_new_start.strftime("%H:%M:%S"),
