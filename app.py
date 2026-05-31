@@ -15024,8 +15024,14 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
         emp_options = _internal_work_employee_options(store_id, role, cross_store=is_confidential)
         emp_username_to_label = {u: lbl for u, lbl in emp_options}
 
-        # 파일 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
-        nt_ver = int(st.session_state.get("nt_files_ver", 0))
+        # 폼 버전 키 (등록 후 위젯 리셋용)
+        nt_ver = int(st.session_state.get("nt_form_ver", 0))
+        _vk = str(nt_ver)  # 위젯 key suffix
+
+        title = st.text_input("제목 *", key=f"nt_title_{_vk}", placeholder="업무 제목")
+        description = st.text_area("설명", key=f"nt_desc_{_vk}", height=100, placeholder="상세 내용 / 요청 사항")
+
+        # 파일 첨부 — 설명 바로 아래, 즉시 미리보기
         nt_files_key = f"nt_files_{nt_ver}"
         nt_files = st.file_uploader(
             "📎 파일 첨부 (선택, 이미지·문서 등 모든 종류 다중 가능)",
@@ -15034,83 +15040,78 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
         )
         _render_upload_preview(nt_files)
 
-        with st.form("new_task_form", clear_on_submit=True):
-            title = st.text_input("제목 *", key="nt_title", placeholder="업무 제목")
-            description = st.text_area("설명", key="nt_desc", height=100, placeholder="상세 내용 / 요청 사항")
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                start = st.date_input("시작일", value=None, key="nt_start")
-            with col_b:
-                due = st.date_input("마감일", value=None, key="nt_due")
-            with col_c:
-                priority = st.selectbox(
-                    "우선순위",
-                    options=_tb.TASK_PRIORITIES,
-                    index=1,
-                    format_func=lambda p: _tb.TASK_PRIORITY_LABELS.get(p, p),
-                    key="nt_priority",
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            start = st.date_input("시작일", value=None, key=f"nt_start_{_vk}")
+        with col_b:
+            due = st.date_input("마감일", value=None, key=f"nt_due_{_vk}")
+        with col_c:
+            priority = st.selectbox(
+                "우선순위",
+                options=_tb.TASK_PRIORITIES,
+                index=1,
+                format_func=lambda p: _tb.TASK_PRIORITY_LABELS.get(p, p),
+                key=f"nt_priority_{_vk}",
+            )
+        assignees = st.multiselect(
+            "담당자 (첫 번째가 책임자)",
+            options=[u for u, _ in emp_options],
+            format_func=lambda u: emp_username_to_label.get(u, u),
+            key=f"nt_assignees_{_vk}",
+        )
+        parent_options = _internal_work_parent_options(
+            store_name, role, confidential=is_confidential, me_uname=me_uname,
+        )
+        parent_label_to_id = {lbl: i for i, lbl in parent_options}
+        parent_label = st.selectbox(
+            "상위 업무 (선택)",
+            options=["(없음 - 상위 업무로 등록)"] + [lbl for _, lbl in parent_options],
+            key=f"nt_parent_{_vk}",
+        )
+        parent_task_id = parent_label_to_id.get(parent_label)
+
+        tcol1, tcol2 = st.columns([3, 1])
+        with tcol1:
+            nt_tags = st.text_input("태그 (쉼표로 구분)", key=f"nt_tags_{_vk}", placeholder="예: 핀즈, 2026, 입고일정")
+        with tcol2:
+            nt_pin = st.checkbox("📌 상단 고정", value=False, key=f"nt_pin_{_vk}")
+
+        if st.button("등록", key=f"nt_submit_{_vk}", type="primary"):
+            if not (title or "").strip():
+                st.error("제목을 입력해 주세요.")
+            else:
+                new_id, err = _tb.create_task(
+                    title=title,
+                    description=description,
+                    created_by=me_uname,
+                    store_name=store_name,
+                    db_filename=current_db,
+                    parent_task_id=parent_task_id,
+                    start_date=start,
+                    due_date=due,
+                    priority=priority,
+                    assignees=assignees,
+                    category=_tb.CONFIDENTIAL_CATEGORY if is_confidential else None,
+                    tags=nt_tags,
+                    is_pinned=nt_pin,
                 )
-            assignees = st.multiselect(
-                "담당자 (첫 번째가 책임자)",
-                options=[u for u, _ in emp_options],
-                format_func=lambda u: emp_username_to_label.get(u, u),
-                key="nt_assignees",
-            )
-            parent_options = _internal_work_parent_options(
-                store_name, role, confidential=is_confidential, me_uname=me_uname,
-            )
-            parent_label_to_id = {lbl: i for i, lbl in parent_options}
-            parent_label = st.selectbox(
-                "상위 업무 (선택)",
-                options=["(없음 - 상위 업무로 등록)"] + [lbl for _, lbl in parent_options],
-                key="nt_parent",
-            )
-            parent_task_id = parent_label_to_id.get(parent_label)
-
-            tcol1, tcol2 = st.columns([3, 1])
-            with tcol1:
-                nt_tags = st.text_input("태그 (쉼표로 구분)", key="nt_tags", placeholder="예: 핀즈, 2026, 입고일정")
-            with tcol2:
-                nt_pin = st.checkbox("📌 상단 고정", value=False, key="nt_pin")
-
-            submitted = st.form_submit_button("등록", type="primary")
-            if submitted:
-                if not (title or "").strip():
-                    st.error("제목을 입력해 주세요.")
+                if new_id:
+                    for f in nt_files or []:
+                        try:
+                            f.seek(0)
+                        except Exception:
+                            pass
+                        _row, ferr = _tb.attach_file(
+                            task_id=new_id, comment_id=None,
+                            uploaded_file=f, uploaded_by=me_uname,
+                        )
+                        if ferr:
+                            st.warning(f"첨부 실패 ({f.name}): {ferr}")
+                    st.session_state["nt_form_ver"] = nt_ver + 1  # 위젯 전체 리셋
+                    flash(f"업무가 등록되었습니다. (#{new_id})")
+                    st.rerun()
                 else:
-                    new_id, err = _tb.create_task(
-                        title=title,
-                        description=description,
-                        created_by=me_uname,
-                        store_name=store_name,
-                        db_filename=current_db,
-                        parent_task_id=parent_task_id,
-                        start_date=start,
-                        due_date=due,
-                        priority=priority,
-                        assignees=assignees,
-                        category=_tb.CONFIDENTIAL_CATEGORY if is_confidential else None,
-                        tags=nt_tags,
-                        is_pinned=nt_pin,
-                    )
-                    if new_id:
-                        # 업무 생성 후 첨부 파일 업로드 (task 레벨, comment_id=None)
-                        for f in nt_files or []:
-                            try:
-                                f.seek(0)
-                            except Exception:
-                                pass
-                            _row, ferr = _tb.attach_file(
-                                task_id=new_id, comment_id=None,
-                                uploaded_file=f, uploaded_by=me_uname,
-                            )
-                            if ferr:
-                                st.warning(f"첨부 실패 ({f.name}): {ferr}")
-                        st.session_state["nt_files_ver"] = nt_ver + 1  # uploader 위젯 리셋
-                        flash(f"업무가 등록되었습니다. (#{new_id})")
-                        st.rerun()
-                    else:
-                        st.error(f"등록 실패: {err}")
+                    st.error(f"등록 실패: {err}")
 
 
 def _internal_work_employee_options(store_id, role: str, cross_store: bool = False) -> list[tuple[str, str]]:
@@ -16046,7 +16047,13 @@ def _render_new_post_form(me_uname: str, store_name: str | None, role: str, stor
     """새 게시물 작성 폼 ('글' 탭)."""
     import post_board as _pb  # noqa: WPS433
 
-    np_ver = int(st.session_state.get("np_files_ver", 0))
+    np_ver = int(st.session_state.get("np_form_ver", 0))
+    _vk = str(np_ver)
+
+    title = st.text_input("제목 *", key=f"np_title_{_vk}", placeholder="제목을 입력하세요")
+    content = st.text_area("내용", key=f"np_content_{_vk}", height=160, placeholder="여기에 내용을 작성해 주세요")
+
+    # 파일 첨부 — 내용 바로 아래, 즉시 미리보기
     np_files_key = f"np_files_{np_ver}"
     np_files = st.file_uploader(
         "📎 파일 첨부 (선택, 이미지·문서 등 모든 종류 다중 가능)",
@@ -16055,48 +16062,45 @@ def _render_new_post_form(me_uname: str, store_name: str | None, role: str, stor
     )
     _render_upload_preview(np_files)
 
-    with st.form("new_post_form", clear_on_submit=True):
-        title = st.text_input("제목 *", key="np_title", placeholder="제목을 입력하세요")
-        content = st.text_area("내용", key="np_content", height=160, placeholder="여기에 내용을 작성해 주세요")
-        pc1, pc2 = st.columns(2)
-        with pc1:
-            scope = st.selectbox(
-                "열람 범위",
-                options=_pb.POST_SCOPES,
-                index=0,
-                format_func=lambda s: _pb.POST_SCOPE_LABELS.get(s, s),
-                key="np_scope",
-            )
-        with pc2:
-            tags = st.text_input("태그 (쉼표로 구분)", key="np_tags", placeholder="예: 참고사이트, ID&PW, 2026")
-        is_pinned = st.checkbox("📌 상단 고정", value=False, key="np_pin")
-        st.caption("⚠️ 계정·비밀번호 등 민감정보는 열람 범위와 태그를 신중히 설정해 저장하세요. (본문은 평문 저장됩니다)")
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        scope = st.selectbox(
+            "열람 범위",
+            options=_pb.POST_SCOPES,
+            index=0,
+            format_func=lambda s: _pb.POST_SCOPE_LABELS.get(s, s),
+            key=f"np_scope_{_vk}",
+        )
+    with pc2:
+        tags = st.text_input("태그 (쉼표로 구분)", key=f"np_tags_{_vk}", placeholder="예: 참고사이트, ID&PW, 2026")
+    is_pinned = st.checkbox("📌 상단 고정", value=False, key=f"np_pin_{_vk}")
+    st.caption("⚠️ 계정·비밀번호 등 민감정보는 열람 범위와 태그를 신중히 설정해 저장하세요. (본문은 평문 저장됩니다)")
 
-        if st.form_submit_button("등록", type="primary"):
-            if not (title or "").strip():
-                st.error("제목을 입력해 주세요.")
+    if st.button("등록", key=f"np_submit_{_vk}", type="primary"):
+        if not (title or "").strip():
+            st.error("제목을 입력해 주세요.")
+        else:
+            new_id, err = _pb.create_post(
+                title=title, content=content, author=me_uname,
+                store_name=store_name, scope=scope, tags=tags, is_pinned=is_pinned,
+            )
+            if new_id:
+                for f in np_files or []:
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
+                    _row, ferr = _pb.attach_file(
+                        post_id=new_id, comment_id=None,
+                        uploaded_file=f, uploaded_by=me_uname,
+                    )
+                    if ferr:
+                        st.warning(f"첨부 실패 ({f.name}): {ferr}")
+                st.session_state["np_form_ver"] = np_ver + 1  # 위젯 전체 리셋
+                flash(f"게시물이 등록되었습니다. (#{new_id})")
+                st.rerun()
             else:
-                new_id, err = _pb.create_post(
-                    title=title, content=content, author=me_uname,
-                    store_name=store_name, scope=scope, tags=tags, is_pinned=is_pinned,
-                )
-                if new_id:
-                    for f in np_files or []:
-                        try:
-                            f.seek(0)
-                        except Exception:
-                            pass
-                        _row, ferr = _pb.attach_file(
-                            post_id=new_id, comment_id=None,
-                            uploaded_file=f, uploaded_by=me_uname,
-                        )
-                        if ferr:
-                            st.warning(f"첨부 실패 ({f.name}): {ferr}")
-                    st.session_state["np_files_ver"] = np_ver + 1
-                    flash(f"게시물이 등록되었습니다. (#{new_id})")
-                    st.rerun()
-                else:
-                    st.error(f"등록 실패: {err}")
+                st.error(f"등록 실패: {err}")
 
 
 def render_employee_management():
