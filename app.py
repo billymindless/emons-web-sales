@@ -11425,17 +11425,55 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                             _e_start = st.time_input("출근 시각", value=_erp_parse_time(_sh.get("shift_start")) or _es_def, key=f"qe_e_s_{_sid}", step=900)
                         with _ec_b:
                             _e_end = st.time_input("퇴근 시각", value=_erp_parse_time(_sh.get("shift_end")) or _ee_def, key=f"qe_e_e_{_sid}", step=900)
-                        _e_loc = st.text_input("근무 장소 (기타 근무지면 상세 입력)", value=_loc, key=f"qe_e_loc_{_sid}", placeholder="예: 동부산예술 / 롯데백화점 행사장")
+                        # 근무 장소 셀렉트 (실근무지 명시 선택)
+                        _ETC_E_LABEL = "기타 (외부/행사) — 직접 입력"
+                        _e_loc_opts = list(all_store_names) + [_ETC_E_LABEL]
+                        _cur_loc = (_loc or "").strip()
+                        _cur_db_sn = _dbf_to_sn.get(_sh.get("db_filename"), "")
+                        if _cur_loc and _cur_loc not in all_store_names:
+                            _e_default_label = _ETC_E_LABEL
+                        elif _cur_loc in all_store_names:
+                            _e_default_label = _cur_loc
+                        elif _cur_db_sn in all_store_names:
+                            _e_default_label = _cur_db_sn  # wloc 비어있으면 소속 매장 디폴트
+                        else:
+                            _e_default_label = _e_loc_opts[0] if _e_loc_opts else _ETC_E_LABEL
+                        try:
+                            _e_loc_idx = _e_loc_opts.index(_e_default_label)
+                        except ValueError:
+                            _e_loc_idx = 0
+                        _e_loc_sel = st.selectbox(
+                            "근무 장소 (실근무지)",
+                            _e_loc_opts, index=_e_loc_idx, key=f"qe_e_loc_sel_{_sid}",
+                            help="이 일정의 실제 근무 매장. 직원 소속과 무관하게 이 값으로 캘린더에 합산됩니다.",
+                        )
+                        _e_is_etc = (_e_loc_sel == _ETC_E_LABEL)
+                        if _e_is_etc:
+                            _e_loc_etc = st.text_input(
+                                "외부 행사명/상세 위치",
+                                value=_cur_loc if _cur_loc not in all_store_names else "",
+                                key=f"qe_e_loc_etc_{_sid}",
+                                placeholder="예: 유에코임주박람회 / 롯데백화점 행사장",
+                            )
+                            _e_final_loc = (_e_loc_etc or "").strip()
+                        else:
+                            _e_final_loc = _e_loc_sel
                         _eb1, _eb2, _ = st.columns([1, 1, 3])
                         with _eb1:
                             if st.button("💾 저장", type="primary", key=f"qe_e_save_{_sid}"):
                                 if (_e_start.hour * 60 + _e_start.minute) >= (_e_end.hour * 60 + _e_end.minute):
                                     st.error("퇴근 시각이 출근 시각보다 늦어야 합니다.")
+                                elif _e_is_etc and not _e_final_loc:
+                                    st.error("외부 행사명/상세 위치를 입력해 주세요.")
                                 else:
+                                    # 소속 매장과 같으면 wloc 비움 (정합성)
+                                    _wloc_e: str | None = _e_final_loc or None
+                                    if _wloc_e and _wloc_e == _cur_db_sn:
+                                        _wloc_e = None
                                     ok, e = _erp_update_row("app_shift_schedules", _sid, {
                                         "shift_start": _e_start.strftime("%H:%M:%S"),
                                         "shift_end": _e_end.strftime("%H:%M:%S"),
-                                        "work_location_name": (_e_loc or "").strip() or None,
+                                        "work_location_name": _wloc_e,
                                     })
                                     if ok:
                                         st.session_state.pop("qe_edit_id", None)
@@ -11495,43 +11533,61 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             qe_new_start = st.time_input("출근 시각", value=_add_def_s, key="qe_new_start_calendar", step=900)
         with _add_c3:
             qe_new_end = st.time_input("퇴근 시각", value=_add_def_e, key="qe_new_end_calendar", step=900)
-        # 새 일정 추가 시 db_filename / work_location_name 결정 규칙
-        #   1) 기타(외부/행사) 뷰: db_filename=직원 소속(추정), work_location=사용자 입력값 (필수)
-        #   2) 등록 매장 뷰:
-        #      - 직원 소속 = 그 매장 → db_filename=매장, work_location=비움(또는 사용자가 명시 입력)
-        #      - 직원 소속 ≠ 그 매장 → db_filename=직원 소속, work_location=매장명(파견 기록)
-        _add_home_dbf = _resolve_home_dbf(qe_emp, edit_dbf)
-        if _qe_is_etc:
-            _new_loc_default = "기타 (외부/행사)"
-            _loc_help = "외부 행사면 행사명을 정확히 입력하세요. (예: 유에코임주박람회)"
-        elif _add_home_dbf == edit_dbf:
-            _new_loc_default = ""
-            _loc_help = "본인 소속 매장 근무는 비워두면 됩니다. 같은 매장 안의 특정 장소를 표시하고 싶을 때만 입력."
-        else:
-            _new_loc_default = qe_store_sel
-            _loc_help = f"이 직원의 소속은 [{_dbf_to_sn.get(_add_home_dbf, _add_home_dbf)}] 이고 지금 추가하는 일정은 [{qe_store_sel}] 파견 근무로 저장됩니다."
-        qe_new_loc = st.text_input(
-            "근무 장소 (기타 근무지면 상세 입력)", value=_new_loc_default,
-            key="qe_new_loc_calendar", placeholder="예: 동부산예술 / 롯데백화점 행사장",
-            help=_loc_help,
+        # ── 근무 장소 선택 (명시적 선택 — 자동 추론 X, 직원 소속과 무관)
+        #   실근무지 기준으로 저장되어 캘린더 카운팅·표시가 일치
+        _ETC_LOC_LABEL = "기타 (외부/행사) — 직접 입력"
+        _loc_opts = list(all_store_names) + [_ETC_LOC_LABEL]
+        _default_loc_label = _ETC_LOC_LABEL if _qe_is_etc else (
+            qe_store_sel if qe_store_sel in all_store_names else (_loc_opts[0] if _loc_opts else _ETC_LOC_LABEL)
         )
+        try:
+            _loc_idx = _loc_opts.index(_default_loc_label)
+        except ValueError:
+            _loc_idx = 0
+        qe_new_loc_sel = st.selectbox(
+            "근무 장소 (실근무지)",
+            _loc_opts, index=_loc_idx, key="qe_new_loc_sel_calendar",
+            help="이 일정이 실제로 수행되는 매장을 선택하세요. 직원 소속과 무관하게 이 값으로 캘린더에 합산됩니다.",
+        )
+        _is_loc_etc_sel = (qe_new_loc_sel == _ETC_LOC_LABEL)
+        if _is_loc_etc_sel:
+            qe_new_loc_etc = st.text_input(
+                "외부 행사명/상세 위치", value="",
+                key="qe_new_loc_etc_calendar",
+                placeholder="예: 유에코임주박람회 / 롯데백화점 행사장",
+            )
+            _final_loc = (qe_new_loc_etc or "").strip()
+        else:
+            _final_loc = qe_new_loc_sel
+
         if st.button("➕ 이 날짜 추가", type="primary", key="qe_add_calendar"):
             if (qe_new_start.hour * 60 + qe_new_start.minute) >= (qe_new_end.hour * 60 + qe_new_end.minute):
                 st.error("퇴근 시각이 출근 시각보다 늦어야 합니다.")
+            elif _is_loc_etc_sel and not _final_loc:
+                st.error("외부 행사명/상세 위치를 입력해 주세요.")
             elif any(str(s.get("shift_date") or "")[:10] == qe_new_date.isoformat() for s in _my_shifts):
                 st.warning("이미 이 날짜에 등록된 일정이 있습니다. 위 목록에서 수정해 주세요.")
             else:
+                # db_filename = 직원 본래 소속 (정체성 유지), work_location_name = 사용자가 명시 선택한 실근무지
+                # 단, 소속 매장과 실근무지가 같으면 wloc 은 비워둠 (정합성)
+                _add_db = _resolve_home_dbf(qe_emp, edit_dbf)
+                _wloc_save: str | None = _final_loc or None
+                if _wloc_save and _wloc_save == _dbf_to_sn.get(_add_db, ""):
+                    _wloc_save = None
                 ok, e = _erp_insert_row("app_shift_schedules", {
-                    "db_filename": _add_home_dbf,  # 직원 본래 소속 매장
+                    "db_filename": _add_db,
                     "employee_name": qe_emp,
                     "shift_date": qe_new_date.isoformat(),
                     "shift_start": qe_new_start.strftime("%H:%M:%S"),
                     "shift_end": qe_new_end.strftime("%H:%M:%S"),
-                    "work_location_name": (qe_new_loc or "").strip() or None,
+                    "work_location_name": _wloc_save,
                     "created_by": me_name,
                 })
                 if ok:
-                    st.session_state["_erp_cal_flash"] = f"{qe_new_date.isoformat()} {qe_emp} 일정이 추가되었습니다."
+                    _flash_loc = _final_loc or _dbf_to_sn.get(_add_db, "")
+                    st.session_state["_erp_cal_flash"] = (
+                        f"{qe_new_date.isoformat()} {qe_emp} 일정이 [{_flash_loc}] 근무로 추가되었습니다."
+                    )
                     st.rerun(scope="fragment")
                 else:
                     st.error(f"추가 실패: {e}")
