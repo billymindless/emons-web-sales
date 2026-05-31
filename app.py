@@ -15928,13 +15928,15 @@ def render_internal_board():
     st.header("📋 사내업무/게시판")
 
     # ── 통합 검색 (사내업무·게시판·투표 등 모든 컨텐츠) ──────────
+    # _search_ver 를 증가시키면 text_input 위젯이 완전히 새로 생성되어 빈값으로 초기화됨
+    _sv = int(st.session_state.get("_board_search_ver", 0))
     gkw = st.text_input(
-        "🔍 통합 검색", key="board_global_search",
+        "🔍 통합 검색", key=f"board_global_search_{_sv}",
         placeholder="키워드 입력 — 사내업무·게시판 글 등 모든 컨텐츠 검색",
     )
     if (gkw or "").strip():
         if st.button("← 사내업무/게시판 홈으로", key="board_search_home"):
-            st.session_state["board_global_search"] = ""
+            st.session_state["_board_search_ver"] = _sv + 1  # 위젯 key 교체 → 빈값으로 리셋
             st.rerun()
         _render_board_unified_search((gkw or "").strip(), me_uname, store_name, role, current_db)
         return
