@@ -15201,11 +15201,34 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
             m2.markdown(f"📅 **마감** &nbsp; {due}")
             m3.caption(f"작성: {_uname_to_display(task.get('created_by'))}  ·  하위업무 {sub_count}")
 
+            _can_del = is_admin or (task.get("created_by") == me_uname)
+            _btn_cols = st.columns([2, 2, 2, 6])
             if is_admin:
-                _pin_label = "📌 고정 해제" if is_pinned else "📌 상단 고정"
-                if st.button(_pin_label, key=f"task_pin_{tid}"):
+                _pin_label = "📌 해제" if is_pinned else "📌 고정"
+                if _btn_cols[0].button(_pin_label, key=f"task_pin_{tid}"):
                     _tb.update_task_fields(tid, me_uname, is_pinned=not is_pinned)
+                    flash("상단 고정 상태가 변경되었습니다.")
                     st.rerun()
+            if _can_del:
+                _del_confirm_key = f"task_del_confirm_{tid}"
+                if not st.session_state.get(_del_confirm_key):
+                    if _btn_cols[1].button("🗑️ 삭제", key=f"task_del_btn_{tid}"):
+                        st.session_state[_del_confirm_key] = True
+                        st.rerun()
+                else:
+                    _btn_cols[1].warning("정말 삭제?")
+                    c_yes, c_no = _btn_cols[2], _btn_cols[3]
+                    if c_yes.button("✅ 확인", key=f"task_del_yes_{tid}", type="primary"):
+                        _ok, _err = _tb.delete_task(tid)
+                        st.session_state.pop(_del_confirm_key, None)
+                        if _ok:
+                            flash(f"업무 #{tid} 가 삭제되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"삭제 실패: {_err}")
+                    if c_no.button("✖ 취소", key=f"task_del_no_{tid}"):
+                        st.session_state.pop(_del_confirm_key, None)
+                        st.rerun()
 
             desc = (task.get("description") or "").strip()
             if desc:
@@ -15701,41 +15724,68 @@ def _render_post_card(post: dict, me_uname: str, role: str):
                 with a_cols[i % n_cols]:
                     _render_attachment_inline(a, key_suffix=f"post{pid}")
 
-        # 관리/편집 도구
-        with st.expander("💬 댓글 · 첨부 · 관리", expanded=False):
-            if can_edit:
-                ec1, ec2, ec3 = st.columns([2, 2, 6])
-                if is_admin:
-                    _pin_label = "📌 고정 해제" if is_pinned else "📌 상단 고정"
-                    if ec1.button(_pin_label, key=f"post_pin_{pid}"):
-                        _pb.toggle_post_pin(pid, not is_pinned)
-                        st.rerun()
-                if ec2.button("🗑️ 삭제", key=f"post_del_{pid}"):
+        # ── 수정 / 삭제 / 핀 버튼 (카드 본문 하단, 바로 노출) ──────
+        if can_edit:
+            _p_act_cols = st.columns([2, 2, 2, 6])
+            if is_admin:
+                _pin_label = "📌 해제" if is_pinned else "📌 고정"
+                if _p_act_cols[0].button(_pin_label, key=f"post_pin_{pid}"):
+                    _pb.toggle_post_pin(pid, not is_pinned)
+                    flash("상단 고정 상태가 변경되었습니다.")
+                    st.rerun()
+
+            # 수정 토글
+            _post_edit_key = f"post_edit_open_{pid}"
+            _edit_label = "✏️ 수정 닫기" if st.session_state.get(_post_edit_key) else "✏️ 수정"
+            if _p_act_cols[1].button(_edit_label, key=f"post_edit_toggle_{pid}"):
+                st.session_state[_post_edit_key] = not st.session_state.get(_post_edit_key, False)
+                st.rerun()
+
+            # 삭제 (2단 확인)
+            _post_del_key = f"post_del_confirm_{pid}"
+            if not st.session_state.get(_post_del_key):
+                if _p_act_cols[2].button("🗑️ 삭제", key=f"post_del_btn_{pid}"):
+                    st.session_state[_post_del_key] = True
+                    st.rerun()
+            else:
+                _p_act_cols[2].warning("정말 삭제?")
+                _dy, _dn = st.columns([1, 1])
+                if _dy.button("✅ 확인", key=f"post_del_yes_{pid}", type="primary"):
                     _ok, _err = _pb.delete_post(pid)
+                    st.session_state.pop(_post_del_key, None)
                     if _ok:
                         flash("게시물이 삭제되었습니다.")
                         st.rerun()
                     else:
                         st.error(f"삭제 실패: {_err}")
+                if _dn.button("✖ 취소", key=f"post_del_no_{pid}"):
+                    st.session_state.pop(_post_del_key, None)
+                    st.rerun()
 
-                # 인라인 수정 폼
-                with st.expander("✏️ 게시물 수정", expanded=False):
-                    with st.form(f"post_edit_{pid}"):
-                        e_title = st.text_input("제목", value=title, key=f"pe_title_{pid}")
-                        e_content = st.text_area("내용", value=content, key=f"pe_content_{pid}", height=120)
-                        e_tags = st.text_input(
-                            "태그 (쉼표로 구분)", value=",".join(tags), key=f"pe_tags_{pid}",
-                            placeholder="예: 참고사이트, ID&PW, 2026",
+            # 수정 폼 (토글 시 인라인 표시)
+            if st.session_state.get(_post_edit_key):
+                with st.form(f"post_edit_{pid}"):
+                    e_title = st.text_input("제목", value=title, key=f"pe_title_{pid}")
+                    e_content = st.text_area("내용", value=content, key=f"pe_content_{pid}", height=120)
+                    e_tags = st.text_input(
+                        "태그 (쉼표로 구분)", value=",".join(tags), key=f"pe_tags_{pid}",
+                        placeholder="예: 참고사이트, ID&PW, 2026",
+                    )
+                    if st.form_submit_button("저장", type="primary"):
+                        _ok, _err = _pb.update_post(
+                            pid, title=e_title, content=e_content, tags=e_tags,
                         )
-                        if st.form_submit_button("저장", type="primary"):
-                            _ok, _err = _pb.update_post(
-                                pid, title=e_title, content=e_content, tags=e_tags,
-                            )
-                            if _ok:
-                                flash("게시물이 수정되었습니다.")
-                                st.rerun()
-                            else:
-                                st.error(f"수정 실패: {_err}")
+                        if _ok:
+                            st.session_state.pop(_post_edit_key, None)
+                            flash("게시물이 수정되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"수정 실패: {_err}")
+
+        # 관리/편집 도구
+        with st.expander("💬 댓글 · 첨부", expanded=False):
+            if can_edit:
+                pass  # 수정/삭제는 위에서 처리
 
             # 게시물 본문에 파일 추가 첨부
             _post_file_ver_key = f"post_files_ver_{pid}"

@@ -455,6 +455,21 @@ def update_task_fields(task_id: int, actor: str, **fields) -> tuple[bool, str | 
         return False, str(e)
 
 
+def delete_task(task_id: int) -> tuple[bool, str | None]:
+    """업무 삭제. 하위업무가 있으면 parent_task_id를 NULL로 만들고 삭제."""
+    client, err = _client()
+    if err or not client:
+        return False, err or "Supabase 연결 불가"
+    try:
+        # 하위업무의 parent 참조 해제 (CASCADE 미설정 환경 대비)
+        client.table("app_tasks").update({"parent_task_id": None}).eq("parent_task_id", task_id).execute()
+        client.table("app_tasks").delete().eq("id", task_id).execute()
+        clear_task_caches()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def assign_users(task_id: int, usernames: list[str], actor: str) -> tuple[bool, str | None]:
     """담당자 교체: 기존 owner는 유지, assignee/watcher만 교체."""
     client, err = _client()
