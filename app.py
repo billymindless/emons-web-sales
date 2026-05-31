@@ -15895,11 +15895,18 @@ def render_internal_board():
     st.header("📋 사내업무/게시판")
 
     # ── 통합 검색 (사내업무·게시판·투표 등 모든 컨텐츠) ──────────
-    gkw = st.text_input(
-        "🔍 통합 검색", key="board_global_search",
-        placeholder="키워드 입력 — 사내업무·게시판 글 등 모든 컨텐츠 검색",
-    )
+    _search_col, _home_col = st.columns([8, 2])
+    with _search_col:
+        gkw = st.text_input(
+            "🔍 통합 검색", key="board_global_search",
+            placeholder="키워드 입력 — 사내업무·게시판 글 등 모든 컨텐츠 검색",
+        )
     if (gkw or "").strip():
+        with _home_col:
+            st.markdown("<div style='margin-top:1.8rem;'></div>", unsafe_allow_html=True)
+            if st.button("🏠 홈으로", key="board_search_home", use_container_width=True):
+                st.session_state["board_global_search"] = ""
+                st.rerun()
         _render_board_unified_search((gkw or "").strip(), me_uname, store_name, role, current_db)
         return
 
