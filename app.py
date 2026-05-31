@@ -14304,48 +14304,7 @@ def render_internal_work():
             st.session_state.pop(_bucket_key, None)
             st.rerun()
 
-    # 친구추가 미완료 직원 카드 (매장관리자 이상)
-    if role in ("store_admin", "superadmin"):
-        pending = _tb.load_friend_pending_users(store_id if role == "store_admin" else None)
-        if pending:
-            with st.container(border=True):
-                st.warning(f"⚠️ 카카오 채널 친구추가 미완료 직원 **{len(pending)}명**")
-                rows = [{
-                    "이름": (u.get("name") or u.get("username") or "-"),
-                    "사용자명": u.get("username"),
-                    "휴대폰": u.get("phone") or "(미입력)",
-                } for u in pending]
-                st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
-                st.caption("위 직원들은 인앱 알림만 받습니다. 본인 카카오톡에서 회사 채널을 친구 추가해 주세요.")
-
-    # 알림 문구 편집 모달 (매장관리자 이상)
-    if role in ("store_admin", "superadmin"):
-        with st.expander("📝 알림 문구 편집 (관리자 전용)", expanded=False):
-            tmpls = _tb.load_templates_cached()
-            tmpl_labels = {
-                "task_assigned": "신규 업무 배정",
-                "status_changed": "상태 변경",
-                "comment_added": "새 댓글",
-                "due_soon": "마감 임박 (D-1)",
-            }
-            for k, label in tmpl_labels.items():
-                cur = tmpls.get(k, "")
-                with st.form(f"tmpl_form_{k}"):
-                    st.markdown(f"**{label}**")
-                    new_body = st.text_area(
-                        "본문",
-                        value=cur,
-                        height=140,
-                        key=f"tmpl_body_{k}",
-                        help="변수: {name} {title} {due_date} {requester} {link} {from_status} {to_status} {actor} {author} {preview}",
-                    )
-                    if st.form_submit_button(f"저장 ({label})"):
-                        ok, err = _tb.update_template(k, new_body, me_uname)
-                        if ok:
-                            flash("템플릿이 저장되었습니다.")
-                            st.rerun()
-                        else:
-                            st.error(f"저장 실패: {err}")
+    # 카카오/알림 문구 설정은 ⚙️ 관리자 설정 메뉴로 이동됨
 
     st.divider()
 
@@ -15864,6 +15823,79 @@ def _render_post_card(post: dict, me_uname: str, role: str):
             _render_post_comment_input(pid, me_uname, parent_cid=None, key_prefix=f"pnew_{pid}")
 
 
+def render_admin_settings():
+    """⚙️ 관리자 설정 — ERP 운영 설정을 모아두는 허브.
+    알림톡·카카오 채널 설정, 알림 문구 편집 등을 포함하며 항목이 늘어나면 여기에 추가."""
+    import task_board as _tb  # noqa: WPS433
+
+    current_user = st.session_state.get("current_user") or {}
+    role = (current_user.get("role") or "user").strip()
+    me_uname = (current_user.get("username") or current_user.get("email") or "").strip()
+    store_id = (current_user.get("store_id") or st.session_state.get("current_store_id"))
+
+    if role not in ("store_admin", "superadmin"):
+        st.warning("관리자 전용 메뉴입니다.")
+        return
+
+    st.header("⚙️ 관리자 설정")
+    st.caption("ERP 운영에 필요한 설정을 관리합니다. 항목은 추후 확장됩니다.")
+
+    # ── 카카오 채널 / 알림톡 ───────────────────────────────────
+    st.subheader("📲 카카오 채널 / 알림톡")
+
+    # 친구추가 미완료 직원 목록
+    pending = _tb.load_friend_pending_users(store_id if role == "store_admin" else None)
+    if pending:
+        with st.container(border=True):
+            st.warning(f"⚠️ 카카오 채널 친구추가 미완료 직원 **{len(pending)}명**")
+            rows = [{
+                "이름": (u.get("name") or u.get("username") or "-"),
+                "사용자명": u.get("username"),
+                "휴대폰": u.get("phone") or "(미입력)",
+            } for u in pending]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption("위 직원들은 인앱 알림만 받습니다. 본인 카카오톡에서 회사 채널을 친구 추가해 주세요.")
+    else:
+        st.success("전 직원 카카오 채널 친구추가 완료 ✅")
+
+    st.divider()
+
+    # ── 알림 문구 편집 ─────────────────────────────────────────
+    st.subheader("📝 알림 문구 편집")
+    tmpl_labels = {
+        "task_assigned": "신규 업무 배정",
+        "status_changed": "상태 변경",
+        "comment_added": "새 댓글",
+        "due_soon": "마감 임박 (D-1)",
+    }
+    tmpls = _tb.load_templates_cached()
+    for k, label in tmpl_labels.items():
+        cur = tmpls.get(k, "")
+        with st.expander(f"✏️ {label}", expanded=False):
+            with st.form(f"as_tmpl_form_{k}"):
+                st.markdown(f"**{label}**")
+                new_body = st.text_area(
+                    "본문",
+                    value=cur,
+                    height=140,
+                    key=f"as_tmpl_body_{k}",
+                    help="변수: {name} {title} {due_date} {requester} {link} {from_status} {to_status} {actor} {author} {preview}",
+                )
+                if st.form_submit_button(f"저장 ({label})"):
+                    ok, err = _tb.update_template(k, new_body, me_uname)
+                    if ok:
+                        flash("템플릿이 저장되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"저장 실패: {err}")
+
+    st.divider()
+
+    # ── 추후 확장 플레이스홀더 ──────────────────────────────────
+    st.subheader("🔧 기타 설정")
+    st.info("ERP 운영 설정 항목은 추후 이 곳에 추가됩니다.")
+
+
 # 사내 게시판 섹션 레지스트리 — 나중에 일정/할일/투표 활성화 시
 # enabled=True 로 바꾸고 디스패치에 render_fn 만 연결하면 켜진다.
 BOARD_SECTIONS = [
@@ -15896,18 +15928,14 @@ def render_internal_board():
     st.header("📋 사내업무/게시판")
 
     # ── 통합 검색 (사내업무·게시판·투표 등 모든 컨텐츠) ──────────
-    _search_col, _home_col = st.columns([8, 2])
-    with _search_col:
-        gkw = st.text_input(
-            "🔍 통합 검색", key="board_global_search",
-            placeholder="키워드 입력 — 사내업무·게시판 글 등 모든 컨텐츠 검색",
-        )
+    gkw = st.text_input(
+        "🔍 통합 검색", key="board_global_search",
+        placeholder="키워드 입력 — 사내업무·게시판 글 등 모든 컨텐츠 검색",
+    )
     if (gkw or "").strip():
-        with _home_col:
-            st.markdown("<div style='margin-top:1.8rem;'></div>", unsafe_allow_html=True)
-            if st.button("🏠 홈으로", key="board_search_home", use_container_width=True):
-                st.session_state["board_global_search"] = ""
-                st.rerun()
+        if st.button("← 사내업무/게시판 홈으로", key="board_search_home"):
+            st.session_state["board_global_search"] = ""
+            st.rerun()
         _render_board_unified_search((gkw or "").strip(), me_uname, store_name, role, current_db)
         return
 
@@ -22431,6 +22459,8 @@ def main():
     if role in ("store_admin", "superadmin"):
         if st.sidebar.button("📈 인력 효율 분석", width='stretch'):
             st.session_state["active_admin_page"] = "employee_analytics"
+        if st.sidebar.button("⚙️ 관리자 설정", width='stretch'):
+            st.session_state["active_admin_page"] = "admin_settings"
     # 사내 업무판 (전 역할 노출)
     try:
         from task_board import count_unread_notifications as _count_unread  # noqa: WPS433
@@ -22492,6 +22522,11 @@ def main():
     # 인력 효율 분석 화면 라우팅 (store_admin / superadmin)
     if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "employee_analytics":
         render_employee_analytics()
+        return
+
+    # 관리자 설정 라우팅
+    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "admin_settings":
+        render_admin_settings()
         return
 
     if st.session_state.get("active_admin_page") == "internal_work":
