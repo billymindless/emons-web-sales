@@ -1,0 +1,20 @@
+﻿app_attendance_logs 6??嫄댁닔: 2
+app_shift_schedules 6??嫄댁닔: 198
+
+app_shift_schedules 吏곸썝蹂?6??嫄댁닔:
+  源?섎옒 / store_1.db: 22嫄?
+  源?곗쭊 / store_1.db: 22嫄?
+  源?뺤쭊 / store_1.db: 21嫄?
+  源?쒖셿 / store_1.db: 21嫄?
+  援щ굹??/ store_2.db: 19嫄?
+  源?⑥젙 / store_1.db: 18嫄?
+  理쒖?鍮?/ store_1.db: 17嫄?
+  諛뺤꽦吏?/ store_2.db: 15嫄?
+  源?뱀갔 / store_1.db: 13嫄?
+  源?ㅺ꼍 / store_1.db: 12嫄?
+  源?ㅺ꼍 / store_2.db: 8嫄?
+  源?뱀갔 / store_3.db: 7嫄?
+  諛뺤꽦吏?/ store_3.db: 3嫄?
+
+app_attendance_logs 吏곸썝蹂?6??嫄댁닔:
+  諛뺤꽦吏?/ store_2.db: 2嫄?

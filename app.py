@@ -15837,22 +15837,19 @@ def _render_post_card(post: dict, me_uname: str, role: str):
             _render_post_comment_input(pid, me_uname, parent_cid=None, key_prefix=f"pnew_{pid}")
 
 
+# 사내 게시판 섹션 레지스트리 — 나중에 일정/할일/투표 활성화 시
+# enabled=True 로 바꾸고 디스패치에 render_fn 만 연결하면 켜진다.
+BOARD_SECTIONS = [
+    ("post", "📝 글", True),
+    ("task", "✅ 업무", True),
+    ("sched", "📅 일정", False),
+    ("todo", "☑️ 할일", False),
+    ("vote", "🗳️ 투표", False),
+]
+
+
 def render_internal_board():
-    """사내 게시판 — ERP 메뉴 하위. 글 작성·댓글·첨부·태그·검색·상단고정."""
-    import post_board as _pb  # noqa: WPS433
-
-    if not ensure_supabase_post_tables():
-        st.error(
-            "사내 게시판 테이블(app_posts)이 아직 생성되지 않았습니다. "
-            "`.streamlit/secrets.toml`에 `[supabase] database_url`이 설정되어 있으면 "
-            "앱을 새로고침하면 자동 생성됩니다. "
-            "그래도 안 되면 Supabase SQL Editor에서 `SUPABASE_APP_POSTS.sql`을 실행해 주세요."
-        )
-        if st.button("🔄 테이블 생성 다시 시도", key="retry_post_tables"):
-            st.session_state.pop("_supa_post_tables_avail", None)
-            st.rerun()
-        return
-
+    """사내 게시판 — 통합 허브. 상단 섹션 선택기로 글/업무 전환(일정·할일·투표는 준비 중)."""
     current_user = st.session_state.get("current_user") or {}
     role = (current_user.get("role") or "user").strip()
     me_uname = (current_user.get("username") or current_user.get("email") or "").strip()
@@ -15868,19 +15865,56 @@ def render_internal_board():
         except Exception:
             store_name = None
 
-    st.header("📝 게시물")
+    st.header("📋 사내 게시판")
+
+    labels = [lbl for _, lbl, _ in BOARD_SECTIONS]
+    if st.session_state.get("board_section_label") not in labels:
+        st.session_state["board_section_label"] = labels[0]
+    if st.session_state.pop("board_goto_task", False):
+        st.session_state["board_section_label"] = labels[1]
+    if hasattr(st, "segmented_control"):
+        choice = st.segmented_control(
+            "섹션", labels, label_visibility="collapsed", key="board_section_label",
+        )
+    else:
+        choice = st.radio(
+            "섹션", labels, horizontal=True,
+            label_visibility="collapsed", key="board_section_label",
+        )
+    if not choice:
+        choice = st.session_state.get("board_section_label") or labels[0]
+    sec_key = next(k for k, lbl, _ in BOARD_SECTIONS if lbl == choice)
+    enabled = next(e for k, _, e in BOARD_SECTIONS if k == sec_key)
+
+    if sec_key == "post":
+        _render_board_posts_section(me_uname, store_name, role, store_id)
+    elif sec_key == "task" and enabled:
+        render_internal_work()
+    else:
+        st.info(f"'{choice}' 기능은 준비 중입니다.")
+
+
+def _render_board_posts_section(me_uname: str, store_name: str | None, role: str, store_id):
+    """게시판 '글' 섹션 — 작성 폼·검색·목록."""
+    import post_board as _pb  # noqa: WPS433
+
+    if not ensure_supabase_post_tables():
+        st.error(
+            "사내 게시판 테이블(app_posts)이 아직 생성되지 않았습니다. "
+            "`.streamlit/secrets.toml`에 `[supabase] database_url`이 설정되어 있으면 "
+            "앱을 새로고침하면 자동 생성됩니다. "
+            "그래도 안 되면 Supabase SQL Editor에서 `SUPABASE_APP_POSTS.sql`을 실행해 주세요."
+        )
+        if st.button("🔄 테이블 생성 다시 시도", key="retry_post_tables"):
+            st.session_state.pop("_supa_post_tables_avail", None)
+            st.rerun()
+        return
+
     st.caption("사내 게시판 — 참고자료·과거 업무·계정 정보 등을 글로 남기고 댓글·첨부로 공유합니다.")
 
-    # ── 작성 영역 (첨부 이미지 스타일 탭) ──────────────────────
+    # ── 작성 영역 ─────────────────────────────────────────────
     with st.expander("✍️ 게시물 작성", expanded=False):
-        tab_post, tab_task, tab_sched, tab_todo, tab_vote = st.tabs(
-            ["📝 글", "✅ 업무", "📅 일정", "☑️ 할일", "🗳️ 투표"]
-        )
-        with tab_post:
-            _render_new_post_form(me_uname, store_name, role, store_id)
-        for _t, _label in ((tab_task, "업무"), (tab_sched, "일정"), (tab_todo, "할일"), (tab_vote, "투표")):
-            with _t:
-                st.info(f"'{_label}' 기능은 준비 중입니다. 현재는 '글' 게시물 작성만 지원합니다.")
+        _render_new_post_form(me_uname, store_name, role, store_id)
 
     st.divider()
 
@@ -22319,9 +22353,7 @@ def main():
     except Exception:
         _unread_n = 0
     _badge = f"  🔔 {_unread_n}" if _unread_n > 0 else ""
-    if st.sidebar.button(f"📋 사내 업무{_badge}", width='stretch'):
-        st.session_state["active_admin_page"] = "internal_work"
-    if st.sidebar.button("📝 게시물", width='stretch'):
+    if st.sidebar.button(f"📝 게시판{_badge}", width='stretch'):
         st.session_state["active_admin_page"] = "internal_board"
 
     st.sidebar.markdown("---")
@@ -22376,8 +22408,9 @@ def main():
         return
 
     if st.session_state.get("active_admin_page") == "internal_work":
-        render_internal_work()
-        return
+        # 레거시 라우팅: 사내 업무는 게시판 '업무' 섹션으로 통합됨
+        st.session_state["active_admin_page"] = "internal_board"
+        st.session_state["board_goto_task"] = True
 
     if st.session_state.get("active_admin_page") == "internal_board":
         render_internal_board()
