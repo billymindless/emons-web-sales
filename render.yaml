@@ -1,0 +1,22 @@
+# Render Blueprint — 입금 SMS webhook 서버(api.py) 배포 설정
+# 사용법:
+#   1. https://render.com 가입 후 New + → Blueprint 선택
+#   2. 이 GitHub 저장소 연결 → render.yaml 자동 인식
+#   3. 환경변수 3개(SUPABASE_URL / SUPABASE_SERVICE_KEY / SMS_WEBHOOK_TOKEN) 입력
+#   4. 배포 완료 후 https://<서비스명>.onrender.com/webhook/sms/deposit 가 webhook 주소
+services:
+  - type: web
+    name: emons-sms-webhook
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SMS_WEBHOOK_TOKEN
+        sync: false
