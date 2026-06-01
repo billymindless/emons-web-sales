@@ -10222,11 +10222,11 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     msc1, msc2 = st.columns([1, 2])
     with msc1:
         _sp_sel_label = st.selectbox(
-            "📍 실제 근무 매장",
+            "📍 근무매장",
             _sp_store_labels,
             index=_sp_home_idx,
             key="erp_shift_work_store",
-            help="소속 매장과 다른 곳에서 근무하는 경우 선택.",
+            help="실제로 근무한 매장을 선택. 소속과 다를 수 있으며, 외부 행사는 '기타 (외부/행사)' 선택.",
         )
     with msc2:
         loc_input = st.text_input(
@@ -10237,16 +10237,42 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     _sp_sel_idx = _sp_store_labels.index(_sp_sel_label)
     _sp_work_db = _sp_store_opts[_sp_sel_idx][1]
 
-    # 매장이 변경되면 체크박스 상태 초기화 (오입력 방지)
-    # pop() 대신 False로 명시 설정: has_existing=True인 날짜도 체크 해제되도록
+    # 매장이 변경되면 위젯 키만 비워서 다음 렌더링에서 해당 매장 기존 데이터로 재채움
+    # (False로 강제 설정하면 has_existing=True인 날짜의 기존 데이터를 무시하게 됨)
     _sp_prev_store_key = "erp_shift_work_store_prev"
     if st.session_state.get(_sp_prev_store_key) != _sp_sel_label:
-        if st.session_state.get(_sp_prev_store_key) is not None:
-            for _d in date_list:
-                st.session_state[f"sp_chk_{_d.isoformat()}"] = False
-                st.session_state.pop(f"sp_start_{_d.isoformat()}", None)
-                st.session_state.pop(f"sp_end_{_d.isoformat()}", None)
+        for _d in date_list:
+            st.session_state.pop(f"sp_chk_{_d.isoformat()}", None)
+            st.session_state.pop(f"sp_start_{_d.isoformat()}", None)
+            st.session_state.pop(f"sp_end_{_d.isoformat()}", None)
         st.session_state[_sp_prev_store_key] = _sp_sel_label
+
+    # 선택한 근무매장에 해당하는 기존 일정만 existing_by_key/existing_rows_by_date 에 담는다
+    # (입력 모드와 수정 모드의 표시 일관성 확보 — 근무매장 기준으로 보여줌)
+    _known_store_names_sp = set(_sp_store_labels) - {"기타 (외부/행사)"}
+    _filtered_existing: list = []
+    for _row in existing:
+        _wloc = (_row.get("work_location_name") or "").strip()
+        if _sp_work_db is None:
+            # 기타 (외부/행사): work_location_name 이 등록 매장명 목록에 없는 것
+            if _wloc and _wloc not in _known_store_names_sp:
+                _filtered_existing.append(_row)
+        elif _sp_work_db == current_db:
+            # 소속 매장: work_location_name 이 비어있거나 == 소속매장명
+            if not _wloc or _wloc == _sp_sel_label:
+                _filtered_existing.append(_row)
+        else:
+            # 타 매장 지원 근무: work_location_name == 선택 매장명
+            if _wloc == _sp_sel_label:
+                _filtered_existing.append(_row)
+    existing_by_key = {}
+    for _row in _filtered_existing:
+        _k = (str(_row.get("employee_name") or ""), str(_row.get("shift_date") or "")[:10])
+        existing_by_key[_k] = _row
+    existing_rows_by_date = {}
+    for _row in _filtered_existing:
+        if str(_row.get("employee_name") or "").strip() in _my_aliases:
+            existing_rows_by_date.setdefault(str(_row.get("shift_date") or "")[:10], []).append(_row)
 
     # 일별 체크박스 + 시간 입력 (테이블 형태)
     with st.container(border=True):
@@ -11483,7 +11509,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     _is_admin = role in ("store_admin", "superadmin")
     with st.expander("✏️ 등록된 근무일 수정 / 삭제", expanded=False):
         if _is_admin:
-            st.caption("**근무 매장**(실제 일한 곳)을 선택하면 해당 매장에서 일한 모든 직원(소속+파견)의 이번 달 근무일이 나옵니다. 외부 행사는 '기타 (외부/행사)' 선택.")
+            st.caption("**근무매장**(실제 근무한 매장)을 선택하면 해당 매장에서 일한 모든 직원(소속+파견)의 이번 달 근무일이 나옵니다. 외부 행사는 '기타 (외부/행사)' 선택.")
         else:
             st.caption("내 이번 달 등록 근무일 목록입니다. 각 행에서 수정하거나 삭제할 수 있습니다.")
         # 이 섹션 자체 매장 선택 (상단 필터와 독립). '기타 (외부/행사)'는 내 매장 db에 저장.
@@ -11498,11 +11524,11 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         ec0, ec1 = st.columns([2, 2])
         with ec0:
             if _is_admin:
-                qe_store_sel = st.selectbox("📍 근무 매장 (실제 일한 곳)", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
+                qe_store_sel = st.selectbox("📍 근무매장", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
             else:
                 # 일반 직원은 본인 소속 매장 고정
                 qe_store_sel = _dbf_to_sn.get(current_db) or (_qe_store_opts[0] if _qe_store_opts else "기타 (외부/행사)")
-                st.text_input("📍 근무 매장 (실제 일한 곳)", value=qe_store_sel, disabled=True, key="qe_store_fixed_calendar")
+                st.text_input("📍 근무매장", value=qe_store_sel, disabled=True, key="qe_store_fixed_calendar")
         _qe_is_etc = (qe_store_sel == "기타 (외부/행사)")
         edit_dbf = current_db if _qe_is_etc else _sn_to_dbf.get(qe_store_sel, current_db)
 
