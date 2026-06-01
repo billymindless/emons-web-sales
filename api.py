@@ -114,6 +114,111 @@ async def solapi_friend_added_webhook(request: Request) -> JSONResponse:
     }, status_code=200)
 
 
+@app.post("/webhook/sms/deposit", summary="기업은행 입금 SMS 수신")
+async def sms_deposit_webhook(request: Request) -> JSONResponse:
+    """사업장 휴대폰의 SMS 포워딩 앱이 전달한 기업은행 입금 문자를 파싱·적재.
+
+    인증: 헤더 X-Webhook-Token 이 환경변수 SMS_WEBHOOK_TOKEN 과 일치해야 함.
+    본문: JSON {"message": "<문자원문>"} 또는 폼/텍스트 본문(message/text/body 키 허용).
+    입금 문자만 처리하고 출금은 무시한다. 계좌 끝자리로 매장을 자동 판별한다.
+    """
+    expected_token = os.environ.get("SMS_WEBHOOK_TOKEN", "")
+    sent_token = request.headers.get("x-webhook-token", "") or request.query_params.get("token", "")
+    if expected_token and sent_token != expected_token:
+        return JSONResponse({"status": "error", "reason": "unauthorized"}, status_code=401)
+
+    # 본문에서 문자 원문 추출 (JSON / form / raw 모두 시도)
+    message = ""
+    try:
+        payload = await request.json()
+        if isinstance(payload, dict):
+            message = payload.get("message") or payload.get("text") or payload.get("body") or ""
+        elif isinstance(payload, str):
+            message = payload
+    except Exception:
+        try:
+            form = await request.form()
+            message = form.get("message") or form.get("text") or form.get("body") or ""
+        except Exception:
+            try:
+                message = (await request.body()).decode("utf-8", errors="ignore")
+            except Exception:
+                message = ""
+
+    if not message:
+        return JSONResponse({"status": "error", "reason": "empty_message"}, status_code=400)
+
+    try:
+        import deposit_sms
+    except Exception as e:
+        logger.error("deposit_sms import 실패: %s", e)
+        return JSONResponse({"status": "error", "reason": "parser_unavailable"}, status_code=500)
+
+    parsed = deposit_sms.parse_ibk_sms(message)
+    if not parsed:
+        # 입금 문자가 아니거나(출금 등) 형식 불일치 → 무시(정상 200)
+        return JSONResponse({"status": "ignored", "reason": "not_a_deposit"}, status_code=200)
+
+    headers = _supa_headers()
+    if not headers:
+        return JSONResponse({"status": "error", "reason": "supabase_not_configured"}, status_code=500)
+
+    # 계좌-매장 매핑 조회 후 매장 판별
+    store_name = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            acc_resp = await client.get(
+                _supa_url("app_bank_accounts") + "?select=account_suffix,store_name,is_active",
+                headers=headers,
+            )
+            accounts = acc_resp.json() if acc_resp.status_code < 300 else []
+        store_name = deposit_sms.match_store(parsed.get("account_suffix"), accounts)
+    except Exception as e:
+        logger.warning("계좌-매장 매핑 조회 실패: %s", e)
+
+    row = {
+        "txn_at": parsed["txn_at"],
+        "counterparty": parsed.get("counterparty"),
+        "amount": parsed["amount"],
+        "balance": parsed.get("balance"),
+        "bank_name": parsed.get("bank_name") or "기업은행",
+        "account_suffix": parsed.get("account_suffix"),
+        "account_masked": parsed.get("account_masked"),
+        "store_name": store_name,
+        "source": "auto_sms",
+        "raw_message": message,
+        "dedup_hash": deposit_sms.make_dedup_hash(parsed),
+        "created_by": "sms_webhook",
+    }
+
+    inserted = False
+    duplicated = False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                _supa_url("app_deposits"),
+                headers={**headers, "Prefer": "return=representation,resolution=ignore-duplicates"},
+                json=row,
+            )
+            if resp.status_code < 300:
+                inserted = True
+            elif resp.status_code == 409:
+                duplicated = True
+            else:
+                logger.warning("app_deposits insert 실패 %s: %s", resp.status_code, resp.text)
+    except Exception as e:
+        logger.error("app_deposits insert 예외: %s", e)
+        return JSONResponse({"status": "error", "reason": "insert_failed"}, status_code=500)
+
+    return JSONResponse({
+        "status": "ok",
+        "inserted": inserted,
+        "duplicated": duplicated,
+        "matched_store": store_name,
+        "amount": parsed["amount"],
+    }, status_code=200)
+
+
 @app.get("/health", summary="헬스체크")
 async def health() -> JSONResponse:
     return JSONResponse({

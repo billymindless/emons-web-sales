@@ -541,6 +541,8 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_TASKS_TAGS.sql",
         "SUPABASE_APP_TASKS_SCOPE.sql",
         "SUPABASE_APP_POSTS.sql",
+        "SUPABASE_APP_BANK_ACCOUNTS.sql",
+        "SUPABASE_APP_DEPOSITS.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -601,7 +603,9 @@ def _supabase_run_task_tables_sql() -> bool:
                   "SUPABASE_APP_TASKS_CATEGORY.sql",
                   "SUPABASE_APP_TASKS_TAGS.sql",
                   "SUPABASE_APP_TASKS_SCOPE.sql",
-                  "SUPABASE_APP_POSTS.sql"):
+                  "SUPABASE_APP_POSTS.sql",
+                  "SUPABASE_APP_BANK_ACCOUNTS.sql",
+                  "SUPABASE_APP_DEPOSITS.sql"):
         fpath = os.path.join(BASE_DIR, fname)
         if os.path.isfile(fpath) and _supabase_run_sql_file(db_url, fpath):
             ok = True
@@ -15863,6 +15867,256 @@ def _render_post_card(post: dict, me_uname: str, role: str):
             _render_post_comment_input(pid, me_uname, parent_cid=None, key_prefix=f"pnew_{pid}")
 
 
+def _deposit_resolve_my_store_name(stores: list[dict], store_id) -> str | None:
+    if not store_id:
+        return None
+    for s in stores:
+        if str(s.get("id")) == str(store_id):
+            return s.get("store_name")
+    return None
+
+
+def _deposit_load_store_sales(db_filename: str) -> list[dict]:
+    """매출 연결용: 해당 매장 최근 매출(sales) 목록 (id 포함)."""
+    if not db_filename:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        q = client.table("sales").select("id, transaction_date, amount, note, order_id")
+        tenant_col = _sales_tenant_column()
+        if tenant_col:
+            q = q.eq(tenant_col, db_filename)
+        r = q.order("transaction_date", desc=True).limit(150).execute()
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _deposit_sale_label(sale: dict) -> str:
+    note = (sale.get("note") or "").strip()
+    amt = sale.get("amount") or 0
+    try:
+        amt_txt = f"{int(float(amt)):,}원"
+    except Exception:
+        amt_txt = f"{amt}원"
+    date = (sale.get("transaction_date") or "")[:10]
+    head = note or f"주문#{sale.get('order_id')}"
+    return f"{date} · {head} · {amt_txt}"
+
+
+def render_deposit_management():
+    """💰 입금 관리 — 기업은행 입금 SMS(자동) + 수기 입금을 매장별로 조회·관리.
+    상단 매장 선택 드롭다운으로 매장별 전환, KPI·검색·표·수기등록·매출연결 제공."""
+    import deposit_board as _dep  # noqa: WPS433
+    from datetime import datetime as _dt, date as _date
+
+    _consume_flash()
+
+    current_user = st.session_state.get("current_user") or {}
+    role = (current_user.get("role") or "user").strip()
+    me_uname = (current_user.get("username") or current_user.get("email") or "").strip()
+    store_id = current_user.get("store_id") or st.session_state.get("current_store_id")
+    is_superadmin = role == "superadmin"
+
+    st.header("💰 입금 관리")
+    st.caption("기록된 입금은 안심이고, 누락된 입금은 사건입니다.")
+
+    stores = _get_supabase_stores_list()
+    store_by_name = {s.get("store_name"): s for s in stores}
+    my_store_name = _deposit_resolve_my_store_name(stores, store_id)
+
+    # ── 매장 선택 드롭다운 ───────────────────────────────────────
+    if is_superadmin:
+        options = ["전체"] + [s.get("store_name") for s in stores] + ["미분류"]
+        sel = st.selectbox("🏪 매장 선택", options, key="dep_store_sel")
+    else:
+        sel = my_store_name
+        st.selectbox(
+            "🏪 매장 선택",
+            [my_store_name or "(매장 미지정)"],
+            disabled=True,
+            key="dep_store_sel_fixed",
+        )
+
+    # ── 데이터 로드 ──────────────────────────────────────────────
+    if is_superadmin:
+        if sel == "전체":
+            rows = _dep.load_deposits_cached(None, include_unmatched=True)
+        elif sel == "미분류":
+            rows = [r for r in _dep.load_deposits_cached(None, include_unmatched=True) if not r.get("store_name")]
+        else:
+            rows = _dep.load_deposits_cached(sel)
+    else:
+        rows = _dep.load_deposits_cached(sel) if sel else []
+
+    def _amt(v) -> float:
+        try:
+            return float(v or 0)
+        except Exception:
+            return 0.0
+
+    today = _date.today()
+    month_sum = sum(_amt(r.get("amount")) for r in rows if (r.get("txn_at") or "")[:7] == today.strftime("%Y-%m"))
+    year_sum = sum(_amt(r.get("amount")) for r in rows if (r.get("txn_at") or "")[:4] == str(today.year))
+    cnt = len(rows)
+    linked_cnt = sum(1 for r in rows if r.get("linked_sale_id"))
+
+    # ── KPI 카드 ─────────────────────────────────────────────────
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(f"{today.month}월 입금액", f"{int(month_sum):,}원")
+    k2.metric(f"{today.year}년 입금액", f"{int(year_sum):,}원")
+    k3.metric("입금 건수", f"{cnt}건")
+    k4.metric("매출 연결", f"{linked_cnt}건")
+
+    st.divider()
+
+    # ── 수기 입금 등록 ───────────────────────────────────────────
+    with st.expander("➕ 입금 등록 (수기)", expanded=False):
+        with st.form("dep_manual_form"):
+            mc1, mc2 = st.columns(2)
+            m_date = mc1.date_input("입금일", value=today, key="dep_m_date")
+            m_amount = mc2.number_input("입금액", min_value=0, step=1000, key="dep_m_amount")
+            m_name = st.text_input("입금자명(거래처)", key="dep_m_name")
+            m_memo = st.text_input("메모", key="dep_m_memo")
+            # 매장 결정: superadmin은 선택 매장(전체/미분류면 지정 필요), 그 외는 본인 매장
+            target_store = None if (is_superadmin and sel in ("전체", "미분류")) else sel
+            if is_superadmin and sel in ("전체", "미분류"):
+                _st_opts = [s.get("store_name") for s in stores]
+                target_store = st.selectbox("매장", _st_opts, key="dep_m_store") if _st_opts else None
+            if st.form_submit_button("등록", type="primary"):
+                if not m_amount:
+                    st.error("입금액을 입력해 주세요.")
+                elif not target_store:
+                    st.error("매장을 선택해 주세요.")
+                else:
+                    ok, err = _dep.create_manual_deposit(
+                        txn_at=_dt(m_date.year, m_date.month, m_date.day, 0, 0).isoformat() + "+09:00",
+                        counterparty=m_name,
+                        amount=float(m_amount),
+                        store_name=target_store,
+                        created_by=me_uname,
+                        memo=m_memo,
+                    )
+                    if ok:
+                        flash("입금이 등록되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"등록 실패: {err}")
+
+    # ── 검색 ─────────────────────────────────────────────────────
+    kw = st.text_input("🔎 입금자명·은행·메모 검색", key="dep_search", placeholder="입금자명, 은행, 메모를 검색하세요")
+    if kw:
+        low = kw.strip().lower()
+        rows = [
+            r for r in rows
+            if low in str(r.get("counterparty") or "").lower()
+            or low in str(r.get("bank_name") or "").lower()
+            or low in str(r.get("memo") or "").lower()
+        ]
+
+    st.caption(f"{len(rows)}건 표시 중")
+
+    if not rows:
+        st.info("표시할 입금 내역이 없습니다.")
+        return
+
+    # 매출 연결 표시용 라벨 매핑 (선택 매장 db 기준)
+    sale_label_by_id: dict = {}
+    sel_db = None
+    if sel and sel not in ("전체", "미분류"):
+        sel_db = (store_by_name.get(sel) or {}).get("db_filename")
+    if sel_db:
+        for s in _deposit_load_store_sales(sel_db):
+            sale_label_by_id[int(s["id"])] = _deposit_sale_label(s)
+
+    # ── 표 ───────────────────────────────────────────────────────
+    table_rows = []
+    for r in rows:
+        lid = r.get("linked_sale_id")
+        link_txt = sale_label_by_id.get(int(lid), f"#{lid}") if lid else "-"
+        table_rows.append({
+            "입금일": (r.get("txn_at") or "")[:16].replace("T", " "),
+            "입금명": r.get("counterparty") or "-",
+            "입금액": f"{int(_amt(r.get('amount'))):,}원",
+            "은행": r.get("bank_name") or "-",
+            "출처": "자동" if r.get("source") == "auto_sms" else "수기",
+            "매장": r.get("store_name") or "미분류",
+            "매출 연결": link_txt,
+        })
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+    # ── 건별 관리 (매출 연결 / 매장 지정 / 삭제) ────────────────────
+    with st.expander("🔧 입금 건 관리 (매출 연결 · 매장 지정 · 삭제)", expanded=False):
+        opt_map = {
+            f"{(r.get('txn_at') or '')[:16].replace('T',' ')} · {r.get('counterparty') or '-'} · {int(_amt(r.get('amount'))):,}원": r
+            for r in rows
+        }
+        pick = st.selectbox("입금 건 선택", list(opt_map.keys()), key="dep_pick")
+        target = opt_map.get(pick)
+        if target:
+            tid = int(target["id"])
+            # 매출 연결
+            if sel_db:
+                sale_opts = ["(연결 안 함)"] + list(sale_label_by_id.values())
+                cur_lid = target.get("linked_sale_id")
+                cur_label = sale_label_by_id.get(int(cur_lid)) if cur_lid else None
+                idx = sale_opts.index(cur_label) if cur_label in sale_opts else 0
+                sale_sel = st.selectbox("매출 연결", sale_opts, index=idx, key=f"dep_link_{tid}")
+                if st.button("매출 연결 저장", key=f"dep_link_btn_{tid}"):
+                    new_id = None
+                    if sale_sel != "(연결 안 함)":
+                        for sid, lbl in sale_label_by_id.items():
+                            if lbl == sale_sel:
+                                new_id = sid
+                                break
+                    ok, err = _dep.link_sale(tid, new_id)
+                    if ok:
+                        flash("매출 연결이 저장되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"실패: {err}")
+            else:
+                st.caption("특정 매장을 선택하면 해당 매장 매출과 연결할 수 있습니다.")
+
+            # 미분류 → 매장 지정
+            if not target.get("store_name") or is_superadmin:
+                _st_opts = [s.get("store_name") for s in stores]
+                if _st_opts:
+                    cur_store = target.get("store_name")
+                    sidx = _st_opts.index(cur_store) if cur_store in _st_opts else 0
+                    store_sel = st.selectbox("매장 지정", _st_opts, index=sidx, key=f"dep_store_assign_{tid}")
+                    if st.button("매장 지정 저장", key=f"dep_store_btn_{tid}"):
+                        ok, err = _dep.update_deposit(tid, store_name=store_sel)
+                        if ok:
+                            flash("매장이 지정되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error(f"실패: {err}")
+
+            # 삭제
+            _dk = f"dep_del_{tid}"
+            if not st.session_state.get(_dk):
+                if st.button("🗑️ 삭제", key=f"dep_del_btn_{tid}"):
+                    st.session_state[_dk] = True
+                    st.rerun()
+            else:
+                st.warning("정말 삭제하시겠습니까?")
+                cyes, cno = st.columns(2)
+                if cyes.button("✅ 확인", key=f"dep_del_yes_{tid}", type="primary"):
+                    ok, err = _dep.delete_deposit(tid)
+                    st.session_state.pop(_dk, None)
+                    if ok:
+                        flash("입금 건이 삭제되었습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"삭제 실패: {err}")
+                if cno.button("✖ 취소", key=f"dep_del_no_{tid}"):
+                    st.session_state.pop(_dk, None)
+                    st.rerun()
+
+
 def render_admin_settings():
     """⚙️ 관리자 설정 — ERP 운영 설정을 모아두는 허브.
     알림톡·카카오 채널 설정, 알림 문구 편집 등을 포함하며 항목이 늘어나면 여기에 추가."""
@@ -15928,6 +16182,75 @@ def render_admin_settings():
                         st.rerun()
                     else:
                         st.error(f"저장 실패: {err}")
+
+    st.divider()
+
+    # ── 계좌-매장 매핑 (입금 SMS 자동 분류) ─────────────────────
+    import deposit_board as _dep  # noqa: WPS433
+    st.subheader("🏦 계좌-매장 매핑 (입금 문자 자동 분류)")
+    st.caption(
+        "기업은행 입금 문자의 계좌(예: 392***16401011)에서 **끝 8자리**(16401011)로 매장을 자동 분류합니다. "
+        "각 매장 계좌의 끝 8자리를 등록해 주세요."
+    )
+
+    accounts = _dep.load_bank_accounts_cached()
+    if accounts:
+        st.dataframe(
+            pd.DataFrame([{
+                "은행": a.get("bank_name"),
+                "계좌(표시)": a.get("account_masked") or "-",
+                "끝자리": a.get("account_suffix"),
+                "매장": a.get("store_name"),
+                "별칭": a.get("account_alias") or "-",
+                "사용": "✅" if a.get("is_active", True) else "❌",
+            } for a in accounts]),
+            use_container_width=True, hide_index=True,
+        )
+
+    _stores = _get_supabase_stores_list()
+    _store_opts = [s.get("store_name") for s in _stores]
+    with st.form("admin_bank_acc_form"):
+        bc1, bc2 = st.columns(2)
+        a_suffix = bc1.text_input("계좌 끝 8자리", key="adm_acc_suffix", placeholder="예: 16401011")
+        a_store = bc2.selectbox("매장", _store_opts, key="adm_acc_store") if _store_opts else None
+        bc3, bc4 = st.columns(2)
+        a_masked = bc3.text_input("계좌(표시용, 선택)", key="adm_acc_masked", placeholder="예: 392***16401011")
+        a_alias = bc4.text_input("별칭(선택)", key="adm_acc_alias")
+        if st.form_submit_button("계좌 매핑 저장", type="primary"):
+            if not (a_suffix or "").strip():
+                st.error("계좌 끝 8자리를 입력해 주세요.")
+            elif not a_store:
+                st.error("매장을 선택해 주세요.")
+            else:
+                ok, err = _dep.upsert_bank_account(
+                    account_suffix=a_suffix, store_name=a_store,
+                    account_masked=a_masked, account_alias=a_alias,
+                )
+                if ok:
+                    flash("계좌 매핑이 저장되었습니다.")
+                    st.rerun()
+                else:
+                    st.error(f"저장 실패: {err}")
+
+    if accounts:
+        _del_opts = {f"{a.get('account_suffix')} → {a.get('store_name')}": a.get("id") for a in accounts}
+        dsel = st.selectbox("삭제할 매핑", list(_del_opts.keys()), key="adm_acc_del_sel")
+        if st.button("선택 매핑 삭제", key="adm_acc_del_btn"):
+            ok, err = _dep.delete_bank_account(int(_del_opts[dsel]))
+            if ok:
+                flash("매핑이 삭제되었습니다.")
+                st.rerun()
+            else:
+                st.error(f"삭제 실패: {err}")
+
+    with st.expander("📩 입금 문자 포워딩 설정 방법", expanded=False):
+        st.markdown(
+            "1. 사업장 휴대폰에 **SMS 포워딩 앱** 설치 (안드로이드)\n"
+            "2. 필터: 발신 = 기업은행, 본문 키워드 = `입금`\n"
+            "3. 전송(POST) 주소: `https://<서버주소>/webhook/sms/deposit`\n"
+            "4. 헤더 `X-Webhook-Token` 에 서버 환경변수 `SMS_WEBHOOK_TOKEN` 과 동일한 값 설정\n"
+            "5. 계좌 끝 8자리로 매장이 자동 분류됩니다. (미등록 계좌는 '미분류'로 적재 후 위에서 등록)"
+        )
 
     st.divider()
 
@@ -17241,8 +17564,9 @@ def render_superadmin():
         "⑥ 전 지점 마케팅 분석",
         "⑦ 미수금(잔금) 레포트",
         "⑧ 결제수단별 집계표",
-        "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
-        "⑩ FAQ (도움말)",
+        "⑨ 💰 입금 관리",
+        "⑩ ⚠️ 데이터 초기화 (Danger Zone)",
+        "⑪ FAQ (도움말)",
     ]
     if "superadmin_menu_idx" not in st.session_state:
         st.session_state["superadmin_menu_idx"] = 0
@@ -17280,9 +17604,11 @@ def render_superadmin():
         _superadmin_tab_unpaid_report()
     elif menu_sel == "⑧ 결제수단별 집계표":
         render_monthly_payment_report(is_superadmin=True)
-    elif menu_sel == "⑨ ⚠️ 데이터 초기화 (Danger Zone)":
+    elif menu_sel == "⑨ 💰 입금 관리":
+        render_deposit_management()
+    elif menu_sel == "⑩ ⚠️ 데이터 초기화 (Danger Zone)":
         _superadmin_tab_danger_zone_data_reset()
-    elif menu_sel == "⑩ FAQ (도움말)":
+    elif menu_sel == "⑪ FAQ (도움말)":
         render_faq_page()
 
 
@@ -22592,11 +22918,12 @@ def main():
             "2. 마케팅 인사이트",
             "3. 새로운 매출 등록",
             "4. 고객 및 잔금 관리",
-            "5. 매장 관리자 메뉴",
-            "6. 결제수단별 집계표",
-            "7. 고객 CRM 자동화",
-            "8. 전시품 판매 검증",
-            "9. FAQ (도움말)",
+            "5. 입금 관리",
+            "6. 매장 관리자 메뉴",
+            "7. 결제수단별 집계표",
+            "8. 고객 CRM 자동화",
+            "9. 전시품 판매 검증",
+            "10. FAQ (도움말)",
         ]
     else:
         tab_labels = [
@@ -22604,9 +22931,10 @@ def main():
             "2. 마케팅 인사이트",
             "3. 새로운 매출 등록",
             "4. 고객 및 잔금 관리",
-            "5. 결제수단별 집계표",
-            "6. 전시품 판매 검증",
-            "7. FAQ (도움말)",
+            "5. 입금 관리",
+            "6. 결제수단별 집계표",
+            "7. 전시품 판매 검증",
+            "8. FAQ (도움말)",
         ]
     if "main_tab_idx" not in st.session_state:
         st.session_state["main_tab_idx"] = 0
@@ -22658,22 +22986,24 @@ def main():
         render_new_sales()
     elif idx == 3:
         render_customer_balance()
-    elif role == "store_admin" and idx == 4:
-        render_store_admin_employees()
+    elif idx == 4:
+        render_deposit_management()
     elif role == "store_admin" and idx == 5:
-        render_monthly_payment_report(is_superadmin=False)
-    elif role == "user" and idx == 4:
-        render_monthly_payment_report(is_superadmin=False)
+        render_store_admin_employees()
     elif role == "store_admin" and idx == 6:
+        render_monthly_payment_report(is_superadmin=False)
+    elif role == "user" and idx == 5:
+        render_monthly_payment_report(is_superadmin=False)
+    elif role == "store_admin" and idx == 7:
         if CRM_MODULE_AVAILABLE:
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
-    elif (role == "store_admin" and idx == 7) or (role == "user" and idx == 5):
+    elif (role == "store_admin" and idx == 8) or (role == "user" and idx == 6):
         render_display_sales_audit()
-    elif role == "store_admin" and idx == 8:
+    elif role == "store_admin" and idx == 9:
         render_faq_page()
-    elif role == "user" and idx == 6:
+    elif role == "user" and idx == 7:
         render_faq_page()
 
 
