@@ -13198,45 +13198,11 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
 def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
     """직원·관리자 공용: 내 근태 (월·연 잔여 카드 + +/- 신청 + 내 신청 내역)."""
     st.subheader("🧑‍💼 근무시간 관리")
-    st.caption("이번 달과 올해의 필수 근무시간 대비 승인된 신청 합계, 잔여 시간을 확인하고 +/- 신청을 등록합니다.")
-
     today = _today_kst()
-    cy, cm = st.columns(2)
-    with cy:
-        year = st.number_input("연도", min_value=2020, max_value=2099, value=today.year, step=1, key="my_y")
-    with cm:
-        month = st.number_input("월", min_value=1, max_value=12, value=today.month, step=1, key="my_m")
-    ym = f"{int(year):04d}-{int(month):02d}"
-    yr = int(year)
-
-    m = _erp_compute_monthly_remaining_v2(current_db, me_name, ym)
-    y = _erp_compute_yearly_remaining_v2(current_db, me_name, yr)
-
-    def _h(mins: int) -> str:
-        h = abs(mins) // 60
-        mm = abs(mins) % 60
-        sgn = "-" if mins < 0 else ""
-        return f"{sgn}{h}h" if mm == 0 else f"{sgn}{h}h {mm}m"
-
-    card_l, card_r = st.columns(2)
-    with card_l:
-        with st.container(border=True):
-            st.markdown(f"##### 이번 달 ({ym})")
-            st.metric("필수", _h(m["required_min"]))
-            st.metric("승인 합계", _h(m["approved_min"]))
-            st.metric("잔여", _h(m["remaining_min"]))
-            if m["source"] == "year_div_12":
-                st.caption("ⓘ 월 입력이 없어 연 입력의 1/12로 환산되었습니다.")
-            elif m["source"] == "none":
-                st.caption("⚠️ 매장관리자가 필수 시간을 설정하지 않았습니다.")
-    with card_r:
-        with st.container(border=True):
-            st.markdown(f"##### 올해 ({yr})")
-            st.metric("필수", _h(y["required_min"]))
-            st.metric("승인 합계", _h(y["approved_min"]))
-            st.metric("잔여", _h(y["remaining_min"]))
-            if y["required_min"] == 0:
-                st.caption("ⓘ 연 단위 입력값이 없습니다.")
+    year = today.year
+    month = today.month
+    ym = f"{year:04d}-{month:02d}"
+    yr = year
 
     st.divider()
 
