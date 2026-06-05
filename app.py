@@ -11762,9 +11762,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         _es_def, _ee_def = _erp_default_times_for_date(edit_dbf, _sd)
                         _ec_a, _ec_b = st.columns(2)
                         with _ec_a:
-                            _e_start = st.time_input("출근 시각", value=_erp_parse_time(_sh.get("shift_start")) or _es_def, key=f"qe_e_s_{_sid}", step=900)
+                            _e_start = st.time_input("출근 시각", value=_erp_parse_time(_sh.get("shift_start")) or _es_def, key=f"qe_e_s_{_sid}", step=60)
                         with _ec_b:
-                            _e_end = st.time_input("퇴근 시각", value=_erp_parse_time(_sh.get("shift_end")) or _ee_def, key=f"qe_e_e_{_sid}", step=900)
+                            _e_end = st.time_input("퇴근 시각", value=_erp_parse_time(_sh.get("shift_end")) or _ee_def, key=f"qe_e_e_{_sid}", step=60)
                         # 근무 장소 셀렉트 (실근무지 명시 선택)
                         _ETC_E_LABEL = "기타 (외부/행사) — 직접 입력"
                         _e_loc_opts = list(all_store_names) + [_ETC_E_LABEL]
@@ -11870,9 +11870,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             )
         _add_def_s, _add_def_e = _erp_default_times_for_date(edit_dbf, qe_new_date)
         with _add_c2:
-            qe_new_start = st.time_input("출근 시각", value=_add_def_s, key="qe_new_start_calendar", step=900)
+            qe_new_start = st.time_input("출근 시각", value=_add_def_s, key="qe_new_start_calendar", step=60)
         with _add_c3:
-            qe_new_end = st.time_input("퇴근 시각", value=_add_def_e, key="qe_new_end_calendar", step=900)
+            qe_new_end = st.time_input("퇴근 시각", value=_add_def_e, key="qe_new_end_calendar", step=60)
         # ── 근무 장소 선택 (명시적 선택 — 자동 추론 X, 직원 소속과 무관)
         #   실근무지 기준으로 저장되어 캘린더 카운팅·표시가 일치
         _ETC_LOC_LABEL = "기타 (외부/행사) — 직접 입력"
