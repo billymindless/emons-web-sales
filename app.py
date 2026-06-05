@@ -10112,22 +10112,48 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     if _annual_remain_h < 0:
         st.warning(f"⚠️ 연간 목표 근무시간({_annual_target_h:.0f}h)을 이미 초과했습니다. 보상(시차·연차·급여) 신청을 검토해 주세요.")
 
-    # ── 관리자 전용: 매장 전체 직원 현황 ────────────────────────
+    # ── 관리자 전용: 매장 전체 직원 현황 (전 매장 합산) ─────────
     if role in ("store_admin", "superadmin"):
         st.divider()
-        st.markdown(f"##### 👥 {today.year}년 {today.month}월 매장 전체 직원 현황")
+        st.markdown(f"##### 👥 {today.year}년 {today.month}월 매장 전체 직원 현황 (전 매장 합산)")
+        st.caption("이번달 근무일·근무시간은 소속 매장 외 타 매장 파견·외부행사 근무를 포함한 총합입니다.")
         _employees = _erp_get_employee_names_for_store(current_db)
         if not _employees:
             st.info("배정된 직원이 없습니다.")
         else:
+            # 전 매장 이번달 시프트 조회 (employee_name 기준, db_filename 무관)
+            _all_month_shifts: list = []
+            try:
+                _cli2, _e2 = get_supabase_client()
+                if not _e2 and _cli2:
+                    _r_all = _cli2.table("app_shift_schedules").select(
+                        "employee_name, shift_date, shift_start, shift_end, db_filename, work_location_name"
+                    ).gte("shift_date", _m_start.isoformat()).lte(
+                        "shift_date", _m_end.isoformat()
+                    ).execute()
+                    _all_month_shifts = list(_r_all.data or [])
+            except Exception:
+                _all_month_shifts = []
+
             _rows = []
             for _emp in _employees:
-                _emp_shifts = [s for s in _shifts if _resolve_name(s.get("employee_name") or "") == _emp]
-                _emp_work_days = len(_emp_shifts)
-                _emp_work_h = sum(_erp_calc_shift_hours(
-                    _erp_parse_time(s.get("shift_start")),
-                    _erp_parse_time(s.get("shift_end")),
-                ) for s in _emp_shifts)
+                # 해당 직원의 시프트: 모든 매장에서 employee_name 이 _emp 인 행
+                _emp_shifts_all = [
+                    s for s in _all_month_shifts
+                    if _resolve_name(s.get("employee_name") or "") == _emp
+                ]
+                # 중복 제거: 같은 날짜에 여러 행이 있으면 가장 긴 근무를 대표로 사용
+                _date_seen: dict[str, float] = {}
+                for _s in _emp_shifts_all:
+                    _sd = str(_s.get("shift_date") or "")[:10]
+                    _sh = _erp_calc_shift_hours(
+                        _erp_parse_time(_s.get("shift_start")),
+                        _erp_parse_time(_s.get("shift_end")),
+                    )
+                    _date_seen[_sd] = _date_seen.get(_sd, 0) + _sh  # 같은 날 여러 매장 합산
+
+                _emp_work_days = len(_date_seen)
+                _emp_work_h = sum(_date_seen.values())
                 _emp_off = max(0, _weekdays_in_month - _emp_work_days)
                 _emp_monthly_tgt_h = _erp_get_employee_monthly_target(current_db, _emp)
                 _emp_annual_tgt_h = _emp_monthly_tgt_h * 12
