@@ -11590,7 +11590,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         if _is_admin:
             st.caption("**근무매장**(실제 근무한 매장)을 선택하면 해당 매장에서 일한 모든 직원(소속+파견)의 이번 달 근무일이 나옵니다. 외부 행사는 '기타 (외부/행사)' 선택.")
         else:
-            st.caption("내 이번 달 등록 근무일 목록입니다. 각 행에서 수정하거나 삭제할 수 있습니다.")
+            st.caption("내 이번 달 등록 근무일 목록입니다. 소속 매장 외 타 매장(파견)·외부행사 근무도 매장을 바꿔 선택하면 수정·삭제할 수 있습니다.")
         # 이 섹션 자체 매장 선택 (상단 필터와 독립). '기타 (외부/행사)'는 내 매장 db에 저장.
         _qe_store_opts = all_store_names + ["기타 (외부/행사)"]
         _qe_default_store = sel_store if sel_store in all_store_names else (
@@ -11602,12 +11602,8 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             _qe_store_idx = 0
         ec0, ec1 = st.columns([2, 2])
         with ec0:
-            if _is_admin:
-                qe_store_sel = st.selectbox("📍 근무매장", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
-            else:
-                # 일반 직원은 본인 소속 매장 고정
-                qe_store_sel = _dbf_to_sn.get(current_db) or (_qe_store_opts[0] if _qe_store_opts else "기타 (외부/행사)")
-                st.text_input("📍 근무매장", value=qe_store_sel, disabled=True, key="qe_store_fixed_calendar")
+            # 일반 user도 매장 변경 가능 (본인이 일한 모든 매장의 시프트를 수정·삭제할 수 있도록)
+            qe_store_sel = st.selectbox("📍 근무매장", _qe_store_opts, index=_qe_store_idx, key="qe_store_calendar")
         _qe_is_etc = (qe_store_sel == "기타 (외부/행사)")
         edit_dbf = current_db if _qe_is_etc else _sn_to_dbf.get(qe_store_sel, current_db)
 
