@@ -10402,7 +10402,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                     t_s = st.time_input(
                         "출근시각", value=init_start,
                         key=f"sp_start_{d.isoformat()}",
-                        label_visibility="collapsed", step=900,
+                        label_visibility="collapsed", step=60,
                     )
                 else:
                     st.markdown("<span style='color:#999;'>— 휴무 —</span>", unsafe_allow_html=True)
@@ -10412,7 +10412,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                     t_e = st.time_input(
                         "퇴근시각", value=init_end,
                         key=f"sp_end_{d.isoformat()}",
-                        label_visibility="collapsed", step=900,
+                        label_visibility="collapsed", step=60,
                     )
                 else:
                     t_e = None
@@ -10520,7 +10520,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
             _dup_note = f" 중복 {len(dedup_ids)}건 정리." if dedup_ids else ""
             flash(
                 f"근무 일정 저장 완료 — 신규 {ok_n}건 · 덮어쓰기 {ow_n}건 · 휴무 삭제 {del_n}건."
-                f"{_dup_note} 총 계획 근무 {_total_planned_hours:.1f}h / 출근 {_work_days_count}일.{violation_note}",
+                f"{_dup_note}{violation_note}",
                 level="success",
             )
         else:
