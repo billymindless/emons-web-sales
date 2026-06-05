@@ -10001,25 +10001,53 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     st.subheader(f"📊 {today.year}년 {today.month}월 근태 현황")
 
     # ── 데이터 수집 ───────────────────────────────────────────────
-    # 이번달 shift_schedules
     _last_day = calendar.monthrange(today.year, today.month)[1]
     _m_start = date(today.year, today.month, 1)
     _m_end   = date(today.year, today.month, _last_day)
 
-    # 이번달 계획 근무(shift) — 직원 본인 기준
-    _shifts = _erp_fetch_range("app_shift_schedules", "db_filename", current_db,
-                               "shift_date", _m_start, _m_end)
     _name_map = _get_app_user_display_name_map()
     def _resolve_name(raw: str) -> str:
         k = str(raw or "").strip()
         return _name_map.get(k) or _name_map.get(k.lower()) or _email_local_part(k) or k
 
-    _my_shifts = [s for s in _shifts if _resolve_name(s.get("employee_name") or "") == me_name]
-    _work_days = len(_my_shifts)
-    _work_hours = sum(_erp_calc_shift_hours(
-        _erp_parse_time(s.get("shift_start")),
-        _erp_parse_time(s.get("shift_end")),
-    ) for s in _my_shifts)
+    # 전 매장 이번달 시프트 조회 (실근무 매장 합산)
+    _my_shifts: list = []
+    try:
+        _cli_d, _err_d = get_supabase_client()
+        if not _err_d and _cli_d:
+            _r_me = _cli_d.table("app_shift_schedules").select(
+                "employee_name, shift_date, shift_start, shift_end, db_filename, work_location_name"
+            ).gte("shift_date", _m_start.isoformat()).lte(
+                "shift_date", _m_end.isoformat()
+            ).execute()
+            _all_shifts_raw = list(_r_me.data or [])
+            _my_shifts = [s for s in _all_shifts_raw
+                          if _resolve_name(s.get("employee_name") or "") == me_name]
+    except Exception:
+        _my_shifts = []
+
+    # 날짜별 합산 (같은 날 여러 매장 근무 가능)
+    _date_hours: dict[str, float] = {}
+    _store_hours: dict[str, float] = {}  # 실근무 매장별 시간
+    _all_stores_list = _get_supabase_stores_list() or []
+    _dbf_to_sn = {s["db_filename"]: s["store_name"] for s in _all_stores_list}
+    for _s in _my_shifts:
+        _sd = str(_s.get("shift_date") or "")[:10]
+        _sh = _erp_calc_shift_hours(
+            _erp_parse_time(_s.get("shift_start")),
+            _erp_parse_time(_s.get("shift_end")),
+        )
+        _date_hours[_sd] = _date_hours.get(_sd, 0.0) + _sh
+        # 실근무 매장명 결정
+        _wloc = (_s.get("work_location_name") or "").strip()
+        _store_label = _wloc if _wloc else (_dbf_to_sn.get(_s.get("db_filename") or "", "") or "소속 매장")
+        _store_hours[_store_label] = _store_hours.get(_store_label, 0.0) + _sh
+
+    _work_days = len(_date_hours)
+    _work_hours = sum(_date_hours.values())
+
+    # _shifts 는 관리자 전용 직원 현황 테이블에서도 사용하므로 전체 raw 보관
+    _shifts = _my_shifts
 
     # 이번달 평일 수 (법정 공휴일 제외)
     _weekdays_in_month = sum(
@@ -10044,12 +10072,16 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
+        _store_detail = " / ".join(
+            f"{_sn} {_sh:.1f}h" for _sn, _sh in sorted(_store_hours.items(), key=lambda x: -x[1])
+        ) if len(_store_hours) > 1 else ""
         st.markdown(
             f"<div style='background:#E3F2FD; border-radius:10px; padding:20px 18px; text-align:center;'>"
             f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>📅 이번달 근무일수</div>"
             f"<div style='font-size:2.2rem; font-weight:700; color:#1565C0;'>{_work_days}일</div>"
-            f"<div style='font-size:0.9rem; color:#1976D2; margin-top:4px;'>{_work_hours:.1f}h 예정</div>"
-            f"</div>",
+            f"<div style='font-size:0.9rem; color:#1976D2; margin-top:4px;'>{_work_hours:.1f}h (전 매장 합산)</div>"
+            + (f"<div style='font-size:0.75rem; color:#888; margin-top:3px;'>{_store_detail}</div>" if _store_detail else "")
+            + f"</div>",
             unsafe_allow_html=True,
         )
     with c2:
