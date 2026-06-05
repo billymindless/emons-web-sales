@@ -13089,16 +13089,46 @@ def _erp_period_target_editor(current_db: str, me_name: str, emp_names: list, to
 
 def _erp_tab_period_targets(current_db: str, me_name: str):
     """매장관리자: 근무시간 설정 (기간 목표 입력)."""
+    role = (st.session_state.get("current_user") or {}).get("role") or "user"
+    if role not in ("store_admin", "superadmin"):
+        st.warning("매장 관리자 이상만 접근할 수 있습니다.")
+        return
+
     st.subheader("⏰ 근무시간 설정")
     st.caption("직원별로 임의 기간(예: 6~7월 200h)의 필수 근무시간 목표를 입력합니다.")
 
     today = _today_kst()
-    emp_names = _erp_get_employee_names_for_store(current_db)
+
+    # ── 매장 선택 드롭다운 ──────────────────────────────────────
+    _all_stores = _get_supabase_stores_list() or []
+    _store_opts = [("전체 매장", None)] + [(s["store_name"], s["db_filename"]) for s in _all_stores]
+    _store_labels = [s[0] for s in _store_opts]
+    _default_store_idx = next(
+        (i for i, s in enumerate(_store_opts) if s[1] == current_db), 0
+    )
+    _sel_store_label = st.selectbox(
+        "📍 매장 선택", _store_labels, index=_default_store_idx, key="pt_store_filter"
+    )
+    _sel_store_dbf = next((s[1] for s in _store_opts if s[0] == _sel_store_label), None)
+
+    # ── 선택 매장 기준 직원 목록 ───────────────────────────────
+    if _sel_store_dbf is None:
+        # 전체 매장: 모든 매장 직원 합집합
+        _emp_set: set[str] = set()
+        for _s in _all_stores:
+            for _e in (_erp_get_employee_names_for_store(_s["db_filename"]) or []):
+                _emp_set.add(_e)
+        emp_names = sorted(_emp_set)
+        _target_db = current_db  # 기간 목표는 현재 관리자의 home db에 저장
+    else:
+        emp_names = _erp_get_employee_names_for_store(_sel_store_dbf) or []
+        _target_db = _sel_store_dbf
+
     if not emp_names:
-        st.info("매장에 배정된 직원이 없습니다. 직원 관리에서 매장을 배정해 주세요.")
+        st.info("선택한 매장에 배정된 직원이 없습니다. 직원 관리에서 매장을 배정해 주세요.")
         return
 
-    _erp_period_target_editor(current_db, me_name, emp_names, today)
+    _erp_period_target_editor(_target_db, me_name, emp_names, today)
 
 
 def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
