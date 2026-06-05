@@ -10285,56 +10285,6 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         if str(row.get("employee_name") or "").strip() in _my_aliases:
             existing_rows_by_date.setdefault(str(row.get("shift_date") or "")[:10], []).append(row)
 
-    sh_hours = _erp_get_store_hours(current_db)
-
-    # ── 실시간 요약 + 연차 경고 (입력 위 상단) ──────────────────
-    leave_status = _erp_compute_leave_status(current_db, me_name, today)
-    _total_planned_hours = 0.0
-    _work_days_count = 0
-    for d in date_list:
-        ck = st.session_state.get(f"sp_chk_{d.isoformat()}", None)
-        if ck is None:
-            existing_row = _erp_lookup_existing_shift(existing_by_key, me_name, d.isoformat())
-            ck = bool(existing_row and existing_row.get("shift_start") and existing_row.get("shift_end"))
-        if ck:
-            ss_val = st.session_state.get(f"sp_start_{d.isoformat()}")
-            ee_val = st.session_state.get(f"sp_end_{d.isoformat()}")
-            if not ss_val or not ee_val:
-                existing_row = _erp_lookup_existing_shift(existing_by_key, me_name, d.isoformat())
-                if existing_row and existing_row.get("shift_start"):
-                    ss_val = _erp_parse_time(existing_row.get("shift_start"))
-                    ee_val = _erp_parse_time(existing_row.get("shift_end"))
-                else:
-                    ss_val, ee_val = _erp_default_times_for_date(current_db, d)
-            _total_planned_hours += _erp_calc_shift_hours(ss_val, ee_val)
-            _work_days_count += 1
-
-    # 직원별 주간 목표 근무시간 (관리자 설정값, 기본 40h)
-    _weekly_target = _erp_get_employee_weekly_target(current_db, me_name)
-    _weeks = days_n / 7.0
-    _expected_hours = _weekly_target * _weeks
-    _hour_diff = _total_planned_hours - _expected_hours
-
-    sumc1, sumc2, sumc3, sumc4 = st.columns(4)
-    with sumc1:
-        st.metric("출근 예정", f"{_work_days_count}일")
-    with sumc2:
-        st.metric("총 계획 근무", f"{_total_planned_hours:.1f}h",
-                  delta=f"{_hour_diff:+.1f}h (기준 {_expected_hours:.0f}h / 주{_weekly_target:g}h)")
-    with sumc3:
-        st.metric("휴무 예정", f"{days_n - _work_days_count}일")
-    with sumc4:
-        st.metric("잔여 연차", f"{leave_status['annual_remain']:g}일",
-                  delta=f"올해 {int(leave_status['days_until_year_end'])}일 남음")
-
-
-    st.divider()
-    st.caption(
-        f"📌 매장 기본 근무시간: "
-        f"주중 {sh_hours['weekday_start'].strftime('%H:%M')}~{sh_hours['weekday_end'].strftime('%H:%M')} / "
-        f"주말·공휴일 {sh_hours['weekend_start'].strftime('%H:%M')}~{sh_hours['weekend_end'].strftime('%H:%M')}"
-    )
-
     # ── 입력 영역 ────────────────────────────────────────────────
     st.markdown(f"##### ✏️ 내 근무 일정 — **{me_name}**")
 
