@@ -9975,26 +9975,6 @@ def render_erp_attendance():
             _erp_tab_shift_plan(current_db, me_name)
         elif selected_tab == "추가근무·휴무 신청":
             _erp_tab_my_attendance(current_db, role, me_name)
-            st.divider()
-            st.subheader("⚙️ 매장별 근무 기준 설정")
-            _stores_list_sr = _get_supabase_stores_list()
-            if _stores_list_sr:
-                _sr_tab_labels = [s["store_name"] for s in _stores_list_sr]
-                _sr_key = "erp_staffing_store_tab"
-                if _sr_key not in st.session_state or st.session_state[_sr_key] not in _sr_tab_labels:
-                    st.session_state[_sr_key] = _sr_tab_labels[0]
-                _sr_selected = st.segmented_control(
-                    "매장", _sr_tab_labels, key=_sr_key, label_visibility="collapsed",
-                )
-                if not _sr_selected:
-                    _sr_selected = _sr_tab_labels[0]
-                _sr_db = next(
-                    (s["db_filename"] for s in _stores_list_sr if s["store_name"] == _sr_selected),
-                    _stores_list_sr[0]["db_filename"],
-                )
-                _erp_tab_staffing_rules(_sr_db, me_name)
-            else:
-                _erp_tab_staffing_rules(current_db, me_name)
         elif selected_tab == "근무시간 설정":
             _erp_tab_period_targets(current_db, me_name)
         elif selected_tab == "신청 승인":
@@ -16344,6 +16324,31 @@ def render_admin_settings():
 
     st.header("⚙️ 관리자 설정")
     st.caption("ERP 운영에 필요한 설정을 관리합니다. 항목은 추후 확장됩니다.")
+
+    # ── 매장별 근무 기준 설정 ──────────────────────────────────
+    current_db = st.session_state.get("current_db")
+    if current_db:
+        with st.expander("🏪 매장별 근무 기준 설정", expanded=True):
+            _stores_list_sr = _get_supabase_stores_list()
+            if _stores_list_sr:
+                _sr_tab_labels = [s["store_name"] for s in _stores_list_sr]
+                _sr_key = "admin_staffing_store_tab"
+                if _sr_key not in st.session_state or st.session_state[_sr_key] not in _sr_tab_labels:
+                    st.session_state[_sr_key] = _sr_tab_labels[0]
+                _sr_selected = st.segmented_control(
+                    "매장", _sr_tab_labels, key=_sr_key, label_visibility="collapsed",
+                )
+                if not _sr_selected:
+                    _sr_selected = _sr_tab_labels[0]
+                _sr_db = next(
+                    (s["db_filename"] for s in _stores_list_sr if s["store_name"] == _sr_selected),
+                    _stores_list_sr[0]["db_filename"],
+                )
+                _erp_tab_staffing_rules(_sr_db, me_uname)
+            else:
+                _erp_tab_staffing_rules(current_db, me_uname)
+
+    st.divider()
 
     # ── 카카오 채널 / 알림톡 ───────────────────────────────────
     st.subheader("📲 카카오 채널 / 알림톡")
