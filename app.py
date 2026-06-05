@@ -9954,9 +9954,9 @@ def render_erp_attendance():
     # st.tabs 대신 segmented_control 사용: st.rerun() 호출 후에도 활성 탭 유지
     # (st.tabs는 stateless라 rerun 시 항상 첫 번째 탭으로 리셋되어 저장/수정 후 화면 이탈)
     if role == "store_admin":
-        tab_labels = ["근무 일정 계획", "근무시간 관리", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
+        tab_labels = ["대시보드", "근무 일정 계획", "근무시간 관리", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
     else:
-        tab_labels = ["근무 일정 계획", "근무시간 관리", "매장 캘린더"]
+        tab_labels = ["대시보드", "근무 일정 계획", "근무시간 관리", "매장 캘린더"]
 
     _tab_key = "erp_main_tab_label"
     if _tab_key not in st.session_state or st.session_state[_tab_key] not in tab_labels:
@@ -9968,7 +9968,9 @@ def render_erp_attendance():
         selected_tab = tab_labels[0]
     st.markdown("---")
 
-    if role == "store_admin":
+    if selected_tab == "대시보드":
+        _erp_tab_dashboard(current_db, role, me_name, today)
+    elif role == "store_admin":
         if selected_tab == "근무 일정 계획":
             _erp_tab_shift_plan(current_db, me_name)
         elif selected_tab == "근무시간 관리":
@@ -10008,6 +10010,237 @@ def render_erp_attendance():
             _erp_tab_my_attendance(current_db, role, me_name)
         elif selected_tab == "매장 캘린더":
             _erp_tab_calendar(current_db, role, me_name, today)
+
+
+# ---------- 대시보드 ----------
+
+def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
+    """근태 관리 첫 화면 대시보드.
+    이번달 근무일수(시간) / 휴무 예정 / 잔여 근무시간(연간) / 잔여 연차 4개 KPI 카드."""
+
+    st.subheader(f"📊 {today.year}년 {today.month}월 근태 현황")
+
+    # ── 데이터 수집 ───────────────────────────────────────────────
+    # 이번달 shift_schedules
+    _last_day = calendar.monthrange(today.year, today.month)[1]
+    _m_start = date(today.year, today.month, 1)
+    _m_end   = date(today.year, today.month, _last_day)
+
+    # 이번달 계획 근무(shift) — 직원 본인 기준
+    _shifts = _erp_fetch_range("app_shift_schedules", "db_filename", current_db,
+                               "shift_date", _m_start, _m_end)
+    _name_map = _get_app_user_display_name_map()
+    def _resolve_name(raw: str) -> str:
+        k = str(raw or "").strip()
+        return _name_map.get(k) or _name_map.get(k.lower()) or _email_local_part(k) or k
+
+    _my_shifts = [s for s in _shifts if _resolve_name(s.get("employee_name") or "") == me_name]
+    _work_days = len(_my_shifts)
+    _work_hours = sum(_erp_calc_shift_hours(
+        _erp_parse_time(s.get("shift_start")),
+        _erp_parse_time(s.get("shift_end")),
+    ) for s in _my_shifts)
+
+    # 이번달 평일 수 (법정 공휴일 제외)
+    _weekdays_in_month = sum(
+        1 for i in range(1, _last_day + 1)
+        if not _erp_is_weekend_or_holiday(date(today.year, today.month, i))
+    )
+    _off_days = max(0, _weekdays_in_month - _work_days)
+
+    # 잔여 근무시간 (연간): 연간 목표 − 올해 1월~오늘까지 누적 근무
+    _monthly_target_h = _erp_get_employee_monthly_target(current_db, me_name)
+    _annual_target_h = _monthly_target_h * 12
+    _ytd_start = date(today.year, 1, 1)
+    _ytd_worked_min = _erp_compute_worked_minutes(current_db, me_name, _ytd_start, today)
+    _ytd_worked_h = _ytd_worked_min / 60.0
+    _annual_remain_h = _annual_target_h - _ytd_worked_h
+
+    # 잔여 연차
+    _leave = _erp_compute_leave_status(current_db, me_name, today)
+    _annual_remain_days = _leave["annual_remain"]
+
+    # ── KPI 카드 4개 ─────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.markdown(
+            f"<div style='background:#E3F2FD; border-radius:10px; padding:20px 18px; text-align:center;'>"
+            f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>📅 이번달 근무일수</div>"
+            f"<div style='font-size:2.2rem; font-weight:700; color:#1565C0;'>{_work_days}일</div>"
+            f"<div style='font-size:0.9rem; color:#1976D2; margin-top:4px;'>{_work_hours:.1f}h 예정</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            f"<div style='background:#F3E5F5; border-radius:10px; padding:20px 18px; text-align:center;'>"
+            f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>🏖️ 휴무 예정</div>"
+            f"<div style='font-size:2.2rem; font-weight:700; color:#6A1B9A;'>{_off_days}일</div>"
+            f"<div style='font-size:0.9rem; color:#7B1FA2; margin-top:4px;'>이번달 평일 {_weekdays_in_month}일 기준</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with c3:
+        _remain_color_y = "#E53935" if _annual_remain_h < 0 else ("#FB8C00" if _annual_remain_h < _monthly_target_h else "#2E7D32")
+        _remain_bg_y = "#FFEBEE" if _annual_remain_h < 0 else ("#FFF8E1" if _annual_remain_h < _monthly_target_h else "#E8F5E9")
+        st.markdown(
+            f"<div style='background:{_remain_bg_y}; border-radius:10px; padding:20px 18px; text-align:center;'>"
+            f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>⏱️ 잔여 근무시간(연간)</div>"
+            f"<div style='font-size:2.2rem; font-weight:700; color:{_remain_color_y};'>{_annual_remain_h:+.0f}h</div>"
+            f"<div style='font-size:0.9rem; color:#777; margin-top:4px;'>연간 목표 {_annual_target_h:.0f}h · 누적 {_ytd_worked_h:.0f}h</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with c4:
+        _leave_color = "#E53935" if _annual_remain_days == 0 else ("#FB8C00" if _leave["soak_risk"] else "#2E7D32")
+        _leave_bg = "#FFEBEE" if _annual_remain_days == 0 else ("#FFF8E1" if _leave["soak_risk"] else "#E8F5E9")
+        st.markdown(
+            f"<div style='background:{_leave_bg}; border-radius:10px; padding:20px 18px; text-align:center;'>"
+            f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>🎫 잔여 연차</div>"
+            f"<div style='font-size:2.2rem; font-weight:700; color:{_leave_color};'>{_annual_remain_days:g}일</div>"
+            f"<div style='font-size:0.9rem; color:#777; margin-top:4px;'>"
+            f"올해 {int(_leave['days_until_year_end'])}일 남음</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── 경고 배너 ────────────────────────────────────────────────
+    st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+    if _leave["soak_risk"]:
+        st.error(f"🔴 연차 소멸 위험 — 잔여 {_annual_remain_days:g}일 / 연말까지 {int(_leave['days_until_year_end'])}일 남음. 연차 사용을 서둘러 주세요.")
+    if _annual_remain_h < 0:
+        st.warning(f"⚠️ 연간 목표 근무시간({_annual_target_h:.0f}h)을 이미 초과했습니다. 보상(시차·연차·급여) 신청을 검토해 주세요.")
+
+    # ── 관리자 전용: 매장 전체 직원 현황 ────────────────────────
+    if role in ("store_admin", "superadmin"):
+        st.divider()
+        st.markdown(f"##### 👥 {today.year}년 {today.month}월 매장 전체 직원 현황")
+        _employees = _erp_get_employee_names_for_store(current_db)
+        if not _employees:
+            st.info("배정된 직원이 없습니다.")
+        else:
+            _rows = []
+            for _emp in _employees:
+                _emp_shifts = [s for s in _shifts if _resolve_name(s.get("employee_name") or "") == _emp]
+                _emp_work_days = len(_emp_shifts)
+                _emp_work_h = sum(_erp_calc_shift_hours(
+                    _erp_parse_time(s.get("shift_start")),
+                    _erp_parse_time(s.get("shift_end")),
+                ) for s in _emp_shifts)
+                _emp_off = max(0, _weekdays_in_month - _emp_work_days)
+                _emp_monthly_tgt_h = _erp_get_employee_monthly_target(current_db, _emp)
+                _emp_annual_tgt_h = _emp_monthly_tgt_h * 12
+                _emp_ytd_min = _erp_compute_worked_minutes(current_db, _emp, _ytd_start, today)
+                _emp_remain_h = _emp_annual_tgt_h - _emp_ytd_min / 60.0
+                _emp_leave = _erp_compute_leave_status(current_db, _emp, today)
+                _rows.append({
+                    "직원명": _emp,
+                    "이번달 근무일": _emp_work_days,
+                    "이번달 근무(h)": round(_emp_work_h, 1),
+                    "휴무 예정(일)": _emp_off,
+                    "잔여근무시간(연간)": f"{_emp_remain_h:+.0f}h",
+                    "잔여 연차(일)": f"{_emp_leave['annual_remain']:g}",
+                })
+            import pandas as pd
+            st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+
+        # ── 연간 근무시간 설정 (관리자) ──────────────────────────
+        st.divider()
+        st.markdown("##### ⚙️ 직원별 월 목표 근무시간 설정 (연간 기준 자동 계산)")
+        st.caption("월 목표를 설정하면 연간 목표(×12)가 자동으로 계산됩니다. 잔여 근무시간 카드에 즉시 반영됩니다.")
+        _emp_settings_all = _erp_employee_settings_cached(current_db)
+        _emp_map_all = {r.get("employee_name"): r for r in _emp_settings_all}
+        _employees_for_setting = _erp_get_employee_names_for_store(current_db)
+        if _employees_for_setting:
+            _preset_map = {
+                "정규직 (월 173h)": 173.0, "단시간 (월 152h)": 152.0,
+                "파트타임 (월 130h)": 130.0, "파트타임 (월 108h)": 108.0,
+                "파트타임 (월 87h)": 87.0, "파트타임 (월 65h)": 65.0,
+                "직접 입력": None,
+            }
+            _preset_types = list(_preset_map.keys())
+            _hdr = st.columns([1.5, 2, 1.5, 1.5, 1.5])
+            _hdr[0].markdown("**직원명**")
+            _hdr[1].markdown("**유형**")
+            _hdr[2].markdown("**월 목표(h)**")
+            _hdr[3].markdown("**주 환산**")
+            _hdr[4].markdown("**연간 목표**")
+            _edits: dict[str, float] = {}
+            for _emp in _employees_for_setting:
+                _saved = _emp_map_all.get(_emp, {})
+                _saved_monthly = _saved.get("monthly_target_hours")
+                if _saved_monthly:
+                    _sh = float(_saved_monthly)
+                elif _saved.get("weekly_target_hours"):
+                    _sh = round(float(_saved["weekly_target_hours"]) * 4.33, 1)
+                else:
+                    _sh = 173.0
+                _matched = next(
+                    (t for t, h in _preset_map.items() if h is not None and abs(h - _sh) < 0.5),
+                    "직접 입력",
+                )
+                _rc = st.columns([1.5, 2, 1.5, 1.5, 1.5])
+                with _rc[0]:
+                    st.markdown(f"**{_emp}**")
+                with _rc[1]:
+                    _sel = st.selectbox("유형", _preset_types,
+                                        index=_preset_types.index(_matched),
+                                        key=f"db_emp_type_{_emp}",
+                                        label_visibility="collapsed")
+                with _rc[2]:
+                    _preset_h = _preset_map.get(_sel)
+                    _default_h = _preset_h if _preset_h is not None else _sh
+                    _hval = st.number_input("월 목표(h)", min_value=10.0, max_value=300.0,
+                                            value=float(_default_h), step=1.0,
+                                            key=f"db_emp_h_{_emp}",
+                                            label_visibility="collapsed",
+                                            disabled=(_preset_h is not None))
+                with _rc[3]:
+                    st.markdown(f"<span style='color:#666;'>주 {round(float(_hval)/4.33,1):g}h</span>",
+                                unsafe_allow_html=True)
+                with _rc[4]:
+                    st.markdown(f"<span style='color:#1565C0; font-weight:600;'>연 {float(_hval)*12:.0f}h</span>",
+                                unsafe_allow_html=True)
+                _edits[_emp] = _hval
+
+            if st.button("💾 목표 근무시간 저장", type="primary", key="db_emp_save"):
+                _ok, _fail, _warn_monthly = 0, 0, False
+                for _emp, _h in _edits.items():
+                    _saved = _emp_map_all.get(_emp)
+                    _row = {
+                        "db_filename": current_db,
+                        "employee_name": _emp,
+                        "monthly_target_hours": float(_h),
+                        "weekly_target_hours": round(float(_h) / 4.33, 2),
+                        "updated_by": me_name,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if _saved and _saved.get("id"):
+                        ok, e = _erp_update_row("app_employee_settings", int(_saved["id"]), _row)
+                    else:
+                        ok, e = _erp_insert_row("app_employee_settings", _row)
+                    if not ok and ("monthly_target_hours" in str(e) or "PGRST204" in str(e)):
+                        _row2 = {k: v for k, v in _row.items() if k != "monthly_target_hours"}
+                        if _saved and _saved.get("id"):
+                            ok, e = _erp_update_row("app_employee_settings", int(_saved["id"]), _row2)
+                        else:
+                            ok, e = _erp_insert_row("app_employee_settings", _row2)
+                        if ok:
+                            _warn_monthly = True
+                    if ok:
+                        _ok += 1
+                    else:
+                        _fail += 1
+                _erp_employee_settings_cached.clear()
+                if _fail == 0:
+                    if _warn_monthly:
+                        flash("저장 완료. monthly_target_hours 컬럼이 없어 주 단위만 저장되었습니다. SUPABASE_APP_ATTENDANCE_COUNTER.sql 을 실행해 주세요.", level="warning")
+                    else:
+                        flash(f"{_ok}명의 목표 근무시간이 저장되었습니다.")
+                    st.rerun()
+                else:
+                    st.error(f"저장 완료 {_ok}명 / 실패 {_fail}명.")
 
 
 # ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
@@ -10093,110 +10326,6 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     with sumc4:
         st.metric("잔여 연차", f"{leave_status['annual_remain']:g}일",
                   delta=f"올해 {int(leave_status['days_until_year_end'])}일 남음")
-
-    # ── 월간 근무 카운터 (목표 − 누적) ──────────────────────────
-    _ctr = _erp_compute_monthly_remaining(current_db, me_name, today.year, today.month)
-    _target_h = _ctr["target_min"] / 60.0
-    _worked_h = _ctr["worked_min"] / 60.0
-    _remain_h = _ctr["remaining_min"] / 60.0
-    _percent = _ctr["percent"]
-    _weekly_derived = round(_target_h / 4.33, 1)
-    if _percent >= 100:
-        _remain_color = "#E53935"   # 빨강: 초과
-        _remain_label = "초과 근무"
-    elif _percent >= 80:
-        _remain_color = "#FB8C00"   # 노랑: 임박
-        _remain_label = "달성 임박"
-    else:
-        _remain_color = "#2E7D32"   # 초록: 여유
-        _remain_label = "근무 가능"
-    st.markdown(
-        f"<div style='margin-top:6px; padding:10px 14px; background:#F5F5F5; "
-        f"border-left:5px solid {_remain_color}; border-radius:4px;'>"
-        f"<div style='font-size:0.85rem; color:#555; margin-bottom:4px;'>"
-        f"⏱️ <b>{today.year}년 {today.month}월 근무 카운터</b> ({_remain_label})</div>"
-        f"<div style='font-size:1.05rem;'>"
-        f"<span style='color:#666;'>목표</span> <b>{_target_h:.0f}h</b> "
-        f"<span style='color:#999;'>(주 환산 {_weekly_derived:g}h)</span>"
-        f"  &nbsp;|&nbsp;  "
-        f"<span style='color:#666;'>누적</span> <b>{_worked_h:.1f}h</b> "
-        f"<span style='color:#999;'>({_percent:g}%)</span>"
-        f"  &nbsp;|&nbsp;  "
-        f"<span style='color:#666;'>잔여(카운터)</span> "
-        f"<b style='color:{_remain_color}; font-size:1.2rem;'>{_remain_h:+.1f}h</b>"
-        f"</div></div>",
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "💡 카운터는 실제 근태 기록(정상·연차·반차·시차사용·포상시간·추가근무 등)을 모두 합산합니다. "
-        "잔여가 음수면 목표 시간을 초과해 일한 것으로, [추가근무·시차 관리]에서 보상(시차/연차/급여)을 신청할 수 있습니다."
-    )
-
-    # ── 기간 목표 카운터 (매장관리자가 지정한 임의 기간) ────────────
-    _ptgt = _erp_find_active_period_target(current_db, me_name, today)
-    if _ptgt:
-        _p_start_ym = _ptgt.get("start_ym") or ""
-        _p_end_ym = _ptgt.get("end_ym") or ""
-        _p_target_min = int(_ptgt.get("required_minutes") or 0)
-        try:
-            _p_start_d, _p_end_d = _erp_ym_range_bounds(_p_start_ym, _p_end_ym)
-            _p_worked_min = _erp_compute_worked_minutes(current_db, me_name, _p_start_d, _p_end_d)
-        except Exception:
-            _p_worked_min = 0
-        _p_target_h = _p_target_min / 60.0
-        _p_worked_h = _p_worked_min / 60.0
-        _p_remain_h = (_p_target_min - _p_worked_min) / 60.0
-        _p_percent = round(_p_worked_min / _p_target_min * 100.0, 1) if _p_target_min > 0 else 0.0
-        if _p_percent >= 100:
-            _p_color, _p_label = "#E53935", "초과 달성"
-        elif _p_percent >= 80:
-            _p_color, _p_label = "#FB8C00", "달성 임박"
-        else:
-            _p_color, _p_label = "#1565C0", "진행 중"
-        st.markdown(
-            f"<div style='margin-top:6px; padding:10px 14px; background:#E8F0FE; "
-            f"border-left:5px solid {_p_color}; border-radius:4px;'>"
-            f"<div style='font-size:0.85rem; color:#555; margin-bottom:4px;'>"
-            f"🎯 <b>기간 목표 카운터</b> ({_p_start_ym} ~ {_p_end_ym}, {_p_label})</div>"
-            f"<div style='font-size:1.05rem;'>"
-            f"<span style='color:#666;'>기간 목표</span> <b>{_p_target_h:.0f}h</b>"
-            f"  &nbsp;|&nbsp;  "
-            f"<span style='color:#666;'>기간 누적</span> <b>{_p_worked_h:.1f}h</b> "
-            f"<span style='color:#999;'>({_p_percent:g}%)</span>"
-            f"  &nbsp;|&nbsp;  "
-            f"<span style='color:#666;'>기간 잔여</span> "
-            f"<b style='color:{_p_color}; font-size:1.2rem;'>{_p_remain_h:+.1f}h</b>"
-            f"</div></div>",
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            "🎯 기간 목표는 매장관리자가 [근무시간 설정 → 기간 목표]에서 지정한 임의 기간의 총 필수시간입니다. "
-            "기간 누적은 해당 기간(시작월~종료월)의 실제 근태를 합산합니다."
-        )
-
-    # 경고/안내 메시지
-    if leave_status["soak_risk"]:
-        st.error(
-            f"🔴 **연차 소멸 위험**: 잔여 연차 {leave_status['annual_remain']:g}일 / "
-            f"올해 {int(leave_status['days_until_year_end'])}일 남음. "
-            f"연차 신청을 서둘러 검토해 주세요."
-        )
-    elif leave_status["annual_remain"] > 0:
-        st.info(
-            f"💡 잔여 연차 **{leave_status['annual_remain']:g}일** — "
-            f"이번 기간에 연차 사용 계획이 없다면 [휴무·근태 입력]에서 연차를 신청할 수 있습니다."
-        )
-
-    if _hour_diff < -8:
-        st.warning(
-            f"⚠️ 계획 근무시간이 기준({_expected_hours:.0f}h) 대비 "
-            f"**{abs(_hour_diff):.1f}h 부족**합니다. 출근일 또는 근무시간을 늘려 주세요."
-        )
-    elif _hour_diff > 12:
-        st.warning(
-            f"⚠️ 계획 근무시간이 기준 대비 **{_hour_diff:.1f}h 초과**합니다. "
-            f"초과근무는 [추가근무·시차 관리]에서 신청해 주세요."
-        )
 
 
     st.divider()
