@@ -13123,6 +13123,30 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     })
                     if ok:
                         _erp_v2_clear_caches()
+                        # 추가근무·회의(+)에 시간대 정보가 있으면 캘린더(app_attendance_logs)에도 자동 반영
+                        _shift_s = adj.get("shift_start")
+                        _shift_e = adj.get("shift_end")
+                        if kind in ("overtime", "meeting") and sign == "+" and _shift_s and _shift_e:
+                            _work_db_adj = adj.get("work_db_filename") or current_db
+                            _work_loc_adj = adj.get("work_location_name")
+                            _log_row = {
+                                "home_db_filename": current_db,
+                                "work_db_filename": _work_db_adj,
+                                "work_location_name": _work_loc_adj,
+                                "employee_name": adj.get("employee_name"),
+                                "log_date": str(adj.get("target_date") or "")[:10],
+                                "work_type": "추가근무" if kind == "overtime" else "회의",
+                                "leave_deduction": False,
+                                "diff_minutes": minutes,
+                                "start_time": _shift_s,
+                                "end_time": _shift_e,
+                                "standard_start": _shift_s,
+                                "standard_end": _shift_e,
+                                "status": "approved",
+                                "note": adj.get("reason"),
+                                "created_by": me_name,
+                            }
+                            _erp_insert_row("app_attendance_logs", _log_row)
                         flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
                         st.rerun()
                     else:
@@ -13158,6 +13182,16 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
 
     # ── +/- 신청 폼 ───────────────────────────────────────────────
     st.markdown("##### ➕➖ 신청 등록")
+
+    # 근무지 목록
+    _adj_stores = _get_supabase_stores_list() or []
+    _adj_store_opts = [(s["store_name"], s["db_filename"]) for s in _adj_stores]
+    if not any(s[1] == current_db for s in _adj_store_opts):
+        _adj_store_opts.insert(0, ("현재 매장", current_db))
+    _adj_store_opts.append(("기타 (외부/행사)", None))
+    _adj_store_labels = [s[0] for s in _adj_store_opts]
+    _adj_home_idx = next((i for i, s in enumerate(_adj_store_opts) if s[1] == current_db), 0)
+
     fc1, fc2 = st.columns([1, 1])
     with fc1:
         new_kind = st.selectbox(
@@ -13173,34 +13207,88 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
             new_sign = _ERP_ADJ_KIND_DEFAULT_SIGN[new_kind]
             st.markdown(f"**부호: {new_sign}** (고정)")
 
+    # 추가근무·회의는 시간대 직접 입력 → 캘린더 자동 반영
+    _needs_timeslot = new_kind in ("overtime", "meeting") and new_sign == "+"
+
     with st.form("my_new_adj_form", clear_on_submit=True):
-        gc1, gc2, gc3 = st.columns([1, 1, 3])
-        with gc1:
-            new_date = st.date_input("대상 일자", value=today, key="my_new_date")
-        with gc2:
-            new_hours = st.number_input("시간(h)", min_value=0.25, max_value=744.0, step=0.5, value=1.0, key="my_new_h")
-        with gc3:
-            placeholder_reason = "사유 (기타는 필수)"
-            new_reason = st.text_input("사유", placeholder=placeholder_reason, key="my_new_reason")
+        if _needs_timeslot:
+            st.caption("📌 추가근무·회의는 실제 시간대를 입력하면 캘린더에 자동 반영됩니다.")
+            ts1, ts2, ts3, ts4 = st.columns([1.2, 1, 1, 2])
+            with ts1:
+                new_date = st.date_input("날짜", value=today, key="my_new_date")
+            with ts2:
+                new_start = st.time_input("시작 시간", value=time(18, 0), step=60, key="my_new_start")
+            with ts3:
+                new_end = st.time_input("종료 시간", value=time(20, 0), step=60, key="my_new_end")
+            with ts4:
+                new_store_label = st.selectbox("근무지", _adj_store_labels,
+                                               index=_adj_home_idx, key="my_new_store")
+            new_reason = st.text_input("사유", placeholder="사유를 입력해 주세요 (선택)", key="my_new_reason")
+        else:
+            gc1, gc2, gc3 = st.columns([1, 1, 3])
+            with gc1:
+                new_date = st.date_input("대상 일자", value=today, key="my_new_date")
+            with gc2:
+                new_hours = st.number_input("시간(h)", min_value=0.25, max_value=744.0, step=0.5,
+                                            value=1.0, key="my_new_h")
+            with gc3:
+                new_reason = st.text_input("사유", placeholder="사유 (기타는 필수)", key="my_new_reason")
+
         if st.form_submit_button("📤 신청 등록", type="primary"):
+            _err_msg = None
             if new_kind == "etc" and not (new_reason or "").strip():
-                st.error("기타 유형은 사유를 입력해 주세요.")
+                _err_msg = "기타 유형은 사유를 입력해 주세요."
+            elif _needs_timeslot:
+                _s_min = new_start.hour * 60 + new_start.minute
+                _e_min = new_end.hour * 60 + new_end.minute
+                if _e_min <= _s_min:
+                    _err_msg = "종료 시간이 시작 시간보다 늦어야 합니다."
+            if _err_msg:
+                st.error(_err_msg)
             else:
+                if _needs_timeslot:
+                    _s_min = new_start.hour * 60 + new_start.minute
+                    _e_min = new_end.hour * 60 + new_end.minute
+                    _total_min = _e_min - _s_min
+                    _sel_store = next((s for s in _adj_store_opts if s[0] == new_store_label), _adj_store_opts[_adj_home_idx])
+                    _work_db = _sel_store[1]
+                    _work_loc = _sel_store[0] if _work_db is None else None
+                else:
+                    _total_min = int(round(float(new_hours) * 60))
+                    _work_db = current_db
+                    _work_loc = None
+
                 payload = {
                     "db_filename": current_db,
                     "employee_name": me_name,
                     "target_date": new_date.isoformat(),
                     "kind": new_kind,
                     "sign": new_sign,
-                    "minutes": int(round(float(new_hours) * 60)),
+                    "minutes": _total_min,
                     "reason": (new_reason or "").strip() or None,
                     "status": "pending",
                     "created_by": me_name,
                 }
+                if _needs_timeslot:
+                    payload["shift_start"] = new_start.strftime("%H:%M:%S")
+                    payload["shift_end"] = new_end.strftime("%H:%M:%S")
+                    payload["work_db_filename"] = _work_db
+                    payload["work_location_name"] = _work_loc
+
                 ok, e = _erp_insert_row("app_work_adjustments", payload)
+                if not ok and _needs_timeslot and "PGRST204" in str(e):
+                    # 컬럼 미존재 시 시간대 필드 제외하고 재시도
+                    _p2 = {k: v for k, v in payload.items()
+                           if k not in ("shift_start", "shift_end", "work_db_filename", "work_location_name")}
+                    ok, e = _erp_insert_row("app_work_adjustments", _p2)
+                    if ok:
+                        st.warning("⚠️ 시간대 컬럼이 없어 기본 정보만 저장되었습니다. SUPABASE_APP_ATTENDANCE_V2.sql 의 3-1번 구문을 실행해 주세요.")
                 if ok:
                     _erp_v2_clear_caches()
-                    flash("신청이 등록되었습니다. 매장관리자 승인 대기 중.")
+                    if _needs_timeslot:
+                        flash(f"신청이 등록되었습니다. 승인 후 {new_date.isoformat()} 캘린더에 자동 반영됩니다.")
+                    else:
+                        flash("신청이 등록되었습니다. 매장관리자 승인 대기 중.")
                     st.rerun()
                 else:
                     st.error(f"등록 실패: {e}")

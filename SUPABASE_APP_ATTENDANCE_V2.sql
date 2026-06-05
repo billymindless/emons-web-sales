@@ -103,6 +103,16 @@ CREATE POLICY "Allow all app_work_adjustments" ON app_work_adjustments
 
 
 -- ---------------------------------------------------------------------
+-- 3-1) 추가근무·회의 시간대 + 근무지 컬럼 추가 (캘린더 자동 반영용)
+-- ---------------------------------------------------------------------
+ALTER TABLE app_work_adjustments
+    ADD COLUMN IF NOT EXISTS shift_start TIME,           -- 시작 시간 (추가근무·회의용)
+    ADD COLUMN IF NOT EXISTS shift_end   TIME,           -- 종료 시간
+    ADD COLUMN IF NOT EXISTS work_db_filename TEXT,      -- 근무 매장 db_filename
+    ADD COLUMN IF NOT EXISTS work_location_name TEXT;    -- 외부 근무지 명칭
+
+
+-- ---------------------------------------------------------------------
 -- 4) 1회성 마이그레이션 ─ app_overtime_claims → app_work_adjustments
 --    기존 모든 추가근무 보상 신청을 새 통합 테이블로 복사합니다.
 --    매핑:
