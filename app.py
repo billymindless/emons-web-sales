@@ -12957,7 +12957,8 @@ def _erp_tab_my_leave_status(current_db: str, me_name: str):
 # (메뉴 단순화: admin 7탭→4탭, user 5탭→1~2탭)
 # =====================================================================
 
-def _erp_period_target_editor(current_db: str, me_name: str, emp_names: list, today: date):
+def _erp_period_target_editor(current_db: str, me_name: str, emp_names: list, today: date,
+                               all_dbs: list | None = None):
     """기간 목표 등록/수정/삭제 UI. 직원별 임의 기간(YYYY-MM~YYYY-MM) + 총 시간."""
     st.markdown("##### 🎯 기간 목표 관리")
     st.caption("직원과 기간(시작월~종료월), 기간 총 필수시간을 입력합니다. "
@@ -13020,7 +13021,20 @@ def _erp_period_target_editor(current_db: str, me_name: str, emp_names: list, to
     st.divider()
 
     # ── 등록된 기간 목표 목록 (수정/삭제) ──────────────────────
-    rows = _erp_list_period_targets(current_db)
+    if all_dbs:
+        # 전체 매장: 모든 db에서 조회 후 합산
+        rows = []
+        _seen_ids: set = set()
+        for _dbf in all_dbs:
+            for _r in _erp_list_period_targets(_dbf):
+                if _r.get("id") not in _seen_ids:
+                    _seen_ids.add(_r.get("id"))
+                    rows.append(_r)
+        if rows:
+            st.caption(f"📋 전체 매장 등록 기간 목표 ({len(rows)}건)")
+    else:
+        rows = _erp_list_period_targets(current_db)
+
     if not rows:
         st.info("등록된 기간 목표가 없습니다.")
         return
@@ -13127,20 +13141,22 @@ def _erp_tab_period_targets(current_db: str, me_name: str):
     if _sel_store_dbf is None:
         # 전체 매장: 모든 매장 직원 합집합
         _emp_set: set[str] = set()
+        _all_dbfs = [s["db_filename"] for s in _all_stores]
         for _s in _all_stores:
             for _e in (_erp_get_employee_names_for_store(_s["db_filename"]) or []):
                 _emp_set.add(_e)
         emp_names = sorted(_emp_set)
-        _target_db = current_db  # 기간 목표는 현재 관리자의 home db에 저장
+        _target_db = current_db  # 신규 등록은 현재 관리자 home db에 저장
     else:
         emp_names = _erp_get_employee_names_for_store(_sel_store_dbf) or []
         _target_db = _sel_store_dbf
+        _all_dbfs = None
 
     if not emp_names:
         st.info("선택한 매장에 배정된 직원이 없습니다. 직원 관리에서 매장을 배정해 주세요.")
         return
 
-    _erp_period_target_editor(_target_db, me_name, emp_names, today)
+    _erp_period_target_editor(_target_db, me_name, emp_names, today, all_dbs=_all_dbfs)
 
 
 def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
