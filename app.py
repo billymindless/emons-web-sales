@@ -13283,7 +13283,9 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                                     value=_today_kst().year, step=1, key="xls_year")
         if st.button("📥 엑셀 생성", key="xls_approved_btn"):
             try:
-                _sb = get_supabase_client()
+                _sb = get_supabase_client_or_warn()
+                if _sb is None:
+                    st.stop()
                 _xls_q = _sb.table("app_work_adjustments").select("*")\
                     .eq("status", "approved")
                 if _xls_kind_filter:
