@@ -10068,28 +10068,43 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     _leave = _erp_compute_leave_status(current_db, me_name, today)
     _annual_remain_days = _leave["annual_remain"]
 
+    # ── KPI 카드 공통 CSS ────────────────────────────────────────
+    _card_css = (
+        "display:flex; flex-direction:column; align-items:center; justify-content:center; "
+        "border-radius:12px; padding:22px 16px; text-align:center; min-height:130px; "
+        "box-sizing:border-box;"
+    )
+    _label_css = "font-size:0.82rem; color:#666; margin-bottom:8px; line-height:1.3;"
+    _value_css = "font-size:2.1rem; font-weight:700; line-height:1.2; margin:0;"
+    _sub_css   = "font-size:0.82rem; color:#777; margin-top:6px; line-height:1.4;"
+    _detail_css= "font-size:0.74rem; color:#999; margin-top:4px; line-height:1.4; word-break:keep-all;"
+
     # ── KPI 카드 4개 ─────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        _store_detail = " / ".join(
-            f"{_sn} {_sh:.1f}h" for _sn, _sh in sorted(_store_hours.items(), key=lambda x: -x[1])
-        ) if len(_store_hours) > 1 else ""
+        _store_detail_html = ""
+        if len(_store_hours) > 1:
+            _detail_lines = "<br>".join(
+                f"{_sn}&nbsp;{_sh:.1f}h"
+                for _sn, _sh in sorted(_store_hours.items(), key=lambda x: -x[1])
+            )
+            _store_detail_html = f"<div style='{_detail_css}'>{_detail_lines}</div>"
         st.markdown(
-            f"<div style='background:#E3F2FD; border-radius:10px; padding:20px 18px; text-align:center;'>"
-            f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>📅 이번달 근무일수</div>"
-            f"<div style='font-size:2.2rem; font-weight:700; color:#1565C0;'>{_work_days}일</div>"
-            f"<div style='font-size:0.9rem; color:#1976D2; margin-top:4px;'>{_work_hours:.1f}h (전 매장 합산)</div>"
-            + (f"<div style='font-size:0.75rem; color:#888; margin-top:3px;'>{_store_detail}</div>" if _store_detail else "")
-            + f"</div>",
+            f"<div style='background:#E3F2FD; {_card_css}'>"
+            f"<div style='{_label_css}'>📅 이번달 근무일수</div>"
+            f"<div style='{_value_css} color:#1565C0;'>{_work_days}일</div>"
+            f"<div style='{_sub_css} color:#1976D2;'>{_work_hours:.1f}h (전 매장 합산)</div>"
+            f"{_store_detail_html}"
+            f"</div>",
             unsafe_allow_html=True,
         )
     with c2:
         st.markdown(
-            f"<div style='background:#F3E5F5; border-radius:10px; padding:20px 18px; text-align:center;'>"
-            f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>🏖️ 휴무 예정</div>"
-            f"<div style='font-size:2.2rem; font-weight:700; color:#6A1B9A;'>{_off_days}일</div>"
-            f"<div style='font-size:0.9rem; color:#7B1FA2; margin-top:4px;'>이번달 평일 {_weekdays_in_month}일 기준</div>"
+            f"<div style='background:#F3E5F5; {_card_css}'>"
+            f"<div style='{_label_css}'>🏖️ 휴무 예정</div>"
+            f"<div style='{_value_css} color:#6A1B9A;'>{_off_days}일</div>"
+            f"<div style='{_sub_css} color:#7B1FA2;'>이번달 평일 {_weekdays_in_month}일 기준</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -10097,10 +10112,10 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         _remain_color_y = "#E53935" if _annual_remain_h < 0 else ("#FB8C00" if _annual_remain_h < _monthly_target_h else "#2E7D32")
         _remain_bg_y = "#FFEBEE" if _annual_remain_h < 0 else ("#FFF8E1" if _annual_remain_h < _monthly_target_h else "#E8F5E9")
         st.markdown(
-            f"<div style='background:{_remain_bg_y}; border-radius:10px; padding:20px 18px; text-align:center;'>"
-            f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>⏱️ 잔여 근무시간(연간)</div>"
-            f"<div style='font-size:2.2rem; font-weight:700; color:{_remain_color_y};'>{_annual_remain_h:+.0f}h</div>"
-            f"<div style='font-size:0.9rem; color:#777; margin-top:4px;'>연간 목표 {_annual_target_h:.0f}h · 누적 {_ytd_worked_h:.0f}h</div>"
+            f"<div style='background:{_remain_bg_y}; {_card_css}'>"
+            f"<div style='{_label_css}'>⏱️ 잔여 근무시간(연간)</div>"
+            f"<div style='{_value_css} color:{_remain_color_y};'>{_annual_remain_h:+.0f}h</div>"
+            f"<div style='{_sub_css}'>연간 목표 {_annual_target_h:.0f}h<br>누적 {_ytd_worked_h:.0f}h</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -10108,11 +10123,10 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         _leave_color = "#E53935" if _annual_remain_days == 0 else ("#FB8C00" if _leave["soak_risk"] else "#2E7D32")
         _leave_bg = "#FFEBEE" if _annual_remain_days == 0 else ("#FFF8E1" if _leave["soak_risk"] else "#E8F5E9")
         st.markdown(
-            f"<div style='background:{_leave_bg}; border-radius:10px; padding:20px 18px; text-align:center;'>"
-            f"<div style='font-size:0.85rem; color:#555; margin-bottom:6px;'>🎫 잔여 연차</div>"
-            f"<div style='font-size:2.2rem; font-weight:700; color:{_leave_color};'>{_annual_remain_days:g}일</div>"
-            f"<div style='font-size:0.9rem; color:#777; margin-top:4px;'>"
-            f"올해 {int(_leave['days_until_year_end'])}일 남음</div>"
+            f"<div style='background:{_leave_bg}; {_card_css}'>"
+            f"<div style='{_label_css}'>🎫 잔여 연차</div>"
+            f"<div style='{_value_css} color:{_leave_color};'>{_annual_remain_days:g}일</div>"
+            f"<div style='{_sub_css}'>올해 {int(_leave['days_until_year_end'])}일 남음</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
