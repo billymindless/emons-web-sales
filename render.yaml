@@ -1,9 +1,12 @@
-# Render Blueprint — 입금 SMS webhook 서버(api.py) 배포 설정
+# Render Blueprint — 이몬스 웹훅 서버(api.py) 배포 설정
 # 사용법:
 #   1. https://render.com 가입 후 New + → Blueprint 선택
 #   2. 이 GitHub 저장소 연결 → render.yaml 자동 인식
-#   3. 환경변수 3개(SUPABASE_URL / SUPABASE_SERVICE_KEY / SMS_WEBHOOK_TOKEN) 입력
-#   4. 배포 완료 후 https://<서비스명>.onrender.com/webhook/sms/deposit 가 webhook 주소
+#   3. 아래 환경변수를 Render 대시보드에서 직접 입력
+#   4. 배포 완료 후 엔드포인트:
+#      - https://<서비스명>.onrender.com/webhook/sms/deposit
+#      - https://<서비스명>.onrender.com/webhook/solapi/friend-added
+#      - https://<서비스명>.onrender.com/webhook/solapi/message-received
 services:
   - type: web
     name: emons-sms-webhook
@@ -20,3 +23,5 @@ services:
         sync: false
       - key: SMS_WEBHOOK_TOKEN
         sync: false
+      - key: SOLAPI_WEBHOOK_SECRET
+        sync: false   # Solapi 콘솔 > 웹훅 > Secret HTTP Header 값과 동일하게 설정
