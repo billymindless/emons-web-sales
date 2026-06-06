@@ -19778,6 +19778,28 @@ def render_new_sales():
             clear_data_cache()
             _saving_msg.empty()
             st.success("매출등록이 완료되었습니다.")
+            # 카카오 채널 구매 알림 자동 발송 (백그라운드 — 실패해도 주문 등록에 영향 없음)
+            try:
+                from customer_channel import send_purchase_notification as _send_kakao_notif
+                _kakao_res = _send_kakao_notif(
+                    customer_id=int(customer_id),
+                    phone=str(phone1 or ""),
+                    customer_name=str(cust_name or ""),
+                    order_info={
+                        "category": category,
+                        "total_amount": int(final_sales_save),
+                        "delivery_date": delivery_date.isoformat() if delivery_date else "",
+                    },
+                    store_name=store_name or db_filename or "",
+                    order_id=order_id,
+                    sent_by=_current_username(),
+                )
+                if _kakao_res.get("status") == "sent":
+                    st.toast("카카오 알림 발송 완료", icon="💬")
+                elif _kakao_res.get("status") == "skipped":
+                    pass  # 키 미설정 환경에서는 조용히 스킵
+            except Exception:
+                pass  # 알림 실패가 주문 등록 화면을 깨지 않도록
             net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
             st.session_state["_gamification_ctx"] = {
                 "amount": final_sales_save,
@@ -20568,6 +20590,71 @@ def render_customer_balance():
                 ]["id"].tolist()
                 if not all_cids:
                     all_cids = [cid]
+
+                # ── 카카오 채널 상태 배지 및 발송 UI ──────────────────
+                try:
+                    from customer_channel import (
+                        get_customer_kakao_status,
+                        send_channel_invite_sms,
+                        send_manual_friendtalk,
+                    )
+                    _kk = get_customer_kakao_status(int(cid))
+                    _kk_friend = _kk.get("kakao_friend_added", False)
+                    _kk_at = str(_kk.get("kakao_friend_added_at") or "")[:16].replace("T", " ")
+                    _kk_store = _get_current_store_name_for_customers(db_filename) or db_filename or ""
+                    _kk_actor = _current_username()
+
+                    _kk_col1, _kk_col2 = st.columns([2, 3])
+                    with _kk_col1:
+                        if _kk_friend:
+                            st.success(f"💬 카카오채널 친구 ✅  ({_kk_at})" if _kk_at else "💬 카카오채널 친구 ✅")
+                        else:
+                            st.warning("💬 카카오채널 미연결 ⚠️")
+                    with _kk_col2:
+                        _kk_btn_cols = st.columns(2)
+                        with _kk_btn_cols[0]:
+                            if st.button("📨 채널 초대 문자 발송", key=f"kakao_invite_{cid}", use_container_width=True):
+                                _inv_res = send_channel_invite_sms(
+                                    customer_id=int(cid),
+                                    phone=_sel_phone,
+                                    customer_name=_sel_name,
+                                    store_name=_kk_store,
+                                    sent_by=_kk_actor,
+                                )
+                                if _inv_res.get("status") == "sent":
+                                    st.toast("채널 초대 문자가 발송되었습니다.", icon="✅")
+                                elif _inv_res.get("status") == "skipped":
+                                    st.warning("Solapi 설정이 없어 발송이 건너뛰어졌습니다.")
+                                else:
+                                    st.error(f"발송 실패: {_inv_res.get('error')}")
+                        with _kk_btn_cols[1]:
+                            with st.popover("💬 친구톡 직접 발송", use_container_width=True):
+                                _ft_body = st.text_area(
+                                    "메시지 내용",
+                                    placeholder=f"{_sel_name}님, 안녕하세요. 이몬스입니다.",
+                                    key=f"kakao_ft_body_{cid}",
+                                    height=100,
+                                )
+                                if st.button("발송", key=f"kakao_ft_send_{cid}", type="primary"):
+                                    if not _ft_body.strip():
+                                        st.error("메시지 내용을 입력하세요.")
+                                    else:
+                                        _ft_res = send_manual_friendtalk(
+                                            customer_id=int(cid),
+                                            phone=_sel_phone,
+                                            customer_name=_sel_name,
+                                            message_body=_ft_body.strip(),
+                                            store_name=_kk_store,
+                                            sent_by=_kk_actor,
+                                        )
+                                        if _ft_res.get("status") == "sent":
+                                            st.toast("친구톡이 발송되었습니다.", icon="✅")
+                                        elif _ft_res.get("status") == "not_friend":
+                                            st.warning("해당 고객은 채널 친구가 아니어서 발송되지 않았습니다.")
+                                        else:
+                                            st.error(f"발송 실패: {_ft_res.get('error')}")
+                except Exception:
+                    pass  # customer_channel 미설치 환경에서도 UI가 깨지지 않도록
 
                 if _supabase_orders_payments_available():
                     all_orders = _load_orders_supabase(

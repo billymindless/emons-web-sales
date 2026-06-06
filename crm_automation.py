@@ -263,6 +263,144 @@ def _get_current_store_name(db_filename: str | None) -> str | None:
 # 메인 렌더 함수
 # ──────────────────────────────────────────────
 
+def _render_kakao_channel_tab(db_filename: str | None, store_name: str | None) -> None:
+    """카카오 채널 동기화 현황 탭 — 친구 현황 요약 + 발송 이력 조회."""
+    sc = _get_supabase()
+
+    st.subheader("채널 친구 현황")
+    if sc and db_filename and store_name:
+        try:
+            r_all = (
+                sc.table("app_customers")
+                .select("id, name, phone1, kakao_friend_added, kakao_friend_added_at")
+                .eq("store_name", store_name)
+                .limit(2000)
+                .execute()
+            )
+            cust_df = pd.DataFrame(r_all.data or [])
+            if cust_df.empty:
+                st.info("등록된 고객이 없습니다.")
+            else:
+                total = len(cust_df)
+                friends = cust_df["kakao_friend_added"].fillna(False).sum()
+                non_friends = total - friends
+                c1, c2, c3 = st.columns(3)
+                c1.metric("전체 고객", f"{total}명")
+                c2.metric("채널 친구", f"{int(friends)}명")
+                c3.metric("미연결", f"{int(non_friends)}명")
+
+                tab_all, tab_non = st.tabs(["전체 고객", "미연결 고객"])
+                with tab_all:
+                    disp = cust_df.rename(columns={
+                        "id": "ID", "name": "이름", "phone1": "전화번호",
+                        "kakao_friend_added": "친구", "kakao_friend_added_at": "친구추가일",
+                    }).copy()
+                    disp["친구"] = disp["친구"].fillna(False).map({True: "✅", False: "⚠️"})
+                    disp["친구추가일"] = disp["친구추가일"].fillna("").astype(str).str[:16].str.replace("T", " ")
+                    st.dataframe(disp, use_container_width=True)
+                with tab_non:
+                    non_df = cust_df[~cust_df["kakao_friend_added"].fillna(False)].copy()
+                    if non_df.empty:
+                        st.success("모든 고객이 채널 친구입니다.")
+                    else:
+                        non_disp = non_df[["id", "name", "phone1"]].rename(
+                            columns={"id": "ID", "name": "이름", "phone1": "전화번호"}
+                        )
+                        st.dataframe(non_disp, use_container_width=True)
+                        st.caption(f"미연결 고객 {len(non_df)}명에게 채널 초대 문자를 일괄 발송하려면 아래 버튼을 사용하세요.")
+                        if st.button("📨 미연결 고객 전체 채널 초대 발송", key="crm_bulk_invite_btn", type="primary"):
+                            try:
+                                from customer_channel import send_channel_invite_sms
+                                _actor = (st.session_state.get("current_user") or {}).get("username", "system")
+                                _ok_cnt = 0
+                                _fail_cnt = 0
+                                for _, row in non_df.iterrows():
+                                    _res = send_channel_invite_sms(
+                                        customer_id=int(row["id"]),
+                                        phone=str(row.get("phone1") or ""),
+                                        customer_name=str(row.get("name") or "고객"),
+                                        store_name=store_name,
+                                        sent_by=_actor,
+                                    )
+                                    if _res.get("status") == "sent":
+                                        _ok_cnt += 1
+                                    else:
+                                        _fail_cnt += 1
+                                st.success(f"발송 완료: {_ok_cnt}건 성공 / {_fail_cnt}건 실패")
+                            except Exception as e:
+                                st.error(f"발송 중 오류: {e}")
+        except Exception as e:
+            st.warning(f"고객 조회 실패: {e}")
+    else:
+        st.info("매장 선택 후 이용 가능합니다.")
+
+    st.divider()
+    st.subheader("발송 이력 조회")
+    if sc and store_name:
+        try:
+            col_f1, col_f2 = st.columns(2)
+            with col_f1:
+                _log_type = st.selectbox(
+                    "메시지 유형",
+                    ["전체", "purchase_confirm", "channel_invite", "cs_reply", "manual"],
+                    key="crm_log_type_filter",
+                )
+            with col_f2:
+                _log_status = st.selectbox(
+                    "발송 상태",
+                    ["전체", "sent", "failed", "skipped", "not_friend", "out_of_hours"],
+                    key="crm_log_status_filter",
+                )
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                _log_start = st.date_input("시작일", value=None, key="crm_log_start")
+            with col_d2:
+                _log_end = st.date_input("종료일", value=None, key="crm_log_end")
+
+            q = (
+                sc.table("app_customer_messages")
+                .select("id, customer_id, phone, message_type, channel, status, sent_by, message_body, error_detail, created_at")
+                .eq("store_name", store_name)
+                .order("created_at", desc=True)
+                .limit(200)
+            )
+            if _log_type != "전체":
+                q = q.eq("message_type", _log_type)
+            if _log_status != "전체":
+                q = q.eq("status", _log_status)
+            if _log_start:
+                q = q.gte("created_at", str(_log_start))
+            if _log_end:
+                q = q.lte("created_at", str(_log_end) + "T23:59:59")
+            r_logs = q.execute()
+            logs_df = pd.DataFrame(r_logs.data or [])
+            if logs_df.empty:
+                st.info("조건에 맞는 발송 이력이 없습니다.")
+            else:
+                logs_df["created_at"] = logs_df["created_at"].astype(str).str[:16].str.replace("T", " ")
+                disp_logs = logs_df.rename(columns={
+                    "id": "ID", "customer_id": "고객ID", "phone": "전화번호",
+                    "message_type": "유형", "channel": "채널", "status": "상태",
+                    "sent_by": "발송자", "message_body": "메시지", "error_detail": "오류", "created_at": "발송일시",
+                })
+                st.dataframe(disp_logs, use_container_width=True)
+
+                import io as _io
+                _xl_buf = _io.BytesIO()
+                logs_df.to_excel(_xl_buf, index=False, sheet_name="발송이력")
+                st.download_button(
+                    "📥 발송 이력 Excel 다운로드",
+                    data=_xl_buf.getvalue(),
+                    file_name=f"kakao_send_logs_{store_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="crm_log_download",
+                )
+        except Exception as e:
+            st.warning(f"발송 이력 조회 실패: {e}")
+    else:
+        st.info("매장 선택 후 이용 가능합니다.")
+
+
 def render_crm_menu() -> None:
     """7. 고객 CRM 자동화 메뉴 진입점."""
 
@@ -279,6 +417,15 @@ def render_crm_menu() -> None:
     st.title("7. 고객 CRM 자동화")
     st.caption("타겟 고객을 필터링하고 카카오 친구톡(광고) 또는 SMS로 CRM 메시지를 발송·예약합니다.")
 
+    _crm_tab1, _crm_tab2 = st.tabs(["CRM 캠페인", "카카오 채널 현황"])
+    with _crm_tab2:
+        _render_kakao_channel_tab(db_filename, store_name)
+    with _crm_tab1:
+        _render_crm_campaign_tab(db_filename, store_name)
+
+
+def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) -> None:
+    """CRM 캠페인 탭 내용."""
     # ── 2) 타겟 고객 필터링 ───────────────────
     with st.expander("🎯 타겟 고객 필터 설정", expanded=True):
         col1, col2 = st.columns(2)

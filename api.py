@@ -92,23 +92,38 @@ async def solapi_friend_added_webhook(request: Request) -> JSONResponse:
     )
 
     digits = "".join(c for c in str(phone) if c.isdigit())
-    updated = False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updated_users = False
+    updated_customers = False
     headers = _supa_headers()
     if digits and headers:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
+                # 직원(app_users) 갱신
                 resp = await client.patch(
                     _supa_url("app_users") + f"?phone=eq.{digits}",
                     headers=headers,
                     json={"kakao_friend_added": True},
                 )
-                updated = resp.status_code < 300
+                updated_users = resp.status_code < 300
+
+                # 고객(app_customers) 갱신 — phone1 매칭
+                resp2 = await client.patch(
+                    _supa_url("app_customers") + f"?phone1=eq.{digits}",
+                    headers=headers,
+                    json={
+                        "kakao_friend_added": True,
+                        "kakao_friend_added_at": now_iso,
+                    },
+                )
+                updated_customers = resp2.status_code < 300
         except Exception as e:
             logger.warning("solapi_friend_added_webhook update failed: %s", e)
 
     return JSONResponse({
         "status": "ok",
-        "matched_by_phone": updated,
+        "matched_users": updated_users,
+        "matched_customers": updated_customers,
         "phone_digits": digits or None,
         "sender_key": sender_key or None,
     }, status_code=200)
