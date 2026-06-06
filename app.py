@@ -11448,12 +11448,22 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 extra = f" {lg.get('diff_minutes') or 0}분" if wt in ("시차적립", "시차사용") else ""
                 sn_tag = (f" <span style='font-size:0.58rem; color:{sc};"
                           f" font-weight:bold;'>({_dbf_to_sn.get(dbf,'')})</span>") if show_store_tag else ""
+                # 추가근무·회의는 시간대 표시
+                _time_txt = ""
+                if wt in ("추가근무", "회의"):
+                    _st = str(lg.get("start_time") or "")[:5]
+                    _et = str(lg.get("end_time") or "")[:5]
+                    if _st and _et:
+                        _time_txt = (
+                            f" <span style='font-size:0.62rem; color:#555;'>"
+                            f"{_st}~{_et}</span>"
+                        )
                 cell.append(
                     f"<div style='margin-top:1px;'>"
                     f"<span style='background:{bc}; color:white; padding:1px 4px;"
                     f" border-radius:3px; font-size:0.65rem;'>{wt}{extra}</span>"
                     f" <span style='font-size:0.68rem; color:{sc}; font-weight:600;'>{emp}</span>"
-                    f"{sn_tag}</div>"
+                    f"{_time_txt}{sn_tag}</div>"
                 )
             cell.append("</td>")
             html.append("".join(cell))
@@ -11983,6 +11993,189 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     st.rerun(scope="fragment")
                 else:
                     st.error(f"추가 실패: {e}")
+
+    # ── ✨ 추가근무·회의 로그 수정 / 삭제 ──────────────────────────────
+    with st.expander("✨ 추가근무·회의 로그 검색 / 수정 / 삭제", expanded=False):
+        st.caption(
+            "캘린더에 표시되는 추가근무·회의 기록(app_attendance_logs)을 직접 수정·삭제합니다. "
+            "여기서 수정해도 원본 신청서(app_work_adjustments)는 변경되지 않습니다."
+        )
+        _ot_c1, _ot_c2, _ot_c3 = st.columns([1.2, 1.2, 1.6])
+        with _ot_c1:
+            _ot_emp_opts = ["(전체 직원)"] + sorted(set(all_emps))
+            _ot_emp_def_idx = (
+                _ot_emp_opts.index(selected_emp)
+                if (selected_emp and selected_emp in _ot_emp_opts) else 0
+            )
+            _ot_emp = st.selectbox("직원 필터", _ot_emp_opts,
+                                   index=_ot_emp_def_idx, key="ot_log_emp")
+        with _ot_c2:
+            _ot_kind = st.selectbox("유형", ["전체", "추가근무", "회의"], key="ot_log_kind")
+        with _ot_c3:
+            _ot_start = st.date_input("시작일", value=period_start, key="ot_log_start")
+            _ot_end = st.date_input("종료일", value=period_end, key="ot_log_end")
+
+        try:
+            _ot_client, _ot_err = get_supabase_client()
+            if _ot_err or not _ot_client:
+                st.error(f"DB 연결 실패: {_ot_err}")
+                _ot_rows = []
+            else:
+                _ot_types = ["추가근무", "회의"] if _ot_kind == "전체" else [_ot_kind]
+                _ot_q = _ot_client.table("app_attendance_logs").select("*")\
+                    .in_("work_type", _ot_types)\
+                    .gte("log_date", _ot_start.isoformat())\
+                    .lte("log_date", _ot_end.isoformat())\
+                    .order("log_date", desc=True)
+                _ot_rows = _ot_q.execute().data or []
+                # 이름 정규화 + 직원 필터
+                for _r in _ot_rows:
+                    _r["_display_emp"] = _resolve(_r.get("employee_name") or "")
+                if _ot_emp and _ot_emp != "(전체 직원)":
+                    _ot_rows = [r for r in _ot_rows if r.get("_display_emp") == _ot_emp]
+        except Exception as _ot_ex:
+            st.error(f"조회 오류: {_ot_ex}")
+            _ot_rows = []
+
+        st.markdown(f"**📋 검색 결과: {len(_ot_rows)}건**")
+        if not _ot_rows:
+            st.info("조건에 해당하는 추가근무·회의 로그가 없습니다.")
+        else:
+            _ot_edit_id = st.session_state.get("ot_log_edit_id")
+            for _ot in _ot_rows:
+                _otid = int(_ot.get("id") or 0)
+                try:
+                    _odt = date.fromisoformat(str(_ot.get("log_date") or "")[:10])
+                except Exception:
+                    continue
+                _ots = str(_ot.get("start_time") or "")[:5]
+                _ote = str(_ot.get("end_time") or "")[:5]
+                _ow_loc = _ot.get("work_location_name") or _dbf_to_sn.get(_ot.get("work_db_filename") or _ot.get("home_db_filename"), "")
+                _own_wt = _ot.get("work_type") or ""
+                _own_emp = _ot.get("_display_emp") or _ot.get("employee_name") or ""
+
+                if _ot_edit_id == _otid:
+                    with st.container(border=True):
+                        st.markdown(f"**✏️ {_odt} · {_own_wt} · {_own_emp}**")
+                        _oe_db = _ot.get("home_db_filename") or current_db
+                        _oe_def_s, _oe_def_e = _erp_default_times_for_date(_oe_db, _odt)
+                        _oe_c1, _oe_c2, _oe_c3 = st.columns([1, 1, 2])
+                        with _oe_c1:
+                            _ot_e_s = st.time_input(
+                                "시작 시간",
+                                value=_erp_parse_time(_ot.get("start_time")) or _oe_def_s,
+                                step=60, key=f"ot_e_s_{_otid}",
+                            )
+                        with _oe_c2:
+                            _ot_e_e = st.time_input(
+                                "종료 시간",
+                                value=_erp_parse_time(_ot.get("end_time")) or _oe_def_e,
+                                step=60, key=f"ot_e_e_{_otid}",
+                            )
+                        with _oe_c3:
+                            _OT_ETC = "기타 (외부/행사) — 직접 입력"
+                            _ot_loc_opts = list(all_store_names) + [_OT_ETC]
+                            _cur_loc_v = (_ot.get("work_location_name") or "").strip()
+                            if _cur_loc_v and _cur_loc_v not in all_store_names:
+                                _ot_def_loc = _OT_ETC
+                            elif _cur_loc_v in all_store_names:
+                                _ot_def_loc = _cur_loc_v
+                            else:
+                                _cur_db_sn2 = _dbf_to_sn.get(_ot.get("work_db_filename") or _ot.get("home_db_filename"), "")
+                                _ot_def_loc = _cur_db_sn2 if _cur_db_sn2 in all_store_names else (_ot_loc_opts[0] if _ot_loc_opts else _OT_ETC)
+                            try:
+                                _ot_loc_idx = _ot_loc_opts.index(_ot_def_loc)
+                            except ValueError:
+                                _ot_loc_idx = 0
+                            _ot_loc_sel = st.selectbox(
+                                "근무지", _ot_loc_opts, index=_ot_loc_idx,
+                                key=f"ot_e_loc_{_otid}",
+                            )
+                            if _ot_loc_sel == _OT_ETC:
+                                _ot_loc_etc = st.text_input(
+                                    "외부 행사명",
+                                    value=_cur_loc_v if _cur_loc_v not in all_store_names else "",
+                                    key=f"ot_e_loc_etc_{_otid}",
+                                )
+                                _ot_final_loc = (_ot_loc_etc or "").strip()
+                                _ot_final_db = None
+                            else:
+                                _ot_final_loc = _ot_loc_sel
+                                _ot_final_db = _sn_to_dbf.get(_ot_loc_sel)
+                        _ot_note = st.text_input(
+                            "사유/메모",
+                            value=_ot.get("note") or "",
+                            key=f"ot_e_note_{_otid}",
+                        )
+                        _ot_bs, _ot_bc2, _ = st.columns([1, 1, 3])
+                        with _ot_bs:
+                            if st.button("💾 저장", type="primary", key=f"ot_e_save_{_otid}"):
+                                if (_ot_e_s.hour * 60 + _ot_e_s.minute) >= (_ot_e_e.hour * 60 + _ot_e_e.minute):
+                                    st.error("종료 시간이 시작 시간보다 늦어야 합니다.")
+                                else:
+                                    _ot_diff = (_ot_e_e.hour * 60 + _ot_e_e.minute) - (_ot_e_s.hour * 60 + _ot_e_s.minute)
+                                    _ot_patch = {
+                                        "start_time": _ot_e_s.strftime("%H:%M:%S"),
+                                        "end_time": _ot_e_e.strftime("%H:%M:%S"),
+                                        "diff_minutes": _ot_diff,
+                                        "work_location_name": _ot_final_loc or None,
+                                        "work_db_filename": _ot_final_db,
+                                        "note": (_ot_note or "").strip() or None,
+                                    }
+                                    _ok_ot, _err_ot = _erp_update_row("app_attendance_logs", _otid, _ot_patch)
+                                    if not _ok_ot:
+                                        _patch_min = {k: v for k, v in _ot_patch.items()
+                                                      if k not in ("work_location_name", "work_db_filename")}
+                                        _ok_ot, _err_ot = _erp_update_row("app_attendance_logs", _otid, _patch_min)
+                                    if _ok_ot:
+                                        st.session_state.pop("ot_log_edit_id", None)
+                                        st.session_state["_erp_cal_flash"] = (
+                                            f"{_odt} {_own_emp} {_own_wt} 로그가 수정되었습니다."
+                                        )
+                                        st.rerun(scope="fragment")
+                                    else:
+                                        st.error(f"저장 실패: {_err_ot}")
+                        with _ot_bc2:
+                            if st.button("취소", key=f"ot_e_cancel_{_otid}"):
+                                st.session_state.pop("ot_log_edit_id", None)
+                                st.rerun(scope="fragment")
+                else:
+                    _orc = st.columns([1.6, 1.4, 1.4, 2.6, 0.9, 0.9])
+                    with _orc[0]:
+                        _dow_c = "#E53935" if _odt.weekday() == 6 else ("#1565C0" if _odt.weekday() == 5 else "#37474F")
+                        st.markdown(
+                            f"<span style='color:{_dow_c}; font-weight:600;'>"
+                            f"{_odt.month}/{_odt.day} ({_ERP_DOW_LABELS[_odt.weekday()]})</span>",
+                            unsafe_allow_html=True,
+                        )
+                    with _orc[1]:
+                        _wt_c = _ERP_BADGE_COLORS.get(_own_wt, "#90A4AE")
+                        st.markdown(
+                            f"<span style='background:{_wt_c}; color:white;"
+                            f" padding:2px 6px; border-radius:3px; font-size:0.78rem;'>{_own_wt}</span>"
+                            f" <b>{_own_emp}</b>",
+                            unsafe_allow_html=True,
+                        )
+                    with _orc[2]:
+                        st.markdown(f"{_ots}~{_ote}" if _ots and _ote else "-")
+                    with _orc[3]:
+                        st.markdown(
+                            f"<span style='color:#607D8B;'>{_ow_loc}</span>"
+                            + (f" · <span style='color:#999; font-size:0.8rem;'>{_ot.get('note')}</span>" if _ot.get("note") else ""),
+                            unsafe_allow_html=True,
+                        )
+                    with _orc[4]:
+                        if st.button("✏️", key=f"ot_edit_btn_{_otid}", help="수정"):
+                            st.session_state["ot_log_edit_id"] = _otid
+                            st.rerun(scope="fragment")
+                    with _orc[5]:
+                        if st.button("🗑️", key=f"ot_del_btn_{_otid}", help="삭제"):
+                            _erp_delete_row("app_attendance_logs", _otid)
+                            st.session_state.pop("ot_log_edit_id", None)
+                            st.session_state["_erp_cal_flash"] = (
+                                f"{_odt} {_own_emp} {_own_wt} 로그가 삭제되었습니다."
+                            )
+                            st.rerun(scope="fragment")
 
     # ── 범례 ────────────────────────────────────────────────────
     with st.expander("🎨 색상 범례"):
