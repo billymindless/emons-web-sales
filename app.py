@@ -15571,7 +15571,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
     import task_board as _tb  # noqa: WPS433
 
     toggle_key = f"pcr_open_{order_id}"
-    if st.button("💳 사내 결제변경 검증 요청", key=f"pcr_btn_{order_id}",
+    if st.button("💳 결제변경/환불요청", key=f"pcr_btn_{order_id}",
                  help="결제변경 내역을 사내 업무로 올려 관리자/담당자가 증빙을 검증합니다."):
         st.session_state[toggle_key] = not st.session_state.get(toggle_key, False)
     if not st.session_state.get(toggle_key):
