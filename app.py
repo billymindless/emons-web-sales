@@ -13062,10 +13062,10 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
         sn = store.get("store_name") or dbf
         shifts = _erp_fetch_range("app_shift_schedules", "db_filename", dbf, "shift_date", p_start, p_end)
         logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf, "log_date", p_start, p_end)
-        overtime = _erp_fetch_range("app_overtime_requests", "home_db_filename", dbf, "request_date", p_start, p_end, extra_eq={"status": "approved"})
         for emp in employees:
             emp_shifts = [s for s in shifts if (s.get("employee_name") or "") == emp]
-            emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp]
+            emp_logs = [l for l in logs if (l.get("employee_name") or "") == emp
+                        and (l.get("status") or "approved") == "approved"]
             if not emp_shifts and not emp_logs:
                 continue
             # 정상근무일: 근무계획(shift_schedules) 건수 기준
@@ -13073,8 +13073,20 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
             annual_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
             half_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
             early_late_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") in ("조퇴", "지각"))
-            comp_use_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") == "시차사용" and (l.get("status") or "approved") == "approved")
-            ot_min = sum(int(o.get("extra_minutes") or 0) for o in overtime if (o.get("employee_name") or "") == emp)
+            comp_use_min = sum(int(l.get("diff_minutes") or 0) for l in emp_logs if l.get("work_type") == "시차사용")
+            # 추가근무·회의: app_attendance_logs work_type 기준 (승인 후 자동 삽입된 레코드)
+            ot_min = 0
+            for _ol in emp_logs:
+                if _ol.get("work_type") not in ("추가근무", "회의"):
+                    continue
+                _ols = _erp_parse_time(_ol.get("start_time"))
+                _ole = _erp_parse_time(_ol.get("end_time"))
+                if _ols and _ole:
+                    _od = (_ole.hour * 60 + _ole.minute) - (_ols.hour * 60 + _ols.minute)
+                    if _od > 0:
+                        ot_min += _od
+                else:
+                    ot_min += int(_ol.get("diff_minutes") or 0)
             detail_rows.append({
                 "직원명": emp,
                 "근무매장": sn,
@@ -13112,6 +13124,7 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
             "조퇴/지각(분)": sum(r["조퇴/지각(분)"] for r in emp_details),
             "시차사용(분)": sum(r["시차사용(분)"] for r in emp_details),
             "추가근무(분)": sum(r["추가근무(분)"] for r in emp_details),
+            "추가근무(h)": round(sum(r["추가근무(분)"] for r in emp_details) / 60, 2),
             "잔여연차": annual - total_annual_used,
             "잔여시차(분)": comp_remain,
         })
@@ -13479,6 +13492,76 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                             st.rerun()
                         else:
                             st.error(f"반려 실패: {e}")
+
+    # ── 승인 완료 내역 (취소 가능) ─────────────────────────────────────
+    st.divider()
+    with st.expander("✅ 승인 완료 내역 확인 및 취소", expanded=False):
+        st.caption(
+            "승인된 내역을 취소하면 신청 상태가 '대기'로 돌아가고, "
+            "캘린더(app_attendance_logs)에 자동 반영된 근무 기록도 함께 삭제됩니다."
+        )
+        try:
+            _appr_client, _appr_err = get_supabase_client()
+            if _appr_err or not _appr_client:
+                st.error(f"DB 연결 실패: {_appr_err}")
+            else:
+                _appr_rows = _appr_client.table("app_work_adjustments").select("*")\
+                    .eq("db_filename", current_db)\
+                    .eq("status", "approved")\
+                    .order("target_date", desc=True)\
+                    .limit(50).execute().data or []
+                if not _appr_rows:
+                    st.info("승인 완료된 신청이 없습니다.")
+                else:
+                    st.caption(f"최근 50건 표시")
+                    for _ar in _appr_rows:
+                        _arid = int(_ar.get("id") or 0)
+                        _ar_kind = _ar.get("kind") or "etc"
+                        _ar_sign = _ar.get("sign") or "+"
+                        _ar_min = int(_ar.get("minutes") or 0)
+                        _ar_h = f"{_ar_min//60}h {_ar_min%60}m" if _ar_min % 60 else f"{_ar_min//60}h"
+                        _arc = st.columns([1.2, 1, 0.4, 1.5, 2.5, 1.3])
+                        with _arc[0]:
+                            st.markdown(f"**{_ar.get('employee_name') or '-'}**")
+                        with _arc[1]:
+                            st.markdown(str(_ar.get("target_date") or "")[:10])
+                        with _arc[2]:
+                            st.markdown(f"### {_ar_sign}")
+                        with _arc[3]:
+                            st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(_ar_kind, _ar_kind)} · {_ar_h}")
+                        with _arc[4]:
+                            st.caption((_ar.get("reason") or "") + (f" | 승인: {_ar.get('approved_by') or ''}" if _ar.get("approved_by") else ""))
+                        with _arc[5]:
+                            with st.popover("↩️ 승인 취소"):
+                                st.warning("승인을 취소하면 캘린더 기록도 삭제됩니다.")
+                                if st.button("취소 확정", key=f"appr_cancel_{_arid}", type="primary"):
+                                    # 1) app_work_adjustments → pending 복원
+                                    _ok_rev, _err_rev = _erp_update_row("app_work_adjustments", _arid, {
+                                        "status": "pending",
+                                        "approved_by": None,
+                                        "approved_at": None,
+                                    })
+                                    if _ok_rev:
+                                        # 2) app_attendance_logs 에서 동일 직원·날짜·유형 레코드 삭제
+                                        _wt_del = "추가근무" if _ar_kind == "overtime" else ("회의" if _ar_kind == "meeting" else None)
+                                        if _wt_del:
+                                            try:
+                                                _del_logs = _appr_client.table("app_attendance_logs").select("id")\
+                                                    .eq("employee_name", _ar.get("employee_name"))\
+                                                    .eq("log_date", str(_ar.get("target_date") or "")[:10])\
+                                                    .eq("work_type", _wt_del)\
+                                                    .execute().data or []
+                                                for _dl in _del_logs:
+                                                    _erp_delete_row("app_attendance_logs", int(_dl["id"]))
+                                            except Exception as _del_ex:
+                                                st.warning(f"캘린더 기록 삭제 중 오류: {_del_ex}")
+                                        _erp_v2_clear_caches()
+                                        flash(f"승인 취소: {_ar.get('employee_name')} {str(_ar.get('target_date') or '')[:10]}")
+                                        st.rerun()
+                                    else:
+                                        st.error(f"취소 실패: {_err_rev}")
+        except Exception as _appr_ex:
+            st.error(f"조회 오류: {_appr_ex}")
 
     # ── 기존 승인 내역 캘린더 재동기화 ────────────────────────────────
     st.divider()
