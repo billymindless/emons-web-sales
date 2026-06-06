@@ -9954,9 +9954,9 @@ def render_erp_attendance():
     # st.tabs 대신 segmented_control 사용: st.rerun() 호출 후에도 활성 탭 유지
     # (st.tabs는 stateless라 rerun 시 항상 첫 번째 탭으로 리셋되어 저장/수정 후 화면 이탈)
     if role == "store_admin":
-        tab_labels = ["대시보드", "근무 일정 계획", "추가근무·휴무 신청", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
+        tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
     else:
-        tab_labels = ["대시보드", "근무 일정 계획", "추가근무·휴무 신청", "매장 캘린더"]
+        tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청", "매장 캘린더"]
 
     _tab_key = "erp_main_tab_label"
     if _tab_key not in st.session_state or st.session_state[_tab_key] not in tab_labels:
@@ -9971,7 +9971,7 @@ def render_erp_attendance():
     if selected_tab == "대시보드":
         _erp_tab_dashboard(current_db, role, me_name, today)
     elif role == "store_admin":
-        if selected_tab == "근무 일정 계획":
+        if selected_tab == "정기근무일정":
             _erp_tab_shift_plan(current_db, me_name)
         elif selected_tab == "추가근무·휴무 신청":
             _erp_tab_my_attendance(current_db, role, me_name)
@@ -9984,7 +9984,7 @@ def render_erp_attendance():
         elif selected_tab == "월말 요약":
             _erp_tab_monthly_summary(current_db, today)
     else:
-        if selected_tab == "근무 일정 계획":
+        if selected_tab == "정기근무일정":
             _erp_tab_shift_plan(current_db, me_name)
         elif selected_tab == "추가근무·휴무 신청":
             _erp_tab_my_attendance(current_db, role, me_name)
@@ -10298,7 +10298,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
 # ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
 
 def _erp_tab_shift_plan(current_db: str, me_name: str):
-    st.subheader("📅 근무 일정 계획 (본인 일정 등록)")
+    st.subheader("📅 정기근무일정 (본인 일정 등록)")
     st.caption("출근일은 ✅ 체크하고, 휴무일은 체크 해제하세요. 시간은 매장 기본값이 자동 입력되며, 필요 시 수정 가능합니다.")
     st.caption("ⓘ 기간을 1주/2주로 선택하면 주 단위·일 단위로 나눠 저장할 수 있습니다. 같은 날짜를 다시 저장하면 최신 내용으로 덮어쓰기됩니다.")
     role = (st.session_state.get("current_user") or {}).get("role") or "user"
