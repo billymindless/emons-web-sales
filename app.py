@@ -13186,9 +13186,8 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
     ]
     if not pending:
         st.info("대기 중인 신청이 없습니다.")
-        return
-
-    st.caption(f"대기 중 {len(pending)}건")
+    else:
+        st.caption(f"대기 중 {len(pending)}건")
     for adj in pending:
         adj_id = int(adj["id"])
         kind = adj.get("kind") or "etc"
@@ -13219,37 +13218,45 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         _erp_v2_clear_caches()
                         # 추가근무·회의(+)는 캘린더(app_attendance_logs)에 반영
                         if kind in ("overtime", "meeting") and sign == "+":
-                            _shift_s = str(adj.get("shift_start") or "")[:8] or None
-                            _shift_e = str(adj.get("shift_end") or "")[:8] or None
-                            _work_db_adj = adj.get("work_db_filename") or current_db
-                            _work_loc_adj = adj.get("work_location_name")
-                            _log_date_d = date.fromisoformat(str(adj.get("target_date") or "")[:10])
-                            _std_s, _std_e = _erp_default_times_for_date(current_db, _log_date_d)
-                            _log_row = {
-                                "home_db_filename": current_db,
-                                "work_db_filename": _work_db_adj,
-                                "work_location_name": _work_loc_adj,
-                                "employee_name": adj.get("employee_name"),
-                                "log_date": str(adj.get("target_date") or "")[:10],
-                                "work_type": "추가근무" if kind == "overtime" else "회의",
-                                "leave_deduction": 0,
-                                "diff_minutes": minutes,
-                                "start_time": _shift_s,
-                                "end_time": _shift_e,
-                                "standard_start": _std_s.strftime("%H:%M:%S"),
-                                "standard_end": _std_e.strftime("%H:%M:%S"),
-                                "status": "approved",
-                                "note": adj.get("reason"),
-                                "created_by": me_name,
-                            }
-                            _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_row)
-                            if not _log_ok:
-                                # 일부 컬럼 없으면 필수 필드만으로 재시도
-                                _log_min = {k: v for k, v in _log_row.items()
-                                            if k not in ("work_db_filename", "work_location_name")}
-                                _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_min)
-                            if not _log_ok:
-                                st.warning(f"캘린더 반영 실패(신청 승인은 완료됨): {_log_err}")
+                            try:
+                                _shift_s = str(adj.get("shift_start") or "")[:8] or None
+                                _shift_e = str(adj.get("shift_end") or "")[:8] or None
+                                _work_db_adj = adj.get("work_db_filename") or current_db
+                                _work_loc_adj = adj.get("work_location_name")
+                                _td_str = str(adj.get("target_date") or "")[:10]
+                                try:
+                                    _log_date_d = date.fromisoformat(_td_str)
+                                except Exception:
+                                    _log_date_d = _today_kst()
+                                _std_s, _std_e = _erp_default_times_for_date(current_db, _log_date_d)
+                                _log_row = {
+                                    "home_db_filename": current_db,
+                                    "work_db_filename": _work_db_adj,
+                                    "work_location_name": _work_loc_adj,
+                                    "employee_name": adj.get("employee_name"),
+                                    "log_date": _td_str,
+                                    "work_type": "추가근무" if kind == "overtime" else "회의",
+                                    "leave_deduction": 0,
+                                    "diff_minutes": minutes,
+                                    "start_time": _shift_s,
+                                    "end_time": _shift_e,
+                                    "standard_start": _std_s.strftime("%H:%M:%S"),
+                                    "standard_end": _std_e.strftime("%H:%M:%S"),
+                                    "status": "approved",
+                                    "note": adj.get("reason"),
+                                    "created_by": me_name,
+                                }
+                                _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_row)
+                                if not _log_ok:
+                                    _log_min = {k: v for k, v in _log_row.items()
+                                                if k not in ("work_db_filename", "work_location_name", "leave_deduction")}
+                                    _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_min)
+                                if _log_ok:
+                                    st.toast(f"📅 캘린더에 반영됨: {adj.get('employee_name')} {_td_str}", icon="📅")
+                                else:
+                                    st.error(f"❌ 캘린더 반영 실패: {_log_err}")
+                            except Exception as _sync_ex:
+                                st.error(f"❌ 캘린더 반영 중 예외: {_sync_ex}")
                         flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
                         st.rerun()
                     else:
@@ -13338,6 +13345,10 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         "created_by": me_name,
                     }
                     _lok, _lerr = _erp_insert_row("app_attendance_logs", _lr)
+                    if not _lok:
+                        _lr_min = {k: v for k, v in _lr.items()
+                                   if k not in ("work_db_filename", "work_location_name", "leave_deduction")}
+                        _lok, _lerr = _erp_insert_row("app_attendance_logs", _lr_min)
                     if _lok:
                         _synced += 1
                         _existing_keys.add((_emp, _dt, _wt))
@@ -13357,41 +13368,51 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
 
     # ── 전체 승인 내역 엑셀 내보내기 ──────────────────────────────────
     with st.expander("📊 전체 승인 내역 엑셀 다운로드", expanded=False):
-        st.caption("승인 완료된 추가근무·휴무 신청 내역 전체를 엑셀 파일로 내보냅니다.")
+        st.caption("승인 완료된 추가근무·휴무·포상 등 모든 신청 내역을 직원/기간/유형별로 필터링해 내보냅니다.")
+
+        # 직원 목록 (전체 매장)
+        _xls_stores = _get_supabase_stores_list() or []
+        _xls_all_emps: list[str] = []
+        for _s in _xls_stores:
+            _xls_all_emps += _erp_get_employee_names_for_store(_s.get("db_filename"))
+        _xls_all_emps = sorted(set([e for e in _xls_all_emps if e]))
+
+        _xls_emp = st.selectbox(
+            "직원 선택",
+            options=["(전체 직원)"] + _xls_all_emps,
+            key="xls_emp",
+        )
         _xls_kind_filter = st.multiselect(
             "유형 필터 (비어 있으면 전체)",
             options=list(_ERP_ADJ_KINDS),
             format_func=lambda k: _ERP_ADJ_KIND_LABEL.get(k, k),
             key="xls_kind_filter",
         )
-        _xls_col1, _xls_col2 = st.columns([1, 1])
-        with _xls_col1:
-            _xls_year = st.number_input("연도", min_value=2020, max_value=2100,
-                                        value=_today_kst().year, step=1, key="xls_year")
-        with _xls_col2:
-            _xls_month = st.selectbox(
-                "월 (전체=선택 안함)",
-                options=[0] + list(range(1, 13)),
-                format_func=lambda m: "전체" if m == 0 else f"{m}월",
-                index=_today_kst().month,
-                key="xls_month",
-            )
+        _xls_dcol1, _xls_dcol2 = st.columns([1, 1])
+        _today_d = _today_kst()
+        _xls_default_start = _today_d.replace(day=1)
+        with _xls_dcol1:
+            _xls_start = st.date_input("시작일", value=_xls_default_start, key="xls_start")
+        with _xls_dcol2:
+            _xls_end = st.date_input("종료일", value=_today_d, key="xls_end")
+
         if st.button("📥 엑셀 생성", key="xls_approved_btn"):
             try:
+                if _xls_end < _xls_start:
+                    st.error("종료일은 시작일 이후여야 합니다.")
+                    st.stop()
                 _sb = get_supabase_client_or_warn()
                 if _sb is None:
                     st.stop()
                 _xls_q = _sb.table("app_work_adjustments").select("*")\
-                    .eq("status", "approved")
+                    .eq("status", "approved")\
+                    .gte("target_date", _xls_start.isoformat())\
+                    .lte("target_date", _xls_end.isoformat())
                 if _xls_kind_filter:
                     _xls_q = _xls_q.in_("kind", _xls_kind_filter)
-                _xls_rows = _xls_q.execute().data or []
-                # 연도·월 필터
-                _xls_ym_prefix = f"{int(_xls_year):04d}-{int(_xls_month):02d}" if _xls_month else f"{int(_xls_year):04d}"
-                _xls_rows = [
-                    r for r in _xls_rows
-                    if str(r.get("target_date") or "").startswith(_xls_ym_prefix)
-                ]
+                if _xls_emp and _xls_emp != "(전체 직원)":
+                    _xls_q = _xls_q.eq("employee_name", _xls_emp)
+                _xls_rows = _xls_q.order("target_date", desc=False).execute().data or []
                 if not _xls_rows:
                     st.info("해당 조건의 승인 내역이 없습니다.")
                 else:
@@ -13416,19 +13437,30 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         })
                     _xls_df = pd.DataFrame(_xls_records)
                     _xls_df = _xls_df.sort_values(["날짜", "직원명"], kind="stable")
+                    # 합계 행 추가
+                    _total_min = int(_xls_df["시간(분)"].sum())
+                    _total_h = round(_total_min / 60, 2)
+                    _summary = pd.DataFrame([{
+                        "직원명": "─ 합계 ─", "날짜": "", "부호": "",
+                        "유형": f"총 {len(_xls_df)}건",
+                        "시간(분)": _total_min, "시간(h)": _total_h,
+                        "시작시간": "", "종료시간": "", "근무지": "",
+                        "신청사유": "", "승인자": "", "승인일시": "",
+                    }])
+                    _xls_df = pd.concat([_xls_df, _summary], ignore_index=True)
+
                     _buf = io.BytesIO()
                     _xls_df.to_excel(_buf, index=False, sheet_name="승인내역")
                     _buf.seek(0)
-                    _xls_label = (
-                        f"{int(_xls_year)}년 {int(_xls_month)}월" if _xls_month
-                        else f"{int(_xls_year)}년 전체"
+                    _emp_tag = "전체직원" if _xls_emp == "(전체 직원)" else _xls_emp
+                    _xls_fname = f"approved_{_emp_tag}_{_xls_start.isoformat()}_{_xls_end.isoformat()}.xlsx"
+                    st.success(
+                        f"✅ {len(_xls_records)}건 · 총 {_total_h}h ({_total_min}분) — 아래 버튼으로 다운로드"
                     )
-                    _xls_fname = (
-                        f"approved_{int(_xls_year)}_{int(_xls_month):02d}.xlsx" if _xls_month
-                        else f"approved_{int(_xls_year)}.xlsx"
-                    )
+                    # 화면 미리보기
+                    st.dataframe(_xls_df, use_container_width=True, hide_index=True)
                     st.download_button(
-                        label=f"⬇️ {_xls_label} 승인내역 다운로드 ({len(_xls_records)}건)",
+                        label=f"⬇️ 엑셀 다운로드 ({_emp_tag} · {_xls_start} ~ {_xls_end})",
                         data=_buf,
                         file_name=_xls_fname,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
