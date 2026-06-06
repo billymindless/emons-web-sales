@@ -16083,13 +16083,57 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                 with st.form(f"pcr_resolve_{tid}"):
                     note = st.text_input("검증 비고 (선택)", key=f"pcr_note_{tid}",
                                          placeholder="예: 증빙 확인 완료, 카드 취소 영수증 일치")
-                    if st.form_submit_button("✅ 검증 완료 처리", type="primary"):
+                    btn_ok, btn_rj, _ = st.columns([1, 1, 3])
+                    with btn_ok:
+                        submit_ok = st.form_submit_button("✅ 검증 완료", type="primary")
+                    with btn_rj:
+                        submit_rj = st.form_submit_button("❌ 반려")
+                    if submit_ok:
                         ok, err = _tb.resolve_payment_change(tid, me_uname, note)
                         if ok:
                             flash("결제변경 검증이 완료 처리되었습니다.")
                             st.rerun()
                         else:
                             st.error(f"처리 실패: {err}")
+                    if submit_rj:
+                        # 반려: verify_status 유지(미결), task status → rejected + 요청자 알림
+                        try:
+                            _rj_client, _ = get_supabase_client()
+                            if _rj_client:
+                                _rj_task = _rj_client.table("app_tasks").select("created_by, title")\
+                                    .eq("id", tid).maybe_single().execute().data or {}
+                                _rj_creator = _rj_task.get("created_by")
+                                _rj_title = _rj_task.get("title", "")
+                                _rj_client.table("app_tasks").update({
+                                    "status": "on_hold",
+                                    "verify_status": "rejected",
+                                    "verified_by": me_uname,
+                                    "verified_at": _tb._now_iso() if hasattr(_tb, "_now_iso") else None,
+                                    "verify_note": (note or "").strip() or None,
+                                }).eq("id", tid).execute()
+                                _tb.log_activity(tid, me_uname, "payment_change_rejected",
+                                                 {"note": (note or "")[:200]})
+                                # 요청자에게 반려 알림
+                                if _rj_creator and _rj_creator != me_uname:
+                                    _tb.notify_recipients(
+                                        task_id=tid,
+                                        recipients=[_rj_creator],
+                                        event_type="status_changed",
+                                        template_vars={
+                                            "title": _rj_title,
+                                            "from_status": "미결",
+                                            "to_status": "반려",
+                                            "actor": me_uname,
+                                            "link": _tb._task_link(tid) if hasattr(_tb, "_task_link") else "",
+                                        },
+                                        in_app_message=f"결제변경 검증 반려: {_rj_title}" + (f" | 사유: {note}" if note else ""),
+                                    )
+                                _tb.clear_task_caches()
+                        except Exception as _rj_ex:
+                            st.error(f"반려 처리 실패: {_rj_ex}")
+                            st.stop()
+                        flash("결제변경 검증이 반려 처리되었습니다.")
+                        st.rerun()
 
 
 def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
@@ -23562,6 +23606,33 @@ def main():
         unsafe_allow_html=True
     )
     st.sidebar.divider()
+    # 🔔 인앱 알림 배지
+    try:
+        import task_board as _tb_noti  # noqa: WPS433
+        _noti_uname = user.get("username") or ""
+        _noti_cnt = _tb_noti.count_unread_notifications(_noti_uname) if _noti_uname else 0
+        if _noti_cnt > 0:
+            st.sidebar.markdown(
+                f"<div style='background:#ef4444; color:white; border-radius:8px;"
+                f" padding:6px 14px; font-weight:700; font-size:0.95rem;"
+                f" text-align:center; margin-bottom:6px;'>"
+                f"🔔 미확인 알림 {_noti_cnt}건</div>",
+                unsafe_allow_html=True,
+            )
+            # 최신 알림 미리보기 (최대 3건)
+            _recent_notis = _tb_noti.load_my_notifications_cached(_noti_uname, unread_only=True, limit=3)
+            for _noti in _recent_notis:
+                st.sidebar.markdown(
+                    f"<div style='background:#fef2f2; border-left:3px solid #ef4444;"
+                    f" padding:5px 10px; border-radius:4px; margin-bottom:4px;"
+                    f" font-size:0.8rem;'>🔵 {_noti.get('message','')}</div>",
+                    unsafe_allow_html=True,
+                )
+            if st.sidebar.button("✅ 모두 읽음 처리", key="sidebar_noti_read_all"):
+                _tb_noti.mark_all_read(_noti_uname)
+                st.rerun()
+    except Exception:
+        pass
     # 비밀번호 변경 (Supabase Auth)
     with st.sidebar.expander("🔐 비밀번호 변경"):
         new_pw = st.text_input("새 비밀번호", type="password", key="new_password_input")
