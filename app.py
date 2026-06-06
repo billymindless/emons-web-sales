@@ -11448,7 +11448,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 extra = f" {lg.get('diff_minutes') or 0}분" if wt in ("시차적립", "시차사용") else ""
                 sn_tag = (f" <span style='font-size:0.58rem; color:{sc};"
                           f" font-weight:bold;'>({_dbf_to_sn.get(dbf,'')})</span>") if show_store_tag else ""
-                # 추가근무·회의는 시간대 표시
+                # 추가근무·회의는 시간대 표시 (없으면 diff_minutes 로 fallback)
                 _time_txt = ""
                 if wt in ("추가근무", "회의"):
                     _st = str(lg.get("start_time") or "")[:5]
@@ -11458,6 +11458,15 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                             f" <span style='font-size:0.62rem; color:#555;'>"
                             f"{_st}~{_et}</span>"
                         )
+                    else:
+                        _dm = int(lg.get("diff_minutes") or 0)
+                        if _dm:
+                            _dh, _dmm = divmod(_dm, 60)
+                            _dur = f"{_dh}h{_dmm:02d}m" if _dmm else f"{_dh}h"
+                            _time_txt = (
+                                f" <span style='font-size:0.62rem; color:#777;'>"
+                                f"+{_dur}</span>"
+                            )
                 cell.append(
                     f"<div style='margin-top:1px;'>"
                     f"<span style='background:{bc}; color:white; padding:1px 4px;"
@@ -13559,9 +13568,9 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
             except Exception as _se:
                 st.error(f"동기화 오류: {_se}")
 
-    # ── 전체 승인 내역 엑셀 내보내기 ──────────────────────────────────
-    with st.expander("📊 전체 승인 내역 엑셀 다운로드", expanded=False):
-        st.caption("승인 완료된 추가근무·휴무·포상 등 모든 신청 내역을 직원/기간/유형별로 필터링해 내보냅니다.")
+    # ── 전체 신청 내역 엑셀 내보내기 ──────────────────────────────────
+    with st.expander("📊 전체 신청 내역 엑셀 다운로드", expanded=True):
+        st.caption("추가근무·휴무·포상·회의·여름휴가 등 모든 신청 내역을 직원/기간/유형/상태별로 필터링해 내보냅니다.")
 
         # 직원 목록 (전체 매장)
         _xls_stores = _get_supabase_stores_list() or []
@@ -13570,11 +13579,22 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
             _xls_all_emps += _erp_get_employee_names_for_store(_s.get("db_filename"))
         _xls_all_emps = sorted(set([e for e in _xls_all_emps if e]))
 
-        _xls_emp = st.selectbox(
-            "직원 선택",
-            options=["(전체 직원)"] + _xls_all_emps,
-            key="xls_emp",
-        )
+        _xls_r1, _xls_r2 = st.columns([2, 2])
+        with _xls_r1:
+            _xls_emp = st.selectbox(
+                "직원 선택",
+                options=["(전체 직원)"] + _xls_all_emps,
+                key="xls_emp",
+            )
+        with _xls_r2:
+            _xls_status_opts = {"전체": None, "승인": "approved", "대기": "pending", "반려": "rejected"}
+            _xls_status_label = st.selectbox(
+                "상태",
+                options=list(_xls_status_opts.keys()),
+                index=1,
+                key="xls_status",
+            )
+            _xls_status = _xls_status_opts[_xls_status_label]
         _xls_kind_filter = st.multiselect(
             "유형 필터 (비어 있으면 전체)",
             options=list(_ERP_ADJ_KINDS),
@@ -13598,18 +13618,20 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 if _sb is None:
                     st.stop()
                 _xls_q = _sb.table("app_work_adjustments").select("*")\
-                    .eq("status", "approved")\
                     .gte("target_date", _xls_start.isoformat())\
                     .lte("target_date", _xls_end.isoformat())
+                if _xls_status:
+                    _xls_q = _xls_q.eq("status", _xls_status)
                 if _xls_kind_filter:
                     _xls_q = _xls_q.in_("kind", _xls_kind_filter)
                 if _xls_emp and _xls_emp != "(전체 직원)":
                     _xls_q = _xls_q.eq("employee_name", _xls_emp)
                 _xls_rows = _xls_q.order("target_date", desc=False).execute().data or []
                 if not _xls_rows:
-                    st.info("해당 조건의 승인 내역이 없습니다.")
+                    st.info("해당 조건의 신청 내역이 없습니다.")
                 else:
                     import io
+                    _STATUS_KR = {"approved": "승인", "pending": "대기", "rejected": "반려"}
                     _xls_records = []
                     for r in _xls_rows:
                         _kn = r.get("kind") or "etc"
@@ -13619,6 +13641,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                             "날짜": str(r.get("target_date") or "")[:10],
                             "부호": r.get("sign") or "",
                             "유형": _ERP_ADJ_KIND_LABEL.get(_kn, _kn),
+                            "상태": _STATUS_KR.get(r.get("status") or "", r.get("status") or ""),
                             "시간(분)": _mn,
                             "시간(h)": round(_mn / 60, 2),
                             "시작시간": str(r.get("shift_start") or "")[:5] or "",
@@ -13626,7 +13649,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                             "근무지": r.get("work_location_name") or "",
                             "신청사유": r.get("reason") or "",
                             "승인자": r.get("approved_by") or "",
-                            "승인일시": str(r.get("approved_at") or "")[:19],
+                            "승인/처리일시": str(r.get("approved_at") or "")[:19],
                         })
                     _xls_df = pd.DataFrame(_xls_records)
                     _xls_df = _xls_df.sort_values(["날짜", "직원명"], kind="stable")
@@ -13635,25 +13658,25 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     _total_h = round(_total_min / 60, 2)
                     _summary = pd.DataFrame([{
                         "직원명": "─ 합계 ─", "날짜": "", "부호": "",
-                        "유형": f"총 {len(_xls_df)}건",
+                        "유형": f"총 {len(_xls_df)}건", "상태": "",
                         "시간(분)": _total_min, "시간(h)": _total_h,
                         "시작시간": "", "종료시간": "", "근무지": "",
-                        "신청사유": "", "승인자": "", "승인일시": "",
+                        "신청사유": "", "승인자": "", "승인/처리일시": "",
                     }])
                     _xls_df = pd.concat([_xls_df, _summary], ignore_index=True)
 
                     _buf = io.BytesIO()
-                    _xls_df.to_excel(_buf, index=False, sheet_name="승인내역")
+                    _xls_df.to_excel(_buf, index=False, sheet_name="신청내역")
                     _buf.seek(0)
                     _emp_tag = "전체직원" if _xls_emp == "(전체 직원)" else _xls_emp
-                    _xls_fname = f"approved_{_emp_tag}_{_xls_start.isoformat()}_{_xls_end.isoformat()}.xlsx"
+                    _st_tag = _xls_status_label
+                    _xls_fname = f"adjustments_{_emp_tag}_{_st_tag}_{_xls_start.isoformat()}_{_xls_end.isoformat()}.xlsx"
                     st.success(
                         f"✅ {len(_xls_records)}건 · 총 {_total_h}h ({_total_min}분) — 아래 버튼으로 다운로드"
                     )
-                    # 화면 미리보기
                     st.dataframe(_xls_df, use_container_width=True, hide_index=True)
                     st.download_button(
-                        label=f"⬇️ 엑셀 다운로드 ({_emp_tag} · {_xls_start} ~ {_xls_end})",
+                        label=f"⬇️ 엑셀 다운로드 ({_emp_tag} · {_st_tag} · {_xls_start} ~ {_xls_end})",
                         data=_buf,
                         file_name=_xls_fname,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
