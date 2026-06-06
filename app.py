@@ -13217,30 +13217,37 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     })
                     if ok:
                         _erp_v2_clear_caches()
-                        # 추가근무·회의(+)에 시간대 정보가 있으면 캘린더(app_attendance_logs)에도 자동 반영
-                        _shift_s = adj.get("shift_start")
-                        _shift_e = adj.get("shift_end")
-                        if kind in ("overtime", "meeting") and sign == "+" and _shift_s and _shift_e:
+                        # 추가근무·회의(+)는 캘린더(app_attendance_logs)에 반영
+                        if kind in ("overtime", "meeting") and sign == "+":
+                            _shift_s = str(adj.get("shift_start") or "")[:8] or None
+                            _shift_e = str(adj.get("shift_end") or "")[:8] or None
                             _work_db_adj = adj.get("work_db_filename") or current_db
                             _work_loc_adj = adj.get("work_location_name")
-                            _log_row = {
+                            _log_base = {
                                 "home_db_filename": current_db,
-                                "work_db_filename": _work_db_adj,
-                                "work_location_name": _work_loc_adj,
                                 "employee_name": adj.get("employee_name"),
                                 "log_date": str(adj.get("target_date") or "")[:10],
                                 "work_type": "추가근무" if kind == "overtime" else "회의",
                                 "leave_deduction": False,
                                 "diff_minutes": minutes,
-                                "start_time": _shift_s,
-                                "end_time": _shift_e,
-                                "standard_start": _shift_s,
-                                "standard_end": _shift_e,
                                 "status": "approved",
                                 "note": adj.get("reason"),
                                 "created_by": me_name,
                             }
-                            _erp_insert_row("app_attendance_logs", _log_row)
+                            _log_extra = {
+                                "work_db_filename": _work_db_adj,
+                                "work_location_name": _work_loc_adj,
+                                "start_time": _shift_s,
+                                "end_time": _shift_e,
+                                "standard_start": _shift_s,
+                                "standard_end": _shift_e,
+                            }
+                            _log_ok, _log_err = _erp_insert_row("app_attendance_logs", {**_log_base, **_log_extra})
+                            if not _log_ok and "PGRST204" in str(_log_err):
+                                # 일부 컬럼 없으면 기본 필드만으로 재시도
+                                _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_base)
+                            if not _log_ok:
+                                st.warning(f"캘린더 반영 실패(신청 승인은 완료됨): {_log_err}")
                         flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
                         st.rerun()
                     else:
@@ -13261,6 +13268,67 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                             st.rerun()
                         else:
                             st.error(f"반려 실패: {e}")
+
+    # ── 전체 승인 내역 엑셀 내보내기 ──────────────────────────────────
+    st.divider()
+    with st.expander("📊 전체 승인 내역 엑셀 다운로드", expanded=False):
+        st.caption("승인 완료된 추가근무·휴무 신청 내역 전체를 엑셀 파일로 내보냅니다.")
+        _xls_kind_filter = st.multiselect(
+            "유형 필터 (비어 있으면 전체)",
+            options=list(_ERP_ADJ_KINDS),
+            format_func=lambda k: _ERP_ADJ_KIND_LABEL.get(k, k),
+            key="xls_kind_filter",
+        )
+        _xls_year = st.number_input("연도", min_value=2020, max_value=2100,
+                                    value=_today_kst().year, step=1, key="xls_year")
+        if st.button("📥 엑셀 생성", key="xls_approved_btn"):
+            try:
+                _sb = get_supabase_client()
+                _xls_q = _sb.table("app_work_adjustments").select("*")\
+                    .eq("status", "approved")
+                if _xls_kind_filter:
+                    _xls_q = _xls_q.in_("kind", _xls_kind_filter)
+                _xls_rows = _xls_q.execute().data or []
+                # 연도 필터
+                _xls_rows = [
+                    r for r in _xls_rows
+                    if str(r.get("target_date") or "")[:4] == str(int(_xls_year))
+                ]
+                if not _xls_rows:
+                    st.info("해당 조건의 승인 내역이 없습니다.")
+                else:
+                    import io
+                    _xls_records = []
+                    for r in _xls_rows:
+                        _kn = r.get("kind") or "etc"
+                        _mn = int(r.get("minutes") or 0)
+                        _xls_records.append({
+                            "직원명": r.get("employee_name") or "",
+                            "날짜": str(r.get("target_date") or "")[:10],
+                            "부호": r.get("sign") or "",
+                            "유형": _ERP_ADJ_KIND_LABEL.get(_kn, _kn),
+                            "시간(분)": _mn,
+                            "시간(h)": round(_mn / 60, 2),
+                            "시작시간": str(r.get("shift_start") or "")[:5] or "",
+                            "종료시간": str(r.get("shift_end") or "")[:5] or "",
+                            "근무지": r.get("work_location_name") or "",
+                            "신청사유": r.get("reason") or "",
+                            "승인자": r.get("approved_by") or "",
+                            "승인일시": str(r.get("approved_at") or "")[:19],
+                        })
+                    _xls_df = pd.DataFrame(_xls_records)
+                    _buf = io.BytesIO()
+                    _xls_df.to_excel(_buf, index=False, sheet_name="승인내역")
+                    _buf.seek(0)
+                    st.download_button(
+                        label=f"⬇️ {int(_xls_year)}년 승인내역 다운로드 ({len(_xls_records)}건)",
+                        data=_buf,
+                        file_name=f"approved_adjustments_{int(_xls_year)}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="xls_approved_download",
+                    )
+            except Exception as _xls_ex:
+                st.error(f"엑셀 생성 오류: {_xls_ex}")
 
 
 def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
