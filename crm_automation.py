@@ -400,153 +400,31 @@ def _render_kakao_channel_tab(db_filename: str | None, store_name: str | None) -
     else:
         st.info("매장 선택 후 이용 가능합니다.")
 
-    # ── 고객 인바운드 메시지 상담 패널 ────────────────────────────────────
+    # ── 고객 실시간 상담 채팅창 (Next.js 앱 iframe) ────────────────────
     st.divider()
-    st.subheader("고객 수신 메시지 상담")
-    st.caption("고객이 카카오채널로 보낸 메시지를 확인하고 답장을 보냅니다. (5초마다 자동 새로고침)")
+    st.subheader("고객 실시간 상담")
 
-    if sc and store_name:
-        # 자동 새로고침 토글
-        _auto_refresh = st.toggle("자동 새로고침 (5초)", value=False, key="crm_inbound_autorefresh")
-        if _auto_refresh:
-            import time as _time
-            _time.sleep(5)
-            st.rerun()
+    import streamlit.components.v1 as _components
+    try:
+        import streamlit as _st
+        _chat_app_url = (
+            _st.secrets.get("chat_app", {}).get("url", "")
+            if hasattr(_st, "secrets") else ""
+        )
+    except Exception:
+        _chat_app_url = ""
 
-        try:
-            # 인바운드 메시지 목록 (최근 50건)
-            _inbound_q = (
-                sc.table("app_customer_messages")
-                .select("id, customer_id, kakao_user_key, message_body, created_at")
-                .eq("direction", "inbound")
-                .order("created_at", desc=True)
-                .limit(50)
-            )
-            if store_name:
-                _inbound_q = _inbound_q.eq("store_name", store_name)
-            _inbound_r = _inbound_q.execute()
-            _inbound_df = pd.DataFrame(_inbound_r.data or [])
+    if not _chat_app_url:
+        _chat_app_url = "https://emons-chat.vercel.app"
 
-            if _inbound_df.empty:
-                st.info("수신된 고객 메시지가 없습니다.")
-                st.caption(
-                    "고객이 카카오채널로 메시지를 보내면 이 화면에 표시됩니다.\n"
-                    "Solapi 콘솔에 메시지 수신 웹훅 URL이 등록되어 있어야 합니다:\n"
-                    "`https://emons-sms-webhook.onrender.com/webhook/solapi/message-received`"
-                )
-            else:
-                # customer_id → 고객명 매핑
-                _cust_ids = _inbound_df["customer_id"].dropna().astype(int).unique().tolist()
-                _cust_map: dict = {}
-                if _cust_ids:
-                    try:
-                        _cr = (
-                            sc.table("app_customers")
-                            .select("id, name, phone1")
-                            .in_("id", _cust_ids)
-                            .execute()
-                        )
-                        _cust_map = {
-                            int(r["id"]): {"name": r.get("name", "알 수 없음"), "phone": r.get("phone1", "")}
-                            for r in (_cr.data or [])
-                        }
-                    except Exception:
-                        pass
+    _store_param = f"?store={store_name}" if store_name else ""
+    _iframe_url = f"{_chat_app_url}/chat{_store_param}"
 
-                # 고객 선택 드롭다운
-                _unique_custs = _inbound_df["customer_id"].dropna().astype(int).unique().tolist()
-
-                def _fmt_cust_inbound(cid: int) -> str:
-                    info = _cust_map.get(int(cid), {})
-                    return f"{info.get('name', '?')} ({info.get('phone', '')})" if info else str(cid)
-
-                _sel_cust_id = st.selectbox(
-                    "대화할 고객 선택",
-                    options=_unique_custs,
-                    format_func=_fmt_cust_inbound,
-                    key="crm_inbound_cust_select",
-                )
-
-                if _sel_cust_id:
-                    # 선택 고객의 전체 대화 이력 (인바운드 + 아웃바운드)
-                    try:
-                        _chat_r = (
-                            sc.table("app_customer_messages")
-                            .select("id, direction, message_body, sent_by, channel, created_at")
-                            .eq("customer_id", int(_sel_cust_id))
-                            .order("created_at", desc=False)
-                            .limit(100)
-                            .execute()
-                        )
-                        _chat_rows = _chat_r.data or []
-                    except Exception:
-                        _chat_rows = []
-
-                    # 대화창 표시
-                    _chat_container = st.container(border=True)
-                    with _chat_container:
-                        if not _chat_rows:
-                            st.caption("대화 내용이 없습니다.")
-                        for _msg in _chat_rows:
-                            _dir = _msg.get("direction", "outbound")
-                            _body = _msg.get("message_body") or ""
-                            _ts = str(_msg.get("created_at") or "")[:16].replace("T", " ")
-                            _by = _msg.get("sent_by") or ""
-                            if _dir == "inbound":
-                                st.chat_message("user").markdown(
-                                    f"{_body}\n\n<small style='color:gray'>{_ts}</small>",
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.chat_message("assistant").markdown(
-                                    f"{_body}\n\n<small style='color:gray'>{_ts} · {_by}</small>",
-                                    unsafe_allow_html=True,
-                                )
-
-                    # 답장 입력창
-                    _reply_body = st.text_area(
-                        "답장 메시지 입력",
-                        placeholder="고객에게 보낼 메시지를 입력하세요.",
-                        height=100,
-                        key=f"crm_reply_body_{_sel_cust_id}",
-                    )
-                    _cust_info = _cust_map.get(int(_sel_cust_id), {})
-                    _cust_phone = _cust_info.get("phone", "")
-                    _cust_name = _cust_info.get("name", "고객")
-                    _actor = (st.session_state.get("current_user") or {}).get("username", "system")
-
-                    if st.button("답장 보내기", key=f"crm_reply_send_{_sel_cust_id}", type="primary", use_container_width=True):
-                        if not _reply_body.strip():
-                            st.warning("메시지 내용을 입력하세요.")
-                        elif not _cust_phone:
-                            st.warning("고객 전화번호가 없어 발송할 수 없습니다.")
-                        else:
-                            try:
-                                from customer_channel import send_manual_friendtalk
-                                _reply_res = send_manual_friendtalk(
-                                    customer_id=int(_sel_cust_id),
-                                    phone=_cust_phone,
-                                    customer_name=_cust_name,
-                                    message_body=_reply_body.strip(),
-                                    store_name=store_name,
-                                    sent_by=_actor,
-                                )
-                                if _reply_res.get("status") == "sent":
-                                    st.toast("답장이 발송되었습니다.", icon="✅")
-                                    st.rerun()
-                                elif _reply_res.get("status") == "not_friend":
-                                    st.warning("채널 친구가 아니어서 친구톡 발송이 불가합니다. 일반 SMS로 발송하려면 채널 초대 먼저 발송하세요.")
-                                elif _reply_res.get("status") == "skipped":
-                                    st.warning("Solapi 설정이 없어 발송이 건너뛰어졌습니다.")
-                                else:
-                                    st.error(f"발송 실패: {_reply_res.get('error')}")
-                            except Exception as e:
-                                st.error(f"발송 중 오류: {e}")
-
-        except Exception as e:
-            st.warning(f"인바운드 메시지 조회 실패: {e}")
-    else:
-        st.info("매장 선택 후 이용 가능합니다.")
+    st.caption(
+        f"아래 창은 실시간 상담 앱입니다. 고객이 메시지를 보내면 즉시 표시됩니다. "
+        f"([별도 창으로 열기]({_iframe_url}))"
+    )
+    _components.iframe(_iframe_url, height=680, scrolling=True)
 
 
 def render_crm_menu() -> None:
