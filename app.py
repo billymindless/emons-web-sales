@@ -13297,9 +13297,9 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
             with ts1:
                 new_date = st.date_input("날짜", value=today, key="my_new_date")
             with ts2:
-                new_start = st.time_input("시작 시간", value=time(18, 0), step=60, key="my_new_start")
+                new_start = st.time_input("시작 시간", value=dt_time(18, 0), step=60, key="my_new_start")
             with ts3:
-                new_end = st.time_input("종료 시간", value=time(20, 0), step=60, key="my_new_end")
+                new_end = st.time_input("종료 시간", value=dt_time(20, 0), step=60, key="my_new_end")
             with ts4:
                 new_store_label = st.selectbox("근무지", _adj_store_labels,
                                                index=_adj_home_idx, key="my_new_store")
