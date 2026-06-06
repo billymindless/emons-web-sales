@@ -13279,8 +13279,18 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
             format_func=lambda k: _ERP_ADJ_KIND_LABEL.get(k, k),
             key="xls_kind_filter",
         )
-        _xls_year = st.number_input("연도", min_value=2020, max_value=2100,
-                                    value=_today_kst().year, step=1, key="xls_year")
+        _xls_col1, _xls_col2 = st.columns([1, 1])
+        with _xls_col1:
+            _xls_year = st.number_input("연도", min_value=2020, max_value=2100,
+                                        value=_today_kst().year, step=1, key="xls_year")
+        with _xls_col2:
+            _xls_month = st.selectbox(
+                "월 (전체=선택 안함)",
+                options=[0] + list(range(1, 13)),
+                format_func=lambda m: "전체" if m == 0 else f"{m}월",
+                index=_today_kst().month,
+                key="xls_month",
+            )
         if st.button("📥 엑셀 생성", key="xls_approved_btn"):
             try:
                 _sb = get_supabase_client_or_warn()
@@ -13291,10 +13301,11 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 if _xls_kind_filter:
                     _xls_q = _xls_q.in_("kind", _xls_kind_filter)
                 _xls_rows = _xls_q.execute().data or []
-                # 연도 필터
+                # 연도·월 필터
+                _xls_ym_prefix = f"{int(_xls_year):04d}-{int(_xls_month):02d}" if _xls_month else f"{int(_xls_year):04d}"
                 _xls_rows = [
                     r for r in _xls_rows
-                    if str(r.get("target_date") or "")[:4] == str(int(_xls_year))
+                    if str(r.get("target_date") or "").startswith(_xls_ym_prefix)
                 ]
                 if not _xls_rows:
                     st.info("해당 조건의 승인 내역이 없습니다.")
@@ -13319,13 +13330,22 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                             "승인일시": str(r.get("approved_at") or "")[:19],
                         })
                     _xls_df = pd.DataFrame(_xls_records)
+                    _xls_df = _xls_df.sort_values(["날짜", "직원명"], kind="stable")
                     _buf = io.BytesIO()
                     _xls_df.to_excel(_buf, index=False, sheet_name="승인내역")
                     _buf.seek(0)
+                    _xls_label = (
+                        f"{int(_xls_year)}년 {int(_xls_month)}월" if _xls_month
+                        else f"{int(_xls_year)}년 전체"
+                    )
+                    _xls_fname = (
+                        f"approved_{int(_xls_year)}_{int(_xls_month):02d}.xlsx" if _xls_month
+                        else f"approved_{int(_xls_year)}.xlsx"
+                    )
                     st.download_button(
-                        label=f"⬇️ {int(_xls_year)}년 승인내역 다운로드 ({len(_xls_records)}건)",
+                        label=f"⬇️ {_xls_label} 승인내역 다운로드 ({len(_xls_records)}건)",
                         data=_buf,
-                        file_name=f"approved_adjustments_{int(_xls_year)}.xlsx",
+                        file_name=_xls_fname,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key="xls_approved_download",
                     )
