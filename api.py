@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 import re
@@ -909,31 +910,54 @@ async def _ct_fetch_latest_order_with_balance(
 # 채널톡 Custom Tab 엔드포인트
 # ──────────────────────────────────────────────
 
-@app.post("/channel-talk/custom-tab", summary="채널톡 Custom Tab 고객 정보 조회")
-async def channel_talk_custom_tab(payload: ChannelTalkPayload) -> JSONResponse:
+@app.api_route(
+    "/channel-talk/custom-tab",
+    methods=["POST", "PUT"],
+    summary="채널톡 Snippet 고객 정보 조회",
+)
+async def channel_talk_custom_tab(request: Request) -> JSONResponse:
     """
-    채널톡 상담원이 채팅을 열 때 호출되는 Custom Tab webhook.
-    1) 전화번호 추출 → 정규화
-    2) Supabase app_customers 조회 (없으면 자동 가입)
-    3) 최근 주문 + 결제 합계 조회 → 잔금 계산
-    4) 채널톡 JSON 블록 응답 (고객 정보 + 매직링크 버튼)
-
-    실패 시에도 200 OK + 에러 메시지 블록 반환 (UI 깨짐 방지).
+    채널톡 Snippet webhook (POST와 PUT 모두 지원).
+    1) 요청 본문 RAW 로깅 (디버깅용)
+    2) 전화번호 추출 → 정규화
+    3) Supabase app_customers 조회 (없으면 자동 가입)
+    4) 최근 주문 + 결제 합계 조회 → 잔금 계산
+    5) 채널톡 Snippet v0 JSON 응답 + RAW 로깅
     """
     try:
-        # 전화번호 추출 (채널톡 Snippet 요청: user.mobileNumber)
+        # ── 디버깅: 요청 본문 RAW 로깅 ──
+        raw_body = await request.body()
+        try:
+            payload_dict = json.loads(raw_body) if raw_body else {}
+        except Exception:
+            payload_dict = {}
+        logger.info(
+            "channel-talk REQUEST: method=%s, body=%s",
+            request.method,
+            raw_body.decode("utf-8", errors="replace")[:1000],
+        )
+
+        # 전화번호 추출 (여러 위치에서 시도)
         raw_phone = ""
         name_from_ct = "채널톡고객"
-        if payload.user:
-            raw_phone = payload.user.mobileNumber or ""
-            name_from_ct = payload.user.name or "채널톡고객"
+        user_obj = payload_dict.get("user") or {}
+        if isinstance(user_obj, dict):
+            raw_phone = (
+                user_obj.get("mobileNumber")
+                or user_obj.get("mobile_number")
+                or user_obj.get("phone")
+                or ""
+            )
+            name_from_ct = user_obj.get("name") or "채널톡고객"
 
         cleaned_phone = _normalize_phone(raw_phone)
 
         if not cleaned_phone:
-            return JSONResponse(_ct_error_response(
-                "전화번호 정보가 없습니다.\n채팅창에 전화번호를 입력해 주세요."
-            ))
+            response_body = _ct_error_response(
+                "전화번호 정보가 없습니다.\n채팅창에서 전화번호를 입력 받아주세요."
+            )
+            logger.info("channel-talk RESPONSE (no-phone): %s", json.dumps(response_body, ensure_ascii=False)[:500])
+            return JSONResponse(response_body)
 
         headers = _supa_headers()
         if not headers:
@@ -956,16 +980,21 @@ async def channel_talk_custom_tab(payload: ChannelTalkPayload) -> JSONResponse:
                 except Exception as e:
                     logger.warning("channel-talk: 주문 조회 실패 (계속 진행): %s", e)
 
-        return JSONResponse(_build_ct_response(
+        response_body = _build_ct_response(
             customer_name=customer_name,
             is_new=is_new,
             order_info=order_info,
             cleaned_phone=cleaned_phone,
-        ))
+        )
+        logger.info(
+            "channel-talk RESPONSE (ok): phone=%s, is_new=%s, response=%s",
+            cleaned_phone, is_new,
+            json.dumps(response_body, ensure_ascii=False)[:500],
+        )
+        return JSONResponse(response_body)
 
     except Exception as e:
-        logger.error("channel-talk webhook error: %s", e)
-        # 채널톡 UI가 깨지지 않도록 200 OK + 에러 메시지 반환
+        logger.error("channel-talk webhook error: %s", e, exc_info=True)
         return JSONResponse(_ct_error_response(
             f"서버 에러: 데이터를 불러오지 못했습니다. ({type(e).__name__})"
         ))
