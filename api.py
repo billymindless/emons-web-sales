@@ -715,48 +715,56 @@ async def imweb_order_webhook(request: Request) -> JSONResponse:
 
 
 # ──────────────────────────────────────────────
-# 채널톡 Custom Tab — Pydantic 모델
+# 채널톡 Snippet — Pydantic 모델
+# 실제 채널톡 요청 구조: { "user": {...}, "channel": {...}, "manager": {...}, "params": {...} }
 # ──────────────────────────────────────────────
 
-class CTProfile(BaseModel):
-    """채널톡 페이로드의 context.profile 부분."""
+class CTUser(BaseModel):
+    """채널톡 Snippet 요청의 user 필드."""
     name: str | None = None
     mobileNumber: str | None = None
 
-
-class CTContext(BaseModel):
-    profile: CTProfile | None = None
+    class Config:
+        extra = "allow"
 
 
 class ChannelTalkPayload(BaseModel):
-    """채널톡 Custom Tab webhook payload. 알 수 없는 필드는 무시."""
-    context: CTContext | None = None
+    """채널톡 Snippet initialize/submit 요청 payload."""
+    user: CTUser | None = None
 
     class Config:
         extra = "allow"
 
 
 # ──────────────────────────────────────────────
-# 채널톡 Custom Tab — 응답 빌더 헬퍼
+# 채널톡 Snippet — 응답 빌더 헬퍼 (v0 스펙)
+# 공식 스펙: version="v0", layout=[{id, type, ...}]
+# 컴포넌트: text(text), key-value(items), button(title+action)
 # ──────────────────────────────────────────────
 
-def _ct_text_block(text: str) -> dict:
-    return {"type": "text", "value": text}
+def _ct_text_component(component_id: str, text: str, style: str = "paragraph") -> dict:
+    return {"id": component_id, "type": "text", "text": text, "style": style}
 
 
-def _ct_button_block(label: str, url: str) -> dict:
+def _ct_keyvalue_component(component_id: str, items: list[dict]) -> dict:
+    return {"id": component_id, "type": "key-value", "items": items}
+
+
+def _ct_button_component(component_id: str, label: str, url: str) -> dict:
     return {
+        "id": component_id,
         "type": "button",
         "title": label,
-        "action": {"type": "openUrl", "attributes": {"url": url}},
+        "action": {"type": "url", "url": url},
     }
 
 
 def _ct_error_response(message: str) -> dict:
     """모든 에러 상황에서도 채널톡 UI가 깨지지 않도록 정상 JSON 반환."""
     return {
-        "version": "v1",
-        "blocks": [_ct_text_block(message)],
+        "version": "v0",
+        "layout": [_ct_text_component("error-msg", message)],
+        "params": {},
     }
 
 
@@ -775,10 +783,10 @@ def _build_ct_response(
     order_info: dict | None,
     cleaned_phone: str,
 ) -> dict:
-    """채널톡 Custom Tab JSON 응답 생성."""
+    """채널톡 Snippet JSON 응답 생성 (v0 스펙)."""
     status_text = "신규 자동가입" if is_new else "기존 고객"
-    blocks: list[dict] = [
-        _ct_text_block(f"{customer_name}님 ({status_text})"),
+    layout: list[dict] = [
+        _ct_text_component("customer-title", f"👤 {customer_name} ({status_text})", style="h1"),
     ]
 
     if order_info and order_info.get("total_amount") is not None:
@@ -786,21 +794,19 @@ def _build_ct_response(
         total = int(order_info.get("total_amount") or 0)
         paid = int(order_info.get("paid_total") or 0)
         balance = total - paid
-        blocks.append(_ct_text_block(
-            f"최근 주문: {category}\n"
-            f"결제금액: {_format_currency(total)}\n"
-            f"입금완료: {_format_currency(paid)}\n"
-            f"잔금: {_format_currency(balance)}"
-        ))
+        layout.append(_ct_keyvalue_component("order-info", [
+            {"key": "최근 주문", "value": category},
+            {"key": "결제금액", "value": _format_currency(total)},
+            {"key": "입금완료", "value": _format_currency(paid)},
+            {"key": "잔금", "value": _format_currency(balance)},
+        ]))
     else:
-        blocks.append(_ct_text_block("최근 구매 내역 없음"))
+        layout.append(_ct_text_component("no-order", "최근 구매 내역 없음"))
 
-    magic_url = (
-        f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
-    )
-    blocks.append(_ct_button_block("[momo] 매출/견적 등록하기", magic_url))
+    magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
+    layout.append(_ct_button_component("magic-link-btn", "[momo] 매출/견적 등록하기", magic_url))
 
-    return {"version": "v1", "blocks": blocks}
+    return {"version": "v0", "layout": layout, "params": {}}
 
 
 # ──────────────────────────────────────────────
@@ -914,12 +920,12 @@ async def channel_talk_custom_tab(payload: ChannelTalkPayload) -> JSONResponse:
     실패 시에도 200 OK + 에러 메시지 블록 반환 (UI 깨짐 방지).
     """
     try:
-        # 전화번호 추출 (deeply nested)
+        # 전화번호 추출 (채널톡 Snippet 요청: user.mobileNumber)
         raw_phone = ""
         name_from_ct = "채널톡고객"
-        if payload.context and payload.context.profile:
-            raw_phone = payload.context.profile.mobileNumber or ""
-            name_from_ct = payload.context.profile.name or "채널톡고객"
+        if payload.user:
+            raw_phone = payload.user.mobileNumber or ""
+            name_from_ct = payload.user.name or "채널톡고객"
 
         cleaned_phone = _normalize_phone(raw_phone)
 
