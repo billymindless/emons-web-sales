@@ -827,6 +827,16 @@ def _build_ct_response(
 # 채널톡 — Supabase 조회/삽입 (내부 함수)
 # ──────────────────────────────────────────────
 
+def _phone_variants(cleaned: str) -> list[str]:
+    """01012345678 → [01012345678, 010-1234-5678, 010 1234 5678] 등 검색 변형."""
+    variants = {cleaned}
+    if len(cleaned) == 11 and cleaned.startswith("010"):
+        variants.add(f"{cleaned[:3]}-{cleaned[3:7]}-{cleaned[7:]}")
+        variants.add(f"{cleaned[:3]} {cleaned[3:7]} {cleaned[7:]}")
+        variants.add(f"{cleaned[:3]}.{cleaned[3:7]}.{cleaned[7:]}")
+    return list(variants)
+
+
 async def _ct_get_or_create_customer(
     client: httpx.AsyncClient,
     headers: dict,
@@ -835,15 +845,27 @@ async def _ct_get_or_create_customer(
 ) -> tuple[int | None, str, bool]:
     """
     전화번호로 app_customers 조회 → 없으면 자동 가입.
+    phone1/phone2 + 정규화/하이픈/공백 형식 모두 검색.
     반환: (customer_id, name, is_new)
     """
-    # 1) 기존 고객 조회
+    variants = _phone_variants(cleaned_phone)
+    # Supabase or 필터: or=(phone1.eq.X,phone1.eq.Y,phone2.eq.X,phone2.eq.Y)
+    or_parts: list[str] = []
+    for v in variants:
+        or_parts.append(f"phone1.eq.{v}")
+        or_parts.append(f"phone2.eq.{v}")
+    or_filter = "(" + ",".join(or_parts) + ")"
+
     resp = await client.get(
         _supa_url("app_customers"),
         headers=headers,
-        params={"phone1": f"eq.{cleaned_phone}", "select": "id,name", "limit": "1"},
+        params={"or": or_filter, "select": "id,name,phone1,phone2", "limit": "1"},
     )
     rows = resp.json() if resp.status_code == 200 else []
+    logger.info(
+        "channel-talk lookup: variants=%s, status=%s, found=%d",
+        variants, resp.status_code, len(rows),
+    )
     if rows:
         return int(rows[0]["id"]), str(rows[0].get("name") or name_from_ct or ""), False
 
