@@ -85,7 +85,6 @@ def _normalize_phone(phone: str) -> str:
 def _log_message(
     customer_id: int | None,
     store_name: str,
-    order_id: int | None,
     phone: str,
     message_type: str,
     channel: str,
@@ -94,6 +93,8 @@ def _log_message(
     message_body: str,
     error_detail: str | None,
     sent_by: str,
+    order_id: int | None = None,
+    direction: str = "outbound",
 ) -> None:
     """발송 결과를 app_customer_messages 테이블에 기록."""
     sc = _get_supabase()
@@ -112,6 +113,7 @@ def _log_message(
             "message_body": message_body,
             "error_detail": error_detail,
             "sent_by": sent_by,
+            "direction": direction,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
     except Exception:
@@ -307,6 +309,190 @@ def send_channel_invite_sms(
     )
 
     return {"status": result.get("status"), "error": result.get("error")}
+
+
+DEFAULT_WELCOME_TEMPLATE = (
+    "[이몬스] {이름}님, 환영합니다!\n"
+    "이몬스 공식 카카오채널에서 구매 문의, AS 신청, 배송 안내를 받으실 수 있습니다.\n"
+    "채널 추가 후 편리하게 이용해 주세요 😊\n"
+    "채널 추가: {채널URL}"
+)
+
+DEFAULT_CARE_TEMPLATE = (
+    "[이몬스] {이름}님, 구매하신 제품은 잘 도착하셨나요?\n"
+    "품목: {품목}\n\n"
+    "가구 관리 팁이나 AS가 필요하시면 언제든지 이 채널로 문의해 주세요.\n"
+    "항상 감사합니다 🙏"
+)
+
+
+def send_welcome_message(
+    customer_id: int,
+    phone: str,
+    customer_name: str,
+    store_name: str,
+    sent_by: str = "system",
+) -> dict[str, Any]:
+    """
+    아임웹 신규 회원가입 시 웰컴 알림톡/SMS 발송.
+    이미 발송된 경우 중복 발송하지 않음 (welcome_sent 플래그 확인).
+    """
+    from solapi_sender import send_sms  # type: ignore
+
+    phone_digits = _normalize_phone(phone)
+    if not phone_digits:
+        return {"status": "skipped", "error": "phone_empty"}
+
+    # 이미 웰컴 메시지 발송된 경우 스킵
+    sc = _get_supabase()
+    if sc:
+        try:
+            r = sc.table("app_customers").select("welcome_sent").eq("id", customer_id).execute()
+            if r.data and r.data[0].get("welcome_sent"):
+                return {"status": "skipped", "error": "already_sent"}
+        except Exception:
+            pass
+
+    channel_url = os.environ.get("KAKAO_CHANNEL_URL", "https://pf.kakao.com/_your_channel")
+    body = (
+        DEFAULT_WELCOME_TEMPLATE
+        .replace("{이름}", customer_name)
+        .replace("{채널URL}", channel_url)
+    )
+
+    # 알림톡 템플릿이 없으면 SMS로 폴백
+    status = "failed"
+    msg_id = None
+    error_detail = None
+    try:
+        result = send_sms(to_phone=phone_digits, text=body)
+        status = result.get("status", "failed")
+        msg_id = result.get("msg_id")
+        error_detail = result.get("error")
+    except Exception as e:
+        error_detail = str(e)
+
+    _log_message(
+        customer_id=customer_id,
+        store_name=store_name,
+        phone=phone_digits,
+        message_type="welcome",
+        channel="sms",
+        status=status,
+        msg_id=msg_id,
+        message_body=body,
+        error_detail=error_detail,
+        sent_by=sent_by,
+    )
+
+    # welcome_sent 플래그 업데이트
+    if status in ("sent", "skipped") and sc:
+        try:
+            sc.table("app_customers").update({"welcome_sent": True}).eq("id", customer_id).execute()
+        except Exception:
+            pass
+
+    return {"status": status, "error": error_detail}
+
+
+def send_care_message(
+    customer_id: int,
+    phone: str,
+    customer_name: str,
+    product_name: str,
+    store_name: str,
+    sent_by: str = "system",
+) -> dict[str, Any]:
+    """
+    배송완료 N일 후 케어 메시지 발송 (친구톡 우선, SMS 폴백).
+    """
+    from solapi_sender import send_friendtalk, send_sms  # type: ignore
+
+    phone_digits = _normalize_phone(phone)
+    if not phone_digits:
+        return {"status": "skipped", "error": "phone_empty"}
+
+    body = (
+        DEFAULT_CARE_TEMPLATE
+        .replace("{이름}", customer_name)
+        .replace("{품목}", product_name or "구매하신 제품")
+    )
+
+    # kakao_friend_added 여부 확인
+    kakao_status = get_customer_kakao_status(customer_id)
+    if kakao_status.get("kakao_friend_added"):
+        result = send_friendtalk(phone_digits, body, disable_sms_fallback=False)
+        channel = "friendtalk"
+    else:
+        result = send_sms(to_phone=phone_digits, text=body)
+        channel = "sms"
+
+    _log_message(
+        customer_id=customer_id,
+        store_name=store_name,
+        phone=phone_digits,
+        message_type="care",
+        channel=channel,
+        status=result.get("status", "failed"),
+        msg_id=result.get("msg_id"),
+        message_body=body,
+        error_detail=result.get("error"),
+        sent_by=sent_by,
+    )
+    return {"status": result.get("status"), "error": result.get("error")}
+
+
+def send_bulk_marketing(
+    targets: list[dict],
+    message_body: str,
+    store_name: str,
+    sent_by: str = "system",
+) -> dict[str, Any]:
+    """
+    마케팅 타겟 일괄 발송 (marketing_agreed=true 고객만 허용).
+    targets: [{"customer_id": int, "phone": str, "name": str}, ...]
+    반드시 marketing_agreed=True 고객만 전달할 것 (법적 의무).
+    """
+    from solapi_sender import send_friendtalk  # type: ignore
+
+    sent = 0
+    failed = 0
+    skipped = 0
+
+    for t in targets:
+        phone_digits = _normalize_phone(t.get("phone", ""))
+        if not phone_digits:
+            skipped += 1
+            continue
+
+        customer_id = t.get("customer_id")
+        name = t.get("name", "고객")
+
+        personalized = message_body.replace("{이름}", name)
+        result = send_friendtalk(phone_digits, personalized, disable_sms_fallback=False)
+
+        _log_message(
+            customer_id=customer_id,
+            store_name=store_name,
+            phone=phone_digits,
+            message_type="marketing",
+            channel="friendtalk",
+            status=result.get("status", "failed"),
+            msg_id=result.get("msg_id"),
+            message_body=personalized,
+            error_detail=result.get("error"),
+            sent_by=sent_by,
+            direction="outbound",
+        )
+
+        if result.get("status") in ("sent",):
+            sent += 1
+        elif result.get("status") == "skipped":
+            skipped += 1
+        else:
+            failed += 1
+
+    return {"sent": sent, "failed": failed, "skipped": skipped, "total": len(targets)}
 
 
 def send_manual_friendtalk(

@@ -6,6 +6,8 @@
   POST /webhook/solapi/friend-added     — Solapi 카카오채널 친구추가 이벤트 수신
   POST /webhook/solapi/message-received — 고객이 카카오채널로 보낸 메시지 수신
   POST /webhook/sms/deposit             — 기업은행 입금 SMS 수신
+  POST /webhook/imweb/member            — 아임웹 신규 회원가입 이벤트 수신
+  POST /webhook/imweb/order             — 아임웹 주문/배송 이벤트 수신
   GET  /health                          — 헬스체크
 
 실행:
@@ -16,6 +18,9 @@
   SUPABASE_SERVICE_KEY   service_role key (전체 쓰기 권한)
   SOLAPI_WEBHOOK_SECRET  Solapi 웹훅 Secret (X-Solapi-Secret 헤더 검증용)
   SMS_WEBHOOK_TOKEN      SMS 포워딩 앱 인증 토큰
+  IMWEB_WEBHOOK_TOKEN    아임웹 웹훅 보안 토큰 (아임웹 관리자에서 설정한 값)
+  IMWEB_API_KEY          아임웹 REST API 키 (폴링 배치용)
+  IMWEB_API_SECRET       아임웹 REST API Secret (폴링 배치용)
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+IMWEB_WEBHOOK_TOKEN = os.environ.get("IMWEB_WEBHOOK_TOKEN", "")
 
 app = FastAPI(
     title="이몬스 웹훅 API",
@@ -89,6 +95,17 @@ def _verify_solapi_secret(request: Request) -> bool:
 
 def _digits_only(phone: str) -> str:
     return re.sub(r"\D", "", phone or "")
+
+
+def _normalize_phone(phone: str) -> str:
+    """
+    010-1234-5678, +82-10-1234-5678 등 모든 형식을 01012345678로 통일.
+    아임웹과 내부 DB 간 전화번호 형식 불일치 해결용.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("82") and len(digits) >= 11:
+        digits = "0" + digits[2:]
+    return digits
 
 
 # ──────────────────────────────────────────────
@@ -407,12 +424,288 @@ async def sms_deposit_webhook(request: Request) -> JSONResponse:
     }, status_code=200)
 
 
+# ──────────────────────────────────────────────
+# 아임웹 웹훅 — 신규 회원가입
+# ──────────────────────────────────────────────
+
+@app.post("/webhook/imweb/member", summary="아임웹 신규 회원가입 이벤트")
+async def imweb_member_webhook(request: Request) -> JSONResponse:
+    """
+    아임웹 Pro 웹훅: 신규 회원가입 이벤트 수신.
+    - 전화번호로 기존 app_customers 조회
+    - 있으면: imweb_member_id, marketing_agreed 업데이트, customer_type='purchaser' 유지
+    - 없으면: 신규 레코드 생성 (customer_type='member_only')
+    - 웰컴 알림톡 발송 트리거
+    """
+    # 아임웹 웹훅 토큰 검증
+    received_token = (
+        request.headers.get("x-imweb-token")
+        or request.headers.get("authorization", "").replace("Bearer ", "")
+    )
+    if IMWEB_WEBHOOK_TOKEN and not hmac.compare_digest(IMWEB_WEBHOOK_TOKEN, received_token):
+        logger.warning("imweb member webhook: 토큰 검증 실패")
+        return JSONResponse({"status": "error", "reason": "unauthorized"}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    logger.info("imweb member webhook 수신: %s", str(payload)[:300])
+
+    # 아임웹 페이로드 파싱 (필드명은 아임웹 문서 기준)
+    raw_phone = (
+        payload.get("phone")
+        or payload.get("mobile")
+        or (payload.get("member") or {}).get("phone")
+        or (payload.get("member") or {}).get("mobile")
+        or ""
+    )
+    phone = _normalize_phone(raw_phone)
+    name = (
+        payload.get("name")
+        or (payload.get("member") or {}).get("name")
+        or ""
+    )
+    email = (
+        payload.get("email")
+        or (payload.get("member") or {}).get("email")
+        or ""
+    )
+    imweb_member_id = str(
+        payload.get("member_id")
+        or payload.get("id")
+        or (payload.get("member") or {}).get("member_id")
+        or (payload.get("member") or {}).get("id")
+        or ""
+    )
+    marketing_agreed = bool(
+        payload.get("marketing_agree")
+        or payload.get("marketing_agreed")
+        or (payload.get("member") or {}).get("marketing_agree")
+    )
+    joined_at = (
+        payload.get("created")
+        or payload.get("join_date")
+        or (payload.get("member") or {}).get("created")
+        or datetime.now(timezone.utc).isoformat()
+    )
+
+    if not phone:
+        logger.warning("imweb member webhook: 전화번호 없음 — 무시")
+        return JSONResponse({"status": "skipped", "reason": "no_phone"})
+
+    headers = _supa_headers()
+    if not headers:
+        logger.error("imweb member webhook: Supabase 미설정")
+        return JSONResponse({"status": "error", "reason": "supabase_not_configured"}, status_code=500)
+
+    customer_id: int | None = None
+    is_new = False
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            # 1) 전화번호로 기존 고객 조회
+            resp = await client.get(
+                _supa_url("app_customers"),
+                headers=headers,
+                params={"phone1": f"eq.{phone}", "select": "id,customer_type", "limit": "1"},
+            )
+            existing = resp.json() if resp.status_code == 200 else []
+
+            if existing:
+                customer_id = int(existing[0]["id"])
+                # 기존 고객 업데이트 (imweb 정보 보강)
+                patch_data: dict = {
+                    "imweb_member_id": imweb_member_id or None,
+                    "imweb_joined_at": joined_at,
+                    "marketing_agreed": marketing_agreed,
+                }
+                await client.patch(
+                    _supa_url("app_customers") + f"?id=eq.{customer_id}",
+                    headers=headers,
+                    json=patch_data,
+                )
+                logger.info("imweb member: 기존 고객 업데이트 customer_id=%s", customer_id)
+            else:
+                # 신규 고객 생성
+                insert_data = {
+                    "name": name or "아임웹회원",
+                    "phone1": phone,
+                    "email": email or None,
+                    "imweb_member_id": imweb_member_id or None,
+                    "imweb_joined_at": joined_at,
+                    "marketing_agreed": marketing_agreed,
+                    "customer_type": "member_only",
+                    "store_name": "아임웹",
+                }
+                resp2 = await client.post(
+                    _supa_url("app_customers"),
+                    headers={**headers, "Prefer": "return=representation"},
+                    json=insert_data,
+                )
+                if resp2.status_code in (200, 201):
+                    created = resp2.json()
+                    customer_id = int(created[0]["id"]) if created else None
+                    is_new = True
+                    logger.info("imweb member: 신규 고객 생성 customer_id=%s phone=%s", customer_id, phone)
+                else:
+                    logger.error("imweb member: 신규 고객 생성 실패 %s %s", resp2.status_code, resp2.text)
+
+        except Exception as e:
+            logger.error("imweb member webhook 처리 오류: %s", e)
+            return JSONResponse({"status": "error", "reason": str(e)}, status_code=500)
+
+    # 웰컴 알림톡 발송 (신규 가입자 + 전화번호 있을 때)
+    if is_new and customer_id and phone:
+        try:
+            from customer_channel import send_welcome_message
+            send_welcome_message(
+                customer_id=customer_id,
+                phone=phone,
+                customer_name=name or "고객",
+                store_name="이몬스",
+                sent_by="imweb_webhook",
+            )
+        except Exception as e:
+            logger.warning("웰컴 메시지 발송 실패 (주문 등록에는 영향 없음): %s", e)
+
+    return JSONResponse({
+        "status": "ok",
+        "customer_id": customer_id,
+        "is_new": is_new,
+        "phone": phone,
+    })
+
+
+# ──────────────────────────────────────────────
+# 아임웹 웹훅 — 주문/배송 이벤트
+# ──────────────────────────────────────────────
+
+@app.post("/webhook/imweb/order", summary="아임웹 주문/배송 이벤트")
+async def imweb_order_webhook(request: Request) -> JSONResponse:
+    """
+    아임웹 Pro 웹훅: 주문완료 / 배송완료 이벤트 수신.
+    - 전화번호로 customer_id 조회 및 customer_type='purchaser' 업데이트
+    - imweb_order_events 테이블에 이벤트 저장
+    - 배송완료(delivered) 시 7일 후 케어 메시지 예약 시각 기록
+    """
+    received_token = (
+        request.headers.get("x-imweb-token")
+        or request.headers.get("authorization", "").replace("Bearer ", "")
+    )
+    if IMWEB_WEBHOOK_TOKEN and not hmac.compare_digest(IMWEB_WEBHOOK_TOKEN, received_token):
+        logger.warning("imweb order webhook: 토큰 검증 실패")
+        return JSONResponse({"status": "error", "reason": "unauthorized"}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    logger.info("imweb order webhook 수신: %s", str(payload)[:300])
+
+    raw_phone = (
+        payload.get("phone")
+        or payload.get("receiver_phone")
+        or (payload.get("order") or {}).get("phone")
+        or (payload.get("orderer") or {}).get("phone")
+        or ""
+    )
+    phone = _normalize_phone(raw_phone)
+    imweb_order_id = str(
+        payload.get("order_id")
+        or payload.get("id")
+        or (payload.get("order") or {}).get("order_code")
+        or ""
+    )
+    order_status = (
+        payload.get("status")
+        or payload.get("order_status")
+        or (payload.get("order") or {}).get("status")
+        or ""
+    )
+    product_name = (
+        payload.get("product_name")
+        or (payload.get("items") or [{}])[0].get("name", "")
+        or ""
+    )
+
+    if not phone or not imweb_order_id:
+        return JSONResponse({"status": "skipped", "reason": "missing_fields"})
+
+    headers = _supa_headers()
+    if not headers:
+        return JSONResponse({"status": "error", "reason": "supabase_not_configured"}, status_code=500)
+
+    customer_id: int | None = None
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            # 전화번호로 customer_id 조회
+            resp = await client.get(
+                _supa_url("app_customers"),
+                headers=headers,
+                params={"phone1": f"eq.{phone}", "select": "id", "limit": "1"},
+            )
+            rows = resp.json() if resp.status_code == 200 else []
+            if rows:
+                customer_id = int(rows[0]["id"])
+                # 구매 이력 있는 고객으로 업데이트
+                await client.patch(
+                    _supa_url("app_customers") + f"?id=eq.{customer_id}",
+                    headers=headers,
+                    json={
+                        "customer_type": "purchaser",
+                        "last_order_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+
+            # 배송완료 시 케어 메시지 발송 예정 시각 계산 (7일 후)
+            from datetime import timedelta
+            care_send_at = None
+            if order_status in ("delivered", "배송완료", "DELIVERED"):
+                care_send_at = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+
+            # imweb_order_events 저장 (중복 시 업데이트)
+            event_data = {
+                "imweb_order_id": imweb_order_id,
+                "customer_id": customer_id,
+                "phone": phone,
+                "product_name": product_name,
+                "order_status": order_status,
+                "raw_payload": payload,
+                "care_send_at": care_send_at,
+            }
+            await client.post(
+                _supa_url("imweb_order_events"),
+                headers={**headers, "Prefer": "resolution=merge-duplicates,return=representation"},
+                json=event_data,
+            )
+            logger.info(
+                "imweb order: order_id=%s status=%s customer_id=%s care_at=%s",
+                imweb_order_id, order_status, customer_id, care_send_at,
+            )
+
+        except Exception as e:
+            logger.error("imweb order webhook 처리 오류: %s", e)
+            return JSONResponse({"status": "error", "reason": str(e)}, status_code=500)
+
+    return JSONResponse({
+        "status": "ok",
+        "order_id": imweb_order_id,
+        "order_status": order_status,
+        "customer_id": customer_id,
+    })
+
+
 @app.get("/health", summary="헬스체크")
 async def health() -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_KEY),
         "solapi_secret_set": bool(os.environ.get("SOLAPI_WEBHOOK_SECRET")),
+        "imweb_webhook_configured": bool(IMWEB_WEBHOOK_TOKEN),
     })
 
 

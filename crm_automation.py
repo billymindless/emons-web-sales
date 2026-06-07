@@ -715,3 +715,112 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                 st.warning(f"룰 목록 조회 실패: {e}")
         else:
             st.info("Supabase 연결이 필요합니다.")
+
+    # ── 아임웹 잠재고객 마케팅 발송 ───────────────────────────────────────
+    st.divider()
+    st.subheader("아임웹 잠재고객 마케팅 발송")
+    st.caption(
+        "아임웹 가입 후 구매 이력이 없는 고객(잠재고객)에게 친구톡 광고 메시지를 발송합니다.\n"
+        "⚠️ marketing_agreed=True(마케팅 수신 동의) 고객에게만 발송됩니다. 법적 의무 준수."
+    )
+
+    sc2 = _get_supabase()
+    if sc2:
+        with st.expander("잠재고객 필터 및 발송", expanded=False):
+            _col1, _col2 = st.columns(2)
+            with _col1:
+                _days_since_join = st.number_input(
+                    "가입 후 최소 경과일 (미구매 기간)",
+                    min_value=1, value=7, step=1,
+                    key="imweb_days_filter",
+                    help="가입 후 이 기간 이상 구매가 없는 고객만 조회",
+                )
+            with _col2:
+                _marketing_only = st.checkbox(
+                    "마케팅 동의 고객만 (권장)",
+                    value=True,
+                    key="imweb_marketing_filter",
+                )
+
+            if st.button("잠재고객 조회", key="imweb_prospect_search", use_container_width=True):
+                try:
+                    from datetime import timedelta as _td
+                    _cutoff = (datetime.now() - _td(days=int(_days_since_join))).isoformat()
+                    _q = (
+                        sc2.table("app_customers")
+                        .select("id,name,phone1,imweb_joined_at,marketing_agreed,kakao_friend_added")
+                        .eq("customer_type", "member_only")
+                        .lte("imweb_joined_at", _cutoff)
+                    )
+                    if _marketing_only:
+                        _q = _q.eq("marketing_agreed", True)
+                    _r = _q.limit(200).execute()
+                    _prospect_df = pd.DataFrame(_r.data or [])
+                    st.session_state["imweb_prospects"] = _prospect_df
+                except Exception as e:
+                    st.error(f"조회 실패: {e}")
+
+            _prospect_df = st.session_state.get("imweb_prospects", pd.DataFrame())
+            if not _prospect_df.empty:
+                st.success(f"조회된 잠재고객: **{len(_prospect_df)}명**")
+                st.dataframe(
+                    _prospect_df.rename(columns={
+                        "name": "이름", "phone1": "전화번호",
+                        "imweb_joined_at": "가입일", "marketing_agreed": "마케팅동의",
+                        "kakao_friend_added": "채널친구",
+                    }),
+                    use_container_width=True,
+                    height=200,
+                )
+
+                _msg_body = st.text_area(
+                    "발송 메시지 내용",
+                    placeholder=(
+                        "{이름}님, 이몬스입니다.\n"
+                        "가입 감사 이벤트로 특별 할인 혜택을 준비했습니다.\n"
+                        "(광고) 수신거부: 080-000-0000"
+                    ),
+                    height=130,
+                    key="imweb_bulk_msg",
+                    help="{이름} 으로 고객 이름 자동 삽입 가능. 광고성 메시지는 반드시 (광고) 표기 및 수신거부 번호 포함 필요",
+                )
+
+                _actor = (st.session_state.get("current_user") or {}).get("username", "system")
+                if st.button(
+                    f"친구톡 일괄 발송 ({len(_prospect_df)}명)",
+                    key="imweb_bulk_send",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    if not _msg_body.strip():
+                        st.error("메시지 내용을 입력하세요.")
+                    elif "(광고)" not in _msg_body:
+                        st.error("광고성 메시지에는 반드시 '(광고)' 표기가 있어야 합니다. (정보통신망법 준수)")
+                    else:
+                        _targets = [
+                            {
+                                "customer_id": int(row["id"]),
+                                "phone": str(row.get("phone1") or ""),
+                                "name": str(row.get("name") or "고객"),
+                            }
+                            for _, row in _prospect_df.iterrows()
+                            if row.get("phone1")
+                        ]
+                        with st.spinner(f"{len(_targets)}명에게 발송 중..."):
+                            try:
+                                from customer_channel import send_bulk_marketing
+                                _result = send_bulk_marketing(
+                                    targets=_targets,
+                                    message_body=_msg_body.strip(),
+                                    store_name=store_name or db_filename or "",
+                                    sent_by=_actor,
+                                )
+                                st.success(
+                                    f"발송 완료 — 성공: {_result['sent']}건 / "
+                                    f"실패: {_result['failed']}건 / 스킵: {_result['skipped']}건"
+                                )
+                                st.session_state.pop("imweb_prospects", None)
+                            except Exception as e:
+                                st.error(f"발송 오류: {e}")
+    else:
+        st.info("Supabase 연결 후 이용 가능합니다.")
