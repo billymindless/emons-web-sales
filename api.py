@@ -850,6 +850,7 @@ def _build_ct_response(
     cleaned_phone: str,
     params: dict | None = None,
     auth_token: str | None = None,
+    store_name: str = "",
 ) -> dict:
     """채널톡 Snippet JSON 응답 생성 (공식 v0 스펙).
     응답 최상위 키는 반드시 "snippet" 이어야 함.
@@ -866,6 +867,8 @@ def _build_ct_response(
         paid = int(order_info.get("paid_total") or 0)
         balance = total - paid
         items = [
+            {"key": "구매 매장", "value": store_name or "-"},
+            {"key": "담당자", "value": str(order_info.get("employee_names") or "-")},
             {"key": "최근 주문", "value": str(category)},
             {"key": "계약일", "value": str(order_info.get("order_date") or "-")},
             {"key": "배송일", "value": str(order_info.get("delivery_date") or "-")},
@@ -875,7 +878,11 @@ def _build_ct_response(
         ]
         layout.append(_ct_keyvalue("order-info", items))
     else:
-        layout.append(_ct_text("no-order", "최근 구매 내역 없음"))
+        items = [
+            {"key": "구매 매장", "value": store_name or "-"},
+            {"key": "구매 내역", "value": "없음"},
+        ]
+        layout.append(_ct_keyvalue("no-order", items))
 
     magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
     if auth_token:
@@ -910,11 +917,11 @@ async def _ct_get_or_create_customer(
     headers: dict,
     cleaned_phone: str,
     name_from_ct: str,
-) -> tuple[int | None, str, bool]:
+) -> tuple[int | None, str, str, bool]:
     """
     전화번호로 app_customers 조회 → 없으면 자동 가입.
     phone1/phone2 + 정규화/하이픈/공백 형식 모두 검색.
-    반환: (customer_id, name, is_new)
+    반환: (customer_id, name, store_name, is_new)
     """
     variants = _phone_variants(cleaned_phone)
     # Supabase or 필터: or=(phone1.eq.X,phone1.eq.Y,phone2.eq.X,phone2.eq.Y)
@@ -927,7 +934,7 @@ async def _ct_get_or_create_customer(
     resp = await client.get(
         _supa_url("app_customers"),
         headers=headers,
-        params={"or": or_filter, "select": "id,name,phone1,phone2", "limit": "1"},
+        params={"or": or_filter, "select": "id,name,phone1,phone2,store_name", "limit": "1"},
     )
     rows = resp.json() if resp.status_code == 200 else []
     logger.info(
@@ -935,7 +942,12 @@ async def _ct_get_or_create_customer(
         variants, resp.status_code, len(rows),
     )
     if rows:
-        return int(rows[0]["id"]), str(rows[0].get("name") or name_from_ct or ""), False
+        return (
+            int(rows[0]["id"]),
+            str(rows[0].get("name") or name_from_ct or ""),
+            str(rows[0].get("store_name") or ""),
+            False,
+        )
 
     # 2) 신규 자동 가입
     insert_data = {
@@ -952,9 +964,14 @@ async def _ct_get_or_create_customer(
     if resp2.status_code in (200, 201):
         created = resp2.json()
         if created:
-            return int(created[0]["id"]), str(created[0].get("name") or insert_data["name"]), True
+            return (
+                int(created[0]["id"]),
+                str(created[0].get("name") or insert_data["name"]),
+                str(created[0].get("store_name") or CHANNEL_TALK_DEFAULT_STORE),
+                True,
+            )
     logger.warning("channel-talk: 자동 가입 실패 %s %s", resp2.status_code, resp2.text[:200])
-    return None, name_from_ct or "채널톡고객", False
+    return None, name_from_ct or "채널톡고객", "", False
 
 
 async def _ct_fetch_latest_order_with_balance(
@@ -972,7 +989,7 @@ async def _ct_fetch_latest_order_with_balance(
         headers=headers,
         params={
             "customer_id": f"eq.{customer_id}",
-            "select": "id,category,total_amount,db_filename,order_date,delivery_date",
+            "select": "id,category,total_amount,db_filename,order_date,delivery_date,employee_names",
             "order": "created_at.desc",
             "limit": "1",
         },
@@ -1007,6 +1024,7 @@ async def _ct_fetch_latest_order_with_balance(
         "paid_total": paid_total,
         "order_date": (str(order.get("order_date") or "")[:10] or None),
         "delivery_date": (str(order.get("delivery_date") or "")[:10] or None),
+        "employee_names": (str(order.get("employee_names") or "") or None),
     }
 
 
@@ -1082,7 +1100,7 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
 
         auth_token: str | None = None
         async with httpx.AsyncClient(timeout=10.0) as client:
-            customer_id, customer_name, is_new = await _ct_get_or_create_customer(
+            customer_id, customer_name, customer_store, is_new = await _ct_get_or_create_customer(
                 client, headers, cleaned_phone, name_from_ct,
             )
 
@@ -1123,6 +1141,7 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             cleaned_phone=cleaned_phone,
             params=req_params,
             auth_token=auth_token,
+            store_name=customer_store,
         )
         logger.info(
             "channel-talk RESPONSE (ok): phone=%s, is_new=%s, response=%s",
