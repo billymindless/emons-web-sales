@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -56,6 +57,14 @@ app = FastAPI(
     title="이몬스 웹훅 API",
     description="Solapi 친구추가·메시지 수신, 기업은행 입금 SMS 처리",
     version="4.0.0",
+)
+
+# CORS — 채널톡 데스크 브라우저에서 직접 fetch 요청 허용
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 채널톡 도메인이 다양하므로 전체 허용
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 
