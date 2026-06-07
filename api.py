@@ -8,19 +8,22 @@
   POST /webhook/sms/deposit             — 기업은행 입금 SMS 수신
   POST /webhook/imweb/member            — 아임웹 신규 회원가입 이벤트 수신
   POST /webhook/imweb/order             — 아임웹 주문/배송 이벤트 수신
+  POST /channel-talk/custom-tab         — 채널톡 Custom Tab 고객 정보 조회
   GET  /health                          — 헬스체크
 
 실행:
   uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 
 환경변수:
-  SUPABASE_URL           Supabase 프로젝트 URL
-  SUPABASE_SERVICE_KEY   service_role key (전체 쓰기 권한)
-  SOLAPI_WEBHOOK_SECRET  Solapi 웹훅 Secret (X-Solapi-Secret 헤더 검증용)
-  SMS_WEBHOOK_TOKEN      SMS 포워딩 앱 인증 토큰
-  IMWEB_WEBHOOK_TOKEN    아임웹 웹훅 보안 토큰 (아임웹 관리자에서 설정한 값)
-  IMWEB_API_KEY          아임웹 REST API 키 (폴링 배치용)
-  IMWEB_API_SECRET       아임웹 REST API Secret (폴링 배치용)
+  SUPABASE_URL              Supabase 프로젝트 URL
+  SUPABASE_SERVICE_KEY      service_role key (전체 쓰기 권한)
+  SOLAPI_WEBHOOK_SECRET     Solapi 웹훅 Secret (X-Solapi-Secret 헤더 검증용)
+  SMS_WEBHOOK_TOKEN         SMS 포워딩 앱 인증 토큰
+  IMWEB_WEBHOOK_TOKEN       아임웹 웹훅 보안 토큰 (아임웹 관리자에서 설정한 값)
+  IMWEB_API_KEY             아임웹 REST API 키 (폴링 배치용)
+  IMWEB_API_SECRET          아임웹 REST API Secret (폴링 배치용)
+  MOMO_APP_URL              momo Streamlit 앱 도메인 (예: https://emons.streamlit.app)
+  CHANNEL_TALK_DEFAULT_STORE  채널톡 자동 가입 시 기본 store_name (기본값: '채널톡')
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 # ──────────────────────────────────────────────
 # 설정
@@ -45,6 +49,8 @@ logger = logging.getLogger(__name__)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 IMWEB_WEBHOOK_TOKEN = os.environ.get("IMWEB_WEBHOOK_TOKEN", "")
+MOMO_APP_URL = os.environ.get("MOMO_APP_URL", "https://emons.streamlit.app").rstrip("/")
+CHANNEL_TALK_DEFAULT_STORE = os.environ.get("CHANNEL_TALK_DEFAULT_STORE", "채널톡")
 
 app = FastAPI(
     title="이몬스 웹훅 API",
@@ -699,6 +705,256 @@ async def imweb_order_webhook(request: Request) -> JSONResponse:
     })
 
 
+# ──────────────────────────────────────────────
+# 채널톡 Custom Tab — Pydantic 모델
+# ──────────────────────────────────────────────
+
+class CTProfile(BaseModel):
+    """채널톡 페이로드의 context.profile 부분."""
+    name: str | None = None
+    mobileNumber: str | None = None
+
+
+class CTContext(BaseModel):
+    profile: CTProfile | None = None
+
+
+class ChannelTalkPayload(BaseModel):
+    """채널톡 Custom Tab webhook payload. 알 수 없는 필드는 무시."""
+    context: CTContext | None = None
+
+    class Config:
+        extra = "allow"
+
+
+# ──────────────────────────────────────────────
+# 채널톡 Custom Tab — 응답 빌더 헬퍼
+# ──────────────────────────────────────────────
+
+def _ct_text_block(text: str) -> dict:
+    return {"type": "text", "value": text}
+
+
+def _ct_button_block(label: str, url: str) -> dict:
+    return {
+        "type": "button",
+        "title": label,
+        "action": {"type": "openUrl", "attributes": {"url": url}},
+    }
+
+
+def _ct_error_response(message: str) -> dict:
+    """모든 에러 상황에서도 채널톡 UI가 깨지지 않도록 정상 JSON 반환."""
+    return {
+        "version": "v1",
+        "blocks": [_ct_text_block(message)],
+    }
+
+
+def _format_currency(value: int | float | None) -> str:
+    if value is None:
+        return "0원"
+    try:
+        return f"{int(value):,}원"
+    except Exception:
+        return "0원"
+
+
+def _build_ct_response(
+    customer_name: str,
+    is_new: bool,
+    order_info: dict | None,
+    cleaned_phone: str,
+) -> dict:
+    """채널톡 Custom Tab JSON 응답 생성."""
+    status_text = "신규 자동가입" if is_new else "기존 고객"
+    blocks: list[dict] = [
+        _ct_text_block(f"{customer_name}님 ({status_text})"),
+    ]
+
+    if order_info and order_info.get("total_amount") is not None:
+        category = order_info.get("category") or "상품"
+        total = int(order_info.get("total_amount") or 0)
+        paid = int(order_info.get("paid_total") or 0)
+        balance = total - paid
+        blocks.append(_ct_text_block(
+            f"최근 주문: {category}\n"
+            f"결제금액: {_format_currency(total)}\n"
+            f"입금완료: {_format_currency(paid)}\n"
+            f"잔금: {_format_currency(balance)}"
+        ))
+    else:
+        blocks.append(_ct_text_block("최근 구매 내역 없음"))
+
+    magic_url = (
+        f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
+    )
+    blocks.append(_ct_button_block("[momo] 매출/견적 등록하기", magic_url))
+
+    return {"version": "v1", "blocks": blocks}
+
+
+# ──────────────────────────────────────────────
+# 채널톡 — Supabase 조회/삽입 (내부 함수)
+# ──────────────────────────────────────────────
+
+async def _ct_get_or_create_customer(
+    client: httpx.AsyncClient,
+    headers: dict,
+    cleaned_phone: str,
+    name_from_ct: str,
+) -> tuple[int | None, str, bool]:
+    """
+    전화번호로 app_customers 조회 → 없으면 자동 가입.
+    반환: (customer_id, name, is_new)
+    """
+    # 1) 기존 고객 조회
+    resp = await client.get(
+        _supa_url("app_customers"),
+        headers=headers,
+        params={"phone1": f"eq.{cleaned_phone}", "select": "id,name", "limit": "1"},
+    )
+    rows = resp.json() if resp.status_code == 200 else []
+    if rows:
+        return int(rows[0]["id"]), str(rows[0].get("name") or name_from_ct or ""), False
+
+    # 2) 신규 자동 가입
+    insert_data = {
+        "store_name": CHANNEL_TALK_DEFAULT_STORE,
+        "name": name_from_ct or "채널톡고객",
+        "phone1": cleaned_phone,
+        "source": "채널톡_자동가입",
+    }
+    resp2 = await client.post(
+        _supa_url("app_customers"),
+        headers={**headers, "Prefer": "return=representation"},
+        json=insert_data,
+    )
+    if resp2.status_code in (200, 201):
+        created = resp2.json()
+        if created:
+            return int(created[0]["id"]), str(created[0].get("name") or insert_data["name"]), True
+    logger.warning("channel-talk: 자동 가입 실패 %s %s", resp2.status_code, resp2.text[:200])
+    return None, name_from_ct or "채널톡고객", False
+
+
+async def _ct_fetch_latest_order_with_balance(
+    client: httpx.AsyncClient,
+    headers: dict,
+    customer_id: int,
+) -> dict | None:
+    """
+    customer_id의 최근 1건 주문 + 결제 합계 조회.
+    반환: {category, total_amount, paid_total} 또는 None.
+    """
+    # 최근 주문 1건
+    resp = await client.get(
+        _supa_url("app_orders"),
+        headers=headers,
+        params={
+            "customer_id": f"eq.{customer_id}",
+            "select": "id,category,total_amount,db_filename",
+            "order": "created_at.desc",
+            "limit": "1",
+        },
+    )
+    orders = resp.json() if resp.status_code == 200 else []
+    if not orders:
+        return None
+
+    order = orders[0]
+    order_id = int(order["id"])
+    db_filename = order.get("db_filename") or ""
+
+    # 결제 합계 조회 (해당 order_id + db_filename)
+    pay_params: dict = {
+        "order_id": f"eq.{order_id}",
+        "select": "amount",
+    }
+    if db_filename:
+        pay_params["db_filename"] = f"eq.{db_filename}"
+    resp2 = await client.get(
+        _supa_url("app_payments"),
+        headers=headers,
+        params=pay_params,
+    )
+    payments = resp2.json() if resp2.status_code == 200 else []
+    paid_total = sum(int(p.get("amount") or 0) for p in payments)
+
+    return {
+        "order_id": order_id,
+        "category": order.get("category"),
+        "total_amount": order.get("total_amount"),
+        "paid_total": paid_total,
+    }
+
+
+# ──────────────────────────────────────────────
+# 채널톡 Custom Tab 엔드포인트
+# ──────────────────────────────────────────────
+
+@app.post("/channel-talk/custom-tab", summary="채널톡 Custom Tab 고객 정보 조회")
+async def channel_talk_custom_tab(payload: ChannelTalkPayload) -> JSONResponse:
+    """
+    채널톡 상담원이 채팅을 열 때 호출되는 Custom Tab webhook.
+    1) 전화번호 추출 → 정규화
+    2) Supabase app_customers 조회 (없으면 자동 가입)
+    3) 최근 주문 + 결제 합계 조회 → 잔금 계산
+    4) 채널톡 JSON 블록 응답 (고객 정보 + 매직링크 버튼)
+
+    실패 시에도 200 OK + 에러 메시지 블록 반환 (UI 깨짐 방지).
+    """
+    try:
+        # 전화번호 추출 (deeply nested)
+        raw_phone = ""
+        name_from_ct = "채널톡고객"
+        if payload.context and payload.context.profile:
+            raw_phone = payload.context.profile.mobileNumber or ""
+            name_from_ct = payload.context.profile.name or "채널톡고객"
+
+        cleaned_phone = _normalize_phone(raw_phone)
+
+        if not cleaned_phone:
+            return JSONResponse(_ct_error_response(
+                "전화번호 정보가 없습니다.\n채팅창에 전화번호를 입력해 주세요."
+            ))
+
+        headers = _supa_headers()
+        if not headers:
+            logger.error("channel-talk: Supabase 환경변수 미설정")
+            return JSONResponse(_ct_error_response(
+                "서버 에러: 데이터베이스 연결이 설정되지 않았습니다."
+            ))
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            customer_id, customer_name, is_new = await _ct_get_or_create_customer(
+                client, headers, cleaned_phone, name_from_ct,
+            )
+
+            order_info: dict | None = None
+            if customer_id is not None:
+                try:
+                    order_info = await _ct_fetch_latest_order_with_balance(
+                        client, headers, customer_id,
+                    )
+                except Exception as e:
+                    logger.warning("channel-talk: 주문 조회 실패 (계속 진행): %s", e)
+
+        return JSONResponse(_build_ct_response(
+            customer_name=customer_name,
+            is_new=is_new,
+            order_info=order_info,
+            cleaned_phone=cleaned_phone,
+        ))
+
+    except Exception as e:
+        logger.error("channel-talk webhook error: %s", e)
+        # 채널톡 UI가 깨지지 않도록 200 OK + 에러 메시지 반환
+        return JSONResponse(_ct_error_response(
+            f"서버 에러: 데이터를 불러오지 못했습니다. ({type(e).__name__})"
+        ))
+
+
 @app.get("/health", summary="헬스체크")
 async def health() -> JSONResponse:
     return JSONResponse({
@@ -706,6 +962,7 @@ async def health() -> JSONResponse:
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_KEY),
         "solapi_secret_set": bool(os.environ.get("SOLAPI_WEBHOOK_SECRET")),
         "imweb_webhook_configured": bool(IMWEB_WEBHOOK_TOKEN),
+        "momo_app_url_set": bool(MOMO_APP_URL and MOMO_APP_URL != "https://emons.streamlit.app"),
     })
 
 

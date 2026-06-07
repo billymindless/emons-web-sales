@@ -5237,6 +5237,54 @@ def _try_restore_from_query_params():
     return True
 
 
+def _handle_channel_talk_magic_link():
+    """채널톡 매직링크(?menu=new_sales&phone=01012345678) 진입 시 처리.
+    - 매출등록 메뉴 인덱스(2)로 자동 이동
+    - 검색창에 전화번호 자동 입력 및 검색 결과 prefill
+    - 1회만 처리 (session_state 플래그로 중복 처리 방지)
+    """
+    if st.session_state.get("_ct_magic_link_handled"):
+        return
+    try:
+        q = st.query_params
+    except Exception:
+        return
+    menu = (q.get("menu") or "").strip()
+    phone = (q.get("phone") or "").strip()
+    if menu != "new_sales" or not phone:
+        return
+
+    st.session_state["_ct_magic_link_handled"] = True
+    st.session_state["main_tab_idx"] = 2
+    st.session_state["new_sales_cust_search"] = phone
+
+    try:
+        sc, _err = get_supabase_client()
+        db_filename = st.session_state.get("current_db") or (
+            (st.session_state.get("current_user") or {}).get("db_filename")
+        )
+        store_name = _get_current_store_name_for_customers(db_filename) if db_filename else None
+        if sc and store_name:
+            r = (
+                sc.table("app_customers")
+                .select("id, name, phone1, phone2, address")
+                .eq("store_name", store_name)
+                .order("id", desc=True)
+                .limit(200)
+                .execute()
+            )
+            rows = r.data or []
+            q_lower = phone.lower()
+            results = [
+                row for row in rows
+                if q_lower in (str(row.get("phone1") or "").lower())
+                or q_lower in (str(row.get("phone2") or "").lower())
+            ]
+            st.session_state["_cust_search_results"] = results
+    except Exception:
+        st.session_state["_cust_search_results"] = []
+
+
 def _inject_js_url_auth_save_and_replace_state():
     """[비활성] components.html iframe sandbox 제약으로 부모 navigation/URL 변경이 차단되므로,
     URL에서 ?auth= 를 제거하지 않고 그대로 유지한다. F5 시 URL의 ?auth= 로 자동 복구."""
@@ -23893,6 +23941,8 @@ def main():
         st.session_state["main_tab_idx"] = 0
     if st.session_state["main_tab_idx"] >= len(tab_labels):
         st.session_state["main_tab_idx"] = 0
+    # 채널톡 매직링크(?menu=new_sales&phone=...)로 진입 시 1회 자동 처리
+    _handle_channel_talk_magic_link()
     # Supabase 오류 시 안내 (테이블 없음 / RLS / 연결 실패 구분)
     if st.session_state.get("supabase_error"):
         err_text = str(st.session_state["supabase_error"] or "")

@@ -33,3 +33,7 @@ services:
         sync: false   # 아임웹 관리자 > 개발자 설정 > API Secret
       - key: KAKAO_CHANNEL_URL
         sync: false   # 카카오채널 URL (예: https://pf.kakao.com/_xxxxx)
+      - key: MOMO_APP_URL
+        sync: false   # momo Streamlit 앱 도메인 (예: https://emons.streamlit.app)
+      - key: CHANNEL_TALK_DEFAULT_STORE
+        sync: false   # 채널톡 자동 가입 시 기본 store_name (예: '채널톡')
