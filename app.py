@@ -6716,11 +6716,22 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             _cm_grp = _sdf[_sdf["_ym"] == cm].groupby("_day")["amount"].sum()
             _cm_values = [float(_cm_grp.get(d, 0)) for d in _cm_days]
             _cm_color = _PALETTE[i % len(_PALETTE)]
+            # 비교 월도 토요일(파란색)·일요일/공휴일(빨간색) 마커 적용
+            def _cm_marker(d, _yr=_cm_dt.year, _mo=_cm_dt.month, _base=_cm_color):
+                try:
+                    _d = date(_yr, _mo, d); _dw = _d.weekday()
+                    if _d in _KR_HOLIDAYS or _dw == 6: return ("#E53935", 8)
+                    if _dw == 5: return ("#1565C0", 8)
+                    return (_base, 5)
+                except Exception:
+                    return (_base, 5)
+            _cm_mc = [_cm_marker(d)[0] for d in _cm_days]
+            _cm_ms = [_cm_marker(d)[1] for d in _cm_days]
             fig.add_trace(go.Scatter(
                 x=_cm_days, y=_cm_values, mode="lines+markers",
                 name=cm,
                 line=dict(color=_cm_color, width=2, dash="dot"),
-                marker=dict(size=5, color=_cm_color),
+                marker=dict(size=_cm_ms, color=_cm_mc),
                 hovertemplate="%{x}일<br>%{y:,.0f}원<extra>" + cm + "</extra>",
             ))
             _comp_rows.append({
