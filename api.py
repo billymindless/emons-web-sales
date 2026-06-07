@@ -802,12 +802,15 @@ def _build_ct_response(
         total = int(order_info.get("total_amount") or 0)
         paid = int(order_info.get("paid_total") or 0)
         balance = total - paid
-        layout.append(_ct_keyvalue("order-info", [
+        items = [
             {"key": "최근 주문", "value": str(category)},
+            {"key": "계약일", "value": str(order_info.get("order_date") or "-")},
+            {"key": "배송일", "value": str(order_info.get("delivery_date") or "-")},
             {"key": "결제금액", "value": _format_currency(total)},
             {"key": "입금완료", "value": _format_currency(paid)},
             {"key": "잔금", "value": _format_currency(balance)},
-        ]))
+        ]
+        layout.append(_ct_keyvalue("order-info", items))
     else:
         layout.append(_ct_text("no-order", "최근 구매 내역 없음"))
 
@@ -904,7 +907,7 @@ async def _ct_fetch_latest_order_with_balance(
         headers=headers,
         params={
             "customer_id": f"eq.{customer_id}",
-            "select": "id,category,total_amount,db_filename",
+            "select": "id,category,total_amount,db_filename,order_date,delivery_date",
             "order": "created_at.desc",
             "limit": "1",
         },
@@ -937,6 +940,8 @@ async def _ct_fetch_latest_order_with_balance(
         "category": order.get("category"),
         "total_amount": order.get("total_amount"),
         "paid_total": paid_total,
+        "order_date": (str(order.get("order_date") or "")[:10] or None),
+        "delivery_date": (str(order.get("delivery_date") or "")[:10] or None),
     }
 
 
