@@ -37,3 +37,5 @@ services:
         sync: false   # momo Streamlit 앱 도메인 (예: https://emons.streamlit.app)
       - key: CHANNEL_TALK_DEFAULT_STORE
         sync: false   # 채널톡 자동 가입 시 기본 store_name (예: '채널톡')
+      - key: EMONS_AUTH_SECRET
+        sync: false   # momo Streamlit과 동일한 HMAC 서명 키 (매직링크 자동 로그인용)

@@ -28,11 +28,14 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -111,6 +114,64 @@ def _verify_solapi_secret(request: Request) -> bool:
 
 def _digits_only(phone: str) -> str:
     return re.sub(r"\D", "", phone or "")
+
+
+# ──────────────────────────────────────────────
+# 인증 토큰 생성 (app.py의 _create_auth_token과 동일 알고리즘)
+# 환경변수 EMONS_AUTH_SECRET 이 app.py와 동일해야 자동 로그인 작동
+# ──────────────────────────────────────────────
+
+_AUTH_SECRET_FALLBACK = "emons-default-secret-change-in-production"
+AUTH_EXPIRY_DAYS = 30
+
+
+def _get_auth_secret() -> str:
+    return os.environ.get("EMONS_AUTH_SECRET", _AUTH_SECRET_FALLBACK)
+
+
+def _create_auth_token(user_id: int, username: str, role: str,
+                       store_id: int | None, db_filename: str | None) -> str:
+    now = time.time()
+    payload = {
+        "user_id": user_id,
+        "username": username,
+        "role": role,
+        "store_id": store_id,
+        "db_filename": db_filename,
+        "logged_at": now,
+        "exp": now + AUTH_EXPIRY_DAYS * 24 * 3600,
+    }
+    payload_b64 = base64.urlsafe_b64encode(
+        json.dumps(payload, sort_keys=True).encode()
+    ).decode()
+    sig = hmac.new(
+        _get_auth_secret().encode(), payload_b64.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{payload_b64}.{sig}"
+
+
+async def _fetch_app_user_by_email(
+    client: httpx.AsyncClient, headers: dict, email: str,
+) -> dict | None:
+    """이메일로 app_users 조회. 반환: {id, username, role, store_id, db_filename} 또는 None."""
+    if not email:
+        return None
+    try:
+        resp = await client.get(
+            _supa_url("app_users"),
+            headers=headers,
+            params={
+                "email": f"eq.{email}",
+                "select": "id,username,role,store_id,db_filename",
+                "limit": "1",
+            },
+        )
+        rows = resp.json() if resp.status_code == 200 else []
+        if rows:
+            return rows[0]
+    except Exception as e:
+        logger.warning("fetch_app_user_by_email failed: %s", e)
+    return None
 
 
 def _normalize_phone(phone: str) -> str:
@@ -788,9 +849,11 @@ def _build_ct_response(
     order_info: dict | None,
     cleaned_phone: str,
     params: dict | None = None,
+    auth_token: str | None = None,
 ) -> dict:
     """채널톡 Snippet JSON 응답 생성 (공식 v0 스펙).
     응답 최상위 키는 반드시 "snippet" 이어야 함.
+    auth_token이 있으면 매직링크에 ?auth=토큰 포함 → 자동 로그인.
     """
     status_text = "신규 자동가입" if is_new else "기존 고객"
     layout: list[dict] = [
@@ -815,6 +878,8 @@ def _build_ct_response(
         layout.append(_ct_text("no-order", "최근 구매 내역 없음"))
 
     magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
+    if auth_token:
+        magic_url += f"&auth={auth_token}"
     layout.append(_ct_button("magic-link-btn", "momo 시스템에서 열기", magic_url))
 
     return {
@@ -993,6 +1058,10 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             )
             name_from_ct = user_obj.get("name") or "채널톡고객"
 
+        # 매니저(상담원) 이메일 추출 — 매직링크 자동 로그인 토큰 생성에 사용
+        manager_obj = payload_dict.get("manager") or {}
+        manager_email = (manager_obj.get("email") or "").strip().lower() if isinstance(manager_obj, dict) else ""
+
         cleaned_phone = _normalize_phone(raw_phone)
 
         if not cleaned_phone:
@@ -1011,6 +1080,7 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                 params=req_params,
             ))
 
+        auth_token: str | None = None
         async with httpx.AsyncClient(timeout=10.0) as client:
             customer_id, customer_name, is_new = await _ct_get_or_create_customer(
                 client, headers, cleaned_phone, name_from_ct,
@@ -1025,12 +1095,34 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                 except Exception as e:
                     logger.warning("channel-talk: 주문 조회 실패 (계속 진행): %s", e)
 
+            # 매니저 이메일로 app_users 조회 → 자동 로그인 토큰 생성
+            if manager_email:
+                app_user = await _fetch_app_user_by_email(client, headers, manager_email)
+                if app_user:
+                    auth_token = _create_auth_token(
+                        user_id=int(app_user["id"]),
+                        username=str(app_user.get("username") or ""),
+                        role=str(app_user.get("role") or "user"),
+                        store_id=app_user.get("store_id"),
+                        db_filename=app_user.get("db_filename"),
+                    )
+                    logger.info(
+                        "channel-talk auth: manager_email=%s → user_id=%s, token issued",
+                        manager_email, app_user["id"],
+                    )
+                else:
+                    logger.warning(
+                        "channel-talk auth: manager_email=%s not found in app_users",
+                        manager_email,
+                    )
+
         response_body = _build_ct_response(
             customer_name=customer_name,
             is_new=is_new,
             order_info=order_info,
             cleaned_phone=cleaned_phone,
             params=req_params,
+            auth_token=auth_token,
         )
         logger.info(
             "channel-talk RESPONSE (ok): phone=%s, is_new=%s, response=%s",
