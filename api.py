@@ -737,34 +737,16 @@ class ChannelTalkPayload(BaseModel):
 
 
 # ──────────────────────────────────────────────
-# 채널톡 Snippet — 응답 빌더 헬퍼 (v0 스펙)
-# 공식 스펙: version="v0", layout=[{id, type, ...}]
-# 컴포넌트: text(text), key-value(items), button(title+action)
+# 채널톡 Custom Tab — 응답 빌더 헬퍼
+# 스키마: {"blocks": [{"type": ..., "value": ...}, ...]}
 # ──────────────────────────────────────────────
-
-def _ct_text_component(component_id: str, text: str, style: str = "paragraph") -> dict:
-    return {"id": component_id, "type": "text", "text": text, "style": style}
-
-
-def _ct_keyvalue_component(component_id: str, items: list[dict]) -> dict:
-    return {"id": component_id, "type": "key-value", "items": items}
-
-
-def _ct_button_component(component_id: str, label: str, url: str) -> dict:
-    return {
-        "id": component_id,
-        "type": "button",
-        "title": label,
-        "action": {"type": "url", "url": url},
-    }
-
 
 def _ct_error_response(message: str) -> dict:
     """모든 에러 상황에서도 채널톡 UI가 깨지지 않도록 정상 JSON 반환."""
     return {
-        "version": "v0",
-        "layout": [_ct_text_component("error-msg", message)],
-        "params": {},
+        "blocks": [
+            {"type": "text", "value": message},
+        ]
     }
 
 
@@ -783,10 +765,10 @@ def _build_ct_response(
     order_info: dict | None,
     cleaned_phone: str,
 ) -> dict:
-    """채널톡 Snippet JSON 응답 생성 (v0 스펙)."""
+    """채널톡 Custom Tab JSON 응답 생성."""
     status_text = "신규 자동가입" if is_new else "기존 고객"
-    layout: list[dict] = [
-        _ct_text_component("customer-title", f"👤 {customer_name} ({status_text})", style="h1"),
+    blocks: list[dict] = [
+        {"type": "text", "value": f"👤 고객명: {customer_name} ({status_text})"},
     ]
 
     if order_info and order_info.get("total_amount") is not None:
@@ -794,19 +776,24 @@ def _build_ct_response(
         total = int(order_info.get("total_amount") or 0)
         paid = int(order_info.get("paid_total") or 0)
         balance = total - paid
-        layout.append(_ct_keyvalue_component("order-info", [
-            {"key": "최근 주문", "value": category},
-            {"key": "결제금액", "value": _format_currency(total)},
-            {"key": "입금완료", "value": _format_currency(paid)},
-            {"key": "잔금", "value": _format_currency(balance)},
-        ]))
+        blocks.append({"type": "text", "value": f"📦 최근 주문: {category}"})
+        blocks.append({"type": "text", "value": f"💳 결제금액: {_format_currency(total)}"})
+        blocks.append({"type": "text", "value": f"✅ 입금완료: {_format_currency(paid)}"})
+        blocks.append({"type": "text", "value": f"💰 남은 잔금: {_format_currency(balance)}"})
     else:
-        layout.append(_ct_text_component("no-order", "최근 구매 내역 없음"))
+        blocks.append({"type": "text", "value": "📭 최근 구매 내역 없음"})
 
     magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
-    layout.append(_ct_button_component("magic-link-btn", "[momo] 매출/견적 등록하기", magic_url))
+    blocks.append({
+        "type": "button",
+        "value": "momo 시스템에서 열기",
+        "action": {
+            "type": "link",
+            "url": magic_url,
+        },
+    })
 
-    return {"version": "v0", "layout": layout, "params": {}}
+    return {"blocks": blocks}
 
 
 # ──────────────────────────────────────────────
