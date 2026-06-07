@@ -1,5 +1,5 @@
 """
-Solapi 카카오 친구톡 실시간 발송 모듈 (사내 업무 알림용).
+Solapi 카카오 친구톡/알림톡/SMS/MMS 발송 모듈 (사내 업무 알림용).
 
 `crm_automation.py`의 ATA(알림톡) payload 빌더와 분리되어 있고,
 이쪽은 사내 업무판에서 직원에게 즉시 친구톡을 발송하기 위해 사용한다.
@@ -258,6 +258,167 @@ def send_alimtalk(
             json=payload,
             headers=headers,
             timeout=timeout,
+        )
+    except requests.RequestException as e:
+        return {"status": "failed", "msg_id": None, "error": f"network: {e}", "raw": None}
+
+    raw: dict[str, Any]
+    try:
+        raw = resp.json()
+    except Exception:
+        raw = {"text": resp.text[:500]}
+
+    if resp.status_code >= 400:
+        return {"status": "failed", "msg_id": None, "error": str(raw)[:500], "raw": raw}
+
+    msg_id = None
+    try:
+        if isinstance(raw, dict):
+            if "messageList" in raw and isinstance(raw["messageList"], list) and raw["messageList"]:
+                msg_id = raw["messageList"][0].get("messageId")
+            elif "groupInfo" in raw and isinstance(raw["groupInfo"], dict):
+                msg_id = raw["groupInfo"].get("groupId")
+    except Exception:
+        pass
+
+    return {"status": "sent", "msg_id": msg_id, "error": None, "raw": raw}
+
+
+def send_sms(
+    to_phone: str,
+    text: str,
+    *,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """
+    일반 SMS/LMS 단문 발송.
+
+    카카오 채널 미친구 고객용 폴백. 90자 초과 시 LMS로 자동 전환.
+
+    반환 형식:
+        {
+            "status": "sent" | "failed" | "skipped",
+            "msg_id": str | None,
+            "error": str | None,
+            "raw": dict | None,
+        }
+    """
+    phone = _normalize_phone(to_phone)
+    if not phone:
+        return {"status": "skipped", "msg_id": None, "error": "phone_empty", "raw": None}
+
+    sec = _get_secrets()
+    api_key = sec.get("api_key", "")
+    api_secret = sec.get("api_secret", "")
+    sender = sec.get("sender", "")
+
+    if not api_key or not api_secret or not sender:
+        return {"status": "skipped", "msg_id": None, "error": "solapi_secrets_missing", "raw": None}
+
+    msg_type = "LMS" if len(text) > 90 else "SMS"
+    payload = {
+        "messages": [{"to": phone, "from": sender, "text": text, "type": msg_type}]
+    }
+    headers = {
+        "Authorization": _build_auth_header(api_key, api_secret),
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(
+            SOLAPI_BASE_URL + SOLAPI_SEND_PATH, json=payload, headers=headers, timeout=timeout
+        )
+    except requests.RequestException as e:
+        return {"status": "failed", "msg_id": None, "error": f"network: {e}", "raw": None}
+
+    raw: dict[str, Any]
+    try:
+        raw = resp.json()
+    except Exception:
+        raw = {"text": resp.text[:500]}
+
+    if resp.status_code >= 400:
+        return {"status": "failed", "msg_id": None, "error": str(raw)[:500], "raw": raw}
+
+    msg_id = None
+    try:
+        if isinstance(raw, dict):
+            if "messageList" in raw and isinstance(raw["messageList"], list) and raw["messageList"]:
+                msg_id = raw["messageList"][0].get("messageId")
+            elif "groupInfo" in raw and isinstance(raw["groupInfo"], dict):
+                msg_id = raw["groupInfo"].get("groupId")
+    except Exception:
+        pass
+
+    return {"status": "sent", "msg_id": msg_id, "error": None, "raw": raw}
+
+
+def send_mms(
+    to_phone: str,
+    text: str,
+    image_url: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """
+    MMS 이미지 첨부 발송 (오프라인 방문 명함+사진용).
+
+    image_url을 Solapi 파일 업로드 API에 먼저 전송 후 imageId를 MMS에 첨부.
+    업로드 실패 시 LMS(텍스트)로 폴백 발송하고 status="lms_fallback" 반환.
+
+    반환 형식:
+        {
+            "status": "sent" | "failed" | "skipped" | "lms_fallback",
+            "msg_id": str | None,
+            "error": str | None,
+            "raw": dict | None,
+        }
+    """
+    phone = _normalize_phone(to_phone)
+    if not phone:
+        return {"status": "skipped", "msg_id": None, "error": "phone_empty", "raw": None}
+
+    sec = _get_secrets()
+    api_key = sec.get("api_key", "")
+    api_secret = sec.get("api_secret", "")
+    sender = sec.get("sender", "")
+
+    if not api_key or not api_secret or not sender:
+        return {"status": "skipped", "msg_id": None, "error": "solapi_secrets_missing", "raw": None}
+
+    headers_auth = {
+        "Authorization": _build_auth_header(api_key, api_secret),
+        "Content-Type": "application/json",
+    }
+
+    image_id: str | None = None
+    if image_url and image_url.startswith("http"):
+        try:
+            up_resp = requests.post(
+                SOLAPI_BASE_URL + "/storage/v1/files",
+                json={"url": image_url, "type": "MMS"},
+                headers=headers_auth,
+                timeout=10.0,
+            )
+            if up_resp.status_code < 400:
+                image_id = up_resp.json().get("fileId")
+        except Exception:
+            pass
+
+    if not image_id:
+        result = send_sms(to_phone, text, timeout=timeout)
+        result["status"] = "lms_fallback"
+        return result
+
+    payload = {
+        "messages": [
+            {"to": phone, "from": sender, "text": text, "type": "MMS", "imageId": image_id}
+        ]
+    }
+
+    try:
+        resp = requests.post(
+            SOLAPI_BASE_URL + SOLAPI_SEND_PATH, json=payload, headers=headers_auth, timeout=timeout
         )
     except requests.RequestException as e:
         return {"status": "failed", "msg_id": None, "error": f"network: {e}", "raw": None}

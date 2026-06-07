@@ -443,11 +443,13 @@ def render_crm_menu() -> None:
     st.title("7. 고객 CRM 자동화")
     st.caption("타겟 고객을 필터링하고 카카오 친구톡(광고) 또는 SMS로 CRM 메시지를 발송·예약합니다.")
 
-    _crm_tab1, _crm_tab2 = st.tabs(["CRM 캠페인", "카카오 채널 현황"])
+    _crm_tab1, _crm_tab2, _crm_tab3 = st.tabs(["CRM 캠페인", "카카오 채널 현황", "가망고객 등록"])
     with _crm_tab2:
         _render_kakao_channel_tab(db_filename, store_name)
     with _crm_tab1:
         _render_crm_campaign_tab(db_filename, store_name)
+    with _crm_tab3:
+        _render_lead_registration_tab(db_filename, store_name)
 
 
 def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) -> None:
@@ -824,3 +826,183 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                                 st.error(f"발송 오류: {e}")
     else:
         st.info("Supabase 연결 후 이용 가능합니다.")
+
+
+# ──────────────────────────────────────────────
+# 가망고객 등록 탭 (옴니채널 리드)
+# ──────────────────────────────────────────────
+
+def _render_lead_registration_tab(db_filename: str | None, store_name: str | None) -> None:
+    """가망고객(리드) 등록 및 목록 조회 탭."""
+    st.subheader("가망고객 등록")
+    st.caption("전화 문의 또는 오프라인 방문 고객 정보를 등록하면 즉시 메시지가 발송되고, T+N일 후 넛징이 자동 예약됩니다.")
+
+    user = st.session_state.get("current_user") or {}
+    employee_id = user.get("id")
+    auto_store = store_name or user.get("store_name") or ""
+
+    with st.form("lead_register_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            lead_source = st.radio(
+                "유입 경로",
+                ["전화_문의", "오프라인_방문"],
+                horizontal=True,
+            )
+        with col2:
+            send_now = st.toggle("즉시 메시지 발송", value=True)
+
+        phone_input = st.text_input("전화번호 (필수)", placeholder="010-0000-0000")
+        name_input = st.text_input("고객 성함 (선택)")
+        memo_input = st.text_area("상담 메모", placeholder="예: 토레도 소파 4인용 가격 문의", height=80)
+
+        col3, col4 = st.columns(2)
+        with col3:
+            next_contact = st.date_input(
+                "다음 연락 예정일",
+                value=date.today() + timedelta(days=3),
+            )
+        with col4:
+            image_url_input = ""
+            if lead_source == "오프라인_방문":
+                image_url_input = st.text_input(
+                    "MMS 첨부 사진 URL (선택)",
+                    placeholder="https://... (제품/매장 사진)",
+                )
+
+        submitted = st.form_submit_button("가망고객 등록", type="primary", use_container_width=True)
+
+    if submitted:
+        phone_clean = re.sub(r"\D", "", phone_input or "")
+        if not phone_clean or len(phone_clean) < 10:
+            st.error("전화번호를 올바르게 입력해 주세요.")
+        else:
+            try:
+                from lead_manager import register_lead
+                result = register_lead(
+                    phone=phone_clean,
+                    name=name_input or "",
+                    memo=memo_input or "",
+                    lead_source=lead_source,
+                    store_name=auto_store,
+                    employee_id=employee_id,
+                    next_contact_date=str(next_contact),
+                    send_now=send_now,
+                    image_url=image_url_input or "",
+                )
+                if result.get("ok"):
+                    send_status = result.get("send_result", {}) or {}
+                    send_label = {
+                        "sent": "발송 완료",
+                        "lms_fallback": "LMS 발송 완료 (이미지 업로드 실패)",
+                        "skipped": "발송 보류 (키 미설정)",
+                        "failed": "발송 실패",
+                    }.get(send_status.get("status", ""), "미발송")
+                    st.success(f"등록 완료 — lead_id: {result['lead_id']} | 메시지: {send_label}")
+
+                    # app_chat_history에도 상담 메모 저장
+                    if memo_input:
+                        try:
+                            from lead_manager import save_chat_history
+                            save_chat_history(
+                                phone=phone_clean,
+                                channel="전화_통화" if lead_source == "전화_문의" else "오프라인_메모",
+                                summary=memo_input,
+                                handled_by=str(user.get("username") or ""),
+                            )
+                        except Exception:
+                            pass
+                else:
+                    st.error(f"등록 실패: {result.get('error')}")
+            except ImportError:
+                st.error("lead_manager 모듈을 불러오지 못했습니다.")
+            except Exception as e:
+                st.error(f"오류: {e}")
+
+    # ── 리드 목록 ─────────────────────────────
+    st.divider()
+    st.subheader("리드 목록")
+
+    supa = _get_supabase()
+    if not supa:
+        st.info("Supabase 연결 후 이용 가능합니다.")
+        return
+
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        filter_source = st.selectbox(
+            "유입 경로", ["전체", "전화_문의", "오프라인_방문", "온라인_채널톡"]
+        )
+    with col_f2:
+        filter_stage = st.selectbox(
+            "단계", ["전체", "1_신규유입", "2_자료발송", "3_매장방문", "4_계약완료", "5_계약실패"]
+        )
+    with col_f3:
+        filter_store = st.selectbox(
+            "매장", ["전체", auto_store] if auto_store else ["전체"]
+        )
+
+    try:
+        query = supa.table("app_leads").select(
+            "id,phone,name,lead_source,lead_stage,memo,next_contact_date,assigned_store,created_at,revenue_amount"
+        ).order("created_at", desc=True).limit(200)
+
+        if filter_source != "전체":
+            query = query.eq("lead_source", filter_source)
+        if filter_stage != "전체":
+            query = query.eq("lead_stage", filter_stage)
+        if filter_store != "전체" and auto_store:
+            query = query.eq("assigned_store", auto_store)
+
+        resp = query.execute()
+        leads = resp.data or []
+    except Exception as e:
+        st.error(f"리드 목록 조회 실패: {e}")
+        return
+
+    if not leads:
+        st.info("등록된 리드가 없습니다.")
+        return
+
+    df = pd.DataFrame(leads)
+    rename_map = {
+        "id": "ID", "phone": "전화번호", "name": "성함",
+        "lead_source": "유입 경로", "lead_stage": "단계",
+        "memo": "상담 메모", "next_contact_date": "다음 연락",
+        "assigned_store": "매장", "created_at": "등록일",
+        "revenue_amount": "계약금액",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    if "등록일" in df.columns:
+        df["등록일"] = df["등록일"].str[:10]
+
+    # 단계별 색상 강조
+    stage_colors = {
+        "4_계약완료": "background-color: #d4edda",
+        "5_계약실패": "background-color: #f8d7da",
+        "1_신규유입": "",
+    }
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.caption(f"총 {len(df)}건")
+
+    # 단계 업데이트
+    with st.expander("리드 단계 업데이트"):
+        lead_ids = [str(l["id"]) for l in leads]
+        selected_id = st.selectbox("리드 ID 선택", lead_ids)
+        new_stage = st.selectbox(
+            "새 단계",
+            ["1_신규유입", "2_자료발송", "3_매장방문", "4_계약완료", "5_계약실패"],
+        )
+        contact_memo_input = st.text_area("사후 관리 메모 (Follow-up)", height=60)
+        if st.button("단계 업데이트", key="lead_stage_update"):
+            try:
+                update_data: dict = {"lead_stage": new_stage}
+                if contact_memo_input:
+                    update_data["contact_memo"] = contact_memo_input
+                    update_data["followup_done"] = True
+                supa.table("app_leads").update(update_data).eq("id", int(selected_id)).execute()
+                st.success(f"리드 {selected_id} → {new_stage} 업데이트 완료")
+                st.rerun()
+            except Exception as e:
+                st.error(f"업데이트 실패: {e}")

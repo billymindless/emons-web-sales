@@ -851,14 +851,17 @@ def _build_ct_response(
     params: dict | None = None,
     auth_token: str | None = None,
     store_name: str = "",
+    chat_history: list[dict] | None = None,
+    lead_info: dict | None = None,
 ) -> dict:
     """채널톡 Snippet JSON 응답 생성 (공식 v0 스펙).
     응답 최상위 키는 반드시 "snippet" 이어야 함.
     auth_token이 있으면 매직링크에 ?auth=토큰 포함 → 자동 로그인.
+    chat_history가 있으면 과거 상담 이력을 Snippet 하단에 추가.
     """
-    status_text = "신규 자동가입" if is_new else "기존 고객"
+    status_label = "가망고객" if (is_new and not order_info) else ("신규 자동가입" if is_new else "기존 고객")
     layout: list[dict] = [
-        _ct_text("customer-title", f"{customer_name} ({status_text})", style="h2"),
+        _ct_text("customer-title", f"{customer_name} ({status_label})", style="h2"),
     ]
 
     if order_info and order_info.get("total_amount") is not None:
@@ -878,11 +881,27 @@ def _build_ct_response(
         ]
         layout.append(_ct_keyvalue("order-info", items))
     else:
-        items = [
-            {"key": "구매 매장", "value": store_name or "-"},
-            {"key": "구매 내역", "value": "없음"},
-        ]
-        layout.append(_ct_keyvalue("no-order", items))
+        no_order_items = [{"key": "구매 매장", "value": store_name or "-"}]
+        # 리드 정보가 있으면 Snippet에 노출
+        if lead_info:
+            no_order_items.extend([
+                {"key": "유입 경로", "value": lead_info.get("lead_source", "-")},
+                {"key": "상담 메모", "value": (lead_info.get("memo") or "-")[:60]},
+                {"key": "상담일", "value": str(lead_info.get("created_at", ""))[:10] or "-"},
+                {"key": "다음 연락", "value": str(lead_info.get("next_contact_date") or "-")},
+            ])
+        else:
+            no_order_items.append({"key": "구매 내역", "value": "없음"})
+        layout.append(_ct_keyvalue("no-order", no_order_items))
+
+    # 과거 상담 이력 (최신 3건)
+    if chat_history:
+        layout.append(_ct_text("history-title", "─── 과거 상담 이력 ───", style="paragraph"))
+        for i, rec in enumerate(chat_history[:3]):
+            date_str = str(rec.get("created_at", ""))[:10]
+            channel = rec.get("channel", "")
+            summary = (rec.get("summary") or "")[:60]
+            layout.append(_ct_text(f"hist-{i}", f"[{date_str} / {channel}] {summary}"))
 
     magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
     if auth_token:
@@ -1029,6 +1048,132 @@ async def _ct_fetch_latest_order_with_balance(
 
 
 # ──────────────────────────────────────────────
+# 채널톡 보조 함수 — 상담 이력 / 리드 조회 / Open API
+# ──────────────────────────────────────────────
+
+async def _ct_fetch_chat_history(
+    client: httpx.AsyncClient,
+    headers: dict,
+    cleaned_phone: str,
+    limit: int = 3,
+) -> list[dict]:
+    """app_chat_history 최신순 조회."""
+    try:
+        resp = await client.get(
+            _supa_url("app_chat_history"),
+            headers=headers,
+            params={
+                "customer_phone": f"eq.{cleaned_phone}",
+                "order": "created_at.desc",
+                "limit": str(limit),
+                "select": "channel,summary,created_at",
+            },
+        )
+        return resp.json() if resp.status_code == 200 else []
+    except Exception as e:
+        logger.warning("chat_history 조회 실패: %s", e)
+        return []
+
+
+async def _ct_fetch_lead_info(
+    client: httpx.AsyncClient,
+    headers: dict,
+    cleaned_phone: str,
+) -> dict | None:
+    """app_leads 최신 활성 리드 1건 조회."""
+    try:
+        resp = await client.get(
+            _supa_url("app_leads"),
+            headers=headers,
+            params={
+                "phone": f"eq.{cleaned_phone}",
+                "lead_stage": "not.in.(4_계약완료,5_계약실패)",
+                "order": "created_at.desc",
+                "limit": "1",
+                "select": "id,lead_source,lead_stage,memo,next_contact_date,assigned_store,created_at",
+            },
+        )
+        data = resp.json() if resp.status_code == 200 else []
+        return data[0] if data else None
+    except Exception as e:
+        logger.warning("lead 조회 실패: %s", e)
+        return None
+
+
+async def _ct_register_online_lead(
+    client: httpx.AsyncClient,
+    headers: dict,
+    cleaned_phone: str,
+    name: str,
+) -> None:
+    """채널톡 신규 고객 → app_leads에 온라인_채널톡으로 자동 등록 (중복 시 무시)."""
+    try:
+        # 이미 리드가 있으면 등록 생략
+        existing = await _ct_fetch_lead_info(client, headers, cleaned_phone)
+        if existing:
+            return
+
+        from datetime import timedelta
+        now_utc = datetime.now(timezone.utc)
+        next_nurture_at = (now_utc + timedelta(days=2)).isoformat()
+
+        await client.post(
+            _supa_url("app_leads"),
+            headers={**headers, "Prefer": "return=minimal"},
+            json={
+                "store_name": CHANNEL_TALK_DEFAULT_STORE,
+                "phone": cleaned_phone,
+                "name": name or "",
+                "lead_source": "온라인_채널톡",
+                "lead_stage": "1_신규유입",
+                "assigned_store": CHANNEL_TALK_DEFAULT_STORE,
+                "nurturing_step": 0,
+                "next_nurture_at": next_nurture_at,
+            },
+            timeout=5.0,
+        )
+        logger.info("온라인 채널톡 리드 자동 등록: phone=%s", cleaned_phone)
+    except Exception as e:
+        logger.warning("온라인 리드 등록 실패 (계속 진행): %s", e)
+
+
+async def _ct_upsert_user(
+    phone: str,
+    name: str,
+    tags: list[str],
+) -> bool:
+    """
+    채널톡 Open API — 유저 프로필 upsert + 태그 주입.
+    환경변수: CHANNEL_TALK_ACCESS_KEY, CHANNEL_TALK_ACCESS_SECRET
+    """
+    access_key = os.environ.get("CHANNEL_TALK_ACCESS_KEY", "")
+    access_secret = os.environ.get("CHANNEL_TALK_ACCESS_SECRET", "")
+    if not access_key or not access_secret:
+        logger.warning("채널톡 Open API 키 미설정 — ct_upsert_user 건너뜀")
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.channel.io/v5/users",
+                auth=(access_key, access_secret),
+                json={
+                    "mobileNumber": phone,
+                    "name": name or "",
+                    "tags": tags,
+                },
+            )
+            if resp.status_code < 400:
+                logger.info("채널톡 유저 upsert 성공: phone=%s tags=%s", phone, tags)
+                return True
+            logger.warning("채널톡 유저 upsert 실패: %s %s", resp.status_code, resp.text[:200])
+            return False
+    except Exception as e:
+        logger.warning("채널톡 upsert 예외: %s", e)
+        return False
+
+
+# ──────────────────────────────────────────────
 # 채널톡 Custom Tab 엔드포인트
 # ──────────────────────────────────────────────
 
@@ -1083,12 +1228,24 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
         cleaned_phone = _normalize_phone(raw_phone)
 
         if not cleaned_phone:
-            response_body = _ct_error_response(
-                "전화번호 정보가 없습니다.\n채팅창에서 전화번호를 입력 받아주세요.",
-                params=req_params,
-            )
-            logger.info("channel-talk RESPONSE (no-phone): %s", json.dumps(response_body, ensure_ascii=False)[:500])
-            return JSONResponse(response_body)
+            # 익명 고객 안내 — 전화번호 확보 유도
+            anon_response = {
+                "snippet": {
+                    "version": "v0",
+                    "layout": [
+                        _ct_text("anon-warn", "익명 고객", style="h2"),
+                        _ct_text(
+                            "anon-guide",
+                            "우측 프로필에 연락처를 입력하거나\n"
+                            "서포트봇 폼으로 전화번호를 받으면\n"
+                            "momo DB와 자동 연동됩니다.",
+                        ),
+                    ],
+                    "params": req_params,
+                }
+            }
+            logger.info("channel-talk RESPONSE (anonymous): no phone")
+            return JSONResponse(anon_response)
 
         headers = _supa_headers()
         if not headers:
@@ -1099,6 +1256,9 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             ))
 
         auth_token: str | None = None
+        chat_history: list[dict] = []
+        lead_info: dict | None = None
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             customer_id, customer_name, customer_store, is_new = await _ct_get_or_create_customer(
                 client, headers, cleaned_phone, name_from_ct,
@@ -1112,6 +1272,23 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                     )
                 except Exception as e:
                     logger.warning("channel-talk: 주문 조회 실패 (계속 진행): %s", e)
+
+            # 과거 상담 이력 조회 (app_chat_history)
+            try:
+                chat_history = await _ct_fetch_chat_history(client, headers, cleaned_phone)
+            except Exception as e:
+                logger.warning("channel-talk: chat_history 조회 실패 (계속 진행): %s", e)
+
+            # 리드 정보 조회 (구매 이력 없는 경우 노출용)
+            if not order_info:
+                try:
+                    lead_info = await _ct_fetch_lead_info(client, headers, cleaned_phone)
+                except Exception as e:
+                    logger.warning("channel-talk: lead 조회 실패 (계속 진행): %s", e)
+
+                # 신규 고객이고 리드도 없으면 온라인 채널톡 리드로 자동 등록
+                if is_new and not lead_info:
+                    await _ct_register_online_lead(client, headers, cleaned_phone, name_from_ct)
 
             # 매니저 이메일로 app_users 조회 → 자동 로그인 토큰 생성
             if manager_email:
@@ -1142,6 +1319,8 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             params=req_params,
             auth_token=auth_token,
             store_name=customer_store,
+            chat_history=chat_history if chat_history else None,
+            lead_info=lead_info,
         )
         logger.info(
             "channel-talk RESPONSE (ok): phone=%s, is_new=%s, response=%s",
@@ -1155,6 +1334,148 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
         return JSONResponse(_ct_error_response(
             f"서버 에러: 데이터를 불러오지 못했습니다. ({type(e).__name__})"
         ))
+
+
+# ──────────────────────────────────────────────
+# 채널톡 chat.closed 웹훅 — 대화 전문 자동 아카이빙
+# ──────────────────────────────────────────────
+
+@app.post("/channel-talk/webhook", summary="채널톡 이벤트 웹훅 (chat.closed 아카이빙)")
+async def channel_talk_webhook(request: Request) -> JSONResponse:
+    """
+    채널톡 chat.closed 이벤트를 수신하여 대화 전문을 app_chat_history에 저장.
+    채널톡 Developer Portal에서 chat.closed 이벤트를 이 URL로 등록 필요.
+    """
+    try:
+        raw_body = await request.body()
+        try:
+            payload = json.loads(raw_body) if raw_body else {}
+        except Exception:
+            payload = {}
+
+        event = payload.get("event") or payload.get("type") or ""
+        logger.info("channel-talk webhook: event=%s", event)
+
+        if event != "chat.closed":
+            return JSONResponse({"ok": True, "skipped": True})
+
+        chat_obj = payload.get("chat") or {}
+        user_obj = payload.get("user") or {}
+        manager_obj = payload.get("manager") or {}
+
+        chat_id = str(chat_obj.get("id") or "")
+        phone = _normalize_phone(str(user_obj.get("mobileNumber") or user_obj.get("mobile_number") or ""))
+        handled_by = str(manager_obj.get("email") or manager_obj.get("name") or "")
+
+        if not phone:
+            logger.info("channel-talk chat.closed: 전화번호 없음, 저장 건너뜀")
+            return JSONResponse({"ok": True, "skipped": True, "reason": "no_phone"})
+
+        # 채널톡 Open API로 대화 전문 수집
+        full_text = ""
+        access_key = os.environ.get("CHANNEL_TALK_ACCESS_KEY", "")
+        access_secret = os.environ.get("CHANNEL_TALK_ACCESS_SECRET", "")
+        if chat_id and access_key and access_secret:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"https://api.channel.io/v5/chats/{chat_id}/messages",
+                        auth=(access_key, access_secret),
+                        params={"limit": "100"},
+                    )
+                    if resp.status_code < 400:
+                        messages = resp.json().get("messages") or []
+                        lines = []
+                        for m in messages:
+                            author = m.get("author", {}).get("name") or "고객"
+                            text = m.get("plainText") or m.get("text") or ""
+                            if text:
+                                lines.append(f"[{author}] {text}")
+                        full_text = "\n".join(lines)
+            except Exception as e:
+                logger.warning("채널톡 대화 전문 수집 실패: %s", e)
+
+        # app_chat_history 저장
+        supa_hdrs = {**_supa_headers(), "Prefer": "return=minimal"}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                _supa_url("app_chat_history"),
+                headers=supa_hdrs,
+                json={
+                    "customer_phone": phone,
+                    "channel": "채널톡_웹챗",
+                    "chat_id": chat_id or None,
+                    "summary": full_text[:200] if full_text else "채팅 종료",
+                    "full_text": full_text or None,
+                    "handled_by": handled_by,
+                },
+            )
+
+        logger.info("chat.closed 아카이빙 완료: phone=%s chat_id=%s", phone, chat_id)
+        return JSONResponse({"ok": True})
+
+    except Exception as e:
+        logger.error("channel-talk webhook error: %s", e, exc_info=True)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# ──────────────────────────────────────────────
+# 리드 넛징 예약 발송 실행기
+# ──────────────────────────────────────────────
+
+@app.get("/run-lead-care", summary="리드 넛징 예약 발송 실행")
+async def run_lead_care() -> JSONResponse:
+    """
+    app_leads에서 next_nurture_at <= now() 조건 대상을 조회하여
+    유입 경로별 넛징 메시지를 발송하고 nurturing_step을 갱신한다.
+    GitHub Actions 또는 Render Cron으로 매일 오전 10시 실행.
+    """
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return JSONResponse({"ok": False, "error": "supabase not configured"}, status_code=500)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    headers = _supa_headers()
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                _supa_url("app_leads"),
+                headers=headers,
+                params={
+                    "nurturing_step": "lt.2",
+                    "next_nurture_at": f"lte.{now_iso}",
+                    "lead_stage": "not.in.(4_계약완료,5_계약실패)",
+                    "select": "id,phone,name,lead_source,lead_stage",
+                    "limit": "100",
+                },
+            )
+            leads = resp.json() if resp.status_code == 200 else []
+    except Exception as e:
+        logger.error("run-lead-care 조회 실패: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    if not leads:
+        return JSONResponse({"ok": True, "processed": 0})
+
+    try:
+        from lead_manager import send_nurturing_message
+    except ImportError:
+        return JSONResponse({"ok": False, "error": "lead_manager import 실패"}, status_code=500)
+
+    sent, failed = 0, 0
+    for lead in leads:
+        try:
+            result = send_nurturing_message(lead)
+            if result.get("status") in ("sent", "lms_fallback"):
+                sent += 1
+            else:
+                failed += 1
+        except Exception as e:
+            logger.warning("넛징 발송 실패 lead_id=%s: %s", lead.get("id"), e)
+            failed += 1
+
+    logger.info("run-lead-care 완료: sent=%d failed=%d", sent, failed)
+    return JSONResponse({"ok": True, "processed": len(leads), "sent": sent, "failed": failed})
 
 
 @app.get("/health", summary="헬스체크")

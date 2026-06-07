@@ -19874,6 +19874,16 @@ def render_new_sales():
                     pass  # 키 미설정 환경에서는 조용히 스킵
             except Exception:
                 pass  # 알림 실패가 주문 등록 화면을 깨지 않도록
+            # 리드 자동 클로즈: 동일 전화번호의 활성 리드가 있으면 4_계약완료로 업데이트
+            try:
+                from lead_manager import auto_close_lead as _auto_close_lead
+                _auto_close_lead(
+                    phone=str(phone1 or ""),
+                    order_id=order_id,
+                    revenue=float(final_sales_save),
+                )
+            except Exception:
+                pass  # 리드 클로즈 실패가 매출 등록 화면을 깨지 않도록
             net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
             st.session_state["_gamification_ctx"] = {
                 "amount": final_sales_save,
@@ -20471,6 +20481,250 @@ def _customer_balance_payment_ui(
             st.warning("금액을 입력하세요.")
 
 
+def render_sales_kpi_dashboard() -> None:
+    """9. 세일즈 퍼포먼스 KPI 대시보드."""
+    st.title("세일즈 퍼포먼스 KPI")
+    st.caption("리드 전환율, 매출 기여액, 사후관리 성실도 등 5대 KPI 지표를 추적합니다.")
+
+    user = st.session_state.get("current_user") or {}
+    role = user.get("role", "")
+    employee_id = user.get("id")
+
+    supa, supa_err = get_supabase_client()
+    if supa_err or not supa:
+        st.error("Supabase 연결이 필요합니다.")
+        return
+
+    # 보기 모드 선택
+    col_view, col_period = st.columns(2)
+    with col_view:
+        view_mode = st.radio("보기", ["내 성과", "매장 전체"], horizontal=True)
+    with col_period:
+        period = st.selectbox("기간", ["이번 달", "최근 3개월", "전체"])
+
+    # 기간 필터 계산
+    from datetime import date, timedelta
+    today = date.today()
+    if period == "이번 달":
+        date_from = today.replace(day=1).isoformat()
+    elif period == "최근 3개월":
+        date_from = (today - timedelta(days=90)).isoformat()
+    else:
+        date_from = "2000-01-01"
+
+    try:
+        query = supa.table("app_leads").select(
+            "id,lead_source,lead_stage,assigned_employee_id,next_contact_date,"
+            "followup_done,contact_memo,converted_at,revenue_amount,created_at"
+        ).gte("created_at", date_from)
+
+        if view_mode == "내 성과" and employee_id:
+            query = query.eq("assigned_employee_id", employee_id)
+
+        resp = query.execute()
+        leads = resp.data or []
+    except Exception as e:
+        st.error(f"데이터 조회 실패: {e}")
+        return
+
+    if not leads:
+        st.info("해당 기간에 등록된 리드가 없습니다.")
+        return
+
+    import pandas as pd
+
+    df = pd.DataFrame(leads)
+    total = len(df)
+
+    # KPI 1: 리드 전환율
+    converted = len(df[df["lead_stage"] == "4_계약완료"])
+    conversion_rate = (converted / total * 100) if total > 0 else 0
+
+    # KPI 2: 리드 매출 기여액
+    revenue_total = df[df["lead_stage"] == "4_계약완료"]["revenue_amount"].fillna(0).sum()
+
+    # KPI 3: 평균 클로징 기간
+    converted_df = df[df["converted_at"].notna()].copy()
+    avg_close_days = None
+    if not converted_df.empty:
+        try:
+            converted_df["created_at_dt"] = pd.to_datetime(converted_df["created_at"], utc=True)
+            converted_df["converted_at_dt"] = pd.to_datetime(converted_df["converted_at"], utc=True)
+            converted_df["close_days"] = (
+                converted_df["converted_at_dt"] - converted_df["created_at_dt"]
+            ).dt.days
+            avg_close_days = converted_df["close_days"].mean()
+        except Exception:
+            pass
+
+    # KPI 4: 사후관리 성실도
+    needs_followup = len(df[df["next_contact_date"].notna()])
+    done_followup = len(df[(df["followup_done"] == True) & (df["contact_memo"].notna())])
+    followup_rate = (done_followup / needs_followup * 100) if needs_followup > 0 else 0
+
+    # KPI 5: DB 획득률 (오프라인 전용)
+    offline_count = len(df[df["lead_source"] == "오프라인_방문"])
+
+    # 지표 카드 표시
+    st.divider()
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.metric("리드 전환율", f"{conversion_rate:.1f}%", help=f"계약완료 {converted}건 / 전체 {total}건")
+    with k2:
+        st.metric("리드 매출 기여액", f"{int(revenue_total):,}원", help="담당 리드 중 계약완료된 건의 합계")
+    with k3:
+        st.metric(
+            "평균 클로징 기간",
+            f"{avg_close_days:.1f}일" if avg_close_days is not None else "-",
+            help="첫 접촉 → 계약 완료까지 평균 일수",
+        )
+
+    k4, k5, k6 = st.columns(3)
+    with k4:
+        st.metric("사후관리 성실도", f"{followup_rate:.1f}%", help=f"기한 내 Follow-up 완료 {done_followup}건 / 필요 {needs_followup}건")
+    with k5:
+        st.metric("오프라인 리드 등록", f"{offline_count}건", help="오프라인 방문으로 등록된 리드 수")
+    with k6:
+        st.metric("전체 리드", f"{total}건")
+
+    # 진행 바 (목표 대비)
+    st.divider()
+    st.subheader("목표 달성률")
+    target_conversion = 40.0
+    target_followup = 80.0
+
+    prog1, prog2 = st.columns(2)
+    with prog1:
+        st.write(f"**전환율** {conversion_rate:.1f}% / 목표 {target_conversion}%")
+        st.progress(min(conversion_rate / target_conversion, 1.0))
+    with prog2:
+        st.write(f"**사후관리** {followup_rate:.1f}% / 목표 {target_followup}%")
+        st.progress(min(followup_rate / target_followup, 1.0))
+
+    # 리드 목록
+    st.divider()
+    st.subheader("리드 목록")
+
+    stage_filter = st.multiselect(
+        "단계 필터",
+        ["1_신규유입", "2_자료발송", "3_매장방문", "4_계약완료", "5_계약실패"],
+        default=["1_신규유입", "2_자료발송", "3_매장방문"],
+    )
+    if stage_filter:
+        display_df = df[df["lead_stage"].isin(stage_filter)].copy()
+    else:
+        display_df = df.copy()
+
+    rename_map = {
+        "lead_source": "유입 경로", "lead_stage": "단계",
+        "next_contact_date": "다음 연락", "followup_done": "사후관리",
+        "revenue_amount": "계약금액", "created_at": "등록일",
+    }
+    display_df = display_df.rename(columns={k: v for k, v in rename_map.items() if k in display_df.columns})
+    show_cols = [c for c in ["등록일", "유입 경로", "단계", "계약금액", "다음 연락", "사후관리"] if c in display_df.columns]
+    if "등록일" in display_df.columns:
+        display_df["등록일"] = display_df["등록일"].str[:10]
+    st.dataframe(display_df[show_cols] if show_cols else display_df, use_container_width=True, hide_index=True)
+
+
+def _render_chat_history_section(customer_id: int, phone: str, customer_name: str) -> None:
+    """
+    고객 상세 화면 내 상담 이력 섹션.
+    app_chat_history(모든 채널 이력)와 app_leads(리드 정보)를 통합 표시.
+    직원이 전화 통화/오프라인 메모를 직접 추가할 수도 있다.
+    """
+    try:
+        from lead_manager import get_chat_history, get_leads_by_phone, save_chat_history
+    except ImportError:
+        st.warning("lead_manager 모듈을 찾을 수 없습니다.")
+        return
+
+    CHANNEL_ICONS = {
+        "채널톡_웹챗": "🔵",
+        "카카오톡": "🟡",
+        "오프라인_메모": "🟢",
+        "전화_통화": "⚪",
+    }
+
+    # 상담 이력 로드
+    histories = get_chat_history(phone, limit=20)
+    leads = get_leads_by_phone(phone)
+
+    # 리드 단계 표시
+    if leads:
+        lead = leads[0]
+        stage_colors = {
+            "4_계약완료": "🟢", "5_계약실패": "🔴",
+            "3_매장방문": "🔵", "2_자료발송": "🟡", "1_신규유입": "⚪",
+        }
+        icon = stage_colors.get(lead.get("lead_stage", ""), "⚪")
+        st.info(
+            f"{icon} **리드 단계:** {lead.get('lead_stage', '-')} | "
+            f"**유입:** {lead.get('lead_source', '-')} | "
+            f"**다음 연락:** {lead.get('next_contact_date') or '-'}"
+        )
+
+    col_left, col_right = st.columns([3, 1])
+    with col_right:
+        st.caption(f"총 {len(histories)}건")
+
+    if not histories:
+        st.caption("상담 이력이 없습니다.")
+    else:
+        for i, rec in enumerate(histories):
+            channel = rec.get("channel", "")
+            icon = CHANNEL_ICONS.get(channel, "📋")
+            date_str = str(rec.get("created_at", ""))[:10]
+            handled = rec.get("handled_by") or "시스템"
+            summary = rec.get("summary") or "(내용 없음)"
+            full_text = rec.get("full_text") or ""
+
+            with st.container():
+                st.markdown(
+                    f"{icon} **{date_str}** &nbsp; `{channel}` &nbsp; 담당: {handled}"
+                )
+                st.write(summary[:100] + ("..." if len(summary) > 100 else ""))
+                if full_text and len(full_text) > len(summary):
+                    with st.expander("전체 대화 보기"):
+                        st.text(full_text)
+            if i < len(histories) - 1:
+                st.divider()
+
+    # 메모 직접 추가
+    st.markdown("---")
+    with st.expander("+ 상담 메모 추가 (전화 통화 / 오프라인 메모)"):
+        _user = st.session_state.get("current_user") or {}
+        col_ch, col_memo = st.columns([1, 3])
+        with col_ch:
+            add_channel = st.selectbox(
+                "채널",
+                ["전화_통화", "오프라인_메모", "카카오톡"],
+                key=f"chat_hist_ch_{customer_id}",
+            )
+        with col_memo:
+            add_memo = st.text_area(
+                "상담 내용",
+                key=f"chat_hist_memo_{customer_id}",
+                height=80,
+                placeholder="예: 가격 재문의, 이번 주 방문 예정",
+            )
+        if st.button("메모 저장", key=f"chat_hist_save_{customer_id}", type="primary"):
+            if not add_memo.strip():
+                st.error("내용을 입력해 주세요.")
+            else:
+                ok = save_chat_history(
+                    phone=phone,
+                    channel=add_channel,
+                    summary=add_memo.strip(),
+                    handled_by=str(_user.get("username") or ""),
+                )
+                if ok:
+                    st.success("저장되었습니다.")
+                    st.rerun()
+                else:
+                    st.error("저장에 실패했습니다. Supabase 연결을 확인하세요.")
+
+
 def render_customer_balance():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -20771,6 +21025,10 @@ def render_customer_balance():
                         num_cols = [c for c in ["cost_price", "total_amount", "paid", "balance"] if c in orders.columns]
                         disp_df = orders.copy().rename(columns={"id": "주문ID", "order_date": "계약일", "delivery_date": "배송일"})
                         st.dataframe(_format_df_display(disp_df, num_cols), width='stretch')
+                    # ── 상담 이력 (app_chat_history + app_leads) ──────────────
+                    with st.expander("💬 상담 이력", expanded=False):
+                        _render_chat_history_section(cid, _sel_phone, _sel_name)
+
                     # 선택된 주문의 변경 이력 보기
                     with st.expander("선택 주문 변경 이력 보기"):
                         def _fmt_order_hist(oid):
@@ -23938,8 +24196,9 @@ def main():
             "6. 매장 관리자 메뉴",
             "7. 결제수단별 집계표",
             "8. 고객 CRM 자동화",
-            "9. 전시품 판매 검증",
-            "10. FAQ (도움말)",
+            "9. 세일즈 퍼포먼스",
+            "10. 전시품 판매 검증",
+            "11. FAQ (도움말)",
         ]
     else:
         tab_labels = [
@@ -24017,9 +24276,11 @@ def main():
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
-    elif (role == "store_admin" and idx == 8) or (role == "user" and idx == 6):
+    elif role == "store_admin" and idx == 8:
+        render_sales_kpi_dashboard()
+    elif (role == "store_admin" and idx == 9) or (role == "user" and idx == 6):
         render_display_sales_audit()
-    elif role == "store_admin" and idx == 9:
+    elif role == "store_admin" and idx == 10:
         render_faq_page()
     elif role == "user" and idx == 7:
         render_faq_page()
