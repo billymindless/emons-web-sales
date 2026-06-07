@@ -756,8 +756,9 @@ def _ct_button(component_id: str, label: str, url: str) -> dict:
     return {
         "id": component_id,
         "type": "button",
-        "title": label,
+        "label": label,
         "action": {"type": "url", "url": url},
+        "style": "primary",
     }
 
 
