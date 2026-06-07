@@ -762,12 +762,12 @@ def _ct_button(component_id: str, label: str, url: str) -> dict:
     }
 
 
-def _ct_error_response(message: str) -> dict:
+def _ct_error_response(message: str, params: dict | None = None) -> dict:
     """모든 에러 상황에서도 채널톡 UI가 깨지지 않도록 정상 JSON 반환."""
     return {
         "version": "v0",
         "layout": [_ct_text("error-msg", message)],
-        "params": {},
+        "params": params or {},
     }
 
 
@@ -785,11 +785,12 @@ def _build_ct_response(
     is_new: bool,
     order_info: dict | None,
     cleaned_phone: str,
+    params: dict | None = None,
 ) -> dict:
     """채널톡 Snippet JSON 응답 생성 (공식 v0 스펙)."""
     status_text = "신규 자동가입" if is_new else "기존 고객"
     layout: list[dict] = [
-        _ct_text("customer-title", f"👤 {customer_name} ({status_text})", style="h2"),
+        _ct_text("customer-title", f"{customer_name} ({status_text})", style="h2"),
     ]
 
     if order_info and order_info.get("total_amount") is not None:
@@ -809,7 +810,7 @@ def _build_ct_response(
     magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
     layout.append(_ct_button("magic-link-btn", "momo 시스템에서 열기", magic_url))
 
-    return {"version": "v0", "layout": layout, "params": {}}
+    return {"version": "v0", "layout": layout, "params": params or {}}
 
 
 # ──────────────────────────────────────────────
@@ -926,17 +927,21 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
     5) 채널톡 Snippet v0 JSON 응답 + RAW 로깅
     """
     try:
-        # ── 디버깅: 요청 본문 RAW 로깅 ──
+        # ── 디버깅: 요청 본문 RAW 로깅 (전체) ──
         raw_body = await request.body()
         try:
             payload_dict = json.loads(raw_body) if raw_body else {}
         except Exception:
             payload_dict = {}
+        body_str = raw_body.decode("utf-8", errors="replace")
         logger.info(
-            "channel-talk REQUEST: method=%s, body=%s",
-            request.method,
-            raw_body.decode("utf-8", errors="replace")[:1000],
+            "channel-talk REQUEST: method=%s, len=%d, keys=%s",
+            request.method, len(body_str), list(payload_dict.keys()),
         )
+        logger.info("channel-talk REQUEST BODY FULL: %s", body_str)
+
+        # 요청 params 추출 (응답에 echo back)
+        req_params = payload_dict.get("params") or {}
 
         # 전화번호 추출 (여러 위치에서 시도)
         raw_phone = ""
@@ -955,7 +960,8 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
 
         if not cleaned_phone:
             response_body = _ct_error_response(
-                "전화번호 정보가 없습니다.\n채팅창에서 전화번호를 입력 받아주세요."
+                "전화번호 정보가 없습니다.\n채팅창에서 전화번호를 입력 받아주세요.",
+                params=req_params,
             )
             logger.info("channel-talk RESPONSE (no-phone): %s", json.dumps(response_body, ensure_ascii=False)[:500])
             return JSONResponse(response_body)
@@ -964,7 +970,8 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
         if not headers:
             logger.error("channel-talk: Supabase 환경변수 미설정")
             return JSONResponse(_ct_error_response(
-                "서버 에러: 데이터베이스 연결이 설정되지 않았습니다."
+                "서버 에러: 데이터베이스 연결이 설정되지 않았습니다.",
+                params=req_params,
             ))
 
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -986,11 +993,12 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             is_new=is_new,
             order_info=order_info,
             cleaned_phone=cleaned_phone,
+            params=req_params,
         )
         logger.info(
             "channel-talk RESPONSE (ok): phone=%s, is_new=%s, response=%s",
             cleaned_phone, is_new,
-            json.dumps(response_body, ensure_ascii=False)[:500],
+            json.dumps(response_body, ensure_ascii=False)[:1000],
         )
         return JSONResponse(response_body)
 
