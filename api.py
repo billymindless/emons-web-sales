@@ -765,9 +765,11 @@ def _ct_button(component_id: str, label: str, url: str) -> dict:
 def _ct_error_response(message: str, params: dict | None = None) -> dict:
     """모든 에러 상황에서도 채널톡 UI가 깨지지 않도록 정상 JSON 반환."""
     return {
-        "version": "v0",
-        "layout": [_ct_text("error-msg", message)],
-        "params": params or {},
+        "snippet": {
+            "version": "v0",
+            "layout": [_ct_text("error-msg", message)],
+            "params": params or {},
+        }
     }
 
 
@@ -788,14 +790,37 @@ def _build_ct_response(
     params: dict | None = None,
 ) -> dict:
     """채널톡 Snippet JSON 응답 생성 (공식 v0 스펙).
-    DEBUG: 최소 레이아웃으로 렌더링 여부 확인.
+    응답 최상위 키는 반드시 "snippet" 이어야 함.
     """
-    status_text = "신규" if is_new else "기존"
+    status_text = "신규 자동가입" if is_new else "기존 고객"
     layout: list[dict] = [
-        _ct_text("t1", f"[TEST] {customer_name} ({status_text})", style="h2"),
-        _ct_text("t2", f"phone: {cleaned_phone}", style="paragraph"),
+        _ct_text("customer-title", f"{customer_name} ({status_text})", style="h2"),
     ]
-    return {"version": "v0", "layout": layout, "params": params or {}}
+
+    if order_info and order_info.get("total_amount") is not None:
+        category = order_info.get("category") or "상품"
+        total = int(order_info.get("total_amount") or 0)
+        paid = int(order_info.get("paid_total") or 0)
+        balance = total - paid
+        layout.append(_ct_keyvalue("order-info", [
+            {"key": "최근 주문", "value": str(category)},
+            {"key": "결제금액", "value": _format_currency(total)},
+            {"key": "입금완료", "value": _format_currency(paid)},
+            {"key": "잔금", "value": _format_currency(balance)},
+        ]))
+    else:
+        layout.append(_ct_text("no-order", "최근 구매 내역 없음"))
+
+    magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
+    layout.append(_ct_button("magic-link-btn", "momo 시스템에서 열기", magic_url))
+
+    return {
+        "snippet": {
+            "version": "v0",
+            "layout": layout,
+            "params": params or {},
+        }
+    }
 
 
 # ──────────────────────────────────────────────
