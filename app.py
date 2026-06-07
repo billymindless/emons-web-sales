@@ -5838,23 +5838,38 @@ def render_login():
     st.caption("💡 로그인할 때 사용한 이메일은 이 기기(브라우저)에만 저장되며, 다음 로그인 시 자동으로 채워집니다.")
     st.caption("🔒 한 번 로그인하면 이 브라우저에서 **30일간 자동 로그인**이 유지됩니다 (회사 PC 전용).")
 
-    # 이메일 자동 저장/자동 입력: localStorage 사용 (같은 브라우저에서 다음 로그인 시 이메일 유지)
-    # 1) URL에 email이 없고 localStorage에 저장된 이메일이 있으면 ?email= 붙여서 이동 → 서버에서 default value로 채움
-    # 2) 로그인 성공 시에는 메인 화면 로드 시 한 번만 localStorage에 저장(위에서 _pending_save_login_email 설정)
-    # 이메일 자동입력: 부모 윈도우 localStorage 접근 (components.html iframe 안에서 실행)
-    # 단, 자동 로그인 토큰(emons_auth)이 있으면 _inject_js_localStorage_redirect_with_auth 가 먼저 처리하므로 양보
+    # 자동 로그인 + 이메일 자동 입력: localStorage 활용
+    # 우선순위:
+    #   1) localStorage에 emons_auth 토큰이 있고 URL에 ?auth= 없으면 → URL에 토큰 추가 후 redirect (자동 로그인)
+    #      (채널톡 매직링크 등 외부 진입 시에도 자동 로그인 보장)
+    #   2) URL에 ?auth=가 이미 있으면 → 백엔드가 검증/복구 처리 중이므로 양보
+    #   3) localStorage에 이메일이 있고 URL에 ?email= 없으면 → 이메일 prefill 위해 redirect
     components.html(
         """
         <script>
         (function(){
-            var KEY = 'emons_login_email';
+            var EMAIL_KEY = 'emons_login_email';
+            var AUTH_KEY = 'emons_auth';
             try {
                 var w = window.parent;
-                if (w.localStorage.getItem('emons_auth')) { return; }
                 var u = new URL(w.location.href);
-                if (u.searchParams.get('auth')) { return; }
-                if (!u.searchParams.get('email') && w.localStorage.getItem(KEY)) {
-                    u.searchParams.set('email', w.localStorage.getItem(KEY));
+
+                // 1) 자동 로그인 토큰 복구: localStorage 토큰 → URL ?auth=
+                if (!u.searchParams.get('auth')) {
+                    var stored_auth = w.localStorage.getItem(AUTH_KEY) || w.sessionStorage.getItem(AUTH_KEY);
+                    if (stored_auth) {
+                        u.searchParams.set('auth', stored_auth);
+                        w.location.replace(u.toString());
+                        return;
+                    }
+                } else {
+                    // 이미 처리 중이므로 양보
+                    return;
+                }
+
+                // 2) 이메일 자동 입력
+                if (!u.searchParams.get('email') && w.localStorage.getItem(EMAIL_KEY)) {
+                    u.searchParams.set('email', w.localStorage.getItem(EMAIL_KEY));
                     w.location.replace(u.toString());
                     return;
                 }
