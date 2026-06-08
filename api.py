@@ -116,79 +116,8 @@ def _digits_only(phone: str) -> str:
     return re.sub(r"\D", "", phone or "")
 
 
-# ──────────────────────────────────────────────
-# 인증 토큰 생성 (app.py의 _create_auth_token과 동일 알고리즘)
-# 환경변수 EMONS_AUTH_SECRET 이 app.py와 동일해야 자동 로그인 작동
-# ──────────────────────────────────────────────
-
-_AUTH_SECRET_FALLBACK = "emons-default-secret-change-in-production"
-AUTH_EXPIRY_DAYS = 30
 
 
-def _get_auth_secret() -> str:
-    return os.environ.get("EMONS_AUTH_SECRET", _AUTH_SECRET_FALLBACK)
-
-
-def _create_auth_token(user_id: int, username: str, role: str,
-                       store_id: int | None, db_filename: str | None) -> str:
-    now = time.time()
-    payload = {
-        "user_id": user_id,
-        "username": username,
-        "role": role,
-        "store_id": store_id,
-        "db_filename": db_filename,
-        "logged_at": now,
-        "exp": now + AUTH_EXPIRY_DAYS * 24 * 3600,
-    }
-    payload_b64 = base64.urlsafe_b64encode(
-        json.dumps(payload, sort_keys=True).encode()
-    ).decode()
-    sig = hmac.new(
-        _get_auth_secret().encode(), payload_b64.encode(), hashlib.sha256
-    ).hexdigest()
-    return f"{payload_b64}.{sig}"
-
-
-async def _fetch_app_user_by_phone(
-    client: httpx.AsyncClient, headers: dict, phone: str,
-) -> dict | None:
-    """전화번호로 app_users 조회. phone1/phone2 둘 중 하나라도 매칭되면 반환.
-    반환: {id, username, role, store_id, db_filename} 또는 None.
-    """
-    if not phone:
-        return None
-    try:
-        # app_users.phone 컬럼: 정규화된 번호(01012345678)로 저장되어 있다고 가정
-        resp = await client.get(
-            _supa_url("app_users"),
-            headers=headers,
-            params={
-                "phone": f"eq.{phone}",
-                "select": "id,username,role,store_id",
-                "limit": "1",
-            },
-        )
-        rows = resp.json() if resp.status_code == 200 else []
-        if not rows:
-            return None
-        user_row = rows[0]
-        # store_id로 app_stores에서 db_filename 별도 조회
-        store_id = user_row.get("store_id")
-        if store_id:
-            s_resp = await client.get(
-                _supa_url("app_stores"),
-                headers=headers,
-                params={"id": f"eq.{store_id}", "select": "db_filename", "limit": "1"},
-            )
-            s_rows = s_resp.json() if s_resp.status_code == 200 else []
-            user_row["db_filename"] = s_rows[0].get("db_filename", "") if s_rows else ""
-        else:
-            user_row["db_filename"] = ""
-        return user_row
-    except Exception as e:
-        logger.warning("fetch_app_user_by_phone failed: %s", e)
-    return None
 
 
 def _normalize_phone(phone: str) -> str:
@@ -866,7 +795,6 @@ def _build_ct_response(
     order_info: dict | None,
     cleaned_phone: str,
     params: dict | None = None,
-    auth_token: str | None = None,
     store_name: str = "",
     chat_history: list[dict] | None = None,
     lead_info: dict | None = None,
@@ -921,8 +849,6 @@ def _build_ct_response(
             layout.append(_ct_text(f"hist-{i}", f"[{date_str} / {channel}] {summary}"))
 
     magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
-    if auth_token:
-        magic_url += f"&auth={auth_token}"
     layout.append(_ct_button("magic-link-btn", "momo 시스템에서 열기", magic_url))
 
     return {
@@ -1261,15 +1187,6 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             list(user_obj.keys()) if isinstance(user_obj, dict) else "N/A",
         )
 
-        # 매니저(상담원) 전화번호 추출 — 매직링크 자동 로그인 토큰 생성에 사용
-        # Snippet 요청: payload["manager"], 일반 웹훅: payload["refers"]["manager"]
-        manager_obj = payload_dict.get("manager") or {}
-        if not manager_obj:
-            _refers_mgr = payload_dict.get("refers") or {}
-            manager_obj = _refers_mgr.get("manager") or {}
-        raw_manager_phone = (manager_obj.get("mobileNumber") or "") if isinstance(manager_obj, dict) else ""
-        manager_phone = _normalize_phone(raw_manager_phone)
-
         cleaned_phone = _normalize_phone(raw_phone)
         logger.info("channel-talk PHONE CLEANED: %r", cleaned_phone)
 
@@ -1301,7 +1218,6 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                 params=req_params,
             ))
 
-        auth_token: str | None = None
         chat_history: list[dict] = []
         lead_info: dict | None = None
 
@@ -1336,34 +1252,12 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                 if is_new and not lead_info:
                     await _ct_register_online_lead(client, headers, cleaned_phone, name_from_ct)
 
-            # 매니저 전화번호로 app_users 조회 → 자동 로그인 토큰 생성
-            if manager_phone:
-                app_user = await _fetch_app_user_by_phone(client, headers, manager_phone)
-                if app_user:
-                    auth_token = _create_auth_token(
-                        user_id=int(app_user["id"]),
-                        username=str(app_user.get("username") or ""),
-                        role=str(app_user.get("role") or "user"),
-                        store_id=app_user.get("store_id"),
-                        db_filename=app_user.get("db_filename"),
-                    )
-                    logger.info(
-                        "channel-talk auth: manager_phone=%s → user_id=%s, token issued",
-                        manager_phone, app_user["id"],
-                    )
-                else:
-                    logger.warning(
-                        "channel-talk auth: manager_phone=%s not found in app_users",
-                        manager_phone,
-                    )
-
         response_body = _build_ct_response(
             customer_name=customer_name,
             is_new=is_new,
             order_info=order_info,
             cleaned_phone=cleaned_phone,
             params=req_params,
-            auth_token=auth_token,
             store_name=customer_store,
             chat_history=chat_history if chat_history else None,
             lead_info=lead_info,
