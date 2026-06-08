@@ -1209,9 +1209,23 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
         req_params = payload_dict.get("params") or {}
 
         # 전화번호 추출 (여러 위치에서 시도)
+        # 채널톡은 payload 구조가 요청 유형에 따라 다름:
+        #   Snippet 요청: payload["user"] 또는 payload["context"]["profile"]
+        #   일반 웹훅 이벤트: payload["refers"]["user"]
         raw_phone = ""
         name_from_ct = "채널톡고객"
+
+        # 1) Snippet 요청 — payload["user"]
         user_obj = payload_dict.get("user") or {}
+        # 2) 일반 웹훅 이벤트 — payload["refers"]["user"]
+        if not user_obj:
+            refers = payload_dict.get("refers") or {}
+            user_obj = refers.get("user") or {}
+        # 3) context.profile (일부 Snippet 버전)
+        if not user_obj:
+            ctx = payload_dict.get("context") or {}
+            user_obj = ctx.get("profile") or {}
+
         if isinstance(user_obj, dict):
             raw_phone = (
                 user_obj.get("mobileNumber")
@@ -1222,7 +1236,11 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             name_from_ct = user_obj.get("name") or "채널톡고객"
 
         # 매니저(상담원) 이메일 추출 — 매직링크 자동 로그인 토큰 생성에 사용
+        # Snippet 요청: payload["manager"], 일반 웹훅: payload["refers"]["manager"]
         manager_obj = payload_dict.get("manager") or {}
+        if not manager_obj:
+            refers = payload_dict.get("refers") or {}
+            manager_obj = refers.get("manager") or {}
         manager_email = (manager_obj.get("email") or "").strip().lower() if isinstance(manager_obj, dict) else ""
 
         cleaned_phone = _normalize_phone(raw_phone)
@@ -1417,6 +1435,15 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
     except Exception as e:
         logger.error("channel-talk webhook error: %s", e, exc_info=True)
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# 채널톡 웹훅 별칭 — base URL 등록 시 채널톡이 /channel-talk/webhook 경로를 자동 추가하는 경우 대비
+app.add_api_route(
+    "/channel-talk/webhook/channel-talk/webhook",
+    channel_talk_webhook,
+    methods=["POST"],
+    include_in_schema=False,
+)
 
 
 # ──────────────────────────────────────────────
