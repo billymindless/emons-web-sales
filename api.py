@@ -1231,19 +1231,29 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                 user_obj.get("mobileNumber")
                 or user_obj.get("mobile_number")
                 or user_obj.get("phone")
+                or (user_obj.get("profile") or {}).get("mobileNumber")
                 or ""
             )
             name_from_ct = user_obj.get("name") or "채널톡고객"
+
+        # 디버그: 전화번호 추출 경로 로깅
+        logger.info(
+            "channel-talk PHONE DEBUG: raw=%r user_obj_type=%s user_obj_keys=%s",
+            raw_phone,
+            type(user_obj).__name__,
+            list(user_obj.keys()) if isinstance(user_obj, dict) else "N/A",
+        )
 
         # 매니저(상담원) 이메일 추출 — 매직링크 자동 로그인 토큰 생성에 사용
         # Snippet 요청: payload["manager"], 일반 웹훅: payload["refers"]["manager"]
         manager_obj = payload_dict.get("manager") or {}
         if not manager_obj:
-            refers = payload_dict.get("refers") or {}
-            manager_obj = refers.get("manager") or {}
+            _refers_mgr = payload_dict.get("refers") or {}
+            manager_obj = _refers_mgr.get("manager") or {}
         manager_email = (manager_obj.get("email") or "").strip().lower() if isinstance(manager_obj, dict) else ""
 
         cleaned_phone = _normalize_phone(raw_phone)
+        logger.info("channel-talk PHONE CLEANED: %r", cleaned_phone)
 
         if not cleaned_phone:
             # 익명 고객 안내 — 전화번호 확보 유도
