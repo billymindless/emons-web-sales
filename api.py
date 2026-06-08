@@ -162,11 +162,14 @@ async def _fetch_app_user_by_email(
             headers=headers,
             params={
                 "email": f"eq.{email}",
-                "select": "id,username,role,store_id,db_filename",
+                "select": "id,username,role,store_id,app_stores(db_filename)",
                 "limit": "1",
             },
         )
         rows = resp.json() if resp.status_code == 200 else []
+        # PostgREST join 결과 평탄화: app_stores: {db_filename: ...} → db_filename
+        if rows and isinstance(rows[0].get("app_stores"), dict):
+            rows[0]["db_filename"] = rows[0]["app_stores"].get("db_filename", "")
         if rows:
             return rows[0]
     except Exception as e:
