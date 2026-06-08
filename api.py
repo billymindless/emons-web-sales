@@ -162,16 +162,27 @@ async def _fetch_app_user_by_email(
             headers=headers,
             params={
                 "email": f"eq.{email}",
-                "select": "id,username,role,store_id,app_stores(db_filename)",
+                "select": "id,username,role,store_id",
                 "limit": "1",
             },
         )
         rows = resp.json() if resp.status_code == 200 else []
-        # PostgREST join 결과 평탄화: app_stores: {db_filename: ...} → db_filename
-        if rows and isinstance(rows[0].get("app_stores"), dict):
-            rows[0]["db_filename"] = rows[0]["app_stores"].get("db_filename", "")
-        if rows:
-            return rows[0]
+        if not rows:
+            return None
+        user_row = rows[0]
+        # store_id가 있으면 app_stores에서 db_filename을 별도 조회
+        store_id = user_row.get("store_id")
+        if store_id:
+            s_resp = await client.get(
+                _supa_url("app_stores"),
+                headers=headers,
+                params={"id": f"eq.{store_id}", "select": "db_filename", "limit": "1"},
+            )
+            s_rows = s_resp.json() if s_resp.status_code == 200 else []
+            user_row["db_filename"] = s_rows[0].get("db_filename", "") if s_rows else ""
+        else:
+            user_row["db_filename"] = ""
+        return user_row
     except Exception as e:
         logger.warning("fetch_app_user_by_email failed: %s", e)
     return None
