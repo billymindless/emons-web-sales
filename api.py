@@ -32,6 +32,10 @@ import base64
 import hashlib
 import hmac
 import json
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import os
 import re
@@ -56,6 +60,44 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 IMWEB_WEBHOOK_TOKEN = os.environ.get("IMWEB_WEBHOOK_TOKEN", "")
 MOMO_APP_URL = os.environ.get("MOMO_APP_URL", "https://emons.streamlit.app").rstrip("/")
 CHANNEL_TALK_DEFAULT_STORE = os.environ.get("CHANNEL_TALK_DEFAULT_STORE", "채널톡")
+
+# 채널톡 → momo 자동 로그인용 환경변수 (app.py와 동일한 EMONS_AUTH_SECRET 사용)
+# Render 환경변수에 아래 값들을 설정:
+#   EMONS_AUTH_SECRET     — app.py와 공유하는 서명 비밀키
+#   CT_AGENT_USER_ID      — 채널톡 전용 app_users.id
+#   CT_AGENT_USERNAME     — app_users.username
+#   CT_AGENT_ROLE         — 역할 (superadmin / store_admin / user)
+#   CT_AGENT_STORE_ID     — app_users.store_id (선택)
+#   CT_AGENT_DB_FILENAME  — 매장 db_filename (선택)
+_CT_AUTH_SECRET = os.environ.get("EMONS_AUTH_SECRET", "emons-default-secret-change-in-production")
+_CT_AGENT_USER_ID = int(os.environ.get("CT_AGENT_USER_ID", "0") or 0)
+_CT_AGENT_USERNAME = os.environ.get("CT_AGENT_USERNAME", "")
+_CT_AGENT_ROLE = os.environ.get("CT_AGENT_ROLE", "user")
+_CT_AGENT_STORE_ID = os.environ.get("CT_AGENT_STORE_ID")
+_CT_AGENT_DB_FILENAME = os.environ.get("CT_AGENT_DB_FILENAME", "")
+
+
+def _make_ct_auth_token() -> str | None:
+    """채널톡 버튼용 자동 로그인 토큰 생성. 환경변수 미설정 시 None 반환."""
+    if not _CT_AGENT_USER_ID or not _CT_AGENT_USERNAME:
+        return None
+    now = time.time()
+    payload = {
+        "user_id": _CT_AGENT_USER_ID,
+        "username": _CT_AGENT_USERNAME,
+        "role": _CT_AGENT_ROLE,
+        "store_id": int(_CT_AGENT_STORE_ID) if _CT_AGENT_STORE_ID else None,
+        "db_filename": _CT_AGENT_DB_FILENAME,
+        "logged_at": now,
+        "exp": now + 30 * 24 * 3600,  # 30일 유효
+    }
+    payload_b64 = base64.urlsafe_b64encode(
+        json.dumps(payload, sort_keys=True).encode()
+    ).decode()
+    sig = hmac.new(
+        _CT_AUTH_SECRET.encode(), payload_b64.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{payload_b64}.{sig}"
 
 app = FastAPI(
     title="이몬스 웹훅 API",
@@ -849,6 +891,9 @@ def _build_ct_response(
             layout.append(_ct_text(f"hist-{i}", f"[{date_str} / {channel}] {summary}"))
 
     magic_url = f"{MOMO_APP_URL}/?home=1&menu=new_sales&phone={cleaned_phone}"
+    ct_token = _make_ct_auth_token()
+    if ct_token:
+        magic_url += f"&auth={ct_token}"
     layout.append(_ct_button("magic-link-btn", "momo 시스템에서 열기", magic_url))
 
     return {
