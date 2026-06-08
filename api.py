@@ -150,18 +150,21 @@ def _create_auth_token(user_id: int, username: str, role: str,
     return f"{payload_b64}.{sig}"
 
 
-async def _fetch_app_user_by_email(
-    client: httpx.AsyncClient, headers: dict, email: str,
+async def _fetch_app_user_by_phone(
+    client: httpx.AsyncClient, headers: dict, phone: str,
 ) -> dict | None:
-    """이메일로 app_users 조회. 반환: {id, username, role, store_id, db_filename} 또는 None."""
-    if not email:
+    """전화번호로 app_users 조회. phone1/phone2 둘 중 하나라도 매칭되면 반환.
+    반환: {id, username, role, store_id, db_filename} 또는 None.
+    """
+    if not phone:
         return None
     try:
+        # app_users.phone 컬럼: 정규화된 번호(01012345678)로 저장되어 있다고 가정
         resp = await client.get(
             _supa_url("app_users"),
             headers=headers,
             params={
-                "email": f"eq.{email}",
+                "phone": f"eq.{phone}",
                 "select": "id,username,role,store_id",
                 "limit": "1",
             },
@@ -170,7 +173,7 @@ async def _fetch_app_user_by_email(
         if not rows:
             return None
         user_row = rows[0]
-        # store_id가 있으면 app_stores에서 db_filename을 별도 조회
+        # store_id로 app_stores에서 db_filename 별도 조회
         store_id = user_row.get("store_id")
         if store_id:
             s_resp = await client.get(
@@ -184,7 +187,7 @@ async def _fetch_app_user_by_email(
             user_row["db_filename"] = ""
         return user_row
     except Exception as e:
-        logger.warning("fetch_app_user_by_email failed: %s", e)
+        logger.warning("fetch_app_user_by_phone failed: %s", e)
     return None
 
 
@@ -1258,13 +1261,14 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             list(user_obj.keys()) if isinstance(user_obj, dict) else "N/A",
         )
 
-        # 매니저(상담원) 이메일 추출 — 매직링크 자동 로그인 토큰 생성에 사용
+        # 매니저(상담원) 전화번호 추출 — 매직링크 자동 로그인 토큰 생성에 사용
         # Snippet 요청: payload["manager"], 일반 웹훅: payload["refers"]["manager"]
         manager_obj = payload_dict.get("manager") or {}
         if not manager_obj:
             _refers_mgr = payload_dict.get("refers") or {}
             manager_obj = _refers_mgr.get("manager") or {}
-        manager_email = (manager_obj.get("email") or "").strip().lower() if isinstance(manager_obj, dict) else ""
+        raw_manager_phone = (manager_obj.get("mobileNumber") or "") if isinstance(manager_obj, dict) else ""
+        manager_phone = _normalize_phone(raw_manager_phone)
 
         cleaned_phone = _normalize_phone(raw_phone)
         logger.info("channel-talk PHONE CLEANED: %r", cleaned_phone)
@@ -1332,9 +1336,9 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                 if is_new and not lead_info:
                     await _ct_register_online_lead(client, headers, cleaned_phone, name_from_ct)
 
-            # 매니저 이메일로 app_users 조회 → 자동 로그인 토큰 생성
-            if manager_email:
-                app_user = await _fetch_app_user_by_email(client, headers, manager_email)
+            # 매니저 전화번호로 app_users 조회 → 자동 로그인 토큰 생성
+            if manager_phone:
+                app_user = await _fetch_app_user_by_phone(client, headers, manager_phone)
                 if app_user:
                     auth_token = _create_auth_token(
                         user_id=int(app_user["id"]),
@@ -1344,13 +1348,13 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                         db_filename=app_user.get("db_filename"),
                     )
                     logger.info(
-                        "channel-talk auth: manager_email=%s → user_id=%s, token issued",
-                        manager_email, app_user["id"],
+                        "channel-talk auth: manager_phone=%s → user_id=%s, token issued",
+                        manager_phone, app_user["id"],
                     )
                 else:
                     logger.warning(
-                        "channel-talk auth: manager_email=%s not found in app_users",
-                        manager_email,
+                        "channel-talk auth: manager_phone=%s not found in app_users",
+                        manager_phone,
                     )
 
         response_body = _build_ct_response(
