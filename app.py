@@ -9153,18 +9153,43 @@ def _erp_time_input_30min(
     key: str,
     label_visibility: str = "visible",
 ) -> dt_time:
-    """30분 단위 스텝 시간 입력 위젯.
+    """근태용 HH:MM 텍스트 시간 입력 위젯.
 
-    화살표(▲▼)는 30분 단위로 이동하며, 시간/분 부분을 클릭 후 직접 타이핑도 가능.
-    st.time_input(step=1800) 래퍼 — 저장 누락 없이 모든 컨텍스트(폼 내외)에서 동작.
+    - 기본값은 30분 단위(예: 09:00, 18:30)로 제공
+    - 사용자는 09:15, 14:45 등 어떠한 시각이든 자유롭게 직접 타이핑 가능
+    - 잘못된 형식이면 기본값을 반환하고 경고 표시
+    - st.form 내부/외부 모두에서 동일하게 동작
     """
-    return st.time_input(
+    if isinstance(value, dt_time):
+        init_str = f"{value.hour:02d}:{value.minute:02d}"
+        fallback = value
+    else:
+        init_str = "09:00"
+        fallback = dt_time(9, 0)
+
+    raw = st.text_input(
         label,
-        value=value if isinstance(value, dt_time) else dt_time(9, 0),
+        value=init_str,
         key=key,
-        step=1800,
+        placeholder="HH:MM (예: 09:00, 14:30, 18:15)",
+        max_chars=5,
         label_visibility=label_visibility,
     )
+
+    s = (raw or "").strip()
+    if not s:
+        return fallback
+    try:
+        parts = s.split(":")
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return dt_time(h, m)
+        st.caption(f"⚠️ '{s}' — 0~23시, 0~59분 범위를 확인해 주세요.")
+    except Exception:
+        st.caption(f"⚠️ '{s}' — HH:MM 형식으로 입력해 주세요 (예: 09:15)")
+    return fallback
 
 
 def _erp_get_employee_names_for_store(db_filename: str) -> list:
