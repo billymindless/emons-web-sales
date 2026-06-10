@@ -9147,6 +9147,62 @@ def _erp_parse_time(s, default=None):
         return default
 
 
+def _erp_time_input_30min(
+    label: str,
+    value: dt_time,
+    key: str,
+    label_visibility: str = "visible",
+) -> dt_time:
+    """30분 단위 selectbox + 직접 입력 옵션이 결합된 시간 입력 위젯.
+
+    - 00:00 ~ 23:30 사이의 30분 단위 옵션 표시
+    - 기존 값이 30분 단위면 해당 슬롯 자동 선택, 아니면 '직접 입력' 선택됨
+    - '직접 입력' 선택 시 HH:MM 텍스트 입력창 추가 노출
+    - datetime.time 반환
+    """
+    # 30분 단위 슬롯 목록 + 직접 입력
+    _SLOTS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
+    _MANUAL = "직접 입력"
+    options = _SLOTS + [_MANUAL]
+
+    # 기본 선택 슬롯 결정
+    if isinstance(value, dt_time):
+        val_str = f"{value.hour:02d}:{value.minute:02d}"
+        default_idx = options.index(val_str) if val_str in _SLOTS else len(_SLOTS)
+    else:
+        default_idx = 0
+
+    sel = st.selectbox(
+        label,
+        options,
+        index=default_idx,
+        key=f"{key}_sel30",
+        label_visibility=label_visibility,
+    )
+
+    if sel == _MANUAL:
+        # 직접 입력 텍스트 박스
+        init_manual = f"{value.hour:02d}:{value.minute:02d}" if isinstance(value, dt_time) else "09:00"
+        raw = st.text_input(
+            "시간 직접 입력",
+            value=init_manual,
+            key=f"{key}_manual30",
+            placeholder="예: 09:15",
+            label_visibility="collapsed",
+        )
+        try:
+            h, m = map(int, (raw or "").strip().split(":"))
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return dt_time(h, m)
+            st.caption("⚠️ 0~23시, 0~59분 범위를 확인해 주세요.")
+        except Exception:
+            st.caption("⚠️ HH:MM 형식으로 입력해 주세요 (예: 09:15)")
+        return value if isinstance(value, dt_time) else dt_time(9, 0)
+
+    h, m = map(int, sel.split(":"))
+    return dt_time(h, m)
+
+
 def _erp_get_employee_names_for_store(db_filename: str) -> list:
     """현재 매장에 소속된 직원 표시명 목록 (관리자용)."""
     if not db_filename:
@@ -10525,20 +10581,20 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 )
             with row[2]:
                 if checked:
-                    t_s = st.time_input(
+                    t_s = _erp_time_input_30min(
                         "출근시각", value=init_start,
                         key=f"sp_start_{d.isoformat()}",
-                        label_visibility="collapsed", step=60,
+                        label_visibility="collapsed",
                     )
                 else:
                     st.markdown("<span style='color:#999;'>— 휴무 —</span>", unsafe_allow_html=True)
                     t_s = None
             with row[3]:
                 if checked:
-                    t_e = st.time_input(
+                    t_e = _erp_time_input_30min(
                         "퇴근시각", value=init_end,
                         key=f"sp_end_{d.isoformat()}",
-                        label_visibility="collapsed", step=60,
+                        label_visibility="collapsed",
                     )
                 else:
                     t_e = None
@@ -10677,13 +10733,13 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
     with st.form(f"erp_store_hours_form_{_kp}", clear_on_submit=False):
         hc = st.columns(4)
         with hc[0]:
-            wd_s = st.time_input("주중 출근", value=cur_hours["weekday_start"], key=f"erp_sh_wd_s_{_kp}")
+            wd_s = _erp_time_input_30min("주중 출근", value=cur_hours["weekday_start"], key=f"erp_sh_wd_s_{_kp}")
         with hc[1]:
-            wd_e = st.time_input("주중 퇴근", value=cur_hours["weekday_end"], key=f"erp_sh_wd_e_{_kp}")
+            wd_e = _erp_time_input_30min("주중 퇴근", value=cur_hours["weekday_end"], key=f"erp_sh_wd_e_{_kp}")
         with hc[2]:
-            we_s = st.time_input("주말/공휴일 출근", value=cur_hours["weekend_start"], key=f"erp_sh_we_s_{_kp}")
+            we_s = _erp_time_input_30min("주말/공휴일 출근", value=cur_hours["weekend_start"], key=f"erp_sh_we_s_{_kp}")
         with hc[3]:
-            we_e = st.time_input("주말/공휴일 퇴근", value=cur_hours["weekend_end"], key=f"erp_sh_we_e_{_kp}")
+            we_e = _erp_time_input_30min("주말/공휴일 퇴근", value=cur_hours["weekend_end"], key=f"erp_sh_we_e_{_kp}")
         sh_submit = st.form_submit_button("💾 기본 근무시간 저장", type="primary")
     if sh_submit:
         if wd_e <= wd_s or we_e <= we_s:
@@ -10827,9 +10883,9 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
             with st.form(f"erp_rule_add_{form_key}", clear_on_submit=False):
                 fc = st.columns([1.2, 1.2, 1, 1, 1])
                 with fc[0]:
-                    s_t = st.time_input("시작", value=dt_time(9, 0), key=f"erp_rule_s_{form_key}")
+                    s_t = _erp_time_input_30min("시작", value=dt_time(9, 0), key=f"erp_rule_s_{form_key}")
                 with fc[1]:
-                    e_t = st.time_input("종료", value=dt_time(18, 0), key=f"erp_rule_e_{form_key}")
+                    e_t = _erp_time_input_30min("종료", value=dt_time(18, 0), key=f"erp_rule_e_{form_key}")
                 with fc[2]:
                     n = st.number_input("최소 인원", min_value=0, max_value=20, value=1, step=1, key=f"erp_rule_n_{form_key}")
                 with fc[3]:
@@ -10961,9 +11017,9 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                                 _et_default = dt_time(20, 0)
                             _ec4, _ec5 = st.columns(2)
                             with _ec4:
-                                _new_st_t = st.time_input("시작 시각", value=_st_default, key=f"se_edit_st_{_ev_id}")
+                                _new_st_t = _erp_time_input_30min("시작 시각", value=_st_default, key=f"se_edit_st_{_ev_id}")
                             with _ec5:
-                                _new_et_t = st.time_input("종료 시각", value=_et_default, key=f"se_edit_et_{_ev_id}")
+                                _new_et_t = _erp_time_input_30min("종료 시각", value=_et_default, key=f"se_edit_et_{_ev_id}")
                             _new_has_time = True
                         else:
                             _new_st_t = None
@@ -11076,9 +11132,9 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
         if se_time_mode == "시간대 지정":
             sec4, sec5 = st.columns(2)
             with sec4:
-                se_start = st.time_input("시작 시각", value=dt_time(18, 0), key=f"se_start_{_kp}")
+                se_start = _erp_time_input_30min("시작 시각", value=dt_time(18, 0), key=f"se_start_{_kp}")
             with sec5:
-                se_end = st.time_input("종료 시각", value=dt_time(20, 0), key=f"se_end_{_kp}")
+                se_end = _erp_time_input_30min("종료 시각", value=dt_time(20, 0), key=f"se_end_{_kp}")
             se_has_time = True
         else:
             se_start = None
@@ -11907,9 +11963,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         _es_def, _ee_def = _erp_default_times_for_date(edit_dbf, _sd)
                         _ec_a, _ec_b = st.columns(2)
                         with _ec_a:
-                            _e_start = st.time_input("출근 시각", value=_erp_parse_time(_sh.get("shift_start")) or _es_def, key=f"qe_e_s_{_sid}", step=60)
+                            _e_start = _erp_time_input_30min("출근 시각", value=_erp_parse_time(_sh.get("shift_start")) or _es_def, key=f"qe_e_s_{_sid}")
                         with _ec_b:
-                            _e_end = st.time_input("퇴근 시각", value=_erp_parse_time(_sh.get("shift_end")) or _ee_def, key=f"qe_e_e_{_sid}", step=60)
+                            _e_end = _erp_time_input_30min("퇴근 시각", value=_erp_parse_time(_sh.get("shift_end")) or _ee_def, key=f"qe_e_e_{_sid}")
                         # 근무 장소 셀렉트 (실근무지 명시 선택)
                         _ETC_E_LABEL = "기타 (외부/행사) — 직접 입력"
                         _e_loc_opts = list(all_store_names) + [_ETC_E_LABEL]
@@ -12015,9 +12071,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             )
         _add_def_s, _add_def_e = _erp_default_times_for_date(edit_dbf, qe_new_date)
         with _add_c2:
-            qe_new_start = st.time_input("출근 시각", value=_add_def_s, key="qe_new_start_calendar", step=60)
+            qe_new_start = _erp_time_input_30min("출근 시각", value=_add_def_s, key="qe_new_start_calendar")
         with _add_c3:
-            qe_new_end = st.time_input("퇴근 시각", value=_add_def_e, key="qe_new_end_calendar", step=60)
+            qe_new_end = _erp_time_input_30min("퇴근 시각", value=_add_def_e, key="qe_new_end_calendar")
         # ── 근무 장소 선택 (명시적 선택 — 자동 추론 X, 직원 소속과 무관)
         #   실근무지 기준으로 저장되어 캘린더 카운팅·표시가 일치
         _ETC_LOC_LABEL = "기타 (외부/행사) — 직접 입력"
@@ -12144,16 +12200,16 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         _oe_def_s, _oe_def_e = _erp_default_times_for_date(_oe_db, _odt)
                         _oe_c1, _oe_c2, _oe_c3 = st.columns([1, 1, 2])
                         with _oe_c1:
-                            _ot_e_s = st.time_input(
+                            _ot_e_s = _erp_time_input_30min(
                                 "시작 시간",
                                 value=_erp_parse_time(_ot.get("start_time")) or _oe_def_s,
-                                step=60, key=f"ot_e_s_{_otid}",
+                                key=f"ot_e_s_{_otid}",
                             )
                         with _oe_c2:
-                            _ot_e_e = st.time_input(
+                            _ot_e_e = _erp_time_input_30min(
                                 "종료 시간",
                                 value=_erp_parse_time(_ot.get("end_time")) or _oe_def_e,
-                                step=60, key=f"ot_e_e_{_otid}",
+                                key=f"ot_e_e_{_otid}",
                             )
                         with _oe_c3:
                             _OT_ETC = "기타 (외부/행사) — 직접 입력"
@@ -12363,11 +12419,11 @@ def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
         )
         col_t1, col_t2 = st.columns(2)
         with col_t1:
-            start_time = st.time_input("실제 출근 시각", value=std_s,
-                                       key=f"erp_att_start_{log_date.isoformat()}_{weekend_flag}")
+            start_time = _erp_time_input_30min("실제 출근 시각", value=std_s,
+                                               key=f"erp_att_start_{log_date.isoformat()}_{weekend_flag}")
         with col_t2:
-            end_time = st.time_input("실제 퇴근 시각", value=std_e,
-                                     key=f"erp_att_end_{log_date.isoformat()}_{weekend_flag}")
+            end_time = _erp_time_input_30min("실제 퇴근 시각", value=std_e,
+                                             key=f"erp_att_end_{log_date.isoformat()}_{weekend_flag}")
 
         # 근무 매장 선택
         _att_stores_df = get_supabase_stores_dataframe_cached()
@@ -12642,9 +12698,9 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
         with oc[1]:
             ov_date = st.date_input("날짜", value=today, key="erp_ov_date")
         with oc[2]:
-            ov_start = st.time_input("시작", value=dt_time(18, 0), key="erp_ov_start")
+            ov_start = _erp_time_input_30min("시작", value=dt_time(18, 0), key="erp_ov_start")
         with oc[3]:
-            ov_end = st.time_input("종료", value=dt_time(20, 0), key="erp_ov_end")
+            ov_end = _erp_time_input_30min("종료", value=dt_time(20, 0), key="erp_ov_end")
         ov_loc = st.text_input("근무 장소", value="", key="erp_ov_loc")
         ov_comp_type = st.selectbox(
             "💰 보상 방식 선택",
@@ -13891,9 +13947,9 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
             with ts1:
                 new_date = st.date_input("날짜", value=today, key="my_new_date")
             with ts2:
-                new_start = st.time_input("시작 시간", value=dt_time(18, 0), step=60, key="my_new_start")
+                new_start = _erp_time_input_30min("시작 시간", value=dt_time(18, 0), key="my_new_start")
             with ts3:
-                new_end = st.time_input("종료 시간", value=dt_time(20, 0), step=60, key="my_new_end")
+                new_end = _erp_time_input_30min("종료 시간", value=dt_time(20, 0), key="my_new_end")
             with ts4:
                 new_store_label = st.selectbox("근무지", _adj_store_labels,
                                                index=_adj_home_idx, key="my_new_store")
