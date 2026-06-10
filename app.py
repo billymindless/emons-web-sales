@@ -9153,54 +9153,18 @@ def _erp_time_input_30min(
     key: str,
     label_visibility: str = "visible",
 ) -> dt_time:
-    """30분 단위 selectbox + 직접 입력 옵션이 결합된 시간 입력 위젯.
+    """30분 단위 스텝 시간 입력 위젯.
 
-    - 00:00 ~ 23:30 사이의 30분 단위 옵션 표시
-    - 기존 값이 30분 단위면 해당 슬롯 자동 선택, 아니면 '직접 입력' 선택됨
-    - '직접 입력' 선택 시 HH:MM 텍스트 입력창 추가 노출
-    - datetime.time 반환
+    화살표(▲▼)는 30분 단위로 이동하며, 시간/분 부분을 클릭 후 직접 타이핑도 가능.
+    st.time_input(step=1800) 래퍼 — 저장 누락 없이 모든 컨텍스트(폼 내외)에서 동작.
     """
-    # 30분 단위 슬롯 목록 + 직접 입력
-    _SLOTS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
-    _MANUAL = "직접 입력"
-    options = _SLOTS + [_MANUAL]
-
-    # 기본 선택 슬롯 결정
-    if isinstance(value, dt_time):
-        val_str = f"{value.hour:02d}:{value.minute:02d}"
-        default_idx = options.index(val_str) if val_str in _SLOTS else len(_SLOTS)
-    else:
-        default_idx = 0
-
-    sel = st.selectbox(
+    return st.time_input(
         label,
-        options,
-        index=default_idx,
-        key=f"{key}_sel30",
+        value=value if isinstance(value, dt_time) else dt_time(9, 0),
+        key=key,
+        step=1800,
         label_visibility=label_visibility,
     )
-
-    if sel == _MANUAL:
-        # 직접 입력 텍스트 박스
-        init_manual = f"{value.hour:02d}:{value.minute:02d}" if isinstance(value, dt_time) else "09:00"
-        raw = st.text_input(
-            "시간 직접 입력",
-            value=init_manual,
-            key=f"{key}_manual30",
-            placeholder="예: 09:15",
-            label_visibility="collapsed",
-        )
-        try:
-            h, m = map(int, (raw or "").strip().split(":"))
-            if 0 <= h <= 23 and 0 <= m <= 59:
-                return dt_time(h, m)
-            st.caption("⚠️ 0~23시, 0~59분 범위를 확인해 주세요.")
-        except Exception:
-            st.caption("⚠️ HH:MM 형식으로 입력해 주세요 (예: 09:15)")
-        return value if isinstance(value, dt_time) else dt_time(9, 0)
-
-    h, m = map(int, sel.split(":"))
-    return dt_time(h, m)
 
 
 def _erp_get_employee_names_for_store(db_filename: str) -> list:
