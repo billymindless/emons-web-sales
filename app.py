@@ -10425,18 +10425,23 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     today = _today_kst()
 
     # ── 기간 선택 ────────────────────────────────────────────────
+    import calendar as _cal
     col_a, col_b = st.columns([1, 2])
     with col_a:
         period_mode = st.radio("기간", ["1주", "2주", "1개월"], horizontal=True, index=2, key="erp_shift_period")
     with col_b:
-        base_date = st.date_input("시작일", value=today, key="erp_shift_base_date")
-    if period_mode == "1주":
-        days_n = 7
-    elif period_mode == "2주":
-        days_n = 14
-    else:
-        days_n = 30
-    date_list = [base_date + timedelta(days=i) for i in range(days_n)]
+        if period_mode == "1개월":
+            # 월 단위: 기본값은 이번 달 1일, 선택한 날짜의 해당 월 전체를 표시
+            month_first = today.replace(day=1)
+            base_date = st.date_input("시작일", value=month_first, key="erp_shift_base_month")
+            _last_day = _cal.monthrange(base_date.year, base_date.month)[1]
+            period_start = base_date.replace(day=1)
+            period_end   = base_date.replace(day=_last_day)
+            date_list = [period_start + timedelta(days=i) for i in range((period_end - period_start).days + 1)]
+        else:
+            base_date = st.date_input("시작일", value=today, key="erp_shift_base_date")
+            days_n = 7 if period_mode == "1주" else 14
+            date_list = [base_date + timedelta(days=i) for i in range(days_n)]
 
     employees = _erp_get_employee_names_for_store(current_db)
     if not employees:
