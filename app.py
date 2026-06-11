@@ -10181,17 +10181,17 @@ def _erp_collect_auto_adjustments(*, db_filename: str, employee_name: str,
                                   shifts: list, source_tag: str, created_by: str,
                                   work_db_filename: str | None = None,
                                   work_location_name: str | None = None) -> dict:
-    """여러 시프트에 대해 매장 표준 대비 차이를 일괄 등록.
+    """여러 시프트에 대해 매장 표준 대비 차이를 후보 풀에 적재.
 
     shifts: [{"shift_date":"YYYY-MM-DD", "shift_start":"HH:MM" or "HH:MM:SS",
               "shift_end":"...", "work_location_name": str | None}]
-    단축(diff<0)은 즉시 자동 pending 등록.
-    연장(diff>0)은 session_state['_erp_overtime_candidates'] 에 후보로 적재.
-    반환: {short_registered:int, overtime_candidates:int, errors:list[str]}
+    연장(diff>0) / 단축(diff<0) 모두 session_state['_erp_overtime_candidates'] 에
+    후보로 적재되어 사용자가 [✅ 신청]/[❌ 취소] 선택 후 pending 등록 → 관리자 승인.
+    반환: {candidates_added:int, errors:list[str]}
     """
-    short_registered = 0
+    candidates_added = 0
     errors: list[str] = []
-    overtime_pool = st.session_state.setdefault("_erp_overtime_candidates", [])
+    pool = st.session_state.setdefault("_erp_overtime_candidates", [])
 
     for sh in shifts:
         try:
@@ -10214,55 +10214,49 @@ def _erp_collect_auto_adjustments(*, db_filename: str, employee_name: str,
             wloc = (sh.get("work_location_name") or work_location_name) or None
             wdb = work_db_filename or db_filename
 
-            if diff_min < 0:
-                ok, e = _erp_upsert_auto_adjustment(
-                    db_filename=db_filename, employee_name=employee_name,
-                    target_date=d_str, diff_min=diff_min,
-                    std_start_str=std_ss, std_end_str=std_ee,
-                    actual_start_str=act_ss, actual_end_str=act_ee,
-                    source_tag=source_tag, created_by=created_by,
-                    work_db_filename=wdb, work_location_name=wloc,
-                )
-                if ok:
-                    short_registered += 1
-                else:
-                    errors.append(f"{d_str} 단축 등록 실패: {e}")
-            elif diff_min > 0:
-                # 동일 후보 중복 방지 (같은 emp+date+source 만 유지)
-                overtime_pool[:] = [c for c in overtime_pool
-                                    if not (c.get("employee_name") == employee_name
-                                            and c.get("target_date") == d_str
-                                            and c.get("source_tag") == source_tag)]
-                overtime_pool.append({
-                    "db_filename": db_filename,
-                    "employee_name": employee_name,
-                    "target_date": d_str,
-                    "diff_min": diff_min,
-                    "std_start": std_ss, "std_end": std_ee,
-                    "actual_start": act_ss, "actual_end": act_ee,
-                    "source_tag": source_tag,
-                    "created_by": created_by,
-                    "work_db_filename": wdb,
-                    "work_location_name": wloc,
-                })
-            else:
-                # 차이 0: 기존 자동 행 정리
+            # 차이 0이면 기존 자동 행만 정리하고 후보 추가 X
+            if diff_min == 0:
                 _erp_delete_existing_auto_adjustment(db_filename, employee_name, d_str, source_tag)
+                # 기존 후보 중 동일한 항목도 제거
+                pool[:] = [c for c in pool
+                           if not (c.get("employee_name") == employee_name
+                                   and c.get("target_date") == d_str
+                                   and c.get("source_tag") == source_tag)]
+                continue
+
+            # 동일 후보 중복 방지 (같은 emp+date+source 만 유지)
+            pool[:] = [c for c in pool
+                       if not (c.get("employee_name") == employee_name
+                               and c.get("target_date") == d_str
+                               and c.get("source_tag") == source_tag)]
+            pool.append({
+                "db_filename": db_filename,
+                "employee_name": employee_name,
+                "target_date": d_str,
+                "diff_min": diff_min,
+                "std_start": std_ss, "std_end": std_ee,
+                "actual_start": act_ss, "actual_end": act_ee,
+                "source_tag": source_tag,
+                "created_by": created_by,
+                "work_db_filename": wdb,
+                "work_location_name": wloc,
+            })
+            candidates_added += 1
         except Exception as ex:
             errors.append(f"{sh.get('shift_date')}: {ex}")
 
     return {
-        "short_registered": short_registered,
-        "overtime_candidates": len(overtime_pool),
+        "candidates_added": candidates_added,
         "errors": errors,
     }
 
 
 def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> None:
-    """저장 후 화면 상단에 표시되는 '연장근무 자동 신청 대기' UI.
+    """저장 후 화면 상단에 표시되는 '근무시간 자동 조정 대기' UI.
 
-    scope_employee 지정 시 해당 직원의 후보만 렌더링 (캘린더는 직원별 뷰).
-    각 후보별 [신청]/[취소] + 전체 [모두 신청]/[모두 취소] 버튼.
+    연장(+)/단축(-) 모두 표시. 사용자가 [✅ 신청]/[❌ 취소] 선택 시 pending 등록
+    → 관리자 승인 후 대시보드에 반영.
+    scope_employee 지정 시 해당 직원의 후보만 렌더링.
     """
     pool = st.session_state.get("_erp_overtime_candidates") or []
     if scope_employee:
@@ -10270,21 +10264,29 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
     if not pool:
         return
 
+    n_ext = sum(1 for c in pool if int(c.get("diff_min") or 0) > 0)
+    n_sht = sum(1 for c in pool if int(c.get("diff_min") or 0) < 0)
     st.markdown(
         "<div style='background:#FFF8E1; border-left:4px solid #FB8C00; "
         "padding:12px 16px; border-radius:8px; margin:10px 0;'>"
-        f"<b>🔔 연장근무 자동 신청 대기 ({len(pool)}건)</b><br>"
-        "<span style='font-size:0.86rem; color:#555;'>다음 일정은 매장 표준보다 길게 근무했습니다. "
-        "신청 시 관리자 승인 후 실제 근무시간에 반영됩니다.</span>"
+        f"<b>🔔 근무시간 자동 조정 신청 대기 ({len(pool)}건 — 연장 {n_ext} · 단축 {n_sht})</b><br>"
+        "<span style='font-size:0.86rem; color:#555;'>다음 일정은 매장 표준 시간과 차이가 있습니다. "
+        "신청 후 관리자 승인을 거쳐 실제 근무시간에 가산(+) 또는 차감(−) 반영됩니다.</span>"
         "</div>",
         unsafe_allow_html=True,
     )
 
     for idx, cand in enumerate(list(pool)):
+        diff_min = int(cand.get("diff_min") or 0)
+        is_ext = diff_min > 0
+        sign_label = "+" if is_ext else "−"
+        kind_label = "연장근무" if is_ext else "단축근무"
+        color = "#E65100" if is_ext else "#C62828"  # 연장: 주황, 단축: 빨강
+
         cols = st.columns([2, 2, 1.2, 1, 1])
         with cols[0]:
             st.markdown(
-                f"**{cand['target_date']}** · {cand['employee_name']}"
+                f"**{cand['target_date']}** · {cand['employee_name']} · <span style='color:{color}; font-weight:600;'>{kind_label}</span>"
                 f"<br><span style='color:#888; font-size:0.82rem;'>"
                 f"표준 {cand['std_start']}~{cand['std_end']} → 실제 {cand['actual_start']}~{cand['actual_end']}"
                 f"</span>",
@@ -10292,8 +10294,8 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
             )
         with cols[1]:
             st.markdown(
-                f"<span style='color:#E65100; font-weight:600; font-size:1.05rem;'>"
-                f"+{_erp_fmt_hm(int(cand['diff_min']))}</span>"
+                f"<span style='color:{color}; font-weight:700; font-size:1.05rem;'>"
+                f"{sign_label}{_erp_fmt_hm(abs(diff_min))}</span>"
                 f"<br><span style='color:#999; font-size:0.78rem;'>{cand['source_tag']}</span>",
                 unsafe_allow_html=True,
             )
@@ -10302,10 +10304,10 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
             st.markdown(f"<span style='color:#607D8B; font-size:0.82rem;'>{_wloc}</span>",
                         unsafe_allow_html=True)
         with cols[3]:
-            if st.button("✅ 신청", key=f"ot_apply_{idx}_{cand['employee_name']}_{cand['target_date']}", type="primary"):
+            if st.button("✅ 신청", key=f"adj_apply_{idx}_{cand['employee_name']}_{cand['target_date']}", type="primary"):
                 ok, e = _erp_upsert_auto_adjustment(
                     db_filename=cand["db_filename"], employee_name=cand["employee_name"],
-                    target_date=cand["target_date"], diff_min=int(cand["diff_min"]),
+                    target_date=cand["target_date"], diff_min=diff_min,
                     std_start_str=cand["std_start"], std_end_str=cand["std_end"],
                     actual_start_str=cand["actual_start"], actual_end_str=cand["actual_end"],
                     source_tag=cand["source_tag"], created_by=cand["created_by"],
@@ -10319,12 +10321,12 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
                                 and c.get("target_date") == cand["target_date"]
                                 and c.get("source_tag") == cand["source_tag"])
                     ]
-                    flash(f"{cand['target_date']} 연장근무 {_erp_fmt_hm(int(cand['diff_min']))} 신청 완료 (승인 대기)", "success")
+                    flash(f"{cand['target_date']} {kind_label} {sign_label}{_erp_fmt_hm(abs(diff_min))} 신청 완료 (승인 대기)", "success")
                     st.rerun()
                 else:
                     st.error(f"신청 실패: {e}")
         with cols[4]:
-            if st.button("❌ 취소", key=f"ot_skip_{idx}_{cand['employee_name']}_{cand['target_date']}"):
+            if st.button("❌ 취소", key=f"adj_skip_{idx}_{cand['employee_name']}_{cand['target_date']}"):
                 st.session_state["_erp_overtime_candidates"] = [
                     c for c in st.session_state.get("_erp_overtime_candidates", [])
                     if not (c.get("employee_name") == cand["employee_name"]
@@ -10336,7 +10338,7 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
     # 일괄 액션
     _ab1, _ab2, _ = st.columns([1.2, 1.2, 5])
     with _ab1:
-        if st.button("✅ 모두 신청", key="ot_apply_all", type="primary"):
+        if st.button("✅ 모두 신청", key="adj_apply_all", type="primary"):
             _all = list(st.session_state.get("_erp_overtime_candidates") or [])
             ok_n, fail_n = 0, 0
             for c in _all:
@@ -10359,10 +10361,10 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
                 c for c in st.session_state.get("_erp_overtime_candidates", [])
                 if scope_employee and c.get("employee_name") != scope_employee
             ]
-            flash(f"연장근무 일괄 신청 완료 — 성공 {ok_n}건 / 실패 {fail_n}건 (승인 대기)", "success")
+            flash(f"근무시간 조정 일괄 신청 완료 — 성공 {ok_n}건 / 실패 {fail_n}건 (승인 대기)", "success")
             st.rerun()
     with _ab2:
-        if st.button("❌ 모두 취소", key="ot_skip_all"):
+        if st.button("❌ 모두 취소", key="adj_skip_all"):
             st.session_state["_erp_overtime_candidates"] = [
                 c for c in st.session_state.get("_erp_overtime_candidates", [])
                 if scope_employee and c.get("employee_name") != scope_employee
@@ -11202,9 +11204,9 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 work_db_filename=_adj_db,
                 work_location_name=(loc_input or None),
             )
-            if _result["short_registered"]:
+            if _result["candidates_added"]:
                 flash(
-                    f"⚠️ 단축근무 {_result['short_registered']}건이 자동 차감 등록되었습니다 (승인 대기).",
+                    f"⏱️ 매장 표준 시간과 차이가 있는 일정 {_result['candidates_added']}건 — 상단의 [근무시간 자동 조정 신청 대기]에서 확인 후 신청해 주세요.",
                     level="warning",
                 )
             if _result["errors"]:
