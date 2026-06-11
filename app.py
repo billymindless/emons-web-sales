@@ -9149,6 +9149,42 @@ def _erp_parse_time(s, default=None):
         return default
 
 
+def _erp_parse_time_loose(raw: str) -> tuple[int, int] | None:
+    """다양한 형식의 시각 문자열을 (h, m) 튜플로 파싱.
+
+    허용:
+      - "14:30", "09:15"   (HH:MM)
+      - "1430", "0915"     (HHMM, 4자리)
+      - "930"              (HMM, 3자리 → 9:30)
+      - "14", "9"          (HH 또는 H → 14:00 / 9:00)
+      - "1.30", "14,30"    (구분자 . 또는 , 도 허용)
+    실패 시 None.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    h = m = None
+    try:
+        for sep in (":", ".", ","):
+            if sep in s:
+                parts = s.split(sep, 1)
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    h, m = int(parts[0]), int(parts[1])
+                break
+        if h is None and s.isdigit():
+            if len(s) == 4:
+                h, m = int(s[:2]), int(s[2:])
+            elif len(s) == 3:
+                h, m = int(s[:1]), int(s[1:])
+            elif 1 <= len(s) <= 2:
+                h, m = int(s), 0
+        if h is not None and 0 <= h <= 23 and 0 <= m <= 59:
+            return (h, m)
+    except Exception:
+        return None
+    return None
+
+
 def _erp_time_input_30min(
     label: str,
     value: dt_time,
@@ -9157,12 +9193,8 @@ def _erp_time_input_30min(
 ) -> dt_time:
     """근태용 HH:MM 텍스트 시간 입력 위젯 (수기 친화).
 
-    허용 입력 형식 (모두 자동 인식):
-      - "14:30", "09:15"   (HH:MM)
-      - "1430", "0915"     (HHMM, 4자리)
-      - "930"              (HMM, 3자리 → 9:30)
-      - "14", "9"          (HH 또는 H → 14:00 / 9:00)
-      - "1.30", "14,30"    (구분자 . 또는 , 도 허용)
+    사용자가 "1430" 등을 입력하고 포커스 이탈/Enter 누르면 on_change 콜백이
+    `HH:MM` 형식으로 즉시 보정하여 입력란에 ":" 가 자동으로 표시됩니다.
     """
     if isinstance(value, dt_time):
         init_str = f"{value.hour:02d}:{value.minute:02d}"
@@ -9171,6 +9203,16 @@ def _erp_time_input_30min(
         init_str = "09:00"
         fallback = dt_time(9, 0)
 
+    def _normalize_on_change():
+        raw = st.session_state.get(key, "")
+        parsed = _erp_parse_time_loose(raw)
+        if parsed is None:
+            return
+        h, m = parsed
+        normalized = f"{h:02d}:{m:02d}"
+        if raw != normalized:
+            st.session_state[key] = normalized
+
     raw = st.text_input(
         label,
         value=init_str,
@@ -9178,42 +9220,16 @@ def _erp_time_input_30min(
         placeholder="HH:MM 또는 HHMM (예: 14:30 / 1430)",
         max_chars=5,
         label_visibility=label_visibility,
+        on_change=_normalize_on_change,
     )
 
-    s = (raw or "").strip()
-    if not s:
+    parsed = _erp_parse_time_loose(raw)
+    if parsed is None:
+        s = (raw or "").strip()
+        if s:
+            st.caption(f"⚠️ '{s}' — HH:MM 또는 HHMM 형식으로 입력해 주세요 (예: 14:30 / 1430)")
         return fallback
-
-    h = m = None
-    try:
-        # 구분자(:, ., ,) 정규화
-        for sep in (":", ".", ","):
-            if sep in s:
-                parts = s.split(sep, 1)
-                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                    h, m = int(parts[0]), int(parts[1])
-                break
-        # 구분자 없이 숫자만 입력
-        if h is None and s.isdigit():
-            if len(s) == 4:        # HHMM
-                h, m = int(s[:2]), int(s[2:])
-            elif len(s) == 3:      # HMM
-                h, m = int(s[:1]), int(s[1:])
-            elif 1 <= len(s) <= 2: # HH 또는 H
-                h, m = int(s), 0
-
-        if h is not None and 0 <= h <= 23 and 0 <= m <= 59:
-            # 입력값이 정규화 형식과 다르면 다음 rerun에서 자동 보정 (예: '1430' → '14:30')
-            normalized = f"{h:02d}:{m:02d}"
-            if s != normalized:
-                st.session_state[key] = normalized
-                st.caption(f"✅ `{s}` → **{normalized}** 으로 인식됨")
-            return dt_time(h, m)
-
-        st.caption(f"⚠️ '{s}' — HH:MM 또는 HHMM 형식으로 입력해 주세요 (예: 14:30 / 1430)")
-    except Exception:
-        st.caption(f"⚠️ '{s}' — HH:MM 또는 HHMM 형식으로 입력해 주세요 (예: 14:30 / 1430)")
-    return fallback
+    return dt_time(parsed[0], parsed[1])
 
 
 def _erp_get_employee_names_for_store(db_filename: str) -> list:
