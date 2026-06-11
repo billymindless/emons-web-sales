@@ -10059,16 +10059,23 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         elif wt in ("추가근무", "행사"):
             overtime_min_logs += actual_min
         elif wt in ("지각", "조퇴"):
-            try:
-                _ld = date.fromisoformat(_ld_str) if _ld_str else as_of
-                std_s, std_e = _erp_default_times_for_date(db_filename, _ld)
-                std_min = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
-            except Exception:
-                std_min = 480
-            diff = std_min - actual_min
-            if diff > 0:
-                short_min_logs += diff
-            normal_min_logs += actual_min
+            # 자동 단축 신청 승인 시 캘린더에 '조퇴'로 동기화된 행은
+            # work_adjustments에서 이미 카운트되므로 short 중복 방지.
+            _log_note = (l.get("note") or "")
+            _is_auto_synced = any(_log_note.startswith(t) for t in _ERP_AUTO_ADJ_TAGS)
+            if _is_auto_synced:
+                normal_min_logs += actual_min  # 출근 시간만 정상 카운트, 단축은 adj에서
+            else:
+                try:
+                    _ld = date.fromisoformat(_ld_str) if _ld_str else as_of
+                    std_s, std_e = _erp_default_times_for_date(db_filename, _ld)
+                    std_min = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
+                except Exception:
+                    std_min = 480
+                diff = std_min - actual_min
+                if diff > 0:
+                    short_min_logs += diff
+                normal_min_logs += actual_min
         elif wt == "연차":
             leave_min += 480
         elif wt == "반차":
@@ -10192,12 +10199,14 @@ def _erp_upsert_auto_adjustment(*, db_filename: str, employee_name: str,
                                 actual_start_str: str, actual_end_str: str,
                                 source_tag: str, created_by: str,
                                 work_db_filename: str | None = None,
-                                work_location_name: str | None = None) -> tuple[bool, str]:
+                                work_location_name: str | None = None,
+                                user_note: str | None = None) -> tuple[bool, str]:
     """자동 연장(+)/단축(-) 신청 행을 pending으로 insert. 기존 [자동] 행은 사전 정리.
 
     - diff > 0: kind='overtime', sign='+'
     - diff < 0: kind='etc',      sign='-'
     - diff == 0: no-op (True 반환)
+    - user_note: 사용자가 직접 입력한 비고 (reason 끝에 ' | 비고: ...' 형식으로 결합)
     """
     diff_min = int(diff_min or 0)
     if diff_min == 0:
@@ -10216,6 +10225,9 @@ def _erp_upsert_auto_adjustment(*, db_filename: str, employee_name: str,
         f"{source_tag} {direction} {_erp_fmt_hm(minutes_abs)} "
         f"(표준 {std_start_str}~{std_end_str} → 실제 {actual_start_str}~{actual_end_str})"
     )
+    _note_clean = (user_note or "").strip()
+    if _note_clean:
+        reason = f"{reason} | 비고: {_note_clean}"
 
     payload = {
         "db_filename": db_filename,
@@ -10346,29 +10358,39 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
         sign_label = "+" if is_ext else "−"
         kind_label = "연장근무" if is_ext else "단축근무"
         color = "#E65100" if is_ext else "#C62828"  # 연장: 주황, 단축: 빨강
+        _cand_key = f"{cand['employee_name']}_{cand['target_date']}_{cand['source_tag']}"
 
-        cols = st.columns([2, 2, 1.2, 1, 1])
+        cols = st.columns([1.6, 1.3, 2.5, 0.9, 0.9])
         with cols[0]:
             st.markdown(
-                f"**{cand['target_date']}** · {cand['employee_name']} · <span style='color:{color}; font-weight:600;'>{kind_label}</span>"
-                f"<br><span style='color:#888; font-size:0.82rem;'>"
+                f"**{cand['target_date']}** · {cand['employee_name']}<br>"
+                f"<span style='color:{color}; font-weight:600;'>{kind_label}</span> "
+                f"<span style='color:#888; font-size:0.78rem;'>"
                 f"표준 {cand['std_start']}~{cand['std_end']} → 실제 {cand['actual_start']}~{cand['actual_end']}"
                 f"</span>",
                 unsafe_allow_html=True,
             )
         with cols[1]:
+            _wloc = cand.get("work_location_name") or "—"
             st.markdown(
-                f"<span style='color:{color}; font-weight:700; font-size:1.05rem;'>"
+                f"<span style='color:{color}; font-weight:700; font-size:1.15rem;'>"
                 f"{sign_label}{_erp_fmt_hm(abs(diff_min))}</span>"
-                f"<br><span style='color:#999; font-size:0.78rem;'>{cand['source_tag']}</span>",
+                f"<br><span style='color:#607D8B; font-size:0.78rem;'>{_wloc}</span>",
                 unsafe_allow_html=True,
             )
         with cols[2]:
-            _wloc = cand.get("work_location_name") or "—"
-            st.markdown(f"<span style='color:#607D8B; font-size:0.82rem;'>{_wloc}</span>",
-                        unsafe_allow_html=True)
+            _note_key = f"adj_note_{idx}_{_cand_key}"
+            _placeholder = "비고 (선택) — 예: 고객 응대 연장 / 본사 회의" if is_ext else "비고 (선택) — 예: 병원 진료 / 조퇴 사유"
+            user_note = st.text_input(
+                "비고",
+                value=st.session_state.get(_note_key, ""),
+                key=_note_key,
+                placeholder=_placeholder,
+                label_visibility="collapsed",
+            )
         with cols[3]:
-            if st.button("✅ 신청", key=f"adj_apply_{idx}_{cand['employee_name']}_{cand['target_date']}", type="primary"):
+            if st.button("✅ 신청", key=f"adj_apply_{idx}_{_cand_key}", type="primary"):
+                _user_note = (st.session_state.get(_note_key) or "").strip()
                 ok, e = _erp_upsert_auto_adjustment(
                     db_filename=cand["db_filename"], employee_name=cand["employee_name"],
                     target_date=cand["target_date"], diff_min=diff_min,
@@ -10377,6 +10399,7 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
                     source_tag=cand["source_tag"], created_by=cand["created_by"],
                     work_db_filename=cand.get("work_db_filename"),
                     work_location_name=cand.get("work_location_name"),
+                    user_note=_user_note,
                 )
                 if ok:
                     st.session_state["_erp_overtime_candidates"] = [
@@ -10385,18 +10408,20 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
                                 and c.get("target_date") == cand["target_date"]
                                 and c.get("source_tag") == cand["source_tag"])
                     ]
+                    st.session_state.pop(_note_key, None)
                     flash(f"{cand['target_date']} {kind_label} {sign_label}{_erp_fmt_hm(abs(diff_min))} 신청 완료 (승인 대기)", "success")
                     st.rerun()
                 else:
                     st.error(f"신청 실패: {e}")
         with cols[4]:
-            if st.button("❌ 취소", key=f"adj_skip_{idx}_{cand['employee_name']}_{cand['target_date']}"):
+            if st.button("❌ 취소", key=f"adj_skip_{idx}_{_cand_key}"):
                 st.session_state["_erp_overtime_candidates"] = [
                     c for c in st.session_state.get("_erp_overtime_candidates", [])
                     if not (c.get("employee_name") == cand["employee_name"]
                             and c.get("target_date") == cand["target_date"]
                             and c.get("source_tag") == cand["source_tag"])
                 ]
+                st.session_state.pop(_note_key, None)
                 st.rerun()
 
     # 일괄 액션
@@ -10405,9 +10430,11 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
         if st.button("✅ 모두 신청", key="adj_apply_all", type="primary"):
             _all = list(st.session_state.get("_erp_overtime_candidates") or [])
             ok_n, fail_n = 0, 0
-            for c in _all:
+            for _i, c in enumerate(_all):
                 if scope_employee and c.get("employee_name") != scope_employee:
                     continue
+                _ckey = f"{c['employee_name']}_{c['target_date']}_{c['source_tag']}"
+                _note_val = (st.session_state.get(f"adj_note_{_i}_{_ckey}") or "").strip()
                 ok, _ = _erp_upsert_auto_adjustment(
                     db_filename=c["db_filename"], employee_name=c["employee_name"],
                     target_date=c["target_date"], diff_min=int(c["diff_min"]),
@@ -10416,6 +10443,7 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
                     source_tag=c["source_tag"], created_by=c["created_by"],
                     work_db_filename=c.get("work_db_filename"),
                     work_location_name=c.get("work_location_name"),
+                    user_note=_note_val,
                 )
                 if ok:
                     ok_n += 1
@@ -14137,47 +14165,52 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     })
                     if ok:
                         _erp_v2_clear_caches()
-                        # 추가근무·회의(+)는 캘린더(app_attendance_logs)에 반영
-                        if kind in ("overtime", "meeting") and sign == "+":
+                        # 캘린더(app_attendance_logs)에 자동 반영 — 연장(+)·단축(-) 모두 비고와 함께
+                        try:
+                            _shift_s = str(adj.get("shift_start") or "")[:8] or None
+                            _shift_e = str(adj.get("shift_end") or "")[:8] or None
+                            _work_db_adj = adj.get("work_db_filename") or current_db
+                            _work_loc_adj = adj.get("work_location_name")
+                            _td_str = str(adj.get("target_date") or "")[:10]
                             try:
-                                _shift_s = str(adj.get("shift_start") or "")[:8] or None
-                                _shift_e = str(adj.get("shift_end") or "")[:8] or None
-                                _work_db_adj = adj.get("work_db_filename") or current_db
-                                _work_loc_adj = adj.get("work_location_name")
-                                _td_str = str(adj.get("target_date") or "")[:10]
-                                try:
-                                    _log_date_d = date.fromisoformat(_td_str)
-                                except Exception:
-                                    _log_date_d = _today_kst()
-                                _std_s, _std_e = _erp_default_times_for_date(current_db, _log_date_d)
-                                _log_row = {
-                                    "home_db_filename": current_db,
-                                    "work_db_filename": _work_db_adj,
-                                    "work_location_name": _work_loc_adj,
-                                    "employee_name": adj.get("employee_name"),
-                                    "log_date": _td_str,
-                                    "work_type": "추가근무" if kind == "overtime" else "회의",
-                                    "leave_deduction": 0,
-                                    "diff_minutes": minutes,
-                                    "start_time": _shift_s,
-                                    "end_time": _shift_e,
-                                    "standard_start": _std_s.strftime("%H:%M:%S"),
-                                    "standard_end": _std_e.strftime("%H:%M:%S"),
-                                    "status": "approved",
-                                    "note": adj.get("reason"),
-                                    "created_by": me_name,
-                                }
-                                _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_row)
-                                if not _log_ok:
-                                    _log_min = {k: v for k, v in _log_row.items()
-                                                if k not in ("work_db_filename", "work_location_name", "leave_deduction")}
-                                    _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_min)
-                                if _log_ok:
-                                    st.toast(f"📅 캘린더에 반영됨: {adj.get('employee_name')} {_td_str}", icon="📅")
-                                else:
-                                    st.error(f"❌ 캘린더 반영 실패: {_log_err}")
-                            except Exception as _sync_ex:
-                                st.error(f"❌ 캘린더 반영 중 예외: {_sync_ex}")
+                                _log_date_d = date.fromisoformat(_td_str)
+                            except Exception:
+                                _log_date_d = _today_kst()
+                            _std_s, _std_e = _erp_default_times_for_date(current_db, _log_date_d)
+                            # work_type 매핑: 연장(+) → '추가근무'/'회의', 단축(-) → '조퇴' (비고로 단축 식별)
+                            if sign == "+":
+                                _wt_map = {"overtime": "추가근무", "meeting": "회의"}
+                                _wt = _wt_map.get(kind, "추가근무")
+                            else:
+                                _wt = "조퇴"
+                            _log_row = {
+                                "home_db_filename": current_db,
+                                "work_db_filename": _work_db_adj,
+                                "work_location_name": _work_loc_adj,
+                                "employee_name": adj.get("employee_name"),
+                                "log_date": _td_str,
+                                "work_type": _wt,
+                                "leave_deduction": 0,
+                                "diff_minutes": minutes,
+                                "start_time": _shift_s,
+                                "end_time": _shift_e,
+                                "standard_start": _std_s.strftime("%H:%M:%S"),
+                                "standard_end": _std_e.strftime("%H:%M:%S"),
+                                "status": "approved",
+                                "note": adj.get("reason"),
+                                "created_by": me_name,
+                            }
+                            _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_row)
+                            if not _log_ok:
+                                _log_min = {k: v for k, v in _log_row.items()
+                                            if k not in ("work_db_filename", "work_location_name", "leave_deduction")}
+                                _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_min)
+                            if _log_ok:
+                                st.toast(f"📅 캘린더 반영: {adj.get('employee_name')} {_td_str} ({sign}{_wt})", icon="📅")
+                            else:
+                                st.error(f"❌ 캘린더 반영 실패: {_log_err}")
+                        except Exception as _sync_ex:
+                            st.error(f"❌ 캘린더 반영 중 예외: {_sync_ex}")
                         flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
                         st.rerun()
                     else:
