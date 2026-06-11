@@ -543,6 +543,7 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_POSTS.sql",
         "SUPABASE_APP_BANK_ACCOUNTS.sql",
         "SUPABASE_APP_DEPOSITS.sql",
+        "SUPABASE_APP_WORK_ADJ_LONG_SERVICE.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -605,7 +606,8 @@ def _supabase_run_task_tables_sql() -> bool:
                   "SUPABASE_APP_TASKS_SCOPE.sql",
                   "SUPABASE_APP_POSTS.sql",
                   "SUPABASE_APP_BANK_ACCOUNTS.sql",
-                  "SUPABASE_APP_DEPOSITS.sql"):
+                  "SUPABASE_APP_DEPOSITS.sql",
+                  "SUPABASE_APP_WORK_ADJ_LONG_SERVICE.sql"):
         fpath = os.path.join(BASE_DIR, fname)
         if os.path.isfile(fpath) and _supabase_run_sql_file(db_url, fpath):
             ok = True
@@ -9767,11 +9769,12 @@ def _erp_delete_row(table: str, row_id: int) -> tuple[bool, str]:
 # (스키마: SUPABASE_APP_ATTENDANCE_V2.sql)
 # =====================================================================
 
-_ERP_ADJ_KINDS = ("reward", "meeting", "summer_vacation", "overtime", "etc")
+_ERP_ADJ_KINDS = ("reward", "meeting", "summer_vacation", "long_service", "overtime", "etc")
 _ERP_ADJ_KIND_LABEL = {
     "reward": "포상",
     "meeting": "회의",
     "summer_vacation": "여름휴가",
+    "long_service": "장기근속",
     "overtime": "추가근무",
     "etc": "기타",
 }
@@ -9779,6 +9782,7 @@ _ERP_ADJ_KIND_DEFAULT_SIGN = {
     "reward": "-",
     "meeting": "+",
     "summer_vacation": "-",
+    "long_service": "-",
     "overtime": "+",
     "etc": "+",
 }
