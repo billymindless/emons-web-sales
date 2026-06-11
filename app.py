@@ -12152,11 +12152,24 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     f" padding:0px 3px; border-radius:2px; margin-right:2px;'>"
                     f"{_badge_label}</span> "
                 ) if _show_badge else ""
+                # 비고(note): 특별근무·초과근무 사유 등 — 본문 + 툴팁
+                _note_txt = str(sh.get("note") or "").strip()
+                if _note_txt:
+                    _note_safe = (_note_txt.replace("&", "&amp;").replace("<", "&lt;")
+                                          .replace(">", "&gt;").replace('"', "&quot;"))
+                    _note_html = (
+                        f"<div style='margin-left:6px; font-size:0.6rem; color:#8E24AA;"
+                        f" line-height:1.1; word-break:break-word;'"
+                        f" title='{_note_safe}'>📝 {_note_safe}</div>"
+                    )
+                else:
+                    _note_html = ""
                 cell.append(
                     f"<div style='margin-top:2px; border-left:3px solid {sc};"
                     f" background:{sc}15; padding:1px 3px; border-radius:0 2px 2px 0;'>"
                     f"{sn_badge}<span style='color:{sc}; font-weight:600; font-size:0.7rem;'>{emp}</span>"
-                    f"<span style='color:#666; font-size:0.65rem;'>{time_txt}</span></div>"
+                    f"<span style='color:#666; font-size:0.65rem;'>{time_txt}</span>"
+                    f"{_note_html}</div>"
                 )
 
             # 근태 기록 (attendance_logs) — 실근무지 기준 컬러 (work_location_name 컬럼이 있으면 우선)
@@ -12591,6 +12604,13 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                             _e_final_loc = (_e_loc_etc or "").strip()
                         else:
                             _e_final_loc = _e_loc_sel
+                        _e_note = st.text_input(
+                            "비고 (특별근무 · 초과근무 사유 등)",
+                            value=str(_sh.get("note") or ""),
+                            key=f"qe_e_note_{_sid}",
+                            placeholder="예: 행사 지원 / 인수인계 야근 / 명절 특근",
+                            help="여기에 입력한 메모는 캘린더와 월말 요약 다운로드에 함께 표기됩니다.",
+                        )
                         _eb1, _eb2, _ = st.columns([1, 1, 3])
                         with _eb1:
                             if st.button("💾 저장", type="primary", key=f"qe_e_save_{_sid}"):
@@ -12607,6 +12627,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                                         "shift_start": _e_start.strftime("%H:%M:%S"),
                                         "shift_end": _e_end.strftime("%H:%M:%S"),
                                         "work_location_name": _wloc_e,
+                                        "note": (_e_note or "").strip() or None,
                                     })
                                     if ok:
                                         # 매장 표준 대비 차이 자동 보정
@@ -12709,6 +12730,14 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         else:
             _final_loc = qe_new_loc_sel
 
+        qe_new_note = st.text_input(
+            "비고 (특별근무 · 초과근무 사유 등)",
+            value="",
+            key="qe_new_note_calendar",
+            placeholder="예: 행사 지원 / 인수인계 야근 / 명절 특근",
+            help="여기에 입력한 메모는 캘린더와 월말 요약 다운로드에 함께 표기됩니다.",
+        )
+
         if st.button("➕ 이 날짜 추가", type="primary", key="qe_add_calendar"):
             if (qe_new_start.hour * 60 + qe_new_start.minute) >= (qe_new_end.hour * 60 + qe_new_end.minute):
                 st.error("퇴근 시각이 출근 시각보다 늦어야 합니다.")
@@ -12730,6 +12759,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     "shift_start": qe_new_start.strftime("%H:%M:%S"),
                     "shift_end": qe_new_end.strftime("%H:%M:%S"),
                     "work_location_name": _wloc_save,
+                    "note": (qe_new_note or "").strip() or None,
                     "created_by": me_name,
                 })
                 if ok:
@@ -13811,6 +13841,7 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
     # 연차/반차/조퇴 등 예외항목: app_attendance_logs에서 집계
     emp_set = set(employees)
     detail_rows = []  # {"직원명", "근무매장", 각 집계 컬럼들}
+    shift_detail_rows = []  # 일별 근무 상세 (비고 포함)
     for store in all_stores:
         dbf = store["db_filename"]
         sn = store.get("store_name") or dbf
@@ -13822,6 +13853,23 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
                         and (l.get("status") or "approved") == "approved"]
             if not emp_shifts and not emp_logs:
                 continue
+            for _es in emp_shifts:
+                _ss = str(_es.get("shift_start") or "")[:5]
+                _ee = str(_es.get("shift_end") or "")[:5]
+                _ss_t = _erp_parse_time(_es.get("shift_start"))
+                _ee_t = _erp_parse_time(_es.get("shift_end"))
+                _hours = round(_erp_calc_shift_hours(_ss_t, _ee_t), 2) if (_ss_t and _ee_t) else 0
+                _wloc = (_es.get("work_location_name") or "").strip()
+                shift_detail_rows.append({
+                    "직원명": emp,
+                    "소속매장": sn,
+                    "근무일": str(_es.get("shift_date") or "")[:10],
+                    "출근": _ss,
+                    "퇴근": _ee,
+                    "근무시간(h)": _hours,
+                    "실근무지": _wloc or sn,
+                    "비고": str(_es.get("note") or "").strip(),
+                })
             # 정상근무일: 근무계획(shift_schedules) 건수 기준
             normal_days = len(emp_shifts)
             annual_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "연차")
@@ -13893,6 +13941,10 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
         if detail_rows:
             df_detail = pd.DataFrame(detail_rows).sort_values(["직원명", "근무매장"], ignore_index=True)
             df_detail.to_excel(writer, sheet_name="매장별세부내역", index=False)
+        if shift_detail_rows:
+            df_shift = (pd.DataFrame(shift_detail_rows)
+                        .sort_values(["직원명", "근무일"], ignore_index=True))
+            df_shift.to_excel(writer, sheet_name="일별근무상세", index=False)
     buf.seek(0)
     st.download_button(
         "📥 엑셀 다운로드",
