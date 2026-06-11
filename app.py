@@ -9153,12 +9153,14 @@ def _erp_time_input_30min(
     key: str,
     label_visibility: str = "visible",
 ) -> dt_time:
-    """근태용 HH:MM 텍스트 시간 입력 위젯.
+    """근태용 HH:MM 텍스트 시간 입력 위젯 (수기 친화).
 
-    - 기본값은 30분 단위(예: 09:00, 18:30)로 제공
-    - 사용자는 09:15, 14:45 등 어떠한 시각이든 자유롭게 직접 타이핑 가능
-    - 잘못된 형식이면 기본값을 반환하고 경고 표시
-    - st.form 내부/외부 모두에서 동일하게 동작
+    허용 입력 형식 (모두 자동 인식):
+      - "14:30", "09:15"   (HH:MM)
+      - "1430", "0915"     (HHMM, 4자리)
+      - "930"              (HMM, 3자리 → 9:30)
+      - "14", "9"          (HH 또는 H → 14:00 / 9:00)
+      - "1.30", "14,30"    (구분자 . 또는 , 도 허용)
     """
     if isinstance(value, dt_time):
         init_str = f"{value.hour:02d}:{value.minute:02d}"
@@ -9171,7 +9173,7 @@ def _erp_time_input_30min(
         label,
         value=init_str,
         key=key,
-        placeholder="HH:MM (예: 09:00, 14:30, 18:15)",
+        placeholder="HH:MM 또는 HHMM (예: 14:30 / 1430)",
         max_chars=5,
         label_visibility=label_visibility,
     )
@@ -9179,16 +9181,36 @@ def _erp_time_input_30min(
     s = (raw or "").strip()
     if not s:
         return fallback
+
+    h = m = None
     try:
-        parts = s.split(":")
-        if len(parts) != 2:
-            raise ValueError
-        h, m = int(parts[0]), int(parts[1])
-        if 0 <= h <= 23 and 0 <= m <= 59:
+        # 구분자(:, ., ,) 정규화
+        for sep in (":", ".", ","):
+            if sep in s:
+                parts = s.split(sep, 1)
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    h, m = int(parts[0]), int(parts[1])
+                break
+        # 구분자 없이 숫자만 입력
+        if h is None and s.isdigit():
+            if len(s) == 4:        # HHMM
+                h, m = int(s[:2]), int(s[2:])
+            elif len(s) == 3:      # HMM
+                h, m = int(s[:1]), int(s[1:])
+            elif 1 <= len(s) <= 2: # HH 또는 H
+                h, m = int(s), 0
+
+        if h is not None and 0 <= h <= 23 and 0 <= m <= 59:
+            # 입력값이 정규화 형식과 다르면 다음 rerun에서 자동 보정 (예: '1430' → '14:30')
+            normalized = f"{h:02d}:{m:02d}"
+            if s != normalized:
+                st.session_state[key] = normalized
+                st.caption(f"✅ `{s}` → **{normalized}** 으로 인식됨")
             return dt_time(h, m)
-        st.caption(f"⚠️ '{s}' — 0~23시, 0~59분 범위를 확인해 주세요.")
+
+        st.caption(f"⚠️ '{s}' — HH:MM 또는 HHMM 형식으로 입력해 주세요 (예: 14:30 / 1430)")
     except Exception:
-        st.caption(f"⚠️ '{s}' — HH:MM 형식으로 입력해 주세요 (예: 09:15)")
+        st.caption(f"⚠️ '{s}' — HH:MM 또는 HHMM 형식으로 입력해 주세요 (예: 14:30 / 1430)")
     return fallback
 
 
