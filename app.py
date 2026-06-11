@@ -9955,18 +9955,22 @@ def _erp_compute_yearly_remaining_v2(db_filename: str, employee_name: str, year:
 
 def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                                   year: int, as_of: date) -> dict:
-    """연도별 대시보드용 근무 breakdown.
+    """연도별 대시보드용 근무 breakdown (통합 카테고리).
+
+    카테고리 통합 정책:
+      - 연장근무: '추가근무'·'행사'·'시차사용'·'포상시간' + work_adjustments sign='+' (회의·풀근무·overtime 모두 통합)
+      - 단축근무: 지각/조퇴 표준 대비 부족분 + work_adjustments sign='-' (포상·여름휴가·기타 모두 통합)
+      - 정상근무: '정상' work_type + **시프트(app_shift_schedules) 자동 가산** (오늘 포함 과거)
+                  단, 같은 날짜에 attendance_logs가 있으면 logs 우선 (중복 방지)
 
     반환 dict (단위: 분):
-      - required_min      : 공통 필요근무시간 (app_yearly_work_targets)
-      - deductions        : {kind_label: minutes} — app_work_adjustments sign='-' 합산
-      - additions         : {kind_label: minutes} — app_work_adjustments sign='+' 합산
-      - normal_min        : work_type='정상' 누적 (실제 근무 분)
-      - overtime_min      : work_type IN ('추가근무','행사') 누적
-      - short_min         : 지각/조퇴로 인한 매장 표준 대비 단축분 (양수)
+      - required_min      : 공통 필요근무시간
+      - deductions / additions : 상세 분류 (kind_label → minutes) — UI 상세보기용
+      - normal_min        : 정상근무 합산 (logs + shifts)
+      - overtime_min      : 연장근무 통합
+      - short_min         : 단축근무 통합
       - leave_min         : 연차 480×n + 반차 240×n
-      - hour_swap_min     : 시차사용·포상시간 diff_minutes 합산
-      - actual_total_min  : 실제 근무시간 = 정상 + 연장 + 연차 + 반차 + 시차사용 − 단축
+      - actual_total_min  : 실제 근무시간 = 정상 + 연장 + 연차 − 단축
     """
     period_start = date(int(year), 1, 1)
     period_end   = date(int(year), 12, 31)
@@ -9979,6 +9983,8 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
     # ── 조정 항목 (app_work_adjustments, sign별·kind별 분리) ────
     deductions: dict[str, int] = {}
     additions: dict[str, int] = {}
+    overtime_adj_min = 0   # sign='+' 합산 (회의·풀근무·연장 모두)
+    short_adj_min = 0      # sign='-' 합산 (포상·여름휴가·기타 모두)
     try:
         client, err = get_supabase_client()
         if not err and client:
@@ -9992,25 +9998,33 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
             for r_ in (r.data or []):
                 kind = (r_.get("kind") or "etc").strip()
                 sign = (r_.get("sign") or _ERP_ADJ_KIND_DEFAULT_SIGN.get(kind, "+")).strip()
-                m = int(r_.get("minutes") or 0)
+                m = abs(int(r_.get("minutes") or 0))
                 label = _ERP_ADJ_KIND_LABEL.get(kind, kind)
-                bucket = deductions if sign == "-" else additions
-                bucket[label] = bucket.get(label, 0) + abs(m)
+                if sign == "-":
+                    short_adj_min += m
+                    deductions[label] = deductions.get(label, 0) + m
+                else:
+                    overtime_adj_min += m
+                    additions[label] = additions.get(label, 0) + m
     except Exception:
         pass
 
-    # ── 캘린더 합산 (app_attendance_logs) ────────────────────────
+    # ── 캘린더 출퇴근 로그 (app_attendance_logs) ────────────────
     logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", db_filename,
                             "log_date", period_start, today_cap,
                             extra_eq={"employee_name": employee_name})
-    normal_min = 0
-    overtime_min = 0
-    short_min = 0
+    normal_min_logs = 0
+    overtime_min_logs = 0
+    short_min_logs = 0      # 지각/조퇴 차감
     leave_min = 0
-    hour_swap_min = 0
+    log_dates: set[str] = set()
     for l in logs:
         if (l.get("status") or "approved") != "approved":
             continue
+        _ld_raw = l.get("log_date")
+        _ld_str = str(_ld_raw)[:10] if _ld_raw else ""
+        if _ld_str:
+            log_dates.add(_ld_str)
         wt = l.get("work_type") or ""
         ss = _erp_parse_time(l.get("start_time"))
         ee = _erp_parse_time(l.get("end_time"))
@@ -10019,30 +10033,57 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
             actual_min = max(0, (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute))
 
         if wt == "정상":
-            normal_min += actual_min
+            normal_min_logs += actual_min
         elif wt in ("추가근무", "행사"):
-            overtime_min += actual_min
+            overtime_min_logs += actual_min
         elif wt in ("지각", "조퇴"):
-            # 단축 = 매장 표준(평일/주말 기준) − 실제
             try:
-                _ld_raw = l.get("log_date")
-                _ld = date.fromisoformat(str(_ld_raw)[:10]) if _ld_raw else as_of
+                _ld = date.fromisoformat(_ld_str) if _ld_str else as_of
                 std_s, std_e = _erp_default_times_for_date(db_filename, _ld)
                 std_min = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
             except Exception:
                 std_min = 480
             diff = std_min - actual_min
             if diff > 0:
-                short_min += diff
-            normal_min += actual_min  # 출근한 시간 자체는 정상으로 카운트
+                short_min_logs += diff
+            normal_min_logs += actual_min
         elif wt == "연차":
             leave_min += 480
         elif wt == "반차":
             leave_min += 240
         elif wt in ("시차사용", "포상시간"):
-            hour_swap_min += int(l.get("diff_minutes") or 0)
+            overtime_min_logs += int(l.get("diff_minutes") or 0)  # 통합: 연장으로 카운트
 
-    actual_total_min = normal_min + overtime_min + leave_min + hour_swap_min - short_min
+    # ── 시프트 자동 가산 (app_shift_schedules, 오늘 포함 과거) ──
+    # logs에 이미 있는 날짜는 logs가 우선 (중복 방지)
+    shift_normal_min = 0
+    try:
+        client2, err2 = get_supabase_client()
+        if not err2 and client2:
+            r2 = client2.table("app_shift_schedules").select("shift_date,shift_start,shift_end")\
+                .eq("db_filename", db_filename)\
+                .eq("employee_name", employee_name)\
+                .gte("shift_date", period_start.isoformat())\
+                .lte("shift_date", today_cap.isoformat())\
+                .execute()
+            for sh in (r2.data or []):
+                sd = str(sh.get("shift_date") or "")[:10]
+                if not sd or sd in log_dates:
+                    continue  # logs 우선
+                ss = _erp_parse_time(sh.get("shift_start"))
+                ee = _erp_parse_time(sh.get("shift_end"))
+                if ss and ee:
+                    m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
+                    if m > 0:
+                        shift_normal_min += m
+    except Exception:
+        pass
+
+    # ── 통합 합산 ────────────────────────────────────────────────
+    normal_min   = normal_min_logs + shift_normal_min
+    overtime_min = overtime_min_logs + overtime_adj_min
+    short_min    = short_min_logs + short_adj_min
+    actual_total_min = normal_min + overtime_min + leave_min - short_min
 
     return {
         "required_min": required_min,
@@ -10052,8 +10093,9 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         "overtime_min": overtime_min,
         "short_min": short_min,
         "leave_min": leave_min,
-        "hour_swap_min": hour_swap_min,
+        "hour_swap_min": 0,  # overtime_min에 통합
         "actual_total_min": actual_total_min,
+        "shift_normal_min": shift_normal_min,  # 디버그·표시용 (시프트 자동 가산분)
     }
 
 
@@ -10566,18 +10608,18 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
 
     required_min = int(bd["required_min"])
     deductions = bd["deductions"] or {}
-    # 휴가류(여름휴가·기타 휴가 후보) vs 포상류 분리
-    vacation_min = deductions.get("여름휴가", 0)
-    reward_min   = deductions.get("포상", 0)
-    other_ded_min = sum(v for k, v in deductions.items() if k not in ("여름휴가", "포상"))
-    total_ded_min = vacation_min + reward_min + other_ded_min
-    remaining_required_min = required_min - total_ded_min
+    additions  = bd["additions"] or {}
+    total_short_adj_min = sum(int(v) for v in deductions.values())  # work_adjustments sign='-' 합
 
     normal_min   = int(bd["normal_min"])
-    overtime_min = int(bd["overtime_min"]) + int(bd["hour_swap_min"])  # 시차사용·포상시간 = 연장 카운트
-    short_min    = int(bd["short_min"])
+    overtime_min = int(bd["overtime_min"])
+    short_min    = int(bd["short_min"])         # 통합: 지각·조퇴 + 모든 sign='-' 차감
     leave_min    = int(bd["leave_min"])
-    actual_total_min = normal_min + overtime_min + leave_min - short_min
+    shift_normal_min = int(bd.get("shift_normal_min", 0))
+    actual_total_min = int(bd["actual_total_min"])
+
+    # 잔여 필요근무 = 공통 − 단축근무 누계 (포상·여름휴가·기타 차감 모두 통합)
+    remaining_required_min = required_min - total_short_adj_min
 
     # 잔여 연차
     _leave = _erp_compute_leave_status(current_db, me_name, _as_of)
@@ -10593,9 +10635,9 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     _value_css = "font-size:1.7rem; font-weight:700; line-height:1.2; margin:0;"
     _sub_css   = "font-size:0.72rem; color:#777; margin-top:4px; line-height:1.3;"
 
-    # ── 상단 카드: 필요·차감·잔여 ───────────────────────────────
+    # ── 상단 3카드: 공통 필요 / 단축근무 누계 / 잔여 필요 ──────
     st.markdown("##### 🎯 연간 필요 근무시간")
-    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r1c1, r1c2, r1c3 = st.columns(3)
     with r1c1:
         st.markdown(
             f"<div style='background:#E3F2FD; {_card_css}'>"
@@ -10608,77 +10650,59 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     with r1c2:
         st.markdown(
             f"<div style='background:#FFF3E0; {_card_css}'>"
-            f"<div style='{_label_css}'>(-) 장기근속·여름휴가</div>"
-            f"<div style='{_value_css} color:#E65100;'>{_erp_fmt_hm(vacation_min)}</div>"
-            f"<div style='{_sub_css}'>승인된 휴가 차감</div>"
+            f"<div style='{_label_css}'>(−) 단축근무 누계 (통합)</div>"
+            f"<div style='{_value_css} color:#E65100;'>{_erp_fmt_hm(total_short_adj_min)}</div>"
+            f"<div style='{_sub_css}'>포상·여름휴가·기타 차감 통합</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
     with r1c3:
-        st.markdown(
-            f"<div style='background:#FFF3E0; {_card_css}'>"
-            f"<div style='{_label_css}'>(-) 포상 적립</div>"
-            f"<div style='{_value_css} color:#E65100;'>{_erp_fmt_hm(reward_min)}</div>"
-            f"<div style='{_sub_css}'>포상시간 차감</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with r1c4:
         _rem_color = "#C62828" if remaining_required_min > 0 else "#2E7D32"
         st.markdown(
             f"<div style='background:#FFEBEE; {_card_css}'>"
             f"<div style='{_label_css}'>🎯 잔여 필요근무시간</div>"
             f"<div style='{_value_css} color:{_rem_color};'>{_erp_fmt_hm(remaining_required_min)}</div>"
-            f"<div style='{_sub_css}'>= 공통 − 차감</div>"
+            f"<div style='{_sub_css}'>= 공통 − 단축근무 누계</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
 
-    if other_ded_min > 0:
-        _other_lines = ", ".join(
-            f"{k}: {_erp_fmt_hm(v)}" for k, v in deductions.items()
-            if k not in ("여름휴가", "포상")
-        )
-        st.caption(f"ℹ️ 기타 차감(상단 카드 미표시): {_other_lines} — 잔여 계산에는 포함됨")
+    if deductions:
+        with st.expander("ℹ️ 단축근무 누계 상세 (kind별 분류)", expanded=False):
+            for k, v in sorted(deductions.items(), key=lambda x: -x[1]):
+                st.markdown(f"- **{k}**: {_erp_fmt_hm(v)}")
 
-    # ── 하단 카드: 실제 근무 합산 ────────────────────────────────
+    # ── 하단 3카드: 정상근무 / 연장근무 / 실제 근무시간 ────────
     st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
     st.markdown("##### ⏱️ 실제 근무시간 (캘린더 기준)")
-    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1, r2c2, r2c3 = st.columns(3)
     with r2c1:
+        _sub_normal = f"시프트 자동 {_erp_fmt_hm(shift_normal_min)} + 연차/반차 {_erp_fmt_hm(leave_min)}"
         st.markdown(
             f"<div style='background:#E8F5E9; {_card_css}'>"
             f"<div style='{_label_css}'>(+) 정상근무</div>"
             f"<div style='{_value_css} color:#1B5E20;'>{_erp_fmt_hm(normal_min)}</div>"
-            f"<div style='{_sub_css}'>+ 연차/반차 {_erp_fmt_hm(leave_min)}</div>"
+            f"<div style='{_sub_css}'>{_sub_normal}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
     with r2c2:
+        _add_detail = ", ".join(f"{k} {_erp_fmt_hm(v)}" for k, v in sorted(additions.items(), key=lambda x: -x[1])[:3]) if additions else "추가근무·행사·회의·풀근무 통합"
         st.markdown(
             f"<div style='background:#E8F5E9; {_card_css}'>"
-            f"<div style='{_label_css}'>(+) 연장근무</div>"
+            f"<div style='{_label_css}'>(+) 연장근무 (통합)</div>"
             f"<div style='{_value_css} color:#1B5E20;'>{_erp_fmt_hm(overtime_min)}</div>"
-            f"<div style='{_sub_css}'>추가근무·행사·시차사용</div>"
+            f"<div style='{_sub_css}'>{_add_detail}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
     with r2c3:
-        st.markdown(
-            f"<div style='background:#FFF3E0; {_card_css}'>"
-            f"<div style='{_label_css}'>(−) 단축근무</div>"
-            f"<div style='{_value_css} color:#E65100;'>{_erp_fmt_hm(short_min)}</div>"
-            f"<div style='{_sub_css}'>지각·조퇴로 인한 차감</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with r2c4:
         _act_color = "#C62828" if actual_total_min < remaining_required_min else "#2E7D32"
         st.markdown(
             f"<div style='background:#FFEBEE; {_card_css}'>"
             f"<div style='{_label_css}'>✅ 실제 근무시간</div>"
             f"<div style='{_value_css} color:{_act_color};'>{_erp_fmt_hm(actual_total_min)}</div>"
-            f"<div style='{_sub_css}'>= 정상+연차+연장 − 단축</div>"
+            f"<div style='{_sub_css}'>= 정상 + 연장 + 연차 − 단축</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -10769,14 +10793,12 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
                 _emp_work_days = len(_date_seen)
                 _emp_work_h = sum(_date_seen.values())
                 _emp_off = max(0, _weekdays_in_month - _emp_work_days)
-                # 연간 breakdown: 실제 등록된 연간 목표(app_yearly_work_targets) 기준
+                # 연간 breakdown: 통합 정책 (단축근무 누계 통합)
                 _emp_bd = _erp_compute_yearly_breakdown(current_db, _emp, sel_year, _as_of)
                 _emp_required_min = int(_emp_bd["required_min"])
-                _emp_ded_min = sum(int(v) for v in (_emp_bd["deductions"] or {}).values())
-                _emp_actual_min = int(_emp_bd["normal_min"]) + int(_emp_bd["overtime_min"]) \
-                                  + int(_emp_bd["leave_min"]) + int(_emp_bd["hour_swap_min"]) \
-                                  - int(_emp_bd["short_min"])
-                _emp_remain_min = (_emp_required_min - _emp_ded_min) - _emp_actual_min
+                _emp_short_adj_min = sum(int(v) for v in (_emp_bd["deductions"] or {}).values())
+                _emp_actual_min = int(_emp_bd["actual_total_min"])
+                _emp_remain_min = (_emp_required_min - _emp_short_adj_min) - _emp_actual_min
                 _emp_leave = _erp_compute_leave_status(current_db, _emp, _as_of)
                 _rows.append({
                     "직원명": _emp,
@@ -10784,7 +10806,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
                     "이번달 근무(h)": round(_emp_work_h, 1),
                     "휴무 예정(일)": _emp_off,
                     "공통 필요(h)": round(_emp_required_min / 60, 1) if _emp_required_min else "-",
-                    "차감(h)": round(_emp_ded_min / 60, 1),
+                    "단축근무 누계(h)": round(_emp_short_adj_min / 60, 1),
                     "실제 근무(h)": round(_emp_actual_min / 60, 1),
                     "잔여 필요(h)": _erp_fmt_hm(_emp_remain_min) if _emp_required_min else "미설정",
                     "잔여 연차(일)": f"{_emp_leave['annual_remain']:g}",
