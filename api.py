@@ -1311,6 +1311,23 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
                 if is_new and not lead_info:
                     await _ct_register_online_lead(client, headers, cleaned_phone, name_from_ct)
 
+        # 채널톡 우측 패널에 momo DB의 이름/매장 태그 동기화 (Open API)
+        # 익명("채널톡고객") 상태가 아닐 때만 호출하여 의미 있는 정보만 push
+        try:
+            if customer_name and customer_name not in ("", "채널톡고객"):
+                _ct_tags: list[str] = []
+                if customer_store:
+                    _ct_tags.append(str(customer_store))
+                if order_info:
+                    _ct_tags.append("기존고객")
+                elif lead_info:
+                    _ct_tags.append("리드")
+                else:
+                    _ct_tags.append("신규")
+                await _ct_upsert_user(cleaned_phone, customer_name, _ct_tags)
+        except Exception as e:
+            logger.warning("channel-talk: _ct_upsert_user 동기화 실패 (계속 진행): %s", e)
+
         response_body = _build_ct_response(
             customer_name=customer_name,
             is_new=is_new,
