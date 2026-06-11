@@ -226,25 +226,38 @@ async def solapi_friend_added_webhook(request: Request) -> JSONResponse:
     if headers:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # 1) 직원(app_users) kakao_friend_added 갱신
-                if digits:
+                # phone1/phone2가 하이픈 포함/미포함 등 다양한 형식으로 저장될 수 있어
+                # _phone_variants로 OR 매칭 수행
+                variants = _phone_variants(digits) if digits else []
+
+                # 1) 직원(app_users) kakao_friend_added 갱신 — phone 다중 형식 매칭
+                if variants:
+                    user_or_parts = [f"phone.eq.{v}" for v in variants]
+                    user_or_filter = "(" + ",".join(user_or_parts) + ")"
                     resp = await client.patch(
-                        _supa_url("app_users") + f"?phone=eq.{digits}",
+                        _supa_url("app_users") + f"?or={user_or_filter}",
                         headers=headers,
                         json={"kakao_friend_added": True},
                     )
                     updated_users = resp.status_code < 300
 
-                # 2) 고객(app_customers) 갱신 — phone1 매칭
-                if digits:
+                # 2) 고객(app_customers) 갱신 — phone1/phone2 다중 형식 매칭
+                if variants:
                     cust_patch = {
                         "kakao_friend_added": True,
                         "kakao_friend_added_at": now_iso,
                     }
                     if user_key:
                         cust_patch["kakao_user_key"] = user_key
+
+                    cust_or_parts: list[str] = []
+                    for v in variants:
+                        cust_or_parts.append(f"phone1.eq.{v}")
+                        cust_or_parts.append(f"phone2.eq.{v}")
+                    cust_or_filter = "(" + ",".join(cust_or_parts) + ")"
+
                     resp2 = await client.patch(
-                        _supa_url("app_customers") + f"?phone1=eq.{digits}",
+                        _supa_url("app_customers") + f"?or={cust_or_filter}",
                         headers=headers,
                         json=cust_patch,
                     )
@@ -253,7 +266,8 @@ async def solapi_friend_added_webhook(request: Request) -> JSONResponse:
                     # 매핑된 customer_id 조회 (kakao_mapping INSERT에 필요)
                     if updated_customers and user_key:
                         cust_resp = await client.get(
-                            _supa_url("app_customers") + f"?phone1=eq.{digits}&select=id,store_name",
+                            _supa_url("app_customers")
+                            + f"?or={cust_or_filter}&select=id,store_name&limit=1",
                             headers=headers,
                         )
                         if cust_resp.status_code < 300:
