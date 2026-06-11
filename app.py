@@ -10069,6 +10069,308 @@ def _erp_fmt_hm(total_min: int) -> str:
     return f"{sign}{h:,}h {m}m"
 
 
+# =====================================================================
+# 정기근무·캘린더 ↔ 자동 연장/단축 보정 (app_work_adjustments)
+# =====================================================================
+_ERP_AUTO_ADJ_TAGS = ("[자동-정기근무]", "[자동-캘린더]")  # reason prefix 식별
+
+
+def _erp_compute_shift_overage(db_filename: str, shift_date: date,
+                               shift_start_t: dt_time, shift_end_t: dt_time) -> tuple[int, int, int]:
+    """매장 표준 대비 차이(분) 계산.
+
+    반환: (diff_minutes, std_minutes, actual_minutes)
+      - diff > 0 → 연장 / diff < 0 → 단축 / diff == 0 → 동일
+      - 매장 표준은 _erp_default_times_for_date 기준 (평일/주말 자동 분기)
+    """
+    if not (shift_start_t and shift_end_t):
+        return 0, 0, 0
+    actual_min = max(0, (shift_end_t.hour * 60 + shift_end_t.minute)
+                     - (shift_start_t.hour * 60 + shift_start_t.minute))
+    try:
+        std_s, std_e = _erp_default_times_for_date(db_filename, shift_date)
+        std_min = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
+    except Exception:
+        std_min = 0
+    if std_min <= 0:
+        return 0, 0, actual_min
+    return (actual_min - std_min), std_min, actual_min
+
+
+def _erp_delete_existing_auto_adjustment(db_filename: str, employee_name: str,
+                                         target_date: str, source_tag: str) -> None:
+    """동일 날짜·직원의 기존 [자동] 신청 행을 삭제 (덮어쓰기 보장)."""
+    if not (db_filename and employee_name and target_date):
+        return
+    client, err = get_supabase_client()
+    if err or not client:
+        return
+    try:
+        r = client.table("app_work_adjustments").select("id,reason,status")\
+            .eq("db_filename", db_filename)\
+            .eq("employee_name", employee_name)\
+            .eq("target_date", target_date).execute()
+        for row in (r.data or []):
+            rsn = (row.get("reason") or "")
+            if rsn.startswith(source_tag) and (row.get("status") or "pending") != "approved":
+                try:
+                    client.table("app_work_adjustments").delete().eq("id", int(row["id"])).execute()
+                except Exception:
+                    pass
+        _erp_invalidate_fetch_caches("app_work_adjustments")
+    except Exception:
+        pass
+
+
+def _erp_upsert_auto_adjustment(*, db_filename: str, employee_name: str,
+                                target_date: str, diff_min: int,
+                                std_start_str: str, std_end_str: str,
+                                actual_start_str: str, actual_end_str: str,
+                                source_tag: str, created_by: str,
+                                work_db_filename: str | None = None,
+                                work_location_name: str | None = None) -> tuple[bool, str]:
+    """자동 연장(+)/단축(-) 신청 행을 pending으로 insert. 기존 [자동] 행은 사전 정리.
+
+    - diff > 0: kind='overtime', sign='+'
+    - diff < 0: kind='etc',      sign='-'
+    - diff == 0: no-op (True 반환)
+    """
+    diff_min = int(diff_min or 0)
+    if diff_min == 0:
+        # 차이 없어도 기존 자동 행이 있으면 정리
+        _erp_delete_existing_auto_adjustment(db_filename, employee_name, target_date, source_tag)
+        return True, ""
+
+    _erp_delete_existing_auto_adjustment(db_filename, employee_name, target_date, source_tag)
+
+    is_overtime = diff_min > 0
+    minutes_abs = abs(diff_min)
+    kind = "overtime" if is_overtime else "etc"
+    sign = "+" if is_overtime else "-"
+    direction = "연장" if is_overtime else "단축"
+    reason = (
+        f"{source_tag} {direction} {_erp_fmt_hm(minutes_abs)} "
+        f"(표준 {std_start_str}~{std_end_str} → 실제 {actual_start_str}~{actual_end_str})"
+    )
+
+    payload = {
+        "db_filename": db_filename,
+        "employee_name": employee_name,
+        "target_date": target_date,
+        "kind": kind,
+        "sign": sign,
+        "minutes": minutes_abs,
+        "reason": reason,
+        "status": "pending",
+        "created_by": created_by,
+        "shift_start": actual_start_str + ":00" if len(actual_start_str) == 5 else actual_start_str,
+        "shift_end": actual_end_str + ":00" if len(actual_end_str) == 5 else actual_end_str,
+        "work_db_filename": work_db_filename,
+        "work_location_name": work_location_name,
+    }
+    ok, e = _erp_insert_row("app_work_adjustments", payload)
+    if not ok and ("shift_start" in str(e) or "work_db_filename" in str(e) or "PGRST204" in str(e)):
+        # 구 스키마(shift_start/work_db_filename 컬럼 없음) 호환
+        payload2 = {k: v for k, v in payload.items()
+                    if k not in ("shift_start", "shift_end", "work_db_filename", "work_location_name")}
+        ok, e = _erp_insert_row("app_work_adjustments", payload2)
+    return ok, e
+
+
+def _erp_collect_auto_adjustments(*, db_filename: str, employee_name: str,
+                                  shifts: list, source_tag: str, created_by: str,
+                                  work_db_filename: str | None = None,
+                                  work_location_name: str | None = None) -> dict:
+    """여러 시프트에 대해 매장 표준 대비 차이를 일괄 등록.
+
+    shifts: [{"shift_date":"YYYY-MM-DD", "shift_start":"HH:MM" or "HH:MM:SS",
+              "shift_end":"...", "work_location_name": str | None}]
+    단축(diff<0)은 즉시 자동 pending 등록.
+    연장(diff>0)은 session_state['_erp_overtime_candidates'] 에 후보로 적재.
+    반환: {short_registered:int, overtime_candidates:int, errors:list[str]}
+    """
+    short_registered = 0
+    errors: list[str] = []
+    overtime_pool = st.session_state.setdefault("_erp_overtime_candidates", [])
+
+    for sh in shifts:
+        try:
+            d_str = str(sh.get("shift_date") or "")[:10]
+            if not d_str:
+                continue
+            d = date.fromisoformat(d_str)
+            ss = _erp_parse_time(sh.get("shift_start"))
+            ee = _erp_parse_time(sh.get("shift_end"))
+            if not (ss and ee):
+                continue
+            diff_min, std_min, actual_min = _erp_compute_shift_overage(db_filename, d, ss, ee)
+            if std_min == 0:
+                continue  # 매장 표준 미설정
+            std_s, std_e = _erp_default_times_for_date(db_filename, d)
+            std_ss = std_s.strftime("%H:%M")
+            std_ee = std_e.strftime("%H:%M")
+            act_ss = ss.strftime("%H:%M")
+            act_ee = ee.strftime("%H:%M")
+            wloc = (sh.get("work_location_name") or work_location_name) or None
+            wdb = work_db_filename or db_filename
+
+            if diff_min < 0:
+                ok, e = _erp_upsert_auto_adjustment(
+                    db_filename=db_filename, employee_name=employee_name,
+                    target_date=d_str, diff_min=diff_min,
+                    std_start_str=std_ss, std_end_str=std_ee,
+                    actual_start_str=act_ss, actual_end_str=act_ee,
+                    source_tag=source_tag, created_by=created_by,
+                    work_db_filename=wdb, work_location_name=wloc,
+                )
+                if ok:
+                    short_registered += 1
+                else:
+                    errors.append(f"{d_str} 단축 등록 실패: {e}")
+            elif diff_min > 0:
+                # 동일 후보 중복 방지 (같은 emp+date+source 만 유지)
+                overtime_pool[:] = [c for c in overtime_pool
+                                    if not (c.get("employee_name") == employee_name
+                                            and c.get("target_date") == d_str
+                                            and c.get("source_tag") == source_tag)]
+                overtime_pool.append({
+                    "db_filename": db_filename,
+                    "employee_name": employee_name,
+                    "target_date": d_str,
+                    "diff_min": diff_min,
+                    "std_start": std_ss, "std_end": std_ee,
+                    "actual_start": act_ss, "actual_end": act_ee,
+                    "source_tag": source_tag,
+                    "created_by": created_by,
+                    "work_db_filename": wdb,
+                    "work_location_name": wloc,
+                })
+            else:
+                # 차이 0: 기존 자동 행 정리
+                _erp_delete_existing_auto_adjustment(db_filename, employee_name, d_str, source_tag)
+        except Exception as ex:
+            errors.append(f"{sh.get('shift_date')}: {ex}")
+
+    return {
+        "short_registered": short_registered,
+        "overtime_candidates": len(overtime_pool),
+        "errors": errors,
+    }
+
+
+def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> None:
+    """저장 후 화면 상단에 표시되는 '연장근무 자동 신청 대기' UI.
+
+    scope_employee 지정 시 해당 직원의 후보만 렌더링 (캘린더는 직원별 뷰).
+    각 후보별 [신청]/[취소] + 전체 [모두 신청]/[모두 취소] 버튼.
+    """
+    pool = st.session_state.get("_erp_overtime_candidates") or []
+    if scope_employee:
+        pool = [c for c in pool if c.get("employee_name") == scope_employee]
+    if not pool:
+        return
+
+    st.markdown(
+        "<div style='background:#FFF8E1; border-left:4px solid #FB8C00; "
+        "padding:12px 16px; border-radius:8px; margin:10px 0;'>"
+        f"<b>🔔 연장근무 자동 신청 대기 ({len(pool)}건)</b><br>"
+        "<span style='font-size:0.86rem; color:#555;'>다음 일정은 매장 표준보다 길게 근무했습니다. "
+        "신청 시 관리자 승인 후 실제 근무시간에 반영됩니다.</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    for idx, cand in enumerate(list(pool)):
+        cols = st.columns([2, 2, 1.2, 1, 1])
+        with cols[0]:
+            st.markdown(
+                f"**{cand['target_date']}** · {cand['employee_name']}"
+                f"<br><span style='color:#888; font-size:0.82rem;'>"
+                f"표준 {cand['std_start']}~{cand['std_end']} → 실제 {cand['actual_start']}~{cand['actual_end']}"
+                f"</span>",
+                unsafe_allow_html=True,
+            )
+        with cols[1]:
+            st.markdown(
+                f"<span style='color:#E65100; font-weight:600; font-size:1.05rem;'>"
+                f"+{_erp_fmt_hm(int(cand['diff_min']))}</span>"
+                f"<br><span style='color:#999; font-size:0.78rem;'>{cand['source_tag']}</span>",
+                unsafe_allow_html=True,
+            )
+        with cols[2]:
+            _wloc = cand.get("work_location_name") or "—"
+            st.markdown(f"<span style='color:#607D8B; font-size:0.82rem;'>{_wloc}</span>",
+                        unsafe_allow_html=True)
+        with cols[3]:
+            if st.button("✅ 신청", key=f"ot_apply_{idx}_{cand['employee_name']}_{cand['target_date']}", type="primary"):
+                ok, e = _erp_upsert_auto_adjustment(
+                    db_filename=cand["db_filename"], employee_name=cand["employee_name"],
+                    target_date=cand["target_date"], diff_min=int(cand["diff_min"]),
+                    std_start_str=cand["std_start"], std_end_str=cand["std_end"],
+                    actual_start_str=cand["actual_start"], actual_end_str=cand["actual_end"],
+                    source_tag=cand["source_tag"], created_by=cand["created_by"],
+                    work_db_filename=cand.get("work_db_filename"),
+                    work_location_name=cand.get("work_location_name"),
+                )
+                if ok:
+                    st.session_state["_erp_overtime_candidates"] = [
+                        c for c in st.session_state.get("_erp_overtime_candidates", [])
+                        if not (c.get("employee_name") == cand["employee_name"]
+                                and c.get("target_date") == cand["target_date"]
+                                and c.get("source_tag") == cand["source_tag"])
+                    ]
+                    flash(f"{cand['target_date']} 연장근무 {_erp_fmt_hm(int(cand['diff_min']))} 신청 완료 (승인 대기)", "success")
+                    st.rerun()
+                else:
+                    st.error(f"신청 실패: {e}")
+        with cols[4]:
+            if st.button("❌ 취소", key=f"ot_skip_{idx}_{cand['employee_name']}_{cand['target_date']}"):
+                st.session_state["_erp_overtime_candidates"] = [
+                    c for c in st.session_state.get("_erp_overtime_candidates", [])
+                    if not (c.get("employee_name") == cand["employee_name"]
+                            and c.get("target_date") == cand["target_date"]
+                            and c.get("source_tag") == cand["source_tag"])
+                ]
+                st.rerun()
+
+    # 일괄 액션
+    _ab1, _ab2, _ = st.columns([1.2, 1.2, 5])
+    with _ab1:
+        if st.button("✅ 모두 신청", key="ot_apply_all", type="primary"):
+            _all = list(st.session_state.get("_erp_overtime_candidates") or [])
+            ok_n, fail_n = 0, 0
+            for c in _all:
+                if scope_employee and c.get("employee_name") != scope_employee:
+                    continue
+                ok, _ = _erp_upsert_auto_adjustment(
+                    db_filename=c["db_filename"], employee_name=c["employee_name"],
+                    target_date=c["target_date"], diff_min=int(c["diff_min"]),
+                    std_start_str=c["std_start"], std_end_str=c["std_end"],
+                    actual_start_str=c["actual_start"], actual_end_str=c["actual_end"],
+                    source_tag=c["source_tag"], created_by=c["created_by"],
+                    work_db_filename=c.get("work_db_filename"),
+                    work_location_name=c.get("work_location_name"),
+                )
+                if ok:
+                    ok_n += 1
+                else:
+                    fail_n += 1
+            st.session_state["_erp_overtime_candidates"] = [
+                c for c in st.session_state.get("_erp_overtime_candidates", [])
+                if scope_employee and c.get("employee_name") != scope_employee
+            ]
+            flash(f"연장근무 일괄 신청 완료 — 성공 {ok_n}건 / 실패 {fail_n}건 (승인 대기)", "success")
+            st.rerun()
+    with _ab2:
+        if st.button("❌ 모두 취소", key="ot_skip_all"):
+            st.session_state["_erp_overtime_candidates"] = [
+                c for c in st.session_state.get("_erp_overtime_candidates", [])
+                if scope_employee and c.get("employee_name") != scope_employee
+            ]
+            st.rerun()
+    st.markdown("---")
+
+
 @st.cache_data(ttl=30)
 def _erp_list_my_adjustments(db_filename: str, employee_name: str, ym: str) -> list:
     """내 신청 내역 (해당 ym, 최신순)."""
@@ -10591,8 +10893,11 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
 def _erp_tab_shift_plan(current_db: str, me_name: str):
     st.subheader("📅 정기근무일정 (본인 일정 등록)")
     st.caption("출근일은 ✅ 체크하고, 휴무일은 체크 해제하세요. 시간은 매장 기본값이 자동 입력되며, 필요 시 수정 가능합니다.")
-    st.caption("ⓘ 기간을 1주/2주로 선택하면 주 단위·일 단위로 나눠 저장할 수 있습니다. 같은 날짜를 다시 저장하면 최신 내용으로 덮어쓰기됩니다.")
+    st.caption("ⓘ 매장 표준 시간보다 길게 근무한 경우 저장 후 '연장근무 신청' 확인 박스가 표시되며, 짧게 근무한 경우 단축 차감이 자동 등록됩니다.")
     role = (st.session_state.get("current_user") or {}).get("role") or "user"
+
+    # 직전 저장에서 발생한 연장근무 후보 확인 UI (본인 한정)
+    _erp_render_overtime_candidates_ui(scope_employee=me_name)
 
     today = _today_kst()
 
@@ -10877,6 +11182,33 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                 + " / ".join(err_msgs[:3]),
                 level="error",
             )
+
+        # ── 매장 표준 대비 차이 자동 보정 처리 ─────────────────────
+        # 저장된 모든 시프트(신규+덮어쓰기)를 모아 표준과 비교
+        _all_saved_shifts: list = []
+        for r in new_rows:
+            _all_saved_shifts.append(r)
+        for _rid, _patch in updates:
+            _all_saved_shifts.append(_patch)
+
+        _adj_db = _sp_work_db or current_db
+        if _all_saved_shifts and _adj_db:
+            _result = _erp_collect_auto_adjustments(
+                db_filename=_adj_db,
+                employee_name=me_name,
+                shifts=_all_saved_shifts,
+                source_tag="[자동-정기근무]",
+                created_by=me_name,
+                work_db_filename=_adj_db,
+                work_location_name=(loc_input or None),
+            )
+            if _result["short_registered"]:
+                flash(
+                    f"⚠️ 단축근무 {_result['short_registered']}건이 자동 차감 등록되었습니다 (승인 대기).",
+                    level="warning",
+                )
+            if _result["errors"]:
+                flash("일부 자동 보정 등록 실패: " + " / ".join(_result["errors"][:3]), level="error")
         st.rerun()
 
 
@@ -12183,8 +12515,24 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                                         "work_location_name": _wloc_e,
                                     })
                                     if ok:
+                                        # 매장 표준 대비 차이 자동 보정
+                                        _cal_adj_db = _sh.get("db_filename") or edit_dbf
+                                        _erp_collect_auto_adjustments(
+                                            db_filename=_cal_adj_db,
+                                            employee_name=qe_emp,
+                                            shifts=[{
+                                                "shift_date": _sd.isoformat(),
+                                                "shift_start": _e_start.strftime("%H:%M:%S"),
+                                                "shift_end": _e_end.strftime("%H:%M:%S"),
+                                                "work_location_name": _wloc_e,
+                                            }],
+                                            source_tag="[자동-캘린더]",
+                                            created_by=me_name,
+                                            work_db_filename=_cal_adj_db,
+                                            work_location_name=_wloc_e,
+                                        )
                                         st.session_state.pop("qe_edit_id", None)
-                                        st.session_state["_erp_cal_flash"] = f"{_sd.isoformat()} {qe_emp} 일정이 수정되었습니다."
+                                        st.session_state["_erp_cal_flash"] = f"{_sd.isoformat()} {qe_emp} 일정이 수정되었습니다. 표준 시간과 차이가 있으면 [정기근무일정] 화면 상단에서 연장 신청을 확인하세요."
                                         st.rerun(scope="fragment")
                                     else:
                                         st.error(f"저장 실패: {e}")
@@ -12291,9 +12639,25 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     "created_by": me_name,
                 })
                 if ok:
+                    # 매장 표준 대비 차이 자동 보정
+                    _erp_collect_auto_adjustments(
+                        db_filename=_add_db,
+                        employee_name=qe_emp,
+                        shifts=[{
+                            "shift_date": qe_new_date.isoformat(),
+                            "shift_start": qe_new_start.strftime("%H:%M:%S"),
+                            "shift_end": qe_new_end.strftime("%H:%M:%S"),
+                            "work_location_name": _wloc_save,
+                        }],
+                        source_tag="[자동-캘린더]",
+                        created_by=me_name,
+                        work_db_filename=_add_db,
+                        work_location_name=_wloc_save,
+                    )
                     _flash_loc = _final_loc or _dbf_to_sn.get(_add_db, "")
                     st.session_state["_erp_cal_flash"] = (
-                        f"{qe_new_date.isoformat()} {qe_emp} 일정이 [{_flash_loc}] 근무로 추가되었습니다."
+                        f"{qe_new_date.isoformat()} {qe_emp} 일정이 [{_flash_loc}] 근무로 추가되었습니다. "
+                        f"표준 시간과 차이가 있으면 [정기근무일정] 상단에서 연장 신청을 확인하세요."
                     )
                     st.rerun(scope="fragment")
                 else:
