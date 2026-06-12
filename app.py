@@ -10014,13 +10014,23 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
       - leave_min         : 연차 480×n + 반차 240×n
       - actual_total_min  : 실제 근무시간 = 정상 + 연장 + 연차 − 단축
     """
-    period_start = date(int(year), 1, 1)
-    period_end   = date(int(year), 12, 31)
-    today_cap    = min(period_end, as_of)
+    period_end = date(int(year), 12, 31)
 
-    # ── 공통 필요근무시간 ────────────────────────────────────────
+    # ── 공통 필요근무시간 + 집계 시작일 ──────────────────────────
     row_y = _erp_get_yearly_target_row(db_filename, employee_name, int(year))
     required_min = int(row_y["required_minutes"]) if (row_y and row_y.get("required_minutes") is not None) else 0
+
+    # period_start_date 가 있으면 그 날부터, 없으면 연도 1월 1일
+    _raw_psd = row_y.get("period_start_date") if row_y else None
+    if _raw_psd:
+        try:
+            period_start = date.fromisoformat(str(_raw_psd)[:10])
+        except Exception:
+            period_start = date(int(year), 1, 1)
+    else:
+        period_start = date(int(year), 1, 1)
+
+    today_cap = min(period_end, as_of)
 
     # ── 조정 항목 (app_work_adjustments, sign별·kind별 분리) ────
     # 복수 매장 지원: db_filename 필터 제거 → 모든 매장 조정 합산
@@ -10883,6 +10893,89 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
                 })
             import pandas as pd
             st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+
+        # ── 연간 집계 시작일 설정 (관리자) ──────────────────────
+        st.divider()
+        st.markdown("##### 📅 연간 집계 시작일 설정")
+        st.caption(
+            "집계 시작일을 설정하면 해당 날짜부터 연말(12/31)까지의 근무만 집계됩니다. "
+            "예) 2026년 = 2026-06-01 → 6월~12월만 집계. "
+            "미설정 시 1월 1일부터 집계됩니다."
+        )
+        _ytarget_year = sel_year
+        _ytargets_all = _erp_list_yearly_targets(current_db, _ytarget_year)
+        _ytarget_map = {r.get("employee_name"): r for r in _ytargets_all}
+        _employees_yt = _erp_get_employee_names_for_store(current_db)
+
+        if _employees_yt:
+            with st.form("erp_period_start_form"):
+                _psd_hdr = st.columns([2, 2, 2])
+                _psd_hdr[0].markdown("**직원명**")
+                _psd_hdr[1].markdown("**집계 시작일**")
+                _psd_hdr[2].markdown("**현재 설정값**")
+                _psd_edits: dict[str, date | None] = {}
+                for _emp_yt in _employees_yt:
+                    _yt_row = _ytarget_map.get(_emp_yt) or {}
+                    _raw = _yt_row.get("period_start_date")
+                    _cur_psd = None
+                    if _raw:
+                        try:
+                            _cur_psd = date.fromisoformat(str(_raw)[:10])
+                        except Exception:
+                            pass
+                    _def_psd = _cur_psd or date(_ytarget_year, 1, 1)
+                    _pc = st.columns([2, 2, 2])
+                    with _pc[0]:
+                        st.markdown(f"**{_emp_yt}**")
+                    with _pc[1]:
+                        _psd_val = st.date_input(
+                            "시작일", value=_def_psd,
+                            min_value=date(_ytarget_year, 1, 1),
+                            max_value=date(_ytarget_year, 12, 31),
+                            key=f"psd_{_ytarget_year}_{_emp_yt}",
+                            label_visibility="collapsed",
+                        )
+                    with _pc[2]:
+                        _disp = _cur_psd.isoformat() if _cur_psd else f"{_ytarget_year}-01-01 (기본값)"
+                        st.markdown(f"<span style='color:#666; font-size:0.85rem;'>{_disp}</span>",
+                                    unsafe_allow_html=True)
+                    _psd_edits[_emp_yt] = _psd_val
+
+                if st.form_submit_button("💾 집계 시작일 저장", type="primary"):
+                    _psd_ok, _psd_fail = 0, 0
+                    for _emp_yt, _psd_v in _psd_edits.items():
+                        _yt_row = _ytarget_map.get(_emp_yt)
+                        _payload_psd = {"period_start_date": _psd_v.isoformat() if _psd_v else None}
+                        if _yt_row and _yt_row.get("id"):
+                            _ok_p, _e_p = _erp_update_row(
+                                "app_yearly_work_targets", int(_yt_row["id"]), _payload_psd
+                            )
+                        else:
+                            _ok_p, _e_p = _erp_insert_row("app_yearly_work_targets", {
+                                "db_filename": current_db,
+                                "employee_name": _emp_yt,
+                                "year": _ytarget_year,
+                                "required_minutes": 0,
+                                **_payload_psd,
+                            })
+                        if _ok_p:
+                            _psd_ok += 1
+                        else:
+                            _psd_fail += 1
+                            if "period_start_date" in str(_e_p) or "PGRST204" in str(_e_p):
+                                st.error(
+                                    "⚠️ period_start_date 컬럼이 DB에 없습니다. "
+                                    "**SUPABASE_YEARLY_TARGET_PERIOD_START.sql** 을 "
+                                    "Supabase 대시보드 → SQL Editor에서 실행 후 다시 시도해 주세요."
+                                )
+                                break
+                    _erp_get_yearly_target_row.clear()
+                    _erp_list_yearly_targets.clear()
+                    if _psd_ok and not _psd_fail:
+                        flash(f"집계 시작일 저장 완료 ({_psd_ok}명)")
+                        st.rerun()
+                    elif _psd_ok:
+                        flash(f"저장 완료 {_psd_ok}명 / 실패 {_psd_fail}명", level="warning")
 
         # ── 연간 근무시간 설정 (관리자) ──────────────────────────
         st.divider()
