@@ -10023,6 +10023,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
     required_min = int(row_y["required_minutes"]) if (row_y and row_y.get("required_minutes") is not None) else 0
 
     # ── 조정 항목 (app_work_adjustments, sign별·kind별 분리) ────
+    # 복수 매장 지원: db_filename 필터 제거 → 모든 매장 조정 합산
     deductions: dict[str, int] = {}
     additions: dict[str, int] = {}
     overtime_adj_min = 0   # sign='+' 합산 (회의·풀근무·연장 모두)
@@ -10031,7 +10032,6 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         client, err = get_supabase_client()
         if not err and client:
             r = client.table("app_work_adjustments").select("kind,sign,minutes,target_date")\
-                .eq("db_filename", db_filename)\
                 .eq("employee_name", employee_name)\
                 .eq("status", "approved")\
                 .gte("target_date", period_start.isoformat())\
@@ -10104,13 +10104,13 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
             overtime_min_logs += int(l.get("diff_minutes") or 0)  # 통합: 연장으로 카운트
 
     # ── 시프트 자동 가산 (app_shift_schedules, 오늘 포함 과거) ──
+    # 복수 매장 지원: db_filename 필터 제거 → 모든 매장 시프트 합산
     # logs에 이미 있는 날짜는 logs가 우선 (중복 방지)
     shift_normal_min = 0
     try:
         client2, err2 = get_supabase_client()
         if not err2 and client2:
             r2 = client2.table("app_shift_schedules").select("shift_date,shift_start,shift_end")\
-                .eq("db_filename", db_filename)\
                 .eq("employee_name", employee_name)\
                 .gte("shift_date", period_start.isoformat())\
                 .lte("shift_date", today_cap.isoformat())\
