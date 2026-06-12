@@ -10688,8 +10688,8 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     shift_normal_min = int(bd.get("shift_normal_min", 0))
     actual_total_min = int(bd["actual_total_min"])
 
-    # 잔여 필요근무 = 공통 − 단축근무 누계 (포상·여름휴가·기타 차감 모두 통합)
-    remaining_required_min = required_min - total_short_adj_min
+    # 잔여 필요근무 = 공통 − 단축근무 누계 − 실제 근무시간 (캘린더·시프트 반영)
+    remaining_required_min = required_min - total_short_adj_min - actual_total_min
 
     # 잔여 연차
     _leave = _erp_compute_leave_status(current_db, me_name, _as_of)
@@ -10732,7 +10732,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
             f"<div style='background:#FFEBEE; {_card_css}'>"
             f"<div style='{_label_css}'>🎯 잔여 필요근무시간</div>"
             f"<div style='{_value_css} color:{_rem_color};'>{_erp_fmt_hm(remaining_required_min)}</div>"
-            f"<div style='{_sub_css}'>= 공통 − 단축근무 누계</div>"
+            f"<div style='{_sub_css}'>= 공통 − 단축 − 실제근무</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -10767,7 +10767,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
             unsafe_allow_html=True,
         )
     with r2c3:
-        _act_color = "#C62828" if actual_total_min < remaining_required_min else "#2E7D32"
+        _act_color = "#2E7D32" if actual_total_min > 0 else "#777"
         st.markdown(
             f"<div style='background:#FFEBEE; {_card_css}'>"
             f"<div style='{_label_css}'>✅ 실제 근무시간</div>"
@@ -10779,7 +10779,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
 
     # ── 잔여 분석 + 잔여 연차 ───────────────────────────────────
     st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-    gap_min = remaining_required_min - actual_total_min
+    gap_min = remaining_required_min  # actual_total_min 이미 차감된 값
     r3c1, r3c2 = st.columns([3, 2])
     with r3c1:
         if required_min <= 0:
