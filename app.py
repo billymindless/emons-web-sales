@@ -14196,6 +14196,10 @@ def render_gmail_manager():
                     type="primary",
                 )
                 st.caption("버튼 클릭 → Google 로그인 → 권한 허용 → 자동 완료")
+                with st.expander("🔧 redirect_uri 확인 (Google Cloud 설정용)", expanded=False):
+                    st.markdown("Google Cloud Console **승인된 리디렉션 URI**에 아래 값을 **정확히** 복사하세요:")
+                    st.code(_redirect_uri, language=None)
+                    st.caption(f"현재 적용 중인 redirect_uri (길이: {len(_redirect_uri)}자)")
             else:
                 st.warning("관리자 설정이 완료되지 않았습니다. Render 환경변수를 확인해 주세요.")
         return
