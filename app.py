@@ -13894,7 +13894,31 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 # =====================================================================
 
 def render_document_library():
-    """업무 자료 게시판 — 글쓰기 + 첨부파일 업로드/다운로드."""
+    """업무 자료 게시판 — 리치 텍스트 글쓰기 + 첨부파일 업로드/다운로드."""
+    try:
+        from streamlit_quill import st_quill as _st_quill
+        _HAS_QUILL = True
+    except ImportError:
+        _HAS_QUILL = False
+
+    def _render_html_content(html: str, min_height: int = 120):
+        """HTML 또는 평문 콘텐츠를 안전하게 렌더링."""
+        import html as _html_lib
+        _is_html = bool(html and ("<" in html and ">" in html))
+        if _is_html:
+            _safe = (
+                "<html><head><meta charset='utf-8'>"
+                "<style>body{font-family:sans-serif;font-size:14px;margin:0;padding:8px;}"
+                "table{border-collapse:collapse;width:100%}"
+                "td,th{border:1px solid #ccc;padding:4px 8px}"
+                "img{max-width:100%}</style></head>"
+                f"<body>{html}</body></html>"
+            )
+            import streamlit.components.v1 as _comp
+            _comp.html(_safe, height=min_height, scrolling=True)
+        else:
+            st.markdown(html or "*(내용 없음)*")
+
     st.header("📁 자료실")
     st.caption("업무 자료를 게시판 형태로 관리합니다.")
 
@@ -13973,8 +13997,16 @@ def render_document_library():
         with st.container(border=True):
             st.subheader("📝 새 자료 등록")
             _f_title   = st.text_input("제목 *", key="doc_f_title", placeholder="자료 제목을 입력하세요")
-            _f_content = st.text_area("내용", key="doc_f_content", height=220,
-                                      placeholder="내용을 입력하세요. 마크다운 문법을 사용할 수 있습니다.\n\n예) **굵게**, *기울임*, ## 제목, - 목록")
+            st.markdown("**내용**")
+            if _HAS_QUILL:
+                _f_content = _st_quill(
+                    placeholder="내용을 입력하거나, 다른 곳에서 서식 있는 텍스트를 붙여넣기 하세요.",
+                    html=True,
+                    key="doc_f_content",
+                )
+            else:
+                _f_content = st.text_area("내용", key="doc_f_content", height=220,
+                                          placeholder="내용을 입력하세요.")
             _f_tags    = st.text_input("태그 (쉼표 구분)", key="doc_f_tags",
                                        placeholder="예: 가이드, 인사, 2026")
             _f_file    = st.file_uploader(
@@ -14091,7 +14123,7 @@ def render_document_library():
             # ── 상세 보기 ────────────────────────────────────────
             if st.session_state.get(f"doc_expanded_{_doc_id}"):
                 st.markdown("---")
-                st.markdown(_doc_content or "*(내용 없음)*")
+                _render_html_content(_doc_content or "", min_height=150)
 
                 # 첨부파일 다운로드
                 if _doc_furl and _doc_fname:
@@ -14139,7 +14171,16 @@ def render_document_library():
                 if st.session_state.get(f"doc_editing_{_doc_id}"):
                     st.markdown("---")
                     _et  = st.text_input("제목", value=_doc_title, key=f"doc_et_{_doc_id}")
-                    _ec  = st.text_area("내용", value=_doc_content, height=200, key=f"doc_ec_{_doc_id}")
+                    st.markdown("**내용**")
+                    if _HAS_QUILL:
+                        _ec = _st_quill(
+                            value=_doc_content or "",
+                            html=True,
+                            key=f"doc_ec_{_doc_id}",
+                        )
+                    else:
+                        _ec = st.text_area("내용", value=_doc_content, height=200,
+                                           key=f"doc_ec_{_doc_id}")
                     _eg  = st.text_input("태그", value=_doc_tags, key=f"doc_eg_{_doc_id}")
                     _ef  = st.file_uploader("첨부파일 교체 (선택)", key=f"doc_ef_{_doc_id}",
                                             help="새 파일을 올리면 기존 파일이 교체됩니다.")
