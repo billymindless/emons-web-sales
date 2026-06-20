@@ -13893,6 +13893,108 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 # 📧 메일관리 (Gmail 연동) — ERP 사이드바 별도 페이지
 # =====================================================================
 
+def _render_gmail_setup_guide(expanded: bool = False):
+    """Gmail 연동 설정 가이드 — expander 형태로 어디서나 노출."""
+    with st.expander("🔧 Gmail 연동 설정 가이드 (클릭하여 펼치기)", expanded=expanded):
+        st.markdown("### 📋 단계별 연동 방법")
+
+        st.markdown("---")
+        st.markdown("#### STEP 1 — Google Cloud 프로젝트 및 Gmail API 활성화")
+        st.markdown(
+            """
+1. [Google Cloud Console](https://console.cloud.google.com) 접속 후 로그인
+2. 상단 프로젝트 선택 → **새 프로젝트** 생성 (예: `emons-erp`)
+3. 좌측 메뉴 → **API 및 서비스** → **라이브러리**
+4. 검색창에 `Gmail API` 입력 → **Gmail API** 클릭 → **사용 설정**
+            """
+        )
+
+        st.markdown("---")
+        st.markdown("#### STEP 2 — OAuth 동의 화면 설정")
+        st.markdown(
+            """
+1. **API 및 서비스** → **OAuth 동의 화면**
+2. 사용자 유형: **외부** 선택 → 만들기
+3. 앱 이름 입력 (예: `이몬스 ERP`), 지원 이메일 입력
+4. 범위(Scope) 추가 → `https://www.googleapis.com/auth/gmail.modify` 선택
+5. 테스트 사용자에 본인 Gmail 주소 추가
+6. 저장 후 계속
+            """
+        )
+
+        st.markdown("---")
+        st.markdown("#### STEP 3 — OAuth 2.0 클라이언트 ID 생성")
+        st.markdown(
+            """
+1. **API 및 서비스** → **사용자 인증 정보** → **+ 사용자 인증 정보 만들기**
+2. **OAuth 클라이언트 ID** 선택
+3. 애플리케이션 유형: **데스크톱 앱** 선택
+4. 이름 입력 후 **만들기**
+5. **JSON 다운로드** 클릭 → `client_secret.json` 저장
+            """
+        )
+
+        st.markdown("---")
+        st.markdown("#### STEP 4 — Refresh Token 발급 (로컬 PC에서 1회 실행)")
+        st.code(
+            """# 터미널에서 실행
+pip install google-auth-oauthlib google-api-python-client
+
+python -c "
+from google_auth_oauthlib.flow import InstalledAppFlow
+flow = InstalledAppFlow.from_client_secrets_file(
+    'client_secret.json',
+    scopes=['https://www.googleapis.com/auth/gmail.modify']
+)
+creds = flow.run_local_server(port=0)
+print('=== 아래 값을 secrets.toml에 복사하세요 ===')
+print('client_id    :', creds.client_id)
+print('client_secret:', creds.client_secret)
+print('refresh_token:', creds.refresh_token)
+"
+""",
+            language="bash",
+        )
+        st.info("브라우저가 자동으로 열려 Google 계정 로그인 및 권한 허용을 요청합니다. 허용하면 터미널에 토큰이 출력됩니다.")
+
+        st.markdown("---")
+        st.markdown("#### STEP 5 — Render / Streamlit Cloud 환경변수 설정")
+        st.markdown("**방법 A — `.streamlit/secrets.toml` (로컬 또는 Streamlit Cloud)**")
+        st.code(
+            """[gmail]
+client_id     = "123456789-xxxx.apps.googleusercontent.com"
+client_secret = "GOCSPX-xxxxxxxxxxxxxxxx"
+refresh_token = "1//0gxxxxxxxxxxxxxxxxxxxxxxxx"
+sender_email  = "your-account@gmail.com"
+""",
+            language="toml",
+        )
+        st.markdown("**방법 B — Render 환경변수**")
+        st.markdown(
+            """
+| 키 | 값 |
+|---|---|
+| `GMAIL_CLIENT_ID` | 클라이언트 ID |
+| `GMAIL_CLIENT_SECRET` | 클라이언트 Secret |
+| `GMAIL_REFRESH_TOKEN` | Refresh Token |
+| `GMAIL_SENDER_EMAIL` | 발신자 Gmail 주소 |
+            """
+        )
+
+        st.markdown("---")
+        st.markdown("#### STEP 6 — 연동 확인")
+        st.markdown(
+            """
+설정 완료 후 앱을 재시작하면 이 화면에 **📥 받은편지함 / 🔍 메일 검색 / 📤 메일 발송** 탭이 활성화됩니다.
+
+> ⚠️ **주의사항**
+> - Refresh Token은 비밀번호와 동일한 수준의 민감 정보입니다. 코드에 직접 넣지 마세요.
+> - Google 계정의 2단계 인증이 활성화되어 있으면 그대로 진행 가능합니다.
+> - OAuth 동의 화면이 **테스트** 상태이면 7일마다 토큰이 만료될 수 있습니다. **프로덕션 게시** 후 사용을 권장합니다.
+            """
+        )
+
+
 def render_gmail_manager():
     """Gmail OAuth2 연동 — 메일 조회·검색·발송·고객 자동 연결."""
     st.header("📧 메일관리")
@@ -13906,10 +14008,11 @@ def render_gmail_manager():
             "gmail_manager 모듈을 찾을 수 없습니다. "
             "`google-auth`, `google-api-python-client` 패키지가 설치되어 있는지 확인하세요."
         )
+        _render_gmail_setup_guide()
         return
 
     if not _gm.is_gmail_configured():
-        # ── Gmail 미설정 안내 화면 (이미지와 동일한 레이아웃) ──
+        # ── Gmail 미설정 안내 화면 ──
         st.markdown("<br>", unsafe_allow_html=True)
         col_mid = st.columns([1, 2, 1])[1]
         with col_mid:
@@ -13964,38 +14067,7 @@ def render_gmail_manager():
             )
 
         st.markdown("<br>", unsafe_allow_html=True)
-        with st.expander("🔧 Gmail 연동 설정 방법", expanded=False):
-            st.markdown(
-                """
-**1. Google Cloud Console에서 OAuth 2.0 자격증명 생성**
-- [console.cloud.google.com](https://console.cloud.google.com) → API 및 서비스 → 사용자 인증 정보
-- OAuth 2.0 클라이언트 ID 생성 (데스크톱 앱)
-- Gmail API 활성화
-
-**2. Refresh Token 발급**
-```bash
-pip install google-auth-oauthlib
-python -c "
-from google_auth_oauthlib.flow import InstalledAppFlow
-flow = InstalledAppFlow.from_client_secrets_file(
-    'client_secret.json',
-    ['https://www.googleapis.com/auth/gmail.modify']
-)
-creds = flow.run_local_server(port=0)
-print('refresh_token:', creds.refresh_token)
-"
-```
-
-**3. `.streamlit/secrets.toml` 에 추가**
-```toml
-[gmail]
-client_id     = "YOUR_CLIENT_ID.apps.googleusercontent.com"
-client_secret = "YOUR_CLIENT_SECRET"
-refresh_token = "YOUR_REFRESH_TOKEN"
-sender_email  = "you@gmail.com"
-```
-                """
-            )
+        _render_gmail_setup_guide(expanded=True)
         return
 
     # ── Gmail 연동 완료 — 실제 UI ─────────────────────────────────
@@ -14038,7 +14110,6 @@ sender_email  = "you@gmail.com"
                             if _msg["is_unread"]:
                                 _gm.mark_as_read(_msg["id"])
                     with _detail_col2:
-                        # 고객 자동 매칭
                         _cust = _gm.match_sender_to_customer(_from)
                         if _cust:
                             st.success(
@@ -14117,11 +14188,14 @@ sender_email  = "you@gmail.com"
                     )
                 if _result["status"] == "sent":
                     st.success(f"✅ 메일이 발송되었습니다. (메시지 ID: {_result['id']})")
-                    # 발송 후 입력 초기화
                     for _k in ("gm_send_to", "gm_send_subj", "gm_send_body"):
                         st.session_state.pop(_k, None)
                 else:
                     st.error(f"발송 실패: {_result['error']}")
+
+    # ── 연동 완료 후에도 가이드 항상 노출 (접힌 상태) ──
+    st.markdown("---")
+    _render_gmail_setup_guide()
 
 
 # ---------- 탭 7: 월말 급여 요약 (store_admin) ----------
