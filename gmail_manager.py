@@ -33,7 +33,6 @@ from typing import Any
 # ──────────────────────────────────────────────
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/userinfo.email",
 ]
 GOOGLE_AUTH_URL  = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -226,7 +225,7 @@ def _build_service(username: str | None = None):
         client_id=client_id,
         client_secret=client_secret,
         token_uri=GOOGLE_TOKEN_URL,
-        scopes=GMAIL_SCOPES[:1],  # gmail.modify
+        scopes=GMAIL_SCOPES,
     )
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
