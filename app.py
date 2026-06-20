@@ -287,7 +287,14 @@ def get_supabase_client():
     try:
         secrets = st.secrets.get("supabase") or {}
         url = (secrets.get("url") or "").strip()
-        key = (secrets.get("key") or secrets.get("anon_key") or "").strip()
+        # service_role 키가 있으면 우선 사용 (RLS 우회) — 없으면 anon 키 사용
+        key = (
+            secrets.get("service_role_key")
+            or secrets.get("service_role")
+            or secrets.get("key")
+            or secrets.get("anon_key")
+            or ""
+        ).strip()
         if not url or not key:
             return None, "Supabase URL 또는 Key가 설정되지 않았습니다. .streamlit/secrets.toml에 [supabase] url, key를 추가해 주세요."
         # 캐시된 클라이언트가 있고 URL/Key가 동일하면 재사용 (연결 중복 생성 방지)
