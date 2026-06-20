@@ -13934,17 +13934,29 @@ def render_document_library():
     # ── Supabase Storage 업로드 헬퍼 ──────────────────────────────
     def _upload_file(doc_id, uploaded_file) -> tuple[str, str]:
         """파일을 Supabase Storage 'documents' 버킷에 업로드. (url, filename) 반환."""
-        import mimetypes
-        _fname    = uploaded_file.name
-        _fbytes   = uploaded_file.read()
-        _mime     = mimetypes.guess_type(_fname)[0] or "application/octet-stream"
-        _spath    = f"{doc_id}/{_fname}"
+        import mimetypes, re, unicodedata
+        _fname_orig = uploaded_file.name
+        _fbytes     = uploaded_file.read()
+        _mime       = mimetypes.guess_type(_fname_orig)[0] or "application/octet-stream"
+
+        # Supabase Storage key 에 한글/특수문자 불허 → ASCII-safe 파일명 생성
+        # 확장자 분리 후 이름 부분을 NFD 정규화 → ASCII 변환 → 나머지는 밑줄로 치환
+        if "." in _fname_orig:
+            _stem, _ext = _fname_orig.rsplit(".", 1)
+        else:
+            _stem, _ext = _fname_orig, ""
+        _safe_stem = unicodedata.normalize("NFD", _stem).encode("ascii", "ignore").decode("ascii")
+        _safe_stem = re.sub(r"[^A-Za-z0-9_\-]", "_", _safe_stem).strip("_") or "file"
+        _safe_fname = f"{_safe_stem}.{_ext}" if _ext else _safe_stem
+        _spath      = f"{doc_id}/{_safe_fname}"
+
         client.storage.from_("documents").upload(
             _spath, _fbytes,
             file_options={"content-type": _mime, "upsert": "true"},
         )
         _url = client.storage.from_("documents").get_public_url(_spath)
-        return _url, _fname
+        # DB에는 원본 파일명을 저장해 사용자에게 표시
+        return _url, _fname_orig
 
     def _fmt_size(size: int | None) -> str:
         if not size:
