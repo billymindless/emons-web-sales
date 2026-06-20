@@ -14141,17 +14141,72 @@ def render_document_library():
                 st.markdown("---")
                 _render_html_content(_doc_content or "", min_height=150)
 
-                # 첨부파일 다운로드
+                # ── 첨부파일: 미리보기 + 다운로드 ────────────────
                 if _doc_furl and _doc_fname:
+                    import urllib.parse as _uparse
                     _sz2 = f" · {_fmt_size(_doc_fsize)}" if _doc_fsize else ""
-                    st.markdown(
-                        f"<a href='{_doc_furl}' target='_blank' download style='"
-                        f"display:inline-flex;align-items:center;gap:6px;"
-                        f"background:#1a73e8;color:#fff;border-radius:8px;"
-                        f"padding:6px 16px;font-size:0.85rem;text-decoration:none;"
-                        f"margin-top:0.5rem;'>⬇️ {_doc_fname}{_sz2} 다운로드</a>",
-                        unsafe_allow_html=True,
-                    )
+                    _fext = _doc_fname.rsplit(".", 1)[-1].lower() if "." in _doc_fname else ""
+
+                    # 파일 유형 판별
+                    _IMG_EXTS    = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"}
+                    _PDF_EXTS    = {"pdf"}
+                    _OFFICE_EXTS = {"doc", "docx", "xls", "xlsx", "ppt", "pptx", "hwp"}
+
+                    if _fext in _IMG_EXTS:
+                        _ftype = "image"
+                    elif _fext in _PDF_EXTS:
+                        _ftype = "pdf"
+                    elif _fext in _OFFICE_EXTS:
+                        _ftype = "office"
+                    else:
+                        _ftype = "download"
+
+                    # 미리보기 토글 버튼
+                    _prev_key = f"doc_preview_{_doc_id}"
+                    _is_preview = st.session_state.get(_prev_key, False)
+                    _pa1, _pa2 = st.columns([2, 5])
+                    with _pa1:
+                        _prev_icon = {"image": "🖼️", "pdf": "📄", "office": "📊"}.get(_ftype, "")
+                        if _ftype != "download":
+                            _plabel = "▲ 미리보기 닫기" if _is_preview else f"{_prev_icon} 미리보기"
+                            if st.button(_plabel, key=f"doc_prev_btn_{_doc_id}"):
+                                st.session_state[_prev_key] = not _is_preview
+                                st.rerun()
+                    with _pa2:
+                        st.markdown(
+                            f"<a href='{_doc_furl}' target='_blank' download style='"
+                            f"display:inline-flex;align-items:center;gap:6px;"
+                            f"background:#1a73e8;color:#fff;border-radius:8px;"
+                            f"padding:6px 14px;font-size:0.82rem;text-decoration:none;'>"
+                            f"⬇️ {_doc_fname}{_sz2} 다운로드</a>",
+                            unsafe_allow_html=True,
+                        )
+
+                    # 미리보기 렌더링
+                    if _is_preview:
+                        import streamlit.components.v1 as _comp
+                        if _ftype == "image":
+                            _comp.html(
+                                f"<html><body style='margin:0;background:#f5f5f5;text-align:center;padding:8px;'>"
+                                f"<img src='{_doc_furl}' style='max-width:100%;max-height:600px;"
+                                f"object-fit:contain;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.15);'/>"
+                                f"</body></html>",
+                                height=400, scrolling=False,
+                            )
+                        elif _ftype == "pdf":
+                            _comp.html(
+                                f"<iframe src='{_doc_furl}' width='100%' height='700px'"
+                                f" style='border:none;border-radius:4px;'></iframe>",
+                                height=720, scrolling=False,
+                            )
+                        elif _ftype == "office":
+                            _enc_url = _uparse.quote(_doc_furl, safe="")
+                            _viewer  = f"https://view.officeapps.live.com/op/embed.aspx?src={_enc_url}"
+                            _comp.html(
+                                f"<iframe src='{_viewer}' width='100%' height='700px'"
+                                f" style='border:none;border-radius:4px;'></iframe>",
+                                height=720, scrolling=False,
+                            )
 
                 st.markdown("<br>", unsafe_allow_html=True)
                 _can_edit = (_doc_author == _me) or (_role in ("store_admin", "superadmin"))
