@@ -13890,6 +13890,217 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 
 
 # =====================================================================
+# 📁 자료실 — 업무 자료 게시판
+# =====================================================================
+
+def render_document_library():
+    """업무 자료를 게시판 형태로 관리하는 자료실."""
+    st.header("📁 자료실")
+    st.caption("업무 자료를 게시판 형태로 관리합니다.")
+
+    client, err = get_supabase_client()
+    if err or not client:
+        st.error("데이터베이스 연결에 실패했습니다.")
+        return
+
+    _cu   = st.session_state.get("current_user") or {}
+    _me   = (_cu.get("username") or _cu.get("email") or "").strip()
+    _role = _cu.get("role", "staff")
+
+    # ── 전체 자료 불러오기 ──────────────────────────────────────────
+    @st.cache_data(ttl=30, show_spinner=False)
+    def _fetch_docs():
+        try:
+            r = client.table("app_documents").select("*").order("created_at", desc=True).execute()
+            return r.data or []
+        except Exception:
+            return []
+
+    _docs = _fetch_docs()
+
+    # ── 상단: 통계 카드 + 추가 버튼 ──────────────────────────────
+    _hc1, _hc2, _hc3 = st.columns([2, 2, 1])
+    with _hc1:
+        st.markdown(
+            f"<div style='border:1px solid #e0e0e0; border-radius:12px; padding:1rem 1.2rem;'>"
+            f"<div style='font-size:0.8rem; color:#888;'>등록 자료</div>"
+            f"<div style='font-size:1.6rem; font-weight:700;'>{len(_docs)}건</div>"
+            f"<div style='font-size:0.75rem; color:#aaa;'>현재 자료실에 등록된 자료 수</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with _hc2:
+        _latest_date = ""
+        if _docs:
+            try:
+                import datetime as _dt
+                _d = _docs[0].get("created_at", "")[:19].replace("T", " ")
+                _latest_date = _d
+            except Exception:
+                _latest_date = ""
+        st.markdown(
+            f"<div style='border:1px solid #e0e0e0; border-radius:12px; padding:1rem 1.2rem;'>"
+            f"<div style='font-size:0.8rem; color:#888;'>최근 등록</div>"
+            f"<div style='font-size:1.1rem; font-weight:700; margin:0.2rem 0;'>{_latest_date or '—'}</div>"
+            f"<div style='font-size:0.75rem; color:#aaa;'>가장 최근에 등록된 자료 일시</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with _hc3:
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        if st.button("＋ 자료 추가", type="primary", use_container_width=True, key="doc_add_btn"):
+            st.session_state["doc_show_form"] = True
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── 자료 추가 폼 ───────────────────────────────────────────────
+    if st.session_state.get("doc_show_form"):
+        with st.container(border=True):
+            st.subheader("📝 새 자료 등록")
+            _f_title   = st.text_input("제목 *", key="doc_f_title", placeholder="자료 제목을 입력하세요")
+            _f_content = st.text_area("내용", key="doc_f_content", height=200,
+                                      placeholder="내용을 입력하세요. 마크다운 문법을 사용할 수 있습니다.")
+            _f_tags    = st.text_input("태그 (쉼표 구분)", key="doc_f_tags",
+                                       placeholder="예: 가이드, 인사, 2026")
+            _fb1, _fb2 = st.columns([1, 5])
+            with _fb1:
+                if st.button("등록", type="primary", key="doc_f_submit"):
+                    if not _f_title.strip():
+                        st.error("제목을 입력해 주세요.")
+                    else:
+                        try:
+                            client.table("app_documents").insert({
+                                "title":   _f_title.strip(),
+                                "content": _f_content.strip(),
+                                "author":  _me or "unknown",
+                                "tags":    _f_tags.strip(),
+                            }).execute()
+                            st.success("자료가 등록되었습니다.")
+                            st.session_state["doc_show_form"] = False
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as _e:
+                            st.error(f"등록 실패: {_e}")
+            with _fb2:
+                if st.button("취소", key="doc_f_cancel"):
+                    st.session_state["doc_show_form"] = False
+                    st.rerun()
+
+    # ── 검색 바 ────────────────────────────────────────────────────
+    _search = st.text_input(
+        "", placeholder="🔍  제목, 내용, 작성자로 검색",
+        key="doc_search", label_visibility="collapsed",
+    )
+
+    # ── 자료 목록 ─────────────────────────────────────────────────
+    _filtered = [
+        d for d in _docs
+        if not _search.strip() or any(
+            _search.lower() in (d.get(f) or "").lower()
+            for f in ("title", "content", "author", "tags")
+        )
+    ]
+
+    if not _filtered:
+        st.info("등록된 자료가 없습니다." if not _search else "검색 결과가 없습니다.")
+
+    for _doc in _filtered:
+        _doc_id      = _doc.get("id")
+        _doc_title   = _doc.get("title", "")
+        _doc_content = _doc.get("content", "")
+        _doc_author  = _doc.get("author", "")
+        _doc_tags    = _doc.get("tags", "")
+        _doc_date    = str(_doc.get("created_at", ""))[:16].replace("T", " ")
+        _preview     = (_doc_content or "")[:120].replace("\n", " ")
+        if len(_doc_content or "") > 120:
+            _preview += "..."
+
+        with st.container(border=True):
+            _tc1, _tc2 = st.columns([6, 1])
+            with _tc1:
+                st.markdown(f"#### {_doc_title}")
+                if _doc_tags:
+                    _tag_html = " ".join(
+                        f"<span style='background:#f0f4ff;border-radius:4px;padding:2px 8px;"
+                        f"font-size:0.75rem;color:#4a6cf7;margin-right:4px;'>{t.strip()}</span>"
+                        for t in _doc_tags.split(",") if t.strip()
+                    )
+                    st.markdown(_tag_html, unsafe_allow_html=True)
+                st.markdown(
+                    f"<div style='color:#555;font-size:0.88rem;margin:0.3rem 0;'>{_preview}</div>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"작성자 {_doc_author}　　등록 {_doc_date}")
+            with _tc2:
+                if st.button("열기", key=f"doc_open_{_doc_id}"):
+                    _k = f"doc_expanded_{_doc_id}"
+                    st.session_state[_k] = not st.session_state.get(_k, False)
+
+            # ── 상세 보기 ────────────────────────────────────────
+            if st.session_state.get(f"doc_expanded_{_doc_id}"):
+                st.markdown("---")
+                st.markdown(_doc_content or "*(내용 없음)*")
+
+                # 수정/삭제 (작성자 본인 또는 관리자)
+                _can_edit = (_doc_author == _me) or (_role in ("store_admin", "superadmin"))
+                if _can_edit:
+                    _ec1, _ec2 = st.columns([1, 1])
+                    with _ec1:
+                        if st.button("✏️ 수정", key=f"doc_edit_btn_{_doc_id}"):
+                            st.session_state[f"doc_editing_{_doc_id}"] = True
+                    with _ec2:
+                        if st.button("🗑️ 삭제", key=f"doc_del_btn_{_doc_id}"):
+                            st.session_state[f"doc_del_confirm_{_doc_id}"] = True
+
+                # 삭제 확인
+                if st.session_state.get(f"doc_del_confirm_{_doc_id}"):
+                    st.warning("정말 삭제하시겠습니까?")
+                    _dcc1, _dcc2 = st.columns([1, 5])
+                    with _dcc1:
+                        if st.button("확인 삭제", type="primary", key=f"doc_del_ok_{_doc_id}"):
+                            try:
+                                client.table("app_documents").delete().eq("id", _doc_id).execute()
+                                st.success("삭제되었습니다.")
+                                for _k in (f"doc_del_confirm_{_doc_id}", f"doc_expanded_{_doc_id}"):
+                                    st.session_state.pop(_k, None)
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"삭제 실패: {_e}")
+                    with _dcc2:
+                        if st.button("취소", key=f"doc_del_cancel_{_doc_id}"):
+                            st.session_state.pop(f"doc_del_confirm_{_doc_id}", None)
+                            st.rerun()
+
+                # 수정 폼
+                if st.session_state.get(f"doc_editing_{_doc_id}"):
+                    st.markdown("---")
+                    _et = st.text_input("제목", value=_doc_title, key=f"doc_et_{_doc_id}")
+                    _ec = st.text_area("내용", value=_doc_content, height=200, key=f"doc_ec_{_doc_id}")
+                    _eg = st.text_input("태그", value=_doc_tags, key=f"doc_eg_{_doc_id}")
+                    _es1, _es2 = st.columns([1, 5])
+                    with _es1:
+                        if st.button("저장", type="primary", key=f"doc_save_{_doc_id}"):
+                            try:
+                                client.table("app_documents").update({
+                                    "title":   _et.strip(),
+                                    "content": _ec.strip(),
+                                    "tags":    _eg.strip(),
+                                    "updated_at": "now()",
+                                }).eq("id", _doc_id).execute()
+                                st.success("수정되었습니다.")
+                                st.session_state.pop(f"doc_editing_{_doc_id}", None)
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"수정 실패: {_e}")
+                    with _es2:
+                        if st.button("취소", key=f"doc_edit_cancel_{_doc_id}"):
+                            st.session_state.pop(f"doc_editing_{_doc_id}", None)
+                            st.rerun()
+
+
+# =====================================================================
 # 📧 메일관리 (Gmail 연동) — ERP 사이드바 별도 페이지
 # =====================================================================
 
@@ -25296,6 +25507,8 @@ def main():
         st.session_state["active_admin_page"] = "erp_attendance"
     if st.sidebar.button("📧 메일관리", width='stretch'):
         st.session_state["active_admin_page"] = "gmail_manager"
+    if st.sidebar.button("📁 자료실", width='stretch'):
+        st.session_state["active_admin_page"] = "document_library"
     if role in ("store_admin", "superadmin"):
         if st.sidebar.button("📈 인력 효율 분석", width='stretch'):
             st.session_state["active_admin_page"] = "employee_analytics"
@@ -25362,6 +25575,11 @@ def main():
     # ERP 메일관리 (Gmail 연동) 라우팅 (전 역할 공통)
     if st.session_state.get("active_admin_page") == "gmail_manager":
         render_gmail_manager()
+        return
+
+    # 자료실 라우팅 (전 역할 공통)
+    if st.session_state.get("active_admin_page") == "document_library":
+        render_document_library()
         return
 
     # 인력 효율 분석 화면 라우팅 (store_admin / superadmin)
