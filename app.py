@@ -14092,45 +14092,49 @@ def render_document_library():
         _doc_furl    = _doc.get("file_url") or ""
         _doc_fname   = _doc.get("file_name") or ""
         _doc_fsize   = _doc.get("file_size")
-        _preview     = (_doc_content or "")[:120].replace("\n", " ")
-        if len(_doc_content or "") > 120:
+        # HTML 콘텐츠에서 태그 제거 후 텍스트만 추출 (미리보기용)
+        import re as _re
+        _preview_raw = _re.sub(r"<[^>]+>", " ", _doc_content or "").strip()
+        _preview_raw = _re.sub(r"\s+", " ", _preview_raw)
+        _preview     = _preview_raw[:300]
+        if len(_preview_raw) > 300:
             _preview += "..."
 
+        # 카드 전체를 단일 HTML 블록으로 렌더링 (제목 작게 + 미리보기 최대화)
+        _tag_badges = ""
+        if _doc_tags:
+            _tag_badges = " ".join(
+                f"<span style='background:#f0f4ff;border-radius:4px;padding:1px 7px;"
+                f"font-size:0.72rem;color:#4a6cf7;margin-right:3px;'>{t.strip()}</span>"
+                for t in _doc_tags.split(",") if t.strip()
+            )
+        _file_badge = ""
+        if _doc_furl and _doc_fname:
+            _sz = f" ({_fmt_size(_doc_fsize)})" if _doc_fsize else ""
+            _file_badge = (
+                f"<a href='{_doc_furl}' target='_blank' style='display:inline-flex;"
+                f"align-items:center;gap:3px;background:#f8f9fa;border:1px solid #dee2e6;"
+                f"border-radius:5px;padding:2px 8px;font-size:0.75rem;color:#495057;"
+                f"text-decoration:none;margin-top:3px;'>📎 {_doc_fname}{_sz}</a>"
+            )
+        _is_open = st.session_state.get(f"doc_expanded_{_doc_id}", False)
+        _btn_label = "▲ 닫기" if _is_open else "▼ 열기"
+
         with st.container(border=True):
-            _tc1, _tc2 = st.columns([6, 1])
-            with _tc1:
-                # 제목
-                st.markdown(f"#### {_doc_title}")
-                # 태그
-                if _doc_tags:
-                    _tag_html = " ".join(
-                        f"<span style='background:#f0f4ff;border-radius:4px;padding:2px 8px;"
-                        f"font-size:0.75rem;color:#4a6cf7;margin-right:4px;'>{t.strip()}</span>"
-                        for t in _doc_tags.split(",") if t.strip()
-                    )
-                    st.markdown(_tag_html, unsafe_allow_html=True)
-                # 미리보기
-                st.markdown(
-                    f"<div style='color:#555;font-size:0.88rem;margin:0.3rem 0;'>{_preview}</div>",
-                    unsafe_allow_html=True,
-                )
-                # 첨부파일 표시
-                if _doc_furl and _doc_fname:
-                    _ext = _doc_fname.rsplit(".", 1)[-1].upper() if "." in _doc_fname else "FILE"
-                    _sz  = f" ({_fmt_size(_doc_fsize)})" if _doc_fsize else ""
-                    st.markdown(
-                        f"<a href='{_doc_furl}' target='_blank' style='display:inline-flex;"
-                        f"align-items:center;gap:4px;background:#f8f9fa;border:1px solid #dee2e6;"
-                        f"border-radius:6px;padding:3px 10px;font-size:0.8rem;color:#495057;"
-                        f"text-decoration:none;margin-top:4px;'>"
-                        f"📎 {_doc_fname}{_sz}</a>",
-                        unsafe_allow_html=True,
-                    )
-                st.caption(f"작성자 {_doc_author}　　등록 {_doc_date}")
-            with _tc2:
-                if st.button("열기", key=f"doc_open_{_doc_id}"):
-                    _k = f"doc_expanded_{_doc_id}"
-                    st.session_state[_k] = not st.session_state.get(_k, False)
+            st.markdown(
+                f"<div style='margin:-4px 0 2px;'>"
+                f"<span style='font-size:0.95rem;font-weight:600;color:#1a1a1a;'>{_doc_title}</span>"
+                f"&nbsp;&nbsp;{_tag_badges}"
+                f"<span style='float:right;font-size:0.72rem;color:#aaa;'>{_doc_date} · {_doc_author}</span>"
+                f"</div>"
+                f"<div style='font-size:0.83rem;color:#555;line-height:1.55;margin-top:4px;"
+                f"white-space:pre-wrap;word-break:break-all;'>{_preview}</div>"
+                f"<div style='margin-top:4px;'>{_file_badge}</div>",
+                unsafe_allow_html=True,
+            )
+            if st.button(_btn_label, key=f"doc_open_{_doc_id}"):
+                st.session_state[f"doc_expanded_{_doc_id}"] = not _is_open
+                st.rerun()
 
             # ── 상세 보기 ────────────────────────────────────────
             if st.session_state.get(f"doc_expanded_{_doc_id}"):
