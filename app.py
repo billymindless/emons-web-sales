@@ -14261,11 +14261,12 @@ def render_document_library():
                     with _es1:
                         if st.button("저장", type="primary", key=f"doc_save_{_doc_id}"):
                             try:
+                                import datetime as _dtmod
                                 _upd = {
                                     "title":      _et.strip(),
                                     "content":    _ec.strip(),
                                     "tags":       _eg.strip(),
-                                    "updated_at": "now()",
+                                    "updated_at": _dtmod.datetime.utcnow().isoformat(),
                                 }
                                 if _ef:
                                     with st.spinner("파일 업로드 중..."):
