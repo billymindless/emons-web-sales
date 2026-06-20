@@ -14104,134 +14104,20 @@ def render_document_library():
 # 📧 메일관리 (Gmail 연동) — ERP 사이드바 별도 페이지
 # =====================================================================
 
-def _render_gmail_setup_guide(expanded: bool = False):
-    """Gmail 연동 설정 가이드 — expander 형태로 어디서나 노출."""
-    with st.expander("🔧 Gmail 연동 설정 가이드 (클릭하여 펼치기)", expanded=expanded):
-        st.markdown("### 📋 단계별 연동 방법")
-        st.info(
-            "**개인 Gmail(@gmail.com)과 Google Workspace(회사 도메인) 모두 지원합니다.**  \n"
-            "앱 내 '🔗 Google 계정으로 연결' 버튼 방식(권장) 또는 수동 설정 방식 중 선택하세요."
-        )
-
-        st.markdown("---")
-        st.markdown("#### STEP 1 — Google Cloud 프로젝트 및 Gmail API 활성화")
-        st.markdown(
-            """
-1. [Google Cloud Console](https://console.cloud.google.com) 접속 후 로그인
-2. 상단 프로젝트 선택 → **새 프로젝트** 생성 (예: `emons-erp`)
-3. 좌측 메뉴 → **API 및 서비스** → **라이브러리**
-4. 검색창에 `Gmail API` 입력 → **Gmail API** 클릭 → **사용 설정**
-            """
-        )
-
-        st.markdown("---")
-        st.markdown("#### STEP 2 — OAuth 동의 화면 설정")
-        st.markdown(
-            """
-1. **API 및 서비스** → **OAuth 동의 화면**
-2. 사용자 유형: **외부** 선택 → 만들기
-3. 앱 이름 입력 (예: `이몬스 ERP`), 지원 이메일 입력
-4. 범위(Scope) 추가 → `https://www.googleapis.com/auth/gmail.modify` + `userinfo.email` 선택
-5. 테스트 사용자에 연결할 Gmail 주소 추가 (개인/업무 모두 가능)
-6. 저장 후 계속
-            """
-        )
-
-        st.markdown("---")
-        st.markdown("#### STEP 3 — OAuth 2.0 클라이언트 ID 생성")
-        st.markdown(
-            """
-1. **API 및 서비스** → **사용자 인증 정보** → **+ 사용자 인증 정보 만들기**
-2. **OAuth 클라이언트 ID** 선택
-3. 애플리케이션 유형: **웹 애플리케이션** 선택 *(앱 내 연결 버튼 방식)*
-4. **승인된 리디렉션 URI** 에 앱 URL 추가:
-   - Render 배포: `https://your-app.onrender.com`
-   - Streamlit Cloud: `https://your-app.streamlit.app`
-5. 이름 입력 후 **만들기** → 클라이언트 ID와 Secret 복사
-            """
-        )
-
-        st.markdown("---")
-        st.markdown("#### STEP 4 — secrets.toml 설정 (관리자 1회)")
-        st.code(
-            """[gmail]
-client_id     = "123456789-xxxx.apps.googleusercontent.com"
-client_secret = "GOCSPX-xxxxxxxxxxxxxxxx"
-redirect_uri  = "https://your-app.onrender.com"   # 앱 URL (STEP 3에서 등록한 URI)
-sender_email  = ""   # 개인 연결 버튼 사용 시 비워도 됩니다
-
-# 아래는 수동 발급한 경우에만 입력 (앱 내 버튼 방식이면 불필요)
-# refresh_token = "1//0gxxxxxxxxxxxxxxxxxxxxxxxx"
-""",
-            language="toml",
-        )
-        st.markdown("**Render 환경변수 방식 (secrets.toml 대신)**")
-        st.markdown(
-            """
-| 키 | 값 |
-|---|---|
-| `GMAIL_CLIENT_ID` | 클라이언트 ID |
-| `GMAIL_CLIENT_SECRET` | 클라이언트 Secret |
-| `GMAIL_REDIRECT_URI` | 앱 URL |
-| `GMAIL_REFRESH_TOKEN` | (수동 발급 시) Refresh Token |
-            """
-        )
-
-        st.markdown("---")
-        st.markdown("#### STEP 5 — Supabase 테이블 생성")
-        st.markdown("아래 SQL을 Supabase SQL 에디터에서 실행해 사용자별 토큰 저장 테이블을 만듭니다.")
-        st.code(
-            """CREATE TABLE IF NOT EXISTS app_gmail_tokens (
-  id            BIGSERIAL PRIMARY KEY,
-  username      TEXT NOT NULL UNIQUE,
-  gmail_address TEXT,
-  refresh_token TEXT NOT NULL,
-  access_token  TEXT,
-  token_expiry  TIMESTAMPTZ,
-  created_at    TIMESTAMPTZ DEFAULT now(),
-  updated_at    TIMESTAMPTZ DEFAULT now()
-);
-ALTER TABLE app_gmail_tokens ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Allow all" ON app_gmail_tokens FOR ALL USING (true) WITH CHECK (true);
-""",
-            language="sql",
-        )
-
-        st.markdown("---")
-        st.markdown("#### STEP 6 — 앱 내 연결 버튼으로 개인 Gmail 연동")
-        st.markdown(
-            """
-1. secrets.toml과 Supabase 테이블 설정 후 앱 재시작
-2. 메일관리 화면에서 **🔗 Google 계정으로 연결** 버튼 클릭
-3. Google 로그인 → 권한 허용
-4. 자동으로 앱으로 돌아오면 연결 완료 ✅
-5. 각 직원이 자신의 Gmail 계정을 개별 연결 가능합니다
-
-> ⚠️ **주의사항**
-> - OAuth 동의 화면이 **테스트** 상태이면 추가한 테스트 사용자만 연결 가능합니다.
-> - **프로덕션 게시** 후에는 모든 Google 계정에서 연결 가능합니다.
-> - Google 계정의 2단계 인증이 활성화되어 있어도 정상 작동합니다.
-            """
-        )
-
-
 def render_gmail_manager():
-    """Gmail OAuth2 연동 — 개인 Gmail / Google Workspace 모두 지원."""
+    """Gmail OAuth2 연동 — 개인 이메일 주소 입력 후 Google 계정 연결."""
     st.header("📧 메일관리")
-    st.caption("개인 Gmail(@gmail.com) 및 Google Workspace 계정을 연동하여 메일을 확인하고 발송합니다.")
 
     try:
         import gmail_manager as _gm  # noqa: WPS433
     except ImportError:
         st.error("`google-auth`, `google-api-python-client` 패키지가 필요합니다.")
-        _render_gmail_setup_guide()
         return
 
-    # ── 현재 로그인 사용자 식별 ────────────────────────────────────
     _cu = st.session_state.get("current_user") or {}
     _me = (_cu.get("username") or _cu.get("email") or "").strip()
 
-    # ── Step 0: OAuth 콜백 감지 — URL에 ?code=&state=gmail_oauth 가 있으면 처리 ──
+    # ── OAuth 콜백 처리 (?code=&state=gmail_oauth) ─────────────────
     try:
         _oauth_code  = st.query_params.get("code")
         _oauth_state = st.query_params.get("state")
@@ -14239,35 +14125,25 @@ def render_gmail_manager():
         _oauth_code = _oauth_state = None
 
     if _oauth_code and _oauth_state == "gmail_oauth" and _me:
-        # 리디렉트 URI: 현재 앱 URL에서 쿼리스트링 제거
         try:
-            _redirect_uri = st.query_params.get("_redir") or ""
+            _redirect_uri = (st.secrets.get("gmail") or {}).get("redirect_uri", "")
         except Exception:
             _redirect_uri = ""
-        if not _redirect_uri:
-            try:
-                import streamlit as _st2
-                _redirect_uri = (_st2.secrets.get("gmail") or {}).get("redirect_uri", "")
-            except Exception:
-                _redirect_uri = ""
-        if not _redirect_uri:
-            _redirect_uri = os.environ.get("GMAIL_REDIRECT_URI", "")
+        _redirect_uri = _redirect_uri or os.environ.get("GMAIL_REDIRECT_URI", "")
 
-        with st.spinner("Google 인증 처리 중..."):
+        with st.spinner("Google 계정 연결 중..."):
             _tokens = _gm.exchange_code_for_tokens(_oauth_code, _redirect_uri)
 
         if _tokens.get("error"):
-            st.error(f"인증 실패: {_tokens.get('error_description') or _tokens.get('error')}")
+            st.error(f"연결 실패: {_tokens.get('error_description') or _tokens.get('error')}")
         else:
-            _gmail_addr = _gm.fetch_gmail_address(_tokens.get("access_token", ""))
-            _tokens["gmail_address"] = _gmail_addr
-            _saved = _gm.save_user_tokens(_me, _tokens)
-            if _saved:
-                st.success(f"✅ Google 계정 연결 완료! ({_gmail_addr or _me})")
-                st.toast(f"Gmail 연동 성공: {_gmail_addr}", icon="✅")
+            _addr = _gm.fetch_gmail_address(_tokens.get("access_token", ""))
+            _tokens["gmail_address"] = _addr
+            if _gm.save_user_tokens(_me, _tokens):
+                st.success(f"✅ {_addr} 연결 완료!")
+                st.toast(f"Gmail 연동 성공: {_addr}", icon="✅")
             else:
-                st.warning("토큰 저장 중 오류가 발생했습니다. 재시도 해주세요.")
-        # URL 파라미터 정리 후 이 페이지 유지
+                st.warning("저장 중 오류가 발생했습니다. 다시 시도해 주세요.")
         try:
             st.query_params.clear()
             st.session_state["active_admin_page"] = "gmail_manager"
@@ -14276,93 +14152,65 @@ def render_gmail_manager():
         st.rerun()
         return
 
-    # ── Step 1: 연결 상태 확인 ─────────────────────────────────────
-    _global_ok   = _gm.is_gmail_configured()         # secrets.toml 전역 설정
-    _user_ok     = _me and _gm.is_user_connected(_me) # 개인 연결(Supabase)
-    _connected   = _global_ok or _user_ok
-
-    _user_row    = _gm.load_user_tokens(_me) if (_me and _user_ok) else None
-    _gmail_addr  = (_user_row or {}).get("gmail_address", "") if _user_row else ""
-
-    # ── 연결 상태 배너 ──────────────────────────────────────────────
+    # ── 연결 상태 확인 ─────────────────────────────────────────────
+    _global_ok  = _gm.is_gmail_configured()
+    _user_ok    = bool(_me and _gm.is_user_connected(_me))
+    _connected  = _global_ok or _user_ok
+    _user_row   = _gm.load_user_tokens(_me) if _user_ok else None
+    _gmail_addr = (_user_row or {}).get("gmail_address", "")
     _client_id, _ = _gm.get_client_credentials()
-    if _connected:
-        _addr_label = _gmail_addr or ("전역 설정(secrets.toml)" if _global_ok else _me)
-        _banner_cols = st.columns([5, 1])
-        with _banner_cols[0]:
-            st.success(f"✅ 연결됨: **{_addr_label}**")
-        with _banner_cols[1]:
-            if _user_ok and st.button("🔌 연결 해제", key="gm_disconnect"):
-                _gm.delete_user_tokens(_me)
-                st.toast("Gmail 연결이 해제되었습니다.", icon="🔌")
-                st.rerun()
-    else:
-        # ── 미연결: 기능 소개 카드 ──────────────────────────────
+
+    try:
+        _redirect_uri = (st.secrets.get("gmail") or {}).get("redirect_uri", "")
+    except Exception:
+        _redirect_uri = ""
+    _redirect_uri = _redirect_uri or os.environ.get("GMAIL_REDIRECT_URI", "")
+
+    # ── 미연결: 이메일 입력 + 연결 버튼 ──────────────────────────
+    if not _connected:
         st.markdown("<br>", unsafe_allow_html=True)
-        col_mid = st.columns([1, 2, 1])[1]
-        with col_mid:
+        _mid = st.columns([1, 2, 1])[1]
+        with _mid:
             st.markdown(
-                "<div style='text-align:center; padding:1.5rem 1rem;'>"
-                "<div style='font-size:3rem;'>✉️</div>"
-                "<h3 style='margin:0.2rem 0 0.3rem;'>Gmail 연동 기능</h3>"
-                "<p style='color:#666; font-size:0.9rem;'>개인 Gmail과 Google Workspace 계정 모두 지원합니다.</p>"
+                "<div style='text-align:center; padding:2rem 1rem 1rem;'>"
+                "<div style='font-size:3.5rem;'>✉️</div>"
+                "<h3 style='margin:0.5rem 0 0.3rem;'>내 Gmail 연결</h3>"
+                "<p style='color:#888; font-size:0.9rem;'>개인 Gmail(@gmail.com) 및 회사 메일 모두 지원</p>"
                 "</div>",
                 unsafe_allow_html=True,
             )
-        _cs = "border:1px solid #e0e0e0;border-radius:12px;padding:1.2rem;text-align:center;"
-        _c1, _c2, _c3 = st.columns(3)
-        with _c1:
-            st.markdown(f"<div style='{_cs}'><div style='font-size:1.6rem'>🔍</div><b>메일 조회 및 검색</b></div>",
-                        unsafe_allow_html=True)
-        with _c2:
-            st.markdown(f"<div style='{_cs}'><div style='font-size:1.6rem'>👥</div><b>고객 메일 자동 연결</b></div>",
-                        unsafe_allow_html=True)
-        with _c3:
-            st.markdown(f"<div style='{_cs}'><div style='font-size:1.6rem'>📤</div><b>메일 발송</b></div>",
-                        unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
 
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # ── 앱 내 Google 계정 연결 버튼 ────────────────────────
-        if _client_id:
-            st.info(
-                "아래 버튼을 클릭하면 Google 로그인 페이지로 이동합니다. "
-                "로그인 후 권한을 허용하면 자동으로 연결됩니다."
-            )
-            try:
-                _secrets_gm = st.secrets.get("gmail") or {}
-            except Exception:
-                _secrets_gm = {}
-            _redirect_uri = (
-                _secrets_gm.get("redirect_uri")
-                or os.environ.get("GMAIL_REDIRECT_URI", "")
-            )
-            if _redirect_uri:
-                _oauth_url = _gm.get_oauth_url(_redirect_uri)
+            if _client_id and _redirect_uri:
+                _hint = st.text_input(
+                    "Gmail 주소",
+                    placeholder="example@gmail.com",
+                    key="gm_login_hint",
+                    label_visibility="collapsed",
+                )
+                _oauth_url = _gm.get_oauth_url(_redirect_uri, login_hint=_hint.strip())
                 st.link_button(
-                    "🔗 Google 계정으로 연결 (개인/업무 Gmail 모두 가능)",
+                    "Google 계정으로 연결",
                     url=_oauth_url,
                     use_container_width=True,
                     type="primary",
                 )
-                st.caption(
-                    f"연결 후 이 페이지로 자동 복귀합니다.  \n"
-                    f"redirect_uri: `{_redirect_uri}`  \n"
-                    "개인 Gmail(@gmail.com)과 Google Workspace(@회사도메인) 모두 지원합니다."
-                )
+                st.caption("버튼 클릭 → Google 로그인 → 권한 허용 → 자동 완료")
             else:
-                st.warning(
-                    "redirect_uri가 설정되지 않아 버튼 연결이 비활성화되었습니다.  \n"
-                    "secrets.toml `[gmail]` 섹션에 `redirect_uri = \"앱URL\"`을 추가해 주세요."
-                )
-        else:
-            st.warning("Google Cloud OAuth 클라이언트 ID가 설정되지 않았습니다. 아래 가이드를 참고해 주세요.")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        _render_gmail_setup_guide(expanded=True)
+                st.warning("관리자 설정이 완료되지 않았습니다. Render 환경변수를 확인해 주세요.")
         return
 
-    # ── Gmail 연동 완료 — 메일 UI ────────────────────────────────
+    # ── 연결 완료: 상태 표시 + 메일 UI ───────────────────────────
+    _addr_label = _gmail_addr or ("시스템 계정" if _global_ok else _me)
+    _hc1, _hc2 = st.columns([5, 1])
+    with _hc1:
+        st.success(f"✅ 연결된 계정: **{_addr_label}**")
+    with _hc2:
+        if _user_ok and st.button("연결 해제", key="gm_disconnect"):
+            _gm.delete_user_tokens(_me)
+            st.toast("연결이 해제되었습니다.", icon="🔌")
+            st.rerun()
+
     _uname_for_api = _me if _user_ok else None
     gmail_tabs = st.tabs(["📥 받은편지함", "🔍 메일 검색", "📤 메일 발송"])
 
@@ -14373,7 +14221,6 @@ def render_gmail_manager():
             st.subheader("📥 받은편지함")
         with _c2g:
             _unread_only = st.checkbox("읽지 않은 메일만", value=False, key="gm_unread_only")
-
         with st.spinner("메일을 불러오는 중..."):
             try:
                 _lids = ["INBOX", "UNREAD"] if _unread_only else ["INBOX"]
@@ -14381,7 +14228,6 @@ def render_gmail_manager():
             except Exception as _e:
                 st.error(f"메일 로드 실패: {_e}")
                 _msgs = []
-
         if not _msgs:
             st.info("받은편지함이 비어 있습니다.")
         for _msg in _msgs:
@@ -14395,8 +14241,7 @@ def render_gmail_manager():
                 with _dc1:
                     if st.button("📖 전체 보기", key=f"gm_view_{_msg['id']}"):
                         st.session_state[f"gm_body_{_msg['id']}"] = _gm.get_message_body(
-                            _msg["id"], username=_uname_for_api
-                        )
+                            _msg["id"], username=_uname_for_api)
                         if _msg["is_unread"]:
                             _gm.mark_as_read(_msg["id"], username=_uname_for_api)
                 with _dc2:
@@ -14462,14 +14307,11 @@ def render_gmail_manager():
                         username=_uname_for_api,
                     )
                 if _res["status"] == "sent":
-                    st.success(f"✅ 메일이 발송되었습니다.")
+                    st.success("✅ 메일이 발송되었습니다.")
                     for _k in ("gm_send_to", "gm_send_subj", "gm_send_body"):
                         st.session_state.pop(_k, None)
                 else:
                     st.error(f"발송 실패: {_res['error']}")
-
-    st.markdown("---")
-    _render_gmail_setup_guide()
 
 
 # ---------- 탭 7: 월말 급여 요약 (store_admin) ----------

@@ -76,10 +76,14 @@ def get_client_credentials() -> tuple[str, str]:
 # OAuth2 인증 URL 생성 (앱 내 연결 버튼용)
 # ──────────────────────────────────────────────
 
-def get_oauth_url(redirect_uri: str, state: str = "gmail_oauth") -> str:
+def get_oauth_url(
+    redirect_uri: str,
+    state: str = "gmail_oauth",
+    login_hint: str = "",
+) -> str:
     """
     Google OAuth2 인증 URL 생성.
-    redirect_uri: 앱 URL (예: https://emons.streamlit.app)
+    login_hint: 사용자가 입력한 Gmail 주소 — Google 로그인 화면에 이메일 자동 입력됨.
     """
     client_id, _ = get_client_credentials()
     if not client_id:
@@ -90,9 +94,11 @@ def get_oauth_url(redirect_uri: str, state: str = "gmail_oauth") -> str:
         "response_type": "code",
         "scope":         " ".join(GMAIL_SCOPES),
         "access_type":   "offline",
-        "prompt":        "consent",   # refresh_token 강제 발급
+        "prompt":        "consent",
         "state":         state,
     }
+    if login_hint:
+        params["login_hint"] = login_hint
     return f"{GOOGLE_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 
