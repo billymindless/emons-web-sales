@@ -13894,7 +13894,7 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 # =====================================================================
 
 def render_document_library():
-    """업무 자료를 게시판 형태로 관리하는 자료실."""
+    """업무 자료 게시판 — 글쓰기 + 첨부파일 업로드/다운로드."""
     st.header("📁 자료실")
     st.caption("업무 자료를 게시판 형태로 관리합니다.")
 
@@ -13907,7 +13907,31 @@ def render_document_library():
     _me   = (_cu.get("username") or _cu.get("email") or "").strip()
     _role = _cu.get("role", "staff")
 
-    # ── 전체 자료 불러오기 ──────────────────────────────────────────
+    # ── Supabase Storage 업로드 헬퍼 ──────────────────────────────
+    def _upload_file(doc_id, uploaded_file) -> tuple[str, str]:
+        """파일을 Supabase Storage 'documents' 버킷에 업로드. (url, filename) 반환."""
+        import mimetypes
+        _fname    = uploaded_file.name
+        _fbytes   = uploaded_file.read()
+        _mime     = mimetypes.guess_type(_fname)[0] or "application/octet-stream"
+        _spath    = f"{doc_id}/{_fname}"
+        client.storage.from_("documents").upload(
+            _spath, _fbytes,
+            file_options={"content-type": _mime, "upsert": "true"},
+        )
+        _url = client.storage.from_("documents").get_public_url(_spath)
+        return _url, _fname
+
+    def _fmt_size(size: int | None) -> str:
+        if not size:
+            return ""
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 ** 2:
+            return f"{size/1024:.1f} KB"
+        return f"{size/1024**2:.1f} MB"
+
+    # ── 전체 자료 불러오기 ─────────────────────────────────────────
     @st.cache_data(ttl=30, show_spinner=False)
     def _fetch_docs():
         try:
@@ -13922,34 +13946,25 @@ def render_document_library():
     _hc1, _hc2, _hc3 = st.columns([2, 2, 1])
     with _hc1:
         st.markdown(
-            f"<div style='border:1px solid #e0e0e0; border-radius:12px; padding:1rem 1.2rem;'>"
-            f"<div style='font-size:0.8rem; color:#888;'>등록 자료</div>"
-            f"<div style='font-size:1.6rem; font-weight:700;'>{len(_docs)}건</div>"
-            f"<div style='font-size:0.75rem; color:#aaa;'>현재 자료실에 등록된 자료 수</div>"
-            f"</div>",
+            f"<div style='border:1px solid #e0e0e0;border-radius:12px;padding:1rem 1.2rem;'>"
+            f"<div style='font-size:0.8rem;color:#888;'>등록 자료</div>"
+            f"<div style='font-size:1.6rem;font-weight:700;'>{len(_docs)}건</div>"
+            f"<div style='font-size:0.75rem;color:#aaa;'>현재 자료실에 등록된 자료 수</div></div>",
             unsafe_allow_html=True,
         )
     with _hc2:
-        _latest_date = ""
-        if _docs:
-            try:
-                import datetime as _dt
-                _d = _docs[0].get("created_at", "")[:19].replace("T", " ")
-                _latest_date = _d
-            except Exception:
-                _latest_date = ""
+        _latest_date = str(_docs[0].get("created_at", ""))[:16].replace("T", " ") if _docs else "—"
         st.markdown(
-            f"<div style='border:1px solid #e0e0e0; border-radius:12px; padding:1rem 1.2rem;'>"
-            f"<div style='font-size:0.8rem; color:#888;'>최근 등록</div>"
-            f"<div style='font-size:1.1rem; font-weight:700; margin:0.2rem 0;'>{_latest_date or '—'}</div>"
-            f"<div style='font-size:0.75rem; color:#aaa;'>가장 최근에 등록된 자료 일시</div>"
-            f"</div>",
+            f"<div style='border:1px solid #e0e0e0;border-radius:12px;padding:1rem 1.2rem;'>"
+            f"<div style='font-size:0.8rem;color:#888;'>최근 등록</div>"
+            f"<div style='font-size:1.1rem;font-weight:700;margin:0.2rem 0;'>{_latest_date}</div>"
+            f"<div style='font-size:0.75rem;color:#aaa;'>가장 최근에 등록된 자료 일시</div></div>",
             unsafe_allow_html=True,
         )
     with _hc3:
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-        if st.button("＋ 자료 추가", type="primary", use_container_width=True, key="doc_add_btn"):
-            st.session_state["doc_show_form"] = True
+        if st.button("✏️ 글쓰기", type="primary", use_container_width=True, key="doc_add_btn"):
+            st.session_state["doc_show_form"] = not st.session_state.get("doc_show_form", False)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -13958,10 +13973,14 @@ def render_document_library():
         with st.container(border=True):
             st.subheader("📝 새 자료 등록")
             _f_title   = st.text_input("제목 *", key="doc_f_title", placeholder="자료 제목을 입력하세요")
-            _f_content = st.text_area("내용", key="doc_f_content", height=200,
-                                      placeholder="내용을 입력하세요. 마크다운 문법을 사용할 수 있습니다.")
+            _f_content = st.text_area("내용", key="doc_f_content", height=220,
+                                      placeholder="내용을 입력하세요. 마크다운 문법을 사용할 수 있습니다.\n\n예) **굵게**, *기울임*, ## 제목, - 목록")
             _f_tags    = st.text_input("태그 (쉼표 구분)", key="doc_f_tags",
                                        placeholder="예: 가이드, 인사, 2026")
+            _f_file    = st.file_uploader(
+                "첨부파일 (선택)", key="doc_f_file",
+                help="PDF, Word, Excel, 이미지 등 모든 파일 형식 지원 (최대 50MB)",
+            )
             _fb1, _fb2 = st.columns([1, 5])
             with _fb1:
                 if st.button("등록", type="primary", key="doc_f_submit"):
@@ -13969,12 +13988,27 @@ def render_document_library():
                         st.error("제목을 입력해 주세요.")
                     else:
                         try:
-                            client.table("app_documents").insert({
+                            _row = {
                                 "title":   _f_title.strip(),
                                 "content": _f_content.strip(),
                                 "author":  _me or "unknown",
                                 "tags":    _f_tags.strip(),
-                            }).execute()
+                            }
+                            _res = client.table("app_documents").insert(_row).execute()
+                            _new_id = _res.data[0]["id"] if _res.data else None
+
+                            if _f_file and _new_id:
+                                with st.spinner("파일 업로드 중..."):
+                                    try:
+                                        _url, _fname = _upload_file(_new_id, _f_file)
+                                        client.table("app_documents").update({
+                                            "file_url":  _url,
+                                            "file_name": _fname,
+                                            "file_size": _f_file.size,
+                                        }).eq("id", _new_id).execute()
+                                    except Exception as _ue:
+                                        st.warning(f"파일 업로드 실패 (글은 저장됨): {_ue}")
+
                             st.success("자료가 등록되었습니다.")
                             st.session_state["doc_show_form"] = False
                             st.cache_data.clear()
@@ -14011,6 +14045,9 @@ def render_document_library():
         _doc_author  = _doc.get("author", "")
         _doc_tags    = _doc.get("tags", "")
         _doc_date    = str(_doc.get("created_at", ""))[:16].replace("T", " ")
+        _doc_furl    = _doc.get("file_url") or ""
+        _doc_fname   = _doc.get("file_name") or ""
+        _doc_fsize   = _doc.get("file_size")
         _preview     = (_doc_content or "")[:120].replace("\n", " ")
         if len(_doc_content or "") > 120:
             _preview += "..."
@@ -14018,7 +14055,9 @@ def render_document_library():
         with st.container(border=True):
             _tc1, _tc2 = st.columns([6, 1])
             with _tc1:
+                # 제목
                 st.markdown(f"#### {_doc_title}")
+                # 태그
                 if _doc_tags:
                     _tag_html = " ".join(
                         f"<span style='background:#f0f4ff;border-radius:4px;padding:2px 8px;"
@@ -14026,10 +14065,23 @@ def render_document_library():
                         for t in _doc_tags.split(",") if t.strip()
                     )
                     st.markdown(_tag_html, unsafe_allow_html=True)
+                # 미리보기
                 st.markdown(
                     f"<div style='color:#555;font-size:0.88rem;margin:0.3rem 0;'>{_preview}</div>",
                     unsafe_allow_html=True,
                 )
+                # 첨부파일 표시
+                if _doc_furl and _doc_fname:
+                    _ext = _doc_fname.rsplit(".", 1)[-1].upper() if "." in _doc_fname else "FILE"
+                    _sz  = f" ({_fmt_size(_doc_fsize)})" if _doc_fsize else ""
+                    st.markdown(
+                        f"<a href='{_doc_furl}' target='_blank' style='display:inline-flex;"
+                        f"align-items:center;gap:4px;background:#f8f9fa;border:1px solid #dee2e6;"
+                        f"border-radius:6px;padding:3px 10px;font-size:0.8rem;color:#495057;"
+                        f"text-decoration:none;margin-top:4px;'>"
+                        f"📎 {_doc_fname}{_sz}</a>",
+                        unsafe_allow_html=True,
+                    )
                 st.caption(f"작성자 {_doc_author}　　등록 {_doc_date}")
             with _tc2:
                 if st.button("열기", key=f"doc_open_{_doc_id}"):
@@ -14041,7 +14093,19 @@ def render_document_library():
                 st.markdown("---")
                 st.markdown(_doc_content or "*(내용 없음)*")
 
-                # 수정/삭제 (작성자 본인 또는 관리자)
+                # 첨부파일 다운로드
+                if _doc_furl and _doc_fname:
+                    _sz2 = f" · {_fmt_size(_doc_fsize)}" if _doc_fsize else ""
+                    st.markdown(
+                        f"<a href='{_doc_furl}' target='_blank' download style='"
+                        f"display:inline-flex;align-items:center;gap:6px;"
+                        f"background:#1a73e8;color:#fff;border-radius:8px;"
+                        f"padding:6px 16px;font-size:0.85rem;text-decoration:none;"
+                        f"margin-top:0.5rem;'>⬇️ {_doc_fname}{_sz2} 다운로드</a>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown("<br>", unsafe_allow_html=True)
                 _can_edit = (_doc_author == _me) or (_role in ("store_admin", "superadmin"))
                 if _can_edit:
                     _ec1, _ec2 = st.columns([1, 1])
@@ -14060,7 +14124,6 @@ def render_document_library():
                         if st.button("확인 삭제", type="primary", key=f"doc_del_ok_{_doc_id}"):
                             try:
                                 client.table("app_documents").delete().eq("id", _doc_id).execute()
-                                st.success("삭제되었습니다.")
                                 for _k in (f"doc_del_confirm_{_doc_id}", f"doc_expanded_{_doc_id}"):
                                     st.session_state.pop(_k, None)
                                 st.cache_data.clear()
@@ -14075,19 +14138,30 @@ def render_document_library():
                 # 수정 폼
                 if st.session_state.get(f"doc_editing_{_doc_id}"):
                     st.markdown("---")
-                    _et = st.text_input("제목", value=_doc_title, key=f"doc_et_{_doc_id}")
-                    _ec = st.text_area("내용", value=_doc_content, height=200, key=f"doc_ec_{_doc_id}")
-                    _eg = st.text_input("태그", value=_doc_tags, key=f"doc_eg_{_doc_id}")
+                    _et  = st.text_input("제목", value=_doc_title, key=f"doc_et_{_doc_id}")
+                    _ec  = st.text_area("내용", value=_doc_content, height=200, key=f"doc_ec_{_doc_id}")
+                    _eg  = st.text_input("태그", value=_doc_tags, key=f"doc_eg_{_doc_id}")
+                    _ef  = st.file_uploader("첨부파일 교체 (선택)", key=f"doc_ef_{_doc_id}",
+                                            help="새 파일을 올리면 기존 파일이 교체됩니다.")
+                    if _doc_fname:
+                        st.caption(f"현재 첨부파일: 📎 {_doc_fname}")
                     _es1, _es2 = st.columns([1, 5])
                     with _es1:
                         if st.button("저장", type="primary", key=f"doc_save_{_doc_id}"):
                             try:
-                                client.table("app_documents").update({
-                                    "title":   _et.strip(),
-                                    "content": _ec.strip(),
-                                    "tags":    _eg.strip(),
+                                _upd = {
+                                    "title":      _et.strip(),
+                                    "content":    _ec.strip(),
+                                    "tags":       _eg.strip(),
                                     "updated_at": "now()",
-                                }).eq("id", _doc_id).execute()
+                                }
+                                if _ef:
+                                    with st.spinner("파일 업로드 중..."):
+                                        _nurl, _nfname = _upload_file(_doc_id, _ef)
+                                    _upd["file_url"]  = _nurl
+                                    _upd["file_name"] = _nfname
+                                    _upd["file_size"] = _ef.size
+                                client.table("app_documents").update(_upd).eq("id", _doc_id).execute()
                                 st.success("수정되었습니다.")
                                 st.session_state.pop(f"doc_editing_{_doc_id}", None)
                                 st.cache_data.clear()
