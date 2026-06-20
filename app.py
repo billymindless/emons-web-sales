@@ -14105,223 +14105,332 @@ def render_document_library():
 # =====================================================================
 
 def render_gmail_manager():
-    """Gmail IMAP/SMTP 연동 — 앱 비밀번호 방식."""
-    st.header("📧 메일관리")
-
+    """Gmail IMAP/SMTP 연동 — Gmail 스타일 UI."""
     import gmail_manager as _gm  # noqa: WPS433
+    import html as _html
+
+    # ── Gmail 스타일 CSS ──────────────────────────────────────────
+    st.markdown("""
+<style>
+.gm-wrap {
+    background:#fff; border:1px solid #e0e0e0; border-radius:8px;
+    overflow:hidden; margin-top:0.5rem;
+}
+.gm-toolbar {
+    display:flex; align-items:center; gap:0.5rem;
+    padding:0.5rem 1rem; border-bottom:1px solid #e0e0e0;
+    background:#f6f8fc;
+}
+.gm-toolbar input[type=text] { flex:1; border:1px solid #dfe1e5; border-radius:24px;
+    padding:0.35rem 1rem; font-size:0.9rem; outline:none; }
+.gm-row {
+    display:flex; align-items:center; padding:0.55rem 1rem;
+    border-bottom:1px solid #f0f0f0; gap:0.8rem; cursor:pointer;
+    transition:background 0.12s;
+}
+.gm-row:hover { background:#f2f6fc; }
+.gm-row.unread { background:#fff; }
+.gm-row.read   { background:#fafafa; }
+.gm-dot { width:10px; height:10px; border-radius:50%;
+          background:#1a73e8; flex-shrink:0; }
+.gm-dot.read { background:transparent; }
+.gm-sender {
+    width:170px; flex-shrink:0; font-size:0.88rem;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.gm-row.unread .gm-sender { font-weight:700; color:#202124; }
+.gm-row.read   .gm-sender { font-weight:400; color:#5f6368; }
+.gm-content { flex:1; min-width:0; font-size:0.88rem;
+              white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.gm-row.unread .gm-subject { font-weight:700; color:#202124; }
+.gm-row.read   .gm-subject { font-weight:400; color:#5f6368; }
+.gm-preview { color:#9aa0a6; }
+.gm-date { width:72px; flex-shrink:0; text-align:right;
+           font-size:0.8rem; color:#5f6368; white-space:nowrap; }
+.gm-row.unread .gm-date { font-weight:600; color:#202124; }
+.gm-body-wrap {
+    background:#fff; border-bottom:1px solid #e8e8e8;
+    padding:1rem 1.5rem;
+}
+.gm-body-header { margin-bottom:0.6rem; }
+.gm-body-subject { font-size:1.1rem; font-weight:600; color:#202124; }
+.gm-body-meta    { font-size:0.82rem; color:#5f6368; margin-top:0.2rem; }
+.gm-body-text    { font-size:0.9rem; color:#202124; white-space:pre-wrap;
+                   line-height:1.6; max-height:400px; overflow-y:auto;
+                   background:#f9f9f9; border-radius:6px; padding:1rem;
+                   border:1px solid #e8e8e8; margin-top:0.6rem; }
+.gm-cust-badge {
+    display:inline-block; background:#e8f5e9; color:#2e7d32;
+    border-radius:4px; padding:2px 8px; font-size:0.78rem; margin-top:0.3rem;
+}
+.gm-compose-wrap {
+    background:#fff; border-radius:8px; border:1px solid #e0e0e0;
+    padding:1.5rem; margin-top:0.5rem;
+}
+.gm-compose-from { font-size:0.82rem; color:#5f6368; margin-bottom:1rem;
+                   padding-bottom:0.5rem; border-bottom:1px solid #e0e0e0; }
+</style>
+""", unsafe_allow_html=True)
 
     _cu = st.session_state.get("current_user") or {}
     _me = (_cu.get("username") or _cu.get("email") or "").strip()
 
-    # ── 연결 상태 확인 ─────────────────────────────────────────────
     _connected = _me and _gm.is_user_connected(_me)
     _creds     = _gm.load_user_credentials(_me) if _connected else None
     _gaddr     = (_creds or {}).get("gmail_address", "")
     _gpwd      = (_creds or {}).get("app_password", "")
 
-    # ── 미연결: 계정 설정 화면 ─────────────────────────────────────
+    # ── 미연결: 로그인 카드 ────────────────────────────────────────
     if not _connected:
         st.markdown("<br>", unsafe_allow_html=True)
         _mid = st.columns([1, 2, 1])[1]
         with _mid:
             st.markdown(
-                "<div style='text-align:center; padding:1.5rem 1rem 0.5rem;'>"
-                "<div style='font-size:3rem;'>✉️</div>"
-                "<h3 style='margin:0.4rem 0 0.2rem;'>내 Gmail 연결</h3>"
-                "<p style='color:#888; font-size:0.88rem;'>Gmail 주소와 앱 비밀번호로 바로 연결합니다</p>"
+                "<div style='text-align:center;padding:2rem 1rem 1rem;'>"
+                "<img src='https://ssl.gstatic.com/ui/v1/icons/mail/rfr/gmail.ico' width=40><br><br>"
+                "<h3 style='margin:0.2rem 0;'>내 Gmail 연결</h3>"
+                "<p style='color:#5f6368;font-size:0.88rem;'>Gmail 주소와 앱 비밀번호로 연결합니다</p>"
                 "</div>",
                 unsafe_allow_html=True,
             )
             st.markdown("<br>", unsafe_allow_html=True)
-
             _inp_addr = st.text_input("Gmail 주소", placeholder="example@gmail.com", key="gm_inp_addr")
-            _inp_pwd  = st.text_input("앱 비밀번호 (16자리)", placeholder="xxxx xxxx xxxx xxxx",
+            _inp_pwd  = st.text_input("앱 비밀번호", placeholder="xxxx xxxx xxxx xxxx",
                                       type="password", key="gm_inp_pwd")
-
             if st.button("연결", type="primary", use_container_width=True, key="gm_connect_btn"):
                 _a = _inp_addr.strip()
                 _p = _inp_pwd.replace(" ", "").strip()
                 if not _a or "@" not in _a:
                     st.error("올바른 Gmail 주소를 입력해 주세요.")
                 elif len(_p) < 16:
-                    st.error("앱 비밀번호는 16자리입니다. 공백 없이 입력해 주세요.")
+                    st.error("앱 비밀번호는 16자리입니다.")
                 else:
                     with st.spinner("연결 확인 중..."):
-                        _ok, _msg = _gm.test_connection(_a, _p)
+                        _ok, _emsg = _gm.test_connection(_a, _p)
                     if _ok:
                         _gm.save_user_credentials(_me, _a, _p)
                         st.success(f"✅ {_a} 연결 완료!")
-                        st.toast("Gmail 연동 성공!", icon="✅")
                         st.rerun()
                     else:
-                        st.error(f"연결 실패: {_msg}")
-
+                        st.error(f"연결 실패: {_emsg}")
             st.markdown("<br>", unsafe_allow_html=True)
             with st.expander("❓ 앱 비밀번호 발급 방법"):
                 st.markdown(
-                    """
-1. [myaccount.google.com](https://myaccount.google.com) 접속
-2. **보안** → **2단계 인증** 활성화 (미활성 시)
-3. **보안** → **앱 비밀번호** 클릭
-4. 앱 이름 입력 (예: `이몬스ERP`) → **만들기**
-5. 표시된 **16자리 코드**를 위 입력창에 붙여넣기
-                    """
+                    "1. [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) 접속  \n"
+                    "2. 앱 이름 입력 (예: `이몬스ERP`) → **만들기**  \n"
+                    "3. 표시된 **16자리 코드**를 위 입력창에 붙여넣기"
                 )
         return
 
-    # ── 연결 완료: 메일 UI ─────────────────────────────────────────
-    _hc1, _hc2 = st.columns([5, 1])
-    with _hc1:
-        st.success(f"✅ 연결된 계정: **{_gaddr}**")
-    with _hc2:
-        if st.button("연결 해제", key="gm_disconnect"):
+    # ── 연결 완료: 헤더 ────────────────────────────────────────────
+    _top1, _top2, _top3 = st.columns([4, 1, 1])
+    with _top1:
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;'>"
+            f"<img src='https://ssl.gstatic.com/ui/v1/icons/mail/rfr/gmail.ico' width=20>"
+            f"<span style='font-size:1.1rem;font-weight:600;color:#202124;'>Gmail</span>"
+            f"<span style='font-size:0.82rem;color:#5f6368;margin-left:0.3rem;'>— {_gaddr}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with _top2:
+        if st.button("🔄 새로고침", key="gm_refresh", use_container_width=True):
+            st.session_state.pop("gm_inbox_cache", None)
+            st.rerun()
+    with _top3:
+        if st.button("연결 해제", key="gm_disconnect", use_container_width=True):
             _gm.delete_user_credentials(_me)
-            st.toast("연결이 해제되었습니다.", icon="🔌")
+            st.session_state.pop("gm_inbox_cache", None)
             st.rerun()
 
-    gmail_tabs = st.tabs(["📥 받은편지함", "🔍 메일 검색", "📤 메일 발송"])
+    gmail_tabs = st.tabs(["받은편지함", "검색", "메일 쓰기"])
 
     # ── 탭 1: 받은편지함 ──────────────────────────────────────────
     with gmail_tabs[0]:
-        _h1, _h2, _h3 = st.columns([3, 1, 1])
-        with _h1:
-            st.subheader("📥 받은편지함")
-        with _h2:
+        _tf1, _tf2 = st.columns([3, 1])
+        with _tf2:
             _unread_only = st.checkbox("읽지 않은 메일만", value=False, key="gm_unread_only")
-        with _h3:
-            _do_refresh = st.button("🔄 새로고침", key="gm_refresh")
 
-        if _do_refresh or "gm_inbox_cache" not in st.session_state:
-            with st.spinner("메일을 불러오는 중..."):
+        if "gm_inbox_cache" not in st.session_state:
+            with st.spinner("받은편지함 로딩 중..."):
                 try:
                     _search = "UNSEEN" if _unread_only else "ALL"
                     st.session_state["gm_inbox_cache"] = _gm.list_messages(
-                        _gaddr, _gpwd, search=_search, max_results=30
-                    )
+                        _gaddr, _gpwd, search=_search, max_results=30)
                 except Exception as _e:
                     st.error(f"메일 로드 실패: {_e}")
                     st.session_state["gm_inbox_cache"] = []
-        elif _unread_only and st.session_state.get("gm_inbox_cache") is not None:
-            with st.spinner("필터 적용 중..."):
-                try:
-                    st.session_state["gm_inbox_cache"] = _gm.list_messages(
-                        _gaddr, _gpwd, search="UNSEEN", max_results=30
-                    )
-                except Exception:
-                    pass
 
         _msgs = st.session_state.get("gm_inbox_cache", [])
-        if not _msgs:
-            st.info("메일이 없습니다.")
+        _disp = [m for m in _msgs if not _unread_only or m["is_unread"]]
 
-        for _msg in _msgs:
-            _uid  = _msg["uid"]
-            _ub   = "🔵 " if _msg["is_unread"] else ""
-            _date = _msg["date"][:20]
-            with st.container(border=True):
-                _mc1, _mc2 = st.columns([6, 1])
-                with _mc1:
-                    st.markdown(f"{_ub}**{_msg['subject']}**")
-                    st.caption(f"발신: {_msg['from_']}  |  {_date}")
-                    _cust = _gm.match_sender_to_customer(_msg["from_"])
-                    if _cust:
-                        st.success(f"👤 {_cust['name']} ({_cust.get('phone1','')}) — {_cust.get('store_name','')}")
-                with _mc2:
-                    if st.button("열기", key=f"gm_open_{_uid}"):
-                        _k = f"gm_body_{_uid}"
-                        if _k not in st.session_state:
-                            with st.spinner("본문 로딩..."):
-                                st.session_state[_k] = _gm.get_message_body(_gaddr, _gpwd, _uid)
-                        else:
-                            st.session_state.pop(_k)
-                    if st.button("🗑️", key=f"gm_del_{_uid}", help="삭제"):
-                        st.session_state[f"gm_del_confirm_{_uid}"] = True
+        if not _disp:
+            st.markdown(
+                "<div style='text-align:center;padding:3rem;color:#5f6368;'>"
+                "<div style='font-size:2.5rem;'>📭</div>"
+                "<p>메일이 없습니다.</p></div>",
+                unsafe_allow_html=True,
+            )
 
-                # 삭제 확인
-                if st.session_state.get(f"gm_del_confirm_{_uid}"):
-                    st.warning("삭제하시겠습니까?")
-                    _dc1, _dc2 = st.columns([1, 5])
-                    with _dc1:
-                        if st.button("삭제", type="primary", key=f"gm_del_ok_{_uid}"):
-                            _gm.delete_message(_gaddr, _gpwd, _uid)
-                            st.session_state.pop(f"gm_del_confirm_{_uid}", None)
-                            st.session_state.pop(f"gm_body_{_uid}", None)
-                            st.session_state.pop("gm_inbox_cache", None)
-                            st.toast("삭제되었습니다.", icon="🗑️")
-                            st.rerun()
-                    with _dc2:
-                        if st.button("취소", key=f"gm_del_cancel_{_uid}"):
-                            st.session_state.pop(f"gm_del_confirm_{_uid}", None)
-                            st.rerun()
+        st.markdown("<div class='gm-wrap'>", unsafe_allow_html=True)
+        for _msg in _disp:
+            _uid    = _msg["uid"]
+            _rdcls  = "unread" if _msg["is_unread"] else "read"
+            _sender = _html.escape(re.sub(r"<[^>]+>", "", _msg["from_"])[:28])
+            _subj   = _html.escape(_msg["subject"][:55])
+            _date   = _msg["date"][:6]
 
-                # 본문 표시
-                if st.session_state.get(f"gm_body_{_uid}"):
-                    st.markdown("---")
-                    st.text_area("본문", value=st.session_state[f"gm_body_{_uid}"],
-                                 height=250, key=f"gm_body_area_{_uid}", disabled=True)
+            st.markdown(
+                f"<div class='gm-row {_rdcls}'>"
+                f"  <div class='gm-dot {_rdcls}'></div>"
+                f"  <div class='gm-sender'>{_sender}</div>"
+                f"  <div class='gm-content'>"
+                f"    <span class='gm-subject'>{_subj}</span>"
+                f"  </div>"
+                f"  <div class='gm-date'>{_date}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            _bc1, _bc2, _bc3 = st.columns([2, 1, 1])
+            with _bc1:
+                pass
+            with _bc2:
+                if st.button("열기", key=f"gm_open_{_uid}", use_container_width=True):
+                    _k = f"gm_body_{_uid}"
+                    if _k in st.session_state:
+                        st.session_state.pop(_k)
+                    else:
+                        with st.spinner(""):
+                            st.session_state[_k] = _gm.get_message_body(_gaddr, _gpwd, _uid)
+            with _bc3:
+                if st.button("🗑️ 삭제", key=f"gm_del_{_uid}", use_container_width=True):
+                    st.session_state[f"gm_del_confirm_{_uid}"] = True
 
-    # ── 탭 2: 메일 검색 ──────────────────────────────────────────
+            if st.session_state.get(f"gm_del_confirm_{_uid}"):
+                _dcc1, _dcc2, _dcc3 = st.columns([1, 1, 4])
+                with _dcc1:
+                    if st.button("삭제 확인", type="primary", key=f"gm_del_ok_{_uid}"):
+                        _gm.delete_message(_gaddr, _gpwd, _uid)
+                        for _kk in (f"gm_del_confirm_{_uid}", f"gm_body_{_uid}"):
+                            st.session_state.pop(_kk, None)
+                        st.session_state.pop("gm_inbox_cache", None)
+                        st.toast("삭제되었습니다.", icon="🗑️")
+                        st.rerun()
+                with _dcc2:
+                    if st.button("취소", key=f"gm_del_cancel_{_uid}"):
+                        st.session_state.pop(f"gm_del_confirm_{_uid}", None)
+                        st.rerun()
+
+            if st.session_state.get(f"gm_body_{_uid}"):
+                _body_txt = st.session_state[f"gm_body_{_uid}"]
+                _cust = _gm.match_sender_to_customer(_msg["from_"])
+                _cust_html = ""
+                if _cust:
+                    _cust_html = (
+                        f"<div class='gm-cust-badge'>👤 고객 매칭: {_html.escape(_cust['name'])} "
+                        f"({_cust.get('phone1','')}) — {_html.escape(_cust.get('store_name',''))}</div>"
+                    )
+                st.markdown(
+                    f"<div class='gm-body-wrap'>"
+                    f"  <div class='gm-body-header'>"
+                    f"    <div class='gm-body-subject'>{_html.escape(_msg['subject'])}</div>"
+                    f"    <div class='gm-body-meta'>발신: {_html.escape(_msg['from_'])} &nbsp;|&nbsp; {_msg['date'][:25]}</div>"
+                    f"    {_cust_html}"
+                    f"  </div>"
+                    f"  <div class='gm-body-text'>{_html.escape(_body_txt)}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── 탭 2: 검색 ────────────────────────────────────────────────
     with gmail_tabs[1]:
-        st.subheader("🔍 메일 검색")
-        st.caption("검색 예시: `SUBJECT 견적`, `FROM hong@gmail.com`, `BODY AS요청`")
-        _sq1, _sq2 = st.columns([4, 1])
-        with _sq1:
-            _sq = st.text_input("검색어", placeholder="SUBJECT 견적", key="gm_search_q",
-                                label_visibility="collapsed")
-        with _sq2:
-            _smax = st.number_input("최대", min_value=5, max_value=50, value=20, step=5, key="gm_search_max")
-        if st.button("🔍 검색", type="primary", key="gm_search_btn") and _sq.strip():
+        _sq1c, _sq2c = st.columns([5, 1])
+        with _sq1c:
+            _sq = st.text_input("검색어", placeholder="보낸사람, 제목, 내용으로 검색  예) SUBJECT 견적",
+                                key="gm_search_q", label_visibility="collapsed")
+        with _sq2c:
+            _do_search = st.button("검색", type="primary", key="gm_search_btn", use_container_width=True)
+
+        if _do_search and _sq.strip():
             with st.spinner("검색 중..."):
                 try:
-                    _sr = _gm.list_messages(_gaddr, _gpwd, search=_sq.strip(), max_results=int(_smax))
-                except Exception as _e:
-                    st.error(f"검색 실패: {_e}")
-                    _sr = []
-            st.session_state["gm_search_results"] = _sr
+                    st.session_state["gm_search_results"] = _gm.list_messages(
+                        _gaddr, _gpwd, search=_sq.strip(), max_results=20)
+                except Exception as _se:
+                    st.error(f"검색 실패: {_se}")
+                    st.session_state["gm_search_results"] = []
 
-        for _sm in st.session_state.get("gm_search_results", []):
-            _suid = _sm["uid"]
-            _ud   = "🔵 " if _sm["is_unread"] else ""
-            with st.container(border=True):
-                _sc1, _sc2 = st.columns([6, 1])
-                with _sc1:
-                    st.markdown(f"{_ud}**{_sm['subject']}**")
-                    st.caption(f"발신: {_sm['from_']}  |  {_sm['date'][:20]}")
-                with _sc2:
-                    if st.button("열기", key=f"gm_sr_open_{_suid}"):
+        _sr = st.session_state.get("gm_search_results", [])
+        if _sr:
+            st.caption(f"검색 결과 {len(_sr)}건")
+            st.markdown("<div class='gm-wrap'>", unsafe_allow_html=True)
+            for _sm in _sr:
+                _suid   = _sm["uid"]
+                _rdcls2 = "unread" if _sm["is_unread"] else "read"
+                _ssend  = _html.escape(re.sub(r"<[^>]+>", "", _sm["from_"])[:28])
+                _ssubj  = _html.escape(_sm["subject"][:55])
+                st.markdown(
+                    f"<div class='gm-row {_rdcls2}'>"
+                    f"  <div class='gm-dot {_rdcls2}'></div>"
+                    f"  <div class='gm-sender'>{_ssend}</div>"
+                    f"  <div class='gm-content'><span class='gm-subject'>{_ssubj}</span></div>"
+                    f"  <div class='gm-date'>{_sm['date'][:6]}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                _soc1, _soc2 = st.columns([5, 1])
+                with _soc2:
+                    if st.button("열기", key=f"gm_sr_open_{_suid}", use_container_width=True):
                         _sk = f"gm_sr_body_{_suid}"
-                        if _sk not in st.session_state:
-                            with st.spinner("본문 로딩..."):
-                                st.session_state[_sk] = _gm.get_message_body(_gaddr, _gpwd, _suid)
-                        else:
+                        if _sk in st.session_state:
                             st.session_state.pop(_sk)
+                        else:
+                            with st.spinner(""):
+                                st.session_state[_sk] = _gm.get_message_body(_gaddr, _gpwd, _suid)
                 if st.session_state.get(f"gm_sr_body_{_suid}"):
-                    st.text_area("본문", value=st.session_state[f"gm_sr_body_{_suid}"],
-                                 height=200, key=f"gm_sr_area_{_suid}", disabled=True)
+                    st.markdown(
+                        f"<div class='gm-body-wrap'>"
+                        f"  <div class='gm-body-subject'>{_html.escape(_sm['subject'])}</div>"
+                        f"  <div class='gm-body-meta'>발신: {_html.escape(_sm['from_'])}</div>"
+                        f"  <div class='gm-body-text'>{_html.escape(st.session_state[f'gm_sr_body_{_suid}'])}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── 탭 3: 메일 발송 ──────────────────────────────────────────
+    # ── 탭 3: 메일 쓰기 ───────────────────────────────────────────
     with gmail_tabs[2]:
-        st.subheader("📤 메일 발송")
-        st.caption(f"발신: {_gaddr}")
-        _to   = st.text_input("받는 사람", placeholder="customer@example.com", key="gm_send_to")
-        _subj = st.text_input("제목", placeholder="제목을 입력하세요", key="gm_send_subj")
-        _body = st.text_area("내용", height=200, placeholder="메일 내용을 입력하세요.", key="gm_send_body")
-        if st.button("📤 발송", type="primary", key="gm_send_btn"):
-            if not _to.strip():
-                st.error("받는 사람 이메일을 입력해 주세요.")
-            elif not _subj.strip():
-                st.error("제목을 입력해 주세요.")
-            elif not _body.strip():
-                st.error("내용을 입력해 주세요.")
-            else:
-                with st.spinner("발송 중..."):
-                    _res = _gm.send_message(_gaddr, _gpwd, _to.strip(), _subj.strip(), _body.strip())
-                if _res["status"] == "sent":
-                    st.success("✅ 발송 완료!")
-                    for _k in ("gm_send_to", "gm_send_subj", "gm_send_body"):
-                        st.session_state.pop(_k, None)
+        st.markdown(
+            f"<div class='gm-compose-from'>보내는 사람: <b>{_gaddr}</b></div>",
+            unsafe_allow_html=True,
+        )
+        _to   = st.text_input("받는 사람", placeholder="받는 사람 이메일 주소", key="gm_send_to",
+                               label_visibility="collapsed")
+        _subj = st.text_input("제목", placeholder="제목", key="gm_send_subj",
+                               label_visibility="collapsed")
+        _body = st.text_area("내용", height=260, placeholder="내용을 입력하세요.",
+                              key="gm_send_body", label_visibility="collapsed")
+        _pc1, _pc2 = st.columns([1, 5])
+        with _pc1:
+            if st.button("📤 보내기", type="primary", key="gm_send_btn", use_container_width=True):
+                if not _to.strip():
+                    st.error("받는 사람을 입력해 주세요.")
+                elif not _subj.strip():
+                    st.error("제목을 입력해 주세요.")
+                elif not _body.strip():
+                    st.error("내용을 입력해 주세요.")
                 else:
-                    st.error(f"발송 실패: {_res['error']}")
+                    with st.spinner("발송 중..."):
+                        _res = _gm.send_message(_gaddr, _gpwd, _to.strip(), _subj.strip(), _body.strip())
+                    if _res["status"] == "sent":
+                        st.success("✅ 발송 완료!")
+                        for _k in ("gm_send_to", "gm_send_subj", "gm_send_body"):
+                            st.session_state.pop(_k, None)
+                        st.rerun()
+                    else:
+                        st.error(f"발송 실패: {_res['error']}")
 
 
 # ---------- 탭 7: 월말 급여 요약 (store_admin) ----------
