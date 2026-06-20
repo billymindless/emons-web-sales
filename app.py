@@ -9193,8 +9193,8 @@ def _erp_time_input_30min(
 ) -> dt_time:
     """근태용 HH:MM 텍스트 시간 입력 위젯 (수기 친화).
 
-    사용자가 "1430" 등을 입력하고 포커스 이탈/Enter 누르면 on_change 콜백이
-    `HH:MM` 형식으로 즉시 보정하여 입력란에 ":" 가 자동으로 표시됩니다.
+    st.form 내부에서도 안전하게 동작하도록 on_change 콜백 없이 구현.
+    "1430" 입력 시 session_state를 "14:30"으로 보정 → 다음 렌더에서 콜론 자동 표시.
     """
     if isinstance(value, dt_time):
         init_str = f"{value.hour:02d}:{value.minute:02d}"
@@ -9203,16 +9203,6 @@ def _erp_time_input_30min(
         init_str = "09:00"
         fallback = dt_time(9, 0)
 
-    def _normalize_on_change():
-        raw = st.session_state.get(key, "")
-        parsed = _erp_parse_time_loose(raw)
-        if parsed is None:
-            return
-        h, m = parsed
-        normalized = f"{h:02d}:{m:02d}"
-        if raw != normalized:
-            st.session_state[key] = normalized
-
     raw = st.text_input(
         label,
         value=init_str,
@@ -9220,7 +9210,6 @@ def _erp_time_input_30min(
         placeholder="HH:MM 또는 HHMM (예: 14:30 / 1430)",
         max_chars=5,
         label_visibility=label_visibility,
-        on_change=_normalize_on_change,
     )
 
     parsed = _erp_parse_time_loose(raw)
@@ -9229,6 +9218,11 @@ def _erp_time_input_30min(
         if s:
             st.caption(f"⚠️ '{s}' — HH:MM 또는 HHMM 형식으로 입력해 주세요 (예: 14:30 / 1430)")
         return fallback
+
+    normalized = f"{parsed[0]:02d}:{parsed[1]:02d}"
+    # 숫자만 입력된 경우 session_state에 콜론 포함 형식으로 덮어써 다음 렌더 시 자동 표시
+    if (raw or "").strip() != normalized:
+        st.session_state[key] = normalized
     return dt_time(parsed[0], parsed[1])
 
 
