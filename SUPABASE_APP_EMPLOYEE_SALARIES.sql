@@ -1,27 +1,20 @@
--- 직원 급여 정보 (월급제/시급제)
--- 멱등 DDL: 이미 존재하면 무시
+-- =====================================================================
+-- app_employee_salaries — 직원별 급여 정보
+-- Supabase SQL Editor에서 실행하세요.
+-- =====================================================================
+
 CREATE TABLE IF NOT EXISTS app_employee_salaries (
   id              BIGSERIAL PRIMARY KEY,
   db_filename     TEXT NOT NULL,
   employee_name   TEXT NOT NULL,
-  salary_type     TEXT NOT NULL DEFAULT 'monthly'
-                    CHECK (salary_type IN ('monthly', 'hourly')),
-  monthly_salary  BIGINT,
-  hourly_wage     BIGINT,
-  effective_from  DATE NOT NULL DEFAULT CURRENT_DATE,
+  salary_type     TEXT NOT NULL DEFAULT 'monthly'  -- 'monthly' | 'hourly'
+                  CHECK (salary_type IN ('monthly', 'hourly')),
+  monthly_salary  BIGINT DEFAULT 0,   -- 월급제: 월 급여(원)
+  hourly_wage     BIGINT DEFAULT 0,   -- 시급제: 시간당 급여(원)
+  effective_from  DATE,               -- 적용 시작일
   updated_by      TEXT,
   updated_at      TIMESTAMPTZ DEFAULT now(),
   UNIQUE (db_filename, employee_name)
 );
 
-ALTER TABLE app_employee_salaries ENABLE ROW LEVEL SECURITY;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_policies
-    WHERE tablename = 'app_employee_salaries' AND policyname = 'Allow all'
-  ) THEN
-    EXECUTE 'CREATE POLICY "Allow all" ON app_employee_salaries FOR ALL USING (true) WITH CHECK (true)';
-  END IF;
-END $$;
+ALTER TABLE app_employee_salaries DISABLE ROW LEVEL SECURITY;

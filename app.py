@@ -16027,33 +16027,46 @@ def _erp_render_superadmin_view(today: date):
 
 @st.cache_data(ttl=300)
 def _emp_analytics_load_users(db_filename: str) -> list:
-    """매장 직원 목록 + hire_date (app_users 조회, 300초 캐시)."""
-    store_id = _get_supabase_store_by_db_filename(db_filename)
-    if not store_id:
-        return []
+    """매장 직원 목록 + hire_date.
+    우선순위: app_user_stores → app_users → app_employee_settings(폴백)."""
     client, err = get_supabase_client()
-    if err or not client:
+    if err or not client or not db_filename:
         return []
+
+    out = []
     try:
-        us = client.table("app_user_stores").select("user_id").eq("store_id", store_id).execute()
-        user_ids = [x["user_id"] for x in (us.data or [])]
-        if not user_ids:
-            u_r = client.table("app_users").select("id").eq("store_id", store_id).execute()
-            user_ids = [x["id"] for x in (u_r.data or [])]
-        if not user_ids:
-            return []
-        r = client.table("app_users").select("id, name, username, role, hire_date").in_("id", user_ids).execute()
-        out = []
-        for u in (r.data or []):
-            if u.get("role") not in ("store_admin", "user"):
-                continue
-            name = (u.get("name") or u.get("username") or "").strip()
-            if not name:
-                continue
-            out.append({"id": u["id"], "name": name, "hire_date": u.get("hire_date"), "role": u.get("role")})
-        return out
+        store_id = _get_supabase_store_by_db_filename(db_filename)
+        if store_id:
+            us = client.table("app_user_stores").select("user_id").eq("store_id", store_id).execute()
+            user_ids = [x["user_id"] for x in (us.data or [])]
+            if not user_ids:
+                u_r = client.table("app_users").select("id").eq("store_id", store_id).execute()
+                user_ids = [x["id"] for x in (u_r.data or [])]
+            if user_ids:
+                r = client.table("app_users").select("id, name, username, role, hire_date").in_("id", user_ids).execute()
+                for u in (r.data or []):
+                    if u.get("role") not in ("store_admin", "user"):
+                        continue
+                    name = (u.get("name") or u.get("username") or "").strip()
+                    if name:
+                        out.append({"id": u["id"], "name": name, "hire_date": u.get("hire_date"), "role": u.get("role")})
     except Exception:
-        return []
+        pass
+
+    # 폴백: app_employee_settings에서 db_filename 기준으로 직원명 수집
+    if not out:
+        try:
+            r2 = client.table("app_employee_settings").select("employee_name, hire_date").eq("db_filename", db_filename).execute()
+            seen = set()
+            for row in (r2.data or []):
+                name = (row.get("employee_name") or "").strip()
+                if name and name not in seen:
+                    seen.add(name)
+                    out.append({"id": None, "name": name, "hire_date": row.get("hire_date"), "role": "user"})
+        except Exception:
+            pass
+
+    return out
 
 
 @st.cache_data(ttl=300)
