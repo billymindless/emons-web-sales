@@ -13939,7 +13939,7 @@ def render_document_library():
         return
 
     _cu   = st.session_state.get("current_user") or {}
-    _me   = (_cu.get("username") or _cu.get("email") or "").strip()
+    _me   = _get_current_user_display_name() or (_cu.get("username") or _cu.get("email") or "").strip()
     _role = _cu.get("role", "staff")
 
     # ── Supabase Storage 업로드 헬퍼 ──────────────────────────────
