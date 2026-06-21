@@ -13901,30 +13901,34 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 # =====================================================================
 
 def render_document_library():
-    """업무 자료 게시판 — 리치 텍스트 글쓰기 + 첨부파일 업로드/다운로드."""
+    """업무 자료 게시판 — 카테고리 트리 + 리치 텍스트 + 첨부파일."""
+    import re as _re, urllib.parse as _uparse, datetime as _dtmod
+    import streamlit.components.v1 as _comp
+
     try:
         from streamlit_quill import st_quill as _st_quill
         _HAS_QUILL = True
     except ImportError:
         _HAS_QUILL = False
 
-    def _render_html_content(html: str, min_height: int = 120):
-        """HTML 또는 평문 콘텐츠를 안전하게 렌더링."""
-        import html as _html_lib
+    def _render_html_content(html: str, height: int = 400):
+        """HTML 또는 평문 콘텐츠를 스크롤 가능한 창으로 렌더링."""
         _is_html = bool(html and ("<" in html and ">" in html))
         if _is_html:
             _safe = (
                 "<html><head><meta charset='utf-8'>"
-                "<style>body{font-family:sans-serif;font-size:14px;margin:0;padding:8px;}"
+                "<style>body{font-family:sans-serif;font-size:14px;margin:0;padding:12px 16px;}"
                 "table{border-collapse:collapse;width:100%}"
                 "td,th{border:1px solid #ccc;padding:4px 8px}"
-                "img{max-width:100%}</style></head>"
+                "img{max-width:100%}h1,h2,h3{margin-top:0.8em}</style></head>"
                 f"<body>{html}</body></html>"
             )
-            import streamlit.components.v1 as _comp
-            _comp.html(_safe, height=min_height, scrolling=True)
+            _comp.html(_safe, height=height, scrolling=True)
         else:
-            st.markdown(html or "*(내용 없음)*")
+            st.markdown(
+                f"<div style='height:{height}px;overflow-y:auto;padding:8px;'>{html or '*(내용 없음)*'}</div>",
+                unsafe_allow_html=True,
+            )
 
     st.header("📁 자료실")
     st.caption("업무 자료를 게시판 형태로 관리합니다.")
@@ -13985,69 +13989,91 @@ def render_document_library():
 
     _docs = _fetch_docs()
 
-    # ── 상단: 통계 카드 + 추가 버튼 ──────────────────────────────
-    _hc1, _hc2, _hc3 = st.columns([2, 2, 1])
-    with _hc1:
-        st.markdown(
-            f"<div style='border:1px solid #e0e0e0;border-radius:12px;padding:1rem 1.2rem;'>"
-            f"<div style='font-size:0.8rem;color:#888;'>등록 자료</div>"
-            f"<div style='font-size:1.6rem;font-weight:700;'>{len(_docs)}건</div>"
-            f"<div style='font-size:0.75rem;color:#aaa;'>현재 자료실에 등록된 자료 수</div></div>",
-            unsafe_allow_html=True,
-        )
-    with _hc2:
-        _latest_date = str(_docs[0].get("created_at", ""))[:16].replace("T", " ") if _docs else "—"
-        st.markdown(
-            f"<div style='border:1px solid #e0e0e0;border-radius:12px;padding:1rem 1.2rem;'>"
-            f"<div style='font-size:0.8rem;color:#888;'>최근 등록</div>"
-            f"<div style='font-size:1.1rem;font-weight:700;margin:0.2rem 0;'>{_latest_date}</div>"
-            f"<div style='font-size:0.75rem;color:#aaa;'>가장 최근에 등록된 자료 일시</div></div>",
-            unsafe_allow_html=True,
-        )
-    with _hc3:
-        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    # ── 카테고리 트리 구성 ─────────────────────────────────────────
+    # { 카테고리: {서브카테고리: count, ...} }
+    _cat_tree: dict[str, dict[str, int]] = {}
+    for _d in _docs:
+        _c  = (_d.get("category") or "미분류").strip()
+        _sc = (_d.get("subcategory") or "").strip()
+        _cat_tree.setdefault(_c, {})
+        if _sc:
+            _cat_tree[_c][_sc] = _cat_tree[_c].get(_sc, 0) + 1
+        else:
+            _cat_tree[_c]["__root__"] = _cat_tree[_c].get("__root__", 0) + 1
+
+    # ── 현재 선택된 카테고리/서브 (session_state) ─────────────────
+    _sel_cat = st.session_state.get("doc_sel_cat", "전체")
+    _sel_sub = st.session_state.get("doc_sel_sub", "")
+
+    # ── 글쓰기 버튼 + 검색 (상단 우측) ────────────────────────────
+    _top1, _top2 = st.columns([4, 1])
+    with _top1:
+        _search = st.text_input("", placeholder="🔍  제목, 내용, 작성자로 검색",
+                                key="doc_search", label_visibility="collapsed")
+    with _top2:
         if st.button("✏️ 글쓰기", type="primary", use_container_width=True, key="doc_add_btn"):
             st.session_state["doc_show_form"] = not st.session_state.get("doc_show_form", False)
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── 자료 추가 폼 ───────────────────────────────────────────────
+    # ── 글쓰기 폼 ─────────────────────────────────────────────────
     if st.session_state.get("doc_show_form"):
         with st.container(border=True):
             st.subheader("📝 새 자료 등록")
-            _f_title   = st.text_input("제목 *", key="doc_f_title", placeholder="자료 제목을 입력하세요")
+            _fa1, _fa2 = st.columns([1, 1])
+            with _fa1:
+                _existing_cats = [c for c in _cat_tree if c != "미분류"] + ["미분류"]
+                _f_cat_sel = st.selectbox("카테고리", ["직접 입력"] + _existing_cats, key="doc_f_cat_sel")
+                if _f_cat_sel == "직접 입력":
+                    _f_cat = st.text_input("새 카테고리명", key="doc_f_cat_new",
+                                           placeholder="예: 주간회의")
+                else:
+                    _f_cat = _f_cat_sel
+            with _fa2:
+                _existing_subs = sorted(
+                    [s for s in _cat_tree.get(_f_cat if "_f_cat" in dir() else "", {})
+                     if s != "__root__"]
+                ) if "_f_cat" in dir() else []
+                _f_sub_sel = st.selectbox("하위 카테고리 (선택)", ["없음", "직접 입력"] + _existing_subs,
+                                          key="doc_f_sub_sel")
+                if _f_sub_sel == "직접 입력":
+                    _f_sub = st.text_input("새 하위 카테고리명", key="doc_f_sub_new",
+                                           placeholder="예: 2026-W25")
+                elif _f_sub_sel == "없음":
+                    _f_sub = ""
+                else:
+                    _f_sub = _f_sub_sel
+
+            _f_title = st.text_input("제목 *", key="doc_f_title", placeholder="자료 제목을 입력하세요")
             st.markdown("**내용**")
             if _HAS_QUILL:
                 _f_content = _st_quill(
                     placeholder="내용을 입력하거나, 다른 곳에서 서식 있는 텍스트를 붙여넣기 하세요.",
-                    html=True,
-                    key="doc_f_content",
+                    html=True, key="doc_f_content",
                 )
             else:
-                _f_content = st.text_area("내용", key="doc_f_content", height=220,
-                                          placeholder="내용을 입력하세요.")
-            _f_tags    = st.text_input("태그 (쉼표 구분)", key="doc_f_tags",
-                                       placeholder="예: 가이드, 인사, 2026")
-            _f_file    = st.file_uploader(
-                "첨부파일 (선택)", key="doc_f_file",
-                help="PDF, Word, Excel, 이미지 등 모든 파일 형식 지원 (최대 50MB)",
-            )
+                _f_content = st.text_area("내용", key="doc_f_content", height=220)
+            _f_tags = st.text_input("태그 (쉼표 구분)", key="doc_f_tags",
+                                    placeholder="예: 가이드, 인사, 2026")
+            _f_file = st.file_uploader("첨부파일 (선택)", key="doc_f_file",
+                                       help="PDF, Word, Excel, 이미지 등 모든 형식 (최대 50MB)")
             _fb1, _fb2 = st.columns([1, 5])
             with _fb1:
                 if st.button("등록", type="primary", key="doc_f_submit"):
                     if not _f_title.strip():
                         st.error("제목을 입력해 주세요.")
+                    elif not _f_cat.strip():
+                        st.error("카테고리를 입력해 주세요.")
                     else:
                         try:
                             _row = {
-                                "title":   _f_title.strip(),
-                                "content": _f_content.strip(),
-                                "author":  _me or "unknown",
-                                "tags":    _f_tags.strip(),
+                                "title":       _f_title.strip(),
+                                "content":     (_f_content or "").strip(),
+                                "author":      _me or "unknown",
+                                "tags":        _f_tags.strip(),
+                                "category":    _f_cat.strip(),
+                                "subcategory": _f_sub.strip(),
                             }
-                            _res = client.table("app_documents").insert(_row).execute()
+                            _res    = client.table("app_documents").insert(_row).execute()
                             _new_id = _res.data[0]["id"] if _res.data else None
-
                             if _f_file and _new_id:
                                 with st.spinner("파일 업로드 중..."):
                                     try:
@@ -14059,7 +14085,6 @@ def render_document_library():
                                         }).eq("id", _new_id).execute()
                                     except Exception as _ue:
                                         st.warning(f"파일 업로드 실패 (글은 저장됨): {_ue}")
-
                             st.success("자료가 등록되었습니다.")
                             st.session_state["doc_show_form"] = False
                             st.cache_data.clear()
@@ -14071,227 +14096,286 @@ def render_document_library():
                     st.session_state["doc_show_form"] = False
                     st.rerun()
 
-    # ── 검색 바 ────────────────────────────────────────────────────
-    _search = st.text_input(
-        "", placeholder="🔍  제목, 내용, 작성자로 검색",
-        key="doc_search", label_visibility="collapsed",
-    )
+    # ── 2단 레이아웃: 카테고리 트리(좌) + 문서 목록(우) ─────────
+    _lc, _rc = st.columns([1, 3], gap="medium")
 
-    # ── 자료 목록 ─────────────────────────────────────────────────
-    _filtered = [
-        d for d in _docs
-        if not _search.strip() or any(
-            _search.lower() in (d.get(f) or "").lower()
-            for f in ("title", "content", "author", "tags")
-        )
-    ]
-
-    if not _filtered:
-        st.info("등록된 자료가 없습니다." if not _search else "검색 결과가 없습니다.")
-
-    for _doc in _filtered:
-        _doc_id      = _doc.get("id")
-        _doc_title   = _doc.get("title", "")
-        _doc_content = _doc.get("content", "")
-        _doc_author  = _doc.get("author", "")
-        _doc_tags    = _doc.get("tags", "")
-        _doc_date    = str(_doc.get("created_at", ""))[:16].replace("T", " ")
-        _doc_furl    = _doc.get("file_url") or ""
-        _doc_fname   = _doc.get("file_name") or ""
-        _doc_fsize   = _doc.get("file_size")
-        # HTML 콘텐츠에서 태그 제거 후 텍스트만 추출 (미리보기용)
-        import re as _re
-        _preview_raw = _re.sub(r"<[^>]+>", " ", _doc_content or "").strip()
-        _preview_raw = _re.sub(r"\s+", " ", _preview_raw)
-        _preview     = _preview_raw[:300]
-        if len(_preview_raw) > 300:
-            _preview += "..."
-
-        # 카드 전체를 단일 HTML 블록으로 렌더링 (제목 작게 + 미리보기 최대화)
-        _tag_badges = ""
-        if _doc_tags:
-            _tag_badges = " ".join(
-                f"<span style='background:#f0f4ff;border-radius:4px;padding:1px 7px;"
-                f"font-size:0.72rem;color:#4a6cf7;margin-right:3px;'>{t.strip()}</span>"
-                for t in _doc_tags.split(",") if t.strip()
-            )
-        _file_badge = ""
-        if _doc_furl and _doc_fname:
-            _sz = f" ({_fmt_size(_doc_fsize)})" if _doc_fsize else ""
-            _file_badge = (
-                f"<a href='{_doc_furl}' target='_blank' style='display:inline-flex;"
-                f"align-items:center;gap:3px;background:#f8f9fa;border:1px solid #dee2e6;"
-                f"border-radius:5px;padding:2px 8px;font-size:0.75rem;color:#495057;"
-                f"text-decoration:none;margin-top:3px;'>📎 {_doc_fname}{_sz}</a>"
-            )
-        _is_open = st.session_state.get(f"doc_expanded_{_doc_id}", False)
-        _btn_label = "▲ 닫기" if _is_open else "▼ 열기"
-
-        with st.container(border=True):
-            st.markdown(
-                f"<div style='margin:-4px 0 2px;'>"
-                f"<span style='font-size:0.95rem;font-weight:600;color:#1a1a1a;'>{_doc_title}</span>"
-                f"&nbsp;&nbsp;{_tag_badges}"
-                f"<span style='float:right;font-size:0.72rem;color:#aaa;'>{_doc_date} · {_doc_author}</span>"
-                f"</div>"
-                f"<div style='font-size:0.83rem;color:#555;line-height:1.55;margin-top:4px;"
-                f"white-space:pre-wrap;word-break:break-all;'>{_preview}</div>"
-                f"<div style='margin-top:4px;'>{_file_badge}</div>",
-                unsafe_allow_html=True,
-            )
-            if st.button(_btn_label, key=f"doc_open_{_doc_id}"):
-                st.session_state[f"doc_expanded_{_doc_id}"] = not _is_open
+    with _lc:
+        st.markdown("**📂 카테고리**")
+        # 전체 버튼
+        _all_count = len(_docs)
+        _all_style = "background:#4a6cf7;color:#fff;" if _sel_cat == "전체" else "background:#f0f4ff;color:#4a6cf7;"
+        if st.button(f"전체  ({_all_count})", key="doc_cat_all",
+                     use_container_width=True):
+            st.session_state.update({"doc_sel_cat": "전체", "doc_sel_sub": ""})
+            st.rerun()
+        # 카테고리별 버튼
+        for _cat in sorted(_cat_tree.keys()):
+            _cat_total = sum(_cat_tree[_cat].values())
+            _is_active = (_sel_cat == _cat)
+            if st.button(f"📁 {_cat}  ({_cat_total})", key=f"doc_cat_{_cat}",
+                         use_container_width=True,
+                         type="primary" if _is_active else "secondary"):
+                _new_sub = "" if _sel_cat != _cat else _sel_sub
+                st.session_state.update({"doc_sel_cat": _cat, "doc_sel_sub": _new_sub})
                 st.rerun()
+            # 하위 카테고리 (선택된 카테고리만 펼침)
+            if _is_active:
+                for _sub in sorted(s for s in _cat_tree[_cat] if s != "__root__"):
+                    _sub_cnt = _cat_tree[_cat][_sub]
+                    _is_sub_active = (_sel_sub == _sub)
+                    if st.button(
+                        f"  └ {_sub}  ({_sub_cnt})",
+                        key=f"doc_sub_{_cat}_{_sub}",
+                        use_container_width=True,
+                        type="primary" if _is_sub_active else "secondary",
+                    ):
+                        st.session_state.update({"doc_sel_cat": _cat, "doc_sel_sub": _sub})
+                        st.rerun()
 
-            # ── 상세 보기 ────────────────────────────────────────
-            if st.session_state.get(f"doc_expanded_{_doc_id}"):
-                st.markdown("---")
-                _render_html_content(_doc_content or "", min_height=150)
+        st.markdown("<br>", unsafe_allow_html=True)
+        # 뷰어 높이 슬라이더
+        st.markdown("**📐 뷰어 높이**")
+        _viewer_h = st.slider("", min_value=200, max_value=1200, value=500, step=50,
+                              key="doc_viewer_height", label_visibility="collapsed")
 
-                # ── 첨부파일: 미리보기 + 다운로드 ────────────────
-                if _doc_furl and _doc_fname:
-                    import urllib.parse as _uparse
-                    _sz2 = f" · {_fmt_size(_doc_fsize)}" if _doc_fsize else ""
-                    _fext = _doc_fname.rsplit(".", 1)[-1].lower() if "." in _doc_fname else ""
+    with _rc:
+        # 카테고리 필터
+        _filtered = []
+        for _d in _docs:
+            _dc  = (_d.get("category") or "미분류").strip()
+            _dsc = (_d.get("subcategory") or "").strip()
+            if _sel_cat != "전체" and _dc != _sel_cat:
+                continue
+            if _sel_sub and _dsc != _sel_sub:
+                continue
+            if _search.strip() and not any(
+                _search.lower() in (_d.get(f) or "").lower()
+                for f in ("title", "content", "author", "tags", "category", "subcategory")
+            ):
+                continue
+            _filtered.append(_d)
 
-                    # 파일 유형 판별
-                    _IMG_EXTS    = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"}
-                    _PDF_EXTS    = {"pdf"}
-                    _OFFICE_EXTS = {"doc", "docx", "xls", "xlsx", "ppt", "pptx", "hwp"}
+        if not _filtered:
+            st.info("등록된 자료가 없습니다." if not _search else "검색 결과가 없습니다.")
 
-                    if _fext in _IMG_EXTS:
-                        _ftype = "image"
-                    elif _fext in _PDF_EXTS:
-                        _ftype = "pdf"
-                    elif _fext in _OFFICE_EXTS:
-                        _ftype = "office"
-                    else:
-                        _ftype = "download"
+        for _doc in _filtered:
+            _doc_id      = _doc.get("id")
+            _doc_title   = _doc.get("title", "")
+            _doc_content = _doc.get("content", "")
+            _doc_author  = _doc.get("author", "")
+            _doc_tags    = _doc.get("tags", "")
+            _doc_cat     = (_doc.get("category") or "미분류").strip()
+            _doc_sub     = (_doc.get("subcategory") or "").strip()
+            _doc_date    = str(_doc.get("created_at", ""))[:16].replace("T", " ")
+            _doc_furl    = _doc.get("file_url") or ""
+            _doc_fname   = _doc.get("file_name") or ""
+            _doc_fsize   = _doc.get("file_size")
 
-                    # 미리보기 토글 버튼
-                    _prev_key = f"doc_preview_{_doc_id}"
-                    _is_preview = st.session_state.get(_prev_key, False)
-                    _pa1, _pa2 = st.columns([2, 5])
-                    with _pa1:
-                        _prev_icon = {"image": "🖼️", "pdf": "📄", "office": "📊"}.get(_ftype, "")
-                        if _ftype != "download":
-                            _plabel = "▲ 미리보기 닫기" if _is_preview else f"{_prev_icon} 미리보기"
-                            if st.button(_plabel, key=f"doc_prev_btn_{_doc_id}"):
-                                st.session_state[_prev_key] = not _is_preview
-                                st.rerun()
-                    with _pa2:
-                        st.markdown(
-                            f"<a href='{_doc_furl}' target='_blank' download style='"
-                            f"display:inline-flex;align-items:center;gap:6px;"
-                            f"background:#1a73e8;color:#fff;border-radius:8px;"
-                            f"padding:6px 14px;font-size:0.82rem;text-decoration:none;'>"
-                            f"⬇️ {_doc_fname}{_sz2} 다운로드</a>",
-                            unsafe_allow_html=True,
-                        )
+            # 태그 배지
+            _tag_badges = ""
+            if _doc_tags:
+                _tag_badges = " ".join(
+                    f"<span style='background:#f0f4ff;border-radius:4px;padding:1px 7px;"
+                    f"font-size:0.72rem;color:#4a6cf7;margin-right:3px;'>{t.strip()}</span>"
+                    for t in _doc_tags.split(",") if t.strip()
+                )
+            # 첨부파일 배지
+            _file_badge = ""
+            if _doc_furl and _doc_fname:
+                _sz = f" ({_fmt_size(_doc_fsize)})" if _doc_fsize else ""
+                _file_badge = (
+                    f"<a href='{_doc_furl}' target='_blank' style='display:inline-flex;"
+                    f"align-items:center;gap:3px;background:#f8f9fa;border:1px solid #dee2e6;"
+                    f"border-radius:5px;padding:2px 8px;font-size:0.75rem;color:#495057;"
+                    f"text-decoration:none;'>📎 {_doc_fname}{_sz}</a>"
+                )
+            # 카테고리 경로 표시
+            _cat_path = _doc_cat + (f" › {_doc_sub}" if _doc_sub else "")
+            _is_open  = st.session_state.get(f"doc_expanded_{_doc_id}", False)
 
-                    # 미리보기 렌더링
-                    if _is_preview:
-                        import streamlit.components.v1 as _comp
-                        if _ftype == "image":
-                            _comp.html(
-                                f"<html><body style='margin:0;background:#f5f5f5;text-align:center;padding:8px;'>"
-                                f"<img src='{_doc_furl}' style='max-width:100%;max-height:600px;"
-                                f"object-fit:contain;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.15);'/>"
-                                f"</body></html>",
-                                height=400, scrolling=False,
-                            )
-                        elif _ftype == "pdf":
-                            _comp.html(
-                                f"<iframe src='{_doc_furl}' width='100%' height='700px'"
-                                f" style='border:none;border-radius:4px;'></iframe>",
-                                height=720, scrolling=False,
-                            )
-                        elif _ftype == "office":
-                            _enc_url = _uparse.quote(_doc_furl, safe="")
-                            _viewer  = f"https://view.officeapps.live.com/op/embed.aspx?src={_enc_url}"
-                            _comp.html(
-                                f"<iframe src='{_viewer}' width='100%' height='700px'"
-                                f" style='border:none;border-radius:4px;'></iframe>",
-                                height=720, scrolling=False,
-                            )
+            with st.container(border=True):
+                # 헤더 행: 제목 + 카테고리경로 + 날짜/작성자
+                st.markdown(
+                    f"<div style='margin:-4px 0 4px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;'>"
+                    f"<span style='font-size:0.95rem;font-weight:600;color:#1a1a1a;'>{_doc_title}</span>"
+                    f"<span style='font-size:0.72rem;color:#888;background:#f5f5f5;border-radius:4px;"
+                    f"padding:1px 6px;'>{_cat_path}</span>"
+                    f"{_tag_badges}"
+                    f"<span style='margin-left:auto;font-size:0.72rem;color:#aaa;white-space:nowrap;'>"
+                    f"{_doc_date} · {_doc_author}</span></div>"
+                    f"<div style='margin-top:3px;'>{_file_badge}</div>",
+                    unsafe_allow_html=True,
+                )
+                if st.button("▲ 닫기" if _is_open else "▼ 본문 보기",
+                             key=f"doc_open_{_doc_id}"):
+                    st.session_state[f"doc_expanded_{_doc_id}"] = not _is_open
+                    st.rerun()
 
-                st.markdown("<br>", unsafe_allow_html=True)
-                _can_edit = (_doc_author == _me) or (_role in ("store_admin", "superadmin"))
-                if _can_edit:
-                    _ec1, _ec2 = st.columns([1, 1])
-                    with _ec1:
-                        if st.button("✏️ 수정", key=f"doc_edit_btn_{_doc_id}"):
-                            st.session_state[f"doc_editing_{_doc_id}"] = True
-                    with _ec2:
-                        if st.button("🗑️ 삭제", key=f"doc_del_btn_{_doc_id}"):
-                            st.session_state[f"doc_del_confirm_{_doc_id}"] = True
-
-                # 삭제 확인
-                if st.session_state.get(f"doc_del_confirm_{_doc_id}"):
-                    st.warning("정말 삭제하시겠습니까?")
-                    _dcc1, _dcc2 = st.columns([1, 5])
-                    with _dcc1:
-                        if st.button("확인 삭제", type="primary", key=f"doc_del_ok_{_doc_id}"):
-                            try:
-                                client.table("app_documents").delete().eq("id", _doc_id).execute()
-                                for _k in (f"doc_del_confirm_{_doc_id}", f"doc_expanded_{_doc_id}"):
-                                    st.session_state.pop(_k, None)
-                                st.cache_data.clear()
-                                st.rerun()
-                            except Exception as _e:
-                                st.error(f"삭제 실패: {_e}")
-                    with _dcc2:
-                        if st.button("취소", key=f"doc_del_cancel_{_doc_id}"):
-                            st.session_state.pop(f"doc_del_confirm_{_doc_id}", None)
-                            st.rerun()
-
-                # 수정 폼
-                if st.session_state.get(f"doc_editing_{_doc_id}"):
+                # ── 본문 상세 (미리보기 텍스트 없음, 바로 전체 본문) ──
+                if _is_open:
                     st.markdown("---")
-                    _et  = st.text_input("제목", value=_doc_title, key=f"doc_et_{_doc_id}")
-                    st.markdown("**내용**")
-                    if _HAS_QUILL:
-                        _ec = _st_quill(
-                            value=_doc_content or "",
-                            html=True,
-                            key=f"doc_ec_{_doc_id}",
-                        )
-                    else:
-                        _ec = st.text_area("내용", value=_doc_content, height=200,
-                                           key=f"doc_ec_{_doc_id}")
-                    _eg  = st.text_input("태그", value=_doc_tags, key=f"doc_eg_{_doc_id}")
-                    _ef  = st.file_uploader("첨부파일 교체 (선택)", key=f"doc_ef_{_doc_id}",
-                                            help="새 파일을 올리면 기존 파일이 교체됩니다.")
-                    if _doc_fname:
-                        st.caption(f"현재 첨부파일: 📎 {_doc_fname}")
-                    _es1, _es2 = st.columns([1, 5])
-                    with _es1:
-                        if st.button("저장", type="primary", key=f"doc_save_{_doc_id}"):
-                            try:
-                                import datetime as _dtmod
-                                _upd = {
-                                    "title":      _et.strip(),
-                                    "content":    _ec.strip(),
-                                    "tags":       _eg.strip(),
-                                    "updated_at": _dtmod.datetime.utcnow().isoformat(),
-                                }
-                                if _ef:
-                                    with st.spinner("파일 업로드 중..."):
-                                        _nurl, _nfname = _upload_file(_doc_id, _ef)
-                                    _upd["file_url"]  = _nurl
-                                    _upd["file_name"] = _nfname
-                                    _upd["file_size"] = _ef.size
-                                client.table("app_documents").update(_upd).eq("id", _doc_id).execute()
-                                st.success("수정되었습니다.")
-                                st.session_state.pop(f"doc_editing_{_doc_id}", None)
-                                st.cache_data.clear()
+                    _render_html_content(_doc_content or "", height=_viewer_h)
+
+                    # 첨부파일 미리보기 + 다운로드
+                    if _doc_furl and _doc_fname:
+                        _sz2  = f" · {_fmt_size(_doc_fsize)}" if _doc_fsize else ""
+                        _fext = _doc_fname.rsplit(".", 1)[-1].lower() if "." in _doc_fname else ""
+                        _IMG_EXTS    = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"}
+                        _PDF_EXTS    = {"pdf"}
+                        _OFFICE_EXTS = {"doc", "docx", "xls", "xlsx", "ppt", "pptx", "hwp"}
+                        if _fext in _IMG_EXTS:
+                            _ftype = "image"
+                        elif _fext in _PDF_EXTS:
+                            _ftype = "pdf"
+                        elif _fext in _OFFICE_EXTS:
+                            _ftype = "office"
+                        else:
+                            _ftype = "download"
+
+                        _prev_key   = f"doc_preview_{_doc_id}"
+                        _is_preview = st.session_state.get(_prev_key, False)
+                        _pa1, _pa2  = st.columns([2, 5])
+                        with _pa1:
+                            _prev_icon = {"image": "🖼️", "pdf": "📄", "office": "📊"}.get(_ftype, "")
+                            if _ftype != "download":
+                                if st.button(
+                                    "▲ 미리보기 닫기" if _is_preview else f"{_prev_icon} 미리보기",
+                                    key=f"doc_prev_btn_{_doc_id}",
+                                ):
+                                    st.session_state[_prev_key] = not _is_preview
+                                    st.rerun()
+                        with _pa2:
+                            st.markdown(
+                                f"<a href='{_doc_furl}' target='_blank' download style='"
+                                f"display:inline-flex;align-items:center;gap:6px;"
+                                f"background:#1a73e8;color:#fff;border-radius:8px;"
+                                f"padding:6px 14px;font-size:0.82rem;text-decoration:none;'>"
+                                f"⬇️ {_doc_fname}{_sz2} 다운로드</a>",
+                                unsafe_allow_html=True,
+                            )
+                        if _is_preview:
+                            if _ftype == "image":
+                                _comp.html(
+                                    f"<html><body style='margin:0;background:#f5f5f5;text-align:center;padding:8px;'>"
+                                    f"<img src='{_doc_furl}' style='max-width:100%;max-height:600px;"
+                                    f"object-fit:contain;border-radius:6px;'/></body></html>",
+                                    height=400, scrolling=False,
+                                )
+                            elif _ftype == "pdf":
+                                _comp.html(
+                                    f"<iframe src='{_doc_furl}' width='100%' height='{_viewer_h}px'"
+                                    f" style='border:none;'></iframe>",
+                                    height=_viewer_h + 20, scrolling=False,
+                                )
+                            elif _ftype == "office":
+                                _enc_url = _uparse.quote(_doc_furl, safe="")
+                                _comp.html(
+                                    f"<iframe src='https://view.officeapps.live.com/op/embed.aspx?src={_enc_url}'"
+                                    f" width='100%' height='{_viewer_h}px' style='border:none;'></iframe>",
+                                    height=_viewer_h + 20, scrolling=False,
+                                )
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    _can_edit = (_doc_author == _me) or (_role in ("store_admin", "superadmin"))
+                    if _can_edit:
+                        _ec1, _ec2 = st.columns([1, 1])
+                        with _ec1:
+                            if st.button("✏️ 수정", key=f"doc_edit_btn_{_doc_id}"):
+                                st.session_state[f"doc_editing_{_doc_id}"] = True
+                        with _ec2:
+                            if st.button("🗑️ 삭제", key=f"doc_del_btn_{_doc_id}"):
+                                st.session_state[f"doc_del_confirm_{_doc_id}"] = True
+
+                    if st.session_state.get(f"doc_del_confirm_{_doc_id}"):
+                        st.warning("정말 삭제하시겠습니까?")
+                        _dcc1, _dcc2 = st.columns([1, 5])
+                        with _dcc1:
+                            if st.button("확인 삭제", type="primary", key=f"doc_del_ok_{_doc_id}"):
+                                try:
+                                    client.table("app_documents").delete().eq("id", _doc_id).execute()
+                                    for _k in (f"doc_del_confirm_{_doc_id}", f"doc_expanded_{_doc_id}"):
+                                        st.session_state.pop(_k, None)
+                                    st.cache_data.clear()
+                                    st.rerun()
+                                except Exception as _e:
+                                    st.error(f"삭제 실패: {_e}")
+                        with _dcc2:
+                            if st.button("취소", key=f"doc_del_cancel_{_doc_id}"):
+                                st.session_state.pop(f"doc_del_confirm_{_doc_id}", None)
                                 st.rerun()
-                            except Exception as _e:
-                                st.error(f"수정 실패: {_e}")
-                    with _es2:
-                        if st.button("취소", key=f"doc_edit_cancel_{_doc_id}"):
-                            st.session_state.pop(f"doc_editing_{_doc_id}", None)
-                            st.rerun()
+
+                    if st.session_state.get(f"doc_editing_{_doc_id}"):
+                        st.markdown("---")
+                        _ea1, _ea2 = st.columns([1, 1])
+                        with _ea1:
+                            _et_cat_sel = st.selectbox(
+                                "카테고리", ["직접 입력"] + sorted(_cat_tree.keys()),
+                                index=(["직접 입력"] + sorted(_cat_tree.keys())).index(_doc_cat)
+                                if _doc_cat in _cat_tree else 0,
+                                key=f"doc_et_cat_{_doc_id}",
+                            )
+                            _et_cat = (
+                                st.text_input("새 카테고리명", value=_doc_cat, key=f"doc_et_catn_{_doc_id}")
+                                if _et_cat_sel == "직접 입력" else _et_cat_sel
+                            )
+                        with _ea2:
+                            _subs_for_edit = sorted(
+                                s for s in _cat_tree.get(_et_cat, {}) if s != "__root__"
+                            )
+                            _et_sub_sel = st.selectbox(
+                                "하위 카테고리", ["없음", "직접 입력"] + _subs_for_edit,
+                                index=(["없음", "직접 입력"] + _subs_for_edit).index(_doc_sub)
+                                if _doc_sub in _subs_for_edit else 0,
+                                key=f"doc_et_sub_{_doc_id}",
+                            )
+                            if _et_sub_sel == "직접 입력":
+                                _et_sub = st.text_input("새 하위 카테고리명", value=_doc_sub,
+                                                        key=f"doc_et_subn_{_doc_id}")
+                            elif _et_sub_sel == "없음":
+                                _et_sub = ""
+                            else:
+                                _et_sub = _et_sub_sel
+
+                        _et  = st.text_input("제목", value=_doc_title, key=f"doc_et_{_doc_id}")
+                        st.markdown("**내용**")
+                        if _HAS_QUILL:
+                            _ec = _st_quill(value=_doc_content or "", html=True, key=f"doc_ec_{_doc_id}")
+                        else:
+                            _ec = st.text_area("내용", value=_doc_content, height=200, key=f"doc_ec_{_doc_id}")
+                        _eg = st.text_input("태그", value=_doc_tags, key=f"doc_eg_{_doc_id}")
+                        _ef = st.file_uploader("첨부파일 교체 (선택)", key=f"doc_ef_{_doc_id}",
+                                               help="새 파일을 올리면 기존 파일이 교체됩니다.")
+                        if _doc_fname:
+                            st.caption(f"현재 첨부파일: 📎 {_doc_fname}")
+                        _es1, _es2 = st.columns([1, 5])
+                        with _es1:
+                            if st.button("저장", type="primary", key=f"doc_save_{_doc_id}"):
+                                try:
+                                    _upd = {
+                                        "title":       _et.strip(),
+                                        "content":     (_ec or "").strip(),
+                                        "tags":        _eg.strip(),
+                                        "category":    _et_cat.strip(),
+                                        "subcategory": _et_sub.strip(),
+                                        "updated_at":  _dtmod.datetime.utcnow().isoformat(),
+                                    }
+                                    if _ef:
+                                        with st.spinner("파일 업로드 중..."):
+                                            _nurl, _nfname = _upload_file(_doc_id, _ef)
+                                        _upd["file_url"]  = _nurl
+                                        _upd["file_name"] = _nfname
+                                        _upd["file_size"] = _ef.size
+                                    client.table("app_documents").update(_upd).eq("id", _doc_id).execute()
+                                    st.success("수정되었습니다.")
+                                    st.session_state.pop(f"doc_editing_{_doc_id}", None)
+                                    st.cache_data.clear()
+                                    st.rerun()
+                                except Exception as _e:
+                                    st.error(f"수정 실패: {_e}")
+                        with _es2:
+                            if st.button("취소", key=f"doc_edit_cancel_{_doc_id}"):
+                                st.session_state.pop(f"doc_editing_{_doc_id}", None)
+                                st.rerun()
 
 
 # =====================================================================
