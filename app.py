@@ -9227,9 +9227,13 @@ def _erp_time_input_30min(
         return fallback
 
     normalized = f"{parsed[0]:02d}:{parsed[1]:02d}"
-    # 숫자만 입력된 경우 session_state에 콜론 포함 형식으로 덮어써 다음 렌더 시 자동 표시
+    # 숫자만 입력된 경우 콜론 포함 형식으로 덮어써 다음 렌더 시 자동 표시.
+    # st.form 내부에서는 widget key 직접 쓰기가 금지되므로 예외 발생 시 조용히 무시.
     if (raw or "").strip() != normalized:
-        st.session_state[key] = normalized
+        try:
+            st.session_state[key] = normalized
+        except Exception:
+            pass
     return dt_time(parsed[0], parsed[1])
 
 
