@@ -10085,6 +10085,9 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
     except Exception:
         logs = []
     normal_min_logs = 0
+    # 디버그용: 날짜별 정상근무 내역
+    _debug_normal_logs: list = []
+    _debug_normal_shifts: list = []
     overtime_min_logs = 0
     short_min_logs = 0      # 지각/조퇴 차감
     leave_min = 0
@@ -10105,6 +10108,10 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
         if wt == "정상":
             normal_min_logs += actual_min
+            _debug_normal_logs.append({
+                "date": _ld_str, "type": "log:정상", "h": round(actual_min / 60, 2),
+                "store": l.get("home_db_filename") or "",
+            })
         elif wt in ("추가근무", "행사"):
             overtime_min_logs += actual_min
         elif wt in ("지각", "조퇴"):
@@ -10154,6 +10161,9 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                     m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
                     if m > 0:
                         shift_normal_min += m
+                        _debug_normal_shifts.append({
+                            "date": sd, "type": "shift", "h": round(m / 60, 2),
+                        })
     except Exception:
         pass
 
@@ -10174,6 +10184,11 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         "hour_swap_min": 0,  # overtime_min에 통합
         "actual_total_min": actual_total_min,
         "shift_normal_min": shift_normal_min,  # 디버그·표시용 (시프트 자동 가산분)
+        "normal_min_logs": normal_min_logs,    # 디버그용 (logs 기반 정상근무)
+        "period_start": period_start.isoformat(),
+        "today_cap": today_cap.isoformat(),
+        "debug_normal_logs": _debug_normal_logs,
+        "debug_normal_shifts": _debug_normal_shifts,
     }
 
 
@@ -10770,6 +10785,31 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         with st.expander("ℹ️ 단축근무 누계 상세 (kind별 분류)", expanded=False):
             for k, v in sorted(deductions.items(), key=lambda x: -x[1]):
                 st.markdown(f"- **{k}**: {_erp_fmt_hm(v)}")
+
+    # ── 정상근무 진단 (디버그) ────────────────────────────────────
+    with st.expander("🔍 정상근무 내역 상세 (디버그)", expanded=False):
+        _dbg_logs   = bd.get("debug_normal_logs") or []
+        _dbg_shifts = bd.get("debug_normal_shifts") or []
+        st.caption(
+            f"집계 기간: **{bd.get('period_start')}** ~ **{bd.get('today_cap')}** | "
+            f"logs 정상근무 {_erp_fmt_hm(bd.get('normal_min_logs', 0))} + "
+            f"시프트 자동 {_erp_fmt_hm(bd.get('shift_normal_min', 0))} = "
+            f"**정상근무 {_erp_fmt_hm(normal_min)}**"
+        )
+        import pandas as _pd_dbg
+        if _dbg_logs or _dbg_shifts:
+            _dbg_df = _pd_dbg.DataFrame(_dbg_logs + _dbg_shifts).sort_values("date") if (_dbg_logs or _dbg_shifts) else _pd_dbg.DataFrame()
+            st.markdown(f"**총 {len(_dbg_df)}건 / 합계 {round(_dbg_df['h'].sum(), 2)}h**")
+            # 날짜별 중복 체크
+            _dup = _dbg_df.groupby("date")["h"].agg(["count", "sum"]).reset_index()
+            _dup_multi = _dup[_dup["count"] > 1]
+            if len(_dup_multi) > 0:
+                st.warning(f"⚠️ 같은 날짜에 여러 건이 합산된 날: {len(_dup_multi)}일 — 아래 표 확인")
+                st.dataframe(_dup_multi.rename(columns={"count": "건수", "sum": "합산(h)"}),
+                             use_container_width=True, hide_index=True)
+            st.dataframe(_dbg_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("정상근무 내역이 없습니다.")
 
     # ── 하단 3카드: 정상근무 / 연장근무 / 실제 근무시간 ────────
     st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
