@@ -10084,6 +10084,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
             logs = list(_r_logs.data or [])
     except Exception:
         logs = []
+    _LUNCH_MIN = 60  # 점심시간 차감 (4시간 이상 근무일에만 적용)
     normal_min_logs = 0
     # 디버그용: 날짜별 정상근무 내역
     _debug_normal_logs: list = []
@@ -10104,7 +10105,9 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         ee = _erp_parse_time(l.get("end_time"))
         actual_min = 0
         if ss and ee:
-            actual_min = max(0, (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute))
+            raw_min = max(0, (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute))
+            # 4시간 이상 근무 시 점심 1시간 차감
+            actual_min = max(0, raw_min - _LUNCH_MIN) if raw_min >= 240 else raw_min
 
         if wt == "정상":
             normal_min_logs += actual_min
@@ -10126,8 +10129,9 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                     _ld = date.fromisoformat(_ld_str) if _ld_str else as_of
                     std_s, std_e = _erp_default_times_for_date(db_filename, _ld)
                     std_min = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
+                    std_min = max(0, std_min - _LUNCH_MIN) if std_min >= 240 else std_min
                 except Exception:
-                    std_min = 480
+                    std_min = 420  # 기본 8h - 점심 1h = 7h
                 diff = std_min - actual_min
                 if diff > 0:
                     short_min_logs += diff
@@ -10158,7 +10162,9 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                 ss = _erp_parse_time(sh.get("shift_start"))
                 ee = _erp_parse_time(sh.get("shift_end"))
                 if ss and ee:
-                    m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
+                    raw_m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
+                    # 4시간 이상 근무 시 점심 1시간 차감
+                    m = max(0, raw_m - _LUNCH_MIN) if raw_m >= 240 else raw_m
                     if m > 0:
                         shift_normal_min += m
                         _debug_normal_shifts.append({
