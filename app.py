@@ -10004,6 +10004,10 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                                   year: int, as_of: date) -> dict:
     """연도별 대시보드용 근무 breakdown (통합 카테고리).
 
+    집계 정책: **캘린더에 표시된 시간 그대로, 전 매장 합산** (db_filename 무관)
+      - attendance_logs / shift_schedules / work_adjustments 모두 employee_name 기준
+      - 같은 날 attendance_logs가 있으면 logs 우선, 없으면 shift_schedules 가산 (중복 방지)
+
     카테고리 통합 정책:
       - 연장근무: '추가근무'·'행사'·'시차사용'·'포상시간' + work_adjustments sign='+' (회의·풀근무·overtime 모두 통합)
       - 단축근무: 지각/조퇴 표준 대비 부족분 + work_adjustments sign='-' (포상·여름휴가·기타 모두 통합)
@@ -10067,9 +10071,19 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         pass
 
     # ── 캘린더 출퇴근 로그 (app_attendance_logs) ────────────────
-    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", db_filename,
-                            "log_date", period_start, today_cap,
-                            extra_eq={"employee_name": employee_name})
+    # 정책: 캘린더에 표시되는 그대로 — 전 매장 합산 (db_filename 필터 없음)
+    logs = []
+    try:
+        _cli_logs, _e_logs = get_supabase_client()
+        if not _e_logs and _cli_logs:
+            _r_logs = _cli_logs.table("app_attendance_logs").select("*")\
+                .eq("employee_name", employee_name)\
+                .gte("log_date", period_start.isoformat())\
+                .lte("log_date", today_cap.isoformat())\
+                .execute()
+            logs = list(_r_logs.data or [])
+    except Exception:
+        logs = []
     normal_min_logs = 0
     overtime_min_logs = 0
     short_min_logs = 0      # 지각/조퇴 차감
