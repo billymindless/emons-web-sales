@@ -1428,15 +1428,10 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
         logger.info("chat.closed 아카이빙 완료: phone=%s chat_id=%s", phone, chat_id)
 
         # ── Gemini VOC 분석 (full_text가 있고 API 키가 설정된 경우만) ──
+        # google-generativeai 패키지 없이 httpx로 REST API 직접 호출
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
         if full_text and gemini_key:
             try:
-                import google.generativeai as _genai
-                _genai.configure(api_key=gemini_key)
-                _model = _genai.GenerativeModel(
-                    model_name="gemini-1.5-flash",
-                    generation_config={"temperature": 0, "response_mime_type": "application/json"},
-                )
                 _prompt = (
                     "다음은 가구 쇼핑몰 고객 상담 대화입니다.\n"
                     "아래 항목을 분석해 JSON으로만 응답하세요 (다른 텍스트 없이 JSON만):\n"
@@ -1447,10 +1442,23 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
                     "- sentiment: str (긍정/중립/부정 중 하나)\n\n"
                     f"대화:\n{full_text[:3000]}"
                 )
-                _ai_resp = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: _model.generate_content(_prompt)
+                _gemini_url = (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"gemini-1.5-flash:generateContent?key={gemini_key}"
                 )
-                _ai_data = json.loads(_ai_resp.text)
+                _gemini_body = {
+                    "contents": [{"parts": [{"text": _prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "responseMimeType": "application/json",
+                    },
+                }
+                async with httpx.AsyncClient(timeout=20.0) as _gcl:
+                    _gr = await _gcl.post(_gemini_url, json=_gemini_body)
+                    _gr.raise_for_status()
+                _ai_raw = _gr.json()
+                _ai_text = _ai_raw["candidates"][0]["content"]["parts"][0]["text"]
+                _ai_data = json.loads(_ai_text)
 
                 # app_voc_insights upsert (chat_id UNIQUE → 중복 건너뜀)
                 _voc_hdrs = {**_supa_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"}

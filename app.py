@@ -14489,11 +14489,10 @@ def render_voc_dashboard():
                     elif _col_msg == "(없음)":
                         st.error("메시지 내용 컬럼을 선택해야 합니다.")
                     else:
-                        import google.generativeai as _genai_imp
-                        _genai_imp.configure(api_key=_key_to_use)
-                        _gem_model = _genai_imp.GenerativeModel(
-                            model_name="gemini-1.5-flash",
-                            generation_config={"temperature": 0, "response_mime_type": "application/json"},
+                        import requests as _req_imp
+                        _gemini_endpoint = (
+                            "https://generativelanguage.googleapis.com/v1beta/models/"
+                            f"gemini-1.5-flash:generateContent?key={_key_to_use}"
                         )
                         _prog = st.progress(0, text="분석 중...")
                         _ok, _skip = 0, 0
@@ -14514,9 +14513,22 @@ def render_voc_dashboard():
                                     "- product_idea: str\n- summary: str\n- sentiment: str (긍정/중립/부정)\n\n"
                                     f"대화:\n{_ft[:3000]}"
                                 )
-                                _ar = _gem_model.generate_content(_pr)
+                                _gr = _req_imp.post(
+                                    _gemini_endpoint,
+                                    json={
+                                        "contents": [{"parts": [{"text": _pr}]}],
+                                        "generationConfig": {
+                                            "temperature": 0,
+                                            "responseMimeType": "application/json",
+                                        },
+                                    },
+                                    timeout=20,
+                                )
+                                _gr.raise_for_status()
                                 import json as _json_imp
-                                _ad = _json_imp.loads(_ar.text)
+                                _ad = _json_imp.loads(
+                                    _gr.json()["candidates"][0]["content"]["parts"][0]["text"]
+                                )
                                 _voc_row = {
                                     "chat_id": _cid or None,
                                     "customer_phone": _ph,

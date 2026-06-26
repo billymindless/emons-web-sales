@@ -19,5 +19,4 @@ google-auth-oauthlib>=1.2.0
 google-api-python-client>=2.127.0
 # 자료실 리치 텍스트 에디터
 streamlit-quill>=0.0.3
-# AI VOC 분석
-google-generativeai>=0.7.0
+# AI VOC 분석 (Gemini REST API — httpx로 직접 호출, 별도 패키지 불필요)
