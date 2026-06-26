@@ -9144,13 +9144,29 @@ def _erp_minutes_between(t_start, t_end) -> int:
 
 
 def _erp_parse_time(s, default=None):
-    """문자열/time → datetime.time. 실패 시 default."""
+    """문자열/time → datetime.time. 다양한 포맷 허용. 실패 시 default.
+
+    지원 포맷:
+      - datetime.time 객체
+      - "HH:MM", "HH:MM:SS", "HH:MM:SS.ffffff"
+      - "YYYY-MM-DDTHH:MM:SS", "YYYY-MM-DDTHH:MM:SS±HH:MM" (ISO datetime)
+    """
     if isinstance(s, dt_time):
         return s
     if s is None or s == "":
         return default
+    raw = str(s).strip()
+    # ISO datetime 형식 ("T" 포함): 시각 부분만 추출
+    if "T" in raw:
+        raw = raw.split("T", 1)[1]
+    # 타임존 오프셋 제거 (+09:00, -05:00, Z)
+    for sep in ("+", "-"):
+        if sep in raw[1:]:
+            raw = raw[:raw[1:].index(sep) + 1]
+            break
+    raw = raw.rstrip("Z")
     try:
-        parts = str(s).split(":")
+        parts = raw.split(":")
         return dt_time(int(parts[0]), int(parts[1]))
     except Exception:
         return default
@@ -9516,7 +9532,8 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
     try:
         _cli2, _err2 = get_supabase_client()
         if not _err2 and _cli2:
-            _rs = _cli2.table("app_shift_schedules").select("shift_date,shift_start,shift_end")\
+            _rs = _cli2.table("app_shift_schedules")\
+                .select("shift_date,shift_start,shift_end,db_filename")\
                 .eq("employee_name", employee_name)\
                 .gte("shift_date", period_start.isoformat())\
                 .lte("shift_date", today_cap.isoformat())\
@@ -9527,6 +9544,13 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                     continue  # logs 우선 (중복 방지)
                 _ss = _erp_parse_time(_sh.get("shift_start"))
                 _ee = _erp_parse_time(_sh.get("shift_end"))
+                # NULL 시간 폴백: 매장 기본 출퇴근 시각 사용
+                if not _ss or not _ee:
+                    _sh_db = str(_sh.get("db_filename") or db_filename)
+                    try:
+                        _ss, _ee = _erp_default_times_for_date(_sh_db, date.fromisoformat(_sd))
+                    except Exception:
+                        pass
                 if _ss and _ee:
                     _raw = (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute)
                     _m = max(0, _raw - _erp_break_min(_raw))
@@ -10276,10 +10300,12 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
     # 복수 매장 지원: db_filename 필터 제거 → 모든 매장 시프트 합산
     # logs에 이미 있는 날짜는 logs가 우선 (중복 방지)
     shift_normal_min = 0
+    _debug_null_shifts: list[str] = []   # 시간 미입력 시프트 날짜 목록 (경고용)
     try:
         client2, err2 = get_supabase_client()
         if not err2 and client2:
-            r2 = client2.table("app_shift_schedules").select("shift_date,shift_start,shift_end")\
+            r2 = client2.table("app_shift_schedules")\
+                .select("shift_date,shift_start,shift_end,db_filename")\
                 .eq("employee_name", employee_name)\
                 .gte("shift_date", period_start.isoformat())\
                 .lte("shift_date", today_cap.isoformat())\
@@ -10290,14 +10316,28 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                     continue  # logs 우선
                 ss = _erp_parse_time(sh.get("shift_start"))
                 ee = _erp_parse_time(sh.get("shift_end"))
+
+                # ── NULL 시간 폴백: 매장 기본 출퇴근 시각 사용 ──────
+                if not ss or not ee:
+                    _sh_db = str(sh.get("db_filename") or db_filename)
+                    try:
+                        _sd_date = date.fromisoformat(sd)
+                        ss, ee = _erp_default_times_for_date(_sh_db, _sd_date)
+                        _debug_null_shifts.append(sd)
+                    except Exception:
+                        pass
+
                 if ss and ee:
                     raw_m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
                     # 근로기준법: 4h~8h → 30분, 8h 이상 → 60분
                     m = max(0, raw_m - _erp_break_min(raw_m))
                     if m > 0:
                         shift_normal_min += m
+                        _time_note = "shift(기본시간)" if sd in _debug_null_shifts else "shift"
                         _debug_normal_shifts.append({
-                            "date": sd, "type": "shift", "h": round(m / 60, 2),
+                            "date": sd,
+                            "type": _time_note,
+                            "h": round(m / 60, 2),
                         })
     except Exception:
         pass
@@ -10324,6 +10364,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         "today_cap": today_cap.isoformat(),
         "debug_normal_logs": _debug_normal_logs,
         "debug_normal_shifts": _debug_normal_shifts,
+        "debug_null_shifts": _debug_null_shifts,
     }
 
 
@@ -10939,8 +10980,9 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
 
     # ── 정상근무 진단 (디버그) ────────────────────────────────────
     with st.expander("🔍 정상근무 내역 상세 (디버그)", expanded=False):
-        _dbg_logs   = bd.get("debug_normal_logs") or []
-        _dbg_shifts = bd.get("debug_normal_shifts") or []
+        _dbg_logs       = bd.get("debug_normal_logs") or []
+        _dbg_shifts     = bd.get("debug_normal_shifts") or []
+        _dbg_null_shift = bd.get("debug_null_shifts") or []
         st.caption(
             f"집계 기간: **{bd.get('period_start')}** ~ **{bd.get('today_cap')}** | "
             f"logs 정상근무 {_erp_fmt_hm(bd.get('normal_min_logs', 0))} + "
@@ -10948,12 +10990,34 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
             f"**정상근무 {_erp_fmt_hm(normal_min)}** | "
             f"휴게시간: 4h~8h → 30분, 8h 이상 → 60분 차감"
         )
+        if _dbg_null_shift:
+            st.warning(
+                f"⚠️ 시프트 시간 미입력 날짜 {len(_dbg_null_shift)}건 — **매장 기본시간으로 자동 대체** 적용됨: "
+                + ", ".join(_dbg_null_shift)
+                + "\n\n> 시프트 등록 시 출퇴근 시각을 직접 입력하면 더 정확합니다."
+            )
         import pandas as _pd_dbg
         if _dbg_logs or _dbg_shifts:
-            _dbg_df = _pd_dbg.DataFrame(_dbg_logs + _dbg_shifts).sort_values("date") if (_dbg_logs or _dbg_shifts) else _pd_dbg.DataFrame()
-            st.markdown(f"**총 {len(_dbg_df)}건 / 합계 {round(_dbg_df['h'].sum(), 2)}h**")
+            _dbg_rows = []
+            for _r in _dbg_logs:
+                _dbg_rows.append({
+                    "날짜": _r.get("date", ""),
+                    "유형": _r.get("type", ""),
+                    "근무(h)": round(float(_r.get("h") or 0), 2),
+                    "매장": _r.get("store", ""),
+                })
+            for _r in _dbg_shifts:
+                _dbg_rows.append({
+                    "날짜": _r.get("date", ""),
+                    "유형": _r.get("type", ""),
+                    "근무(h)": round(float(_r.get("h") or 0), 2),
+                    "매장": "",
+                })
+            _dbg_df = _pd_dbg.DataFrame(_dbg_rows).sort_values("날짜")
+            _total_h = round(_dbg_df["근무(h)"].sum(), 2)
+            st.markdown(f"**총 {len(_dbg_df)}건 / 합계 {_total_h}h**")
             # 날짜별 중복 체크
-            _dup = _dbg_df.groupby("date")["h"].agg(["count", "sum"]).reset_index()
+            _dup = _dbg_df.groupby("날짜")["근무(h)"].agg(["count", "sum"]).reset_index()
             _dup_multi = _dup[_dup["count"] > 1]
             if len(_dup_multi) > 0:
                 st.warning(f"⚠️ 같은 날짜에 여러 건이 합산된 날: {len(_dup_multi)}일 — 아래 표 확인")
