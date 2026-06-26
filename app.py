@@ -9447,13 +9447,82 @@ def _erp_compute_worked_minutes(db_filename: str, employee_name: str,
 
 def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                                    year: int, month: int) -> dict:
-    """월 카운터 = 월 목표 - 누적 인정 시간. 반환: target_min, worked_min, remaining_min, percent."""
+    """월 카운터 = 월 목표 - 누적 인정 시간. 반환: target_min, worked_min, remaining_min, percent.
+
+    집계 정책 (yearly_breakdown과 동일):
+      - app_attendance_logs + app_shift_schedules 모두 포함
+      - 전 매장 합산 (db_filename 필터 없음)
+      - 오늘까지만 집계 (미래 날짜 제외)
+      - logs가 있는 날은 logs 우선, 없는 날만 shifts 사용 (중복 방지)
+      - 4시간 이상 근무 시 점심 60분 차감
+    """
     target_h = _erp_get_employee_monthly_target(db_filename, employee_name)
     target_min = int(round(target_h * 60))
     last_day = calendar.monthrange(int(year), int(month))[1]
     period_start = date(int(year), int(month), 1)
-    period_end = date(int(year), int(month), last_day)
-    worked_min = _erp_compute_worked_minutes(db_filename, employee_name, period_start, period_end)
+    # 오늘까지만 집계 — 미래 날짜는 카운팅 불가
+    today_cap = min(date.today(), date(int(year), int(month), last_day))
+
+    _LUNCH_MIN = 60
+    worked_min = 0
+    log_dates: set[str] = set()
+
+    # 1) attendance_logs (전 매장, status=approved)
+    try:
+        _cli, _err = get_supabase_client()
+        if not _err and _cli:
+            _rl = _cli.table("app_attendance_logs").select("*")\
+                .eq("employee_name", employee_name)\
+                .gte("log_date", period_start.isoformat())\
+                .lte("log_date", today_cap.isoformat())\
+                .execute()
+            for _l in (_rl.data or []):
+                if (_l.get("status") or "approved") != "approved":
+                    continue
+                _ld = str(_l.get("log_date") or "")[:10]
+                if _ld:
+                    log_dates.add(_ld)
+                _wt = _l.get("work_type") or ""
+                _ss = _erp_parse_time(_l.get("start_time"))
+                _ee = _erp_parse_time(_l.get("end_time"))
+                _actual = 0
+                if _ss and _ee:
+                    _raw = max(0, (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute))
+                    _actual = max(0, _raw - _LUNCH_MIN) if _raw >= 240 else _raw
+                if _wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+                    worked_min += _actual
+                elif _wt == "연차":
+                    worked_min += 480
+                elif _wt == "반차":
+                    worked_min += 240
+                elif _wt in ("시차사용", "포상시간"):
+                    worked_min += int(_l.get("diff_minutes") or 0)
+    except Exception:
+        pass
+
+    # 2) shift_schedules (logs가 없는 날만, 전 매장, 오늘까지)
+    try:
+        _cli2, _err2 = get_supabase_client()
+        if not _err2 and _cli2:
+            _rs = _cli2.table("app_shift_schedules").select("shift_date,shift_start,shift_end")\
+                .eq("employee_name", employee_name)\
+                .gte("shift_date", period_start.isoformat())\
+                .lte("shift_date", today_cap.isoformat())\
+                .execute()
+            for _sh in (_rs.data or []):
+                _sd = str(_sh.get("shift_date") or "")[:10]
+                if not _sd or _sd in log_dates:
+                    continue  # logs 우선 (중복 방지)
+                _ss = _erp_parse_time(_sh.get("shift_start"))
+                _ee = _erp_parse_time(_sh.get("shift_end"))
+                if _ss and _ee:
+                    _raw = (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute)
+                    _m = max(0, _raw - _LUNCH_MIN) if _raw >= 240 else _raw
+                    if _m > 0:
+                        worked_min += _m
+    except Exception:
+        pass
+
     remaining = target_min - worked_min
     percent = (worked_min / target_min * 100.0) if target_min > 0 else 0.0
     return {
