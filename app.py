@@ -9724,19 +9724,68 @@ def _erp_compute_remaining_comptime(home_db: str, employee_name: str) -> int:
         return 0
 
 
-def _erp_compute_annual_days_for_hire(hire_date: date, year: int, full_days: float = 15.0) -> float:
-    """입사일 기준 해당 연도 비례 연차 자동 계산.
-    - 입사 연도: 남은 달 비례 (입사월 포함)
-    - 그 이후 연도: full_days 전액 부여
+def _erp_calc_legal_leave(hire_date: date, year: int) -> dict:
+    """한국 근로기준법(제60조) 기준 연차 일수 상세 계산.
+
+    반환 dict:
+      total_days          : 최종 연차 일수 (대시보드·부여 기본값)
+      base_days           : 기본 연차 (15일 또는 입사연도 비례)
+      long_service_extra  : 장기근속 가산 일수
+      years_of_service    : 근속연수 (해당 연도 1월 1일 기준)
+      note                : 계산 근거 설명 문자열
+
+    근로기준법 공식:
+      - 입사 연도(1년 미만): 15일 × 재직 개월 / 12 (0.5 단위 반올림)
+      - 1년 이상: 기본 15일
+      - 3년 이상: 15일 + floor((근속연수 − 1) / 2) — 최대 25일
     """
-    if hire_date.year < year:
-        return full_days
-    if hire_date.year > year:
-        return 0.0
-    # 입사 연도: 입사월부터 12월까지 개월 수 / 12 × full_days
-    months_remaining = 13 - hire_date.month   # 입사월 포함
-    raw = round(full_days * months_remaining / 12 * 2) / 2   # 0.5 단위 반올림
-    return max(0.0, raw)
+    year_start = date(int(year), 1, 1)
+
+    # 근속연수 계산 (해당 연도 1월 1일 기준)
+    if hire_date >= year_start:
+        # 해당 연도 입사 → 입사월 기준 비례 배분
+        months_remaining = 13 - hire_date.month
+        base = round(15.0 * months_remaining / 12 * 2) / 2
+        return {
+            "total_days": max(0.0, base),
+            "base_days": max(0.0, base),
+            "long_service_extra": 0,
+            "years_of_service": 0,
+            "note": f"입사 연도 비례 ({months_remaining}개월 / 12 × 15일 = {base:g}일)",
+        }
+
+    # 기준일(해당 연도 1월 1일)까지의 근속연수 (정수)
+    yos_raw = (year_start.year - hire_date.year) * 12 + (year_start.month - hire_date.month)
+    if year_start.day < hire_date.day:
+        yos_raw -= 1
+    years_of_service = yos_raw // 12   # 연 단위 정수
+
+    base = 15.0
+    extra = int(min(10, max(0, (years_of_service - 1) // 2)))  # max extra = 10 → 총 25일
+    total = min(25.0, base + extra)
+
+    if years_of_service < 1:
+        note = f"근속 {years_of_service}년 → 비례 (기본 15일 적용)"
+    elif extra == 0:
+        note = f"근속 {years_of_service}년 → 기본 15일"
+    else:
+        note = (
+            f"근속 {years_of_service}년 → 기본 15일 + 장기근속 {extra}일 "
+            f"(floor(({years_of_service}-1)/2)) = {total:g}일"
+        )
+
+    return {
+        "total_days": total,
+        "base_days": base,
+        "long_service_extra": extra,
+        "years_of_service": years_of_service,
+        "note": note,
+    }
+
+
+def _erp_compute_annual_days_for_hire(hire_date: date, year: int, full_days: float = 15.0) -> float:
+    """하위호환 래퍼 — 내부는 _erp_calc_legal_leave 사용."""
+    return _erp_calc_legal_leave(hire_date, year)["total_days"]
 
 
 def _erp_compute_monthly_accrued(hire_date_str: str | None, as_of: date) -> int:
@@ -10821,9 +10870,25 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     # 잔여 필요근무 = 공통 − 단축근무 누계 − 실제 근무시간 (캘린더·시프트 반영)
     remaining_required_min = required_min - total_short_adj_min - actual_total_min
 
-    # 잔여 연차
+    # 잔여 연차 + 장기근속 정보
     _leave = _erp_compute_leave_status(current_db, me_name, _as_of)
     _annual_remain_days = _leave["annual_remain"]
+
+    # 장기근속 정보: app_leave_grants에서 hire_date 읽어 근로기준법 계산
+    _leave_grant_rows = _erp_fetch_table("app_leave_grants", {
+        "home_db_filename": current_db,
+        "employee_name": me_name,
+        "year": int(sel_year),
+    })
+    _leave_grant = _leave_grant_rows[0] if _leave_grant_rows else {}
+    _hire_date_str = _leave_grant.get("hire_date")
+    _legal_info: dict = {}
+    if _hire_date_str:
+        try:
+            _hd = date.fromisoformat(str(_hire_date_str)[:10])
+            _legal_info = _erp_calc_legal_leave(_hd, int(sel_year))
+        except Exception:
+            pass
 
     # ── 카드 공통 CSS ───────────────────────────────────────────
     _card_css = (
@@ -10949,11 +11014,20 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     with r3c2:
         _leave_color = "#E53935" if _annual_remain_days == 0 else ("#FB8C00" if _leave["soak_risk"] else "#2E7D32")
         _leave_bg = "#FFEBEE" if _annual_remain_days == 0 else ("#FFF8E1" if _leave["soak_risk"] else "#E8F5E9")
+        _leave_total = _leave["annual_total"]
+        _leave_used  = _leave["annual_used"]
+        _long_extra  = _legal_info.get("long_service_extra", 0)
+        _yos_str     = f"근속 {_legal_info['years_of_service']}년" if _legal_info else ""
+        _sub_leave   = (
+            f"총 {_leave_total:g}일 중 {_leave_used:g}일 사용"
+            + (f" | 장기근속 +{_long_extra}일 포함" if _long_extra > 0 else "")
+            + (f" | {_yos_str}" if _yos_str else "")
+        )
         st.markdown(
             f"<div style='background:{_leave_bg}; {_card_css}'>"
             f"<div style='{_label_css}'>🎫 잔여 연차</div>"
             f"<div style='{_value_css} color:{_leave_color};'>{_annual_remain_days:g}일</div>"
-            f"<div style='{_sub_css}'>올해 {int(_leave['days_until_year_end'])}일 남음</div>"
+            f"<div style='{_sub_css}'>{_sub_leave}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -11026,6 +11100,20 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
                 _emp_actual_min = int(_emp_bd["actual_total_min"])
                 _emp_remain_min = (_emp_required_min - _emp_short_adj_min) - _emp_actual_min
                 _emp_leave = _erp_compute_leave_status(current_db, _emp, _as_of)
+                # 장기근속 정보
+                _eg_rows = _erp_fetch_table("app_leave_grants", {
+                    "home_db_filename": current_db, "employee_name": _emp, "year": int(sel_year),
+                })
+                _eg = _eg_rows[0] if _eg_rows else {}
+                _eg_hire = _eg.get("hire_date")
+                _eg_legal: dict = {}
+                if _eg_hire:
+                    try:
+                        _eg_legal = _erp_calc_legal_leave(date.fromisoformat(str(_eg_hire)[:10]), int(sel_year))
+                    except Exception:
+                        pass
+                _eg_yos   = _eg_legal.get("years_of_service", "-")
+                _eg_extra = _eg_legal.get("long_service_extra", 0)
                 _rows.append({
                     "직원명": _emp,
                     "이번달 근무일": _emp_work_days,
@@ -11035,6 +11123,8 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
                     "단축근무 누계(h)": round(_emp_short_adj_min / 60, 1),
                     "실제 근무(h)": round(_emp_actual_min / 60, 1),
                     "잔여 필요(h)": _erp_fmt_hm(_emp_remain_min) if _emp_required_min else "미설정",
+                    "근속연수": f"{_eg_yos}년" if _eg_hire else "미등록",
+                    "장기근속+": f"+{_eg_extra}일" if _eg_extra > 0 else "-",
                     "잔여 연차(일)": f"{_emp_leave['annual_remain']:g}",
                 })
             import pandas as pd
@@ -13880,39 +13970,66 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 
     _hire_default = date.fromisoformat(_saved_hire) if _saved_hire else today
 
-    # 입사일 입력 → 자동 계산 연차 참고값 즉시 표시 (폼 외부)
+    # 입사일 입력 → 근로기준법 자동 계산 즉시 표시 (폼 외부)
     g_hire = st.date_input("입사일", value=_hire_default, key="erp_lg_hire")
-    _auto_days = _erp_compute_annual_days_for_hire(g_hire, int(g_year))
-    st.caption(
-        f"📌 입사일 기준 자동 계산: **{_auto_days:g}일** "
-        f"(입사 연도 비례 배분 기준) — 아래에서 최종 부여 일수를 직접 조정하세요."
+    _legal = _erp_calc_legal_leave(g_hire, int(g_year))
+    _auto_days = _legal["total_days"]
+    _extra = _legal["long_service_extra"]
+    _yos   = _legal["years_of_service"]
+
+    # 장기근속 산출 내역 카드
+    _lc_bg = "#E8F5E9" if _extra > 0 else "#F3F4F6"
+    _lc_border = "#43A047" if _extra > 0 else "#9E9E9E"
+    st.markdown(
+        f"<div style='background:{_lc_bg};border-left:4px solid {_lc_border};"
+        f"border-radius:4px;padding:10px 14px;margin-bottom:10px;font-size:0.88rem;'>"
+        f"<b>📋 근로기준법 제60조 자동 계산 결과</b><br>"
+        f"근속연수: <b>{_yos}년</b> &nbsp;|&nbsp; "
+        f"기본 연차: <b>15일</b> &nbsp;|&nbsp; "
+        f"장기근속 가산: <b>+{_extra}일</b> &nbsp;|&nbsp; "
+        f"<b style='font-size:1.05rem;'>총 {_auto_days:g}일</b><br>"
+        f"<span style='color:#666;font-size:0.8rem;'>{_legal['note']}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
     )
 
+    # 자동 계산값 초기화 버튼 (폼 외부 — 클릭 시 session_state 통해 폼 기본값 교체)
+    _init_key = "erp_lg_days_init"
+    if st.button(f"⚡ 자동 계산값({_auto_days:g}일)으로 초기화", key="erp_lg_auto_fill"):
+        st.session_state[_init_key] = _auto_days
+        st.rerun()
+    _days_init_value = st.session_state.pop(_init_key, _saved_days)
+
     with st.form("erp_leave_grant_form", clear_on_submit=False):
-        st.markdown("**최종 연차 부여 설정**")
+        st.markdown("**최종 연차 부여 설정** *(자동 계산값이 기본값 — 수동 조정 가능)*")
         fc1, fc2 = st.columns([1, 2])
         with fc1:
             g_days = st.number_input(
                 "최종 연차 부여 일수",
                 min_value=0.0, max_value=40.0,
-                value=_saved_days, step=0.5,
+                value=float(_days_init_value), step=0.5,
                 key="erp_lg_days",
-                help=f"자동 계산값은 {_auto_days:g}일입니다. 이미 소진한 연차가 있는 경우 실제 잔여 기준으로 조정하세요.",
+                help=(
+                    f"근로기준법 자동 계산: {_auto_days:g}일 (기본 15일 + 장기근속 {_extra}일). "
+                    "기존 직원 중 이미 소진된 연차가 있거나 별도 합의한 경우 직접 조정하세요."
+                ),
             )
         with fc2:
             g_note = st.text_input(
                 "조정 사유 (선택)",
                 value=_saved_note,
                 key="erp_lg_note",
-                placeholder="예: 연중 입사로 인한 수동 조정 / 이월 연차 포함 15일 부여",
+                placeholder="예: 기존 장기근속 소진 반영 / 협의 조정 / 이월 포함",
             )
-        if _existing:
-            _adj_delta = g_days - _auto_days
-            _sign = "+" if _adj_delta >= 0 else ""
+        _adj_delta = g_days - _auto_days
+        _sign = "+" if _adj_delta >= 0 else ""
+        if abs(_adj_delta) > 0:
             st.info(
-                f"ℹ️ 자동 계산 대비 **{_sign}{_adj_delta:g}일** 조정 "
+                f"ℹ️ 자동 계산 대비 **{_sign}{_adj_delta:g}일** 수동 조정 "
                 f"(자동 {_auto_days:g}일 → 최종 {g_days:g}일)"
             )
+        else:
+            st.caption(f"✅ 자동 계산값({_auto_days:g}일)과 동일하게 설정됨")
         g_submit = st.form_submit_button("💾 저장", type="primary")
 
     if g_submit:
@@ -13958,10 +14075,23 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
         half_used = sum(float(l.get("leave_deduction") or 0) for l in emp_logs if l.get("work_type") == "반차")
         monthly_accrued = _erp_compute_monthly_accrued(hire, today if today.year == int(year_for_view) else date(int(year_for_view), 12, 31))
         comp_remain = _erp_compute_remaining_comptime(current_db, emp)
+        # 장기근속 계산
+        _emp_legal: dict = {}
+        if hire:
+            try:
+                _emp_legal = _erp_calc_legal_leave(date.fromisoformat(str(hire)[:10]), int(year_for_view))
+            except Exception:
+                pass
+        _emp_yos   = _emp_legal.get("years_of_service", "-")
+        _emp_extra = _emp_legal.get("long_service_extra", 0)
+        _emp_auto  = _emp_legal.get("total_days", "-")
         rows.append({
             "직원명": emp,
             "입사일": hire or "-",
-            "연차부여": annual,
+            "근속연수": f"{_emp_yos}년" if hire else "-",
+            "법정 연차(자동)": f"{_emp_auto:g}일" if _emp_legal else "-",
+            "장기근속+": f"+{_emp_extra}일" if _emp_extra > 0 else "-",
+            "부여 연차(최종)": annual,
             "연차사용": annual_used,
             "잔여연차": annual - annual_used,
             "월차적립": monthly_accrued,
