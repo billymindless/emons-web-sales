@@ -9508,8 +9508,6 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                 if (_l.get("status") or "approved") != "approved":
                     continue
                 _ld = str(_l.get("log_date") or "")[:10]
-                if _ld:
-                    log_dates.add(_ld)
                 _wt = _l.get("work_type") or ""
                 _ss = _erp_parse_time(_l.get("start_time"))
                 _ee = _erp_parse_time(_l.get("end_time"))
@@ -9517,6 +9515,18 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                 if _ss and _ee:
                     _raw = max(0, (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute))
                     _actual = max(0, _raw - _erp_break_min(_raw))
+                # NULL 시각 보정: standard_start/end + diff_minutes 사용
+                if _actual == 0 and _wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+                    _std_s_l = _erp_parse_time(_l.get("standard_start"))
+                    _std_e_l = _erp_parse_time(_l.get("standard_end"))
+                    if _std_s_l and _std_e_l:
+                        _log_std_r = max(0, (_std_e_l.hour * 60 + _std_e_l.minute)
+                                         - (_std_s_l.hour * 60 + _std_s_l.minute))
+                        _diff_s = int(_l.get("diff_minutes") or 0)
+                        _act_r = max(0, _log_std_r - (_diff_s if _wt in ("지각", "조퇴") else 0))
+                        _actual = max(0, _act_r - _erp_break_min(_act_r))
+                if _ld:
+                    log_dates.add(_ld)
                 if _wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
                     worked_min += _actual
                 elif _wt == "연차":
@@ -10251,16 +10261,30 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
             continue
         _ld_raw = l.get("log_date")
         _ld_str = str(_ld_raw)[:10] if _ld_raw else ""
-        if _ld_str:
-            log_dates.add(_ld_str)
         wt = l.get("work_type") or ""
         ss = _erp_parse_time(l.get("start_time"))
         ee = _erp_parse_time(l.get("end_time"))
         actual_min = 0
         if ss and ee:
             raw_min = max(0, (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute))
-            # 근로기준법: 4h~8h → 30분, 8h 이상 → 60분
             actual_min = max(0, raw_min - _erp_break_min(raw_min))
+
+        # ── NULL 시각 보정 ─────────────────────────────────────────────
+        # start_time/end_time이 없으면 standard_start/end + diff_minutes로 추정
+        if actual_min == 0 and wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+            _std_s_log = _erp_parse_time(l.get("standard_start"))
+            _std_e_log = _erp_parse_time(l.get("standard_end"))
+            if _std_s_log and _std_e_log:
+                _log_std_raw = max(0, (_std_e_log.hour * 60 + _std_e_log.minute)
+                                   - (_std_s_log.hour * 60 + _std_s_log.minute))
+                _diff_stored = int(l.get("diff_minutes") or 0)
+                # 지각/조퇴: 표준 시간에서 단축 분만큼 차감
+                _act_raw = max(0, _log_std_raw - (_diff_stored if wt in ("지각", "조퇴") else 0))
+                actual_min = max(0, _act_raw - _erp_break_min(_act_raw))
+
+        # ── log_dates 등록 (연차/반차/시차사용도 날짜 점유) ──────────
+        if _ld_str:
+            log_dates.add(_ld_str)
 
         if wt == "정상":
             normal_min_logs += actual_min
@@ -10275,20 +10299,30 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
             # work_adjustments에서 이미 카운트되므로 short 중복 방지.
             _log_note = (l.get("note") or "")
             _is_auto_synced = any(_log_note.startswith(t) for t in _ERP_AUTO_ADJ_TAGS)
+            _diff_min_log = int(l.get("diff_minutes") or 0)
             if _is_auto_synced:
                 normal_min_logs += actual_min  # 출근 시간만 정상 카운트, 단축은 adj에서
             else:
-                try:
-                    _ld = date.fromisoformat(_ld_str) if _ld_str else as_of
-                    std_s, std_e = _erp_default_times_for_date(db_filename, _ld)
-                    _std_raw = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
-                    std_min = max(0, _std_raw - _erp_break_min(_std_raw))
-                except Exception:
-                    std_min = 420  # 기본 9h - 점심 1h = 8h → 30+30 → 7.5h (근사)
-                diff = std_min - actual_min
-                if diff > 0:
-                    short_min_logs += diff
+                # 단축 시간: diff_minutes 컬럼 우선, 없으면 standard 기준으로 재계산
+                if _diff_min_log > 0:
+                    short_min_logs += _diff_min_log
+                else:
+                    try:
+                        _ld_d = date.fromisoformat(_ld_str) if _ld_str else as_of
+                        std_s, std_e = _erp_default_times_for_date(db_filename, _ld_d)
+                        _std_raw = max(0, (std_e.hour * 60 + std_e.minute)
+                                       - (std_s.hour * 60 + std_s.minute))
+                        std_min = max(0, _std_raw - _erp_break_min(_std_raw))
+                        _calc_diff = std_min - actual_min
+                        if _calc_diff > 0:
+                            short_min_logs += _calc_diff
+                    except Exception:
+                        pass
                 normal_min_logs += actual_min
+            _debug_normal_logs.append({
+                "date": _ld_str, "type": f"log:{wt}", "h": round(actual_min / 60, 2),
+                "store": l.get("home_db_filename") or "",
+            })
         elif wt == "연차":
             leave_min += 480
         elif wt == "반차":
