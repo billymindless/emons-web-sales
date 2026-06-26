@@ -24,14 +24,12 @@
   IMWEB_API_SECRET          아임웹 REST API Secret (폴링 배치용)
   MOMO_APP_URL              momo Streamlit 앱 도메인 (예: https://emons.streamlit.app)
   CHANNEL_TALK_DEFAULT_STORE  채널톡 자동 가입 시 기본 store_name (기본값: '채널톡')
+  GEMINI_API_KEY              Google Gemini API 키 (VOC 자동 분석용, aistudio.google.com 발급)
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -1429,12 +1427,16 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
 
         logger.info("chat.closed 아카이빙 완료: phone=%s chat_id=%s", phone, chat_id)
 
-        # ── OpenAI VOC 분석 (full_text가 있고 API 키가 설정된 경우만) ──
-        openai_key = os.environ.get("OPENAI_API_KEY", "")
-        if full_text and openai_key:
+        # ── Gemini VOC 분석 (full_text가 있고 API 키가 설정된 경우만) ──
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if full_text and gemini_key:
             try:
-                import openai as _openai
-                _ai_client = _openai.AsyncOpenAI(api_key=openai_key)
+                import google.generativeai as _genai
+                _genai.configure(api_key=gemini_key)
+                _model = _genai.GenerativeModel(
+                    model_name="gemini-1.5-flash",
+                    generation_config={"temperature": 0, "response_mime_type": "application/json"},
+                )
                 _prompt = (
                     "다음은 가구 쇼핑몰 고객 상담 대화입니다.\n"
                     "아래 항목을 분석해 JSON으로만 응답하세요 (다른 텍스트 없이 JSON만):\n"
@@ -1445,14 +1447,10 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
                     "- sentiment: str (긍정/중립/부정 중 하나)\n\n"
                     f"대화:\n{full_text[:3000]}"
                 )
-                _ai_resp = await _ai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": _prompt}],
-                    response_format={"type": "json_object"},
-                    temperature=0,
-                    timeout=15,
+                _ai_resp = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _model.generate_content(_prompt)
                 )
-                _ai_data = json.loads(_ai_resp.choices[0].message.content)
+                _ai_data = json.loads(_ai_resp.text)
 
                 # app_voc_insights upsert (chat_id UNIQUE → 중복 건너뜀)
                 _voc_hdrs = {**_supa_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"}
@@ -1478,7 +1476,7 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
                     chat_id, _ai_data.get("sentiment"), _ai_data.get("is_claim"),
                 )
             except Exception as _ve:
-                logger.warning("VOC OpenAI 분석 실패 (비치명적): %s", _ve)
+                logger.warning("VOC Gemini 분석 실패 (비치명적): %s", _ve)
 
         return JSONResponse({"ok": True})
 

@@ -14184,7 +14184,7 @@ def render_voc_dashboard():
     import plotly.express as _px
 
     st.title("📊 고객의 소리(VOC) 분석")
-    st.caption("채널톡 상담 종료 시 AI(gpt-4o-mini)가 자동 분석한 VOC 인사이트입니다.")
+    st.caption("채널톡 상담 종료 시 AI(Gemini 1.5 Flash)가 자동 분석한 VOC 인사이트입니다.")
 
     supa, _err = get_supabase_client()
     if _err or not supa:
@@ -14346,8 +14346,8 @@ def render_voc_dashboard():
         )
 
         _openai_key_ui = st.text_input(
-            "OpenAI API Key", type="password",
-            placeholder="sk-... (Render 환경변수 설정 시 비워두세요)",
+            "Gemini API Key", type="password",
+            placeholder="AIza... (Render 환경변수 GEMINI_API_KEY 설정 시 비워두세요)",
             key="voc_import_key",
         )
         _uploaded = st.file_uploader("엑셀 파일 업로드 (.xlsx)", type=["xlsx"], key="voc_excel_upload")
@@ -14375,14 +14375,18 @@ def render_voc_dashboard():
                     _col_msg    = st.selectbox("메시지 내용", _cols, key="voc_col_msg")
 
                 if st.button("🤖 AI 일괄 분석 시작", type="primary", key="voc_import_run"):
-                    _key_to_use = _openai_key_ui.strip() or st.secrets.get("openai", {}).get("api_key", "")
+                    _key_to_use = _openai_key_ui.strip() or st.secrets.get("gemini", {}).get("api_key", "") or os.environ.get("GEMINI_API_KEY", "")
                     if not _key_to_use:
-                        st.error("OpenAI API Key가 필요합니다.")
+                        st.error("Gemini API Key가 필요합니다. 위 입력란에 키를 붙여넣거나 환경변수 GEMINI_API_KEY를 설정하세요.")
                     elif _col_msg == "(없음)":
                         st.error("메시지 내용 컬럼을 선택해야 합니다.")
                     else:
-                        import openai as _oai_imp
-                        _oai_cli = _oai_imp.OpenAI(api_key=_key_to_use)
+                        import google.generativeai as _genai_imp
+                        _genai_imp.configure(api_key=_key_to_use)
+                        _gem_model = _genai_imp.GenerativeModel(
+                            model_name="gemini-1.5-flash",
+                            generation_config={"temperature": 0, "response_mime_type": "application/json"},
+                        )
                         _prog = st.progress(0, text="분석 중...")
                         _ok, _skip = 0, 0
                         _total_rows = len(_xl)
@@ -14402,16 +14406,9 @@ def render_voc_dashboard():
                                     "- product_idea: str\n- summary: str\n- sentiment: str (긍정/중립/부정)\n\n"
                                     f"대화:\n{_ft[:3000]}"
                                 )
-                                _ar = _oai_cli.chat.completions.create(
-                                    model="gpt-4o-mini",
-                                    messages=[{"role": "user", "content": _pr}],
-                                    response_format={"type": "json_object"},
-                                    temperature=0,
-                                    timeout=15,
-                                )
-                                _ad = json.loads(_ar.choices[0].message.content) if hasattr(_ar.choices[0].message, "content") else {}
+                                _ar = _gem_model.generate_content(_pr)
                                 import json as _json_imp
-                                _ad = _json_imp.loads(_ar.choices[0].message.content)
+                                _ad = _json_imp.loads(_ar.text)
                                 _voc_row = {
                                     "chat_id": _cid or None,
                                     "customer_phone": _ph,

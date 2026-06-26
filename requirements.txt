@@ -20,4 +20,4 @@ google-api-python-client>=2.127.0
 # 자료실 리치 텍스트 에디터
 streamlit-quill>=0.0.3
 # AI VOC 분석
-openai>=1.30.0
+google-generativeai>=0.7.0
