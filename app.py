@@ -9156,6 +9156,19 @@ def _erp_parse_time(s, default=None):
         return default
 
 
+def _erp_break_min(raw_min: int) -> int:
+    """한국 근로기준법 기준 휴게시간(분) 반환.
+    - 8시간(480분) 이상 → 60분
+    - 4시간(240분) 이상 ~ 8시간 미만 → 30분
+    - 4시간 미만 → 0분
+    """
+    if raw_min >= 480:
+        return 60
+    elif raw_min >= 240:
+        return 30
+    return 0
+
+
 def _erp_parse_time_loose(raw: str) -> tuple[int, int] | None:
     """다양한 형식의 시각 문자열을 (h, m) 튜플로 파싱.
 
@@ -9463,7 +9476,6 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
     # 오늘까지만 집계 — 미래 날짜는 카운팅 불가
     today_cap = min(date.today(), date(int(year), int(month), last_day))
 
-    _LUNCH_MIN = 60
     worked_min = 0
     log_dates: set[str] = set()
 
@@ -9488,7 +9500,7 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                 _actual = 0
                 if _ss and _ee:
                     _raw = max(0, (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute))
-                    _actual = max(0, _raw - _LUNCH_MIN) if _raw >= 240 else _raw
+                    _actual = max(0, _raw - _erp_break_min(_raw))
                 if _wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
                     worked_min += _actual
                 elif _wt == "연차":
@@ -9517,7 +9529,7 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                 _ee = _erp_parse_time(_sh.get("shift_end"))
                 if _ss and _ee:
                     _raw = (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute)
-                    _m = max(0, _raw - _LUNCH_MIN) if _raw >= 240 else _raw
+                    _m = max(0, _raw - _erp_break_min(_raw))
                     if _m > 0:
                         worked_min += _m
     except Exception:
@@ -10153,7 +10165,6 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
             logs = list(_r_logs.data or [])
     except Exception:
         logs = []
-    _LUNCH_MIN = 60  # 점심시간 차감 (4시간 이상 근무일에만 적용)
     normal_min_logs = 0
     # 디버그용: 날짜별 정상근무 내역
     _debug_normal_logs: list = []
@@ -10175,8 +10186,8 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         actual_min = 0
         if ss and ee:
             raw_min = max(0, (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute))
-            # 4시간 이상 근무 시 점심 1시간 차감
-            actual_min = max(0, raw_min - _LUNCH_MIN) if raw_min >= 240 else raw_min
+            # 근로기준법: 4h~8h → 30분, 8h 이상 → 60분
+            actual_min = max(0, raw_min - _erp_break_min(raw_min))
 
         if wt == "정상":
             normal_min_logs += actual_min
@@ -10197,10 +10208,10 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                 try:
                     _ld = date.fromisoformat(_ld_str) if _ld_str else as_of
                     std_s, std_e = _erp_default_times_for_date(db_filename, _ld)
-                    std_min = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
-                    std_min = max(0, std_min - _LUNCH_MIN) if std_min >= 240 else std_min
+                    _std_raw = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
+                    std_min = max(0, _std_raw - _erp_break_min(_std_raw))
                 except Exception:
-                    std_min = 420  # 기본 8h - 점심 1h = 7h
+                    std_min = 420  # 기본 9h - 점심 1h = 8h → 30+30 → 7.5h (근사)
                 diff = std_min - actual_min
                 if diff > 0:
                     short_min_logs += diff
@@ -10232,8 +10243,8 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                 ee = _erp_parse_time(sh.get("shift_end"))
                 if ss and ee:
                     raw_m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
-                    # 4시간 이상 근무 시 점심 1시간 차감
-                    m = max(0, raw_m - _LUNCH_MIN) if raw_m >= 240 else raw_m
+                    # 근로기준법: 4h~8h → 30분, 8h 이상 → 60분
+                    m = max(0, raw_m - _erp_break_min(raw_m))
                     if m > 0:
                         shift_normal_min += m
                         _debug_normal_shifts.append({
@@ -10869,7 +10880,8 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
             f"집계 기간: **{bd.get('period_start')}** ~ **{bd.get('today_cap')}** | "
             f"logs 정상근무 {_erp_fmt_hm(bd.get('normal_min_logs', 0))} + "
             f"시프트 자동 {_erp_fmt_hm(bd.get('shift_normal_min', 0))} = "
-            f"**정상근무 {_erp_fmt_hm(normal_min)}**"
+            f"**정상근무 {_erp_fmt_hm(normal_min)}** | "
+            f"휴게시간: 4h~8h → 30분, 8h 이상 → 60분 차감"
         )
         import pandas as _pd_dbg
         if _dbg_logs or _dbg_shifts:
