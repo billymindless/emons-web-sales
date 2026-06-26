@@ -11034,30 +11034,40 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         if _dbg_logs or _dbg_shifts:
             _dbg_rows = []
             for _r in _dbg_logs:
+                _h_val = float(_r.get("h") or 0)
+                _m_total = int(round(_h_val * 60))
                 _dbg_rows.append({
                     "날짜": _r.get("date", ""),
                     "유형": _r.get("type", ""),
-                    "근무(h)": round(float(_r.get("h") or 0), 2),
+                    "근무시간": f"{_m_total // 60}h {_m_total % 60:02d}m",
+                    "_min": _m_total,
                     "매장": _r.get("store", ""),
                 })
             for _r in _dbg_shifts:
+                _h_val = float(_r.get("h") or 0)
+                _m_total = int(round(_h_val * 60))
                 _dbg_rows.append({
                     "날짜": _r.get("date", ""),
                     "유형": _r.get("type", ""),
-                    "근무(h)": round(float(_r.get("h") or 0), 2),
+                    "근무시간": f"{_m_total // 60}h {_m_total % 60:02d}m",
+                    "_min": _m_total,
                     "매장": "",
                 })
             _dbg_df = _pd_dbg.DataFrame(_dbg_rows).sort_values("날짜")
-            _total_h = round(_dbg_df["근무(h)"].sum(), 2)
-            st.markdown(f"**총 {len(_dbg_df)}건 / 합계 {_total_h}h**")
+            _total_min_sum = int(_dbg_df["_min"].sum())
+            _total_fmt = f"{_total_min_sum // 60}h {_total_min_sum % 60:02d}m"
+            st.markdown(f"**총 {len(_dbg_df)}건 / 합계 {_total_fmt}**")
             # 날짜별 중복 체크
-            _dup = _dbg_df.groupby("날짜")["근무(h)"].agg(["count", "sum"]).reset_index()
+            _dup = _dbg_df.groupby("날짜")["_min"].agg(["count", "sum"]).reset_index()
             _dup_multi = _dup[_dup["count"] > 1]
             if len(_dup_multi) > 0:
                 st.warning(f"⚠️ 같은 날짜에 여러 건이 합산된 날: {len(_dup_multi)}일 — 아래 표 확인")
-                st.dataframe(_dup_multi.rename(columns={"count": "건수", "sum": "합산(h)"}),
+                _dup_multi["합산"] = _dup_multi["sum"].apply(
+                    lambda x: f"{int(x) // 60}h {int(x) % 60:02d}m"
+                )
+                st.dataframe(_dup_multi.rename(columns={"count": "건수"})[["날짜", "건수", "합산"]],
                              use_container_width=True, hide_index=True)
-            st.dataframe(_dbg_df, use_container_width=True, hide_index=True)
+            st.dataframe(_dbg_df.drop(columns=["_min"]), use_container_width=True, hide_index=True)
         else:
             st.info("정상근무 내역이 없습니다.")
 
