@@ -14042,6 +14042,276 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 
 
 # =====================================================================
+# 📊 고객의 소리(VOC) 분석 대시보드
+# =====================================================================
+
+def render_voc_dashboard():
+    """AI 기반 채널톡 VOC 분석 대시보드.
+
+    실시간(webhook) 및 일괄 임포트(엑셀) 두 경로로 수집된
+    app_voc_insights 데이터를 시각화한다.
+    """
+    import plotly.express as _px
+
+    st.title("📊 고객의 소리(VOC) 분석")
+    st.caption("채널톡 상담 종료 시 AI(gpt-4o-mini)가 자동 분석한 VOC 인사이트입니다.")
+
+    supa, _err = get_supabase_client()
+    if _err or not supa:
+        st.error("Supabase 연결이 필요합니다.")
+        return
+
+    # ── 기간 필터 ────────────────────────────────────────────────
+    _col_period, _col_blank = st.columns([2, 5])
+    with _col_period:
+        _period = st.selectbox(
+            "조회 기간",
+            ["이번 주", "이번 달", "최근 3개월", "전체"],
+            key="voc_period",
+        )
+    from datetime import date as _date, timedelta as _td
+    _today = _date.today()
+    if _period == "이번 주":
+        _from = (_today - _td(days=_today.weekday())).isoformat()
+    elif _period == "이번 달":
+        _from = _today.replace(day=1).isoformat()
+    elif _period == "최근 3개월":
+        _from = (_today - _td(days=90)).isoformat()
+    else:
+        _from = "2000-01-01"
+
+    # ── 데이터 로드 ──────────────────────────────────────────────
+    try:
+        _resp = supa.table("app_voc_insights").select("*")\
+            .gte("analyzed_at", _from)\
+            .order("analyzed_at", desc=True)\
+            .execute()
+        _rows = _resp.data or []
+    except Exception as _e:
+        st.error(f"데이터 조회 실패: {_e}")
+        return
+
+    # ── 데이터 없음 처리 ────────────────────────────────────────
+    if not _rows:
+        st.info("해당 기간에 분석된 VOC 데이터가 없습니다.")
+        st.caption("채널톡에서 상담이 종료되면 자동으로 분석됩니다. 또는 아래 과거 데이터 일괄 임포트를 사용하세요.")
+    else:
+        import pandas as _pd_voc
+        _df = _pd_voc.DataFrame(_rows)
+
+        total   = len(_df)
+        claims  = int(_df["is_claim"].fillna(False).astype(bool).sum())
+        claim_r = round(claims / total * 100, 1) if total > 0 else 0.0
+
+        # ── KPI 카드 3개 ─────────────────────────────────────────
+        _kc = "display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:12px;padding:18px 12px;text-align:center;min-height:110px;"
+        _lc = "font-size:0.78rem;color:#555;margin-bottom:6px;font-weight:600;"
+        _vc = "font-size:2rem;font-weight:700;line-height:1.2;margin:0;"
+        _sc = "font-size:0.72rem;color:#777;margin-top:4px;"
+
+        _k1, _k2, _k3 = st.columns(3)
+        with _k1:
+            st.markdown(
+                f"<div style='background:#E3F2FD;{_kc}'>"
+                f"<div style='{_lc}'>💬 총 상담 건수</div>"
+                f"<div style='{_vc} color:#0D47A1;'>{total:,}</div>"
+                f"<div style='{_sc}'>분석 완료 건</div></div>",
+                unsafe_allow_html=True,
+            )
+        with _k2:
+            st.markdown(
+                f"<div style='background:#FFEBEE;{_kc}'>"
+                f"<div style='{_lc}'>🚨 클레임 건수</div>"
+                f"<div style='{_vc} color:#C62828;'>{claims:,}</div>"
+                f"<div style='{_sc}'>전체의 {claim_r:g}%</div></div>",
+                unsafe_allow_html=True,
+            )
+        with _k3:
+            _pos = int((_df["sentiment"] == "긍정").sum())
+            _neg = int((_df["sentiment"] == "부정").sum())
+            st.markdown(
+                f"<div style='background:#E8F5E9;{_kc}'>"
+                f"<div style='{_lc}'>😊 긍정 / 😞 부정</div>"
+                f"<div style='{_vc} color:#1B5E20;'>{_pos:,} / {_neg:,}</div>"
+                f"<div style='{_sc}'>감정 분포</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── 차트 2개 (파이 + 막대) ───────────────────────────────
+        _ch1, _ch2 = st.columns(2)
+
+        with _ch1:
+            st.markdown("##### 불만 카테고리 분포")
+            _cat_data = _df["complaint_category"].fillna("없음")
+            _cat_data = _cat_data[_cat_data != ""]
+            if len(_cat_data) > 0:
+                _cat_cnt = _cat_data.value_counts().reset_index()
+                _cat_cnt.columns = ["카테고리", "건수"]
+                _fig_pie = _px.pie(
+                    _cat_cnt, names="카테고리", values="건수",
+                    hole=0.35,
+                    color_discrete_sequence=_px.colors.qualitative.Pastel,
+                )
+                _fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
+                st.plotly_chart(_fig_pie, use_container_width=True)
+            else:
+                st.info("카테고리 데이터가 없습니다.")
+
+        with _ch2:
+            st.markdown("##### 감정 분포")
+            _sent_order = ["긍정", "중립", "부정"]
+            _sent_cnt = _df["sentiment"].fillna("미분류").value_counts().reindex(_sent_order, fill_value=0).reset_index()
+            _sent_cnt.columns = ["감정", "건수"]
+            _fig_bar = _px.bar(
+                _sent_cnt, x="감정", y="건수",
+                color="감정",
+                color_discrete_map={"긍정": "#43A047", "중립": "#78909C", "부정": "#E53935"},
+                text="건수",
+            )
+            _fig_bar.update_layout(
+                showlegend=False, margin=dict(t=10, b=10, l=10, r=10), height=300,
+            )
+            _fig_bar.update_traces(textposition="outside")
+            st.plotly_chart(_fig_bar, use_container_width=True)
+
+        # ── 신제품 아이디어 리스트 ───────────────────────────────
+        _ideas = _df[_df["product_idea"].fillna("").str.strip() != ""][["analyzed_at", "product_idea", "summary"]].copy()
+        if not _ideas.empty:
+            st.markdown("##### 💡 AI가 추출한 신제품·개선 아이디어")
+            _ideas["날짜"] = _pd_voc.to_datetime(_ideas["analyzed_at"]).dt.strftime("%Y-%m-%d")
+            for _, _row in _ideas.iterrows():
+                st.markdown(
+                    f"<div style='background:#FFFDE7;border-left:4px solid #F9A825;"
+                    f"border-radius:4px;padding:8px 12px;margin-bottom:6px;font-size:0.88rem;'>"
+                    f"<b>💡 {_row['product_idea']}</b>"
+                    f"<span style='color:#888;font-size:0.78rem;margin-left:8px;'>{_row['날짜']}</span><br>"
+                    f"<span style='color:#666;'>요약: {_row['summary']}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        # ── 전체 데이터 테이블 ──────────────────────────────────
+        st.markdown("##### 📋 전체 VOC 목록")
+        _display_df = _df[[
+            "analyzed_at", "sentiment", "is_claim", "complaint_category",
+            "summary", "handled_by", "customer_phone", "source",
+        ]].copy()
+        _display_df.columns = [
+            "분석일시", "감정", "클레임", "카테고리",
+            "요약", "담당자", "고객전화", "수집경로",
+        ]
+        _display_df["분석일시"] = _pd_voc.to_datetime(_display_df["분석일시"]).dt.strftime("%Y-%m-%d %H:%M")
+        _display_df["클레임"] = _display_df["클레임"].map({True: "🚨 클레임", False: "정상", None: ""})
+        st.dataframe(_display_df, use_container_width=True, hide_index=True)
+
+    # ── 과거 데이터 일괄 임포트 (엑셀 업로드) ───────────────────
+    st.divider()
+    with st.expander("📂 과거 상담 데이터 일괄 분석 (채널톡 엑셀 업로드)", expanded=False):
+        st.markdown(
+            "**채널톡 관리자 → 통계 → 상담 통계 → 상담별 → [상담 파일 다운로드]**에서\n"
+            "**[메시지 데이터 포함]** 옵션으로 다운로드한 엑셀 파일을 업로드하세요.\n\n"
+            "> ✅ 소유자(Owner) 권한 계정만 다운로드 가능합니다."
+        )
+
+        _openai_key_ui = st.text_input(
+            "OpenAI API Key", type="password",
+            placeholder="sk-... (Render 환경변수 설정 시 비워두세요)",
+            key="voc_import_key",
+        )
+        _uploaded = st.file_uploader("엑셀 파일 업로드 (.xlsx)", type=["xlsx"], key="voc_excel_upload")
+
+        if _uploaded:
+            import pandas as _pd_imp
+            try:
+                _xl = _pd_imp.read_excel(_uploaded)
+                st.caption(f"파일 로드 완료: {len(_xl)}행, 컬럼: {list(_xl.columns)}")
+            except Exception as _xe:
+                st.error(f"엑셀 읽기 실패: {_xe}")
+                _xl = None
+
+            if _xl is not None and len(_xl) > 0:
+                st.markdown("**컬럼 매핑** (채널톡 엑셀의 컬럼명을 선택하세요)")
+                _cols = ["(없음)"] + list(_xl.columns)
+                _cm1, _cm2, _cm3, _cm4 = st.columns(4)
+                with _cm1:
+                    _col_chatid = st.selectbox("상담 ID", _cols, key="voc_col_chatid")
+                with _cm2:
+                    _col_phone  = st.selectbox("고객 전화번호", _cols, key="voc_col_phone")
+                with _cm3:
+                    _col_mgr    = st.selectbox("담당 매니저", _cols, key="voc_col_mgr")
+                with _cm4:
+                    _col_msg    = st.selectbox("메시지 내용", _cols, key="voc_col_msg")
+
+                if st.button("🤖 AI 일괄 분석 시작", type="primary", key="voc_import_run"):
+                    _key_to_use = _openai_key_ui.strip() or st.secrets.get("openai", {}).get("api_key", "")
+                    if not _key_to_use:
+                        st.error("OpenAI API Key가 필요합니다.")
+                    elif _col_msg == "(없음)":
+                        st.error("메시지 내용 컬럼을 선택해야 합니다.")
+                    else:
+                        import openai as _oai_imp
+                        _oai_cli = _oai_imp.OpenAI(api_key=_key_to_use)
+                        _prog = st.progress(0, text="분석 중...")
+                        _ok, _skip = 0, 0
+                        _total_rows = len(_xl)
+                        for _ri, _xrow in _xl.iterrows():
+                            _ft = str(_xrow.get(_col_msg, "") or "").strip()
+                            if not _ft:
+                                _skip += 1
+                                continue
+                            _cid = str(_xrow.get(_col_chatid, "") or "").strip() if _col_chatid != "(없음)" else None
+                            _ph  = str(_xrow.get(_col_phone,  "") or "").strip() if _col_phone  != "(없음)" else None
+                            _mg  = str(_xrow.get(_col_mgr,    "") or "").strip() if _col_mgr    != "(없음)" else None
+                            try:
+                                _pr = (
+                                    "다음은 가구 쇼핑몰 고객 상담 대화입니다.\n"
+                                    "아래 항목을 분석해 JSON으로만 응답하세요:\n"
+                                    "- is_claim: bool\n- complaint_category: str (배송/제품불량/가격/응대/기타/없음)\n"
+                                    "- product_idea: str\n- summary: str\n- sentiment: str (긍정/중립/부정)\n\n"
+                                    f"대화:\n{_ft[:3000]}"
+                                )
+                                _ar = _oai_cli.chat.completions.create(
+                                    model="gpt-4o-mini",
+                                    messages=[{"role": "user", "content": _pr}],
+                                    response_format={"type": "json_object"},
+                                    temperature=0,
+                                    timeout=15,
+                                )
+                                _ad = json.loads(_ar.choices[0].message.content) if hasattr(_ar.choices[0].message, "content") else {}
+                                import json as _json_imp
+                                _ad = _json_imp.loads(_ar.choices[0].message.content)
+                                _voc_row = {
+                                    "chat_id": _cid or None,
+                                    "customer_phone": _ph,
+                                    "handled_by": _mg,
+                                    "is_claim": bool(_ad.get("is_claim", False)),
+                                    "complaint_category": str(_ad.get("complaint_category") or "").strip(),
+                                    "product_idea": str(_ad.get("product_idea") or "").strip(),
+                                    "summary": str(_ad.get("summary") or "").strip(),
+                                    "sentiment": str(_ad.get("sentiment") or "").strip(),
+                                    "raw_json": _ad,
+                                    "source": "excel_import",
+                                }
+                                supa.table("app_voc_insights").upsert(
+                                    _voc_row,
+                                    on_conflict="chat_id",
+                                    ignore_duplicates=True,
+                                ).execute()
+                                _ok += 1
+                            except Exception as _ie:
+                                _skip += 1
+                            _prog.progress(
+                                min((_ri + 1) / _total_rows, 1.0),
+                                text=f"분석 중... {_ri + 1}/{_total_rows}건",
+                            )
+                        _prog.empty()
+                        st.success(f"완료! 분석 성공 {_ok}건 / 건너뜀(빈 내용·중복) {_skip}건")
+                        st.rerun()
+
+
+# =====================================================================
 # 📁 자료실 — 업무 자료 게시판
 # =====================================================================
 
@@ -25907,6 +26177,8 @@ def main():
     if st.sidebar.button("📁 자료실", width='stretch'):
         st.session_state["active_admin_page"] = "document_library"
     if role in ("store_admin", "superadmin"):
+        if st.sidebar.button("📊 고객의 소리(VOC)", width='stretch'):
+            st.session_state["active_admin_page"] = "voc_dashboard"
         if st.sidebar.button("📈 인력 효율 분석", width='stretch'):
             st.session_state["active_admin_page"] = "employee_analytics"
         if st.sidebar.button("⚙️ 관리자 설정", width='stretch'):
@@ -25977,6 +26249,11 @@ def main():
     # 자료실 라우팅 (전 역할 공통)
     if st.session_state.get("active_admin_page") == "document_library":
         render_document_library()
+        return
+
+    # VOC 대시보드 라우팅 (store_admin / superadmin 전용)
+    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "voc_dashboard":
+        render_voc_dashboard()
         return
 
     # 인력 효율 분석 화면 라우팅 (store_admin / superadmin)

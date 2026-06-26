@@ -1428,6 +1428,58 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
             )
 
         logger.info("chat.closed 아카이빙 완료: phone=%s chat_id=%s", phone, chat_id)
+
+        # ── OpenAI VOC 분석 (full_text가 있고 API 키가 설정된 경우만) ──
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        if full_text and openai_key:
+            try:
+                import openai as _openai
+                _ai_client = _openai.AsyncOpenAI(api_key=openai_key)
+                _prompt = (
+                    "다음은 가구 쇼핑몰 고객 상담 대화입니다.\n"
+                    "아래 항목을 분석해 JSON으로만 응답하세요 (다른 텍스트 없이 JSON만):\n"
+                    "- is_claim: bool (클레임·환불·AS 요청 여부)\n"
+                    "- complaint_category: str (배송/제품불량/가격/응대/기타/없음 중 하나)\n"
+                    "- product_idea: str (신제품·개선 아이디어가 있으면 1문장, 없으면 빈 문자열)\n"
+                    "- summary: str (대화 내용 1문장 요약)\n"
+                    "- sentiment: str (긍정/중립/부정 중 하나)\n\n"
+                    f"대화:\n{full_text[:3000]}"
+                )
+                _ai_resp = await _ai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": _prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                    timeout=15,
+                )
+                _ai_data = json.loads(_ai_resp.choices[0].message.content)
+
+                # app_voc_insights upsert (chat_id UNIQUE → 중복 건너뜀)
+                _voc_hdrs = {**_supa_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"}
+                async with httpx.AsyncClient(timeout=5.0) as _vcl:
+                    await _vcl.post(
+                        _supa_url("app_voc_insights"),
+                        headers=_voc_hdrs,
+                        json={
+                            "chat_id": chat_id or None,
+                            "customer_phone": phone,
+                            "handled_by": handled_by,
+                            "is_claim": bool(_ai_data.get("is_claim", False)),
+                            "complaint_category": str(_ai_data.get("complaint_category") or "").strip(),
+                            "product_idea": str(_ai_data.get("product_idea") or "").strip(),
+                            "summary": str(_ai_data.get("summary") or "").strip(),
+                            "sentiment": str(_ai_data.get("sentiment") or "").strip(),
+                            "raw_json": _ai_data,
+                            "source": "webhook",
+                        },
+                    )
+                logger.info(
+                    "VOC 분석 완료: chat_id=%s sentiment=%s is_claim=%s",
+                    chat_id, _ai_data.get("sentiment"), _ai_data.get("is_claim"),
+                )
+            except Exception as _ve:
+                logger.warning("VOC OpenAI 분석 실패 (비치명적): %s", _ve)
+
         return JSONResponse({"ok": True})
 
     except Exception as e:
