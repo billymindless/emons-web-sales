@@ -174,6 +174,16 @@ def _normalize_phone(phone: str) -> str:
 # FastAPI 라우터
 # ──────────────────────────────────────────────
 
+@app.post("/webhook/solapi/message-received", include_in_schema=False)
+@app.post("/webhook/solapi/message_received", include_in_schema=False)
+async def solapi_message_received_stub(request: Request) -> JSONResponse:
+    """
+    Solapi 수신 웹훅 stub — 실제 처리 없이 200 OK만 반환.
+    Solapi 콘솔에서 웹훅을 삭제하기 전까지 실패 횟수 누적 방지용.
+    """
+    return JSONResponse({"ok": True, "skipped": True})
+
+
 @app.post("/webhook/solapi/friend-added", summary="Solapi 친구추가 이벤트 수신")
 @app.post("/webhook/solapi/friend_added", include_in_schema=False)
 async def solapi_friend_added_webhook(request: Request) -> JSONResponse:
