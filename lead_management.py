@@ -368,8 +368,74 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
 # 메인 페이지
 # ──────────────────────────────────────────────
 
+def _sync_leads_to_customers() -> int:
+    """
+    app_customers에 등록된 전화번호의 활성 리드를 4_계약완료로 자동 동기화.
+    phone 형식(하이픈 유무) 차이를 Python에서 정규화하여 비교.
+    페이지 로드 시 세션당 1회 실행. 처리 건수 반환.
+    """
+    supa = _supa()
+    if not supa:
+        return 0
+    try:
+        # 활성 리드 전체 조회
+        active_leads = supa.table("app_leads").select("id,phone") \
+            .not_.in_("lead_stage", ["4_계약완료", "5_실패", "6_보류"]).execute().data or []
+        if not active_leads:
+            return 0
+
+        # 정규화된 phone → lead_id 맵
+        lead_phone_map: dict[str, int] = {}
+        for l in active_leads:
+            np = _normalize_phone(l.get("phone") or "")
+            if np and l.get("id"):
+                lead_phone_map[np] = l["id"]
+        if not lead_phone_map:
+            return 0
+
+        # app_customers 전체 phone 조회 후 Python에서 정규화 비교
+        # (DB 저장 포맷 차이 – 하이픈 유무 – 무시)
+        all_customer_phones: set[str] = set()
+        offset = 0
+        while True:
+            batch = supa.table("app_customers").select("phone") \
+                .range(offset, offset + 499).execute().data or []
+            for r in batch:
+                cp = _normalize_phone(r.get("phone") or "")
+                if cp:
+                    all_customer_phones.add(cp)
+            if len(batch) < 500:
+                break
+            offset += 500
+
+        # 매칭된 리드 → 4_계약완료 업데이트
+        now_utc = datetime.now(timezone.utc).isoformat()
+        count = 0
+        for np, lead_id in lead_phone_map.items():
+            if np in all_customer_phones:
+                try:
+                    supa.table("app_leads").update({
+                        "lead_stage": "4_계약완료",
+                        "converted_at": now_utc,
+                        "updated_at": now_utc,
+                    }).eq("id", lead_id).execute()
+                    count += 1
+                except Exception:
+                    pass
+        return count
+    except Exception:
+        return 0
+
+
 def render_lead_management() -> None:
     """3. 리드고객 관리 메인 페이지."""
+
+    # ── 백그라운드 자동 동기화 (세션당 1회) ──
+    if not st.session_state.get("_lead_synced"):
+        _synced = _sync_leads_to_customers()
+        st.session_state["_lead_synced"] = True
+        if _synced > 0:
+            st.toast(f"✅ {_synced}건의 리드가 구매 확인되어 계약완료로 자동 업데이트되었습니다.", icon="🔄")
 
     # ── 페이지 헤더 ────────────────────────────
     _hc1, _hc2, _hc3 = st.columns([5, 1.3, 1.3])
@@ -414,22 +480,22 @@ def render_lead_management() -> None:
 
     emp_map = _get_employee_map()
 
-    # ── app_customers에 이미 등록된 phone 집합 (구매 완료 판별) ──
+    # ── app_customers phone 전체 로드 후 정규화 비교 (하이픈 유무 형식 차이 대응) ──
     customer_phones: set[str] = set()
-    _all_phones = list({_normalize_phone(l.get("phone")) for l in leads_raw if l.get("phone")})
-    _all_phones = [p for p in _all_phones if p]
-    if _all_phones:
-        try:
-            for _i in range(0, len(_all_phones), 100):
-                _chunk = _all_phones[_i:_i + 100]
-                _rows = supa.table("app_customers").select("phone") \
-                    .in_("phone", _chunk).execute().data or []
-                for _r in _rows:
-                    _cp = _normalize_phone(_r.get("phone"))
-                    if _cp:
-                        customer_phones.add(_cp)
-        except Exception:
-            pass
+    try:
+        _offset = 0
+        while True:
+            _batch = supa.table("app_customers").select("phone") \
+                .range(_offset, _offset + 499).execute().data or []
+            for _r in _batch:
+                _cp = _normalize_phone(_r.get("phone") or "")
+                if _cp:
+                    customer_phones.add(_cp)
+            if len(_batch) < 500:
+                break
+            _offset += 500
+    except Exception:
+        pass
 
     for _l in leads_raw:
         _l["_is_customer"] = _normalize_phone(_l.get("phone") or "") in customer_phones
