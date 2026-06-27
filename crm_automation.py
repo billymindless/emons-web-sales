@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -29,6 +29,24 @@ import streamlit as st
 ALLOWED_ROLES = ("store_admin", "superadmin")
 
 SEND_CHANNEL_OPTIONS = ["일반 문자 (SMS/LMS)", "카카오 브랜드톡 (친구톡 – 광고용)"]
+
+# 리드 단계 정의 (DB 값 → 표시명)
+LEAD_STAGES: dict[str, str] = {
+    "1_신규": "신규",
+    "2_상담중": "상담중",
+    "3_견적발송": "견적발송",
+    "4_계약완료": "계약완료",
+    "5_실패": "실패",
+    "6_보류": "보류",
+}
+LEAD_STAGE_EMOJI: dict[str, str] = {
+    "1_신규": "⚪",
+    "2_상담중": "🟡",
+    "3_견적발송": "🔵",
+    "4_계약완료": "🟢",
+    "5_실패": "🔴",
+    "6_보류": "⚫",
+}
 
 TRIGGER_OPTIONS = [
     "즉시 발송",
@@ -867,45 +885,25 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
 # 가망고객 등록 탭 (옴니채널 리드)
 # ──────────────────────────────────────────────
 
-def _render_lead_registration_tab(db_filename: str | None, store_name: str | None) -> None:
-    """가망고객(리드) 등록 및 목록 조회 탭."""
-    st.subheader("가망고객 등록")
-    st.caption("전화 문의 또는 오프라인 방문 고객 정보를 등록하면 즉시 메시지가 발송되고, T+N일 후 넛징이 자동 예약됩니다.")
-
-    user = st.session_state.get("current_user") or {}
-    employee_id = user.get("id")
-    auto_store = store_name or user.get("store_name") or ""
-
+def _register_lead_form(auto_store: str, employee_id: Any, user: dict) -> None:
+    """리드 등록 폼 (컨테이너 내부에서 렌더링)."""
     with st.form("lead_register_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            lead_source = st.radio(
-                "유입 경로",
-                ["전화_문의", "오프라인_방문"],
-                horizontal=True,
-            )
-        with col2:
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            lead_source = st.radio("유입 경로", ["전화_문의", "오프라인_방문"], horizontal=True)
+        with fc2:
             send_now = st.toggle("즉시 메시지 발송", value=True)
-
         phone_input = st.text_input("전화번호 (필수)", placeholder="010-0000-0000")
         name_input = st.text_input("고객 성함 (선택)")
         memo_input = st.text_area("상담 메모", placeholder="예: 토레도 소파 4인용 가격 문의", height=80)
-
-        col3, col4 = st.columns(2)
-        with col3:
-            next_contact = st.date_input(
-                "다음 연락 예정일",
-                value=date.today() + timedelta(days=3),
-            )
-        with col4:
+        fd1, fd2 = st.columns(2)
+        with fd1:
+            next_contact = st.date_input("다음 연락 예정일", value=date.today() + timedelta(days=3))
+        with fd2:
             image_url_input = ""
             if lead_source == "오프라인_방문":
-                image_url_input = st.text_input(
-                    "MMS 첨부 사진 URL (선택)",
-                    placeholder="https://... (제품/매장 사진)",
-                )
-
-        submitted = st.form_submit_button("가망고객 등록", type="primary", use_container_width=True)
+                image_url_input = st.text_input("MMS 첨부 사진 URL (선택)", placeholder="https://...")
+        submitted = st.form_submit_button("등록", type="primary", use_container_width=True)
 
     if submitted:
         phone_clean = re.sub(r"\D", "", phone_input or "")
@@ -913,7 +911,7 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
             st.error("전화번호를 올바르게 입력해 주세요.")
         else:
             try:
-                from lead_manager import register_lead
+                from lead_manager import register_lead, save_chat_history  # noqa: WPS433
                 result = register_lead(
                     phone=phone_clean,
                     name=name_input or "",
@@ -926,40 +924,31 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
                     image_url=image_url_input or "",
                 )
                 if result.get("ok"):
-                    send_status = result.get("send_result", {}) or {}
-                    _st = send_status.get("status", "")
-                    _err = send_status.get("error", "")
+                    _sr = result.get("send_result", {}) or {}
+                    _st = _sr.get("status", "")
+                    _err = _sr.get("error", "")
                     send_label = {
-                        "sent": "발송 완료",
-                        "lms_fallback": "LMS 발송 완료",
-                        "skipped": f"발송 보류 ({_err})",
-                        "failed": f"발송 실패 ({_err})",
-                        "not_friend": "미친구 (SMS 폴백 시도)",
-                        "out_of_hours": "야간 발송 거부",
+                        "sent": "발송 완료", "lms_fallback": "LMS 발송 완료",
+                        "skipped": f"발송 보류 ({_err})", "failed": f"발송 실패 ({_err})",
+                        "not_friend": "미친구(SMS 폴백)", "out_of_hours": "야간 발송 거부",
                     }.get(_st, f"미발송 ({_st})" if _st else "즉시발송 OFF")
-                    st.success(f"등록 완료 — lead_id: {result['lead_id']} | 메시지: {send_label}")
+                    st.success(f"✅ 등록 완료 (ID: {result['lead_id']}) | 메시지: {send_label}")
+                    st.session_state["lead_show_form"] = False
                 elif result.get("error") == "duplicate_phone":
                     ex = result.get("existing", {})
                     st.warning(
-                        f"⚠️ 이미 등록된 번호입니다 — "
-                        f"lead_id: {result.get('lead_id')} | "
+                        f"⚠️ 이미 등록된 번호입니다 — ID: {result.get('lead_id')} | "
                         f"성함: {ex.get('name', '—')} | "
-                        f"단계: {ex.get('lead_stage', '—')} | "
+                        f"단계: {LEAD_STAGES.get(ex.get('lead_stage',''), ex.get('lead_stage','—'))} | "
                         f"등록일: {str(ex.get('created_at', ''))[:10]}"
                     )
-
-                    # app_chat_history에도 상담 메모 저장
                     if memo_input:
-                        try:
-                            from lead_manager import save_chat_history
-                            save_chat_history(
-                                phone=phone_clean,
-                                channel="전화_통화" if lead_source == "전화_문의" else "오프라인_메모",
-                                summary=memo_input,
-                                handled_by=str(user.get("username") or ""),
-                            )
-                        except Exception:
-                            pass
+                        save_chat_history(
+                            phone=phone_clean,
+                            channel="전화_통화" if lead_source == "전화_문의" else "오프라인_메모",
+                            summary=memo_input,
+                            handled_by=str(user.get("username") or ""),
+                        )
                 else:
                     st.error(f"등록 실패: {result.get('error')}")
             except ImportError:
@@ -967,90 +956,226 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
             except Exception as e:
                 st.error(f"오류: {e}")
 
-    # ── 리드 목록 ─────────────────────────────
-    st.divider()
-    st.subheader("리드 목록")
 
+def _render_lead_registration_tab(db_filename: str | None, store_name: str | None) -> None:
+    """리드 관리 전체 화면 — 통계 + 필터 + 목록 + 메시지 발송 + 단계 변경."""
+    user = st.session_state.get("current_user") or {}
+    employee_id = user.get("id")
+    auto_store = store_name or user.get("store_name") or ""
     supa = _get_supabase()
+
+    # ── 헤더 + 리드 등록 버튼 ─────────────────
+    hc1, hc2 = st.columns([5, 1])
+    with hc1:
+        st.subheader("리드 관리")
+        st.caption("첫인상은 3초, 후속 연락은 평판으로 남습니다.")
+    with hc2:
+        if st.button("＋ 리드 등록", type="primary", use_container_width=True, key="lead_open_form_btn"):
+            st.session_state["lead_show_form"] = not st.session_state.get("lead_show_form", False)
+            st.session_state.pop("selected_lead_id", None)
+
+    # ── 등록 폼 ───────────────────────────────
+    if st.session_state.get("lead_show_form", False):
+        with st.container(border=True):
+            _register_lead_form(auto_store, employee_id, user)
+
+    # ── 통계 카드 ──────────────────────────────
+    if supa and auto_store:
+        try:
+            _all = supa.table("app_leads").select("id,lead_stage,revenue_amount") \
+                .eq("store_name", auto_store).execute().data or []
+            _df_stat = pd.DataFrame(_all)
+            _total = len(_df_stat)
+            _new = int((_df_stat["lead_stage"] == "1_신규").sum()) if _total else 0
+            _consult = int(_df_stat["lead_stage"].isin(["2_상담중", "3_견적발송"]).sum()) if _total else 0
+            _conv = int((_df_stat["lead_stage"] == "4_계약완료").sum()) if _total else 0
+            _conv_rate = f"{round(_conv / _total * 100, 1)}%" if _total else "0%"
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("전체 리드", f"{_total}건")
+            sc2.metric("신규", f"{_new}건")
+            sc3.metric("상담중", f"{_consult}건", help="상담중 + 견적발송")
+            sc4.metric("전환 완료", f"{_conv}건", delta=f"전환율 {_conv_rate}")
+        except Exception:
+            pass
+
+    st.divider()
+
+    # ── 필터 + 검색 ───────────────────────────
+    fc1, fc2, fc3 = st.columns([3, 2, 3])
+    with fc1:
+        stage_opts = ["전체"] + list(LEAD_STAGES.keys())
+        stage_sel = st.selectbox(
+            "단계",
+            stage_opts,
+            format_func=lambda x: "전체" if x == "전체" else f"{LEAD_STAGE_EMOJI.get(x,'')} {LEAD_STAGES[x]}",
+            key="lead_filter_stage",
+        )
+    with fc2:
+        source_sel = st.selectbox(
+            "유입 경로",
+            ["전체", "전화_문의", "오프라인_방문", "온라인_채널톡"],
+            key="lead_filter_source",
+        )
+    with fc3:
+        search_q = st.text_input("🔍 이름·전화번호 검색", placeholder="검색어 입력", label_visibility="collapsed", key="lead_search")
+
+    # ── 리드 목록 조회 ─────────────────────────
     if not supa:
         st.info("Supabase 연결 후 이용 가능합니다.")
         return
 
-    col_f1, col_f2, col_f3 = st.columns(3)
-    with col_f1:
-        filter_source = st.selectbox(
-            "유입 경로", ["전체", "전화_문의", "오프라인_방문", "온라인_채널톡"]
-        )
-    with col_f2:
-        filter_stage = st.selectbox(
-            "단계", ["전체", "1_신규유입", "2_자료발송", "3_매장방문", "4_계약완료", "5_계약실패"]
-        )
-    with col_f3:
-        filter_store = st.selectbox(
-            "매장", ["전체", auto_store] if auto_store else ["전체"]
-        )
-
     try:
-        query = supa.table("app_leads").select(
-            "id,phone,name,lead_source,lead_stage,memo,next_contact_date,assigned_store,created_at,revenue_amount"
-        ).order("created_at", desc=True).limit(200)
-
-        if filter_source != "전체":
-            query = query.eq("lead_source", filter_source)
-        if filter_stage != "전체":
-            query = query.eq("lead_stage", filter_stage)
-        if filter_store != "전체" and auto_store:
-            query = query.eq("assigned_store", auto_store)
-
-        resp = query.execute()
-        leads = resp.data or []
+        q = supa.table("app_leads").select(
+            "id,phone,name,lead_source,lead_stage,memo,next_contact_date,"
+            "assigned_store,created_at,revenue_amount,contact_memo"
+        ).order("created_at", desc=True).limit(300)
+        if auto_store:
+            q = q.eq("store_name", auto_store)
+        leads_raw: list[dict] = q.execute().data or []
     except Exception as e:
-        st.error(f"리드 목록 조회 실패: {e}")
+        st.error(f"리드 조회 실패: {e}")
         return
+
+    # 클라이언트 필터링
+    leads = leads_raw
+    if stage_sel != "전체":
+        leads = [l for l in leads if l.get("lead_stage") == stage_sel]
+    if source_sel != "전체":
+        leads = [l for l in leads if l.get("lead_source") == source_sel]
+    if search_q:
+        sq = search_q.lower()
+        leads = [
+            l for l in leads
+            if sq in (l.get("name") or "").lower() or sq in (l.get("phone") or "")
+        ]
+
+    st.caption(f"{len(leads)}건 표시 중")
 
     if not leads:
-        st.info("등록된 리드가 없습니다.")
+        st.info("조건에 맞는 리드가 없습니다.")
         return
 
-    df = pd.DataFrame(leads)
-    rename_map = {
-        "id": "ID", "phone": "전화번호", "name": "성함",
-        "lead_source": "유입 경로", "lead_stage": "단계",
-        "memo": "상담 메모", "next_contact_date": "다음 연락",
-        "assigned_store": "매장", "created_at": "등록일",
-        "revenue_amount": "계약금액",
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-    if "등록일" in df.columns:
-        df["등록일"] = df["등록일"].str[:10]
+    # ── 테이블 헤더 ───────────────────────────
+    _hcols = st.columns([2, 2, 1.5, 1.8, 1.5, 1.5, 0.8])
+    for _hc, _hl in zip(_hcols, ["이름", "전화번호", "유입경로", "단계", "담당매장", "등록일", "관리"]):
+        _hc.markdown(f"**{_hl}**")
 
-    # 단계별 색상 강조
-    stage_colors = {
-        "4_계약완료": "background-color: #d4edda",
-        "5_계약실패": "background-color: #f8d7da",
-        "1_신규유입": "",
-    }
+    # ── 리드 행 렌더링 ─────────────────────────
+    for _i, _lead in enumerate(leads):
+        _lid = _lead.get("id")
+        _lname = _lead.get("name") or "—"
+        _lphone = _lead.get("phone") or ""
+        _lstage = _lead.get("lead_stage") or ""
+        _lsource = (_lead.get("lead_source") or "").replace("_", " ")
+        _lstore = _lead.get("assigned_store") or "—"
+        _lcreated = str(_lead.get("created_at") or "")[:10]
+        _slabel = f"{LEAD_STAGE_EMOJI.get(_lstage, '⚪')} {LEAD_STAGES.get(_lstage, _lstage)}"
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption(f"총 {len(df)}건")
+        _rc = st.columns([2, 2, 1.5, 1.8, 1.5, 1.5, 0.8])
+        _rc[0].write(_lname)
+        _rc[1].write(_lphone)
+        _rc[2].write(_lsource)
+        _rc[3].write(_slabel)
+        _rc[4].write(_lstore)
+        _rc[5].write(_lcreated)
+        with _rc[6]:
+            _is_sel = st.session_state.get("selected_lead_id") == _lid
+            if st.button("닫기" if _is_sel else "관리", key=f"lead_act_{_lid}_{_i}", use_container_width=True):
+                if _is_sel:
+                    st.session_state.pop("selected_lead_id", None)
+                else:
+                    st.session_state["selected_lead_id"] = _lid
+                    st.session_state["lead_show_form"] = False
 
-    # 단계 업데이트
-    with st.expander("리드 단계 업데이트"):
-        lead_ids = [str(l["id"]) for l in leads]
-        selected_id = st.selectbox("리드 ID 선택", lead_ids)
-        new_stage = st.selectbox(
-            "새 단계",
-            ["1_신규유입", "2_자료발송", "3_매장방문", "4_계약완료", "5_계약실패"],
-        )
-        contact_memo_input = st.text_area("사후 관리 메모 (Follow-up)", height=60)
-        if st.button("단계 업데이트", key="lead_stage_update"):
-            try:
-                update_data: dict = {"lead_stage": new_stage}
-                if contact_memo_input:
-                    update_data["contact_memo"] = contact_memo_input
-                    update_data["followup_done"] = True
-                supa.table("app_leads").update(update_data).eq("id", int(selected_id)).execute()
-                st.success(f"리드 {selected_id} → {new_stage} 업데이트 완료")
-                st.rerun()
-            except Exception as e:
-                st.error(f"업데이트 실패: {e}")
+    # ── 선택된 리드 액션 패널 ───────────────────
+    _sel_id = st.session_state.get("selected_lead_id")
+    if _sel_id:
+        _sel = next((l for l in leads_raw if l.get("id") == _sel_id), None)
+        if _sel:
+            st.divider()
+            _sname = _sel.get("name") or _sel.get("phone") or "리드"
+            _slabel_sel = f"{LEAD_STAGE_EMOJI.get(_sel.get('lead_stage',''), '⚪')} {LEAD_STAGES.get(_sel.get('lead_stage',''), _sel.get('lead_stage',''))}"
+            st.markdown(f"#### 📋 {_sname} &nbsp; <span style='font-size:0.85rem;color:#666'>{_slabel_sel}</span>", unsafe_allow_html=True)
+
+            _atab1, _atab2 = st.tabs(["💬 메시지 발송", "📊 단계 변경"])
+
+            # ── 메시지 발송 탭 ──────────────────
+            with _atab1:
+                try:
+                    from solapi_sender import send_friendtalk, send_sms  # noqa: WPS433
+                except ImportError:
+                    st.error("solapi_sender 모듈 없음")
+                    send_friendtalk = None  # type: ignore
+                    send_sms = None  # type: ignore
+
+                _ch = st.radio(
+                    "발송 채널",
+                    ["친구톡 (카카오)", "SMS"],
+                    horizontal=True,
+                    key="act_channel",
+                )
+                _default_msg = (
+                    f"안녕하세요 {_sel.get('name') or '고객'}님, 에몬스 {auto_store}입니다.\n"
+                    "문의하신 내용 관련하여 연락드립니다.\n"
+                    "편하신 시간에 답변 주시면 감사하겠습니다."
+                )
+                _msg_body = st.text_area(
+                    "메시지 내용", value=_default_msg, height=130, key="act_msg_body"
+                )
+                if st.button("📤 발송", type="primary", key="act_send_btn", use_container_width=True):
+                    _phone_to = _sel.get("phone", "")
+                    if not _phone_to:
+                        st.error("전화번호가 없습니다.")
+                    elif not send_friendtalk:
+                        st.error("발송 모듈 없음")
+                    else:
+                        with st.spinner("발송 중..."):
+                            if _ch.startswith("친구톡"):
+                                _res = send_friendtalk(_phone_to, _msg_body)
+                            else:
+                                _res = send_sms(_phone_to, _msg_body)
+                        _rs = _res.get("status", "")
+                        if _rs == "sent":
+                            st.success("✅ 발송 완료!")
+                            try:
+                                from customer_channel import _update_kakao_friend_status  # noqa: WPS433
+                                _update_kakao_friend_status(None, _phone_to, _rs)
+                            except Exception:
+                                pass
+                        elif _rs == "skipped":
+                            st.warning(f"발송 보류: {_res.get('error')}")
+                        else:
+                            st.error(f"발송 실패: {_res.get('error')}")
+
+            # ── 단계 변경 탭 ────────────────────
+            with _atab2:
+                _cur_idx = list(LEAD_STAGES.keys()).index(_sel.get("lead_stage", "1_신규")) \
+                    if _sel.get("lead_stage") in LEAD_STAGES else 0
+                _new_stage = st.selectbox(
+                    "새 단계",
+                    list(LEAD_STAGES.keys()),
+                    format_func=lambda x: f"{LEAD_STAGE_EMOJI.get(x,'')} {LEAD_STAGES[x]}",
+                    index=_cur_idx,
+                    key="act_stage_sel",
+                )
+                _nc_upd = st.date_input("다음 연락 예정일", value=None, key="act_next_contact")
+                _memo_upd = st.text_area(
+                    "사후 메모", placeholder="상담 결과, 다음 액션 등", height=80, key="act_memo"
+                )
+                if st.button("단계 업데이트", type="primary", key="act_stage_btn", use_container_width=True):
+                    try:
+                        _upd: dict = {
+                            "lead_stage": _new_stage,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        if _memo_upd:
+                            _upd["contact_memo"] = _memo_upd
+                            _upd["followup_done"] = True
+                        if _nc_upd:
+                            _upd["next_contact_date"] = str(_nc_upd)
+                        supa.table("app_leads").update(_upd).eq("id", _sel_id).execute()
+                        st.success(f"✅ {_sname} → {LEAD_STAGES[_new_stage]} 완료")
+                        st.session_state.pop("selected_lead_id", None)
+                        st.rerun()
+                    except Exception as _ue:
+                        st.error(f"업데이트 실패: {_ue}")

@@ -118,7 +118,7 @@ def register_lead(
         "name": name or "",
         "memo": memo or "",
         "lead_source": lead_source,
-        "lead_stage": "1_신규유입",
+        "lead_stage": "1_신규",
         "assigned_employee_id": employee_id,
         "assigned_store": store_name,
         "next_contact_date": next_contact_date,
@@ -172,7 +172,7 @@ def register_lead(
         try:
             httpx.patch(
                 _supa_url("app_leads") + f"?id=eq.{lead_id}",
-                json={"lead_stage": "2_자료발송", "nurturing_step": 1},
+                json={"lead_stage": "2_상담중", "nurturing_step": 1},
                 headers=_supa_headers(),
                 timeout=5.0,
             )
@@ -304,7 +304,7 @@ def auto_close_lead(phone: str, order_id: int, revenue: float) -> bool:
             _supa_url("app_leads"),
             params={
                 "phone": f"eq.{normalized}",
-                "lead_stage": "not.in.(4_계약완료,5_계약실패)",
+                "lead_stage": "not.in.(4_계약완료,5_실패,6_보류)",
                 "order": "lead_stage.asc,created_at.asc",
                 "limit": "1",
                 "select": "id",

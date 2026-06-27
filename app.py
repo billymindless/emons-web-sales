@@ -22995,8 +22995,8 @@ def render_sales_kpi_dashboard() -> None:
 
     stage_filter = st.multiselect(
         "단계 필터",
-        ["1_신규유입", "2_자료발송", "3_매장방문", "4_계약완료", "5_계약실패"],
-        default=["1_신규유입", "2_자료발송", "3_매장방문"],
+        ["1_신규", "2_상담중", "3_견적발송", "4_계약완료", "5_실패", "6_보류"],
+        default=["1_신규", "2_상담중", "3_견적발송"],
     )
     if stage_filter:
         display_df = df[df["lead_stage"].isin(stage_filter)].copy()
@@ -23042,12 +23042,16 @@ def _render_chat_history_section(customer_id: int, phone: str, customer_name: st
     if leads:
         lead = leads[0]
         stage_colors = {
-            "4_계약완료": "🟢", "5_계약실패": "🔴",
-            "3_매장방문": "🔵", "2_자료발송": "🟡", "1_신규유입": "⚪",
+            "4_계약완료": "🟢", "5_실패": "🔴",
+            "3_견적발송": "🔵", "2_상담중": "🟡", "1_신규": "⚪", "6_보류": "⚫",
+        }
+        _stage_labels = {
+            "1_신규": "신규", "2_상담중": "상담중", "3_견적발송": "견적발송",
+            "4_계약완료": "계약완료", "5_실패": "실패", "6_보류": "보류",
         }
         icon = stage_colors.get(lead.get("lead_stage", ""), "⚪")
         st.info(
-            f"{icon} **리드 단계:** {lead.get('lead_stage', '-')} | "
+            f"{icon} **리드 단계:** {_stage_labels.get(lead.get('lead_stage', ''), lead.get('lead_stage', '-'))} | "
             f"**유입:** {lead.get('lead_source', '-')} | "
             f"**다음 연락:** {lead.get('next_contact_date') or '-'}"
         )
