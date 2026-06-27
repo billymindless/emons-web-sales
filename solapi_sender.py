@@ -37,25 +37,24 @@ NIGHT_END_HOUR = 8
 
 
 def _get_secrets() -> dict[str, str]:
-    """st.secrets에서 solapi 설정 로드. 없으면 환경변수 폴백."""
-    try:
-        import streamlit as st  # noqa: WPS433
-        sec = st.secrets.get("solapi", {}) if hasattr(st, "secrets") else {}
-        if sec:
-            return {
-                "api_key": sec.get("api_key", ""),
-                "api_secret": sec.get("api_secret", ""),
-                "sender": sec.get("sender", ""),
-                "pf_id": sec.get("pf_id", ""),
-            }
-    except Exception:
-        pass
-    return {
+    """환경변수를 기본값으로 읽고, st.secrets에 값이 있으면 덮어씀."""
+    cfg = {
         "api_key": os.environ.get("SOLAPI_API_KEY", ""),
         "api_secret": os.environ.get("SOLAPI_API_SECRET", ""),
         "sender": os.environ.get("SOLAPI_SENDER", ""),
         "pf_id": os.environ.get("SOLAPI_PF_ID", ""),
     }
+    try:
+        import streamlit as st  # noqa: WPS433
+        if hasattr(st, "secrets"):
+            sec = st.secrets.get("solapi", {})
+            for k in ("api_key", "api_secret", "sender", "pf_id"):
+                v = sec.get(k, "")
+                if v:
+                    cfg[k] = v
+    except Exception:
+        pass
+    return cfg
 
 
 def _build_auth_header(api_key: str, api_secret: str) -> str:

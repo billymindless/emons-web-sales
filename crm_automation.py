@@ -907,12 +907,16 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
                 )
                 if result.get("ok"):
                     send_status = result.get("send_result", {}) or {}
+                    _st = send_status.get("status", "")
+                    _err = send_status.get("error", "")
                     send_label = {
                         "sent": "발송 완료",
-                        "lms_fallback": "LMS 발송 완료 (이미지 업로드 실패)",
-                        "skipped": "발송 보류 (키 미설정)",
-                        "failed": "발송 실패",
-                    }.get(send_status.get("status", ""), "미발송")
+                        "lms_fallback": "LMS 발송 완료",
+                        "skipped": f"발송 보류 ({_err})",
+                        "failed": f"발송 실패 ({_err})",
+                        "not_friend": "미친구 (SMS 폴백 시도)",
+                        "out_of_hours": "야간 발송 거부",
+                    }.get(_st, f"미발송 ({_st})" if _st else "즉시발송 OFF")
                     st.success(f"등록 완료 — lead_id: {result['lead_id']} | 메시지: {send_label}")
 
                     # app_chat_history에도 상담 메모 저장
