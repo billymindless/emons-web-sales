@@ -468,13 +468,14 @@ def render_crm_menu() -> None:
     st.title("7. 고객 CRM 자동화")
     st.caption("타겟 고객을 필터링하고 카카오 친구톡(광고) 또는 SMS로 CRM 메시지를 발송·예약합니다.")
 
-    _crm_tab1, _crm_tab2, _crm_tab3 = st.tabs(["CRM 캠페인", "카카오 채널 현황", "가망고객 등록"])
+    _crm_tab1, _crm_tab2 = st.tabs(["CRM 캠페인", "카카오 채널 현황"])
     with _crm_tab2:
         _render_kakao_channel_tab(db_filename, store_name)
     with _crm_tab1:
         _render_crm_campaign_tab(db_filename, store_name)
-    with _crm_tab3:
-        _render_lead_registration_tab(db_filename, store_name)
+
+    st.divider()
+    st.info("📋 **리드고객 관리**는 메뉴 **3번 [리드고객 관리]** 로 이동되었습니다. 메시지 발송·상담 히스토리·채널톡 가져오기 등 모든 리드 기능이 통합되었습니다.")
 
 
 def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) -> None:

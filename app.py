@@ -26645,26 +26645,28 @@ def main():
         tab_labels = [
             "1. 대시보드",
             "2. 마케팅 인사이트",
-            "3. 새로운 매출 등록",
-            "4. 고객 및 잔금 관리",
-            "5. 입금 관리",
-            "6. 매장 관리자 메뉴",
-            "7. 결제수단별 집계표",
-            "8. 고객 CRM 자동화",
-            "9. 세일즈 퍼포먼스",
-            "10. 전시품 판매 검증",
-            "11. FAQ (도움말)",
+            "3. 리드고객 관리",
+            "4. 새로운 매출 등록",
+            "5. 고객 및 잔금 관리",
+            "6. 입금 관리",
+            "7. 매장 관리자 메뉴",
+            "8. 결제수단별 집계표",
+            "9. 고객 CRM 자동화",
+            "10. 세일즈 퍼포먼스",
+            "11. 전시품 판매 검증",
+            "12. FAQ (도움말)",
         ]
     else:
         tab_labels = [
             "1. 대시보드",
             "2. 마케팅 인사이트",
-            "3. 새로운 매출 등록",
-            "4. 고객 및 잔금 관리",
-            "5. 입금 관리",
-            "6. 결제수단별 집계표",
-            "7. 전시품 판매 검증",
-            "8. FAQ (도움말)",
+            "3. 리드고객 관리",
+            "4. 새로운 매출 등록",
+            "5. 고객 및 잔금 관리",
+            "6. 입금 관리",
+            "7. 결제수단별 집계표",
+            "8. 전시품 판매 검증",
+            "9. FAQ (도움말)",
         ]
     if "main_tab_idx" not in st.session_state:
         st.session_state["main_tab_idx"] = 0
@@ -26715,29 +26717,35 @@ def main():
     elif idx == 1:
         render_marketing_insights_tenant()
     elif idx == 2:
-        render_new_sales()
+        try:
+            from lead_management import render_lead_management  # noqa: WPS433
+            render_lead_management()
+        except Exception as _le:
+            st.error(f"리드고객 관리 모듈 로드 실패: {_le}")
     elif idx == 3:
-        render_customer_balance()
+        render_new_sales()
     elif idx == 4:
+        render_customer_balance()
+    elif idx == 5:
         render_deposit_management()
-    elif role == "store_admin" and idx == 5:
-        render_store_admin_employees()
     elif role == "store_admin" and idx == 6:
-        render_monthly_payment_report(is_superadmin=False)
-    elif role == "user" and idx == 5:
-        render_monthly_payment_report(is_superadmin=False)
+        render_store_admin_employees()
     elif role == "store_admin" and idx == 7:
+        render_monthly_payment_report(is_superadmin=False)
+    elif role == "user" and idx == 6:
+        render_monthly_payment_report(is_superadmin=False)
+    elif role == "store_admin" and idx == 8:
         if CRM_MODULE_AVAILABLE:
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
-    elif role == "store_admin" and idx == 8:
+    elif role == "store_admin" and idx == 9:
         render_sales_kpi_dashboard()
-    elif (role == "store_admin" and idx == 9) or (role == "user" and idx == 6):
+    elif (role == "store_admin" and idx == 10) or (role == "user" and idx == 7):
         render_display_sales_audit()
-    elif role == "store_admin" and idx == 10:
+    elif role == "store_admin" and idx == 11:
         render_faq_page()
-    elif role == "user" and idx == 7:
+    elif role == "user" and idx == 8:
         render_faq_page()
 
 
