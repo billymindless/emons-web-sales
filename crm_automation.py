@@ -781,6 +781,19 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                     st.error(f"❌ 발송 실패 ({failed_n}명)")
                     for e in errs:
                         st.error(e)
+
+                # 친구톡 발송 성공 시 → 타겟 고객 친구 상태 갱신
+                if sent_n > 0 and "카카오" in send_channel:
+                    try:
+                        from customer_channel import _update_kakao_friend_status  # noqa: WPS433
+                        for _, trow in targets_df_final.iterrows():
+                            _update_kakao_friend_status(
+                                customer_id=int(trow["id"]) if trow.get("id") else None,
+                                phone=str(trow.get("phone1") or ""),
+                                send_status="sent",
+                            )
+                    except Exception:
+                        pass
             except ImportError:
                 st.error("solapi_sender 모듈을 불러올 수 없습니다.")
             with st.expander("📄 Solapi 발송 Payload (검토용)", expanded=False):

@@ -121,6 +121,43 @@ def _log_message(
 
 
 # ──────────────────────────────────────────────
+# 발송 결과 기반 친구 상태 자동 갱신
+# ──────────────────────────────────────────────
+
+def _update_kakao_friend_status(customer_id: int | None, phone: str, send_status: str) -> None:
+    """
+    친구톡 발송 결과를 보고 app_customers.kakao_friend_added를 자동 갱신.
+    - sent / lms_fallback → kakao_friend_added = True
+    - not_friend          → kakao_friend_added = False
+    그 외 status는 갱신하지 않음 (skipped, failed 등은 판단 불가).
+    """
+    if send_status not in ("sent", "lms_fallback", "not_friend"):
+        return
+
+    sc = _get_supabase()
+    if not sc:
+        return
+
+    is_friend = send_status in ("sent", "lms_fallback")
+    patch: dict[str, Any] = {"kakao_friend_added": is_friend}
+    if is_friend:
+        patch["kakao_friend_added_at"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        if customer_id:
+            sc.table("app_customers").update(patch).eq("id", customer_id).execute()
+        elif phone:
+            digits = _normalize_phone(phone)
+            variants = [digits]
+            if len(digits) == 11 and digits.startswith("010"):
+                variants.append(f"{digits[:3]}-{digits[3:7]}-{digits[7:]}")
+            for v in variants:
+                sc.table("app_customers").update(patch).eq("phone1", v).execute()
+    except Exception:
+        pass  # 상태 갱신 실패는 발송 흐름에 영향 없음
+
+
+# ──────────────────────────────────────────────
 # 고객 카카오 친구 여부 조회
 # ──────────────────────────────────────────────
 
@@ -245,6 +282,12 @@ def send_purchase_notification(
             channel = "sms"
             message_body = sms_body
 
+    send_status = result.get("status", "failed")
+
+    # 발송 결과로 친구 상태 자동 갱신 (친구톡 채널만 해당)
+    if channel == "friendtalk":
+        _update_kakao_friend_status(customer_id, phone_digits, send_status)
+
     _log_message(
         customer_id=customer_id,
         store_name=store_name,
@@ -252,7 +295,7 @@ def send_purchase_notification(
         phone=phone_digits,
         message_type="purchase_confirm",
         channel=channel,
-        status=result.get("status", "failed"),
+        status=send_status,
         msg_id=result.get("msg_id"),
         message_body=message_body,
         error_detail=result.get("error"),
@@ -261,7 +304,7 @@ def send_purchase_notification(
 
     return {
         "channel": channel,
-        "status": result.get("status"),
+        "status": send_status,
         "msg_id": result.get("msg_id"),
         "error": result.get("error"),
     }
