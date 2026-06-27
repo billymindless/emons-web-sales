@@ -125,41 +125,77 @@ def _is_night_kst() -> bool:
 
 
 def check_solapi_config() -> dict[str, object]:
-    """
-    Solapi 설정 로드 상태를 반환한다 (값은 마스킹, 로드 여부만 반환).
-
-    Returns:
-        {
-            "api_key": bool,
-            "api_secret": bool,
-            "sender": bool,
-            "pf_id": bool,
-            "all_ok": bool,          # 발송에 필요한 최소 키 충족 여부
-            "source": str,           # 로드 경로 힌트
-            "api_key_hint": str,     # 값 앞 4자리 (디버그용)
-        }
-    """
-    s = _get_secrets()
-
-    # 어디서 로드됐는지 힌트
+    """Solapi 설정 로드 상태를 단계별 소스 추적과 함께 반환한다."""
     from pathlib import Path
-    _env_key = os.environ.get("SOLAPI_API_KEY", "")
-    if _env_key:
-        source = "환경변수 (Render)"
-    elif (Path(__file__).parent / ".streamlit" / "secrets.toml").exists():
-        source = "secrets.toml 직접 읽기"
-    else:
-        source = "st.secrets 또는 미로드"
 
+    sources: dict[str, dict] = {"toml": {}, "st_secrets": {}, "env": {}}
+
+    # 1) TOML 직접 읽기 결과
+    try:
+        import tomllib
+        toml_paths = [
+            Path(__file__).parent / ".streamlit" / "secrets.toml",
+            Path.cwd() / ".streamlit" / "secrets.toml",
+        ]
+        for _p in toml_paths:
+            sources["toml"][str(_p)] = "exists" if _p.exists() else "missing"
+        for _p in toml_paths:
+            if _p.exists():
+                with open(_p, "rb") as _f:
+                    _data = tomllib.load(_f)
+                _sol = _data.get("solapi", {})
+                sources["toml"]["loaded_keys"] = sorted(list(_sol.keys()))
+                sources["toml"]["api_key"] = bool(_sol.get("api_key"))
+                sources["toml"]["api_secret"] = bool(_sol.get("api_secret"))
+                sources["toml"]["sender"] = bool(_sol.get("sender"))
+                sources["toml"]["pf_id"] = bool(_sol.get("pf_id"))
+                sources["toml"]["used_path"] = str(_p)
+                break
+    except Exception as e:
+        sources["toml"]["error"] = f"{type(e).__name__}: {e}"
+
+    # 2) st.secrets 결과
+    try:
+        import streamlit as st  # noqa: WPS433
+        _sec = st.secrets["solapi"]
+        try:
+            _keys = list(_sec.keys()) if hasattr(_sec, "keys") else list(_sec)
+        except Exception as _ke:
+            _keys = f"keys() error: {_ke}"
+        sources["st_secrets"]["keys"] = _keys
+        for _k in ("api_key", "api_secret", "sender", "pf_id"):
+            try:
+                _v = _sec[_k]
+                sources["st_secrets"][_k] = bool(_v)
+            except Exception as _e:
+                sources["st_secrets"][_k] = f"err: {type(_e).__name__}"
+    except Exception as e:
+        sources["st_secrets"]["error"] = f"{type(e).__name__}: {e}"
+
+    # 3) 환경변수 결과
+    for _ev in ("SOLAPI_API_KEY", "SOLAPI_API_SECRET", "SOLAPI_SENDER", "SOLAPI_PF_ID"):
+        sources["env"][_ev] = bool(os.environ.get(_ev, "").strip())
+
+    # 최종 _get_secrets 결과
+    s = _get_secrets()
     api_key_val = s.get("api_key", "")
+
+    if os.environ.get("SOLAPI_API_KEY", ""):
+        used = "환경변수 (Render)"
+    elif sources["toml"].get("used_path"):
+        used = f"secrets.toml 직접 읽기 ({sources['toml']['used_path']})"
+    else:
+        used = "st.secrets 또는 미로드"
+
     return {
         "api_key": bool(api_key_val),
         "api_secret": bool(s.get("api_secret")),
         "sender": bool(s.get("sender")),
         "pf_id": bool(s.get("pf_id")),
         "all_ok": bool(api_key_val and s.get("api_secret") and s.get("pf_id")),
-        "source": source,
+        "source": used,
         "api_key_hint": api_key_val[:4] + "..." if api_key_val else "(없음)",
+        "sources_detail": sources,
     }
 
 

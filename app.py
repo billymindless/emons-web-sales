@@ -14316,12 +14316,17 @@ def render_send_message():
         if _cfg["all_ok"]:
             st.success("모든 키가 정상 로드되었습니다. 발송 탭에서 테스트해 주세요.")
         else:
-            st.error("누락된 키가 있습니다. 아래를 확인해 주세요.")
+            st.error("누락된 키가 있습니다. 아래 진단 상세를 확인해 주세요.")
             st.info(
                 "**로컬:** `.streamlit/secrets.toml` 의 `[solapi]` 섹션  \n"
                 "**Render:** Environment 탭에서 아래 4개 환경변수 등록  \n"
                 "`SOLAPI_API_KEY` / `SOLAPI_API_SECRET` / `SOLAPI_SENDER` / `SOLAPI_PF_ID`"
             )
+
+        # ── 단계별 진단 상세 ─────────────────────
+        st.divider()
+        st.subheader("🔍 소스별 진단 상세")
+        st.json(_cfg.get("sources_detail", {}))
 
     with _tab_send:
         with st.form("manual_send_form", clear_on_submit=False):
