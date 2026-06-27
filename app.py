@@ -14289,61 +14289,91 @@ def render_send_message():
     st.caption("Solapi를 통해 카카오 친구톡 또는 SMS를 수동으로 발송합니다.")
 
     try:
-        from solapi_sender import send_friendtalk, send_sms  # noqa: WPS433
+        from solapi_sender import send_friendtalk, send_sms, check_solapi_config  # noqa: WPS433
     except ImportError:
         st.error("solapi_sender 모듈을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
         return
 
-    with st.form("manual_send_form", clear_on_submit=False):
-        msg_type = st.selectbox(
-            "메시지 유형",
-            ["친구톡 (FriendTalk)", "SMS / LMS"],
-            help="친구톡: 카카오채널 친구인 고객에게 전송. SMS: 친구 여부 무관하게 문자 전송.",
-        )
-        to_phone = st.text_input(
-            "수신자 전화번호",
-            placeholder="01012345678 (숫자만 또는 하이픈 포함)",
-        )
-        body = st.text_area(
-            "메시지 내용",
-            height=160,
-            placeholder="발송할 메시지를 입력하세요.",
-        )
-        submitted = st.form_submit_button("📤 발송", type="primary", use_container_width=True)
+    # ── Solapi 설정 진단 탭 ──────────────────────────────────
+    _tab_send, _tab_diag = st.tabs(["📤 발송", "⚙️ 설정 확인"])
 
-    if submitted:
-        if not to_phone.strip():
-            st.warning("수신자 전화번호를 입력해 주세요.")
-            return
-        if not body.strip():
-            st.warning("메시지 내용을 입력해 주세요.")
-            return
+    with _tab_diag:
+        st.subheader("Solapi 연결 상태")
+        _cfg = check_solapi_config()
+        _rows = [
+            ("api_key", "API Key (발신 인증)"),
+            ("api_secret", "API Secret"),
+            ("pf_id", "카카오 채널 PF ID"),
+            ("sender", "발신번호"),
+        ]
+        for _k, _label in _rows:
+            _ok = _cfg[_k]
+            st.markdown(f"{'✅' if _ok else '❌'} **{_label}** — {'로드됨' if _ok else '**누락**'}")
 
-        with st.spinner("발송 중..."):
-            if msg_type.startswith("친구톡"):
-                result = send_friendtalk(to_phone.strip(), body.strip())
-            else:
-                result = send_sms(to_phone.strip(), body.strip())
-
-        status = result.get("status", "")
-        msg_id = result.get("msg_id")
-        error = result.get("error")
-
-        if status == "sent":
-            st.success(f"✅ 발송 성공! (msg_id: {msg_id or '—'})")
-        elif status == "skipped":
-            st.warning(f"⚠️ 발송 보류: {error} — Solapi 설정(api_key / pf_id 등)을 확인해 주세요.")
-        elif status == "out_of_hours":
-            st.warning("🌙 야간 시간대(21:00~08:00)로 인해 발송이 거부되었습니다.")
-        elif status == "not_friend":
-            st.warning("👥 해당 고객이 카카오채널 친구가 아닙니다. SMS로 재시도해 주세요.")
-        elif status == "lms_fallback":
-            st.info(f"📩 이미지 업로드 실패로 LMS(문자)로 대체 발송되었습니다. (msg_id: {msg_id or '—'})")
+        st.divider()
+        st.markdown(f"**로드 경로:** {_cfg['source']}")
+        st.markdown(f"**api_key 앞 4자리:** `{_cfg['api_key_hint']}`")
+        if _cfg["all_ok"]:
+            st.success("모든 키가 정상 로드되었습니다. 발송 탭에서 테스트해 주세요.")
         else:
-            st.error(f"❌ 발송 실패: {error}")
+            st.error("누락된 키가 있습니다. 아래를 확인해 주세요.")
+            st.info(
+                "**로컬:** `.streamlit/secrets.toml` 의 `[solapi]` 섹션  \n"
+                "**Render:** Environment 탭에서 아래 4개 환경변수 등록  \n"
+                "`SOLAPI_API_KEY` / `SOLAPI_API_SECRET` / `SOLAPI_SENDER` / `SOLAPI_PF_ID`"
+            )
 
-        with st.expander("응답 상세 보기"):
-            st.json(result.get("raw") or {"status": status, "error": error})
+    with _tab_send:
+        with st.form("manual_send_form", clear_on_submit=False):
+            msg_type = st.selectbox(
+                "메시지 유형",
+                ["친구톡 (FriendTalk)", "SMS / LMS"],
+                help="친구톡: 카카오채널 친구인 고객에게 전송. SMS: 친구 여부 무관하게 문자 전송.",
+            )
+            to_phone = st.text_input(
+                "수신자 전화번호",
+                placeholder="01012345678 (숫자만 또는 하이픈 포함)",
+            )
+            body = st.text_area(
+                "메시지 내용",
+                height=160,
+                placeholder="발송할 메시지를 입력하세요.",
+            )
+            submitted = st.form_submit_button("📤 발송", type="primary", use_container_width=True)
+
+        if submitted:
+            if not to_phone.strip():
+                st.warning("수신자 전화번호를 입력해 주세요.")
+            elif not body.strip():
+                st.warning("메시지 내용을 입력해 주세요.")
+            else:
+                with st.spinner("발송 중..."):
+                    if msg_type.startswith("친구톡"):
+                        result = send_friendtalk(to_phone.strip(), body.strip())
+                    else:
+                        result = send_sms(to_phone.strip(), body.strip())
+
+                status = result.get("status", "")
+                msg_id = result.get("msg_id")
+                error = result.get("error")
+
+                if status == "sent":
+                    st.success(f"✅ 발송 성공! (msg_id: {msg_id or '—'})")
+                elif status == "skipped" and error == "solapi_secrets_missing":
+                    st.error("❌ Solapi 키 미로드 — ⚙️ 설정 확인 탭을 눌러 누락된 키를 확인하세요.")
+                elif status == "skipped":
+                    st.warning(f"⚠️ 발송 보류: {error}")
+                elif status == "out_of_hours":
+                    st.warning("🌙 야간 시간대(21:00~08:00)로 인해 발송이 거부되었습니다.")
+                elif status == "not_friend":
+                    st.warning("👥 카카오채널 친구가 아닙니다. SMS로 재시도해 주세요.")
+                elif status == "lms_fallback":
+                    st.info(f"📩 LMS로 대체 발송 완료 (msg_id: {msg_id or '—'})")
+                else:
+                    st.error(f"❌ 발송 실패: {error}")
+
+                with st.expander("응답 상세 보기"):
+                    st.json(result.get("raw") or {"status": status, "error": error})
 
 
 # =====================================================================
