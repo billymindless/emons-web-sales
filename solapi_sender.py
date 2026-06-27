@@ -80,15 +80,16 @@ def _get_secrets() -> dict[str, str]:
                         _v = str(_sol[_k]).strip()
                         if _v:
                             cfg[_k] = _v
-                    except (KeyError, TypeError):
+                    except Exception:  # KeyError, AttributeError, TypeError 등 모두 포함
                         pass
-        except (KeyError, AttributeError):
+        except Exception:
             pass
     except Exception:
         pass
 
-    # ── 3. secrets.toml 직접 읽기 (폴백) ─────────
-    if not cfg["api_key"]:
+    # ── 3. secrets.toml 직접 읽기 — 누락 키가 하나라도 있으면 시도 ──
+    _missing = [k for k in ("api_key", "api_secret", "sender", "pf_id") if not cfg[k]]
+    if _missing:
         try:
             import tomllib  # Python 3.11+ 표준 라이브러리
             from pathlib import Path
