@@ -41,9 +41,9 @@ def _get_secrets() -> dict[str, str]:
     Solapi 인증 정보를 로드한다.
 
     우선순위:
-      1. st.secrets["solapi"] 섹션 (로컬 secrets.toml)
-      2. st.secrets 최상위 SOLAPI_* 키
-      3. 환경변수 SOLAPI_*
+      1. 환경변수 SOLAPI_* (Render 배포 환경)
+      2. st.secrets["solapi"] 섹션 (로컬 secrets.toml, Streamlit 앱 컨텍스트)
+      3. secrets.toml 파일 직접 읽기 (st.secrets 우회 폴백)
     """
     cfg: dict[str, str] = {
         "api_key": "",
@@ -51,50 +51,62 @@ def _get_secrets() -> dict[str, str]:
         "sender": "",
         "pf_id": "",
     }
-
-    # ── 환경변수 ────────────────────────────────
     _env_map = {
         "api_key": "SOLAPI_API_KEY",
         "api_secret": "SOLAPI_API_SECRET",
         "sender": "SOLAPI_SENDER",
         "pf_id": "SOLAPI_PF_ID",
     }
+
+    # ── 1. 환경변수 ─────────────────────────────
     for _k, _ev in _env_map.items():
         _v = os.environ.get(_ev, "")
         if _v:
             cfg[_k] = _v
 
-    # ── st.secrets ─────────────────────────────
+    # 이미 환경변수로 모두 채워졌으면 조기 반환
+    if all(cfg[k] for k in ("api_key", "api_secret", "pf_id")):
+        return cfg
+
+    # ── 2. st.secrets ────────────────────────────
     try:
         import streamlit as st  # noqa: WPS433
-        _sec = getattr(st, "secrets", None)
-        if _sec is None:
-            return cfg
-
-        # [solapi] 섹션 시도
+        _ss = st.secrets
         try:
-            _section = _sec["solapi"]
+            _sol = _ss["solapi"]
             for _k in ("api_key", "api_secret", "sender", "pf_id"):
-                try:
-                    _v = str(_section[_k]).strip()
-                    if _v:
-                        cfg[_k] = _v
-                except (KeyError, TypeError):
-                    pass
+                if not cfg[_k]:
+                    try:
+                        _v = str(_sol[_k]).strip()
+                        if _v:
+                            cfg[_k] = _v
+                    except (KeyError, TypeError):
+                        pass
         except (KeyError, AttributeError):
             pass
-
-        # 섹션이 없으면 최상위 SOLAPI_* 키 시도
-        if not cfg["api_key"]:
-            for _k, _ev in _env_map.items():
-                try:
-                    _v = str(_sec[_ev]).strip()
-                    if _v:
-                        cfg[_k] = _v
-                except (KeyError, AttributeError, TypeError):
-                    pass
     except Exception:
         pass
+
+    # ── 3. secrets.toml 직접 읽기 (폴백) ─────────
+    if not cfg["api_key"]:
+        try:
+            import tomllib  # Python 3.11+ 표준 라이브러리
+            from pathlib import Path
+            _candidates = [
+                Path(__file__).parent / ".streamlit" / "secrets.toml",
+                Path.cwd() / ".streamlit" / "secrets.toml",
+            ]
+            for _p in _candidates:
+                if _p.exists():
+                    with open(_p, "rb") as _f:
+                        _data = tomllib.load(_f)
+                    _sol = _data.get("solapi", {})
+                    for _k in ("api_key", "api_secret", "sender", "pf_id"):
+                        if _sol.get(_k) and not cfg[_k]:
+                            cfg[_k] = str(_sol[_k]).strip()
+                    break
+        except Exception:
+            pass
 
     return cfg
 
