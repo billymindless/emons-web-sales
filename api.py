@@ -1289,6 +1289,53 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
             logger.info("channel-talk chat.closed: 전화번호 없음, 저장 건너뜀")
             return JSONResponse({"ok": True, "skipped": True, "reason": "no_phone"})
 
+        # ── 채널톡 커스텀 필드 "판매담당자" 추출 → app_leads 자동 업데이트 ──
+        _user_profile = user_obj.get("profile") or {}
+        _user_data = user_obj.get("data") or {}
+        _sales_rep_name = (
+            _user_profile.get("판매담당자")
+            or _user_data.get("판매담당자")
+            or _user_profile.get("salesManager")
+            or _user_data.get("salesManager")
+            or ""
+        ).strip()
+        if _sales_rep_name:
+            try:
+                _supa_base = os.environ.get("SUPABASE_URL", "")
+                _supa_key = os.environ.get("SUPABASE_SERVICE_KEY", "") or os.environ.get("SUPABASE_KEY", "")
+                if _supa_base and _supa_key:
+                    async with httpx.AsyncClient(timeout=5.0) as _cl:
+                        # 직원 이름으로 ID 조회
+                        _emp_resp = await _cl.get(
+                            f"{_supa_base}/rest/v1/app_users",
+                            headers={"apikey": _supa_key, "Authorization": f"Bearer {_supa_key}"},
+                            params={"name": f"eq.{_sales_rep_name}", "select": "id", "limit": "1"},
+                        )
+                        _emp_rows = _emp_resp.json() if _emp_resp.status_code < 400 else []
+                        if _emp_rows and isinstance(_emp_rows, list):
+                            _emp_id = _emp_rows[0].get("id")
+                            # 해당 phone의 리드가 있으면 담당자 업데이트
+                            _lead_resp = await _cl.get(
+                                f"{_supa_base}/rest/v1/app_leads",
+                                headers={"apikey": _supa_key, "Authorization": f"Bearer {_supa_key}"},
+                                params={"phone": f"eq.{phone}", "select": "id,assigned_employee_id", "limit": "1"},
+                            )
+                            _lead_rows = _lead_resp.json() if _lead_resp.status_code < 400 else []
+                            if _lead_rows and isinstance(_lead_rows, list) and not _lead_rows[0].get("assigned_employee_id"):
+                                await _cl.patch(
+                                    f"{_supa_base}/rest/v1/app_leads",
+                                    headers={
+                                        "apikey": _supa_key,
+                                        "Authorization": f"Bearer {_supa_key}",
+                                        "Prefer": "return=minimal",
+                                    },
+                                    params={"phone": f"eq.{phone}"},
+                                    json={"assigned_employee_id": _emp_id},
+                                )
+                                logger.info("chat.closed: 판매담당자 '%s'(id=%s) → app_leads phone=%s", _sales_rep_name, _emp_id, phone)
+            except Exception as _e:
+                logger.warning("판매담당자 자동 업데이트 실패: %s", _e)
+
         # 채널톡 Open API로 대화 전문 수집
         full_text = ""
         access_key = os.environ.get("CHANNEL_TALK_ACCESS_KEY", "")

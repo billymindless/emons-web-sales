@@ -269,6 +269,17 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
     if not supa:
         return {"ok": False, "error": "Supabase 연결 실패", "imported": 0, "skipped": 0, "details": []}
 
+    # 직원 이름 → ID 역방향 맵 (판매담당자 매핑용)
+    _emp_name_to_id: dict[str, int] = {}
+    try:
+        _emp_rows = supa.table("app_users").select("id,name,username").execute().data or []
+        for _er in _emp_rows:
+            _en = (_er.get("name") or _er.get("username") or "").strip()
+            if _en and _er.get("id"):
+                _emp_name_to_id[_en] = int(_er["id"])
+    except Exception:
+        pass
+
     imported, skipped = 0, 0
     details: list[dict] = []
 
@@ -280,7 +291,19 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
             or ""
         )
         phone = _normalize_phone(raw_phone)
-        name = u.get("name") or (u.get("profile") or {}).get("name") or ""
+        _profile = u.get("profile") or {}
+        _udata = u.get("data") or {}
+        name = u.get("name") or _profile.get("name") or ""
+
+        # 채널톡 커스텀 필드 "판매담당자" 추출 (여러 위치 시도)
+        _sales_rep_name = (
+            _profile.get("판매담당자")
+            or _udata.get("판매담당자")
+            or _profile.get("salesManager")
+            or _udata.get("salesManager")
+            or ""
+        )
+        _sales_rep_id = _emp_name_to_id.get(_sales_rep_name.strip()) if _sales_rep_name.strip() else None
 
         if not phone or len(phone) < 10:
             skipped += 1
@@ -297,17 +320,28 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
             pass
 
         try:
-            lead_rows = supa.table("app_leads").select("id") \
+            lead_rows = supa.table("app_leads").select("id,assigned_employee_id") \
                 .eq("phone", phone).limit(1).execute().data or []
             if lead_rows:
-                skipped += 1
-                details.append({"phone": phone, "name": name, "reason": "이미 리드 등록"})
+                # 이미 리드 존재 → 판매담당자만 업데이트 (비어 있을 때)
+                _existing = lead_rows[0]
+                if _sales_rep_id and not _existing.get("assigned_employee_id"):
+                    try:
+                        supa.table("app_leads").update(
+                            {"assigned_employee_id": _sales_rep_id}
+                        ).eq("id", _existing["id"]).execute()
+                        details.append({"phone": phone, "name": name, "reason": f"리드 담당자 업데이트 → {_sales_rep_name}"})
+                    except Exception:
+                        pass
+                else:
+                    skipped += 1
+                    details.append({"phone": phone, "name": name, "reason": "이미 리드 등록"})
                 continue
         except Exception:
             pass
 
         try:
-            supa.table("app_leads").insert({
+            _insert_row: dict = {
                 "store_name": "전체",
                 "phone": phone,
                 "name": name or "채널톡 고객",
@@ -316,9 +350,13 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
                 "lead_stage": "1_신규",
                 "assigned_store": "전체",
                 "nurturing_step": 0,
-            }).execute()
+            }
+            if _sales_rep_id:
+                _insert_row["assigned_employee_id"] = _sales_rep_id
+            supa.table("app_leads").insert(_insert_row).execute()
             imported += 1
-            details.append({"phone": phone, "name": name, "reason": "신규 등록"})
+            _rep_label = f" (담당: {_sales_rep_name})" if _sales_rep_name else ""
+            details.append({"phone": phone, "name": name, "reason": f"신규 등록{_rep_label}"})
         except Exception as e:
             skipped += 1
             details.append({"phone": phone, "name": name, "reason": f"등록 실패: {str(e)[:80]}"})
