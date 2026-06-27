@@ -40,10 +40,10 @@ def _get_secrets() -> dict[str, str]:
     """
     Solapi 인증 정보를 로드한다.
 
-    우선순위:
-      1. 환경변수 SOLAPI_* (Render 배포 환경)
-      2. st.secrets["solapi"] 섹션 (로컬 secrets.toml, Streamlit 앱 컨텍스트)
-      3. secrets.toml 파일 직접 읽기 (st.secrets 우회 폴백)
+    로드 순서 (뒤쪽이 높은 우선순위로 덮어씀):
+      1. secrets.toml 직접 읽기 (가장 신뢰도 높음, 로컬)
+      2. st.secrets 이터레이션 (Streamlit 앱 컨텍스트 보조)
+      3. 환경변수 SOLAPI_* (최우선 — Render 배포 환경)
     """
     cfg: dict[str, str] = {
         "api_key": "",
@@ -51,63 +51,55 @@ def _get_secrets() -> dict[str, str]:
         "sender": "",
         "pf_id": "",
     }
+
+    # ── 1. secrets.toml 직접 읽기 ────────────────
+    try:
+        import tomllib
+        from pathlib import Path
+        for _p in [
+            Path(__file__).parent / ".streamlit" / "secrets.toml",
+            Path.cwd() / ".streamlit" / "secrets.toml",
+        ]:
+            if _p.exists():
+                with open(_p, "rb") as _f:
+                    _data = tomllib.load(_f)
+                _sol = _data.get("solapi", {})
+                for _k in ("api_key", "api_secret", "sender", "pf_id"):
+                    _v = str(_sol.get(_k, "") or "").strip()
+                    if _v:
+                        cfg[_k] = _v
+                break
+    except Exception:
+        pass
+
+    # ── 2. st.secrets — 키를 직접 이터레이션 ───────
+    try:
+        import streamlit as st  # noqa: WPS433
+        _section = st.secrets["solapi"]
+        # AttrDict를 순회해서 일반 dict로 변환
+        _sol_dict: dict[str, str] = {}
+        for _k in _section:
+            try:
+                _sol_dict[_k] = str(_section[_k]).strip()
+            except Exception:
+                pass
+        for _k in ("api_key", "api_secret", "sender", "pf_id"):
+            if _sol_dict.get(_k):
+                cfg[_k] = _sol_dict[_k]
+    except Exception:
+        pass
+
+    # ── 3. 환경변수 (최우선) ──────────────────────
     _env_map = {
         "api_key": "SOLAPI_API_KEY",
         "api_secret": "SOLAPI_API_SECRET",
         "sender": "SOLAPI_SENDER",
         "pf_id": "SOLAPI_PF_ID",
     }
-
-    # ── 1. 환경변수 ─────────────────────────────
     for _k, _ev in _env_map.items():
         _v = os.environ.get(_ev, "")
         if _v:
             cfg[_k] = _v
-
-    # 이미 환경변수로 모두 채워졌으면 조기 반환
-    if all(cfg[k] for k in ("api_key", "api_secret", "pf_id")):
-        return cfg
-
-    # ── 2. st.secrets ────────────────────────────
-    try:
-        import streamlit as st  # noqa: WPS433
-        _ss = st.secrets
-        try:
-            _sol = _ss["solapi"]
-            for _k in ("api_key", "api_secret", "sender", "pf_id"):
-                if not cfg[_k]:
-                    try:
-                        _v = str(_sol[_k]).strip()
-                        if _v:
-                            cfg[_k] = _v
-                    except Exception:  # KeyError, AttributeError, TypeError 등 모두 포함
-                        pass
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    # ── 3. secrets.toml 직접 읽기 — 누락 키가 하나라도 있으면 시도 ──
-    _missing = [k for k in ("api_key", "api_secret", "sender", "pf_id") if not cfg[k]]
-    if _missing:
-        try:
-            import tomllib  # Python 3.11+ 표준 라이브러리
-            from pathlib import Path
-            _candidates = [
-                Path(__file__).parent / ".streamlit" / "secrets.toml",
-                Path.cwd() / ".streamlit" / "secrets.toml",
-            ]
-            for _p in _candidates:
-                if _p.exists():
-                    with open(_p, "rb") as _f:
-                        _data = tomllib.load(_f)
-                    _sol = _data.get("solapi", {})
-                    for _k in ("api_key", "api_secret", "sender", "pf_id"):
-                        if _sol.get(_k) and not cfg[_k]:
-                            cfg[_k] = str(_sol[_k]).strip()
-                    break
-        except Exception:
-            pass
 
     return cfg
 
