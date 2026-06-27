@@ -376,13 +376,35 @@ def render_lead_management() -> None:
 
     emp_map = _get_employee_map()
 
+    # ── app_customers에 이미 등록된 phone 집합 (구매 완료 판별) ──
+    customer_phones: set[str] = set()
+    _all_phones = list({_normalize_phone(l.get("phone")) for l in leads_raw if l.get("phone")})
+    _all_phones = [p for p in _all_phones if p]
+    if _all_phones:
+        try:
+            for _i in range(0, len(_all_phones), 100):
+                _chunk = _all_phones[_i:_i + 100]
+                _rows = supa.table("app_customers").select("phone") \
+                    .in_("phone", _chunk).execute().data or []
+                for _r in _rows:
+                    _cp = _normalize_phone(_r.get("phone"))
+                    if _cp:
+                        customer_phones.add(_cp)
+        except Exception:
+            pass
+
+    for _l in leads_raw:
+        _l["_is_customer"] = _normalize_phone(_l.get("phone") or "") in customer_phones
+
+    _customer_count = sum(1 for _l in leads_raw if _l["_is_customer"])
+
     # ── Stats 카드 ────────────────────────────
     _total = len(leads_raw)
     _new = sum(1 for l in leads_raw if l.get("lead_stage") == "1_신규")
     _consult = sum(1 for l in leads_raw if l.get("lead_stage") in ("2_상담중", "3_견적발송"))
-    _conv = sum(1 for l in leads_raw if l.get("lead_stage") == "4_계약완료")
+    _conv = sum(1 for l in leads_raw if l.get("lead_stage") == "4_계약완료" or l.get("_is_customer"))
 
-    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
     sc1.metric("전체 리드", f"{_total}건", help="전체 등록된 잠재 고객 수")
     sc2.metric("신규", f"{_new}건", help="아직 첫 응대가 필요한 문의")
     sc3.metric("상담중", f"{_consult}건", help="현재 커뮤니케이션이 진행 중인 리드")
@@ -390,7 +412,12 @@ def render_lead_management() -> None:
         "전환 완료",
         f"{_conv}건",
         delta=f"전환율 {round(_conv / _total * 100, 1)}%" if _total else None,
-        help="계약 또는 고객 전환이 끝난 리드",
+        help="계약 완료 단계 또는 이미 우리 DB에 고객으로 등록된 리드",
+    )
+    sc5.metric(
+        "🛒 구매 완료",
+        f"{_customer_count}건",
+        help="app_customers 마스터에 phone이 매칭된 리드 (이미 구매한 고객)",
     )
 
     st.divider()
@@ -412,16 +439,25 @@ def render_lead_management() -> None:
     _sel_stage = _stage_keys[_stage_labels.index(_sel_label)]
     st.session_state["lead_filter_stage"] = _sel_stage
 
-    # ── 검색 + 카운트 ──────────────────────────
-    _sc1, _sc2 = st.columns([5, 1])
+    # ── 검색 + 토글 + 카운트 ─────────────────────
+    _sc1, _sc2, _sc3 = st.columns([4, 1.7, 1])
     with _sc1:
         _q = st.text_input(
             "검색", placeholder="회사명, 담당자, 연락처를 검색하세요",
             label_visibility="collapsed", key="lead_search_q",
         )
+    with _sc2:
+        _hide_customers = st.toggle(
+            "🛒 구매완료 숨기기",
+            value=st.session_state.get("lead_hide_customers", True),
+            key="lead_hide_customers",
+            help="DB에 이미 등록된(구매 완료) 고객을 목록에서 숨깁니다.",
+        )
 
     # ── 필터링 ────────────────────────────────
     leads = leads_raw
+    if _hide_customers:
+        leads = [l for l in leads if not l.get("_is_customer")]
     if _sel_stage != "전체":
         leads = [l for l in leads if l.get("lead_stage") == _sel_stage]
     if _q:
@@ -433,7 +469,7 @@ def render_lead_management() -> None:
             or _ql in (l.get("assigned_store") or "").lower()
         ]
 
-    with _sc2:
+    with _sc3:
         st.markdown(
             f"<div style='text-align:right;padding-top:8px;color:#666;'>{len(leads)}건 표시 중</div>",
             unsafe_allow_html=True,
@@ -473,12 +509,18 @@ def render_lead_management() -> None:
         _rc[1].write(_name)
         _rc[2].write(_phone)
         _rc[3].write(_source)
-        _rc[4].markdown(
+        _badge_html = (
             f"<span style='background:{_bg};color:{_fg};"
             f"padding:3px 10px;border-radius:12px;font-size:0.78rem;font-weight:600;'>"
-            f"{_stage_label}</span>",
-            unsafe_allow_html=True,
+            f"{_stage_label}</span>"
         )
+        if _lead.get("_is_customer"):
+            _badge_html += (
+                " <span style='background:#fef3c7;color:#92400e;padding:3px 8px;"
+                "border-radius:12px;font-size:0.72rem;font-weight:600;margin-left:4px;'>"
+                "🛒 구매완료</span>"
+            )
+        _rc[4].markdown(_badge_html, unsafe_allow_html=True)
         _rc[5].markdown(f"{_emp}  \n<span style='color:#94a3b8;font-size:0.72rem;'>{_store}</span>", unsafe_allow_html=True)
         _rc[6].write(_created)
         with _rc[7]:
@@ -652,12 +694,18 @@ def _render_lead_detail_panel(lead: dict, emp_map: dict[int, str]) -> None:
     _emp = emp_map.get(int(lead.get("assigned_employee_id") or 0), "—")
     _created = str(lead.get("created_at") or "")[:10]
 
-    st.markdown(
+    _header = (
         f"### 📋 {_name} "
         f"<span style='background:{_bg};color:{_fg};padding:4px 12px;border-radius:14px;"
-        f"font-size:0.82rem;font-weight:600;vertical-align:middle;'>{LEAD_STAGES.get(_stage, _stage)}</span>",
-        unsafe_allow_html=True,
+        f"font-size:0.82rem;font-weight:600;vertical-align:middle;'>{LEAD_STAGES.get(_stage, _stage)}</span>"
     )
+    if lead.get("_is_customer"):
+        _header += (
+            " <span style='background:#fef3c7;color:#92400e;padding:4px 10px;border-radius:14px;"
+            "font-size:0.78rem;font-weight:600;vertical-align:middle;margin-left:6px;'>"
+            "🛒 우리 DB에 등록된 구매 고객</span>"
+        )
+    st.markdown(_header, unsafe_allow_html=True)
     _info_c1, _info_c2, _info_c3, _info_c4 = st.columns(4)
     _info_c1.markdown(f"**📞 연락처**  \n{_format_phone_display(_phone)}")
     _info_c2.markdown(f"**🏬 담당매장**  \n{_store}")
