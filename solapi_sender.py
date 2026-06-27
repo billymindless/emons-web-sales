@@ -37,23 +37,65 @@ NIGHT_END_HOUR = 8
 
 
 def _get_secrets() -> dict[str, str]:
-    """환경변수를 기본값으로 읽고, st.secrets에 값이 있으면 덮어씀."""
-    cfg = {
-        "api_key": os.environ.get("SOLAPI_API_KEY", ""),
-        "api_secret": os.environ.get("SOLAPI_API_SECRET", ""),
-        "sender": os.environ.get("SOLAPI_SENDER", ""),
-        "pf_id": os.environ.get("SOLAPI_PF_ID", ""),
+    """
+    Solapi 인증 정보를 로드한다.
+
+    우선순위:
+      1. st.secrets["solapi"] 섹션 (로컬 secrets.toml)
+      2. st.secrets 최상위 SOLAPI_* 키
+      3. 환경변수 SOLAPI_*
+    """
+    cfg: dict[str, str] = {
+        "api_key": "",
+        "api_secret": "",
+        "sender": "",
+        "pf_id": "",
     }
+
+    # ── 환경변수 ────────────────────────────────
+    _env_map = {
+        "api_key": "SOLAPI_API_KEY",
+        "api_secret": "SOLAPI_API_SECRET",
+        "sender": "SOLAPI_SENDER",
+        "pf_id": "SOLAPI_PF_ID",
+    }
+    for _k, _ev in _env_map.items():
+        _v = os.environ.get(_ev, "")
+        if _v:
+            cfg[_k] = _v
+
+    # ── st.secrets ─────────────────────────────
     try:
         import streamlit as st  # noqa: WPS433
-        if hasattr(st, "secrets"):
-            sec = st.secrets.get("solapi", {})
-            for k in ("api_key", "api_secret", "sender", "pf_id"):
-                v = sec.get(k, "")
-                if v:
-                    cfg[k] = v
+        _sec = getattr(st, "secrets", None)
+        if _sec is None:
+            return cfg
+
+        # [solapi] 섹션 시도
+        try:
+            _section = _sec["solapi"]
+            for _k in ("api_key", "api_secret", "sender", "pf_id"):
+                try:
+                    _v = str(_section[_k]).strip()
+                    if _v:
+                        cfg[_k] = _v
+                except (KeyError, TypeError):
+                    pass
+        except (KeyError, AttributeError):
+            pass
+
+        # 섹션이 없으면 최상위 SOLAPI_* 키 시도
+        if not cfg["api_key"]:
+            for _k, _ev in _env_map.items():
+                try:
+                    _v = str(_sec[_ev]).strip()
+                    if _v:
+                        cfg[_k] = _v
+                except (KeyError, AttributeError, TypeError):
+                    pass
     except Exception:
         pass
+
     return cfg
 
 

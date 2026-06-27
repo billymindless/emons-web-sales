@@ -1135,6 +1135,7 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
                             else:
                                 _res = send_sms(_phone_to, _msg_body)
                         _rs = _res.get("status", "")
+                        _re = _res.get("error", "")
                         if _rs == "sent":
                             st.success("✅ 발송 완료!")
                             try:
@@ -1142,10 +1143,18 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
                                 _update_kakao_friend_status(None, _phone_to, _rs)
                             except Exception:
                                 pass
+                        elif _rs == "skipped" and _re == "solapi_secrets_missing":
+                            st.warning(
+                                "⚙️ Solapi 키가 로드되지 않았습니다.  \n"
+                                "`.streamlit/secrets.toml` 의 `[solapi]` 섹션 또는 "
+                                "Render 환경변수 `SOLAPI_API_KEY / SOLAPI_PF_ID` 등을 확인해 주세요."
+                            )
                         elif _rs == "skipped":
-                            st.warning(f"발송 보류: {_res.get('error')}")
+                            st.warning(f"발송 보류: {_re}")
+                        elif _rs == "not_friend":
+                            st.info("카카오 친구가 아닌 고객입니다. SMS로 재시도하려면 채널을 SMS로 변경해 주세요.")
                         else:
-                            st.error(f"발송 실패: {_res.get('error')}")
+                            st.error(f"발송 실패: {_re}")
 
             # ── 단계 변경 탭 ────────────────────
             with _atab2:
