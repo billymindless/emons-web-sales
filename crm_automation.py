@@ -1102,11 +1102,28 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
             # ── 메시지 발송 탭 ──────────────────
             with _atab1:
                 try:
-                    from solapi_sender import send_friendtalk, send_sms  # noqa: WPS433
+                    from solapi_sender import send_friendtalk, send_sms, check_solapi_config  # noqa: WPS433
                 except ImportError:
                     st.error("solapi_sender 모듈 없음")
                     send_friendtalk = None  # type: ignore
                     send_sms = None  # type: ignore
+                    check_solapi_config = None  # type: ignore
+
+                # ── Solapi 설정 진단 ───────────────
+                if check_solapi_config:
+                    _cfg = check_solapi_config()
+                    if not _cfg["all_ok"]:
+                        st.error(
+                            f"⚠️ **Solapi 키 미로드** — 발송 불가  \n"
+                            f"api_key: {'✅' if _cfg['api_key'] else '❌'}  "
+                            f"api_secret: {'✅' if _cfg['api_secret'] else '❌'}  "
+                            f"pf_id: {'✅' if _cfg['pf_id'] else '❌'}  "
+                            f"sender: {'✅' if _cfg['sender'] else '❌'}  \n"
+                            f"로드 경로: {_cfg['source']}  \n"
+                            f"api_key 앞 4자리: `{_cfg['api_key_hint']}`"
+                        )
+                    else:
+                        st.caption(f"✅ Solapi 연결됨 ({_cfg['source']}, key: `{_cfg['api_key_hint']}`)")
 
                 _ch = st.radio(
                     "발송 채널",
