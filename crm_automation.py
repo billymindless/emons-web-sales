@@ -263,129 +263,18 @@ def _get_current_store_name(db_filename: str | None) -> str | None:
 # 메인 렌더 함수
 # ──────────────────────────────────────────────
 
-def _sync_kakao_friends_from_solapi(sc: Any, store_name: str) -> tuple[int, int]:
-    """
-    Solapi 카카오 채널 친구 목록 API를 호출하여 app_customers.kakao_friend_added를 일괄 갱신.
-    반환: (갱신된 고객 수, 실패 수)
-    """
-    import requests as _req  # noqa: WPS433
-
-    try:
-        from solapi_sender import _get_secrets, _build_auth_header  # noqa: WPS433
-    except ImportError:
-        return 0, 0
-
-    sec = _get_secrets()
-    api_key = sec.get("api_key", "")
-    api_secret = sec.get("api_secret", "")
-    pf_id = sec.get("pf_id", "")
-
-    if not api_key or not api_secret or not pf_id:
-        return 0, 0
-
-    updated = 0
-    failed = 0
-    page_token = None
-
-    while True:
-        params: dict = {"pfId": pf_id, "limit": 1000}
-        if page_token:
-            params["startKey"] = page_token
-
-        try:
-            hdrs = {
-                "Authorization": _build_auth_header(api_key, api_secret),
-                "Content-Type": "application/json",
-            }
-            resp = _req.get(
-                "https://api.solapi.com/kakao/v2/channel/friends",
-                headers=hdrs,
-                params=params,
-                timeout=15.0,
-            )
-            if resp.status_code >= 400:
-                break
-            data = resp.json()
-        except Exception:
-            break
-
-        friends: list[dict] = data.get("friendList") or data.get("list") or []
-        if not friends:
-            break
-
-        for fr in friends:
-            phone_raw = fr.get("phone") or fr.get("phoneNumber") or ""
-            user_key = fr.get("userKey") or fr.get("uuid") or ""
-            digits = re.sub(r"\D", "", phone_raw)
-            if not digits:
-                continue
-
-            # phone1 / phone2 다중 형식으로 매칭
-            variants = [digits]
-            if len(digits) == 11 and digits.startswith("010"):
-                variants.append(f"{digits[:3]}-{digits[3:7]}-{digits[7:]}")
-
-            try:
-                patch_val: dict[str, Any] = {
-                    "kakao_friend_added": True,
-                    "kakao_friend_added_at": datetime.utcnow().isoformat() + "Z",
-                }
-                if user_key:
-                    patch_val["kakao_user_key"] = user_key
-
-                or_parts: list[str] = []
-                for v in variants:
-                    or_parts.append(f"phone1.eq.{v}")
-                    or_parts.append(f"phone2.eq.{v}")
-                or_filter = "(" + ",".join(or_parts) + ")"
-
-                r = (
-                    sc.table("app_customers")
-                    .update(patch_val)
-                    .filter("store_name", "eq", store_name)
-                    .or_(or_filter.strip("()"))
-                    .execute()
-                )
-                if r.data:
-                    updated += len(r.data)
-            except Exception:
-                failed += 1
-
-        page_token = data.get("nextKey") or data.get("startKey")
-        if not page_token:
-            break
-
-    return updated, failed
-
-
 def _render_kakao_channel_tab(db_filename: str | None, store_name: str | None) -> None:
     """카카오 채널 동기화 현황 탭 — 친구 현황 요약 + 발송 이력 조회."""
     sc = _get_supabase()
 
     st.subheader("채널 친구 현황")
-
-    # Solapi 친구 목록 일괄 동기화 버튼
-    if sc and store_name:
-        with st.expander("🔄 Solapi 친구 목록 일괄 동기화", expanded=False):
-            st.caption(
-                "Solapi 카카오 채널 친구 목록 API를 호출하여 기존 고객의 친구 상태를 DB에 일괄 반영합니다. "
-                "웹훅 설정 전에 이미 채널 친구를 추가한 고객 데이터를 복구할 때 사용하세요."
-            )
-            if st.button("📡 Solapi 친구 목록 동기화 실행", key="crm_sync_friends_btn", type="secondary"):
-                with st.spinner("Solapi에서 친구 목록을 가져오는 중..."):
-                    ok_cnt, fail_cnt = _sync_kakao_friends_from_solapi(sc, store_name)
-                if ok_cnt > 0:
-                    st.success(f"✅ {ok_cnt}명 갱신 완료 (실패: {fail_cnt}건). 아래 현황을 새로고침하세요.")
-                elif fail_cnt > 0:
-                    st.error(f"갱신 실패: {fail_cnt}건. Solapi API 키 및 pfId를 확인해 주세요.")
-                else:
-                    st.warning(
-                        "동기화된 친구가 없습니다. 다음을 확인해 주세요:\n"
-                        "1. Solapi SOLAPI_PF_ID가 올바르게 설정되어 있는지\n"
-                        "2. Solapi 채널에 실제로 친구 추가한 고객이 있는지\n"
-                        "3. Solapi `/kakao/v2/channel/friends` API 지원 여부"
-                    )
-        st.divider()
+    st.info(
+        "ℹ️ **친구 상태 자동 갱신 방식**: Solapi는 친구 목록 조회 API를 제공하지 않습니다. "
+        "CRM 캠페인 또는 메시지 발송 시 Solapi의 응답 결과에 따라 친구 상태가 자동으로 갱신됩니다.\n\n"
+        "- 친구톡 **발송 성공** → 채널 친구로 자동 기록 ✅\n"
+        "- 친구톡 발송 시 **'미친구' 응답** → 미연결로 자동 기록 ❌\n\n"
+        "캠페인을 운영할수록 실제 친구 현황이 점점 정확해집니다."
+    )
     if sc and db_filename and store_name:
         try:
             r_all = (
