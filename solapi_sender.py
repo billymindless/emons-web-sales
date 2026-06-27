@@ -288,7 +288,22 @@ def send_friendtalk(
             return {"status": "not_friend", "msg_id": None, "error": err_text[:500], "raw": raw}
         return {"status": "failed", "msg_id": None, "error": err_text[:500], "raw": raw}
 
-    # 성공 응답에서 message id 추출
+    # ── HTTP 200이어도 메시지가 거부됐는지 검사 ──────────
+    if isinstance(raw, dict):
+        _gi = raw.get("groupInfo") or {}
+        _count = (_gi.get("count") or {}) if isinstance(_gi, dict) else {}
+        _failed_cnt = _count.get("registeredFailed", 0)
+        _ok_cnt = _count.get("registeredSuccess", 0)
+        if _failed_cnt and not _ok_cnt:
+            _fl = raw.get("failedMessageList") or []
+            _d = _fl[0] if _fl else {}
+            _ec = _d.get("errorCode") or ""
+            _em = _d.get("statusMessage") or _d.get("errorMessage") or ""
+            _ec_lower = (_ec + " " + _em).lower()
+            if "friend" in _ec_lower or "친구" in _em:
+                return {"status": "not_friend", "msg_id": None, "error": f"{_ec}: {_em}", "raw": raw}
+            return {"status": "failed", "msg_id": None, "error": f"{_ec}: {_em}", "raw": raw}
+
     msg_id = None
     try:
         if isinstance(raw, dict):
@@ -460,6 +475,26 @@ def send_sms(
 
     if resp.status_code >= 400:
         return {"status": "failed", "msg_id": None, "error": str(raw)[:500], "raw": raw}
+
+    # ── Solapi 그룹 응답 분석 (HTTP 200이어도 메시지 거부 가능) ──
+    if isinstance(raw, dict):
+        _gi = raw.get("groupInfo") or {}
+        _count = (_gi.get("count") or {}) if isinstance(_gi, dict) else {}
+        _registered_failed = _count.get("registeredFailed", 0)
+        _registered = _count.get("registeredSuccess", 0)
+        if _registered_failed and not _registered:
+            # 메시지 등록 자체 실패
+            _failed_list = raw.get("failedMessageList") or []
+            _detail = _failed_list[0] if _failed_list else {}
+            _scode = _detail.get("statusCode") or _gi.get("statusCode")
+            _smsg = _detail.get("statusMessage") or _gi.get("statusMessage")
+            _ec = _detail.get("errorCode") or _gi.get("appId") or ""
+            return {
+                "status": "failed",
+                "msg_id": None,
+                "error": f"{_ec}: {_smsg} (statusCode={_scode})",
+                "raw": raw,
+            }
 
     msg_id = None
     try:
