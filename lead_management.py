@@ -368,99 +368,149 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
 # 메인 페이지
 # ──────────────────────────────────────────────
 
+def _build_purchase_map(supa: Any) -> tuple[dict[str, str], dict[str, int]]:
+    """
+    실제 매출(app_orders)이 있는 고객만 추출하여 phone → employee_names 맵 생성.
+
+    Returns:
+        (phone_to_emp_names, phone_to_emp_id)
+            phone_to_emp_names: 정규화 phone → 가장 최근 주문의 employee_names 문자열
+            phone_to_emp_id   : 정규화 phone → 해당 employee_names 첫 번째 이름의 app_users.id
+    """
+    phone_to_emp_names: dict[str, str] = {}
+    phone_to_emp_id: dict[str, int] = {}
+
+    # ① 직원 이름 → ID 맵
+    emp_name_to_id: dict[str, int] = {}
+    try:
+        for er in (supa.table("app_users").select("id,name,username").execute().data or []):
+            en = (er.get("name") or er.get("username") or "").strip()
+            if en and er.get("id"):
+                emp_name_to_id[en] = int(er["id"])
+    except Exception:
+        return phone_to_emp_names, phone_to_emp_id
+
+    # ② app_orders 전체 조회 → customer_id별 최신 employee_names 수집
+    customer_id_to_emp: dict[int, str] = {}
+    offset = 0
+    while True:
+        try:
+            batch = supa.table("app_orders") \
+                .select("id,customer_id,employee_names") \
+                .not_.is_("customer_id", "null") \
+                .order("id", desc=True) \
+                .range(offset, offset + 999).execute().data or []
+        except Exception:
+            break
+        if not batch:
+            break
+        for o in batch:
+            cid = o.get("customer_id")
+            if cid is None:
+                continue
+            # 최신순으로 정렬되어 들어오므로, 처음 만난 cid가 가장 최근 주문
+            if cid not in customer_id_to_emp:
+                customer_id_to_emp[cid] = (o.get("employee_names") or "")
+        if len(batch) < 1000:
+            break
+        offset += 1000
+
+    if not customer_id_to_emp:
+        return phone_to_emp_names, phone_to_emp_id
+
+    # ③ 주문 있는 customer_id의 phone1/phone2 조회 → phone 맵 채우기
+    cid_list = list(customer_id_to_emp.keys())
+    for i in range(0, len(cid_list), 200):
+        chunk = cid_list[i:i + 200]
+        try:
+            rows = supa.table("app_customers").select("id,phone1,phone2") \
+                .in_("id", chunk).execute().data or []
+        except Exception:
+            continue
+        for r in rows:
+            cid = r.get("id")
+            if cid is None:
+                continue
+            emp_names = customer_id_to_emp.get(cid, "")
+            for col in ("phone1", "phone2"):
+                np = _normalize_phone(r.get(col) or "")
+                if not np:
+                    continue
+                if np not in phone_to_emp_names:
+                    phone_to_emp_names[np] = emp_names
+                    first = next((n.strip() for n in emp_names.split(",") if n.strip()), "")
+                    if first in emp_name_to_id:
+                        phone_to_emp_id[np] = emp_name_to_id[first]
+
+    return phone_to_emp_names, phone_to_emp_id
+
+
 def _sync_leads_to_customers(full: bool = False) -> dict:
     """
-    app_customers와 app_leads를 동기화.
+    app_orders(매출) 기반으로 app_leads 동기화.
+    매출이 있는 고객의 phone과 일치하는 리드만 → 4_계약완료 + 담당직원 매핑.
 
     full=False (자동): 활성 리드만 4_계약완료로 업데이트
-    full=True  (수동): 모든 리드 대상으로 담당직원 누락분도 채움
+    full=True  (수동): 전체 리드 대상으로 담당직원 누락분도 보강
 
     반환: {stage_updated, emp_updated, total_matched, errors}
     """
     supa = _supa()
-    result = {"stage_updated": 0, "emp_updated": 0, "total_matched": 0, "errors": []}
+    result = {"stage_updated": 0, "emp_updated": 0, "total_matched": 0,
+              "purchase_map_size": 0, "errors": []}
     if not supa:
         result["errors"].append("Supabase 연결 실패")
         return result
 
+    # ① 매출 기반 phone 맵 구성
+    phone_to_emp_names, phone_to_emp_id = _build_purchase_map(supa)
+    result["purchase_map_size"] = len(phone_to_emp_names)
+
+    if not phone_to_emp_names:
+        result["errors"].append("매출(app_orders) 데이터에서 phone 매핑 실패")
+        return result
+
     try:
-        # ① 리드 조회: full이면 assigned_employee_id 없는 전체, 아니면 활성 리드만
+        # ② 리드 조회
         if full:
-            all_leads = supa.table("app_leads").select("id,phone,lead_stage,assigned_employee_id") \
-                .execute().data or []
+            all_leads = supa.table("app_leads").select(
+                "id,phone,lead_stage,assigned_employee_id"
+            ).execute().data or []
         else:
-            all_leads = supa.table("app_leads").select("id,phone,lead_stage,assigned_employee_id") \
-                .not_.in_("lead_stage", ["4_계약완료", "5_실패", "6_보류"]).execute().data or []
+            all_leads = supa.table("app_leads").select(
+                "id,phone,lead_stage,assigned_employee_id"
+            ).not_.in_("lead_stage", ["4_계약완료", "5_실패", "6_보류"]).execute().data or []
 
         if not all_leads:
             return result
 
-        lead_phone_map: dict[str, dict] = {}
-        for l in all_leads:
-            np = _normalize_phone(l.get("phone") or "")
-            if np and l.get("id"):
-                lead_phone_map[np] = {
-                    "id": l["id"],
-                    "stage": l.get("lead_stage") or "1_신규",
-                    "has_emp": bool(l.get("assigned_employee_id")),
-                }
-
-        if not lead_phone_map:
-            return result
-
-        # ② app_customers 전체 로드 (phone1, phone2, id)
-        norm_to_customer: dict[str, dict] = {}
-        offset = 0
-        while True:
-            batch = supa.table("app_customers").select("id,phone1,phone2") \
-                .range(offset, offset + 499).execute().data or []
-            for r in batch:
-                for col in ("phone1", "phone2"):
-                    cp = _normalize_phone(r.get(col) or "")
-                    if cp and cp not in norm_to_customer:
-                        norm_to_customer[cp] = r
-            if len(batch) < 500:
-                break
-            offset += 500
-
-        # ③ 직원 이름 → ID 맵
-        emp_name_to_id: dict[str, int] = {}
-        try:
-            for er in (supa.table("app_users").select("id,name,username").execute().data or []):
-                en = (er.get("name") or er.get("username") or "").strip()
-                if en and er.get("id"):
-                    emp_name_to_id[en] = int(er["id"])
-        except Exception:
-            pass
-
         now_utc = datetime.now(timezone.utc).isoformat()
 
-        for np, info in lead_phone_map.items():
-            cust = norm_to_customer.get(np)
-            if not cust:
+        for l in all_leads:
+            np = _normalize_phone(l.get("phone") or "")
+            if not np or np not in phone_to_emp_names:
                 continue
 
             result["total_matched"] += 1
-            lead_id = info["id"]
-            upd: dict = {"updated_at": now_utc}
-            did_something = False
+            lead_id = l["id"]
+            stage = l.get("lead_stage") or "1_신규"
+            has_emp = bool(l.get("assigned_employee_id"))
 
-            # 단계 업데이트 (활성 리드만)
-            if info["stage"] not in ("4_계약완료", "5_실패", "6_보류"):
+            upd: dict = {"updated_at": now_utc}
+            did = False
+
+            if stage not in ("4_계약완료", "5_실패", "6_보류"):
                 upd["lead_stage"] = "4_계약완료"
                 upd["converted_at"] = now_utc
-                did_something = True
+                did = True
                 result["stage_updated"] += 1
 
-            # 담당직원 업데이트 (미설정인 경우)
-            if not info["has_emp"]:
-                emp_id = _find_employee_for_customer(supa, cust["id"], emp_name_to_id)
-                if emp_id:
-                    upd["assigned_employee_id"] = emp_id
-                    did_something = True
-                    result["emp_updated"] += 1
+            if not has_emp and np in phone_to_emp_id:
+                upd["assigned_employee_id"] = phone_to_emp_id[np]
+                did = True
+                result["emp_updated"] += 1
 
-            if did_something:
+            if did:
                 try:
                     supa.table("app_leads").update(upd).eq("id", lead_id).execute()
                 except Exception as e:
@@ -470,23 +520,6 @@ def _sync_leads_to_customers(full: bool = False) -> dict:
     except Exception as e:
         result["errors"].append(str(e)[:100])
         return result
-
-
-def _find_employee_for_customer(supa: Any, customer_id: int, emp_name_to_id: dict[str, int]) -> int | None:
-    """customer_id로 app_orders를 조회해 employee_names의 첫 번째 이름을 ID로 변환."""
-    try:
-        rows = supa.table("app_orders").select("employee_names") \
-            .eq("customer_id", customer_id) \
-            .not_.is_("employee_names", "null") \
-            .order("id", desc=True).limit(3).execute().data or []
-        for row in rows:
-            raw = row.get("employee_names") or ""
-            for name in (n.strip() for n in raw.split(",") if n.strip()):
-                if name in emp_name_to_id:
-                    return emp_name_to_id[name]
-    except Exception:
-        pass
-    return None
 
 
 def render_lead_management() -> None:
@@ -509,19 +542,30 @@ def render_lead_management() -> None:
         st.caption("빠른 응답은 생각보다 꽤 강력한 무기입니다. (전체 매장 공유)")
     with _hc2:
         if st.button("🔄 담당자 동기화", width="stretch", key="lead_btn_full_sync",
-                     help="구매완료 고객의 담당직원을 주문 데이터에서 다시 채웁니다"):
+                     help="실제 매출(app_orders)이 있는 고객만 담당직원을 다시 매핑합니다"):
             with st.spinner("동기화 중..."):
                 st.session_state.pop("_lead_synced", None)
                 _fsr = _sync_leads_to_customers(full=True)
-            if _fsr["errors"]:
-                st.warning(f"일부 오류: {_fsr['errors'][0]}")
-            st.success(
-                f"✅ 매칭 {_fsr['total_matched']}건 · "
-                f"단계 업데이트 {_fsr['stage_updated']}건 · "
-                f"담당자 업데이트 {_fsr['emp_updated']}건"
-            )
+            st.session_state["_sync_last_result"] = _fsr
             st.session_state["_lead_synced"] = True
             st.rerun()
+
+    # 동기화 결과 표시 (rerun 직후 1회만)
+    if st.session_state.get("_sync_last_result"):
+        _r = st.session_state.pop("_sync_last_result")
+        if _r.get("errors"):
+            st.warning(f"⚠️ 오류: {_r['errors'][0]}")
+        st.success(
+            f"✅ 매출 phone {_r['purchase_map_size']}건 로드 · "
+            f"리드 매칭 {_r['total_matched']}건 · "
+            f"단계 업데이트 {_r['stage_updated']}건 · "
+            f"담당자 업데이트 {_r['emp_updated']}건"
+        )
+        if _r['purchase_map_size'] == 0:
+            st.error(
+                "💡 매출 phone이 0건입니다. `app_orders.customer_id`가 비어있을 가능성. "
+                "Supabase에서 `SELECT COUNT(customer_id) FROM app_orders;`로 확인해 주세요."
+            )
     with _hc3:
         if st.button("📥 채널톡 가져오기", width="stretch", key="lead_btn_import_ct"):
             st.session_state["lead_show_import"] = True
@@ -560,23 +604,10 @@ def render_lead_management() -> None:
 
     emp_map = _get_employee_map()
 
-    # ── app_customers phone1/phone2 전체 로드 후 정규화 비교 (하이픈 유무 무관) ──
-    customer_phones: set[str] = set()
-    try:
-        _offset = 0
-        while True:
-            _batch = supa.table("app_customers").select("phone1,phone2") \
-                .range(_offset, _offset + 499).execute().data or []
-            for _r in _batch:
-                for _col in ("phone1", "phone2"):
-                    _cp = _normalize_phone(_r.get(_col) or "")
-                    if _cp:
-                        customer_phones.add(_cp)
-            if len(_batch) < 500:
-                break
-            _offset += 500
-    except Exception:
-        pass
+    # ── 구매완료 판정: app_orders(실제 매출)이 있는 phone만 ──
+    # 단순 app_customers 등록만으론 구매완료로 분류하지 않음
+    _purchase_map, _ = _build_purchase_map(supa)
+    customer_phones: set[str] = set(_purchase_map.keys())
 
     for _l in leads_raw:
         _l["_is_customer"] = _normalize_phone(_l.get("phone") or "") in customer_phones
