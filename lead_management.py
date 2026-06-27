@@ -366,8 +366,8 @@ def render_lead_management() -> None:
 
     try:
         leads_raw: list[dict] = supa.table("app_leads").select(
-            "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
-            "next_contact_date,assigned_store,assigned_employee_id,store_name,"
+            "id,phone,name,contact_person,lead_source,lead_stage,memo,contact_memo,"
+            "next_contact_date,assigned_store,assigned_employee_id,extra_assignee_ids,store_name,"
             "created_at,converted_at,revenue_amount,converted_order_id"
         ).order("created_at", desc=True).limit(500).execute().data or []
     except Exception as e:
@@ -479,12 +479,29 @@ def render_lead_management() -> None:
         st.info("조건에 맞는 리드가 없습니다.")
         return
 
+    # ── 담당직원 클릭 필터 표시 ────────────────
+    _filter_emp_id = st.session_state.get("lead_filter_emp_id")
+    if _filter_emp_id:
+        _filter_emp_name = emp_map.get(int(_filter_emp_id), "")
+        st.markdown(
+            f"<div style='background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;"
+            f"padding:6px 14px;margin-bottom:8px;font-size:0.85rem;color:#1e40af;display:inline-block;'>"
+            f"👤 <b>{_filter_emp_name}</b> 담당 리드 표시 중 "
+            f"<span style='cursor:pointer;margin-left:8px;'>(전체 보기 → 아래 필터 해제 클릭)</span></div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("✕ 담당자 필터 해제", key="clear_emp_filter"):
+            st.session_state.pop("lead_filter_emp_id", None)
+            st.rerun()
+        leads = [l for l in leads if l.get("assigned_employee_id") == _filter_emp_id
+                 or _filter_emp_id in (l.get("extra_assignee_ids") or [])]
+
     # ── 테이블 헤더 ───────────────────────────
-    _ths = ["회사명/이름", "담당자", "연락처", "유입경로", "상태", "담당직원", "등록일", ""]
-    _ws = [2, 1.6, 1.6, 1.2, 1.3, 1.3, 1.2, 0.8]
+    _ths = ["고객 이름/회사명", "고객사 담당자", "연락처", "유입경로", "상태", "우리 담당직원 ↓클릭=필터", "등록일", ""]
+    _ws = [2, 1.6, 1.6, 1.2, 1.5, 1.6, 1.1, 0.8]
     _hc = st.columns(_ws)
     for _c, _t in zip(_hc, _ths):
-        _c.markdown(f"<div style='color:#475569;font-weight:600;font-size:0.85rem;'>{_t}</div>", unsafe_allow_html=True)
+        _c.markdown(f"<div style='color:#475569;font-weight:600;font-size:0.82rem;'>{_t}</div>", unsafe_allow_html=True)
     st.markdown(
         "<div style='border-bottom:1px solid #e5e7eb;margin:0 0 4px 0;'></div>",
         unsafe_allow_html=True,
@@ -494,19 +511,33 @@ def render_lead_management() -> None:
     for _i, _lead in enumerate(leads):
         _lid = _lead.get("id")
         _name = _lead.get("name") or "—"
+        _contact_person = _lead.get("contact_person") or "—"
         _phone = _format_phone_display(_lead.get("phone") or "")
         _source = LEAD_SOURCE_LABELS.get(_lead.get("lead_source") or "", _lead.get("lead_source") or "—")
         _stage = _lead.get("lead_stage") or "1_신규"
         _stage_label = LEAD_STAGES.get(_stage, _stage)
         _bg = LEAD_STAGE_BADGE.get(_stage, "#e5e7eb")
         _fg = LEAD_STAGE_TEXT.get(_stage, "#374151")
-        _emp = emp_map.get(int(_lead.get("assigned_employee_id") or 0), "—")
-        _store = _lead.get("assigned_store") or _lead.get("store_name") or "—"
+
+        # 담당직원: primary + extra
+        _primary_emp_id = _lead.get("assigned_employee_id")
+        _extra_ids = _lead.get("extra_assignee_ids") or []
+        if isinstance(_extra_ids, str):
+            import json as _json
+            try:
+                _extra_ids = _json.loads(_extra_ids)
+            except Exception:
+                _extra_ids = []
+        _all_emp_ids = ([int(_primary_emp_id)] if _primary_emp_id else []) + [int(i) for i in _extra_ids if i]
+        _emp_names = [emp_map.get(_eid, f"#{_eid}") for _eid in _all_emp_ids if emp_map.get(_eid)]
+        _emp_display = " · ".join(_emp_names) if _emp_names else "—"
+
+        _store = _lead.get("assigned_store") or _lead.get("store_name") or ""
         _created = str(_lead.get("created_at") or "")[:10]
 
         _rc = st.columns(_ws)
         _rc[0].write(_name)
-        _rc[1].write(_name)
+        _rc[1].write(_contact_person)  # 고객사 담당자 (별도 입력)
         _rc[2].write(_phone)
         _rc[3].write(_source)
         _badge_html = (
@@ -521,7 +552,25 @@ def render_lead_management() -> None:
                 "🛒 구매완료</span>"
             )
         _rc[4].markdown(_badge_html, unsafe_allow_html=True)
-        _rc[5].markdown(f"{_emp}  \n<span style='color:#94a3b8;font-size:0.72rem;'>{_store}</span>", unsafe_allow_html=True)
+
+        # 담당직원 — 클릭 시 해당 직원 필터
+        with _rc[5]:
+            if _emp_names:
+                for _eid in _all_emp_ids:
+                    _en = emp_map.get(_eid, "")
+                    if _en and st.button(
+                        f"👤 {_en}", key=f"emp_filter_{_lid}_{_eid}_{_i}",
+                        help="클릭하면 이 담당자의 리드만 표시",
+                    ):
+                        st.session_state["lead_filter_emp_id"] = _eid
+                        st.rerun()
+            else:
+                st.markdown(
+                    f"<span style='color:#94a3b8;font-size:0.82rem;'>—</span>"
+                    f"<br><span style='color:#cbd5e1;font-size:0.72rem;'>{_store}</span>",
+                    unsafe_allow_html=True,
+                )
+
         _rc[6].write(_created)
         with _rc[7]:
             _is_sel = st.session_state.get("lead_selected_id") == _lid
@@ -606,8 +655,16 @@ def _render_register_form() -> None:
         with cc1:
             phone_in = st.text_input("전화번호 *", placeholder="010-0000-0000")
         with cc2:
-            name_in = st.text_input("성함")
-        store_in = st.text_input("담당 매장", value=default_store, placeholder="예: 울산삼산점")
+            name_in = st.text_input("성함 / 회사명")
+        cc1b, cc2b = st.columns(2)
+        with cc1b:
+            contact_person_in = st.text_input(
+                "고객사 담당자",
+                placeholder="예: 김부장, 구매팀장 등",
+                help="고객 내부에서 실제로 응대하는 담당자 이름 (선택)",
+            )
+        with cc2b:
+            store_in = st.text_input("담당 매장", value=default_store, placeholder="예: 울산삼산점")
         memo_in = st.text_area("상담 메모", height=80, placeholder="예: 토레도 소파 4인용 가격 문의")
         cc3, cc4 = st.columns(2)
         with cc3:
@@ -642,6 +699,14 @@ def _render_register_form() -> None:
                 send_now=send_now,
                 image_url=image_in or "",
             )
+            # 고객사 담당자 별도 저장
+            if result.get("ok") and result.get("lead_id") and contact_person_in.strip():
+                try:
+                    _supa().table("app_leads").update(
+                        {"contact_person": contact_person_in.strip()}
+                    ).eq("id", result["lead_id"]).execute()
+                except Exception:
+                    pass
         except Exception as e:
             st.error(f"오류: {e}")
             return
@@ -864,16 +929,63 @@ def _render_stage_change_tab(lead: dict) -> None:
         key=f"stage_sel_{_lid}",
     )
     _nc = st.date_input("다음 연락 예정일", value=None, key=f"stage_nc_{_lid}")
-    _memo = st.text_area("사후 메모", height=80, key=f"stage_memo_{_lid}")
+    _memo = st.text_area("사후 메모", height=70, key=f"stage_memo_{_lid}")
 
-    if st.button("단계 업데이트", type="primary", key=f"stage_btn_{_lid}", width="stretch"):
+    st.divider()
+    st.markdown("**👤 고객사 담당자 / 담당직원 편집**")
+
+    _contact_person_cur = lead.get("contact_person") or ""
+    _contact_person_new = st.text_input(
+        "고객사 담당자 이름",
+        value=_contact_person_cur,
+        placeholder="예: 김부장, 이사장 등 고객측 담당자",
+        key=f"contact_person_{_lid}",
+        help="채널톡에서 넘어온 이름과 별개로, 고객사 내 실제 담당자를 입력합니다.",
+    )
+
+    emp_map = _get_employee_map()
+    all_emp_options = sorted(emp_map.items(), key=lambda x: x[1])
+    _emp_ids_ordered = [k for k, _ in all_emp_options]
+    _emp_labels = [v for _, v in all_emp_options]
+
+    # 현재 담당자 목록 (primary + extra)
+    _primary = lead.get("assigned_employee_id")
+    _extra_raw = lead.get("extra_assignee_ids") or []
+    if isinstance(_extra_raw, str):
+        import json as _json
+        try:
+            _extra_raw = _json.loads(_extra_raw)
+        except Exception:
+            _extra_raw = []
+    _cur_ids = set(([int(_primary)] if _primary else []) + [int(i) for i in _extra_raw if i])
+    _default_sel = [_emp_labels[_i] for _i, _k in enumerate(_emp_ids_ordered) if _k in _cur_ids]
+
+    _sel_names = st.multiselect(
+        "담당직원 (복수 선택 가능)",
+        _emp_labels,
+        default=_default_sel,
+        key=f"stage_emp_{_lid}",
+        help="첫 번째 선택이 주 담당자로 저장됩니다.",
+    )
+
+    if st.button("업데이트 저장", type="primary", key=f"stage_btn_{_lid}", width="stretch"):
         supa = _supa()
         if not supa:
             st.error("Supabase 연결 실패")
             return
+
+        # 선택된 직원 → id 변환
+        _sel_ids = [_k for _k, _v in emp_map.items() if _v in _sel_names]
+        _new_primary = _sel_ids[0] if _sel_ids else None
+        _new_extra = _sel_ids[1:] if len(_sel_ids) > 1 else []
+
+        import json as _json
         _upd: dict = {
             "lead_stage": _new,
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "assigned_employee_id": _new_primary,
+            "extra_assignee_ids": _json.dumps(_new_extra),
+            "contact_person": _contact_person_new.strip() or None,
         }
         if _memo:
             _upd["contact_memo"] = _memo
@@ -882,7 +994,7 @@ def _render_stage_change_tab(lead: dict) -> None:
             _upd["next_contact_date"] = str(_nc)
         try:
             supa.table("app_leads").update(_upd).eq("id", _lid).execute()
-            st.success(f"✅ {LEAD_STAGES[_new]} 단계로 업데이트 완료")
+            st.success(f"✅ {LEAD_STAGES[_new]} 단계 + 담당직원 업데이트 완료")
             st.session_state.pop("lead_selected_id", None)
             st.rerun()
         except Exception as e:
