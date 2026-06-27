@@ -20,9 +20,23 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 MOMO_APP_URL = os.environ.get("MOMO_APP_URL", "")
+
+
+def _get_supa_config() -> tuple[str, str]:
+    """Supabase URL·Service Key를 st.secrets 우선, 환경변수 폴백으로 반환."""
+    try:
+        import streamlit as st  # noqa: WPS433
+        sec = st.secrets.get("supabase", {}) if hasattr(st, "secrets") else {}
+        url = sec.get("url", "") or os.environ.get("SUPABASE_URL", "")
+        key = (
+            sec.get("service_role_key", "")
+            or sec.get("key", "")
+            or os.environ.get("SUPABASE_SERVICE_KEY", "")
+        )
+        return url, key
+    except Exception:
+        return os.environ.get("SUPABASE_URL", ""), os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 
 # ──────────────────────────────────────────
@@ -30,16 +44,18 @@ MOMO_APP_URL = os.environ.get("MOMO_APP_URL", "")
 # ──────────────────────────────────────────
 
 def _supa_headers() -> dict[str, str]:
+    _, key = _get_supa_config()
     return {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
 
 
 def _supa_url(table: str) -> str:
-    return f"{SUPABASE_URL}/rest/v1/{table}"
+    url, _ = _get_supa_config()
+    return f"{url}/rest/v1/{table}"
 
 
 def _normalize_phone(phone: str) -> str:
