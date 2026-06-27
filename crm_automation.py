@@ -225,9 +225,9 @@ def _build_solapi_payload(
             text = "(광고) " + text
         msg: dict[str, Any] = {
             "to": re.sub(r"\D", "", phone),
-            "from": "",  # Solapi 등록 발신번호로 교체 필요
+            "from": "",  # send_batch()에서 secrets의 sender로 자동 주입
             "text": text,
-            "type": "ATA" if is_kakao else "LMS",
+            "type": "CTA" if is_kakao else "LMS",  # CTA = 친구톡 텍스트
         }
         if is_kakao:
             kakao_opts: dict[str, Any] = {
@@ -646,10 +646,25 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
         )
 
         if trigger == "즉시 발송":
-            # 즉시 발송: Payload 확인 후 성공 처리
-            # 실제 Solapi 호출은 아래 주석 해제 후 사용
-            # import solapi; solapi.send_many(payload["messages"])
-            st.success(f"✅ 총 **{n_targets}명**에게 발송 명령이 전달되었습니다.")
+            try:
+                from solapi_sender import send_batch  # noqa: WPS433
+                with st.spinner(f"Solapi로 {n_targets}명에게 발송 중..."):
+                    result = send_batch(payload["messages"])
+                sent_n = result.get("sent", 0)
+                failed_n = result.get("failed", 0)
+                errs = result.get("errors", [])
+                if failed_n == 0:
+                    st.success(f"✅ 총 **{sent_n}명** 발송 완료!")
+                elif sent_n > 0:
+                    st.warning(f"⚠️ {sent_n}명 성공 / {failed_n}명 실패")
+                    for e in errs:
+                        st.error(e)
+                else:
+                    st.error(f"❌ 발송 실패 ({failed_n}명)")
+                    for e in errs:
+                        st.error(e)
+            except ImportError:
+                st.error("solapi_sender 모듈을 불러올 수 없습니다.")
             with st.expander("📄 Solapi 발송 Payload (검토용)", expanded=False):
                 st.json(payload)
 

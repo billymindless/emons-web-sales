@@ -443,3 +443,69 @@ def send_mms(
         pass
 
     return {"status": "sent", "msg_id": msg_id, "error": None, "raw": raw}
+
+
+def send_batch(
+    messages: list[dict],
+    *,
+    chunk_size: int = 100,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """
+    다수 고객에게 메시지 일괄 발송 (CRM 캠페인용).
+
+    messages: Solapi 규격의 메시지 dict 리스트.
+              'from'이 비어있으면 secrets의 sender로 자동 주입.
+    chunk_size: 1회 API 호출 당 최대 메시지 수 (Solapi 권장 ≤ 100).
+
+    반환:
+        {"total": int, "sent": int, "failed": int, "errors": list[str]}
+    """
+    sec = _get_secrets()
+    api_key = sec.get("api_key", "")
+    api_secret = sec.get("api_secret", "")
+    sender_no = sec.get("sender", "")
+
+    if not api_key or not api_secret:
+        return {
+            "total": len(messages), "sent": 0,
+            "failed": len(messages), "errors": ["solapi_secrets_missing"],
+        }
+
+    for m in messages:
+        if not m.get("from"):
+            m["from"] = sender_no
+
+    total = len(messages)
+    sent_count = 0
+    failed_count = 0
+    errors: list[str] = []
+
+    for i in range(0, total, chunk_size):
+        chunk = messages[i: i + chunk_size]
+        hdrs = {
+            "Authorization": _build_auth_header(api_key, api_secret),
+            "Content-Type": "application/json",
+        }
+        try:
+            r = requests.post(
+                SOLAPI_BASE_URL + SOLAPI_SEND_PATH,
+                json={"messages": chunk},
+                headers=hdrs,
+                timeout=timeout,
+            )
+            try:
+                rj: dict[str, Any] = r.json()
+            except Exception:
+                rj = {"text": r.text[:300]}
+
+            if r.status_code >= 400:
+                failed_count += len(chunk)
+                errors.append(f"청크 {i // chunk_size + 1} 오류: {str(rj)[:200]}")
+            else:
+                sent_count += len(chunk)
+        except requests.RequestException as e:
+            failed_count += len(chunk)
+            errors.append(f"청크 {i // chunk_size + 1} 네트워크 오류: {e}")
+
+    return {"total": total, "sent": sent_count, "failed": failed_count, "errors": errors}
