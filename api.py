@@ -4,7 +4,6 @@
 
 현재 제공 엔드포인트:
   POST /webhook/solapi/friend-added     — Solapi 카카오채널 친구추가 이벤트 수신
-  POST /webhook/solapi/message-received — 고객이 카카오채널로 보낸 메시지 수신
   POST /webhook/sms/deposit             — 기업은행 입금 SMS 수신
   POST /webhook/imweb/member            — 아임웹 신규 회원가입 이벤트 수신
   POST /webhook/imweb/order             — 아임웹 주문/배송 이벤트 수신
@@ -299,101 +298,6 @@ async def solapi_friend_added_webhook(request: Request) -> JSONResponse:
         "sender_key": sender_key or None,
     }, status_code=200)
 
-
-@app.post("/webhook/solapi/message-received", summary="카카오채널 고객 수신 메시지")
-async def solapi_message_received_webhook(request: Request) -> JSONResponse:
-    """
-    고객이 카카오 비즈니스 채널로 보낸 메시지 수신.
-    - Solapi Signature 검증
-    - user_key → kakao_mapping → customer_id 조회
-    - app_customer_messages에 direction='inbound'로 저장
-    - 200 OK 즉시 반환 (타임아웃 방지)
-    """
-    if not _verify_solapi_secret(request):
-        logger.warning("message-received: Solapi Secret 검증 실패")
-        return JSONResponse({"status": "error", "reason": "unauthorized"}, status_code=401)
-
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-
-    # Solapi 인바운드 메시지 페이로드에서 필드 추출
-    user_key = (
-        payload.get("userKey")
-        or payload.get("user_key")
-        or (payload.get("data", {}) or {}).get("userKey")
-        or ""
-    )
-    message_text = (
-        payload.get("text")
-        or payload.get("content")
-        or payload.get("message")
-        or (payload.get("data", {}) or {}).get("text")
-        or ""
-    )
-    message_type = payload.get("messageType") or payload.get("type") or "text"
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    headers = _supa_headers()
-    customer_id = None
-    store_name = None
-    saved = False
-
-    if not user_key:
-        logger.info("message-received: user_key 없음 — 무시")
-        return JSONResponse({"status": "ignored", "reason": "no_user_key"}, status_code=200)
-
-    if headers:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                # 1) kakao_mapping에서 customer_id 조회
-                mapping_resp = await client.get(
-                    _supa_url("kakao_mapping")
-                    + f"?kakao_user_key=eq.{user_key}&select=customer_id,store_name",
-                    headers=headers,
-                )
-                if mapping_resp.status_code < 300:
-                    mapping_data = mapping_resp.json()
-                    if mapping_data:
-                        customer_id = mapping_data[0].get("customer_id")
-                        store_name = mapping_data[0].get("store_name")
-
-                # 2) app_customer_messages에 인바운드 메시지 저장
-                msg_row = {
-                    "customer_id": customer_id,
-                    "store_name": store_name,
-                    "phone": None,
-                    "message_type": message_type,
-                    "channel": "friendtalk",
-                    "status": "received",
-                    "message_body": message_text,
-                    "direction": "inbound",
-                    "kakao_user_key": user_key,
-                    "sent_by": "customer",
-                    "created_at": now_iso,
-                }
-                msg_resp = await client.post(
-                    _supa_url("app_customer_messages"),
-                    headers={**headers, "Prefer": "return=minimal"},
-                    json=msg_row,
-                )
-                saved = msg_resp.status_code < 300
-                if not saved:
-                    logger.warning(
-                        "message-received: app_customer_messages 저장 실패 %s: %s",
-                        msg_resp.status_code, msg_resp.text[:200],
-                    )
-
-        except Exception as e:
-            logger.warning("solapi_message_received_webhook 처리 실패: %s", e)
-
-    return JSONResponse({
-        "status": "ok",
-        "user_key": user_key,
-        "customer_id": customer_id,
-        "saved": saved,
-    }, status_code=200)
 
 
 @app.post("/webhook/sms/deposit", summary="기업은행 입금 SMS 수신")
