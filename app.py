@@ -22304,6 +22304,7 @@ def render_new_sales():
                     phone=str(phone1 or ""),
                     order_id=order_id,
                     revenue=float(final_sales_save),
+                    employee_names=str(employee_names_str or ""),
                 )
             except Exception:
                 pass  # 리드 클로즈 실패가 매출 등록 화면을 깨지 않도록

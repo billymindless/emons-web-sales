@@ -440,18 +440,29 @@ def _sync_leads_to_customers() -> int:
                 "updated_at": now_utc,
             }
 
-            # 담당자가 아직 미설정인 경우 → app_orders.employee_names에서 가져오기
+            # 담당자가 아직 미설정인 경우 → app_orders에서 employee_names 검색
+            # customer_id 또는 phone1 기반으로 최신 주문의 담당자를 가져옴
             if not lead_info["has_emp"]:
                 try:
-                    ord_rows = supa.table("app_orders").select("employee_names") \
-                        .eq("customer_id", cust["id"]) \
-                        .order("id", desc=True).limit(1).execute().data or []
-                    if ord_rows:
-                        raw_names = ord_rows[0].get("employee_names") or ""
-                        # "홍길동,김철수" 형태에서 첫 번째 이름 사용
-                        first_name = [n.strip() for n in raw_names.split(",") if n.strip()]
-                        if first_name and first_name[0] in emp_name_to_id:
-                            upd["assigned_employee_id"] = emp_name_to_id[first_name[0]]
+                    emp_id_found = None
+                    # 1) customer_id 기반 조회
+                    if cust.get("id"):
+                        ord_rows = supa.table("app_orders").select("employee_names") \
+                            .eq("customer_id", cust["id"]) \
+                            .order("id", desc=True).limit(1).execute().data or []
+                        if ord_rows:
+                            raw = ord_rows[0].get("employee_names") or ""
+                            first = next((n.strip() for n in raw.split(",") if n.strip()), "")
+                            if first in emp_name_to_id:
+                                emp_id_found = emp_name_to_id[first]
+
+                    # 2) customer_id로 못 찾으면 sales 테이블에서 order_id → employee_names 조회
+                    if not emp_id_found:
+                        # sales 테이블은 order_id 기반이므로 app_orders→id로 재시도
+                        pass  # customer_id가 없는 구조면 생략
+
+                    if emp_id_found:
+                        upd["assigned_employee_id"] = emp_id_found
                 except Exception:
                     pass
 

@@ -3,6 +3,13 @@
 -- app_customers.phone1/phone2 → 숫자 정규화 후 app_leads.phone과 매칭
 -- ============================================================
 
+-- 0) [진단] app_orders에 customer_id가 실제로 채워져 있는지 확인
+SELECT COUNT(*) AS total_orders,
+       COUNT(customer_id) AS orders_with_customer_id,
+       COUNT(employee_names) AS orders_with_employee
+FROM app_orders
+LIMIT 1;
+
 -- 1) 현황 확인 (실행 전 반드시 확인)
 SELECT
     l.id          AS lead_id,

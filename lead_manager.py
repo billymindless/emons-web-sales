@@ -285,12 +285,37 @@ def send_nurturing_message(lead: dict[str, Any]) -> dict[str, Any]:
 # 매출 등록 시 리드 자동 클로즈
 # ──────────────────────────────────────────
 
-def auto_close_lead(phone: str, order_id: int, revenue: float) -> bool:
+def _resolve_employee_id(employee_names: str) -> int | None:
+    """employee_names 문자열(콤마 구분)의 첫 번째 이름을 app_users.id로 변환."""
+    first_name = next(
+        (n.strip() for n in (employee_names or "").split(",") if n.strip()), None
+    )
+    if not first_name:
+        return None
+    try:
+        resp = httpx.get(
+            _supa_url("app_users"),
+            params={"name": f"eq.{first_name}", "select": "id", "limit": "1"},
+            headers=_supa_headers(),
+            timeout=5.0,
+        )
+        rows = resp.json() if resp.status_code < 400 else []
+        if rows and isinstance(rows, list):
+            return int(rows[0]["id"])
+    except Exception:
+        pass
+    return None
+
+
+def auto_close_lead(
+    phone: str,
+    order_id: int,
+    revenue: float,
+    employee_names: str = "",
+) -> bool:
     """
     매출 등록 시 호출. app_leads에서 동일 전화번호의 활성 리드를 찾아 자동 클로즈.
-
-    매칭 우선순위: lead_stage 낮은 단계 → 최근 생성순.
-    매칭 실패 시 False 반환 (조용히 무시).
+    employee_names(콤마 구분 직원 이름)를 받아 assigned_employee_id도 자동 업데이트.
 
     Returns:
         True if a lead was closed, False otherwise.
@@ -307,7 +332,7 @@ def auto_close_lead(phone: str, order_id: int, revenue: float) -> bool:
                 "lead_stage": "not.in.(4_계약완료,5_실패,6_보류)",
                 "order": "lead_stage.asc,created_at.asc",
                 "limit": "1",
-                "select": "id",
+                "select": "id,assigned_employee_id",
             },
             headers=_supa_headers(),
             timeout=5.0,
@@ -320,18 +345,28 @@ def auto_close_lead(phone: str, order_id: int, revenue: float) -> bool:
         return False
 
     lead_id = data[0]["id"]
+    current_emp_id = data[0].get("assigned_employee_id")
     now_utc = datetime.now(timezone.utc).isoformat()
+
+    patch_body: dict = {
+        "lead_stage": "4_계약완료",
+        "converted_at": now_utc,
+        "converted_order_id": order_id,
+        "revenue_amount": revenue,
+        "updated_at": now_utc,
+    }
+
+    # 담당자가 아직 미설정이고 employee_names가 주어진 경우 → ID 조회 후 반영
+    if not current_emp_id and employee_names:
+        emp_id = _resolve_employee_id(employee_names)
+        if emp_id:
+            patch_body["assigned_employee_id"] = emp_id
+            logger.info("리드 담당자 자동 매핑: lead_id=%s employee_names=%s → id=%s", lead_id, employee_names, emp_id)
 
     try:
         httpx.patch(
             _supa_url("app_leads") + f"?id=eq.{lead_id}",
-            json={
-                "lead_stage": "4_계약완료",
-                "converted_at": now_utc,
-                "converted_order_id": order_id,
-                "revenue_amount": revenue,
-                "updated_at": now_utc,
-            },
+            json=patch_body,
             headers=_supa_headers(),
             timeout=5.0,
         )
