@@ -918,6 +918,15 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
                         "out_of_hours": "야간 발송 거부",
                     }.get(_st, f"미발송 ({_st})" if _st else "즉시발송 OFF")
                     st.success(f"등록 완료 — lead_id: {result['lead_id']} | 메시지: {send_label}")
+                elif result.get("error") == "duplicate_phone":
+                    ex = result.get("existing", {})
+                    st.warning(
+                        f"⚠️ 이미 등록된 번호입니다 — "
+                        f"lead_id: {result.get('lead_id')} | "
+                        f"성함: {ex.get('name', '—')} | "
+                        f"단계: {ex.get('lead_stage', '—')} | "
+                        f"등록일: {str(ex.get('created_at', ''))[:10]}"
+                    )
 
                     # app_chat_history에도 상담 메모 저장
                     if memo_input:

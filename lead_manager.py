@@ -126,6 +126,28 @@ def register_lead(
         "next_nurture_at": next_nurture_at,
     }
 
+    # ── 중복 전화번호 체크 ──────────────────────
+    try:
+        chk = httpx.get(
+            _supa_url("app_leads") + f"?phone=eq.{normalized}&store_name=eq.{store_name}"
+            "&select=id,name,lead_stage,created_at&limit=1",
+            headers=_supa_headers(),
+            timeout=5.0,
+        )
+        if chk.status_code < 300:
+            existing = chk.json()
+            if existing:
+                ex = existing[0]
+                return {
+                    "ok": False,
+                    "lead_id": ex.get("id"),
+                    "send_result": None,
+                    "error": "duplicate_phone",
+                    "existing": ex,
+                }
+    except Exception:
+        pass  # 체크 실패 시 등록 계속 진행
+
     lead_id: int | None = None
     try:
         resp = httpx.post(
