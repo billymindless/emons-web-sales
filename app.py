@@ -14280,6 +14280,73 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 
 
 # =====================================================================
+# 💬 Solapi 수동 메시지 발송
+# =====================================================================
+
+def render_send_message():
+    """Solapi를 통해 친구톡 또는 SMS를 수동으로 발송하는 UI."""
+    st.title("💬 메시지 발송")
+    st.caption("Solapi를 통해 카카오 친구톡 또는 SMS를 수동으로 발송합니다.")
+
+    try:
+        from solapi_sender import send_friendtalk, send_sms  # noqa: WPS433
+    except ImportError:
+        st.error("solapi_sender 모듈을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
+        return
+
+    with st.form("manual_send_form", clear_on_submit=False):
+        msg_type = st.selectbox(
+            "메시지 유형",
+            ["친구톡 (FriendTalk)", "SMS / LMS"],
+            help="친구톡: 카카오채널 친구인 고객에게 전송. SMS: 친구 여부 무관하게 문자 전송.",
+        )
+        to_phone = st.text_input(
+            "수신자 전화번호",
+            placeholder="01012345678 (숫자만 또는 하이픈 포함)",
+        )
+        body = st.text_area(
+            "메시지 내용",
+            height=160,
+            placeholder="발송할 메시지를 입력하세요.",
+        )
+        submitted = st.form_submit_button("📤 발송", type="primary", use_container_width=True)
+
+    if submitted:
+        if not to_phone.strip():
+            st.warning("수신자 전화번호를 입력해 주세요.")
+            return
+        if not body.strip():
+            st.warning("메시지 내용을 입력해 주세요.")
+            return
+
+        with st.spinner("발송 중..."):
+            if msg_type.startswith("친구톡"):
+                result = send_friendtalk(to_phone.strip(), body.strip())
+            else:
+                result = send_sms(to_phone.strip(), body.strip())
+
+        status = result.get("status", "")
+        msg_id = result.get("msg_id")
+        error = result.get("error")
+
+        if status == "sent":
+            st.success(f"✅ 발송 성공! (msg_id: {msg_id or '—'})")
+        elif status == "skipped":
+            st.warning(f"⚠️ 발송 보류: {error} — Solapi 설정(api_key / pf_id 등)을 확인해 주세요.")
+        elif status == "out_of_hours":
+            st.warning("🌙 야간 시간대(21:00~08:00)로 인해 발송이 거부되었습니다.")
+        elif status == "not_friend":
+            st.warning("👥 해당 고객이 카카오채널 친구가 아닙니다. SMS로 재시도해 주세요.")
+        elif status == "lms_fallback":
+            st.info(f"📩 이미지 업로드 실패로 LMS(문자)로 대체 발송되었습니다. (msg_id: {msg_id or '—'})")
+        else:
+            st.error(f"❌ 발송 실패: {error}")
+
+        with st.expander("응답 상세 보기"):
+            st.json(result.get("raw") or {"status": status, "error": error})
+
+
+# =====================================================================
 # 📊 고객의 소리(VOC) 분석 대시보드
 # =====================================================================
 
@@ -26424,6 +26491,8 @@ def main():
     if st.sidebar.button("📁 자료실", width='stretch'):
         st.session_state["active_admin_page"] = "document_library"
     if role in ("store_admin", "superadmin"):
+        if st.sidebar.button("💬 메시지 발송", width='stretch'):
+            st.session_state["active_admin_page"] = "send_message"
         if st.sidebar.button("📊 고객의 소리(VOC)", width='stretch'):
             st.session_state["active_admin_page"] = "voc_dashboard"
         if st.sidebar.button("📈 인력 효율 분석", width='stretch'):
@@ -26496,6 +26565,11 @@ def main():
     # 자료실 라우팅 (전 역할 공통)
     if st.session_state.get("active_admin_page") == "document_library":
         render_document_library()
+        return
+
+    # 메시지 수동 발송 라우팅 (store_admin / superadmin 전용)
+    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "send_message":
+        render_send_message()
         return
 
     # VOC 대시보드 라우팅 (store_admin / superadmin 전용)
