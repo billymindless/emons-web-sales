@@ -309,56 +309,166 @@ def simulate_mattress_entry(
 # 시각화
 # ────────────────────────────────────────────────────────────────
 
-def _render_floor_plan(inner_w: int, inner_d: int, mat_w: int, mat_l: int) -> None:
-    """엘리베이터 평면도와 매트리스 배치를 matplotlib로 시각화."""
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-    from matplotlib.transforms import Affine2D
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-
-    elev = patches.Rectangle(
-        (0, 0), inner_w / 1000, inner_d / 1000,
-        linewidth=2, edgecolor="#0ea5e9", facecolor="#f0f9ff",
+def _box_mesh(
+    x0: float, y0: float, z0: float,
+    dx: float, dy: float, dz: float,
+    color: str, opacity: float = 0.5, name: str = "",
+):
+    """plotly Mesh3d 직육면체 생성. 좌표는 m 단위 권장."""
+    import plotly.graph_objects as go
+    x = [x0, x0 + dx, x0 + dx, x0, x0, x0 + dx, x0 + dx, x0]
+    y = [y0, y0, y0 + dy, y0 + dy, y0, y0, y0 + dy, y0 + dy]
+    z = [z0, z0, z0, z0, z0 + dz, z0 + dz, z0 + dz, z0 + dz]
+    # 12개 삼각형 면 인덱스
+    i = [0, 0, 0, 0, 4, 4, 1, 1, 2, 2, 3, 3]
+    j = [1, 2, 4, 3, 5, 6, 2, 5, 6, 3, 7, 0]
+    k = [2, 3, 7, 7, 6, 7, 6, 6, 7, 7, 4, 4]
+    return go.Mesh3d(
+        x=x, y=y, z=z, i=i, j=j, k=k,
+        color=color, opacity=opacity, name=name,
+        flatshading=True, showscale=False,
+        hoverinfo="name",
     )
-    ax.add_patch(elev)
 
-    fits = False
-    fit_deg = 0
-    for deg in range(0, 91, 1):
+
+def _box_wireframe(
+    x0: float, y0: float, z0: float,
+    dx: float, dy: float, dz: float,
+    color: str, name: str = "",
+):
+    """직육면체 12개 모서리 라인."""
+    import plotly.graph_objects as go
+    pts = [
+        (x0, y0, z0), (x0+dx, y0, z0), (x0+dx, y0+dy, z0), (x0, y0+dy, z0),
+        (x0, y0, z0+dz), (x0+dx, y0, z0+dz), (x0+dx, y0+dy, z0+dz), (x0, y0+dy, z0+dz),
+    ]
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    xs, ys, zs = [], [], []
+    for a, b in edges:
+        xs += [pts[a][0], pts[b][0], None]
+        ys += [pts[a][1], pts[b][1], None]
+        zs += [pts[a][2], pts[b][2], None]
+    return go.Scatter3d(
+        x=xs, y=ys, z=zs, mode="lines",
+        line=dict(color=color, width=4),
+        name=name, hoverinfo="name", showlegend=True,
+    )
+
+
+def _decide_mattress_pose(
+    inner_w: int, inner_d: int, inner_h: int,
+    mat_w: int, mat_l: int, mat_t: int,
+    safety_mm: int,
+) -> dict | None:
+    """
+    가장 적합한 매트리스 자세 결정 후 박스 좌표 반환.
+
+    Returns: {"dx","dy","dz","x0","y0","z0","pose","rot_deg"} (mm) 또는 None
+    """
+    iw, id_, ih = inner_w - safety_mm, inner_d - safety_mm, inner_h - safety_mm
+
+    # 1) 눕힘 직진 (가로/세로 그대로)
+    if mat_t <= ih and mat_w <= iw and mat_l <= id_:
+        return {
+            "dx": mat_w, "dy": mat_l, "dz": mat_t,
+            "x0": safety_mm // 2, "y0": safety_mm // 2, "z0": 0,
+            "pose": "눕힘 직진 (회전 없음)", "rot_deg": 0,
+        }
+    if mat_t <= ih and mat_l <= iw and mat_w <= id_:
+        return {
+            "dx": mat_l, "dy": mat_w, "dz": mat_t,
+            "x0": safety_mm // 2, "y0": safety_mm // 2, "z0": 0,
+            "pose": "눕힘 90° 회전", "rot_deg": 90,
+        }
+    # 2) 평면 회전 — 단순 표현 위해 박스를 대각선 위치에 표시
+    for deg in range(1, 90):
         rad = math.radians(deg)
         c, s = abs(math.cos(rad)), abs(math.sin(rad))
         rw = mat_w * c + mat_l * s
         rd = mat_w * s + mat_l * c
-        if rw <= inner_w and rd <= inner_d:
-            fits = True
-            fit_deg = deg
-            break
+        if mat_t <= ih and rw <= iw and rd <= id_:
+            # 회전된 bounding box로 단순화
+            return {
+                "dx": rw, "dy": rd, "dz": mat_t,
+                "x0": (inner_w - rw) / 2,
+                "y0": (inner_d - rd) / 2,
+                "z0": 0,
+                "pose": f"눕힘 + 내부 회전 {deg}°",
+                "rot_deg": deg,
+            }
+    # 3) 세움 — 긴변 수직, 짧은변 바닥, 두께 또 다른 바닥축
+    long_side = max(mat_w, mat_l)
+    short_side = min(mat_w, mat_l)
+    if long_side <= ih and short_side <= iw and mat_t <= id_:
+        return {
+            "dx": short_side, "dy": mat_t, "dz": long_side,
+            "x0": safety_mm // 2, "y0": safety_mm // 2, "z0": 0,
+            "pose": f"세움 (짧은변 {short_side}mm 바닥, 긴변 {long_side}mm 수직)",
+            "rot_deg": 0,
+        }
+    if long_side <= ih and short_side <= id_ and mat_t <= iw:
+        return {
+            "dx": mat_t, "dy": short_side, "dz": long_side,
+            "x0": safety_mm // 2, "y0": safety_mm // 2, "z0": 0,
+            "pose": f"세움 (벽면 부착, 긴변 {long_side}mm 수직)",
+            "rot_deg": 0,
+        }
+    return None
 
-    if fits:
-        cx, cy = (inner_w / 2) / 1000, (inner_d / 2) / 1000
-        mat = patches.Rectangle(
-            (-mat_w / 2 / 1000, -mat_l / 2 / 1000),
-            mat_w / 1000, mat_l / 1000,
-            linewidth=2, edgecolor="#16a34a", facecolor="#dcfce7", alpha=0.6,
-        )
-        t = Affine2D().rotate_deg(fit_deg).translate(cx, cy) + ax.transData
-        mat.set_transform(t)
-        ax.add_patch(mat)
-        ax.set_title(f"매트리스 회전 {fit_deg}°에서 평면 안착 가능", fontsize=11)
+
+def _render_3d_view(
+    inner_w: int, inner_d: int, inner_h: int,
+    mat_w: int, mat_l: int, mat_t: int,
+    safety_mm: int,
+) -> None:
+    """엘리베이터와 매트리스를 3D 인터랙티브 뷰로 시각화."""
+    import plotly.graph_objects as go
+
+    # mm → m 변환
+    iw, id_, ih = inner_w / 1000, inner_d / 1000, inner_h / 1000
+
+    fig = go.Figure()
+
+    # 엘리베이터 내부 박스 (와이어프레임 + 바닥)
+    fig.add_trace(_box_wireframe(0, 0, 0, iw, id_, ih,
+                                 color="#0284c7", name=f"엘리베이터 {inner_w}×{inner_d}×{inner_h}mm"))
+    fig.add_trace(_box_mesh(0, 0, 0, iw, id_, 0.02,
+                            color="#bae6fd", opacity=0.5, name="바닥"))
+
+    # 매트리스 자세 결정
+    pose = _decide_mattress_pose(inner_w, inner_d, inner_h, mat_w, mat_l, mat_t, safety_mm)
+
+    if pose:
+        dx, dy, dz = pose["dx"] / 1000, pose["dy"] / 1000, pose["dz"] / 1000
+        x0, y0, z0 = pose["x0"] / 1000, pose["y0"] / 1000, pose["z0"] / 1000
+        fig.add_trace(_box_mesh(x0, y0, z0, dx, dy, dz,
+                                color="#22c55e", opacity=0.7,
+                                name=f"매트리스 ({pose['pose']})"))
+        fig.add_trace(_box_wireframe(x0, y0, z0, dx, dy, dz,
+                                     color="#15803d", name="매트리스 외곽"))
+        title = f"매트리스 자세: {pose['pose']}"
     else:
-        ax.set_title(f"매트리스 {mat_w}×{mat_l}mm는 평면으로 안착 불가 — 세움 진입 검토", fontsize=10)
+        title = "매트리스 진입 불가 — 빈 엘리베이터만 표시"
 
-    bound = max(inner_w, mat_w, mat_l) / 1000
-    ax.set_xlim(-0.2, bound + 0.2)
-    ax.set_ylim(-0.2, bound + 0.2)
-    ax.set_aspect("equal")
-    ax.set_xlabel("폭 W (m)")
-    ax.set_ylabel("깊이 D (m)")
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(title="폭 W (m)", range=[-0.1, iw + 0.3]),
+            yaxis=dict(title="깊이 D (m)", range=[-0.1, id_ + 0.3]),
+            zaxis=dict(title="높이 H (m)", range=[0, ih + 0.2]),
+            aspectmode="data",
+            camera=dict(eye=dict(x=1.6, y=1.6, z=1.1)),
+        ),
+        title=dict(text=title, x=0.5, font=dict(size=13)),
+        height=520,
+        margin=dict(l=0, r=0, t=40, b=0),
+        legend=dict(orientation="h", y=-0.05),
+    )
+    st.plotly_chart(fig, width="stretch")
+    st.caption("💡 마우스로 드래그하여 시점을 회전, 휠로 확대/축소할 수 있습니다.")
 
 
 # ────────────────────────────────────────────────────────────────
@@ -521,11 +631,11 @@ def _render_simulation_tab() -> None:
             for d in result["details"]:
                 st.write(f"• {d}")
 
-        st.markdown("##### 📐 평면도 시각화 (눕혀서 진입 시 회전 시뮬레이션)")
+        st.markdown("##### 🧊 3D 인터랙티브 시뮬레이션")
         try:
-            _render_floor_plan(inner_w, inner_d, mat_w, mat_l)
+            _render_3d_view(inner_w, inner_d, inner_h, mat_w, mat_l, mat_t, safety)
         except Exception as e:
-            st.warning(f"시각화 생성 실패: {e}")
+            st.warning(f"3D 시각화 생성 실패: {e}")
 
 
 def render_elevator_inspection() -> None:
