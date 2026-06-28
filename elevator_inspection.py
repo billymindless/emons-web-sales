@@ -986,6 +986,46 @@ def _decide_mattress_pose(
     }
 
 
+def _rotated_extent(
+    axis_l: float, axis_w: float, axis_t: float,
+    tilt_deg: float, floor_rot_deg: float = 0.0,
+) -> tuple[float, float, float]:
+    """
+    매트리스를 (Y축 tilt + Z축 floor_rot)으로 회전했을 때
+    bounding box 의 X/Y/Z extent 반환.
+
+    좌표 정의:
+      X 방향 길이 = axis_l (매트리스의 깊이 길이 — 진입 방향)
+      Y 방향 길이 = axis_w (매트리스의 폭 길이 — 출입구 폭 방향)
+      Z 방향 길이 = axis_t (매트리스의 두께/수직 방향)
+    """
+    import numpy as np
+
+    rad_t = math.radians(tilt_deg)
+    rad_f = math.radians(floor_rot_deg)
+    ct, st_ = math.cos(rad_t), math.sin(rad_t)
+    cf, sf = math.cos(rad_f), math.sin(rad_f)
+
+    local = np.array([
+        [0, 0, 0], [axis_l, 0, 0], [axis_l, axis_w, 0], [0, axis_w, 0],
+        [0, 0, axis_t], [axis_l, 0, axis_t], [axis_l, axis_w, axis_t], [0, axis_w, axis_t],
+    ])
+    after_tilt = np.column_stack([
+        local[:, 0] * ct - local[:, 2] * st_,
+        local[:, 1],
+        local[:, 0] * st_ + local[:, 2] * ct,
+    ])
+    after_floor = np.column_stack([
+        after_tilt[:, 0] * cf - after_tilt[:, 1] * sf,
+        after_tilt[:, 0] * sf + after_tilt[:, 1] * cf,
+        after_tilt[:, 2],
+    ])
+    ex = float(after_floor[:, 0].max() - after_floor[:, 0].min())
+    ey = float(after_floor[:, 1].max() - after_floor[:, 1].min())
+    ez = float(after_floor[:, 2].max() - after_floor[:, 2].min())
+    return ex, ey, ez
+
+
 def _tilted_box_traces(
     pivot_x: float, pivot_y: float, pivot_z: float,
     axis_w: float, axis_l: float, axis_t: float,
@@ -994,9 +1034,14 @@ def _tilted_box_traces(
     name: str = "매트리스",
 ):
     """
-    1) Y축 기준 tilt_deg 회전 (수직 기울임)
+    1) Y축 기준 tilt_deg 회전 (수직 기울임 — 매트리스 진입방향이 들림)
     2) Z축 기준 floor_rot_deg 회전 (평면 대각선)
-    이후 회전 결과를 X≥0, Z≥0 으로 자동 정렬한 뒤 pivot 위치로 평행이동.
+    이후 회전 결과를 X≥0, Y≥0, Z≥0 으로 자동 정렬한 뒤 pivot 위치로 평행이동.
+
+    좌표 정의:
+      X = axis_l (매트리스 깊이, 박스 X = 엘리베이터 깊이)
+      Y = axis_w (매트리스 폭, 박스 Y = 엘리베이터 폭)
+      Z = axis_t (매트리스 두께, 박스 Z = 엘리베이터 높이)
     """
     import numpy as np
     import plotly.graph_objects as go
@@ -1010,13 +1055,11 @@ def _tilted_box_traces(
         [0, 0, 0], [axis_l, 0, 0], [axis_l, axis_w, 0], [0, axis_w, 0],
         [0, 0, axis_t], [axis_l, 0, axis_t], [axis_l, axis_w, axis_t], [0, axis_w, axis_t],
     ])
-    # 1) Y축 회전
     after_tilt = np.column_stack([
         local[:, 0] * ct - local[:, 2] * st_,
         local[:, 1],
         local[:, 0] * st_ + local[:, 2] * ct,
     ])
-    # 2) Z축 회전 (평면)
     after_floor = np.column_stack([
         after_tilt[:, 0] * cf - after_tilt[:, 1] * sf,
         after_tilt[:, 0] * sf + after_tilt[:, 1] * cf,
@@ -1064,67 +1107,119 @@ def _render_3d_view(
     mat_w: int, mat_l: int, mat_t: int,
     safety_mm: int,
 ) -> None:
-    """엘리베이터와 매트리스를 3D 인터랙티브 뷰로 시각화 (대각선 기울임 자세 지원)."""
+    """
+    엘리베이터와 매트리스를 3D 인터랙티브 뷰로 시각화.
+
+    좌표계 정의 (통일):
+      X 축 = 깊이 D (매트리스 진입 방향, 출입구 → 안쪽)
+      Y 축 = 폭 W (출입구 폭 방향)
+      Z 축 = 높이 H
+
+    박스 배치:  (0, 0, 0) ~ (inner_d, inner_w, inner_h)  [m 단위]
+    출입구    : X=0 면, Y=[(inner_w-door_w)/2 .. ], Z=[0, door_h]
+    """
     import plotly.graph_objects as go
 
-    iw, id_, ih = inner_w / 1000, inner_d / 1000, inner_h / 1000
+    # m 단위로 변환
+    box_x = inner_d / 1000  # X 방향 = 깊이
+    box_y = inner_w / 1000  # Y 방향 = 폭
+    box_z = inner_h / 1000  # Z 방향 = 높이
     dw_m, dh_m = door_w / 1000, door_h / 1000
 
     fig = go.Figure()
-    # 엘리베이터 외곽
-    fig.add_trace(_box_wireframe(0, 0, 0, iw, id_, ih,
-                                 color="#0284c7",
-                                 name=f"엘리베이터 {inner_w}×{inner_d}×{inner_h}mm"))
-    fig.add_trace(_box_mesh(0, 0, 0, iw, id_, 0.02,
-                            color="#bae6fd", opacity=0.5, name="바닥"))
-    # 출입구 표시 (X=0 면, 중앙)
-    door_y0 = max((id_ - dw_m) / 2, 0)
+    # 엘리베이터 외곽 (X=깊이, Y=폭, Z=높이)
+    fig.add_trace(_box_wireframe(
+        0, 0, 0, box_x, box_y, box_z,
+        color="#0284c7",
+        name=f"엘리베이터 W{inner_w}×D{inner_d}×H{inner_h}mm",
+    ))
+    fig.add_trace(_box_mesh(
+        0, 0, 0, box_x, box_y, 0.02,
+        color="#bae6fd", opacity=0.5, name="바닥",
+    ))
+    # 출입구 (X=0 면, 폭 방향 중앙, 바닥부터 dh_m 높이)
+    door_y0 = max((box_y - dw_m) / 2, 0)
     door_corners_y = [door_y0, door_y0 + dw_m, door_y0 + dw_m, door_y0, door_y0]
     door_corners_z = [0, 0, dh_m, dh_m, 0]
     fig.add_trace(go.Scatter3d(
         x=[0] * 5, y=door_corners_y, z=door_corners_z,
         mode="lines", line=dict(color="#f97316", width=6),
-        name=f"출입구 {door_w}×{door_h}mm",
+        name=f"출입구 W{door_w}×H{door_h}mm",
     ))
 
-    pose = _decide_mattress_pose(inner_w, inner_d, inner_h, door_w, door_h,
-                                  mat_w, mat_l, mat_t, safety_mm)
+    pose = _decide_mattress_pose(
+        inner_w, inner_d, inner_h, door_w, door_h,
+        mat_w, mat_l, mat_t, safety_mm,
+    )
 
     if pose:
-        # 매트리스를 출입구 근처에 배치 (X=0 면 인접)
+        # 매트리스를 X(깊이) / Y(폭) / Z(두께) 방향으로 배치
+        mat_axis_l = pose["axis_d"] / 1000  # X 방향 길이 = 매트리스 깊이
+        mat_axis_w = pose["axis_w"] / 1000  # Y 방향 길이 = 매트리스 폭
+        mat_axis_t = pose["axis_t"] / 1000  # Z 방향 길이 = 매트리스 두께
+        tilt = pose["tilt_deg"]
+        floor_rot = pose.get("floor_rot_deg", 0)
+
+        # 회전 후 bounding box → 박스 내부 중앙 정렬용 pivot 계산
+        ext_x, ext_y, ext_z = _rotated_extent(
+            mat_axis_l, mat_axis_w, mat_axis_t, tilt, floor_rot,
+        )
+
+        # 박스 안에 들어가지 못하는 차원이 있으면 경고용 메타에 표시
+        overflow = []
+        if ext_x > box_x + 1e-6:
+            overflow.append(f"깊이 {ext_x*1000:.0f}mm > 박스 {inner_d}mm")
+        if ext_y > box_y + 1e-6:
+            overflow.append(f"폭 {ext_y*1000:.0f}mm > 박스 {inner_w}mm")
+        if ext_z > box_z + 1e-6:
+            overflow.append(f"높이 {ext_z*1000:.0f}mm > 박스 {inner_h}mm")
+
+        # pivot: X는 출입구 바로 안쪽(safety 만큼), Y/Z는 박스 내부 중앙·바닥
+        margin = safety_mm / 1000 / 2
+        pivot_x = max(margin, 0.0)
+        pivot_y = max((box_y - ext_y) / 2, 0.0)
+        pivot_z = 0.0
+
         mesh, wire = _tilted_box_traces(
-            pivot_x=0.05,
-            pivot_y=max((id_ - pose["axis_w"] / 1000) / 2, 0.05),
-            pivot_z=0,
-            axis_w=pose["axis_w"] / 1000,
-            axis_l=pose["axis_d"] / 1000,
-            axis_t=pose["axis_t"] / 1000,
-            tilt_deg=pose["tilt_deg"],
-            floor_rot_deg=pose.get("floor_rot_deg", 0),
+            pivot_x=pivot_x, pivot_y=pivot_y, pivot_z=pivot_z,
+            axis_w=mat_axis_w, axis_l=mat_axis_l, axis_t=mat_axis_t,
+            tilt_deg=tilt, floor_rot_deg=floor_rot,
             color_fill="#22c55e", color_edge="#15803d",
             name=f"매트리스 ({pose['pose']})",
         )
         fig.add_trace(mesh)
         fig.add_trace(wire)
         title = f"매트리스 자세: {pose['pose']}"
+        if overflow:
+            title += f"  ⚠ 박스 초과: {', '.join(overflow)}"
     else:
         title = "매트리스 진입 불가 — 빈 엘리베이터만 표시"
+        overflow = []
 
     fig.update_layout(
         scene=dict(
-            xaxis=dict(title="깊이 D (m)", range=[-0.1, iw + 0.3]),
-            yaxis=dict(title="폭 W (m)", range=[-0.1, id_ + 0.3]),
-            zaxis=dict(title="높이 H (m)", range=[0, ih + 0.3]),
+            xaxis=dict(title="깊이 D (m, 진입 방향)", range=[-0.1, box_x + 0.3]),
+            yaxis=dict(title="폭 W (m, 출입구 폭)", range=[-0.1, box_y + 0.3]),
+            zaxis=dict(title="높이 H (m)", range=[0, box_z + 0.3]),
             aspectmode="data",
             camera=dict(eye=dict(x=1.8, y=1.8, z=1.2)),
         ),
-        title=dict(text=title, x=0.5, font=dict(size=13)),
+        title=dict(text=title, x=0.5, font=dict(size=12)),
         height=540,
         margin=dict(l=0, r=0, t=40, b=0),
         legend=dict(orientation="h", y=-0.05),
     )
     st.plotly_chart(fig, width="stretch")
-    st.caption("💡 마우스로 드래그하여 시점을 회전, 휠로 확대/축소할 수 있습니다. 주황색 선은 출입구입니다.")
+    st.caption(
+        "💡 X축 = 깊이(진입 방향), Y축 = 폭(출입구 폭), Z축 = 높이. "
+        "주황색 선은 출입구. 마우스 드래그로 시점 회전, 휠로 확대/축소."
+    )
+    if pose and overflow:
+        st.warning(
+            "⚠ 회전 후에도 매트리스 일부가 엘리베이터 박스를 초과합니다: "
+            + ", ".join(overflow)
+            + " — 시뮬레이션 판정과 시각화가 일치하지 않는지 확인이 필요합니다."
+        )
 
 
 # ────────────────────────────────────────────────────────────────
