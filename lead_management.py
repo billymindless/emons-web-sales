@@ -305,6 +305,23 @@ def _inline_save_stage(lead_id: int, key: str) -> None:
         st.toast(f"❌ 저장 실패: {str(e)[:60]}", icon="⚠️")
 
 
+def _inline_save_store(lead_id: int, key: str) -> None:
+    """리드 목록 inline selectbox — store_name 즉시 저장."""
+    new_val = (st.session_state.get(key) or "").strip() or None
+    supa = _supa()
+    if not supa:
+        st.toast("❌ DB 연결 실패", icon="⚠️")
+        return
+    try:
+        supa.table("app_leads").update({
+            "store_name": new_val,
+            "updated_at": _now_iso(),
+        }).eq("id", lead_id).execute()
+        st.toast(f"매장 저장: {new_val or '미지정'}", icon="✅")
+    except Exception as e:
+        st.toast(f"❌ 매장 저장 실패: {str(e)[:60]}", icon="⚠️")
+
+
 def _inline_save_emps(lead_id: int, key: str, emp_name_to_id: dict[str, int]) -> None:
     """리드 목록 inline multiselect — employee_names + assigned_employee_id 즉시 저장."""
     sel_names: list[str] = st.session_state.get(key) or []
@@ -942,8 +959,8 @@ def render_lead_management() -> None:
         ]
 
     # ── 테이블 헤더 ───────────────────────────
-    _ths = ["고객명", "연락처", "유형 ▼", "유입경로", "상태 ▼", "담당직원 ▼", "마지막 연락", ""]
-    _ws = [1.7, 1.4, 1.5, 1.0, 1.4, 2.2, 1.0, 0.7]
+    _ths = ["고객명", "연락처", "유형 ▼", "유입경로", "상태 ▼", "매장 ▼", "담당직원 ▼", "마지막 연락", ""]
+    _ws = [1.5, 1.2, 1.2, 0.9, 1.2, 1.6, 1.8, 0.9, 0.6]
     _hc = st.columns(_ws)
     for _c, _t in zip(_hc, _ths):
         _c.markdown(f"<div style='color:#475569;font-weight:600;font-size:0.82rem;'>{_t}</div>", unsafe_allow_html=True)
@@ -955,6 +972,7 @@ def render_lead_management() -> None:
     _emp_name_to_id = {v: k for k, v in emp_map.items()}
     _stage_keys_list = list(LEAD_STAGES.keys())
     _employees_by_store = _get_employees_by_store()
+    _store_options_master = sorted(_employees_by_store.keys())
 
     # 매장별 직원 매핑이 비어있으면 진단 안내
     if not _employees_by_store and not _emp_all_names:
@@ -989,11 +1007,10 @@ def render_lead_management() -> None:
 
         _rc = st.columns(_ws)
 
-        # 고객명 + 매장 (보조정보)
+        # 고객명
         with _rc[0]:
             st.markdown(
-                f"<div style='font-weight:500;'>{_name}</div>"
-                f"<div style='color:#94a3b8;font-size:0.7rem;'>{_store}</div>",
+                f"<div style='font-weight:500;'>{_name}</div>",
                 unsafe_allow_html=True,
             )
 
@@ -1037,17 +1054,40 @@ def render_lead_management() -> None:
                     unsafe_allow_html=True,
                 )
 
-        # 담당직원 — 인라인 multiselect (해당 매장 직원만)
+        # 매장 — 인라인 selectbox (직원이 등록된 매장 중 선택)
         with _rc[5]:
+            _store_key = f"inline_store_{_lid}"
+            # 옵션: (미지정) + 직원 등록 매장 목록 + 현재 값(목록에 없으면 보존)
+            _row_store_options = [""] + list(_store_options_master)
+            if _store and _store not in _row_store_options:
+                _row_store_options.append(_store)
+            _cur_store_idx = _row_store_options.index(_store) if _store in _row_store_options else 0
+            st.selectbox(
+                "매장",
+                _row_store_options,
+                index=_cur_store_idx,
+                format_func=lambda s: s if s else "(미지정)",
+                key=_store_key,
+                label_visibility="collapsed",
+                on_change=_inline_save_store,
+                args=(_lid, _store_key),
+            )
+
+        # 담당직원 — 인라인 multiselect (선택된 매장 직원만)
+        with _rc[6]:
             _emp_key = f"inline_emps_{_lid}"
-            # 1) 리드의 매장에 등록된 직원만 후보로 사용
-            _store_emps = _employees_for_store(_store, _employees_by_store, _emp_all_names)
-            # 2) 현재 저장된 이름 중 옵션에 없는 것은 강제 추가 (default 매칭 + 데이터 보존)
+            # 같은 행에서 선택 중인 매장(세션 상태) 우선 → 없으면 저장된 값 사용
+            _current_store_for_emp = st.session_state.get(f"inline_store_{_lid}", _store) or _store
+            _store_emps = _employees_for_store(
+                _current_store_for_emp, _employees_by_store, _emp_all_names
+            )
+            # 현재 저장된 이름 중 옵션에 없는 것은 강제 추가 (default 매칭 + 데이터 보존)
             _row_options = list(dict.fromkeys(_store_emps + _emp_names_list))
             _row_default = [n for n in _emp_names_list if n in _row_options]
-            _placeholder = (
-                f"{_store} 직원 선택" if _store else "담당자 선택"
-            )
+            if _current_store_for_emp:
+                _placeholder = f"{_current_store_for_emp} 직원 선택"
+            else:
+                _placeholder = "매장을 먼저 지정하세요"
             st.multiselect(
                 "담당직원",
                 options=_row_options,
@@ -1059,8 +1099,8 @@ def render_lead_management() -> None:
                 args=(_lid, _emp_key, _emp_name_to_id),
             )
 
-        _rc[6].write(_last_contact)
-        with _rc[7]:
+        _rc[7].write(_last_contact)
+        with _rc[8]:
             _is_sel = st.session_state.get("lead_selected_id") == _lid
             if st.button("닫기" if _is_sel else "관리", key=f"lead_act_{_lid}_{_i}", width="stretch"):
                 if _is_sel:
