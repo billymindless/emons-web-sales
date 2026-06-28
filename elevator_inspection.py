@@ -22,7 +22,32 @@ import streamlit as st
 # 공공데이터포털 API 클라이언트
 # ────────────────────────────────────────────────────────────────
 
-ELEVATOR_API_BASE = "http://openapi.elevator.go.kr/openapi/service/ElevatorInfoService"
+ELEVATOR_API_BASE = "https://apis.data.go.kr/B553664/ElevatorInformationService"
+
+# 정원(인승) → 표준 내부치수 추정 (KS B 6361 일반승객용 기준, 보편 사양)
+# (W: 폭, D: 깊이, H: 높이, doorW: 출입구 폭, doorH: 출입구 높이)  단위: mm
+CAPACITY_DIMENSIONS_MM: dict[int, tuple[int, int, int, int, int]] = {
+    6:  (1100, 1000, 2300, 800, 2100),
+    9:  (1400, 1100, 2300, 800, 2100),
+    11: (1400, 1350, 2300, 900, 2100),
+    13: (1600, 1350, 2300, 900, 2100),
+    15: (1600, 1500, 2300, 900, 2100),
+    17: (1800, 1500, 2300, 900, 2100),
+    20: (1800, 1700, 2300, 1000, 2100),
+    24: (2100, 1500, 2300, 1100, 2100),
+    26: (2100, 1700, 2300, 1100, 2100),
+}
+
+
+def _estimate_dimensions(rated_capacity_persons: int) -> tuple[int, int, int, int, int]:
+    """정원에 가장 가까운 표준 치수 반환 (없으면 가장 큰 값으로 외삽)."""
+    if rated_capacity_persons <= 0:
+        return (1600, 1500, 2300, 900, 2100)
+    keys = sorted(CAPACITY_DIMENSIONS_MM.keys())
+    for k in keys:
+        if rated_capacity_persons <= k:
+            return CAPACITY_DIMENSIONS_MM[k]
+    return CAPACITY_DIMENSIONS_MM[keys[-1]]
 
 
 def _get_service_key() -> str:
@@ -39,14 +64,13 @@ def _get_service_key() -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_elevators_by_address(
-    road_addr: str = "",
-    building_name: str = "",
     sido: str = "",
     sigungu: str = "",
-    num_rows: int = 30,
+    building_name: str = "",
+    num_rows: int = 50,
 ) -> dict:
     """
-    공공데이터포털 승강기 정보 API 호출.
+    공공데이터포털 한국승강기안전공단 승강기목록 API 호출.
 
     Returns:
         {"ok": bool, "items": list[dict], "error": str}
@@ -62,23 +86,19 @@ def fetch_elevators_by_address(
         "serviceKey": key,
         "numOfRows": str(num_rows),
         "pageNo": "1",
-        "_type": "xml",
     }
     if sido:
-        params["Sido"] = sido
+        params["sido"] = sido
     if sigungu:
-        params["Sigungu"] = sigungu
-    if road_addr:
-        params["address1"] = road_addr
-        params["roadAddr"] = road_addr
+        params["sigungu"] = sigungu
     if building_name:
-        params["buldNm"] = building_name
+        params["buld_nm"] = building_name
 
     try:
         resp = requests.get(
-            f"{ELEVATOR_API_BASE}/getList",
+            f"{ELEVATOR_API_BASE}/getElevatorListM",
             params=params,
-            timeout=10.0,
+            timeout=15.0,
         )
     except Exception as e:
         return {"ok": False, "items": [], "error": f"API 호출 실패: {e}"}
@@ -88,18 +108,23 @@ def fetch_elevators_by_address(
                 "error": f"API 응답 오류 {resp.status_code}: {resp.text[:200]}"}
 
     text = resp.text or ""
-    # 인증키 오류 케이스 (공공데이터포털은 200 OK로 반환)
-    if "SERVICE_KEY_IS_NOT_REGISTERED" in text or "SERVICE KEY IS NOT REGISTERED" in text.upper():
+    if "SERVICE_KEY_IS_NOT_REGISTERED" in text.upper() or "SERVICE KEY IS NOT REGISTERED" in text.upper():
         return {"ok": False, "items": [],
-                "error": "서비스키가 등록되지 않았습니다. 공공데이터포털에서 활용신청 후 1~2시간 기다리거나 키를 재확인해 주세요."}
+                "error": "서비스키가 등록되지 않았습니다. 공공데이터포털에서 활용신청 후 1~2시간 대기."}
 
     try:
         parsed = xmltodict.parse(text)
     except Exception as e:
         return {"ok": False, "items": [], "error": f"응답 파싱 실패: {e}"}
 
-    # response/body/items/item 구조
-    body = (parsed.get("response") or {}).get("body") or {}
+    response = parsed.get("response") or {}
+    header = response.get("header") or {}
+    result_code = str(header.get("resultCode") or "")
+    if result_code and result_code != "00":
+        return {"ok": False, "items": [],
+                "error": f"API 응답코드 {result_code}: {header.get('resultMsg', '')}"}
+
+    body = response.get("body") or {}
     items_wrap = body.get("items") or {}
     raw_items = items_wrap.get("item") if isinstance(items_wrap, dict) else None
     if raw_items is None:
@@ -110,35 +135,43 @@ def fetch_elevators_by_address(
     return {"ok": True, "items": raw_items, "error": ""}
 
 
-def _to_int_mm(v: Any) -> int:
-    """API 응답값을 mm 정수로 변환 (None/문자열/숫자 모두 처리)."""
+def _parse_int(v: Any) -> int:
+    """'17 인승', '1150 KG' 등에서 숫자만 추출."""
     if v is None or v == "":
         return 0
-    try:
-        return int(float(str(v)))
-    except (TypeError, ValueError):
-        return 0
+    s = str(v)
+    import re
+    m = re.search(r"(\d+)", s)
+    return int(m.group(1)) if m else 0
 
 
 def _items_to_dataframe(items: list[dict]) -> pd.DataFrame:
-    """API 응답을 보기 좋은 DataFrame으로 변환."""
+    """API 응답을 보기 좋은 DataFrame으로 변환 + 정원 기반 추정 치수 추가."""
     if not items:
         return pd.DataFrame()
     rows = []
     for it in items:
+        cap = _parse_int(it.get("ratedCap"))
+        w, d, h, dw, dh = _estimate_dimensions(cap)
         rows.append({
-            "승강기번호": it.get("elvtrAsignNo") or it.get("elevatorNo") or "",
+            "호기": it.get("elvtrAsignNo") or "",
+            "고유번호": it.get("elevatorNo") or "",
             "건물명": it.get("buldNm") or "",
-            "주소": it.get("address1") or it.get("address") or "",
-            "종류": it.get("elvtrKindNm") or it.get("elvtrDiv") or "",
-            "정원(명)": _to_int_mm(it.get("ratedCap") or it.get("rrUsr")),
-            "적재하중(kg)": _to_int_mm(it.get("liveLoad")),
-            "내부폭W(mm)": _to_int_mm(it.get("bdyWdthSz") or it.get("cgeWidth")),
-            "내부깊이D(mm)": _to_int_mm(it.get("bdyLnghSz") or it.get("cgeLength")),
-            "내부높이H(mm)": _to_int_mm(it.get("bdyHgtSz") or it.get("cgeHeight")),
-            "출입구폭(mm)": _to_int_mm(it.get("doorWdthSz") or it.get("entWidth")),
-            "출입구높이(mm)": _to_int_mm(it.get("doorHgtSz") or it.get("entHeight")),
-            "검사유효기간": it.get("nextInspctPlanDt") or it.get("nextInspectionDate") or "",
+            "주소": (it.get("address1") or "") + " " + (it.get("address2") or ""),
+            "종류": it.get("elvtrKindNm") or "",
+            "형식": it.get("elvtrFormNm") or "",
+            "모델": it.get("elvtrModel") or "",
+            "정원(명)": cap,
+            "적재하중": it.get("liveLoad") or "",
+            "추정 내부W(mm)": w,
+            "추정 내부D(mm)": d,
+            "추정 내부H(mm)": h,
+            "추정 출입구W(mm)": dw,
+            "추정 출입구H(mm)": dh,
+            "운행상태": it.get("elvtrStts") or "",
+            "최종검사": it.get("lastInspctDe") or "",
+            "검사결과": it.get("lastResultNm") or "",
+            "관리업체": it.get("mntCpnyNm") or "",
         })
     return pd.DataFrame(rows)
 
@@ -334,37 +367,38 @@ def _render_floor_plan(inner_w: int, inner_d: int, mat_w: int, mat_l: int) -> No
 
 def _render_search_tab() -> None:
     st.markdown("#### 주소로 승강기 스펙 조회")
-    st.caption("공공데이터포털(국가승강기정보센터)에서 도로명주소·건물명으로 등록된 승강기 정보를 조회합니다.")
+    st.caption("한국승강기안전공단 공공데이터로 건물의 승강기 목록과 정원·모델을 조회합니다.")
+
+    st.info(
+        "ℹ️ **공공데이터는 정원(인승)·모델만 제공**하며 내부 치수는 포함되지 않습니다. "
+        "정원 기준 **표준 KS 치수로 자동 추정**하여 표시하고, 시뮬레이션 탭에서 현장 실측치로 수정 가능합니다."
+    )
 
     if not _get_service_key():
         st.warning(
             "**API 서비스키가 설정되지 않았습니다.**\n\n"
-            "1) [공공데이터포털](https://www.data.go.kr) 회원가입 → '승강기 정보' 검색 → 활용신청\n"
-            "2) 발급된 **일반 인증키(Decoding)** 를 복사\n"
-            "3) `.streamlit/secrets.toml`에 다음 추가:\n"
-            "```toml\n[elevator_api]\nservice_key = \"발급받은_디코딩_키\"\n```\n"
-            "또는 Render 환경변수 `ELEVATOR_API_KEY` 로 등록.\n\n"
+            "[공공데이터포털](https://www.data.go.kr) → '한국승강기안전공단_승강기 정보' 활용신청 → "
+            "발급받은 **일반 인증키(Decoding)** 를 `.streamlit/secrets.toml` `[elevator_api] service_key`에 저장.\n\n"
             "자세한 절차는 [ELEVATOR_API_SETUP.md](ELEVATOR_API_SETUP.md) 참고."
         )
 
     with st.form("elev_search_form"):
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
-            sido = st.text_input("시/도", placeholder="예: 울산광역시")
-            road_addr = st.text_input("도로명주소", placeholder="예: 삼산로 200")
+            sido = st.text_input("시/도 *", placeholder="예: 울산광역시")
         with c2:
-            sigungu = st.text_input("시/군/구", placeholder="예: 남구")
-            building_name = st.text_input("건물명 (선택)", placeholder="예: 에몬스아파트")
+            sigungu = st.text_input("시/군/구 *", placeholder="예: 남구")
+        with c3:
+            building_name = st.text_input("건물명", placeholder="예: 에몬스아파트 (부분 일치)")
         submitted = st.form_submit_button("🔍 검색", type="primary", width="stretch")
 
     if submitted:
-        if not (road_addr or building_name):
-            st.error("도로명주소 또는 건물명 중 하나는 입력해 주세요.")
+        if not sido or not sigungu:
+            st.error("시/도와 시/군/구는 필수입니다.")
             return
         with st.spinner("승강기 정보 조회 중..."):
             result = fetch_elevators_by_address(
-                road_addr=road_addr, building_name=building_name,
-                sido=sido, sigungu=sigungu, num_rows=30,
+                sido=sido, sigungu=sigungu, building_name=building_name, num_rows=50,
             )
         if not result["ok"]:
             st.error(f"❌ {result['error']}")
@@ -372,29 +406,39 @@ def _render_search_tab() -> None:
 
         items = result["items"]
         if not items:
-            st.info("조회된 승강기가 없습니다. 주소를 다시 확인해 주세요.")
+            st.info("조회된 승강기가 없습니다. 시/도·시/군/구를 정확히(예: '경남', '진주') 입력했는지 확인해 주세요.")
             return
 
         df = _items_to_dataframe(items)
+        st.session_state["_elev_last_df"] = df
         st.success(f"✅ {len(df)}건 조회됨")
-        st.dataframe(df, width="stretch", hide_index=True)
 
-        # 시뮬레이션으로 보내기 버튼 (행 선택)
-        st.markdown("##### 시뮬레이션에 사용할 승강기 선택")
-        opts = [
-            f"{i+1}. {row['승강기번호'] or '미상'} — 내부 {row['내부폭W(mm)']}×{row['내부깊이D(mm)']}×{row['내부높이H(mm)']}mm"
-            for i, row in df.iterrows()
-        ]
-        sel = st.selectbox("승강기 선택", opts, key="elev_pick")
-        if st.button("📐 시뮬레이션으로 보내기", type="primary"):
-            idx = opts.index(sel)
-            row = df.iloc[idx]
-            st.session_state["elev_inner_w"] = int(row["내부폭W(mm)"] or 0)
-            st.session_state["elev_inner_d"] = int(row["내부깊이D(mm)"] or 0)
-            st.session_state["elev_inner_h"] = int(row["내부높이H(mm)"] or 0)
-            st.session_state["elev_door_w"] = int(row["출입구폭(mm)"] or 0)
-            st.session_state["elev_door_h"] = int(row["출입구높이(mm)"] or 0)
-            st.success("✅ 시뮬레이션 탭으로 이동해서 매트리스 사이즈를 입력해 주세요.")
+    # 이전 결과가 있으면 (form submit이 아닌 경우에도) 표시
+    df = st.session_state.get("_elev_last_df")
+    if df is None or df.empty:
+        return
+
+    st.dataframe(df, width="stretch", hide_index=True)
+
+    st.markdown("##### 시뮬레이션에 사용할 승강기 선택")
+    opts = [
+        f"{i+1}. {row['건물명']} {row['호기']}호기 — {row['정원(명)']}인승, "
+        f"추정 {row['추정 내부W(mm)']}×{row['추정 내부D(mm)']}×{row['추정 내부H(mm)']}mm"
+        for i, row in df.iterrows()
+    ]
+    sel = st.selectbox("승강기 선택", opts, key="elev_pick")
+    if st.button("📐 시뮬레이션으로 보내기", type="primary"):
+        idx = opts.index(sel)
+        row = df.iloc[idx]
+        st.session_state["elev_inner_w"] = int(row["추정 내부W(mm)"] or 0)
+        st.session_state["elev_inner_d"] = int(row["추정 내부D(mm)"] or 0)
+        st.session_state["elev_inner_h"] = int(row["추정 내부H(mm)"] or 0)
+        st.session_state["elev_door_w"] = int(row["추정 출입구W(mm)"] or 0)
+        st.session_state["elev_door_h"] = int(row["추정 출입구H(mm)"] or 0)
+        st.success(
+            "✅ 추정 치수가 시뮬레이션 탭에 입력되었습니다. "
+            "**현장 실측치가 있다면 시뮬레이션 탭에서 직접 수정해 주세요.**"
+        )
 
 
 def _render_simulation_tab() -> None:
