@@ -592,16 +592,49 @@ def render_lead_management() -> None:
         st.error("Supabase 연결 실패")
         return
 
+    _full_select = (
+        "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
+        "next_contact_date,assigned_employee_id,store_name,"
+        "customer_type,classification_memo,classified_by,classified_at,last_contact_at,"
+        "created_at,converted_at,revenue_amount,converted_order_id"
+    )
+    _legacy_select = (
+        "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
+        "next_contact_date,assigned_employee_id,store_name,"
+        "created_at,converted_at,revenue_amount,converted_order_id"
+    )
+    _migration_pending = False
     try:
-        leads_raw: list[dict] = supa.table("app_leads").select(
-            "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
-            "next_contact_date,assigned_employee_id,store_name,"
-            "customer_type,classification_memo,classified_by,classified_at,last_contact_at,"
-            "created_at,converted_at,revenue_amount,converted_order_id"
-        ).order("created_at", desc=True).limit(500).execute().data or []
+        leads_raw: list[dict] = supa.table("app_leads").select(_full_select) \
+            .order("created_at", desc=True).limit(500).execute().data or []
     except Exception as e:
-        st.error(f"리드 조회 실패: {e}")
-        return
+        _err_msg = str(e)
+        # customer_type 컬럼이 없으면 마이그레이션 전 — 레거시 SELECT로 폴백
+        if "customer_type" in _err_msg or "42703" in _err_msg:
+            _migration_pending = True
+            try:
+                leads_raw = supa.table("app_leads").select(_legacy_select) \
+                    .order("created_at", desc=True).limit(500).execute().data or []
+            except Exception as e2:
+                st.error(f"리드 조회 실패: {e2}")
+                return
+            # 신규 컬럼 기본값 주입 → 이후 UI가 .get()으로 안전 접근
+            for _l in leads_raw:
+                _l.setdefault("customer_type", "신규잠재고객")
+                _l.setdefault("classification_memo", None)
+                _l.setdefault("classified_by", None)
+                _l.setdefault("classified_at", None)
+                _l.setdefault("last_contact_at", None)
+        else:
+            st.error(f"리드 조회 실패: {e}")
+            return
+
+    if _migration_pending:
+        st.warning(
+            "⚠️ **SQL 마이그레이션 필요** — `SUPABASE_APP_LEADS_CUSTOMER_TYPE.sql` 파일을 "
+            "Supabase Dashboard › SQL Editor에서 실행하세요. "
+            "고객 유형 분류·재유입 자동 재활성화 기능은 마이그레이션 후 활성화됩니다."
+        )
 
     emp_map = _get_employee_map()
 
@@ -1130,7 +1163,14 @@ def _render_classify_tab(lead: dict) -> None:
             st.session_state.pop("lead_selected_id", None)
             st.rerun()
         except Exception as e:
-            st.error(f"분류 저장 실패: {e}")
+            _emsg = str(e)
+            if "customer_type" in _emsg or "42703" in _emsg:
+                st.error(
+                    "❌ DB 마이그레이션 미실행 — Supabase Dashboard › SQL Editor에서 "
+                    "`SUPABASE_APP_LEADS_CUSTOMER_TYPE.sql` 파일을 실행하세요."
+                )
+            else:
+                st.error(f"분류 저장 실패: {e}")
 
 
 # ──────────────────────────────────────────────
