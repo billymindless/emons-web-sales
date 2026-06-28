@@ -148,16 +148,87 @@ SIDO_TO_SIGUNGU: dict[str, list[str]] = {
 }
 
 
-def _get_service_key() -> str:
-    """승강기 API 서비스 키 로드. 환경변수 우선, secrets 폴백."""
-    key = os.environ.get("ELEVATOR_API_KEY", "")
-    if key:
-        return key.strip()
+_ELEVATOR_ENV_CANDIDATES: tuple[str, ...] = (
+    "ELEVATOR_API_KEY",
+    "ELEVATOR_SERVICE_KEY",
+    "DATA_GO_KR_SERVICE_KEY",
+)
+
+
+def _get_service_key_diagnostic() -> tuple[str, dict[str, str]]:
+    """
+    승강기 API 서비스 키를 3중 폴백으로 로드하고 진단 정보 동시 반환.
+
+    로드 순서 (뒤쪽이 높은 우선순위로 덮어씀):
+      1. secrets.toml 직접 읽기 (Path 기반, 로컬 개발 환경 확인)
+      2. st.secrets[elevator_api] (Streamlit Cloud/로컬 secrets)
+      3. 환경변수 ELEVATOR_API_KEY 등 (Render·Docker 등 배포)
+
+    Returns:
+        (key, diag) — diag는 어느 소스에서 무엇이 발견됐는지의 상세 정보
+    """
+    diag: dict[str, str] = {
+        "secrets_toml_path": "",
+        "secrets_toml_found": "no",
+        "st_secrets_found": "no",
+        "env_var_found": "no",
+        "env_var_name": "",
+        "final_source": "none",
+        "key_len": "0",
+    }
+    key = ""
+
+    # 1) secrets.toml 직접 읽기
     try:
-        sec = st.secrets.get("elevator_api", {}) if hasattr(st, "secrets") else {}
-        return str(sec.get("service_key", "") or "").strip()
+        import tomllib
+        from pathlib import Path
+        for _p in [
+            Path(__file__).parent / ".streamlit" / "secrets.toml",
+            Path.cwd() / ".streamlit" / "secrets.toml",
+        ]:
+            if _p.exists():
+                diag["secrets_toml_path"] = str(_p)
+                with open(_p, "rb") as _f:
+                    _data = tomllib.load(_f)
+                _v = str((_data.get("elevator_api") or {}).get("service_key", "") or "").strip()
+                if _v:
+                    key = _v
+                    diag["secrets_toml_found"] = "yes"
+                    diag["final_source"] = "secrets.toml"
+                break
+    except Exception as e:
+        diag["secrets_toml_path"] = f"error: {type(e).__name__}"
+
+    # 2) st.secrets
+    try:
+        if hasattr(st, "secrets"):
+            _sec = st.secrets.get("elevator_api", {})
+            _v = str(_sec.get("service_key", "") or "").strip()
+            if _v:
+                key = _v
+                diag["st_secrets_found"] = "yes"
+                diag["final_source"] = "st.secrets"
     except Exception:
-        return ""
+        pass
+
+    # 3) 환경변수 (최우선)
+    for _name in _ELEVATOR_ENV_CANDIDATES:
+        _v = (os.environ.get(_name, "") or "").strip()
+        if _v:
+            key = _v
+            diag["env_var_found"] = "yes"
+            diag["env_var_name"] = _name
+            diag["final_source"] = f"env:{_name}"
+            break
+
+    diag["key_len"] = str(len(key))
+    return key, diag
+
+
+def _get_service_key() -> str:
+    """승강기 API 서비스 키 (호환 유지용 단순 래퍼)."""
+    key, _ = _get_service_key_diagnostic()
+    return key
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -896,12 +967,37 @@ def _render_search_tab() -> None:
         "정원 기준 적재중량(kg)을 함께 표시하며, 아래 **시뮬레이션 섹션에서 직접 수치를 입력**해 매트리스 진입 가능 여부를 확인할 수 있습니다."
     )
 
-    if not _get_service_key():
+    _svc_key, _key_diag = _get_service_key_diagnostic()
+    if not _svc_key:
         st.warning(
             "**API 서비스키가 설정되지 않았습니다.**\n\n"
-            "[공공데이터포털](https://www.data.go.kr) → '한국승강기안전공단_승강기 정보' 활용신청 → "
-            "발급받은 **일반 인증키(Decoding)** 를 `.streamlit/secrets.toml` `[elevator_api] service_key`에 저장.\n\n"
+            "**로컬 개발**: `.streamlit/secrets.toml` 의 `[elevator_api] service_key = \"...\"`\n\n"
+            "**Render 등 배포 환경**: Render Dashboard › Environment에 환경변수 "
+            "`ELEVATOR_API_KEY` 를 추가하세요. (`.streamlit/secrets.toml`은 .gitignore되어 배포되지 않음)\n\n"
             "자세한 절차는 [ELEVATOR_API_SETUP.md](ELEVATOR_API_SETUP.md) 참고."
+        )
+        with st.expander("🔍 진단 정보 보기 (어디서 키를 찾으려 했는지)"):
+            st.code(
+                f"secrets.toml 경로     : {_key_diag.get('secrets_toml_path') or '(찾지 못함)'}\n"
+                f"secrets.toml 키 발견  : {_key_diag.get('secrets_toml_found')}\n"
+                f"st.secrets 키 발견    : {_key_diag.get('st_secrets_found')}\n"
+                f"환경변수 키 발견      : {_key_diag.get('env_var_found')} "
+                f"(이름: {_key_diag.get('env_var_name') or '-'})\n"
+                f"시도한 환경변수 이름  : {', '.join(_ELEVATOR_ENV_CANDIDATES)}\n"
+                f"최종 소스             : {_key_diag.get('final_source')}\n"
+                f"키 길이               : {_key_diag.get('key_len')}",
+                language="text",
+            )
+            st.markdown(
+                "**Render에서 환경변수 설정 방법**\n"
+                "1. Render Dashboard → 해당 서비스 선택 → **Environment** 탭\n"
+                "2. **Add Environment Variable** 클릭\n"
+                "3. Key: `ELEVATOR_API_KEY`, Value: 공공데이터포털에서 발급받은 **일반 인증키 (Decoding)** 값\n"
+                "4. **Save Changes** → 자동 재배포 대기"
+            )
+    else:
+        st.success(
+            f"✅ API 서비스키 로드 완료 (소스: `{_key_diag.get('final_source')}`, 길이: {_key_diag.get('key_len')}자)"
         )
 
     c1, c2 = st.columns(2)
