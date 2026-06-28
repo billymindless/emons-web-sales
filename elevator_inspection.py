@@ -236,72 +236,169 @@ def fetch_elevators_by_address(
     sido: str = "",
     sigungu: str = "",
     building_name: str = "",
-    num_rows: int = 50,
+    num_rows: int = 500,
+    max_pages: int = 30,
 ) -> dict:
     """
     공공데이터포털 한국승강기안전공단 승강기목록 API 호출.
 
+    페이지네이션을 자동 처리 (totalCount 만큼 또는 max_pages까지).
+
     Returns:
-        {"ok": bool, "items": list[dict], "error": str}
+        {
+            "ok": bool,
+            "items": list[dict],
+            "total_count": int,     # 서버 totalCount
+            "fetched": int,         # 실제 가져온 건수
+            "pages_fetched": int,
+            "request_url": str,     # 1페이지 호출 URL (디버그용)
+            "error": str,
+        }
     """
     import requests
     import xmltodict
 
+    def _empty(err: str = "") -> dict:
+        return {
+            "ok": not err, "items": [], "total_count": 0, "fetched": 0,
+            "pages_fetched": 0, "request_url": "", "error": err,
+        }
+
     key = _get_service_key()
     if not key:
-        return {"ok": False, "items": [], "error": "API 서비스키가 설정되지 않았습니다."}
+        return _empty("API 서비스키가 설정되지 않았습니다.")
 
-    params: dict[str, Any] = {
+    base_params: dict[str, Any] = {
         "serviceKey": key,
         "numOfRows": str(num_rows),
-        "pageNo": "1",
     }
     if sido:
-        params["sido"] = sido
+        base_params["sido"] = sido
     if sigungu:
-        params["sigungu"] = sigungu
+        base_params["sigungu"] = sigungu
     if building_name:
-        params["buld_nm"] = building_name
+        base_params["buld_nm"] = building_name
 
-    try:
-        resp = requests.get(
-            f"{ELEVATOR_API_BASE}/getElevatorListM",
-            params=params,
-            timeout=15.0,
-        )
-    except Exception as e:
-        return {"ok": False, "items": [], "error": f"API 호출 실패: {e}"}
+    all_items: list[dict] = []
+    total_count = 0
+    request_url = ""
 
-    if resp.status_code >= 400:
-        return {"ok": False, "items": [],
-                "error": f"API 응답 오류 {resp.status_code}: {resp.text[:200]}"}
+    for page in range(1, max_pages + 1):
+        params = dict(base_params)
+        params["pageNo"] = str(page)
+        try:
+            resp = requests.get(
+                f"{ELEVATOR_API_BASE}/getElevatorListM",
+                params=params,
+                timeout=15.0,
+            )
+        except Exception as e:
+            return {
+                "ok": False, "items": all_items, "total_count": total_count,
+                "fetched": len(all_items), "pages_fetched": page - 1,
+                "request_url": request_url,
+                "error": f"API 호출 실패 (페이지 {page}): {e}",
+            }
 
-    text = resp.text or ""
-    if "SERVICE_KEY_IS_NOT_REGISTERED" in text.upper() or "SERVICE KEY IS NOT REGISTERED" in text.upper():
-        return {"ok": False, "items": [],
-                "error": "서비스키가 등록되지 않았습니다. 공공데이터포털에서 활용신청 후 1~2시간 대기."}
+        if page == 1:
+            # serviceKey는 마스킹
+            request_url = str(resp.url).replace(key, key[:8] + "***")
 
-    try:
-        parsed = xmltodict.parse(text)
-    except Exception as e:
-        return {"ok": False, "items": [], "error": f"응답 파싱 실패: {e}"}
+        if resp.status_code >= 400:
+            return {
+                "ok": False, "items": all_items, "total_count": total_count,
+                "fetched": len(all_items), "pages_fetched": page - 1,
+                "request_url": request_url,
+                "error": f"API 응답 오류 {resp.status_code}: {resp.text[:200]}",
+            }
 
-    response = parsed.get("response") or {}
-    header = response.get("header") or {}
-    result_code = str(header.get("resultCode") or "")
-    if result_code and result_code != "00":
-        return {"ok": False, "items": [],
-                "error": f"API 응답코드 {result_code}: {header.get('resultMsg', '')}"}
+        text = resp.text or ""
+        if "SERVICE_KEY_IS_NOT_REGISTERED" in text.upper() or "SERVICE KEY IS NOT REGISTERED" in text.upper():
+            return {
+                "ok": False, "items": [], "total_count": 0,
+                "fetched": 0, "pages_fetched": 0, "request_url": request_url,
+                "error": "서비스키가 등록되지 않았습니다. 공공데이터포털에서 활용신청 후 1~2시간 대기.",
+            }
 
-    body = response.get("body") or {}
-    items_wrap = body.get("items") or {}
-    raw_items = items_wrap.get("item") if isinstance(items_wrap, dict) else None
-    if raw_items is None:
-        return {"ok": True, "items": [], "error": ""}
-    if isinstance(raw_items, dict):
-        raw_items = [raw_items]
+        try:
+            parsed = xmltodict.parse(text)
+        except Exception as e:
+            return {
+                "ok": False, "items": all_items, "total_count": total_count,
+                "fetched": len(all_items), "pages_fetched": page - 1,
+                "request_url": request_url,
+                "error": f"응답 파싱 실패: {e}",
+            }
 
-    return {"ok": True, "items": raw_items, "error": ""}
+        response = parsed.get("response") or {}
+        header = response.get("header") or {}
+        result_code = str(header.get("resultCode") or "")
+        if result_code and result_code != "00":
+            return {
+                "ok": False, "items": all_items, "total_count": total_count,
+                "fetched": len(all_items), "pages_fetched": page - 1,
+                "request_url": request_url,
+                "error": f"API 응답코드 {result_code}: {header.get('resultMsg', '')}",
+            }
+
+        body = response.get("body") or {}
+        try:
+            total_count = int(str(body.get("totalCount") or 0) or 0)
+        except Exception:
+            total_count = 0
+
+        items_wrap = body.get("items") or {}
+        raw_items = items_wrap.get("item") if isinstance(items_wrap, dict) else None
+        if raw_items is None:
+            page_items: list[dict] = []
+        elif isinstance(raw_items, dict):
+            page_items = [raw_items]
+        else:
+            page_items = list(raw_items)
+
+        all_items.extend(page_items)
+
+        # 종료 조건: 누적 ≥ 총건수 OR 이번 페이지가 가득 차지 않음
+        if total_count and len(all_items) >= total_count:
+            return {
+                "ok": True, "items": all_items, "total_count": total_count,
+                "fetched": len(all_items), "pages_fetched": page,
+                "request_url": request_url, "error": "",
+            }
+        if len(page_items) < num_rows:
+            return {
+                "ok": True, "items": all_items, "total_count": total_count or len(all_items),
+                "fetched": len(all_items), "pages_fetched": page,
+                "request_url": request_url, "error": "",
+            }
+
+    # max_pages 도달
+    return {
+        "ok": True, "items": all_items, "total_count": total_count,
+        "fetched": len(all_items), "pages_fetched": max_pages,
+        "request_url": request_url, "error": "",
+    }
+
+
+# 응답 항목에서 주소를 추출할 때 후보 키 (공공데이터 응답 스키마 변동 대비)
+_ADDR_KEYS: tuple[str, ...] = (
+    "address1", "address2", "address", "addr",
+    "rdnmadr", "lnmadr", "doroAddr", "roadAddr", "jibunAddr",
+    "buldNm", "buld_nm",
+)
+
+
+def _get_full_address(it: dict) -> str:
+    """API 응답 항목에서 가능한 모든 주소·건물명 필드를 결합."""
+    parts = [str(it.get(k) or "") for k in _ADDR_KEYS]
+    return " ".join(p for p in parts if p)
+
+
+def _normalize_addr(s: str) -> str:
+    """주소 비교용 정규화 — 공백·하이픈 제거, 소문자화."""
+    if not s:
+        return ""
+    return s.replace(" ", "").replace("-", "").replace("\u00a0", "").lower()
 
 
 def _parse_int(v: Any) -> int:
@@ -1023,29 +1120,105 @@ def _render_search_tab() -> None:
                                       key="elev_buld")
 
     if st.button("🔍 검색", type="primary", width="stretch", key="elev_search_btn"):
-        with st.spinner("승강기 정보 조회 중..."):
+        with st.spinner(
+            "승강기 정보 조회 중... (시군구 전체를 가져오므로 최대 30초 소요. "
+            "두 번째 검색부터는 캐시로 즉시 응답)"
+        ):
             result = fetch_elevators_by_address(
-                sido=sido, sigungu=sigungu, building_name=building_name, num_rows=100,
+                sido=sido, sigungu=sigungu, building_name=building_name,
+                num_rows=500, max_pages=30,
             )
+        st.session_state["_elev_last_result"] = result
         if not result["ok"]:
             st.error(f"❌ {result['error']}")
             return
-        items = result["items"]
+
+        items_all: list[dict] = list(result["items"])
+        items: list[dict] = items_all
+
         # 도로명 부분일치 클라이언트 필터 (API는 도로명 파라미터 미지원)
+        # 공백·하이픈 정규화 + 전체 주소 키(rdnmadr, doroAddr 등) 모두 검사
         if road_name and items:
-            rn = road_name.strip()
-            items = [
-                it for it in items
-                if rn in (str(it.get("address1") or "") + str(it.get("address2") or ""))
-            ]
+            rn = _normalize_addr(road_name)
+            items = [it for it in items if rn in _normalize_addr(_get_full_address(it))]
+
+        st.session_state["_elev_filter_before"] = len(items_all)
+        st.session_state["_elev_filter_after"] = len(items)
+
         if not items:
-            st.info("조회된 승강기가 없습니다. 시/도·시/군/구·도로명을 다시 확인해 주세요.")
+            _tc = result.get("total_count", 0)
+            if _tc == 0:
+                st.error(
+                    f"❌ {sido} {sigungu} 조합으로 검색된 승강기가 **0건**입니다.\n\n"
+                    "**가능한 원인**:\n"
+                    "1. 해당 시/도·시/군/구 명칭이 공공데이터 표준과 다를 수 있음 "
+                    "(예: '울산' vs '울산광역시')\n"
+                    "2. 공공데이터에 해당 지역 데이터가 아직 등록되지 않음\n\n"
+                    "아래 **🔍 API 호출 진단 정보**를 확장해 호출 URL을 직접 확인해 보세요."
+                )
+            else:
+                st.warning(
+                    f"⚠ {sido} {sigungu}에 총 **{_tc}건**의 승강기가 있지만, "
+                    f"도로명/건물명 필터 결과 **0건**입니다.\n\n"
+                    f"- 도로명 입력: `{road_name or '(없음)'}`\n"
+                    f"- 건물명 입력: `{building_name or '(없음)'}`\n\n"
+                    "**시도해 보세요**:\n"
+                    "1. 도로명을 더 짧게 (예: `봉월로 167` → `봉월로`)\n"
+                    "2. 도로명을 비우고 **건물명**만 입력 (API가 건물명을 직접 필터링)\n"
+                    "3. 둘 다 비우고 검색 후 결과에서 직접 찾기"
+                )
             st.session_state["_elev_last_df"] = pd.DataFrame()
-            return
-        df = _items_to_dataframe(items)
-        st.session_state["_elev_last_df"] = df
-        st.session_state["_elev_last_items"] = items
-        st.success(f"✅ {len(df)}건 조회됨")
+        else:
+            df = _items_to_dataframe(items)
+            st.session_state["_elev_last_df"] = df
+            st.session_state["_elev_last_items"] = items
+            _filtered_note = (
+                f" (전체 {result.get('total_count', 0)}건 중 도로명 필터 통과)"
+                if road_name else f" (전체 {result.get('total_count', 0)}건)"
+            )
+            st.success(f"✅ {len(df)}건 조회됨{_filtered_note}")
+
+    # 진단 정보 (마지막 검색 결과 기준)
+    _last_result = st.session_state.get("_elev_last_result")
+    if _last_result:
+        _tc = int(_last_result.get("total_count", 0) or 0)
+        _fc = int(_last_result.get("fetched", 0) or 0)
+        # totalCount > fetched 이면 페이지네이션이 잘렸음
+        if _tc > _fc:
+            st.warning(
+                f"⚠ 서버에 **{_tc:,}건**이 있지만 max_pages 한도로 **{_fc:,}건만** 가져왔습니다. "
+                "원하는 건물이 누락됐을 수 있습니다. 코드의 `max_pages` 값을 늘려야 합니다."
+            )
+
+        with st.expander("🔍 API 호출 진단 정보 (응답이 비어있을 때 펼쳐 확인)"):
+            _bef = st.session_state.get("_elev_filter_before", 0)
+            _aft = st.session_state.get("_elev_filter_after", 0)
+            st.code(
+                f"호출 URL              : {_last_result.get('request_url', '')[:400]}\n"
+                f"서버 totalCount       : {_tc:,}건\n"
+                f"실제 가져온 건수      : {_fc:,}건"
+                + (" ⚠ 한도로 잘림" if _tc > _fc else "") + "\n"
+                f"가져온 페이지 수      : {_last_result.get('pages_fetched', 0)}\n"
+                f"도로명 필터 전        : {_bef}건\n"
+                f"도로명 필터 후        : {_aft}건\n"
+                f"응답 에러             : {_last_result.get('error', '') or '(없음)'}",
+                language="text",
+            )
+            # 첫 항목의 키 구조 노출 (응답 스키마 디버깅용)
+            _items_sample = _last_result.get("items") or []
+            if _items_sample:
+                _first = _items_sample[0]
+                st.markdown("**응답 첫 항목의 키/값 (스키마 확인용)**")
+                st.json({k: str(v)[:80] for k, v in _first.items()})
+            st.markdown(
+                "**필터 매칭 키**: `address1`, `address2`, `address`, `addr`, "
+                "`rdnmadr`, `lnmadr`, `doroAddr`, `roadAddr`, `jibunAddr`, `buldNm`"
+            )
+            st.info(
+                "💡 **빠른 검색 팁**: 건물명을 알면 위 **건물명** 필드에 입력하세요. "
+                "API가 직접 필터링하여 즉시 응답합니다 "
+                "(도로명만 입력하면 시군구 전체를 받아와 클라이언트에서 필터링)."
+            )
 
     df = st.session_state.get("_elev_last_df")
     if df is not None and not df.empty:
