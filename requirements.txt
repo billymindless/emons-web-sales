@@ -20,3 +20,6 @@ google-api-python-client>=2.127.0
 # 자료실 리치 텍스트 에디터
 streamlit-quill>=0.0.3
 # AI VOC 분석 (Gemini REST API — httpx로 직접 호출, 별도 패키지 불필요)
+# 엘리베이터 사이즈 점검 (공공데이터포털 XML 응답 파싱 + 평면도 시각화)
+xmltodict>=0.13.0
+matplotlib>=3.7.0
