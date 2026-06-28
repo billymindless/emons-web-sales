@@ -832,31 +832,41 @@ def render_lead_management() -> None:
     for _l in leads_raw:
         _l["_is_customer"] = _normalize_phone(_l.get("phone") or "") in customer_phones
 
-    _customer_count = sum(1 for _l in leads_raw if _l["_is_customer"])
+    # ── 선택된 리드 상세 패널 (관리 버튼 클릭 시 타이틀 바로 아래로 노출) ──
+    _sel_id = st.session_state.get("lead_selected_id")
+    if _sel_id:
+        _sel = next((l for l in leads_raw if l.get("id") == _sel_id), None)
+        if _sel:
+            with st.container(border=True):
+                _render_lead_detail_panel(_sel, emp_map)
+            st.divider()
 
-    # ── Stats 카드 ────────────────────────────
-    _total = len(leads_raw)
-    _new = sum(1 for l in leads_raw if l.get("lead_stage") == "1_신규")
-    _consult = sum(1 for l in leads_raw if l.get("lead_stage") in ("2_상담중", "3_견적발송"))
-    _conv = sum(1 for l in leads_raw if l.get("lead_stage") == "4_계약완료" or l.get("_is_customer"))
+    # ── Stats 카드 (숨김 처리 — 추후 세일즈 퍼포먼스 메뉴로 이동 예정) ──
+    # 통계 위젯 비활성화. 로직은 유지하여 이전 시 그대로 재사용 가능.
+    if False:
+        _customer_count = sum(1 for _l in leads_raw if _l["_is_customer"])
+        _total = len(leads_raw)
+        _new = sum(1 for l in leads_raw if l.get("lead_stage") == "1_신규")
+        _consult = sum(1 for l in leads_raw if l.get("lead_stage") in ("2_상담중", "3_견적발송"))
+        _conv = sum(1 for l in leads_raw if l.get("lead_stage") == "4_계약완료" or l.get("_is_customer"))
 
-    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-    sc1.metric("전체 리드", f"{_total}건", help="전체 등록된 잠재 고객 수")
-    sc2.metric("신규", f"{_new}건", help="아직 첫 응대가 필요한 문의")
-    sc3.metric("상담중", f"{_consult}건", help="현재 커뮤니케이션이 진행 중인 리드")
-    sc4.metric(
-        "전환 완료",
-        f"{_conv}건",
-        delta=f"전환율 {round(_conv / _total * 100, 1)}%" if _total else None,
-        help="계약 완료 단계 또는 이미 우리 DB에 고객으로 등록된 리드",
-    )
-    sc5.metric(
-        "🛒 구매 완료",
-        f"{_customer_count}건",
-        help="app_customers 마스터에 phone이 매칭된 리드 (이미 구매한 고객)",
-    )
+        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+        sc1.metric("전체 리드", f"{_total}건", help="전체 등록된 잠재 고객 수")
+        sc2.metric("신규", f"{_new}건", help="아직 첫 응대가 필요한 문의")
+        sc3.metric("상담중", f"{_consult}건", help="현재 커뮤니케이션이 진행 중인 리드")
+        sc4.metric(
+            "전환 완료",
+            f"{_conv}건",
+            delta=f"전환율 {round(_conv / _total * 100, 1)}%" if _total else None,
+            help="계약 완료 단계 또는 이미 우리 DB에 고객으로 등록된 리드",
+        )
+        sc5.metric(
+            "🛒 구매 완료",
+            f"{_customer_count}건",
+            help="app_customers 마스터에 phone이 매칭된 리드 (이미 구매한 고객)",
+        )
 
-    st.divider()
+        st.divider()
 
     # ── Stage filter tabs (segmented) ──────────
     _stage_keys = ["전체"] + list(LEAD_STAGES.keys())
@@ -1111,13 +1121,7 @@ def render_lead_management() -> None:
                     st.session_state["lead_show_import"] = False
                     st.rerun()
 
-    # ── 선택된 리드 상세 패널 ───────────────────
-    _sel_id = st.session_state.get("lead_selected_id")
-    if _sel_id:
-        _sel = next((l for l in leads_raw if l.get("id") == _sel_id), None)
-        if _sel:
-            st.divider()
-            _render_lead_detail_panel(_sel, emp_map)
+    # 상세 패널은 페이지 상단(타이틀 직후)에서 렌더링됨 — 여기서는 별도 처리 없음
 
 
 # ──────────────────────────────────────────────
