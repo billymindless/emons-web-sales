@@ -115,7 +115,7 @@ def _format_phone_display(phone: str) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _get_employee_map() -> dict[int, str]:
-    """employee_id → 직원 이름."""
+    """employee_id → 직원 이름 (전체)."""
     supa = _supa()
     if not supa:
         return {}
@@ -127,6 +127,80 @@ def _get_employee_map() -> dict[int, str]:
         }
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_employees_by_store() -> dict[str, list[str]]:
+    """
+    store_name → [직원 표시명 리스트] 매핑.
+
+    조회 우선순위:
+      1) app_stores + app_user_stores + app_users M2M 정식 매핑
+      2) app_users.store_name 직접 컬럼 (1차에서 빈 경우)
+    """
+    supa = _supa()
+    out: dict[str, set[str]] = {}
+    if not supa:
+        return {}
+
+    # 1) M2M 정식 매핑
+    try:
+        stores = supa.table("app_stores").select("id,store_name").execute().data or []
+        store_id_to_name: dict[int, str] = {
+            int(s["id"]): str(s.get("store_name") or "").strip()
+            for s in stores if s.get("id")
+        }
+        users = supa.table("app_users").select("id,name,username").execute().data or []
+        uid_to_name: dict[int, str] = {
+            int(u["id"]): (u.get("name") or u.get("username") or f"#{u['id']}").strip()
+            for u in users if u.get("id")
+        }
+        links = supa.table("app_user_stores").select("user_id,store_id").execute().data or []
+        for ln in links:
+            sn = store_id_to_name.get(int(ln.get("store_id") or 0), "")
+            un = uid_to_name.get(int(ln.get("user_id") or 0), "")
+            if sn and un:
+                out.setdefault(sn, set()).add(un)
+    except Exception:
+        pass
+
+    # 2) app_users.store_name 직접 (1차 결과가 비었을 때)
+    if not out:
+        try:
+            users = supa.table("app_users").select("id,name,username,store_name").execute().data or []
+            for u in users:
+                sn = str(u.get("store_name") or "").strip()
+                un = (u.get("name") or u.get("username") or "").strip()
+                if sn and un:
+                    out.setdefault(sn, set()).add(un)
+        except Exception:
+            pass
+
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def _employees_for_store(
+    lead_store: str,
+    by_store: dict[str, list[str]],
+    all_names: list[str],
+) -> list[str]:
+    """
+    리드의 store_name으로 해당 매장 직원만 추출.
+
+    매칭 전략:
+      a) 완전 일치 (트림)
+      b) 부분 일치 ("울산삼산점" ∈ "에몬스 울산삼산점")
+      c) 매칭 실패 → 전사 전체 이름 폴백 (안전: 빈 드롭다운 방지)
+    """
+    sn = (lead_store or "").strip()
+    if not sn or not by_store:
+        return all_names
+    if sn in by_store:
+        return by_store[sn]
+    for k, v in by_store.items():
+        if sn and k and (sn in k or k in sn):
+            return v
+    return all_names
 
 
 # ──────────────────────────────────────────────
@@ -880,6 +954,14 @@ def render_lead_management() -> None:
 
     _emp_name_to_id = {v: k for k, v in emp_map.items()}
     _stage_keys_list = list(LEAD_STAGES.keys())
+    _employees_by_store = _get_employees_by_store()
+
+    # 매장별 직원 매핑이 비어있으면 진단 안내
+    if not _employees_by_store and not _emp_all_names:
+        st.warning(
+            "⚠ 직원 명단을 불러오지 못했습니다. `app_users` 테이블 권한(RLS) 또는 "
+            "Supabase 연결을 확인하세요. 임시로 전체 이름 폴백을 사용합니다."
+        )
 
     # ── 리드 행 (인라인 편집) ───────────────────
     for _i, _lead in enumerate(leads):
@@ -955,19 +1037,24 @@ def render_lead_management() -> None:
                     unsafe_allow_html=True,
                 )
 
-        # 담당직원 — 인라인 multiselect
+        # 담당직원 — 인라인 multiselect (해당 매장 직원만)
         with _rc[5]:
             _emp_key = f"inline_emps_{_lid}"
-            # 현재 값 중 emp_map에 없는 이름은 옵션에 추가하여 default 매칭 보장
-            _row_options = list(dict.fromkeys(_emp_all_names + _emp_names_list))
+            # 1) 리드의 매장에 등록된 직원만 후보로 사용
+            _store_emps = _employees_for_store(_store, _employees_by_store, _emp_all_names)
+            # 2) 현재 저장된 이름 중 옵션에 없는 것은 강제 추가 (default 매칭 + 데이터 보존)
+            _row_options = list(dict.fromkeys(_store_emps + _emp_names_list))
             _row_default = [n for n in _emp_names_list if n in _row_options]
+            _placeholder = (
+                f"{_store} 직원 선택" if _store else "담당자 선택"
+            )
             st.multiselect(
                 "담당직원",
                 options=_row_options,
                 default=_row_default,
                 key=_emp_key,
                 label_visibility="collapsed",
-                placeholder="담당자 선택",
+                placeholder=_placeholder,
                 on_change=_inline_save_emps,
                 args=(_lid, _emp_key, _emp_name_to_id),
             )
