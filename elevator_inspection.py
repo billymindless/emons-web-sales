@@ -231,6 +231,205 @@ def _get_service_key() -> str:
     return key
 
 
+# ──────────────────────────────────────────────
+# 카카오 로컬 API (도로명 → 건물명 자동 변환)
+# ──────────────────────────────────────────────
+
+_KAKAO_ENV_CANDIDATES: tuple[str, ...] = (
+    "KAKAO_REST_API_KEY",
+    "KAKAO_REST_KEY",
+    "KAKAO_API_KEY",
+)
+# secrets.toml top-level (섹션 없이) 키 후보
+_KAKAO_TOP_LEVEL_KEYS: tuple[str, ...] = (
+    "KAKAO_REST_KEY",
+    "KAKAO_REST_API_KEY",
+    "KAKAO_API_KEY",
+)
+
+
+def _get_kakao_key() -> str:
+    """
+    카카오 REST API 키를 다단계 폴백으로 로드.
+      1. .streamlit/secrets.toml — [kakao] rest_api_key 또는 top-level KAKAO_REST_KEY
+      2. st.secrets — 동일 (섹션 또는 top-level)
+      3. 환경변수 KAKAO_REST_API_KEY / KAKAO_REST_KEY / KAKAO_API_KEY
+    """
+    # 1) secrets.toml 직접 읽기
+    try:
+        import tomllib
+        from pathlib import Path
+        for _p in [
+            Path(__file__).parent / ".streamlit" / "secrets.toml",
+            Path.cwd() / ".streamlit" / "secrets.toml",
+        ]:
+            if _p.exists():
+                with open(_p, "rb") as _f:
+                    _data = tomllib.load(_f)
+                # [kakao] 섹션
+                _v = str((_data.get("kakao") or {}).get("rest_api_key", "") or "").strip()
+                if _v:
+                    return _v
+                # top-level
+                for _k in _KAKAO_TOP_LEVEL_KEYS:
+                    _v = str(_data.get(_k, "") or "").strip()
+                    if _v:
+                        return _v
+                break
+    except Exception:
+        pass
+    # 2) st.secrets
+    try:
+        if hasattr(st, "secrets"):
+            _v = str((st.secrets.get("kakao", {}) or {}).get("rest_api_key", "") or "").strip()
+            if _v:
+                return _v
+            for _k in _KAKAO_TOP_LEVEL_KEYS:
+                try:
+                    _v = str(st.secrets.get(_k, "") or "").strip()
+                    if _v:
+                        return _v
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    # 3) env
+    for _name in _KAKAO_ENV_CANDIDATES:
+        _v = (os.environ.get(_name, "") or "").strip()
+        if _v:
+            return _v
+    return ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def kakao_geocode_address(full_address: str) -> dict:
+    """
+    카카오 로컬 API로 주소를 지오코딩하여 건물명을 추출.
+
+    Args:
+        full_address: 예) "울산광역시 남구 봉월로 167"
+
+    Returns:
+        {
+            "ok": bool,
+            "building_name": str,   # 추출된 건물명 (가장 가능성 높은 1순위)
+            "candidates": list,     # 모든 후보 [{building_name, road_address, ...}]
+            "request_url": str,
+            "error": str,
+        }
+    """
+    import requests
+
+    def _empty(err: str) -> dict:
+        return {
+            "ok": False, "building_name": "", "candidates": [],
+            "request_url": "", "error": err,
+        }
+
+    key = _get_kakao_key()
+    if not key:
+        return _empty(
+            "카카오 REST API 키가 설정되지 않았습니다. "
+            "secrets.toml의 [kakao] rest_api_key 또는 환경변수 KAKAO_REST_API_KEY를 설정하세요."
+        )
+
+    addr = (full_address or "").strip()
+    if not addr:
+        return _empty("주소가 비어있습니다.")
+
+    try:
+        resp = requests.get(
+            "https://dapi.kakao.com/v2/local/search/address.json",
+            params={"query": addr, "size": 10},
+            headers={"Authorization": f"KakaoAK {key}"},
+            timeout=5.0,
+        )
+    except Exception as e:
+        return _empty(f"카카오 API 호출 실패: {e}")
+
+    if resp.status_code == 401:
+        return _empty("카카오 API 인증 실패 (키 확인 필요). 401 Unauthorized")
+    if resp.status_code >= 400:
+        return _empty(f"카카오 API 오류 {resp.status_code}: {resp.text[:200]}")
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        return _empty(f"카카오 응답 파싱 실패: {e}")
+
+    docs = data.get("documents") or []
+    candidates: list[dict] = []
+    for d in docs:
+        ra = d.get("road_address") or {}
+        cand = {
+            "building_name": (ra.get("building_name") or "").strip(),
+            "road_address": ra.get("address_name") or "",
+            "jibun_address": (d.get("address") or {}).get("address_name") or "",
+            "x": d.get("x"), "y": d.get("y"),
+        }
+        candidates.append(cand)
+
+    # 건물명이 있는 첫 후보 우선, 없으면 첫 후보
+    building_name = ""
+    for c in candidates:
+        if c["building_name"]:
+            building_name = c["building_name"]
+            break
+
+    return {
+        "ok": True,
+        "building_name": building_name,
+        "candidates": candidates,
+        "request_url": str(resp.url),
+        "error": "" if candidates else "검색 결과 없음 (주소를 다시 확인해 주세요)",
+    }
+
+
+def _smart_buld_nm_search(
+    sido: str, sigungu: str, kakao_building_name: str,
+) -> tuple[dict | None, str, str]:
+    """
+    카카오에서 추출한 건물명으로 공공데이터 API에 다단계 buld_nm 검색.
+
+    공공데이터의 건물명과 카카오 건물명이 다를 수 있으므로
+    원본 → 공백 제거 → 핵심 키워드(가장 긴 단어) 순으로 fallback.
+
+    Returns:
+        (result_dict, matched_keyword, strategy) — 모두 실패 시 (None, "", "all_failed")
+    """
+    name = (kakao_building_name or "").strip()
+    if not name:
+        return None, "", "empty"
+
+    candidates: list[tuple[str, str]] = [(name, "original")]
+
+    nospace = name.replace(" ", "")
+    if nospace and nospace != name:
+        candidates.append((nospace, "no_space"))
+
+    # 2글자 이상 단어를 길이순(긴 것 우선)으로
+    words = sorted(
+        {w for w in name.split() if len(w) >= 2},
+        key=len, reverse=True,
+    )
+    for w in words:
+        candidates.append((w, f"keyword:{w}"))
+
+    seen: set[str] = set()
+    for kw, strategy in candidates:
+        if kw in seen:
+            continue
+        seen.add(kw)
+        r = fetch_elevators_by_address(
+            sido=sido, sigungu=sigungu, building_name=kw,
+            num_rows=500, max_pages=5,
+        )
+        if r.get("ok") and r.get("fetched", 0) > 0:
+            return r, kw, strategy
+
+    return None, "", "all_failed"
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_elevators_by_address(
     sido: str = "",
@@ -1120,14 +1319,65 @@ def _render_search_tab() -> None:
                                       key="elev_buld")
 
     if st.button("🔍 검색", type="primary", width="stretch", key="elev_search_btn"):
-        with st.spinner(
-            "승강기 정보 조회 중... (시군구 전체를 가져오므로 최대 30초 소요. "
-            "두 번째 검색부터는 캐시로 즉시 응답)"
-        ):
-            result = fetch_elevators_by_address(
-                sido=sido, sigungu=sigungu, building_name=building_name,
-                num_rows=500, max_pages=30,
+        result: dict | None = None
+        _kakao_info: dict | None = None
+        _smart_meta: dict = {}
+
+        # ── Fast Path: 사용자가 도로명을 입력했고 건물명이 비었을 때 ──
+        if road_name and not building_name:
+            _full_addr = f"{sido} {sigungu} {road_name}".strip()
+            with st.spinner(f"⚡ 카카오 로컬 API로 건물명 추출 중... ({_full_addr})"):
+                _kakao_info = kakao_geocode_address(_full_addr)
+            st.session_state["_elev_kakao_info"] = _kakao_info
+
+            if _kakao_info["ok"] and _kakao_info["building_name"]:
+                _bn = _kakao_info["building_name"]
+                with st.spinner(
+                    f"⚡ '{_bn}' 으로 공공데이터 매칭 시도 중 (다단계 fallback)..."
+                ):
+                    _smart_r, _matched_kw, _strategy = _smart_buld_nm_search(sido, sigungu, _bn)
+                _smart_meta = {
+                    "kakao_name": _bn,
+                    "matched_keyword": _matched_kw,
+                    "strategy": _strategy,
+                }
+                if _smart_r:
+                    result = _smart_r
+                    st.success(
+                        f"⚡ **Fast Path 성공** — 카카오: `{_bn}` → "
+                        f"공공데이터 매칭 키워드: `{_matched_kw}` ({_strategy}) → "
+                        f"**{result.get('fetched', 0)}건** 1초 내 조회"
+                    )
+                else:
+                    st.warning(
+                        f"⚠ Fast Path 실패 — 카카오는 '{_bn}'를 찾았지만 공공데이터 buld_nm 매칭 실패. "
+                        "시군구 전체 fallback (~20초)으로 전환합니다."
+                    )
+            elif _kakao_info["ok"]:
+                st.info(
+                    "⚠ 카카오는 응답했지만 해당 주소에 등록된 건물명이 없음. "
+                    "시군구 전체 조회로 진행합니다 (~20초)."
+                )
+            else:
+                st.warning(
+                    f"⚠ 카카오 Fast Path 사용 불가: {_kakao_info['error'][:120]} "
+                    "시군구 전체 조회로 진행합니다 (~20초)."
+                )
+
+        st.session_state["_elev_smart_meta"] = _smart_meta
+
+        # ── Fast Path 실패 또는 사용자가 건물명을 직접 입력한 경우 ──
+        if result is None:
+            _spinner_msg = (
+                f"건물명 '{building_name}'로 직접 조회 중..."
+                if building_name
+                else "시군구 전체 조회 중... 최대 30초 (두 번째부터는 캐시로 즉시)"
             )
+            with st.spinner(_spinner_msg):
+                result = fetch_elevators_by_address(
+                    sido=sido, sigungu=sigungu, building_name=building_name,
+                    num_rows=500, max_pages=30,
+                )
         st.session_state["_elev_last_result"] = result
         if not result["ok"]:
             st.error(f"❌ {result['error']}")
@@ -1219,6 +1469,29 @@ def _render_search_tab() -> None:
                 "API가 직접 필터링하여 즉시 응답합니다 "
                 "(도로명만 입력하면 시군구 전체를 받아와 클라이언트에서 필터링)."
             )
+
+            # 카카오 Fast Path 결과
+            _ki = st.session_state.get("_elev_kakao_info")
+            _sm = st.session_state.get("_elev_smart_meta") or {}
+            if _ki:
+                st.markdown("**⚡ Fast Path 진단 (카카오 → 공공데이터)**")
+                st.code(
+                    f"카카오 API 호출 성공     : {_ki.get('ok')}\n"
+                    f"카카오 추출 건물명       : {_ki.get('building_name') or '(없음)'}\n"
+                    f"카카오 후보 수           : {len(_ki.get('candidates') or [])}\n"
+                    f"카카오 에러              : {_ki.get('error') or '(없음)'}\n"
+                    f"공공데이터 매칭 키워드   : {_sm.get('matched_keyword') or '(매칭 실패)'}\n"
+                    f"매칭 전략                : {_sm.get('strategy') or '(N/A)'}",
+                    language="text",
+                )
+                _cands = _ki.get("candidates") or []
+                if _cands:
+                    st.markdown("**카카오 후보 주소 (최대 3건)**")
+                    st.json([{
+                        "건물명": c["building_name"],
+                        "도로명": c["road_address"],
+                        "지번": c["jibun_address"],
+                    } for c in _cands[:3]])
 
     df = st.session_state.get("_elev_last_df")
     if df is not None and not df.empty:
