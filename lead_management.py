@@ -594,7 +594,7 @@ def render_lead_management() -> None:
 
     _full_select = (
         "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
-        "next_contact_date,assigned_employee_id,store_name,"
+        "next_contact_date,assigned_employee_id,employee_names,store_name,"
         "customer_type,classification_memo,classified_by,classified_at,last_contact_at,"
         "created_at,converted_at,revenue_amount,converted_order_id"
     )
@@ -603,37 +603,45 @@ def render_lead_management() -> None:
         "next_contact_date,assigned_employee_id,store_name,"
         "created_at,converted_at,revenue_amount,converted_order_id"
     )
-    _migration_pending = False
+    _migration_pending: list[str] = []
+    leads_raw: list[dict] = []
     try:
-        leads_raw: list[dict] = supa.table("app_leads").select(_full_select) \
+        leads_raw = supa.table("app_leads").select(_full_select) \
             .order("created_at", desc=True).limit(500).execute().data or []
     except Exception as e:
         _err_msg = str(e)
-        # customer_type 컬럼이 없으면 마이그레이션 전 — 레거시 SELECT로 폴백
-        if "customer_type" in _err_msg or "42703" in _err_msg:
-            _migration_pending = True
+        # 새 컬럼이 누락된 경우 → 레거시 SELECT로 폴백
+        _is_missing_col = "42703" in _err_msg or any(
+            c in _err_msg for c in ("customer_type", "employee_names", "classification_memo", "last_contact_at")
+        )
+        if _is_missing_col:
+            if "customer_type" in _err_msg or "classification_memo" in _err_msg or "last_contact_at" in _err_msg:
+                _migration_pending.append("SUPABASE_APP_LEADS_CUSTOMER_TYPE.sql")
+            if "employee_names" in _err_msg:
+                _migration_pending.append("SUPABASE_APP_LEADS_EMPLOYEE_NAMES.sql")
             try:
                 leads_raw = supa.table("app_leads").select(_legacy_select) \
                     .order("created_at", desc=True).limit(500).execute().data or []
             except Exception as e2:
                 st.error(f"리드 조회 실패: {e2}")
                 return
-            # 신규 컬럼 기본값 주입 → 이후 UI가 .get()으로 안전 접근
             for _l in leads_raw:
                 _l.setdefault("customer_type", "신규잠재고객")
                 _l.setdefault("classification_memo", None)
                 _l.setdefault("classified_by", None)
                 _l.setdefault("classified_at", None)
                 _l.setdefault("last_contact_at", None)
+                _l.setdefault("employee_names", None)
         else:
             st.error(f"리드 조회 실패: {e}")
             return
 
     if _migration_pending:
+        _files = " · ".join(f"`{f}`" for f in _migration_pending)
         st.warning(
-            "⚠️ **SQL 마이그레이션 필요** — `SUPABASE_APP_LEADS_CUSTOMER_TYPE.sql` 파일을 "
+            f"⚠️ **SQL 마이그레이션 필요** — {_files} 파일을 "
             "Supabase Dashboard › SQL Editor에서 실행하세요. "
-            "고객 유형 분류·재유입 자동 재활성화 기능은 마이그레이션 후 활성화됩니다."
+            "해당 기능(고객 유형 분류·다중 담당자·재유입 추적)은 마이그레이션 후 활성화됩니다."
         )
 
     emp_map = _get_employee_map()
@@ -758,7 +766,12 @@ def render_lead_management() -> None:
         if st.button("✕ 담당자 필터 해제", key="clear_emp_filter"):
             st.session_state.pop("lead_filter_emp_id", None)
             st.rerun()
-        leads = [l for l in leads if l.get("assigned_employee_id") == _filter_emp_id]
+        _filter_emp_name = emp_map.get(int(_filter_emp_id), "")
+        leads = [
+            l for l in leads
+            if l.get("assigned_employee_id") == _filter_emp_id
+            or (_filter_emp_name and _filter_emp_name in (l.get("employee_names") or "").split(","))
+        ]
 
     # ── 테이블 헤더 ───────────────────────────
     _ths = ["고객명", "연락처", "유형", "유입경로", "상태", "담당직원 ↓클릭=필터", "마지막 연락", ""]
@@ -783,9 +796,16 @@ def render_lead_management() -> None:
         _fg = LEAD_STAGE_TEXT.get(_stage, "#374151")
         _ctype = _lead.get("customer_type") or "신규잠재고객"
 
-        # 담당직원: 단일
-        _primary_emp_id = _lead.get("assigned_employee_id")
-        _emp_name_single = emp_map.get(int(_primary_emp_id), "") if _primary_emp_id else ""
+        # 담당직원: employee_names(쉼표 구분) 우선, 없으면 assigned_employee_id
+        _emp_names_raw = (_lead.get("employee_names") or "").strip()
+        if _emp_names_raw:
+            _emp_names_list = [n.strip() for n in _emp_names_raw.split(",") if n.strip()]
+        else:
+            _primary_emp_id = _lead.get("assigned_employee_id")
+            _fallback_name = emp_map.get(int(_primary_emp_id), "") if _primary_emp_id else ""
+            _emp_names_list = [_fallback_name] if _fallback_name else []
+
+        _emp_name_to_id = {v: k for k, v in emp_map.items()}
 
         _store = _lead.get("store_name") or ""
         _last_contact = (
@@ -823,15 +843,19 @@ def render_lead_management() -> None:
             )
         _rc[4].markdown(_badge_html, unsafe_allow_html=True)
 
-        # 담당직원 — 클릭 시 해당 직원 필터
+        # 담당직원 — 이름별 칩 버튼, 클릭 시 해당 직원 필터
         with _rc[5]:
-            if _emp_name_single:
-                if st.button(
-                    f"👤 {_emp_name_single}", key=f"emp_filter_{_lid}_{_primary_emp_id}_{_i}",
-                    help="클릭하면 이 담당자의 리드만 표시",
-                ):
-                    st.session_state["lead_filter_emp_id"] = _primary_emp_id
-                    st.rerun()
+            if _emp_names_list:
+                for _j, _en in enumerate(_emp_names_list):
+                    _eid_for = _emp_name_to_id.get(_en)
+                    if st.button(
+                        f"👤 {_en}",
+                        key=f"emp_filter_{_lid}_{_eid_for or _en}_{_j}_{_i}",
+                        help="클릭하면 이 담당자의 리드만 표시",
+                    ):
+                        if _eid_for:
+                            st.session_state["lead_filter_emp_id"] = _eid_for
+                            st.rerun()
             else:
                 st.markdown(
                     f"<span style='color:#94a3b8;font-size:0.82rem;'>—</span>"
@@ -906,20 +930,17 @@ def _render_register_form() -> None:
     user = st.session_state.get("current_user") or {}
     default_store = user.get("store_name") or st.session_state.get("current_store_name") or ""
 
-    # 담당 직원 드롭다운 옵션 (app_users 전체)
+    # 담당 직원 멀티셀렉트 옵션 — 매출 등록과 동일하게 직원 이름 기준
     emp_map = _get_employee_map()
-    emp_options_sorted = sorted(emp_map.items(), key=lambda x: x[1])
-    emp_id_list = [None] + [eid for eid, _ in emp_options_sorted]
-    emp_labels = ["(미배정)"] + [name for _, name in emp_options_sorted]
+    _emp_name_list = sorted(emp_map.values())
 
-    # 현재 로그인 직원이 직원 목록에 있으면 기본 선택
-    _default_emp_idx = 0
+    # 현재 로그인 직원 기본 선택
+    _default_emp_names: list[str] = []
     _cur_uid = user.get("id")
     if _cur_uid is not None:
-        try:
-            _default_emp_idx = emp_id_list.index(int(_cur_uid))
-        except (ValueError, TypeError):
-            _default_emp_idx = 0
+        _cur_name = emp_map.get(int(_cur_uid), "")
+        if _cur_name:
+            _default_emp_names = [_cur_name]
 
     st.markdown("#### ＋ 새 리드 등록")
     with st.form("lead_register_form_v2", clear_on_submit=True):
@@ -938,16 +959,14 @@ def _render_register_form() -> None:
             phone_in = st.text_input("전화번호 *", placeholder="010-0000-0000")
         with cc2:
             name_in = st.text_input("고객 이름")
-        cc1b, cc2b = st.columns(2)
-        with cc1b:
-            emp_label_sel = st.selectbox(
-                "담당 직원",
-                emp_labels,
-                index=_default_emp_idx,
-                help="이 리드를 책임지는 직원을 선택합니다.",
-            )
-        with cc2b:
-            store_in = st.text_input("담당 매장", value=default_store, placeholder="예: 울산삼산점")
+
+        emp_names_sel = st.multiselect(
+            "담당 직원 (복수 선택, 1/n 실적 분배 대상) *",
+            options=_emp_name_list,
+            default=_default_emp_names,
+            help="매출 등록과 동일하게 여러 명을 선택하면 1/n 실적 분배 대상이 됩니다.",
+        )
+        store_in = st.text_input("담당 매장", value=default_store, placeholder="예: 울산삼산점")
         memo_in = st.text_area("상담 메모", height=80, placeholder="예: 토레도 소파 4인용 가격 문의")
         cc3, cc4 = st.columns(2)
         with cc3:
@@ -969,7 +988,10 @@ def _render_register_form() -> None:
         if not phone_clean or len(phone_clean) < 10:
             st.error("전화번호를 올바르게 입력해 주세요.")
             return
-        selected_employee_id = emp_id_list[emp_labels.index(emp_label_sel)]
+        # 멀티셀렉트 → 첫 번째 직원 ID를 FK로, 전체 이름은 employee_names 텍스트로 저장
+        _emp_name_to_id = {v: k for k, v in emp_map.items()}
+        first_emp_id = _emp_name_to_id.get(emp_names_sel[0]) if emp_names_sel else None
+        employee_names_str = ",".join(emp_names_sel) if emp_names_sel else ""
         try:
             from lead_manager import register_lead
             result = register_lead(
@@ -978,11 +1000,19 @@ def _render_register_form() -> None:
                 memo=memo_in or "",
                 lead_source=lead_source,
                 store_name=store_in or "전체",
-                employee_id=selected_employee_id,
+                employee_id=first_emp_id,
                 next_contact_date=str(next_in),
                 send_now=send_now,
                 image_url=image_in or "",
             )
+            # employee_names 별도 저장 (마이그레이션 후에만 컬럼 존재)
+            if result.get("ok") and result.get("lead_id") and employee_names_str:
+                try:
+                    _supa().table("app_leads").update(
+                        {"employee_names": employee_names_str}
+                    ).eq("id", result["lead_id"]).execute()
+                except Exception:
+                    pass
         except Exception as e:
             st.error(f"오류: {e}")
             return
@@ -1040,7 +1070,12 @@ def _render_lead_detail_panel(lead: dict, emp_map: dict[int, str]) -> None:
     _bg = LEAD_STAGE_BADGE.get(_stage, "#e5e7eb")
     _fg = LEAD_STAGE_TEXT.get(_stage, "#374151")
     _store = lead.get("store_name") or "—"
-    _emp = emp_map.get(int(lead.get("assigned_employee_id") or 0), "—")
+    # 담당직원: employee_names 우선 (다중), 없으면 assigned_employee_id
+    _emp_names_raw = (lead.get("employee_names") or "").strip()
+    if _emp_names_raw:
+        _emp = " · ".join(n.strip() for n in _emp_names_raw.split(",") if n.strip()) or "—"
+    else:
+        _emp = emp_map.get(int(lead.get("assigned_employee_id") or 0), "—")
     _created = str(lead.get("created_at") or "")[:10]
     _ctype = lead.get("customer_type") or "신규잠재고객"
     _last_contact = str(lead.get("last_contact_at") or "")[:16].replace("T", " ") or "—"
@@ -1307,25 +1342,26 @@ def _render_stage_change_tab(lead: dict, emp_map: dict[int, str]) -> None:
     st.divider()
     st.markdown("**👤 담당 직원 편집**")
 
-    # 담당 직원 단일 드롭다운 (app_users 기반)
-    emp_options_sorted = sorted(emp_map.items(), key=lambda x: x[1])
-    _emp_id_list = [None] + [eid for eid, _ in emp_options_sorted]
-    _emp_labels = ["(미배정)"] + [name for _, name in emp_options_sorted]
+    # 매출 등록과 동일한 multiselect 패턴 — 직원 이름 기준
+    _emp_name_list = sorted(emp_map.values())
+    _emp_name_to_id = {v: k for k, v in emp_map.items()}
 
-    _cur_emp_id = lead.get("assigned_employee_id")
-    try:
-        _default_idx = _emp_id_list.index(int(_cur_emp_id)) if _cur_emp_id else 0
-    except (ValueError, TypeError):
-        _default_idx = 0
+    # 기존 담당자 추출: employee_names 우선, 없으면 assigned_employee_id에서 역산
+    _cur_names_raw = (lead.get("employee_names") or "").strip()
+    if _cur_names_raw:
+        _default_names = [n.strip() for n in _cur_names_raw.split(",") if n.strip()]
+    else:
+        _cur_emp_id = lead.get("assigned_employee_id")
+        _fallback = emp_map.get(int(_cur_emp_id), "") if _cur_emp_id else ""
+        _default_names = [_fallback] if _fallback else []
 
-    _sel_label = st.selectbox(
-        "담당 직원",
-        _emp_labels,
-        index=_default_idx,
+    _sel_names = st.multiselect(
+        "담당 직원 (복수 선택, 1/n 실적 분배 대상)",
+        options=_emp_name_list,
+        default=[n for n in _default_names if n in _emp_name_list],
         key=f"stage_emp_{_lid}",
-        help="이 리드를 책임지는 직원 1명을 선택합니다.",
+        help="매출 등록과 동일하게 여러 명을 선택하면 1/n 실적 분배 대상이 됩니다.",
     )
-    _new_emp_id = _emp_id_list[_emp_labels.index(_sel_label)]
 
     if st.button("업데이트 저장", type="primary", key=f"stage_btn_{_lid}", width="stretch"):
         supa = _supa()
@@ -1333,10 +1369,14 @@ def _render_stage_change_tab(lead: dict, emp_map: dict[int, str]) -> None:
             st.error("Supabase 연결 실패")
             return
 
+        _new_first_emp_id = _emp_name_to_id.get(_sel_names[0]) if _sel_names else None
+        _new_emp_names_str = ",".join(_sel_names) if _sel_names else ""
+
         _upd: dict = {
             "lead_stage": _new,
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "assigned_employee_id": _new_emp_id,
+            "assigned_employee_id": _new_first_emp_id,
+            "employee_names": _new_emp_names_str or None,
         }
         if _memo:
             _upd["contact_memo"] = _memo
@@ -1349,4 +1389,19 @@ def _render_stage_change_tab(lead: dict, emp_map: dict[int, str]) -> None:
             st.session_state.pop("lead_selected_id", None)
             st.rerun()
         except Exception as e:
-            st.error(f"업데이트 실패: {e}")
+            _emsg = str(e)
+            if "employee_names" in _emsg or "42703" in _emsg:
+                # employee_names 컬럼 없음 → assigned_employee_id만 업데이트 재시도
+                try:
+                    _upd.pop("employee_names", None)
+                    supa.table("app_leads").update(_upd).eq("id", _lid).execute()
+                    st.warning(
+                        "✅ 단계 업데이트 완료 (담당자는 1명만 저장). "
+                        "다중 담당자를 활용하려면 `SUPABASE_APP_LEADS_EMPLOYEE_NAMES.sql`을 실행하세요."
+                    )
+                    st.session_state.pop("lead_selected_id", None)
+                    st.rerun()
+                except Exception as e2:
+                    st.error(f"업데이트 실패: {e2}")
+            else:
+                st.error(f"업데이트 실패: {e}")
