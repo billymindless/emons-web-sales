@@ -181,20 +181,134 @@ def _items_to_dataframe(items: list[dict]) -> pd.DataFrame:
 # ────────────────────────────────────────────────────────────────
 
 def _can_rotate_rectangle_in_box(rect_w: int, rect_l: int, box_w: int, box_d: int) -> bool:
-    """
-    직사각형(rect_w x rect_l)이 직사각형 박스(box_w x box_d) 안에서 회전 가능한지.
-    1도 단위로 스캔하여 모든 각도에서 박스 안에 들어가는 각도가 있는지 검사.
-    """
+    """직사각형(rect_w × rect_l)이 박스(box_w × box_d) 안에 들어가는 각도가 있는지."""
     if rect_w <= 0 or rect_l <= 0 or box_w <= 0 or box_d <= 0:
         return False
     for deg in range(0, 91):
         rad = math.radians(deg)
         c, s = abs(math.cos(rad)), abs(math.sin(rad))
-        rotated_w = rect_w * c + rect_l * s
-        rotated_d = rect_w * s + rect_l * c
-        if rotated_w <= box_w and rotated_d <= box_d:
+        if rect_w * c + rect_l * s <= box_w and rect_w * s + rect_l * c <= box_d:
             return True
     return False
+
+
+def _diagonal_entry_check(
+    iw: int, id_: int, ih: int,
+    dw: int, dh: int,
+    mat_w: int, mat_l: int, mat_t: int,
+) -> dict | None:
+    """
+    매트리스를 θ도 기울인 자세로 진입 가능한지 검사.
+
+    매트리스의 세 변(mat_w, mat_l, mat_t) 중 어느 두 변이 X-Z 평면에서 회전하는지
+    모든 순열(6가지)을 시도하여 가장 평평한(작은 θ) 자세를 찾음.
+
+    축 정의 (수평 = Y, 깊이 = X, 수직 = Z):
+        axis_w (Y축, 출입구 폭 방향)
+        axis_d (X축, 기울이는 축의 한 변 — θ=0일 때 깊이 방향)
+        axis_t (Z축, 기울이는 축의 다른 변 — θ=0일 때 수직 방향)
+
+    제약:
+        출입구 통과: axis_w ≤ dw, 단면 높이 ≤ dh
+        내부 수직:   단면 높이 ≤ ih
+        내부 footprint(axis_w × occupy_d)는 (iw × id_)에 회전 후 안착 가능
+    """
+    if min(iw, id_, ih, dw, dh, mat_w, mat_l, mat_t) <= 0:
+        return None
+
+    from itertools import permutations
+    dims = (mat_w, mat_l, mat_t)
+    best: dict | None = None
+
+    for axis_w, axis_d, axis_t in permutations(dims):
+        if axis_w > dw:
+            continue
+        for deg in range(0, 91):
+            rad = math.radians(deg)
+            s, c = math.sin(rad), math.cos(rad)
+            cross_h = axis_d * s + axis_t * c
+            occupy_d = axis_d * c + axis_t * s
+            if cross_h > dh or cross_h > ih:
+                continue
+            # 내부 안착: (axis_w × occupy_d) footprint가 (iw × id_)에 회전(평면 대각선) 가능
+            if not _can_rotate_rectangle_in_box(int(axis_w), int(occupy_d), iw, id_):
+                continue
+            # 내부에서 어떤 평면 회전(평면 대각선)이 필요한지 계산
+            floor_rot = _find_min_rotation(int(axis_w), int(occupy_d), iw, id_)
+            cand = {
+                "angle": deg,
+                "axis_w": axis_w,
+                "axis_d": axis_d,
+                "axis_t": axis_t,
+                "cross_h": cross_h,
+                "occupy_d": occupy_d,
+                "floor_rot_deg": floor_rot,
+            }
+            if best is None or cand["angle"] < best["angle"]:
+                best = cand
+            break
+    return best
+
+
+def _find_min_rotation(rect_w: int, rect_l: int, box_w: int, box_d: int) -> int:
+    """직사각형이 박스에 들어가는 최소 회전 각도(0~90°). 들어가지 않으면 -1."""
+    for deg in range(0, 91):
+        rad = math.radians(deg)
+        c, s = abs(math.cos(rad)), abs(math.sin(rad))
+        if rect_w * c + rect_l * s <= box_w and rect_w * s + rect_l * c <= box_d:
+            return deg
+    return -1
+
+
+def _check_specific_angle(
+    iw: int, id_: int, ih: int, dw: int, dh: int,
+    mat_w: int, mat_l: int, mat_t: int, angle: int,
+) -> dict | None:
+    """특정 각도에서 진입 가능한 매트리스 자세가 있는지 검사."""
+    if min(iw, id_, ih, dw, dh, mat_w, mat_l, mat_t) <= 0:
+        return None
+    from itertools import permutations
+    rad = math.radians(angle)
+    s, c = math.sin(rad), math.cos(rad)
+    for axis_w, axis_d, axis_t in permutations((mat_w, mat_l, mat_t)):
+        if axis_w > dw:
+            continue
+        cross_h = axis_d * s + axis_t * c
+        occupy_d = axis_d * c + axis_t * s
+        if cross_h > dh or cross_h > ih:
+            continue
+        if (axis_w <= iw and occupy_d <= id_) or (axis_w <= id_ and occupy_d <= iw):
+            return {"axis_w": axis_w, "axis_d": axis_d, "axis_t": axis_t,
+                    "cross_h": cross_h, "occupy_d": occupy_d}
+    return None
+
+
+def _classify_pose(angle: int, axis_w: int, axis_d: int, axis_t: int,
+                   cross_h: float, occupy_d: float, mat_t: int,
+                   floor_rot: int = 0) -> tuple[str, str]:
+    """
+    (angle, axis_*, mat_t, floor_rot) 조합으로 자세 종류와 사람이 읽을 라벨 반환.
+    Returns: (kind, label)  kind ∈ {"flat", "tilted", "standing"}
+    """
+    if 0 < angle < 90:
+        kind = "tilted"
+        label = (
+            f"대각선 기울임 진입 ({angle}°) — 폭 {axis_w}mm, "
+            f"수직 단면 {cross_h:.0f}mm, 바닥 깊이 {occupy_d:.0f}mm"
+        )
+    elif angle == 0 and axis_t == mat_t:
+        kind = "flat"
+        label = f"눕혀서 진입 (평평) — 폭 {axis_w}mm, 깊이 {axis_d}mm, 수직 = 두께 {mat_t}mm"
+    elif angle == 90 and axis_d == mat_t:
+        kind = "flat"
+        label = f"눕혀서 진입 (회전 후) — 폭 {axis_w}mm, 깊이 {axis_t}mm, 수직 = 두께 {mat_t}mm"
+    else:
+        kind = "standing"
+        vert = axis_t if angle == 0 else axis_d
+        label = f"세워서 진입 — 폭 {axis_w}mm, 수직 {vert}mm"
+    if floor_rot > 0:
+        label += f" → 내부에서 평면 대각선 {floor_rot}° 회전 안착"
+    return kind, label
 
 
 def simulate_mattress_entry(
@@ -206,11 +320,8 @@ def simulate_mattress_entry(
     """
     매트리스 진입 가능 여부 판정.
 
-    두 가지 진입 자세 검사:
-      A) 눕힘 진입: 매트리스가 바닥과 평행, 두께가 수직. 출입구를 통과할 때 두께(mt)가
-         수직, 짧은변이 수평이어야 함.
-      B) 세움 진입: 매트리스를 세워서 두께(mt)가 진행방향 폭. 가장 일반적인 운반 방식.
-         출입구 단면 = mt × (mw 또는 ml).
+    _diagonal_entry_check가 매트리스 6가지 자세 순열 × 0~90° 각도 스캔으로 통합 검사.
+    가장 평평한(작은 θ) 자세가 가능하면 진입 가능으로 판정.
 
     Args:
         inner_w/d/h: 엘리베이터 내부 폭/깊이/높이 (mm)
@@ -223,78 +334,46 @@ def simulate_mattress_entry(
     details: list[str] = []
     methods: list[str] = []
 
-    short_side = min(mat_w, mat_l)
-    long_side = max(mat_w, mat_l)
+    diag = _diagonal_entry_check(iw, id_, ih, dw, dh, mat_w, mat_l, mat_t)
 
-    # ── A) 눕힘 진입 ──────────────────────────────
-    # 출입구: 두께(mt)는 출입구 높이, 짧은변은 출입구 폭
-    lay_pass_door = (mat_t <= dh and short_side <= dw)
-    lay_fit_inside_direct = (
-        mat_t <= ih
-        and ((mat_w <= iw and mat_l <= id_) or (mat_l <= iw and mat_w <= id_))
-    )
-    lay_fit_inside_rotated = (
-        mat_t <= ih
-        and _can_rotate_rectangle_in_box(mat_w, mat_l, iw, id_)
-    )
-
-    if lay_pass_door and lay_fit_inside_direct:
-        methods.append("눕혀서 진입 (회전 없이)")
-        details.append(f"매트리스를 바닥에 눕혀 직진 진입 가능 (두께 {mat_t}mm가 출입구 높이 {door_h}mm 안에 들어감)")
-    elif lay_pass_door and lay_fit_inside_rotated:
-        methods.append("눕혀서 진입 (내부 회전 필요)")
-        details.append("출입구 통과 후 엘리베이터 내부에서 회전이 필요합니다.")
-    else:
-        if mat_t > dh:
-            details.append(f"눕힘 불가: 매트리스 두께 {mat_t}mm > 출입구 높이 여유 {dh}mm")
-        elif short_side > dw:
-            details.append(f"눕힘 불가: 매트리스 짧은변 {short_side}mm > 출입구 폭 여유 {dw}mm")
-        elif not lay_fit_inside_rotated:
-            details.append(f"눕힘 불가: 매트리스가 내부 바닥({inner_w}×{inner_d}mm)에 회전해도 들어가지 않음")
-
-    # ── B) 세움 진입 (가장 일반적) ─────────────────
-    # 매트리스를 세워 두께(mt)가 출입구 폭, 한 변(mw 또는 ml)이 출입구 높이
-    # 단면이 도어를 통과: mt가 도어의 짧은 쪽 ≤, 한 변이 도어의 긴 쪽 ≤
-    stand_pass_door_long = (mat_t <= dw and long_side <= dh)   # 긴변 수직, 두께 수평
-    stand_pass_door_short = (mat_t <= dw and short_side <= dh)  # 짧은변 수직, 두께 수평
-    stand_pass_door_rot = (mat_t <= dh and short_side <= dw)    # 도어가 좁고 높을 때
-    stand_pass_door = stand_pass_door_long or stand_pass_door_short or stand_pass_door_rot
-
-    # 내부 안착: 세운 자세에서 footprint = (어느 한 변) × 두께
-    # 그리고 수직 방향 = 다른 한 변이 천장 높이 안에 들어감
-    stand_fit_inside_a = (
-        long_side <= ih   # 긴변 수직
-        and ((short_side <= iw and mat_t <= id_) or (short_side <= id_ and mat_t <= iw))
-    )
-    stand_fit_inside_b = (
-        short_side <= ih  # 짧은변 수직 (천장 낮을 때)
-        and ((long_side <= iw and mat_t <= id_) or (long_side <= id_ and mat_t <= iw))
-    )
-    stand_fit_inside = stand_fit_inside_a or stand_fit_inside_b
-
-    if stand_pass_door and stand_fit_inside:
-        methods.append("세워서 진입 (두께 방향으로 밀어 넣기)")
-        details.append(
-            f"매트리스를 세워서 두께({mat_t}mm)를 진행방향으로 밀면 진입 가능. "
-            f"내부에서 한 면 = {long_side}mm가 수직."
+    if diag:
+        kind, label = _classify_pose(
+            diag["angle"], diag["axis_w"], diag["axis_d"], diag["axis_t"],
+            diag["cross_h"], diag["occupy_d"], mat_t,
+            floor_rot=diag.get("floor_rot_deg", 0),
         )
-    else:
-        if not stand_pass_door:
-            details.append(
-                f"세움 불가: 출입구({door_w}×{door_h}mm-여유)에 단면(두께 {mat_t}mm × 변 {long_side}/{short_side}mm)을 통과시킬 수 없음"
-            )
-        elif not stand_fit_inside:
-            details.append(
-                f"세움 불가: 내부({inner_w}×{inner_d}×{inner_h}mm-여유)에 세운 상태로 안착 불가. "
-                f"수직 길이 최소 {short_side}mm 또는 {long_side}mm가 내부 높이 {inner_h}mm를 초과하거나 바닥 footprint가 들어가지 않음"
-            )
-
-    if methods:
+        methods.append(label)
+        # 다른 자세도 가능한지 보조 검사 (사용자가 옵션 비교용)
+        for try_angle, try_label in [(0, "눕힘"), (45, "대각선 45°"), (90, "완전 세움")]:
+            if try_angle == diag["angle"]:
+                continue
+            _alt = _check_specific_angle(iw, id_, ih, dw, dh,
+                                         mat_w, mat_l, mat_t, try_angle)
+            if _alt:
+                details.append(f"• {try_label} 자세도 가능 (대안)")
+        details.append(
+            f"가장 안전한 자세: 매트리스 폭 {diag['axis_w']}mm가 출입구 폭 방향, "
+            f"기울임 각도 {diag['angle']}°."
+        )
         verdict = "✅ 진입 가능"
-        best = methods[0]
+        best = label
     else:
         verdict = "❌ 진입 불가"
         best = ""
+        # 어떤 제약이 걸렸는지 진단
+        details.append(f"엘리베이터 내부({inner_w}×{inner_d}×{inner_h}mm) - 여유 {safety_mm}mm")
+        details.append(f"출입구({door_w}×{door_h}mm) - 여유 {safety_mm}mm")
+        details.append(f"매트리스({mat_w}×{mat_l}×{mat_t}mm)")
+        min_side = min(mat_w, mat_l, mat_t)
+        if min_side > dw:
+            details.append(
+                f"⚠ 매트리스의 가장 짧은 변 {min_side}mm가 출입구 여유 폭 {dw}mm를 초과 → 통과 불가"
+            )
+        else:
+            details.append(
+                f"⚠ 매트리스를 어떤 각도로 기울여도 출입구 높이({dh}mm) 또는 "
+                f"내부 깊이({id_}mm)에 들어가지 않음"
+            )
 
     return {
         "verdict": verdict,
@@ -361,114 +440,230 @@ def _box_wireframe(
 
 def _decide_mattress_pose(
     inner_w: int, inner_d: int, inner_h: int,
+    door_w: int, door_h: int,
     mat_w: int, mat_l: int, mat_t: int,
     safety_mm: int,
 ) -> dict | None:
     """
-    가장 적합한 매트리스 자세 결정 후 박스 좌표 반환.
+    가장 안전한 운반 자세 결정 후 3D 시각화용 박스 좌표 반환.
+    _diagonal_entry_check가 통합적으로 모든 자세를 검사하여 가장 평평한(작은 θ) 자세를 반환.
 
-    Returns: {"dx","dy","dz","x0","y0","z0","pose","rot_deg"} (mm) 또는 None
+    Returns dict (모두 mm 단위):
+        type: 'flat' (θ=0) | 'tilted' (0<θ<90) | 'standing' (θ=90)
+        x0,y0,z0: 회전 피벗(바닥 앞쪽 한 모서리) 시작 좌표
+        axis_w/axis_d/axis_t: 회전 전 박스의 Y/X/Z 길이
+        tilt_deg: 기울임 각도
+        pose: 사람이 읽을 설명
     """
-    iw, id_, ih = inner_w - safety_mm, inner_d - safety_mm, inner_h - safety_mm
+    iw = inner_w - safety_mm
+    id_ = inner_d - safety_mm
+    ih = inner_h - safety_mm
+    dw = door_w - safety_mm
+    dh = door_h - safety_mm
 
-    # 1) 눕힘 직진 (가로/세로 그대로)
-    if mat_t <= ih and mat_w <= iw and mat_l <= id_:
-        return {
-            "dx": mat_w, "dy": mat_l, "dz": mat_t,
-            "x0": safety_mm // 2, "y0": safety_mm // 2, "z0": 0,
-            "pose": "눕힘 직진 (회전 없음)", "rot_deg": 0,
-        }
-    if mat_t <= ih and mat_l <= iw and mat_w <= id_:
-        return {
-            "dx": mat_l, "dy": mat_w, "dz": mat_t,
-            "x0": safety_mm // 2, "y0": safety_mm // 2, "z0": 0,
-            "pose": "눕힘 90° 회전", "rot_deg": 90,
-        }
-    # 2) 평면 회전 — 단순 표현 위해 박스를 대각선 위치에 표시
-    for deg in range(1, 90):
-        rad = math.radians(deg)
-        c, s = abs(math.cos(rad)), abs(math.sin(rad))
-        rw = mat_w * c + mat_l * s
-        rd = mat_w * s + mat_l * c
-        if mat_t <= ih and rw <= iw and rd <= id_:
-            # 회전된 bounding box로 단순화
-            return {
-                "dx": rw, "dy": rd, "dz": mat_t,
-                "x0": (inner_w - rw) / 2,
-                "y0": (inner_d - rd) / 2,
-                "z0": 0,
-                "pose": f"눕힘 + 내부 회전 {deg}°",
-                "rot_deg": deg,
-            }
-    # 3) 세움 — 긴변 수직, 짧은변 바닥, 두께 또 다른 바닥축
-    long_side = max(mat_w, mat_l)
-    short_side = min(mat_w, mat_l)
-    if long_side <= ih and short_side <= iw and mat_t <= id_:
-        return {
-            "dx": short_side, "dy": mat_t, "dz": long_side,
-            "x0": safety_mm // 2, "y0": safety_mm // 2, "z0": 0,
-            "pose": f"세움 (짧은변 {short_side}mm 바닥, 긴변 {long_side}mm 수직)",
-            "rot_deg": 0,
-        }
-    if long_side <= ih and short_side <= id_ and mat_t <= iw:
-        return {
-            "dx": mat_t, "dy": short_side, "dz": long_side,
-            "x0": safety_mm // 2, "y0": safety_mm // 2, "z0": 0,
-            "pose": f"세움 (벽면 부착, 긴변 {long_side}mm 수직)",
-            "rot_deg": 0,
-        }
-    return None
+    diag = _diagonal_entry_check(iw, id_, ih, dw, dh, mat_w, mat_l, mat_t)
+    if not diag:
+        # 마지막 시도: 평면 회전(눕힘 자세에서 수평으로 회전)
+        for deg in range(1, 90):
+            rad = math.radians(deg)
+            c, s = abs(math.cos(rad)), abs(math.sin(rad))
+            rw = mat_w * c + mat_l * s
+            rd = mat_w * s + mat_l * c
+            if mat_t <= ih and rw <= iw and rd <= id_:
+                return {
+                    "type": "flat",
+                    "axis_w": rw, "axis_d": rd, "axis_t": mat_t,
+                    "x0": safety_mm // 2,
+                    "y0": (inner_d - rw) / 2,
+                    "z0": 0,
+                    "tilt_deg": 0,
+                    "pose": f"눕힘 + 평면 회전 {deg}° (수평 회전)",
+                }
+        return None
+
+    angle = diag["angle"]
+    axis_w = diag["axis_w"]
+    axis_d = diag["axis_d"]
+    axis_t = diag["axis_t"]
+    occupy_d = diag["occupy_d"]
+    cross_h = diag["cross_h"]
+    floor_rot = diag.get("floor_rot_deg", 0)
+
+    if angle == 0 and axis_t == mat_t:
+        ptype = "flat"
+        pose_label = f"눕힘 (평평) — 폭 {axis_w}mm, 깊이 {axis_d}mm, 두께 {mat_t}mm가 수직"
+    elif angle == 90 and axis_d == mat_t:
+        ptype = "flat"
+        pose_label = f"눕힘 (회전 후) — 폭 {axis_w}mm, 두께 {mat_t}mm가 수직"
+    elif 0 < angle < 90:
+        ptype = "tilted"
+        pose_label = (
+            f"대각선 기울임 {angle}° — 폭 {axis_w}mm, "
+            f"수직단면 {cross_h:.0f}mm, 바닥깊이 {occupy_d:.0f}mm"
+        )
+    else:
+        ptype = "standing"
+        vert = axis_t if angle == 0 else axis_d
+        pose_label = f"세움 ({vert}mm 수직, 폭 {axis_w}mm, 깊이 {occupy_d:.0f}mm)"
+
+    if floor_rot > 0:
+        pose_label += f" + 내부 평면 대각선 {floor_rot}°"
+
+    return {
+        "type": ptype,
+        "axis_w": axis_w,
+        "axis_d": axis_d,
+        "axis_t": axis_t,
+        "tilt_deg": angle,
+        "floor_rot_deg": floor_rot,
+        "occupy_d": occupy_d,
+        "cross_h": cross_h,
+        "x0": safety_mm // 2,
+        "y0": (inner_d - axis_w) / 2,
+        "z0": 0,
+        "pose": pose_label,
+    }
+
+
+def _tilted_box_traces(
+    pivot_x: float, pivot_y: float, pivot_z: float,
+    axis_w: float, axis_l: float, axis_t: float,
+    tilt_deg: float, floor_rot_deg: float = 0.0,
+    color_fill: str = "#22c55e", color_edge: str = "#15803d",
+    name: str = "매트리스",
+):
+    """
+    1) Y축 기준 tilt_deg 회전 (수직 기울임)
+    2) Z축 기준 floor_rot_deg 회전 (평면 대각선)
+    이후 회전 결과를 X≥0, Z≥0 으로 자동 정렬한 뒤 pivot 위치로 평행이동.
+    """
+    import numpy as np
+    import plotly.graph_objects as go
+
+    rad_t = math.radians(tilt_deg)
+    rad_f = math.radians(floor_rot_deg)
+    ct, st_ = math.cos(rad_t), math.sin(rad_t)
+    cf, sf = math.cos(rad_f), math.sin(rad_f)
+
+    local = np.array([
+        [0, 0, 0], [axis_l, 0, 0], [axis_l, axis_w, 0], [0, axis_w, 0],
+        [0, 0, axis_t], [axis_l, 0, axis_t], [axis_l, axis_w, axis_t], [0, axis_w, axis_t],
+    ])
+    # 1) Y축 회전
+    after_tilt = np.column_stack([
+        local[:, 0] * ct - local[:, 2] * st_,
+        local[:, 1],
+        local[:, 0] * st_ + local[:, 2] * ct,
+    ])
+    # 2) Z축 회전 (평면)
+    after_floor = np.column_stack([
+        after_tilt[:, 0] * cf - after_tilt[:, 1] * sf,
+        after_tilt[:, 0] * sf + after_tilt[:, 1] * cf,
+        after_tilt[:, 2],
+    ])
+    rotated = after_floor
+    rotated[:, 0] -= rotated[:, 0].min()
+    rotated[:, 1] -= rotated[:, 1].min()
+    rotated[:, 2] -= rotated[:, 2].min()
+    rotated[:, 0] += pivot_x
+    rotated[:, 1] += pivot_y
+    rotated[:, 2] += pivot_z
+
+    x, y, z = rotated[:, 0], rotated[:, 1], rotated[:, 2]
+    i = [0, 0, 0, 0, 4, 4, 1, 1, 2, 2, 3, 3]
+    j = [1, 2, 4, 3, 5, 6, 2, 5, 6, 3, 7, 0]
+    k = [2, 3, 7, 7, 6, 7, 6, 6, 7, 7, 4, 4]
+    mesh = go.Mesh3d(
+        x=x, y=y, z=z, i=i, j=j, k=k,
+        color=color_fill, opacity=0.65, name=name,
+        flatshading=True, showscale=False, hoverinfo="name",
+    )
+    # 와이어프레임
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    xs, ys, zs = [], [], []
+    for a, b in edges:
+        xs += [x[a], x[b], None]
+        ys += [y[a], y[b], None]
+        zs += [z[a], z[b], None]
+    wire = go.Scatter3d(
+        x=xs, y=ys, z=zs, mode="lines",
+        line=dict(color=color_edge, width=5),
+        name=f"{name} 외곽", hoverinfo="name", showlegend=False,
+    )
+    return mesh, wire
 
 
 def _render_3d_view(
     inner_w: int, inner_d: int, inner_h: int,
+    door_w: int, door_h: int,
     mat_w: int, mat_l: int, mat_t: int,
     safety_mm: int,
 ) -> None:
-    """엘리베이터와 매트리스를 3D 인터랙티브 뷰로 시각화."""
+    """엘리베이터와 매트리스를 3D 인터랙티브 뷰로 시각화 (대각선 기울임 자세 지원)."""
     import plotly.graph_objects as go
 
-    # mm → m 변환
     iw, id_, ih = inner_w / 1000, inner_d / 1000, inner_h / 1000
+    dw_m, dh_m = door_w / 1000, door_h / 1000
 
     fig = go.Figure()
-
-    # 엘리베이터 내부 박스 (와이어프레임 + 바닥)
+    # 엘리베이터 외곽
     fig.add_trace(_box_wireframe(0, 0, 0, iw, id_, ih,
-                                 color="#0284c7", name=f"엘리베이터 {inner_w}×{inner_d}×{inner_h}mm"))
+                                 color="#0284c7",
+                                 name=f"엘리베이터 {inner_w}×{inner_d}×{inner_h}mm"))
     fig.add_trace(_box_mesh(0, 0, 0, iw, id_, 0.02,
                             color="#bae6fd", opacity=0.5, name="바닥"))
+    # 출입구 표시 (X=0 면, 중앙)
+    door_y0 = max((id_ - dw_m) / 2, 0)
+    door_corners_y = [door_y0, door_y0 + dw_m, door_y0 + dw_m, door_y0, door_y0]
+    door_corners_z = [0, 0, dh_m, dh_m, 0]
+    fig.add_trace(go.Scatter3d(
+        x=[0] * 5, y=door_corners_y, z=door_corners_z,
+        mode="lines", line=dict(color="#f97316", width=6),
+        name=f"출입구 {door_w}×{door_h}mm",
+    ))
 
-    # 매트리스 자세 결정
-    pose = _decide_mattress_pose(inner_w, inner_d, inner_h, mat_w, mat_l, mat_t, safety_mm)
+    pose = _decide_mattress_pose(inner_w, inner_d, inner_h, door_w, door_h,
+                                  mat_w, mat_l, mat_t, safety_mm)
 
     if pose:
-        dx, dy, dz = pose["dx"] / 1000, pose["dy"] / 1000, pose["dz"] / 1000
-        x0, y0, z0 = pose["x0"] / 1000, pose["y0"] / 1000, pose["z0"] / 1000
-        fig.add_trace(_box_mesh(x0, y0, z0, dx, dy, dz,
-                                color="#22c55e", opacity=0.7,
-                                name=f"매트리스 ({pose['pose']})"))
-        fig.add_trace(_box_wireframe(x0, y0, z0, dx, dy, dz,
-                                     color="#15803d", name="매트리스 외곽"))
+        # 매트리스를 출입구 근처에 배치 (X=0 면 인접)
+        mesh, wire = _tilted_box_traces(
+            pivot_x=0.05,
+            pivot_y=max((id_ - pose["axis_w"] / 1000) / 2, 0.05),
+            pivot_z=0,
+            axis_w=pose["axis_w"] / 1000,
+            axis_l=pose["axis_d"] / 1000,
+            axis_t=pose["axis_t"] / 1000,
+            tilt_deg=pose["tilt_deg"],
+            floor_rot_deg=pose.get("floor_rot_deg", 0),
+            color_fill="#22c55e", color_edge="#15803d",
+            name=f"매트리스 ({pose['pose']})",
+        )
+        fig.add_trace(mesh)
+        fig.add_trace(wire)
         title = f"매트리스 자세: {pose['pose']}"
     else:
         title = "매트리스 진입 불가 — 빈 엘리베이터만 표시"
 
     fig.update_layout(
         scene=dict(
-            xaxis=dict(title="폭 W (m)", range=[-0.1, iw + 0.3]),
-            yaxis=dict(title="깊이 D (m)", range=[-0.1, id_ + 0.3]),
-            zaxis=dict(title="높이 H (m)", range=[0, ih + 0.2]),
+            xaxis=dict(title="깊이 D (m)", range=[-0.1, iw + 0.3]),
+            yaxis=dict(title="폭 W (m)", range=[-0.1, id_ + 0.3]),
+            zaxis=dict(title="높이 H (m)", range=[0, ih + 0.3]),
             aspectmode="data",
-            camera=dict(eye=dict(x=1.6, y=1.6, z=1.1)),
+            camera=dict(eye=dict(x=1.8, y=1.8, z=1.2)),
         ),
         title=dict(text=title, x=0.5, font=dict(size=13)),
-        height=520,
+        height=540,
         margin=dict(l=0, r=0, t=40, b=0),
         legend=dict(orientation="h", y=-0.05),
     )
     st.plotly_chart(fig, width="stretch")
-    st.caption("💡 마우스로 드래그하여 시점을 회전, 휠로 확대/축소할 수 있습니다.")
+    st.caption("💡 마우스로 드래그하여 시점을 회전, 휠로 확대/축소할 수 있습니다. 주황색 선은 출입구입니다.")
 
 
 # ────────────────────────────────────────────────────────────────
@@ -633,7 +828,8 @@ def _render_simulation_tab() -> None:
 
         st.markdown("##### 🧊 3D 인터랙티브 시뮬레이션")
         try:
-            _render_3d_view(inner_w, inner_d, inner_h, mat_w, mat_l, mat_t, safety)
+            _render_3d_view(inner_w, inner_d, inner_h, door_w, door_h,
+                            mat_w, mat_l, mat_t, safety)
         except Exception as e:
             st.warning(f"3D 시각화 생성 실패: {e}")
 
