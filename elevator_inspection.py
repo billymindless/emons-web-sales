@@ -971,10 +971,16 @@ def _render_search_tab() -> None:
     if not _svc_key:
         st.warning(
             "**API 서비스키가 설정되지 않았습니다.**\n\n"
-            "**로컬 개발**: `.streamlit/secrets.toml` 의 `[elevator_api] service_key = \"...\"`\n\n"
-            "**Render 등 배포 환경**: Render Dashboard › Environment에 환경변수 "
-            "`ELEVATOR_API_KEY` 를 추가하세요. (`.streamlit/secrets.toml`은 .gitignore되어 배포되지 않음)\n\n"
-            "자세한 절차는 [ELEVATOR_API_SETUP.md](ELEVATOR_API_SETUP.md) 참고."
+            "**Streamlit Community Cloud (현재 배포 환경)**: "
+            "[share.streamlit.io](https://share.streamlit.io) → 본인 앱 → ⋮ → **Settings** → **Secrets** 탭에 "
+            "아래 TOML을 붙여넣고 Save:\n"
+            "```toml\n"
+            "[elevator_api]\n"
+            "service_key = \"공공데이터포털_일반인증키_Decoding값\"\n"
+            "```\n"
+            "**로컬 개발**: `.streamlit/secrets.toml` 에 위와 동일한 내용 작성.\n\n"
+            "※ Render에 환경변수를 추가해도 Streamlit 앱(여기)에는 적용되지 않습니다. "
+            "Render는 `api.py` 웹훅 서버 전용입니다."
         )
         with st.expander("🔍 진단 정보 보기 (어디서 키를 찾으려 했는지)"):
             st.code(
@@ -989,11 +995,12 @@ def _render_search_tab() -> None:
                 language="text",
             )
             st.markdown(
-                "**Render에서 환경변수 설정 방법**\n"
-                "1. Render Dashboard → 해당 서비스 선택 → **Environment** 탭\n"
-                "2. **Add Environment Variable** 클릭\n"
-                "3. Key: `ELEVATOR_API_KEY`, Value: 공공데이터포털에서 발급받은 **일반 인증키 (Decoding)** 값\n"
-                "4. **Save Changes** → 자동 재배포 대기"
+                "**Streamlit Cloud에서 Secrets 설정 방법**\n"
+                "1. [share.streamlit.io](https://share.streamlit.io) 로그인 → 본인 앱 선택\n"
+                "2. 우측 상단 또는 하단의 **⋮** 메뉴 → **Settings**\n"
+                "3. **Secrets** 탭 선택 → 위 TOML 형식 그대로 붙여넣기\n"
+                "4. **Save** → 앱이 자동 재시작 (수 초 ~ 1분)\n\n"
+                "**※ 환경변수가 아닌 TOML 형식으로 입력**해야 `st.secrets[\"elevator_api\"][\"service_key\"]`로 읽힙니다."
             )
     else:
         st.success(
