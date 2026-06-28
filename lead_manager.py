@@ -120,17 +120,16 @@ def register_lead(
         "lead_source": lead_source,
         "lead_stage": "1_신규",
         "assigned_employee_id": employee_id,
-        "assigned_store": store_name,
         "next_contact_date": next_contact_date,
         "nurturing_step": 0,
         "next_nurture_at": next_nurture_at,
     }
 
-    # ── 중복 전화번호 체크 ──────────────────────
+    # ── 중복 전화번호 체크 (전사 전체 — store_name 무관) ─────────
     try:
         chk = httpx.get(
-            _supa_url("app_leads") + f"?phone=eq.{normalized}&store_name=eq.{store_name}"
-            "&select=id,name,lead_stage,created_at&limit=1",
+            _supa_url("app_leads") + f"?phone=eq.{normalized}"
+            "&select=id,name,lead_stage,created_at,store_name&limit=1",
             headers=_supa_headers(),
             timeout=5.0,
         )
@@ -192,6 +191,107 @@ def register_lead(
     return {"ok": True, "lead_id": lead_id, "send_result": send_result, "error": None}
 
 
+def _log_outbound_message(
+    phone: str,
+    channel: str,
+    text: str,
+    handled_by: str = "system",
+) -> None:
+    """
+    아웃바운드 메시지 발송 성공 시 app_chat_history에 자동 기록.
+
+    Solapi 수신(message-received) 웹훅이 비활성화되어 있으므로, 보낸 메시지는
+    발송 함수에서 직접 INSERT해야 상담 이력이 단일 테이블에 누적된다.
+
+    Args:
+        phone: 수신자 전화번호 (정규화 전/후 모두 허용)
+        channel: '친구톡_발송' | '알림톡_발송' | 'SMS_발송' | 'MMS_발송'
+        text: 발송 본문
+        handled_by: 발신자 (직원 이름/시스템 라벨)
+    """
+    normalized = _normalize_phone(phone)
+    if not normalized:
+        return
+    body = (text or "")[:2000]
+    try:
+        httpx.post(
+            _supa_url("app_chat_history"),
+            json={
+                "customer_phone": normalized,
+                "channel": channel,
+                "summary": body[:200],
+                "full_text": body,
+                "handled_by": handled_by or "system",
+            },
+            headers={**_supa_headers(), "Prefer": "return=minimal"},
+            timeout=5.0,
+        )
+    except Exception:
+        logger.exception("아웃바운드 메시지 로그 실패: phone=%s channel=%s", normalized, channel)
+
+
+_OUTBOUND_CHANNEL_MAP: dict[str, str] = {
+    "friendtalk": "친구톡_발송",
+    "alimtalk": "알림톡_발송",
+    "sms": "SMS_발송",
+    "mms": "MMS_발송",
+}
+
+
+def send_and_log(
+    phone: str,
+    text: str,
+    *,
+    channel: str = "friendtalk",
+    handled_by: str = "system",
+    image_url: str = "",
+) -> dict[str, Any]:
+    """
+    Solapi 발송 + 성공 시 app_chat_history 자동 기록 래퍼.
+
+    채널 폴백 정책:
+        friendtalk → 실패 시 SMS 재시도
+        mms       → image_url 있으면 MMS, 없으면 SMS
+        sms / alimtalk → 직접 호출
+    """
+    try:
+        from solapi_sender import (
+            send_alimtalk,
+            send_friendtalk,
+            send_mms,
+            send_sms,
+        )
+    except ImportError:
+        return {"status": "skipped", "error": "solapi_sender import 실패"}
+
+    actual_channel = channel
+    if channel == "friendtalk":
+        result = send_friendtalk(phone, text)
+        if result.get("status") in ("not_friend", "failed"):
+            result = send_sms(phone, text)
+            actual_channel = "sms"
+    elif channel == "alimtalk":
+        result = send_alimtalk(phone, text)
+    elif channel == "mms":
+        if image_url:
+            result = send_mms(phone, text, image_url)
+        else:
+            result = send_sms(phone, text)
+            actual_channel = "sms"
+    else:
+        result = send_sms(phone, text)
+        actual_channel = "sms"
+
+    if result.get("status") in ("sent", "lms_fallback"):
+        _log_outbound_message(
+            phone=phone,
+            channel=_OUTBOUND_CHANNEL_MAP.get(actual_channel, "SMS_발송"),
+            text=text,
+            handled_by=handled_by,
+        )
+    return result
+
+
 def _send_t0_message(
     phone: str,
     name: str,
@@ -200,11 +300,6 @@ def _send_t0_message(
     image_url: str = "",
 ) -> dict[str, Any]:
     """T+0 즉시 발송. 유입 경로별로 다른 메시지/수단 사용."""
-    try:
-        from solapi_sender import send_friendtalk, send_mms, send_sms
-    except ImportError:
-        return {"status": "skipped", "error": "solapi_sender import 실패"}
-
     if lead_source == "오프라인_방문":
         text = (
             f"안녕하세요 {name}님, 에몬스 {store_name}입니다.\n"
@@ -212,9 +307,12 @@ def _send_t0_message(
             "보셨던 제품 사진과 담당자 연락처를 보내드립니다.\n"
             "궁금하신 점은 아래 채널톡으로 문의 주세요."
         )
-        if image_url:
-            return send_mms(phone, text, image_url)
-        return send_sms(phone, text)
+        return send_and_log(
+            phone, text,
+            channel="mms" if image_url else "sms",
+            handled_by="lead-t0",
+            image_url=image_url,
+        )
 
     # 전화_문의 / 온라인_채널톡
     text = (
@@ -222,10 +320,7 @@ def _send_t0_message(
         "문의하신 제품 카탈로그 및 가격 안내를 보내드립니다.\n"
         "추가 문의는 채널톡으로 편하게 연락 주세요."
     )
-    result = send_friendtalk(phone, text)
-    if result.get("status") in ("not_friend", "failed"):
-        result = send_sms(phone, text)
-    return result
+    return send_and_log(phone, text, channel="friendtalk", handled_by="lead-t0")
 
 
 # ──────────────────────────────────────────
@@ -237,11 +332,6 @@ def send_nurturing_message(lead: dict[str, Any]) -> dict[str, Any]:
     app_leads 레코드 하나를 받아 T+N 넛징 메시지를 발송하고
     nurturing_step과 next_nurture_at을 갱신한다.
     """
-    try:
-        from solapi_sender import send_friendtalk, send_sms
-    except ImportError:
-        return {"status": "skipped", "error": "solapi_sender import 실패"}
-
     phone = lead.get("phone", "")
     name = lead.get("name") or "고객"
     lead_source = lead.get("lead_source", "")
@@ -263,9 +353,7 @@ def send_nurturing_message(lead: dict[str, Any]) -> dict[str, Any]:
             "궁금하신 점은 채널톡으로 편하게 문의해 주세요."
         )
 
-    result = send_friendtalk(phone, text)
-    if result.get("status") in ("not_friend", "failed"):
-        result = send_sms(phone, text)
+    result = send_and_log(phone, text, channel="friendtalk", handled_by="lead-nurture")
 
     # nurturing_step 갱신 (2 = 완료)
     try:
@@ -461,7 +549,7 @@ def get_leads_by_phone(phone: str) -> list[dict]:
             params={
                 "phone": f"eq.{normalized}",
                 "order": "created_at.desc",
-                "select": "id,lead_source,lead_stage,memo,next_contact_date,assigned_store,created_at",
+                "select": "id,lead_source,lead_stage,memo,next_contact_date,store_name,customer_type,last_contact_at,created_at",
             },
             headers=_supa_headers(),
             timeout=5.0,

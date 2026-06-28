@@ -757,6 +757,14 @@ def _format_currency(value: int | float | None) -> str:
         return "0원"
 
 
+_CUSTOMER_TYPE_DISPLAY: dict[str, str] = {
+    "신규잠재고객": "🆕 신규 잠재고객",
+    "기존구매고객_DB외": "🔄 기존 구매 고객 (DB 외)",
+    "AS요청": "🔧 AS 요청",
+    "재상담": "💬 재상담",
+}
+
+
 def _build_ct_response(
     customer_name: str,
     is_new: bool,
@@ -794,18 +802,49 @@ def _build_ct_response(
         ]
         layout.append(_ct_keyvalue("order-info", items))
     else:
-        no_order_items = [{"key": "구매 매장", "value": store_name or "-"}]
-        # 리드 정보가 있으면 Snippet에 노출
+        no_order_items = [{"key": "유입 매장", "value": store_name or "-"}]
+        # 리드 정보가 있으면 Snippet에 노출 + 분류 상태 표시
         if lead_info:
+            _ctype = lead_info.get("customer_type") or "신규잠재고객"
+            _ctype_label = _CUSTOMER_TYPE_DISPLAY.get(_ctype, _ctype)
             no_order_items.extend([
+                {"key": "고객 유형", "value": _ctype_label},
                 {"key": "유입 경로", "value": lead_info.get("lead_source", "-")},
                 {"key": "상담 메모", "value": (lead_info.get("memo") or "-")[:60]},
                 {"key": "상담일", "value": str(lead_info.get("created_at", ""))[:10] or "-"},
                 {"key": "다음 연락", "value": str(lead_info.get("next_contact_date") or "-")},
             ])
+            if lead_info.get("classification_memo"):
+                no_order_items.append({
+                    "key": "분류 메모",
+                    "value": (lead_info.get("classification_memo") or "")[:80],
+                })
+            if lead_info.get("last_contact_at"):
+                no_order_items.append({
+                    "key": "최근 연락",
+                    "value": str(lead_info.get("last_contact_at"))[:10],
+                })
         else:
             no_order_items.append({"key": "구매 내역", "value": "없음"})
         layout.append(_ct_keyvalue("no-order", no_order_items))
+
+        # ── 미분류 안내 블록 ──
+        # 구매 이력도 없고 고객 유형이 '신규잠재고객'(기본값)이거나 None인 경우,
+        # 2026-04 이전 구매 고객일 가능성이 있어 직원이 momo에서 수동 분류해야 함.
+        _ctype_check = (lead_info or {}).get("customer_type")
+        _is_unclassified = (not _ctype_check) or _ctype_check == "신규잠재고객"
+        if _is_unclassified:
+            layout.append(_ct_text(
+                "unclassified-title",
+                "⚠ momo DB 구매이력 없음",
+                style="h3",
+            ))
+            layout.append(_ct_text(
+                "unclassified-guide",
+                "2026년 4월 이전 구매 고객일 수 있습니다.\n"
+                "momo에서 유형을 분류해 주세요.\n"
+                "(기존구매 / AS요청 / 재상담 / 신규)",
+            ))
 
     # 과거 상담 이력 (최신 3건)
     if chat_history:
@@ -821,6 +860,19 @@ def _build_ct_response(
     if ct_token:
         magic_url += f"&auth={ct_token}"
     layout.append(_ct_button("magic-link-btn", "momo 시스템에서 열기", magic_url))
+
+    # 미분류 고객이면 분류 화면 직링크 버튼 추가
+    if not order_info:
+        _ctype_check = (lead_info or {}).get("customer_type")
+        if (not _ctype_check) or _ctype_check == "신규잠재고객":
+            classify_url = f"{MOMO_APP_URL}/?home=1&menu=lead_management&phone={cleaned_phone}"
+            if ct_token:
+                classify_url += f"&auth={ct_token}"
+            layout.append(_ct_button(
+                "classify-btn",
+                "🏷️ momo에서 고객 분류하기",
+                classify_url,
+            ))
 
     return {
         "snippet": {
@@ -994,17 +1046,20 @@ async def _ct_fetch_lead_info(
     headers: dict,
     cleaned_phone: str,
 ) -> dict | None:
-    """app_leads 최신 활성 리드 1건 조회."""
+    """app_leads 전사 1건 조회 (전화번호 = 단일 식별 키, store 무관)."""
     try:
         resp = await client.get(
             _supa_url("app_leads"),
             headers=headers,
             params={
                 "phone": f"eq.{cleaned_phone}",
-                "lead_stage": "not.in.(4_계약완료,5_계약실패)",
                 "order": "created_at.desc",
                 "limit": "1",
-                "select": "id,lead_source,lead_stage,memo,next_contact_date,assigned_store,created_at",
+                "select": (
+                    "id,lead_source,lead_stage,memo,next_contact_date,"
+                    "store_name,customer_type,classification_memo,"
+                    "classified_by,classified_at,last_contact_at,created_at"
+                ),
             },
         )
         data = resp.json() if resp.status_code == 200 else []
@@ -1014,15 +1069,86 @@ async def _ct_fetch_lead_info(
         return None
 
 
+async def _ct_reactivate_lead(
+    client: httpx.AsyncClient,
+    headers: dict,
+    lead_id: int | None,
+    customer_type: str | None,
+) -> None:
+    """
+    기존 app_leads 레코드를 재유입 처리.
+
+    - INSERT 절대 없음. 같은 고객의 재유입이 쌓여도 app_leads 레코드는 1개 유지.
+    - last_contact_at 갱신.
+    - 분류된 고객(기존구매/AS/재상담)인 경우 lead_stage를 '2_상담중'으로 전환
+      (계약완료·실패·보류는 유지).
+    - 미분류(신규잠재고객 또는 NULL)인 경우 lead_stage는 건드리지 않고
+      last_contact_at만 갱신 → momo에서 직원이 분류하도록 유도.
+    """
+    if not lead_id:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    patch_body: dict = {
+        "last_contact_at": now_iso,
+        "updated_at": now_iso,
+    }
+    if customer_type in ("기존구매고객_DB외", "AS요청", "재상담"):
+        # 단, 이미 완료/실패/보류 상태면 그대로 유지 → 서버 측 조건 분기 필요.
+        # PostgREST는 부분 업데이트 시 조건만 URL params로 부착하면 됨.
+        try:
+            await client.patch(
+                _supa_url("app_leads"),
+                headers={**headers, "Prefer": "return=minimal"},
+                params={
+                    "id": f"eq.{lead_id}",
+                    "lead_stage": "not.in.(4_계약완료,5_실패,6_보류)",
+                },
+                json={**patch_body, "lead_stage": "2_상담중"},
+                timeout=5.0,
+            )
+        except Exception as e:
+            logger.warning("리드 재활성화(상담중) 실패: %s", e)
+        # last_contact_at은 완료/실패/보류 리드에서도 갱신해 두기 위해 별도 호출
+        try:
+            await client.patch(
+                _supa_url("app_leads"),
+                headers={**headers, "Prefer": "return=minimal"},
+                params={
+                    "id": f"eq.{lead_id}",
+                    "lead_stage": "in.(4_계약완료,5_실패,6_보류)",
+                },
+                json=patch_body,
+                timeout=5.0,
+            )
+        except Exception:
+            pass
+    else:
+        # 미분류 → 시간만 갱신
+        try:
+            await client.patch(
+                _supa_url("app_leads"),
+                headers={**headers, "Prefer": "return=minimal"},
+                params={"id": f"eq.{lead_id}"},
+                json=patch_body,
+                timeout=5.0,
+            )
+        except Exception as e:
+            logger.warning("리드 last_contact_at 갱신 실패: %s", e)
+
+
 async def _ct_register_online_lead(
     client: httpx.AsyncClient,
     headers: dict,
     cleaned_phone: str,
     name: str,
+    customer_type: str = "신규잠재고객",
 ) -> None:
-    """채널톡 신규 고객 → app_leads에 온라인_채널톡으로 자동 등록 (중복 시 무시)."""
+    """채널톡 신규 고객 → app_leads에 온라인_채널톡으로 자동 등록 (중복 시 무시).
+
+    customer_type: 신규잠재고객(완전 미지) | 재상담(app_customers 매칭).
+    """
     try:
-        # 이미 리드가 있으면 등록 생략
+        # 이미 리드가 있으면 등록 생략 (전사 전화번호 기준)
         existing = await _ct_fetch_lead_info(client, headers, cleaned_phone)
         if existing:
             return
@@ -1030,6 +1156,7 @@ async def _ct_register_online_lead(
         from datetime import timedelta
         now_utc = datetime.now(timezone.utc)
         next_nurture_at = (now_utc + timedelta(days=2)).isoformat()
+        now_iso = now_utc.isoformat()
 
         await client.post(
             _supa_url("app_leads"),
@@ -1039,14 +1166,18 @@ async def _ct_register_online_lead(
                 "phone": cleaned_phone,
                 "name": name or "",
                 "lead_source": "온라인_채널톡",
-                "lead_stage": "1_신규유입",
-                "assigned_store": CHANNEL_TALK_DEFAULT_STORE,
+                "lead_stage": "1_신규",
+                "customer_type": customer_type,
                 "nurturing_step": 0,
                 "next_nurture_at": next_nurture_at,
+                "last_contact_at": now_iso,
             },
             timeout=5.0,
         )
-        logger.info("온라인 채널톡 리드 자동 등록: phone=%s", cleaned_phone)
+        logger.info(
+            "온라인 채널톡 리드 자동 등록: phone=%s customer_type=%s",
+            cleaned_phone, customer_type,
+        )
     except Exception as e:
         logger.warning("온라인 리드 등록 실패 (계속 진행): %s", e)
 
@@ -1212,16 +1343,39 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             except Exception as e:
                 logger.warning("channel-talk: chat_history 조회 실패 (계속 진행): %s", e)
 
-            # 리드 정보 조회 (구매 이력 없는 경우 노출용)
-            if not order_info:
+            # 리드 정보 조회 (전사 전화번호 기준 — store 무관)
+            try:
+                lead_info = await _ct_fetch_lead_info(client, headers, cleaned_phone)
+            except Exception as e:
+                logger.warning("channel-talk: lead 조회 실패 (계속 진행): %s", e)
+
+            # 분기 처리 — 리드 자동 등록 / 재유입 재활성화
+            if lead_info:
+                # ── 분기 A & B — 재유입: 기존 리드 UPDATE만, INSERT 없음 ──
+                await _ct_reactivate_lead(
+                    client, headers,
+                    lead_id=lead_info.get("id"),
+                    customer_type=lead_info.get("customer_type"),
+                )
+            elif not order_info:
+                # 구매 이력 없음 + 리드 없음 → 신규 등록
+                if not is_new:
+                    # ── 분기 C — app_customers 매칭, app_leads 없음 → 재상담 1회 생성 ──
+                    await _ct_register_online_lead(
+                        client, headers, cleaned_phone, name_from_ct,
+                        customer_type="재상담",
+                    )
+                else:
+                    # ── 분기 D — 완전 미지 고객 → 신규 잠재고객 ──
+                    await _ct_register_online_lead(
+                        client, headers, cleaned_phone, name_from_ct,
+                        customer_type="신규잠재고객",
+                    )
+                # 방금 만든 리드를 다시 조회해 Snippet에 반영
                 try:
                     lead_info = await _ct_fetch_lead_info(client, headers, cleaned_phone)
-                except Exception as e:
-                    logger.warning("channel-talk: lead 조회 실패 (계속 진행): %s", e)
-
-                # 신규 고객이고 리드도 없으면 온라인 채널톡 리드로 자동 등록
-                if is_new and not lead_info:
-                    await _ct_register_online_lead(client, headers, cleaned_phone, name_from_ct)
+                except Exception:
+                    pass
 
         # 채널톡 우측 패널에 momo DB의 이름/매장 태그 동기화 (Open API)
         # 익명("채널톡고객") 상태가 아닐 때만 호출하여 의미 있는 정보만 push
@@ -1265,14 +1419,138 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
 
 
 # ──────────────────────────────────────────────
+# 채널톡 chat.created — 재유입 감지 분기 처리 (분기 A/B/C/D)
+# ──────────────────────────────────────────────
+
+async def _handle_chat_created(payload: dict) -> JSONResponse:
+    """
+    chat.created/opened 이벤트 처리. 핵심 원칙: 같은 고객의 재유입은
+    `app_leads` 레코드를 새로 INSERT하지 않고 기존 레코드만 UPDATE.
+
+    분기:
+      A) 기존 lead 존재 + customer_type IN ('기존구매고객_DB외','AS요청','재상담')
+         → lead_stage='2_상담중' + last_contact_at=now, INSERT 없음
+      B) 기존 lead 존재 + customer_type='신규잠재고객'(or NULL)
+         → last_contact_at만 갱신 (분류 대기)
+      C) lead 없음 + app_customers 매칭
+         → customer_type='재상담'으로 신규 INSERT 1회
+      D) lead 없음 + app_customers 없음
+         → customer_type='신규잠재고객'으로 신규 INSERT 1회
+
+    모든 분기에서 app_chat_history에 재유입 로그 1건 INSERT.
+    """
+    user_obj = payload.get("user") or {}
+    chat_obj = payload.get("chat") or {}
+    chat_id = str(chat_obj.get("id") or "")
+
+    raw_phone = (
+        user_obj.get("mobileNumber")
+        or user_obj.get("mobile_number")
+        or (user_obj.get("profile") or {}).get("mobileNumber")
+        or ""
+    )
+    phone = _normalize_phone(str(raw_phone))
+    name_from_ct = str(user_obj.get("name") or "채널톡고객")
+
+    if not phone:
+        return JSONResponse({"ok": True, "skipped": True, "reason": "no_phone"})
+
+    headers = _supa_headers()
+    if not headers:
+        return JSONResponse({"ok": False, "error": "supabase not configured"}, status_code=500)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # 전사 전화번호 기준 리드 조회 (store 무관)
+        lead_info = await _ct_fetch_lead_info(client, headers, phone)
+
+        # 분기 결정
+        branch = ""
+        if lead_info:
+            ctype = lead_info.get("customer_type")
+            if ctype in ("기존구매고객_DB외", "AS요청", "재상담"):
+                branch = "A"
+            else:
+                branch = "B"
+            await _ct_reactivate_lead(
+                client, headers,
+                lead_id=lead_info.get("id"),
+                customer_type=ctype,
+            )
+        else:
+            # app_customers 매칭 여부 확인
+            cust_matched = False
+            try:
+                or_parts: list[str] = []
+                for v in _phone_variants(phone):
+                    or_parts.append(f"phone1.eq.{v}")
+                    or_parts.append(f"phone2.eq.{v}")
+                cust_resp = await client.get(
+                    _supa_url("app_customers"),
+                    headers=headers,
+                    params={
+                        "or": "(" + ",".join(or_parts) + ")",
+                        "select": "id",
+                        "limit": "1",
+                    },
+                )
+                cust_matched = bool(
+                    cust_resp.status_code == 200 and (cust_resp.json() or [])
+                )
+            except Exception as e:
+                logger.warning("chat.created: app_customers 조회 실패: %s", e)
+
+            if cust_matched:
+                branch = "C"
+                await _ct_register_online_lead(
+                    client, headers, phone, name_from_ct,
+                    customer_type="재상담",
+                )
+            else:
+                branch = "D"
+                await _ct_register_online_lead(
+                    client, headers, phone, name_from_ct,
+                    customer_type="신규잠재고객",
+                )
+
+        # ── app_chat_history 재유입 로그 INSERT ──
+        # chat.created 시점에는 대화 내용이 비어 있으므로 메타 로그만 남김.
+        # 실제 대화 전문은 chat.closed에서 별도 저장됨.
+        try:
+            await client.post(
+                _supa_url("app_chat_history"),
+                headers={**headers, "Prefer": "return=minimal"},
+                json={
+                    "customer_phone": phone,
+                    "channel": "채널톡_재유입" if branch == "A" else "채널톡_신규대화",
+                    "chat_id": chat_id or None,
+                    "summary": f"[분기{branch}] 채팅 시작",
+                    "handled_by": "system",
+                },
+                timeout=5.0,
+            )
+        except Exception as e:
+            logger.warning("chat.created 로그 INSERT 실패: %s", e)
+
+    logger.info("chat.created 처리 완료: phone=%s branch=%s chat_id=%s", phone, branch, chat_id)
+    return JSONResponse({"ok": True, "branch": branch})
+
+
+# ──────────────────────────────────────────────
 # 채널톡 chat.closed 웹훅 — 대화 전문 자동 아카이빙
 # ──────────────────────────────────────────────
 
-@app.post("/channel-talk/webhook", summary="채널톡 이벤트 웹훅 (chat.closed 아카이빙)")
+@app.post("/channel-talk/webhook", summary="채널톡 이벤트 웹훅 (chat.created 재유입 + chat.closed 아카이빙)")
 async def channel_talk_webhook(request: Request) -> JSONResponse:
     """
-    채널톡 chat.closed 이벤트를 수신하여 대화 전문을 app_chat_history에 저장.
-    채널톡 Developer Portal에서 chat.closed 이벤트를 이 URL로 등록 필요.
+    채널톡 이벤트 웹훅 통합 핸들러.
+
+    처리 이벤트:
+      - chat.created / chat.opened: 재유입 감지 → 기존 리드 재활성화 (INSERT 없음).
+        분류된 고객(기존구매/AS/재상담)은 lead_stage='2_상담중' + last_contact_at 갱신.
+        app_chat_history에 재유입 로그 1건 INSERT.
+      - chat.closed: 대화 전문을 app_chat_history에 자동 아카이빙 + Gemini VOC 분석.
+
+    채널톡 Developer Portal에서 위 이벤트들을 이 URL로 등록.
     """
     try:
         raw_body = await request.body()
@@ -1283,6 +1561,10 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
 
         event = payload.get("event") or payload.get("type") or ""
         logger.info("channel-talk webhook: event=%s", event)
+
+        # ── chat.created/opened — 재유입 감지 분기 ──────────────────
+        if event in ("chat.created", "chat.opened"):
+            return await _handle_chat_created(payload)
 
         if event != "chat.closed":
             return JSONResponse({"ok": True, "skipped": True})
