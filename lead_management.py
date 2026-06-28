@@ -55,6 +55,15 @@ LEAD_SOURCE_LABELS: dict[str, str] = {
     "기타": "기타",
 }
 
+# 인라인 편집용 — 유형 표시 라벨 (드롭다운에서 사용)
+CUSTOMER_TYPE_KEYS: list[str] = ["신규잠재고객", "기존구매고객_DB외", "AS요청", "재상담"]
+CUSTOMER_TYPE_INLINE_DISPLAY: dict[str, str] = {
+    "신규잠재고객": "🆕 신규",
+    "기존구매고객_DB외": "🔄 기존구매",
+    "AS요청": "🔧 AS요청",
+    "재상담": "💬 재상담",
+}
+
 
 # ──────────────────────────────────────────────
 # Supabase 헬퍼 (lead_manager와 동일한 방식)
@@ -174,6 +183,84 @@ def _get_unified_history(phone: str, lead_id: int | None = None) -> list[dict]:
 
     items.sort(key=lambda x: x.get("at", ""), reverse=True)
     return items
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _inline_save_type(lead_id: int, key: str) -> None:
+    """리드 목록 inline selectbox — customer_type 즉시 저장."""
+    new_val = st.session_state.get(key)
+    if not new_val:
+        return
+    supa = _supa()
+    if not supa:
+        st.toast("❌ DB 연결 실패", icon="⚠️")
+        return
+    try:
+        supa.table("app_leads").update({
+            "customer_type": new_val,
+            "updated_at": _now_iso(),
+        }).eq("id", lead_id).execute()
+        st.toast(f"유형 저장: {CUSTOMER_TYPE_INLINE_DISPLAY.get(new_val, new_val)}", icon="✅")
+    except Exception as e:
+        _emsg = str(e)
+        if "customer_type" in _emsg or "42703" in _emsg:
+            st.toast("❌ SUPABASE_APP_LEADS_CUSTOMER_TYPE.sql 실행 필요", icon="⚠️")
+        else:
+            st.toast(f"❌ 저장 실패: {_emsg[:60]}", icon="⚠️")
+
+
+def _inline_save_stage(lead_id: int, key: str) -> None:
+    """리드 목록 inline selectbox — lead_stage 즉시 저장."""
+    new_val = st.session_state.get(key)
+    if not new_val:
+        return
+    supa = _supa()
+    if not supa:
+        st.toast("❌ DB 연결 실패", icon="⚠️")
+        return
+    try:
+        supa.table("app_leads").update({
+            "lead_stage": new_val,
+            "updated_at": _now_iso(),
+        }).eq("id", lead_id).execute()
+        st.toast(f"상태 저장: {LEAD_STAGES.get(new_val, new_val)}", icon="✅")
+    except Exception as e:
+        st.toast(f"❌ 저장 실패: {str(e)[:60]}", icon="⚠️")
+
+
+def _inline_save_emps(lead_id: int, key: str, emp_name_to_id: dict[str, int]) -> None:
+    """리드 목록 inline multiselect — employee_names + assigned_employee_id 즉시 저장."""
+    sel_names: list[str] = st.session_state.get(key) or []
+    first_id = emp_name_to_id.get(sel_names[0]) if sel_names else None
+    names_str = ",".join(sel_names) if sel_names else None
+    supa = _supa()
+    if not supa:
+        st.toast("❌ DB 연결 실패", icon="⚠️")
+        return
+    try:
+        supa.table("app_leads").update({
+            "employee_names": names_str,
+            "assigned_employee_id": first_id,
+            "updated_at": _now_iso(),
+        }).eq("id", lead_id).execute()
+        st.toast(f"담당자 저장: {names_str or '미배정'}", icon="✅")
+    except Exception as e:
+        _emsg = str(e)
+        if "employee_names" in _emsg or "42703" in _emsg:
+            # 컬럼 미존재 → assigned_employee_id만 저장
+            try:
+                supa.table("app_leads").update({
+                    "assigned_employee_id": first_id,
+                    "updated_at": _now_iso(),
+                }).eq("id", lead_id).execute()
+                st.toast("⚠ 1명만 저장됨 (SUPABASE_APP_LEADS_EMPLOYEE_NAMES.sql 실행 필요)", icon="⚠️")
+            except Exception as e2:
+                st.toast(f"❌ 저장 실패: {str(e2)[:60]}", icon="⚠️")
+        else:
+            st.toast(f"❌ 저장 실패: {_emsg[:60]}", icon="⚠️")
 
 
 def _log_customer_message(
@@ -697,13 +784,31 @@ def render_lead_management() -> None:
     _sel_stage = _stage_keys[_stage_labels.index(_sel_label)]
     st.session_state["lead_filter_stage"] = _sel_stage
 
-    # ── 검색 + 토글 + 카운트 ─────────────────────
-    _sc1, _sc2, _sc3 = st.columns([4, 1.7, 1])
+    # ── 검색 + 담당자 필터 + 토글 + 카운트 ─────────
+    _emp_all_names = sorted(emp_map.values())
+    _emp_filter_options = ["(전체)"] + _emp_all_names
+
+    _sc1, _sc_emp, _sc2, _sc3 = st.columns([3, 1.6, 1.7, 1])
     with _sc1:
         _q = st.text_input(
-            "검색", placeholder="회사명, 담당자, 연락처를 검색하세요",
+            "검색", placeholder="고객명, 연락처, 매장 검색",
             label_visibility="collapsed", key="lead_search_q",
         )
+    with _sc_emp:
+        _filter_emp_name_sel = st.selectbox(
+            "담당자 필터",
+            _emp_filter_options,
+            index=0,
+            label_visibility="collapsed",
+            key="lead_filter_emp_select",
+            help="특정 담당자의 리드만 표시",
+        )
+        if _filter_emp_name_sel != "(전체)":
+            st.session_state["lead_filter_emp_id"] = {
+                v: k for k, v in emp_map.items()
+            }.get(_filter_emp_name_sel)
+        else:
+            st.session_state.pop("lead_filter_emp_id", None)
     with _sc2:
         _hide_customers = st.toggle(
             "🛒 구매완료 숨기기",
@@ -752,20 +857,9 @@ def render_lead_management() -> None:
         st.info("조건에 맞는 리드가 없습니다.")
         return
 
-    # ── 담당직원 클릭 필터 표시 ────────────────
+    # ── 담당자 필터 적용 (상단 selectbox 기반) ──
     _filter_emp_id = st.session_state.get("lead_filter_emp_id")
     if _filter_emp_id:
-        _filter_emp_name = emp_map.get(int(_filter_emp_id), "")
-        st.markdown(
-            f"<div style='background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;"
-            f"padding:6px 14px;margin-bottom:8px;font-size:0.85rem;color:#1e40af;display:inline-block;'>"
-            f"👤 <b>{_filter_emp_name}</b> 담당 리드 표시 중 "
-            f"<span style='cursor:pointer;margin-left:8px;'>(전체 보기 → 아래 필터 해제 클릭)</span></div>",
-            unsafe_allow_html=True,
-        )
-        if st.button("✕ 담당자 필터 해제", key="clear_emp_filter"):
-            st.session_state.pop("lead_filter_emp_id", None)
-            st.rerun()
         _filter_emp_name = emp_map.get(int(_filter_emp_id), "")
         leads = [
             l for l in leads
@@ -774,8 +868,8 @@ def render_lead_management() -> None:
         ]
 
     # ── 테이블 헤더 ───────────────────────────
-    _ths = ["고객명", "연락처", "유형", "유입경로", "상태", "담당직원 ↓클릭=필터", "마지막 연락", ""]
-    _ws = [2, 1.6, 1.3, 1.2, 1.5, 1.6, 1.1, 0.8]
+    _ths = ["고객명", "연락처", "유형 ▼", "유입경로", "상태 ▼", "담당직원 ▼", "마지막 연락", ""]
+    _ws = [1.7, 1.4, 1.5, 1.0, 1.4, 2.2, 1.0, 0.7]
     _hc = st.columns(_ws)
     for _c, _t in zip(_hc, _ths):
         _c.markdown(f"<div style='color:#475569;font-weight:600;font-size:0.82rem;'>{_t}</div>", unsafe_allow_html=True)
@@ -784,16 +878,16 @@ def render_lead_management() -> None:
         unsafe_allow_html=True,
     )
 
-    # ── 리드 행 ───────────────────────────────
+    _emp_name_to_id = {v: k for k, v in emp_map.items()}
+    _stage_keys_list = list(LEAD_STAGES.keys())
+
+    # ── 리드 행 (인라인 편집) ───────────────────
     for _i, _lead in enumerate(leads):
         _lid = _lead.get("id")
         _name = _lead.get("name") or "—"
         _phone = _format_phone_display(_lead.get("phone") or "")
         _source = LEAD_SOURCE_LABELS.get(_lead.get("lead_source") or "", _lead.get("lead_source") or "—")
         _stage = _lead.get("lead_stage") or "1_신규"
-        _stage_label = LEAD_STAGES.get(_stage, _stage)
-        _bg = LEAD_STAGE_BADGE.get(_stage, "#e5e7eb")
-        _fg = LEAD_STAGE_TEXT.get(_stage, "#374151")
         _ctype = _lead.get("customer_type") or "신규잠재고객"
 
         # 담당직원: employee_names(쉼표 구분) 우선, 없으면 assigned_employee_id
@@ -805,8 +899,6 @@ def render_lead_management() -> None:
             _fallback_name = emp_map.get(int(_primary_emp_id), "") if _primary_emp_id else ""
             _emp_names_list = [_fallback_name] if _fallback_name else []
 
-        _emp_name_to_id = {v: k for k, v in emp_map.items()}
-
         _store = _lead.get("store_name") or ""
         _last_contact = (
             str(_lead.get("last_contact_at") or "")[:10]
@@ -814,54 +906,71 @@ def render_lead_management() -> None:
         )
 
         _rc = st.columns(_ws)
-        _rc[0].write(_name)
-        _rc[1].write(_phone)
-        # 고객 유형 뱃지
-        _type_badge_map = {
-            "신규잠재고객":      ("🆕 신규",    "#e0e7ff", "#3730a3"),
-            "기존구매고객_DB외": ("🔄 기존구매", "#fef3c7", "#92400e"),
-            "AS요청":            ("🔧 AS",      "#fee2e2", "#991b1b"),
-            "재상담":            ("💬 재상담",  "#d1fae5", "#065f46"),
-        }
-        _tlabel, _tbg, _tfg = _type_badge_map.get(_ctype, ("🆕 신규", "#e2e8f0", "#475569"))
-        _rc[2].markdown(
-            f"<span style='background:{_tbg};color:{_tfg};padding:3px 8px;"
-            f"border-radius:10px;font-size:0.72rem;font-weight:600;'>{_tlabel}</span>",
-            unsafe_allow_html=True,
-        )
-        _rc[3].write(_source)
-        _badge_html = (
-            f"<span style='background:{_bg};color:{_fg};"
-            f"padding:3px 10px;border-radius:12px;font-size:0.78rem;font-weight:600;'>"
-            f"{_stage_label}</span>"
-        )
-        if _lead.get("_is_customer"):
-            _badge_html += (
-                " <span style='background:#fef3c7;color:#92400e;padding:3px 8px;"
-                "border-radius:12px;font-size:0.72rem;font-weight:600;margin-left:4px;'>"
-                "🛒 구매완료</span>"
-            )
-        _rc[4].markdown(_badge_html, unsafe_allow_html=True)
 
-        # 담당직원 — 이름별 칩 버튼, 클릭 시 해당 직원 필터
-        with _rc[5]:
-            if _emp_names_list:
-                for _j, _en in enumerate(_emp_names_list):
-                    _eid_for = _emp_name_to_id.get(_en)
-                    if st.button(
-                        f"👤 {_en}",
-                        key=f"emp_filter_{_lid}_{_eid_for or _en}_{_j}_{_i}",
-                        help="클릭하면 이 담당자의 리드만 표시",
-                    ):
-                        if _eid_for:
-                            st.session_state["lead_filter_emp_id"] = _eid_for
-                            st.rerun()
-            else:
+        # 고객명 + 매장 (보조정보)
+        with _rc[0]:
+            st.markdown(
+                f"<div style='font-weight:500;'>{_name}</div>"
+                f"<div style='color:#94a3b8;font-size:0.7rem;'>{_store}</div>",
+                unsafe_allow_html=True,
+            )
+
+        _rc[1].write(_phone)
+
+        # 유형 — 인라인 selectbox
+        with _rc[2]:
+            _type_key = f"inline_type_{_lid}"
+            _cur_type_idx = CUSTOMER_TYPE_KEYS.index(_ctype) if _ctype in CUSTOMER_TYPE_KEYS else 0
+            st.selectbox(
+                "유형",
+                CUSTOMER_TYPE_KEYS,
+                index=_cur_type_idx,
+                format_func=lambda k: CUSTOMER_TYPE_INLINE_DISPLAY.get(k, k),
+                key=_type_key,
+                label_visibility="collapsed",
+                on_change=_inline_save_type,
+                args=(_lid, _type_key),
+            )
+
+        _rc[3].write(_source)
+
+        # 상태 — 인라인 selectbox (+ 구매완료 표시)
+        with _rc[4]:
+            _stage_key = f"inline_stage_{_lid}"
+            _cur_stage_idx = _stage_keys_list.index(_stage) if _stage in _stage_keys_list else 0
+            st.selectbox(
+                "상태",
+                _stage_keys_list,
+                index=_cur_stage_idx,
+                format_func=lambda k: LEAD_STAGES.get(k, k),
+                key=_stage_key,
+                label_visibility="collapsed",
+                on_change=_inline_save_stage,
+                args=(_lid, _stage_key),
+            )
+            if _lead.get("_is_customer"):
                 st.markdown(
-                    f"<span style='color:#94a3b8;font-size:0.82rem;'>—</span>"
-                    f"<br><span style='color:#cbd5e1;font-size:0.72rem;'>{_store}</span>",
+                    "<span style='background:#fef3c7;color:#92400e;padding:1px 6px;"
+                    "border-radius:8px;font-size:0.68rem;font-weight:600;'>🛒 구매완료</span>",
                     unsafe_allow_html=True,
                 )
+
+        # 담당직원 — 인라인 multiselect
+        with _rc[5]:
+            _emp_key = f"inline_emps_{_lid}"
+            # 현재 값 중 emp_map에 없는 이름은 옵션에 추가하여 default 매칭 보장
+            _row_options = list(dict.fromkeys(_emp_all_names + _emp_names_list))
+            _row_default = [n for n in _emp_names_list if n in _row_options]
+            st.multiselect(
+                "담당직원",
+                options=_row_options,
+                default=_row_default,
+                key=_emp_key,
+                label_visibility="collapsed",
+                placeholder="담당자 선택",
+                on_change=_inline_save_emps,
+                args=(_lid, _emp_key, _emp_name_to_id),
+            )
 
         _rc[6].write(_last_contact)
         with _rc[7]:
