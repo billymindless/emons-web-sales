@@ -22008,14 +22008,15 @@ def render_new_sales():
             help="(판매가 − 원가 − 수수료) / 판매가 × 100 (카드·메인페이 등 수수료 반영 후 최종 마진율)",
         )
 
-    # 이상 마진율 사유 입력 (10% 이하 또는 30% 이상이면 필수)
+    # 이상 마진율 사유 입력 (실질 마진율 10% 이하 또는 30% 이상이면 필수)
+    # 표시 기준과 저장 검증 기준 모두 net_margin_rate(수수료 반영)으로 통일하여 데드락 방지
     _MARGIN_REASON_LOW = 10.0
     _MARGIN_REASON_HIGH = 30.0
-    _margin_reason_required = final_sales > 0 and (basic_margin_rate < _MARGIN_REASON_LOW or basic_margin_rate > _MARGIN_REASON_HIGH)
+    _margin_reason_required = final_sales > 0 and (net_margin_rate_est < _MARGIN_REASON_LOW or net_margin_rate_est > _MARGIN_REASON_HIGH)
     if _margin_reason_required:
-        _margin_direction = "낮습니다 (10% 미만)" if basic_margin_rate < _MARGIN_REASON_LOW else "높습니다 (30% 초과)"
+        _margin_direction = "낮습니다 (10% 미만)" if net_margin_rate_est < _MARGIN_REASON_LOW else "높습니다 (30% 초과)"
         st.warning(
-            f"⚠️ 현재 마진율이 **{basic_margin_rate:.1f}%** 로 정상 범위(10%~30%)보다 **{_margin_direction}**. "
+            f"⚠️ 현재 **실질 마진율**이 **{net_margin_rate_est:.1f}%** 로 정상 범위(10%~30%)보다 **{_margin_direction}**. "
             "등록하려면 아래에 사유를 반드시 입력하세요."
         )
         st.text_input(
