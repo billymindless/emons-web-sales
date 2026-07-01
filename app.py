@@ -10930,13 +10930,14 @@ def _erp_upsert_auto_adjustment(*, db_filename: str, employee_name: str,
 def _erp_collect_auto_adjustments(*, db_filename: str, employee_name: str,
                                   shifts: list, source_tag: str, created_by: str,
                                   work_db_filename: str | None = None,
-                                  work_location_name: str | None = None) -> dict:
+                                  work_location_name: str | None = None,
+                                  overtime_only: bool = False) -> dict:
     """여러 시프트에 대해 매장 표준 대비 차이를 후보 풀에 적재.
 
     shifts: [{"shift_date":"YYYY-MM-DD", "shift_start":"HH:MM" or "HH:MM:SS",
               "shift_end":"...", "work_location_name": str | None}]
-    연장(diff>0) / 단축(diff<0) 모두 session_state['_erp_overtime_candidates'] 에
-    후보로 적재되어 사용자가 [✅ 신청]/[❌ 취소] 선택 후 pending 등록 → 관리자 승인.
+    overtime_only=True 시 연장(diff>0)만 후보 추가. 단축(diff<0)은 기존 자동 행 정리만 하고 건너뜀.
+    overtime_only=False(기본) 시 연장/단축 모두 후보로 적재.
     반환: {candidates_added:int, errors:list[str]}
     """
     candidates_added = 0
@@ -10968,6 +10969,15 @@ def _erp_collect_auto_adjustments(*, db_filename: str, employee_name: str,
             if diff_min == 0:
                 _erp_delete_existing_auto_adjustment(db_filename, employee_name, d_str, source_tag)
                 # 기존 후보 중 동일한 항목도 제거
+                pool[:] = [c for c in pool
+                           if not (c.get("employee_name") == employee_name
+                                   and c.get("target_date") == d_str
+                                   and c.get("source_tag") == source_tag)]
+                continue
+
+            # overtime_only=True 이고 단축(diff<0)이면 기존 자동 행만 정리하고 후보 추가 X
+            if overtime_only and diff_min < 0:
+                _erp_delete_existing_auto_adjustment(db_filename, employee_name, d_str, source_tag)
                 pool[:] = [c for c in pool
                            if not (c.get("employee_name") == employee_name
                                    and c.get("target_date") == d_str
@@ -13482,6 +13492,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                                             created_by=me_name,
                                             work_db_filename=_cal_adj_db,
                                             work_location_name=_wloc_e,
+                                            overtime_only=True,
                                         )
                                         st.session_state.pop("qe_edit_id", None)
                                         st.session_state["_erp_cal_flash"] = f"{_sd.isoformat()} {qe_emp} 일정이 수정되었습니다. 표준 시간과 차이가 있으면 [정기근무일정] 화면 상단에서 연장 신청을 확인하세요."
@@ -13614,6 +13625,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         created_by=me_name,
                         work_db_filename=_add_db,
                         work_location_name=_wloc_save,
+                        overtime_only=True,
                     )
                     _flash_loc = _final_loc or _dbf_to_sn.get(_add_db, "")
                     st.session_state["_erp_cal_flash"] = (
