@@ -6544,9 +6544,9 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
     bc1, bc2 = st.columns([2, 1])
     with bc1:
         f_building = st.text_input(
-            "건물명 검색 (부분 일치, 대소문자·공백 무시)",
+            "건물명·주소 검색 (부분 일치 · building_name + address 원문 동시 검색)",
             key=f"{key_prefix}_mdim_building",
-            placeholder="예: 태화강엑슬루타워, 힐스테이트 등",
+            placeholder="예: 아너스빌, 태화강엑슬루타워, 힐스테이트 등",
         )
     with bc2:
         bt_opts = sorted([x for x in df["building_type"].dropna().unique() if str(x).strip()])
@@ -6611,9 +6611,16 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
     if f_road:
         fdf = fdf[fdf["road_name"].isin(f_road)]
     if f_building:
+        # 건물명(카카오 API 반환값)은 도로명주소만 있는 경우 자주 비어 있으므로
+        # address 원문에서도 함께 부분 일치 검색해 누락을 방지한다.
         needle = f_building.strip().lower().replace(" ", "")
         _bn = fdf["building_name"].fillna("").astype(str).str.replace(" ", "", regex=False).str.lower()
-        fdf = fdf[_bn.str.contains(needle, na=False)]
+        if "address" in fdf.columns:
+            _addr = fdf["address"].fillna("").astype(str).str.replace(" ", "", regex=False).str.lower()
+            _mask = _bn.str.contains(needle, na=False) | _addr.str.contains(needle, na=False)
+        else:
+            _mask = _bn.str.contains(needle, na=False)
+        fdf = fdf[_mask]
     if f_btype:
         fdf = fdf[fdf["building_type"].isin(f_btype)]
     if f_visit:
