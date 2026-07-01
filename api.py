@@ -902,11 +902,19 @@ async def _ct_get_or_create_customer(
     headers: dict,
     cleaned_phone: str,
     name_from_ct: str,
-) -> tuple[int | None, str, str, bool]:
+) -> tuple[list[int], str, str, bool]:
     """
     전화번호로 app_customers 조회 → 없으면 자동 가입.
     phone1/phone2 + 정규화/하이픈/공백 형식 모두 검색.
-    반환: (customer_id, name, store_name, is_new)
+
+    반환: (customer_ids_list, name, store_name, is_new)
+    - customer_ids_list: 매칭된 모든 고객 ID (여러 매장에 동일 전화번호 등록 가능)
+    - is_new: 아무 고객도 없어 신규 자동가입한 경우 True
+
+    [버그 픽스] 이전에는 limit=1로 첫 번째 고객 ID만 조회했으나,
+    동일 전화번호가 여러 매장에 등록되어 있을 경우 잘못된 customer_id로
+    주문 조회가 실패하는 문제가 있었다. limit=50으로 모든 ID를 수집하여
+    _ct_fetch_latest_order_with_balance에서 in 필터로 한 번에 검색한다.
     """
     variants = _phone_variants(cleaned_phone)
     # Supabase or 필터: or=(phone1.eq.X,phone1.eq.Y,phone2.eq.X,phone2.eq.Y)
@@ -919,20 +927,29 @@ async def _ct_get_or_create_customer(
     resp = await client.get(
         _supa_url("app_customers"),
         headers=headers,
-        params={"or": or_filter, "select": "id,name,phone1,phone2,store_name", "limit": "1"},
+        params={"or": or_filter, "select": "id,name,phone1,phone2,store_name", "limit": "50"},
     )
     rows = resp.json() if resp.status_code == 200 else []
     logger.info(
-        "channel-talk lookup: variants=%s, status=%s, found=%d",
+        "channel-talk lookup: variants=%s, status=%s, found=%d rows=%s",
         variants, resp.status_code, len(rows),
+        [(r.get("id"), r.get("store_name")) for r in rows],
     )
     if rows:
-        return (
-            int(rows[0]["id"]),
-            str(rows[0].get("name") or name_from_ct or ""),
-            str(rows[0].get("store_name") or ""),
-            False,
+        customer_ids = [int(r["id"]) for r in rows]
+        # 이름: 채널톡_자동가입이 아닌 실제 이름 우선
+        name = next(
+            (r.get("name") for r in rows
+             if r.get("name") and r.get("name") not in ("채널톡고객", "", None)),
+            rows[0].get("name") or name_from_ct or "",
         )
+        # 매장: 채널톡 기본 매장이 아닌 실제 매장 우선
+        store_name = next(
+            (r.get("store_name") for r in rows
+             if r.get("store_name") and r.get("store_name") != CHANNEL_TALK_DEFAULT_STORE),
+            rows[0].get("store_name") or "",
+        )
+        return customer_ids, str(name), str(store_name), False
 
     # 2) 신규 자동 가입
     insert_data = {
@@ -950,36 +967,49 @@ async def _ct_get_or_create_customer(
         created = resp2.json()
         if created:
             return (
-                int(created[0]["id"]),
+                [int(created[0]["id"])],
                 str(created[0].get("name") or insert_data["name"]),
                 str(created[0].get("store_name") or CHANNEL_TALK_DEFAULT_STORE),
                 True,
             )
     logger.warning("channel-talk: 자동 가입 실패 %s %s", resp2.status_code, resp2.text[:200])
-    return None, name_from_ct or "채널톡고객", "", False
+    return [], name_from_ct or "채널톡고객", "", False
 
 
 async def _ct_fetch_latest_order_with_balance(
     client: httpx.AsyncClient,
     headers: dict,
-    customer_id: int,
+    customer_ids: list[int],
 ) -> dict | None:
     """
-    customer_id의 최근 1건 주문 + 결제 합계 조회.
-    반환: {category, total_amount, paid_total} 또는 None.
+    customer_ids 중 하나라도 연결된 최근 1건 주문 + 결제 합계 조회.
+    여러 매장에 동일 고객이 등록된 경우를 in 필터로 한 번에 처리.
+    반환: {category, total_amount, paid_total, ...} 또는 None.
     """
-    # 최근 주문 1건
+    if not customer_ids:
+        return None
+
+    # in 필터: customer_id=in.(X,Y,Z) — PostgREST 표준 문법
+    if len(customer_ids) == 1:
+        cid_filter = f"eq.{customer_ids[0]}"
+    else:
+        cid_filter = f"in.({','.join(str(i) for i in customer_ids)})"
+
     resp = await client.get(
         _supa_url("app_orders"),
         headers=headers,
         params={
-            "customer_id": f"eq.{customer_id}",
+            "customer_id": cid_filter,
             "select": "id,category,total_amount,db_filename,order_date,delivery_date,employee_names",
             "order": "created_at.desc",
             "limit": "1",
         },
     )
     orders = resp.json() if resp.status_code == 200 else []
+    logger.info(
+        "channel-talk order lookup: customer_ids=%s, status=%s, found=%d",
+        customer_ids, resp.status_code, len(orders),
+    )
     if not orders:
         return None
 
@@ -1010,6 +1040,7 @@ async def _ct_fetch_latest_order_with_balance(
         "order_date": (str(order.get("order_date") or "")[:10] or None),
         "delivery_date": (str(order.get("delivery_date") or "")[:10] or None),
         "employee_names": (str(order.get("employee_names") or "") or None),
+        "db_filename": db_filename,
     }
 
 
@@ -1324,16 +1355,21 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
         lead_info: dict | None = None
 
         async with httpx.AsyncClient(timeout=10.0) as client:
-            customer_id, customer_name, customer_store, is_new = await _ct_get_or_create_customer(
+            customer_ids, customer_name, customer_store, is_new = await _ct_get_or_create_customer(
                 client, headers, cleaned_phone, name_from_ct,
             )
+            # backward compat: 단일 ID (첫 번째) — 리드 등록 등 ID 1개가 필요한 곳에서 사용
+            customer_id = customer_ids[0] if customer_ids else None
 
             order_info: dict | None = None
-            if customer_id is not None:
+            if customer_ids:
                 try:
                     order_info = await _ct_fetch_latest_order_with_balance(
-                        client, headers, customer_id,
+                        client, headers, customer_ids,
                     )
+                    # 주문의 db_filename으로 실제 매장명 보정
+                    if order_info and order_info.get("db_filename") and not customer_store:
+                        customer_store = order_info["db_filename"]
                 except Exception as e:
                     logger.warning("channel-talk: 주문 조회 실패 (계속 진행): %s", e)
 
