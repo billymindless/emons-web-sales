@@ -2413,13 +2413,18 @@ def _supabase_insert_customer(db_filename: str, name: str, phone1: str, phone2: 
         "phone2": (phone2 or "").strip() or None,
         "address": addr_clean,
     }
-    # 주소가 있으면 카카오 지오코딩으로 위도/경도 자동 저장
+    # 주소가 있으면 카카오 지오코딩으로 위도/경도 + 지역·건물명 자동 저장
+    # (지역 컬럼은 SUPABASE_APP_CUSTOMERS_REGION.sql 마이그레이션 후 사용 가능)
     if addr_clean:
         try:
             _geo = geocode_address_kakao_extended(addr_clean)
             if _geo:
                 payload["latitude"] = _geo["latitude"]
                 payload["longitude"] = _geo["longitude"]
+                for _k in ("sigungu", "bname", "road_name", "building_name"):
+                    _v = _geo.get(_k)
+                    if _v:
+                        payload[_k] = _v
         except Exception:
             pass
     try:
@@ -2434,6 +2439,15 @@ def _supabase_insert_customer(db_filename: str, name: str, phone1: str, phone2: 
                 detail = e.body.get("message") or e.body.get("details") or detail
         except Exception:
             pass
+        # 지역 컬럼(sigungu/bname/road_name/building_name) 미마이그레이션 시 재시도
+        if "42703" in str(detail) or "column" in str(detail).lower():
+            fallback = {k: v for k, v in payload.items() if k not in ("sigungu", "bname", "road_name", "building_name")}
+            try:
+                r2 = client.table("app_customers").insert(fallback).execute()
+                if r2.data and len(r2.data) > 0 and r2.data[0].get("id") is not None:
+                    return int(r2.data[0]["id"]), None
+            except Exception as e2:
+                return None, str(getattr(e2, "message", None) or e2)
         return None, (detail or str(e))
 
 
@@ -5563,8 +5577,14 @@ def geocode_address_kakao(address: str):
 
 def geocode_address_kakao_extended(address: str) -> dict | None:
     """
-    주소 문자열을 카카오 API로 지오코딩하여 좌표 + 건물명/법정동명 반환.
-    반환: {"latitude", "longitude", "address", "building_name", "bname"} 또는 None.
+    주소 문자열을 카카오 API로 지오코딩하여 좌표 + 지역(시군구/법정동/도로명) + 건물명 반환.
+    반환: {
+        "latitude", "longitude", "address",
+        "sigungu",        # region_2depth_name (예: 남구)
+        "bname",          # 법정동명 (예: 삼산동)
+        "road_name",      # 도로명 (예: 봉월로)
+        "building_name",  # 건물명 (예: 태화강엑슬루타워)
+    } 또는 None.
     """
     if not address or not str(address).strip():
         return None
@@ -5589,15 +5609,23 @@ def geocode_address_kakao_extended(address: str) -> dict | None:
             return None
         road = d.get("road_address") or {}
         addr_obj = d.get("address") or {}
-        building_name = (road.get("building_name") or "").strip() or None
+        # 시군구: 도로명 주소 우선, 없으면 지번 주소
+        sigungu = (
+            (road.get("region_2depth_name") or addr_obj.get("region_2depth_name") or "").strip()
+            or None
+        )
         bname = (addr_obj.get("bname") or "").strip() or None
+        road_name = (road.get("road_name") or "").strip() or None
+        building_name = (road.get("building_name") or "").strip() or None
         addr_name = (d.get("address_name") or q) or ""
         return {
             "latitude": float(y),
             "longitude": float(x),
             "address": addr_name,
-            "building_name": building_name,
+            "sigungu": sigungu,
             "bname": bname,
+            "road_name": road_name,
+            "building_name": building_name,
         }
     except Exception:
         return None
@@ -6349,6 +6377,371 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
                             st_folium(m2, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_right")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_customers_region_cached(db_filename: str) -> pd.DataFrame:
+    """app_customers 지역 컬럼(id, sigungu, bname, road_name, building_name) 로드.
+    지역 컬럼이 아직 마이그레이션되지 않은 경우 빈 DF 반환. TTL 5분."""
+    _empty_cols = ["id", "sigungu", "bname", "road_name", "building_name"]
+    client, err = get_supabase_client()
+    if err or not client:
+        return pd.DataFrame(columns=_empty_cols)
+    store_name = _get_current_store_name_for_customers(db_filename)
+    if not store_name:
+        return pd.DataFrame(columns=_empty_cols)
+    try:
+        page_size = 1000
+        offset = 0
+        rows: list[dict] = []
+        while True:
+            r = (
+                client.table("app_customers")
+                .select("id, sigungu, bname, road_name, building_name")
+                .eq("store_name", store_name)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = r.data or []
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=_empty_cols)
+    except Exception:
+        return pd.DataFrame(columns=_empty_cols)
+
+
+def _classify_building_type(name: str | None) -> str:
+    """건물명 문자열에서 대략적 건물유형(아파트/오피스텔/빌라/주택/상가/기타) 추정.
+    카카오 API에는 유형 필드가 없어 명칭 키워드로 근사한다."""
+    if not name:
+        return "기타"
+    n = str(name)
+    KEYWORDS = [
+        ("오피스텔", "오피스텔"),
+        ("아파트", "아파트"),
+        ("빌라", "빌라"),
+        ("타운하우스", "빌라"),
+        ("맨션", "빌라"),
+        ("주택", "주택"),
+        ("상가", "상가"),
+        ("프라자", "상가"),
+        ("플라자", "상가"),
+        ("몰", "상가"),
+        # 대표 아파트 브랜드
+        ("자이", "아파트"),
+        ("힐스테이트", "아파트"),
+        ("푸르지오", "아파트"),
+        ("래미안", "아파트"),
+        ("아이파크", "아파트"),
+        ("타워", "아파트"),
+        ("팰리스", "아파트"),
+        ("SK뷰", "아파트"),
+        ("e편한세상", "아파트"),
+    ]
+    for kw, label in KEYWORDS:
+        if kw in n:
+            return label
+    return "기타"
+
+
+def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map: dict | None = None) -> None:
+    """마케팅 인사이트 「다면 분석」 섹션.
+    여러 조건(기간·지역·건물명·건물유형·품목·이유)을 동시 적용하고, 여러 차원으로 매출을 분해한다.
+
+    merged: orders + customers merge 결과. 필요한 컬럼:
+        order_date, total_amount, customer_id, address, category, visit_reason, purchase_reason, _db_fn
+        (superadmin은 추가로 _store).
+    store_map: {db_filename: store_name} — superadmin 시 매장 multiselect·차원 노출용. tenant는 None.
+    """
+    st.markdown("---")
+    st.subheader("🧩 다면 분석 (다중 조건 · 다중 차원)")
+    st.caption(
+        "여러 조건을 동시에 적용해서 지역·품목·이유 등 여러 차원으로 매출을 분해합니다. "
+        "지역 데이터는 카카오 지오코딩 기반이며, 아직 백필되지 않은 고객은 시군구/도로명 등이 비어 있을 수 있습니다."
+    )
+
+    if merged is None or merged.empty:
+        st.info("분석할 데이터가 없습니다.")
+        return
+
+    df = merged.copy()
+    df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+    df = df[df["order_date"].notna()]
+    if df.empty:
+        st.info("유효한 주문일자가 있는 데이터가 없습니다.")
+        return
+    df["_dt"] = df["order_date"].dt.date
+    df["total_amount"] = pd.to_numeric(df["total_amount"], errors="coerce").fillna(0)
+
+    # 고객 테이블에서 지역 컬럼을 재로드 → customer_id + _db_fn 로 join
+    if "_db_fn" in df.columns and "customer_id" in df.columns:
+        db_fns = [x for x in df["_db_fn"].dropna().unique().tolist() if x]
+        region_frames: list[pd.DataFrame] = []
+        for _fn in db_fns:
+            _rdf = _load_customers_region_cached(_fn)
+            if _rdf is None or _rdf.empty:
+                continue
+            _rdf = _rdf.copy()
+            _rdf["_db_fn"] = _fn
+            region_frames.append(_rdf)
+        if region_frames:
+            reg_all = pd.concat(region_frames, ignore_index=True)
+            reg_all = reg_all.rename(columns={"id": "_cust_id"})
+            df = df.merge(
+                reg_all,
+                left_on=["customer_id", "_db_fn"],
+                right_on=["_cust_id", "_db_fn"],
+                how="left",
+            )
+            if "_cust_id" in df.columns:
+                df = df.drop(columns=["_cust_id"])
+    for c in ("sigungu", "bname", "road_name", "building_name"):
+        if c not in df.columns:
+            df[c] = None
+    df["building_type"] = df["building_name"].map(_classify_building_type)
+
+    # ── ① 필터 UI (여러 조건 동시) ─────────────────────────────────────
+    st.markdown("##### 🔎 필터 (여러 조건 동시 적용)")
+    today = _today_kst()
+    default_start = today.replace(day=1)
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        f_start = st.date_input("시작일", value=default_start, key=f"{key_prefix}_mdim_start")
+    with fc2:
+        f_end = st.date_input("종료일", value=today, key=f"{key_prefix}_mdim_end")
+    if f_start > f_end:
+        f_end = f_start
+
+    # 매장 필터 (superadmin 전용)
+    f_stores: list[str] = []
+    if store_map:
+        store_options = sorted({v for v in store_map.values() if v})
+        f_stores = st.multiselect("매장", store_options, default=[],
+                                  key=f"{key_prefix}_mdim_stores",
+                                  placeholder="선택 없음 = 전체")
+
+    # 지역 필터 (cascading multiselect)
+    rc1, rc2, rc3 = st.columns(3)
+    with rc1:
+        sigungu_opts = sorted([x for x in df["sigungu"].dropna().unique() if str(x).strip()])
+        f_sigungu = st.multiselect("시군구", sigungu_opts, key=f"{key_prefix}_mdim_sigungu",
+                                    placeholder="전체")
+    with rc2:
+        _bname_pool = df if not f_sigungu else df[df["sigungu"].isin(f_sigungu)]
+        bname_opts = sorted([x for x in _bname_pool["bname"].dropna().unique() if str(x).strip()])
+        f_bname = st.multiselect("법정동", bname_opts, key=f"{key_prefix}_mdim_bname",
+                                  placeholder="전체")
+    with rc3:
+        _rn_pool = df
+        if f_sigungu:
+            _rn_pool = _rn_pool[_rn_pool["sigungu"].isin(f_sigungu)]
+        if f_bname:
+            _rn_pool = _rn_pool[_rn_pool["bname"].isin(f_bname)]
+        rn_opts = sorted([x for x in _rn_pool["road_name"].dropna().unique() if str(x).strip()])
+        f_road = st.multiselect("도로명", rn_opts, key=f"{key_prefix}_mdim_road",
+                                 placeholder="전체")
+
+    bc1, bc2 = st.columns([2, 1])
+    with bc1:
+        f_building = st.text_input(
+            "건물명 검색 (부분 일치, 대소문자·공백 무시)",
+            key=f"{key_prefix}_mdim_building",
+            placeholder="예: 태화강엑슬루타워, 힐스테이트 등",
+        )
+    with bc2:
+        bt_opts = sorted([x for x in df["building_type"].dropna().unique() if str(x).strip()])
+        f_btype = st.multiselect("건물유형", bt_opts, key=f"{key_prefix}_mdim_btype",
+                                  placeholder="전체")
+
+    cat_opts = sorted({
+        c.strip()
+        for v in df["category"].dropna() if str(v).strip()
+        for c in str(v).split(",") if c.strip() and c.strip() != "-"
+    })
+    cf1, cf2, cf3 = st.columns(3)
+    with cf1:
+        f_cat = st.multiselect("품목", cat_opts, key=f"{key_prefix}_mdim_cat",
+                                placeholder="전체")
+    with cf2:
+        vr_opts = sorted([x for x in df["visit_reason"].dropna().unique() if str(x).strip()])
+        f_visit = st.multiselect("방문 이유", vr_opts, key=f"{key_prefix}_mdim_visit",
+                                  placeholder="전체")
+    with cf3:
+        pr_opts = sorted([x for x in df["purchase_reason"].dropna().unique() if str(x).strip()])
+        f_purch = st.multiselect("구매 이유", pr_opts, key=f"{key_prefix}_mdim_purch",
+                                  placeholder="전체")
+
+    # ── ② 그룹화 차원 (다중 선택) ────────────────────────────────
+    dim_map = {
+        "시군구": "sigungu",
+        "법정동": "bname",
+        "도로명": "road_name",
+        "건물유형": "building_type",
+        "건물명": "building_name",
+        "품목": "_category_expl",
+        "방문이유": "visit_reason",
+        "구매이유": "purchase_reason",
+    }
+    if store_map and "_store" in df.columns:
+        dim_map["매장"] = "_store"
+
+    dim_options = list(dim_map.keys())
+    default_dims = ["시군구", "품목"]
+    f_dims = st.multiselect(
+        "그룹화 차원 (2개 이상 선택하면 다차원 피벗)",
+        dim_options,
+        default=default_dims,
+        key=f"{key_prefix}_mdim_dims",
+    )
+    metric = st.radio(
+        "측정값",
+        ["매출액(원)", "건수", "객단가(원)"],
+        horizontal=True,
+        key=f"{key_prefix}_mdim_metric",
+    )
+
+    # ── ③ 필터 적용 ────────────────────────────────────────────────
+    fdf = df[(df["_dt"] >= f_start) & (df["_dt"] <= f_end)].copy()
+    if store_map and f_stores and "_store" in fdf.columns:
+        fdf = fdf[fdf["_store"].isin(f_stores)]
+    if f_sigungu:
+        fdf = fdf[fdf["sigungu"].isin(f_sigungu)]
+    if f_bname:
+        fdf = fdf[fdf["bname"].isin(f_bname)]
+    if f_road:
+        fdf = fdf[fdf["road_name"].isin(f_road)]
+    if f_building:
+        needle = f_building.strip().lower().replace(" ", "")
+        _bn = fdf["building_name"].fillna("").astype(str).str.replace(" ", "", regex=False).str.lower()
+        fdf = fdf[_bn.str.contains(needle, na=False)]
+    if f_btype:
+        fdf = fdf[fdf["building_type"].isin(f_btype)]
+    if f_visit:
+        fdf = fdf[fdf["visit_reason"].isin(f_visit)]
+    if f_purch:
+        fdf = fdf[fdf["purchase_reason"].isin(f_purch)]
+
+    # 품목은 explode (한 주문 category="침대,매트리스" → 두 행) 후 필터
+    if "품목" in f_dims or f_cat:
+        fdf = fdf.assign(_category_expl=fdf["category"].fillna("").astype(str).str.split(","))
+        fdf = fdf.explode("_category_expl")
+        fdf["_category_expl"] = fdf["_category_expl"].astype(str).str.strip()
+        fdf = fdf[(fdf["_category_expl"] != "") & (fdf["_category_expl"] != "-")]
+        if f_cat:
+            fdf = fdf[fdf["_category_expl"].isin(f_cat)]
+    else:
+        fdf["_category_expl"] = None
+
+    if fdf.empty:
+        st.info("선택한 조건에 맞는 데이터가 없습니다.")
+        return
+
+    # ── ④ 요약 지표 ────────────────────────────────────────────────
+    s1, s2, s3, s4 = st.columns(4)
+    _amount = float(fdf["total_amount"].sum())
+    _count = int(len(fdf))
+    _uniq_cust = int(fdf["customer_id"].nunique()) if "customer_id" in fdf.columns else 0
+    s1.metric("건수", f"{_count:,}건")
+    s2.metric("매출액", f"{_amount:,.0f}원")
+    s3.metric("객단가", f"{(_amount / _count if _count else 0):,.0f}원")
+    s4.metric("고객 수(중복 제외)", f"{_uniq_cust:,}명")
+
+    # ── ⑤ 피벗 집계 ────────────────────────────────────────────────
+    if not f_dims:
+        st.info("그룹화 차원을 1개 이상 선택하세요.")
+        return
+    dim_cols = [dim_map[d] for d in f_dims]
+    valid_dim_cols = [c for c in dim_cols if c in fdf.columns]
+    if not valid_dim_cols:
+        st.info("선택한 차원 컬럼을 찾을 수 없습니다.")
+        return
+
+    # NaN 방어: groupby에서 NaN 그룹이 사라지므로 '(미분류)'로 대체
+    for c in valid_dim_cols:
+        fdf[c] = fdf[c].fillna("(미분류)")
+
+    if metric == "매출액(원)":
+        agg = fdf.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "sum"))
+    elif metric == "건수":
+        agg = fdf.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "count"))
+    else:  # 객단가
+        agg = fdf.groupby(valid_dim_cols, as_index=False).agg(
+            _sum=("total_amount", "sum"),
+            _cnt=("total_amount", "count"),
+        )
+        agg["값"] = agg["_sum"] / agg["_cnt"].where(agg["_cnt"] > 0, 1)
+        agg = agg.drop(columns=["_sum", "_cnt"])
+    agg = agg.sort_values("값", ascending=False)
+
+    # 컬럼명 라벨화
+    inv_map = {v: k for k, v in dim_map.items()}
+    display_df = agg.rename(columns=inv_map).rename(columns={"값": metric})
+
+    # 표
+    st.markdown("##### 📋 피벗 표 (상위 200행)")
+    st.dataframe(
+        display_df.head(200),
+        width="stretch",
+        height=min(500, 60 + min(len(display_df), 200) * 32),
+        key=f"{key_prefix}_mdim_table",
+    )
+
+    # CSV 다운로드 (전체 결과)
+    csv_bytes = display_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 CSV 다운로드 (전체)",
+        csv_bytes,
+        file_name=f"multi_dim_{f_start}_{f_end}.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_mdim_csv",
+    )
+
+    # ── ⑥ 시각화 ────────────────────────────────────────────────
+    st.markdown("##### 📊 시각화")
+    _top_n = 20
+    _top = display_df.head(_top_n)
+    dim_labels = [inv_map.get(c, c) for c in valid_dim_cols]
+
+    if len(valid_dim_cols) == 1:
+        fig = px.bar(_top, x=dim_labels[0], y=metric,
+                     title=f"{dim_labels[0]}별 {metric} (상위 {min(_top_n, len(_top))})")
+        fig.update_layout(height=400, xaxis_tickangle=-45,
+                          margin=dict(t=40, b=100, l=20, r=20),
+                          xaxis_title=dim_labels[0], yaxis_title=metric)
+        fig.update_yaxes(tickformat=",")
+        st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_mdim_bar")
+    elif len(valid_dim_cols) == 2:
+        _dim1, _dim2 = dim_labels[0], dim_labels[1]
+        fig_bar = px.bar(_top, x=_dim1, y=metric, color=_dim2, barmode="group",
+                         title=f"{_dim1} × {_dim2} — {metric} (상위 {min(_top_n, len(_top))})")
+        fig_bar.update_layout(height=420, xaxis_tickangle=-45,
+                              margin=dict(t=40, b=100, l=20, r=20),
+                              xaxis_title=_dim1, yaxis_title=metric)
+        fig_bar.update_yaxes(tickformat=",")
+        st.plotly_chart(fig_bar, width="stretch", key=f"{key_prefix}_mdim_gbar")
+        try:
+            _pv = display_df.pivot_table(index=_dim1, columns=_dim2, values=metric,
+                                         aggfunc="sum", fill_value=0)
+            _top_rows = _pv.sum(axis=1).sort_values(ascending=False).head(20).index
+            _top_cols = _pv.sum(axis=0).sort_values(ascending=False).head(20).index
+            _pv = _pv.loc[_top_rows, _top_cols]
+            fig_hm = px.imshow(_pv, aspect="auto", color_continuous_scale="Blues",
+                               labels=dict(color=metric),
+                               title=f"{_dim1} × {_dim2} 히트맵 (상위 20×20)")
+            fig_hm.update_layout(height=420, margin=dict(t=40, b=20, l=20, r=20))
+            st.plotly_chart(fig_hm, width="stretch", key=f"{key_prefix}_mdim_heatmap")
+        except Exception as _e:
+            st.caption(f"히트맵 생략: {_e}")
+    else:
+        try:
+            fig_tm = px.treemap(display_df.head(80), path=dim_labels, values=metric,
+                                title=f"트리맵 — {' > '.join(dim_labels)} · {metric} (상위 80)")
+            fig_tm.update_layout(height=560, margin=dict(t=40, b=20, l=20, r=20))
+            st.plotly_chart(fig_tm, width="stretch", key=f"{key_prefix}_mdim_treemap")
+        except Exception as _e:
+            st.caption(f"트리맵 생략: {_e}")
+
+
 def _render_marketing_multi_period_comparison(
     merged_all: pd.DataFrame,
     range_start_a: date,
@@ -6552,6 +6945,9 @@ def render_marketing_insights_tenant():
         key_prefix="mi_tenant",
     )
 
+    # ── 다면 분석 섹션 (매장 단일: store_map=None) ─────────────────
+    _render_multi_dim_analysis(merged, key_prefix="mi_tenant", store_map=None)
+
 
 def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str, key_prefix: str):
     """기간별 필터된 merged로 Folium 지도 1개 렌더링 (좌우 비교용)."""
@@ -6677,6 +7073,10 @@ def render_marketing_insights_superadmin():
         range_start_b, range_end_b,
         key_prefix="mi_superadmin",
     )
+
+    # ── 다면 분석 섹션 (전 매장: store_map = {db_fn: store_name}) ─────
+    _sa_store_map = {row["db_filename"]: row["store_name"] for _, row in stores.iterrows()}
+    _render_multi_dim_analysis(merged_all, key_prefix="mi_superadmin", store_map=_sa_store_map)
 
 
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
