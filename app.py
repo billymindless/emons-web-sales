@@ -10937,14 +10937,12 @@ def _erp_upsert_auto_adjustment(*, db_filename: str, employee_name: str,
 def _erp_collect_auto_adjustments(*, db_filename: str, employee_name: str,
                                   shifts: list, source_tag: str, created_by: str,
                                   work_db_filename: str | None = None,
-                                  work_location_name: str | None = None,
-                                  overtime_only: bool = False) -> dict:
-    """여러 시프트에 대해 매장 표준 대비 차이를 후보 풀에 적재.
+                                  work_location_name: str | None = None) -> dict:
+    """여러 시프트에 대해 매장 표준 대비 연장(diff>0) 차이를 후보 풀에 적재.
 
     shifts: [{"shift_date":"YYYY-MM-DD", "shift_start":"HH:MM" or "HH:MM:SS",
               "shift_end":"...", "work_location_name": str | None}]
-    overtime_only=True 시 연장(diff>0)만 후보 추가. 단축(diff<0)은 기존 자동 행 정리만 하고 건너뜀.
-    overtime_only=False(기본) 시 연장/단축 모두 후보로 적재.
+    연장(diff>0)만 후보 추가. 단축(diff<0)은 기존 자동 행 정리만 하고 건너뜀 (단축근무 신청 모드 폐지).
     반환: {candidates_added:int, errors:list[str]}
     """
     candidates_added = 0
@@ -10982,8 +10980,8 @@ def _erp_collect_auto_adjustments(*, db_filename: str, employee_name: str,
                                    and c.get("source_tag") == source_tag)]
                 continue
 
-            # overtime_only=True 이고 단축(diff<0)이면 기존 자동 행만 정리하고 후보 추가 X
-            if overtime_only and diff_min < 0:
+            # 단축(diff<0)은 신청 모드를 사용하지 않음: 기존 자동 행만 정리하고 후보 추가 X
+            if diff_min < 0:
                 _erp_delete_existing_auto_adjustment(db_filename, employee_name, d_str, source_tag)
                 pool[:] = [c for c in pool
                            if not (c.get("employee_name") == employee_name
@@ -11019,43 +11017,41 @@ def _erp_collect_auto_adjustments(*, db_filename: str, employee_name: str,
 
 
 def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> None:
-    """저장 후 화면 상단에 표시되는 '근무시간 자동 조정 대기' UI.
+    """저장 후 화면 상단에 표시되는 '연장근무 신청 대기' UI.
 
-    연장(+)/단축(-) 모두 표시. 사용자가 [✅ 신청]/[❌ 취소] 선택 시 pending 등록
+    연장(+)만 표시. 사용자가 [✅ 신청]/[❌ 취소] 선택 시 pending 등록
     → 관리자 승인 후 대시보드에 반영.
     scope_employee 지정 시 해당 직원의 후보만 렌더링.
     """
     pool = st.session_state.get("_erp_overtime_candidates") or []
+    # 단축근무 신청 모드 폐지: 혹시 세션에 남아있는 음수 후보는 노출하지 않음
+    pool = [c for c in pool if int(c.get("diff_min") or 0) > 0]
     if scope_employee:
         pool = [c for c in pool if c.get("employee_name") == scope_employee]
     if not pool:
         return
 
-    n_ext = sum(1 for c in pool if int(c.get("diff_min") or 0) > 0)
-    n_sht = sum(1 for c in pool if int(c.get("diff_min") or 0) < 0)
     st.markdown(
         "<div style='background:#FFF8E1; border-left:4px solid #FB8C00; "
         "padding:12px 16px; border-radius:8px; margin:10px 0;'>"
-        f"<b>🔔 근무시간 자동 조정 신청 대기 ({len(pool)}건 — 연장 {n_ext} · 단축 {n_sht})</b><br>"
-        "<span style='font-size:0.86rem; color:#555;'>다음 일정은 매장 표준 시간과 차이가 있습니다. "
-        "신청 후 관리자 승인을 거쳐 실제 근무시간에 가산(+) 또는 차감(−) 반영됩니다.</span>"
+        f"<b>🔔 연장근무 신청 대기 ({len(pool)}건)</b><br>"
+        "<span style='font-size:0.86rem; color:#555;'>다음 일정은 매장 표준 시간보다 길게 근무한 일정입니다. "
+        "신청 후 관리자 승인을 거쳐 실제 근무시간에 가산(+) 반영됩니다.</span>"
         "</div>",
         unsafe_allow_html=True,
     )
 
+    _color = "#E65100"
+
     for idx, cand in enumerate(list(pool)):
         diff_min = int(cand.get("diff_min") or 0)
-        is_ext = diff_min > 0
-        sign_label = "+" if is_ext else "−"
-        kind_label = "연장근무" if is_ext else "단축근무"
-        color = "#E65100" if is_ext else "#C62828"  # 연장: 주황, 단축: 빨강
         _cand_key = f"{cand['employee_name']}_{cand['target_date']}_{cand['source_tag']}"
 
         cols = st.columns([1.6, 1.3, 2.5, 0.9, 0.9])
         with cols[0]:
             st.markdown(
                 f"**{cand['target_date']}** · {cand['employee_name']}<br>"
-                f"<span style='color:{color}; font-weight:600;'>{kind_label}</span> "
+                f"<span style='color:{_color}; font-weight:600;'>연장근무</span> "
                 f"<span style='color:#888; font-size:0.78rem;'>"
                 f"표준 {cand['std_start']}~{cand['std_end']} → 실제 {cand['actual_start']}~{cand['actual_end']}"
                 f"</span>",
@@ -11064,19 +11060,18 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
         with cols[1]:
             _wloc = cand.get("work_location_name") or "—"
             st.markdown(
-                f"<span style='color:{color}; font-weight:700; font-size:1.15rem;'>"
-                f"{sign_label}{_erp_fmt_hm(abs(diff_min))}</span>"
+                f"<span style='color:{_color}; font-weight:700; font-size:1.15rem;'>"
+                f"+{_erp_fmt_hm(abs(diff_min))}</span>"
                 f"<br><span style='color:#607D8B; font-size:0.78rem;'>{_wloc}</span>",
                 unsafe_allow_html=True,
             )
         with cols[2]:
             _note_key = f"adj_note_{idx}_{_cand_key}"
-            _placeholder = "비고 (선택) — 예: 고객 응대 연장 / 본사 회의" if is_ext else "비고 (선택) — 예: 병원 진료 / 조퇴 사유"
             user_note = st.text_input(
                 "비고",
                 value=st.session_state.get(_note_key, ""),
                 key=_note_key,
-                placeholder=_placeholder,
+                placeholder="비고 (선택) — 예: 고객 응대 연장 / 본사 회의",
                 label_visibility="collapsed",
             )
         with cols[3]:
@@ -11100,7 +11095,7 @@ def _erp_render_overtime_candidates_ui(*, scope_employee: str | None = None) -> 
                                 and c.get("source_tag") == cand["source_tag"])
                     ]
                     st.session_state.pop(_note_key, None)
-                    flash(f"{cand['target_date']} {kind_label} {sign_label}{_erp_fmt_hm(abs(diff_min))} 신청 완료 (승인 대기)", "success")
+                    flash(f"{cand['target_date']} 연장근무 +{_erp_fmt_hm(abs(diff_min))} 신청 완료 (승인 대기)", "success")
                     st.rerun()
                 else:
                     st.error(f"신청 실패: {e}")
@@ -11841,7 +11836,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
 def _erp_tab_shift_plan(current_db: str, me_name: str):
     st.subheader("📅 정기근무일정 (본인 일정 등록)")
     st.caption("출근일은 ✅ 체크하고, 휴무일은 체크 해제하세요. 시간은 매장 기본값이 자동 입력되며, 필요 시 수정 가능합니다.")
-    st.caption("ⓘ 매장 표준 시간보다 길게 근무한 경우 저장 후 '연장근무 신청' 확인 박스가 표시되며, 짧게 근무한 경우 단축 차감이 자동 등록됩니다.")
+    st.caption("ⓘ 매장 표준 시간보다 길게 근무한 경우 저장 후 '연장근무 신청' 확인 박스가 표시됩니다. (짧게 근무한 경우 별도 신청 절차 없음)")
     role = (st.session_state.get("current_user") or {}).get("role") or "user"
 
     # 직전 저장에서 발생한 연장근무 후보 확인 UI (본인 한정)
@@ -12152,7 +12147,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
             )
             if _result["candidates_added"]:
                 flash(
-                    f"⏱️ 매장 표준 시간과 차이가 있는 일정 {_result['candidates_added']}건 — 상단의 [근무시간 자동 조정 신청 대기]에서 확인 후 신청해 주세요.",
+                    f"⏱️ 매장 표준 시간보다 길게 근무한 일정 {_result['candidates_added']}건 — 상단의 [연장근무 신청 대기]에서 확인 후 신청해 주세요.",
                     level="warning",
                 )
             if _result["errors"]:
@@ -13499,7 +13494,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                                             created_by=me_name,
                                             work_db_filename=_cal_adj_db,
                                             work_location_name=_wloc_e,
-                                            overtime_only=True,
                                         )
                                         st.session_state.pop("qe_edit_id", None)
                                         st.session_state["_erp_cal_flash"] = f"{_sd.isoformat()} {qe_emp} 일정이 수정되었습니다. 표준 시간과 차이가 있으면 [정기근무일정] 화면 상단에서 연장 신청을 확인하세요."
@@ -13632,7 +13626,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         created_by=me_name,
                         work_db_filename=_add_db,
                         work_location_name=_wloc_save,
-                        overtime_only=True,
                     )
                     _flash_loc = _final_loc or _dbf_to_sn.get(_add_db, "")
                     st.session_state["_erp_cal_flash"] = (
