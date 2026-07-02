@@ -24377,12 +24377,29 @@ def render_customer_balance():
                                 if pd.notna(order_row.get("delivery_date")):
                                     d = order_row["delivery_date"]
                                     dlv_str = d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10] if d else ""
-                                exp_label = f"주문 #{_order_id_pay} | 계약일 {ord_str} | 배송일 {dlv_str} | 총액 {total_sales:,.0f}원 | 잔금 {current_balance:,.0f}원"
+                                # 복합결제 여부: 같은 날짜에 2개 이상의 서로 다른 결제 수단이 사용된 경우
+                                _is_combined = False
+                                if not (pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0):
+                                    _same_date_methods = (
+                                        pay_list.groupby("payment_date")["payment_method"]
+                                        .nunique()
+                                        .gt(1)
+                                        .any()
+                                    ) if "payment_date" in pay_list.columns and "payment_method" in pay_list.columns else False
+                                    _is_combined = bool(_same_date_methods)
+                                _combined_badge = " 🔀 복합결제" if _is_combined else ""
+                                exp_label = f"주문 #{_order_id_pay} | 계약일 {ord_str} | 배송일 {dlv_str} | 총액 {total_sales:,.0f}원 | 잔금 {current_balance:,.0f}원{_combined_badge}"
                                 with st.expander(exp_label, expanded=(_order_id_pay == sel_oid)):
                                     if pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0:
                                         st.info("해당 주문의 결제 내역이 없습니다.")
                                     else:
                                         pay_display = pay_list.copy()
+                                        # 복합결제 표기: 같은 결제일에 여러 수단이 사용된 행에 "복합결제" 마킹
+                                        if "payment_date" in pay_display.columns and "payment_method" in pay_display.columns:
+                                            _date_method_counts = pay_display.groupby("payment_date")["payment_method"].transform("nunique")
+                                            pay_display["복합결제"] = _date_method_counts.gt(1).map({True: "✅ 복합", False: ""})
+                                        else:
+                                            pay_display["복합결제"] = ""
                                         pay_display["amount"] = pay_display["amount"].apply(lambda x: f"{x:,.0f}원")
                                         pay_display["fee_amount"] = pay_display["fee_amount"].fillna(0).apply(lambda x: f"{x:,.0f}원")
                                         # 온누리 결제의 경우 card_company 대신 onnuri_approval_code를 카드사 컬럼에 표시
@@ -24396,7 +24413,7 @@ def render_customer_balance():
                                         pay_display.loc[empty_card & card_method_mask, "card_company"] = "(카드사 미입력)"
                                         pay_display.loc[empty_card & ~card_method_mask, "card_company"] = pay_display.loc[empty_card & ~card_method_mask, "payment_method"].fillna("-")
                                         pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료"})
-                                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료"]], width='stretch')
+                                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료", "복합결제"]], width='stretch')
                                         # 사내 결제변경 검증 요청 (격리된 기능 — 기존 결제 저장 로직과 무관)
                                         _render_payment_change_verify_entry(
                                             db_filename, int(_order_id_pay),
