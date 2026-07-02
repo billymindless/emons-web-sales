@@ -537,6 +537,7 @@ def _supabase_run_app_tables_sql():
         return False
     sql_files = [
         "SUPABASE_APP_TABLES.sql",
+        "SUPABASE_APP_STORES_IS_ACTIVE.sql",
         "SUPABASE_APP_EDIT_REQUESTS.sql",
         "SUPABASE_APP_ERP_ATTENDANCE.sql",
         "SUPABASE_APP_USERS_HIREDATE.sql",
@@ -687,29 +688,54 @@ def ensure_supabase_post_tables() -> bool:
 
 
 @st.cache_data(ttl=3600)
-def _get_supabase_stores_list():
-    """Supabase app_stores 목록 캐시 (10분). 매장 추가/수정 후 clear_data_cache() 호출 시 갱신."""
+def _get_supabase_stores_list_raw():
+    """Supabase app_stores 원본 목록 캐시 (내부용, 활성/폐점 모두 포함).
+    is_active 컬럼이 없는 구 스키마에서도 동작하도록 폴백 처리.
+    매장 추가/수정 후 clear_data_cache() 호출 시 갱신."""
     client, err = get_supabase_client()
     if err or not client:
         return []
     try:
-        r = client.table("app_stores").select("id, store_name, db_filename").order("id").execute()
-        return (r.data or []) if hasattr(r, "data") else []
+        r = client.table("app_stores").select("id, store_name, db_filename, is_active, closed_at").order("id").execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
     except Exception:
-        return []
+        # is_active/closed_at 컬럼이 아직 없는 경우 폴백 (SUPABASE_APP_STORES_IS_ACTIVE.sql 미실행)
+        try:
+            r = client.table("app_stores").select("id, store_name, db_filename").order("id").execute()
+            rows = (r.data or []) if hasattr(r, "data") else []
+        except Exception:
+            return []
+    # is_active 기본값 True (구 스키마 호환)
+    for row in rows:
+        if "is_active" not in row or row.get("is_active") is None:
+            row["is_active"] = True
+    return rows
 
 
-@st.cache_data(ttl=3600)
-def get_supabase_stores_dataframe_cached():
+def _get_supabase_stores_list(include_inactive: bool = False):
+    """Supabase app_stores 목록. 기본은 활성 매장만 반환 (is_active=True).
+    include_inactive=True 시 폐점 매장도 포함 (슈퍼관리자 매장 관리 UI 전용).
     """
-    Supabase app_stores 매장 목록을 DataFrame으로 반환 — 10분 캐시.
-    단일 데이터 소스(Supabase) 전용. clear_data_cache() 호출 시 갱신.
-    반환: DataFrame 컬럼 id, store_name, db_filename (빈 DataFrame일 수 있음).
+    rows = _get_supabase_stores_list_raw()
+    if include_inactive:
+        return list(rows)
+    return [r for r in rows if bool(r.get("is_active", True))]
+
+
+def get_supabase_stores_dataframe_cached(include_inactive: bool = False):
     """
-    data = _get_supabase_stores_list()
+    Supabase app_stores 매장 목록을 DataFrame으로 반환.
+    기본은 활성 매장만 반환. include_inactive=True 시 폐점 매장도 포함.
+    반환: DataFrame 컬럼 id, store_name, db_filename, is_active, closed_at (빈 DataFrame일 수 있음).
+    """
+    data = _get_supabase_stores_list(include_inactive=include_inactive)
     if not data:
-        return pd.DataFrame(columns=["id", "store_name", "db_filename"])
+        return pd.DataFrame(columns=["id", "store_name", "db_filename", "is_active", "closed_at"])
     df = pd.DataFrame(data)
+    if "is_active" not in df.columns:
+        df["is_active"] = True
+    if "closed_at" not in df.columns:
+        df["closed_at"] = None
     if "id" in df.columns:
         df = df.sort_values("id", ignore_index=True)
     return df
@@ -8383,15 +8409,27 @@ def _superadmin_tab_unpaid_report():
 
 
 def _superadmin_tab5_store_accounts():
-    """⑤ 매장 계정 관리: Supabase app_stores / app_users만 사용. 매장 생성·수정·삭제 및 계정 발급·비밀번호 변경."""
+    """⑤ 매장 계정 관리: Supabase app_stores / app_users만 사용. 매장 생성·수정·삭제·폐점/재개 및 계정 발급·비밀번호 변경."""
     client, err = get_supabase_client()
     if err or not client:
         st.error(f"Supabase 연결이 필요합니다: {err or '연결 실패'}")
         return
-    stores_list = _get_supabase_stores_list()
-    stores = pd.DataFrame(stores_list).sort_values("store_name", ignore_index=True) if stores_list else pd.DataFrame(columns=["id", "store_name", "db_filename"])
+    # 슈퍼관리자 관리 화면에서는 폐점 매장도 함께 관리해야 하므로 include_inactive=True.
+    stores_list = _get_supabase_stores_list(include_inactive=True)
+    stores = pd.DataFrame(stores_list).sort_values("store_name", ignore_index=True) if stores_list else pd.DataFrame(columns=["id", "store_name", "db_filename", "is_active", "closed_at"])
     if stores.empty or "store_name" not in stores.columns:
-        stores = pd.DataFrame(columns=["id", "store_name", "db_filename"])
+        stores = pd.DataFrame(columns=["id", "store_name", "db_filename", "is_active", "closed_at"])
+    if "is_active" not in stores.columns:
+        stores["is_active"] = True
+    if "closed_at" not in stores.columns:
+        stores["closed_at"] = None
+
+    def _display_name(row) -> str:
+        base = str(row.get("store_name") or "").strip()
+        return f"{base} [폐점]" if not bool(row.get("is_active", True)) else base
+
+    stores["_display"] = stores.apply(_display_name, axis=1)
+
     users_list = _get_supabase_users_list()
     us_pairs = set()
     try:
@@ -8406,8 +8444,8 @@ def _superadmin_tab5_store_accounts():
         store_name = st.text_input("매장명")
         submitted = st.form_submit_button("매장 생성")
         if submitted and store_name and store_name.strip():
-            stores_list = _get_supabase_stores_list()
-            max_id = max((s["id"] for s in stores_list), default=0)
+            _all_stores = _get_supabase_stores_list(include_inactive=True)
+            max_id = max((s["id"] for s in _all_stores), default=0)
             db_filename = f"store_{max_id + 1}.db"
             try:
                 client.table("app_stores").insert({
@@ -8428,9 +8466,11 @@ def _superadmin_tab5_store_accounts():
             st.warning("매장명을 입력하세요.")
 
     st.subheader("매장별 계정 발급")
-    if len(stores) > 0:
+    # 계정 발급은 활성 매장에만 허용 (폐점 매장에 신규 계정을 붙일 이유가 없음).
+    active_stores = stores[stores["is_active"] == True]
+    if len(active_stores) > 0:
         with st.form("new_user_form"):
-            store_id = st.selectbox("매장 선택", stores["id"].tolist(), format_func=lambda x: stores[stores["id"] == x]["store_name"].iloc[0])
+            store_id = st.selectbox("매장 선택", active_stores["id"].tolist(), format_func=lambda x: active_stores[active_stores["id"] == x]["store_name"].iloc[0])
             new_username = st.text_input("사용자명")
             new_password = st.text_input("비밀번호", type="password")
             new_role = st.selectbox("역할", ["store_admin", "user"])
@@ -8457,16 +8497,22 @@ def _superadmin_tab5_store_accounts():
                             st.error(f"계정 생성 실패: {e}")
                 else:
                     st.warning("사용자명과 비밀번호를 입력하세요.")
+    else:
+        st.info("활성 매장이 없습니다. 폐점 매장에는 계정을 발급할 수 없습니다.")
 
     st.subheader("매장 조회/수정")
     if len(stores) == 0:
         st.info("매장이 없습니다. 위에서 매장을 추가하거나, migrate_stores_to_supabase()를 실행해 Master DB 매장을 이전하세요.")
         return
-    store_options = stores["store_name"].tolist()
-    selected_store_name = st.selectbox("매장 선택 (조회·수정)", store_options, key="sa_edit_store_sel")
-    if selected_store_name:
-        s = stores[stores["store_name"] == selected_store_name].iloc[0]
+    store_options_display = stores["_display"].tolist()
+    selected_display = st.selectbox("매장 선택 (조회·수정)", store_options_display, key="sa_edit_store_sel")
+    if selected_display:
+        s = stores[stores["_display"] == selected_display].iloc[0]
         sid = s["id"]
+        _is_active = bool(s.get("is_active", True))
+        if not _is_active:
+            _closed_at = s.get("closed_at")
+            st.warning(f"⚠️ 이 매장은 **폐점 처리** 상태입니다. 운영 화면(근무표·매출·대시보드)에는 표시되지 않습니다. (폐점 시각: {_closed_at or '-'})")
         store_users = [u for u in users_list if u.get("store_id") == sid or (u["id"], sid) in us_pairs]
         store_users_df = pd.DataFrame(store_users) if store_users else pd.DataFrame(columns=["id", "username", "role", "store_id"])
         with st.expander("📋 매장 정보 수정", expanded=True):
@@ -8491,6 +8537,56 @@ def _superadmin_tab5_store_accounts():
                                 st.error(f"수정 실패: {e}")
                     else:
                         st.warning("매장명과 DB 파일명을 입력하세요.")
+
+        # ── 폐점 처리 / 재개 (신규) ───────────────────────────────────────
+        with st.expander("🔴 매장 폐점 처리 / 🟢 재개", expanded=(not _is_active)):
+            if _is_active:
+                st.caption(
+                    "폐점 처리 시 이 매장은 운영 화면(근무표·매출 리포트·대시보드·매장 선택 드롭다운)에서 즉시 숨김 처리됩니다. "
+                    "**기존 데이터(주문·결제·근무·직원 배정)는 그대로 유지**되며, 다른 매장의 데이터·운영에는 영향이 없습니다. "
+                    "언제든 아래에서 재개할 수 있습니다."
+                )
+                _close_confirm = st.checkbox(
+                    f"'{s['store_name']}' 매장을 폐점 처리하는 데 동의합니다.",
+                    key=f"sa_close_confirm_{int(sid)}",
+                )
+                if st.button("🔴 이 매장 폐점 처리", key=f"sa_close_btn_{int(sid)}", type="secondary"):
+                    if not _close_confirm:
+                        st.error("위 체크박스를 선택한 후 폐점 처리할 수 있습니다.")
+                    else:
+                        try:
+                            client.table("app_stores").update({
+                                "is_active": False,
+                                "closed_at": datetime.now(timezone.utc).isoformat(),
+                            }).eq("id", int(sid)).execute()
+                            clear_data_cache()
+                            flash(f"'{s['store_name']}' 매장이 폐점 처리되었습니다.")
+                            st.rerun()
+                        except Exception as e:
+                            _msg = str(e)
+                            if "is_active" in _msg or "closed_at" in _msg or "PGRST204" in _msg:
+                                st.error(
+                                    "app_stores 테이블에 is_active/closed_at 컬럼이 없습니다. "
+                                    "SUPABASE_APP_STORES_IS_ACTIVE.sql 을 Supabase SQL Editor에서 실행한 뒤 다시 시도해 주세요."
+                                )
+                            else:
+                                st.error(f"폐점 처리 실패: {e}")
+            else:
+                st.caption(
+                    "재개 시 이 매장이 다시 운영 화면에 노출됩니다. 기존 데이터는 그대로 유지되어 있으므로 이어서 사용 가능합니다."
+                )
+                if st.button("🟢 이 매장 재개(활성화)", key=f"sa_reopen_btn_{int(sid)}", type="primary"):
+                    try:
+                        client.table("app_stores").update({
+                            "is_active": True,
+                            "closed_at": None,
+                        }).eq("id", int(sid)).execute()
+                        clear_data_cache()
+                        flash(f"'{s['store_name']}' 매장이 재개되었습니다.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"재개 실패: {e}")
+
         st.caption("계정(ID) 조회 및 비밀번호 변경")
         for _, u in store_users_df.iterrows():
             with st.form(f"pw_{u['id']}"):
@@ -8511,10 +8607,11 @@ def _superadmin_tab5_store_accounts():
                         st.warning("새 비밀번호를 입력하세요.")
 
     st.subheader("매장 삭제 (이중 확인)")
+    st.caption("💡 매장을 완전히 삭제하지 않고 **일시 폐점**만 원하는 경우, 위의 '🔴 매장 폐점 처리' 를 사용하세요. 삭제는 되돌릴 수 없습니다.")
     if len(stores) > 0:
-        del_store_name = st.selectbox("삭제할 매장 선택", store_options, key="sa_del_store_sel")
-        if del_store_name:
-            s = stores[stores["store_name"] == del_store_name].iloc[0]
+        del_display = st.selectbox("삭제할 매장 선택", store_options_display, key="sa_del_store_sel")
+        if del_display:
+            s = stores[stores["_display"] == del_display].iloc[0]
             st.warning("매장 삭제 시 해당 매장 배정이 해제되고 매장 행이 삭제됩니다. 복구할 수 없습니다.")
             confirm = st.checkbox(f"'{s['store_name']}' 매장 삭제에 동의합니다.", key="del_confirm_final")
             if st.button("매장 삭제", key="del_btn_final"):
@@ -20809,7 +20906,7 @@ def render_employee_management():
                 store_ids_by_user = {}
                 for ur, sr in us_rows:
                     store_ids_by_user.setdefault(ur, []).append(sr)
-                stores_map = {s["id"]: s.get("store_name") for s in _get_supabase_stores_list()}
+                stores_map = {s["id"]: s.get("store_name") for s in _get_supabase_stores_list(include_inactive=True)}
                 def _fmt_stores(uid, single_sid):
                     sids = store_ids_by_user.get(uid) or ([single_sid] if single_sid else [])
                     names = [stores_map.get(sid) or str(sid) for sid in sids if sid]
@@ -20818,7 +20915,7 @@ def render_employee_management():
                 df = users_df.drop(columns=["store_id"], errors="ignore")
             else:
                 users_df = pd.read_sql("SELECT id, email, username, name, role, store_id FROM Users ORDER BY id", conn)
-                stores_map = {s["id"]: s.get("store_name") for s in _get_supabase_stores_list()}
+                stores_map = {s["id"]: s.get("store_name") for s in _get_supabase_stores_list(include_inactive=True)}
                 users_df["배정매장"] = users_df["store_id"].map(lambda sid: stores_map.get(sid) or "-" if pd.notna(sid) and sid else "-")
                 df = users_df.drop(columns=["store_id"], errors="ignore")
         finally:
