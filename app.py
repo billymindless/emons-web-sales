@@ -11503,15 +11503,15 @@ def render_erp_attendance():
         st.warning("매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 선택해 주세요.")
         return
 
-    # v2 메뉴 (2026-05-29 근무 일정 계획 탭 복원):
-    #   store_admin: 6탭 (근무 일정 계획 / 내 근태 / 근무시간 설정 / 신청 승인 / 캘린더 / 월말 요약)
-    #   user:        3탭 (근무 일정 계획 / 내 근태 / 매장 캘린더)
+    # v2 메뉴 (2026-07-03 캘린더 대시보드 통합):
+    #   store_admin: 6탭 (대시보드[+캘린더] / 정기근무일정 / 추가근무·휴무 신청 / 근무시간 설정 / 신청 승인 / 월말 요약)
+    #   user:        3탭 (대시보드[+캘린더] / 정기근무일정 / 추가근무·휴무 신청)
     # st.tabs 대신 segmented_control 사용: st.rerun() 호출 후에도 활성 탭 유지
     # (st.tabs는 stateless라 rerun 시 항상 첫 번째 탭으로 리셋되어 저장/수정 후 화면 이탈)
     if role == "store_admin":
-        tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청", "근무시간 설정", "신청 승인", "캘린더", "월말 요약"]
+        tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청", "근무시간 설정", "신청 승인", "월말 요약"]
     else:
-        tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청", "매장 캘린더"]
+        tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청"]
 
     _tab_key = "erp_main_tab_label"
     if _tab_key not in st.session_state or st.session_state[_tab_key] not in tab_labels:
@@ -11524,7 +11524,10 @@ def render_erp_attendance():
     st.markdown("---")
 
     if selected_tab == "대시보드":
+        # 대시보드 카드 → 월별 근무 캘린더를 한 화면에 이어서 표시
         _erp_tab_dashboard(current_db, role, me_name, today)
+        st.divider()
+        _erp_tab_calendar(current_db, role, me_name, today)
     elif role == "store_admin":
         if selected_tab == "정기근무일정":
             _erp_tab_shift_plan(current_db, me_name)
@@ -11534,8 +11537,6 @@ def render_erp_attendance():
             _erp_tab_period_targets(current_db, me_name)
         elif selected_tab == "신청 승인":
             _erp_tab_adjustment_approvals(current_db, me_name)
-        elif selected_tab == "캘린더":
-            _erp_tab_calendar(current_db, role, me_name, today)
         elif selected_tab == "월말 요약":
             _erp_tab_monthly_summary(current_db, today)
     else:
@@ -11543,8 +11544,6 @@ def render_erp_attendance():
             _erp_tab_shift_plan(current_db, me_name)
         elif selected_tab == "추가근무·휴무 신청":
             _erp_tab_my_attendance(current_db, role, me_name)
-        elif selected_tab == "매장 캘린더":
-            _erp_tab_calendar(current_db, role, me_name, today)
 
 
 # ---------- 대시보드 ----------
