@@ -8513,144 +8513,197 @@ def _superadmin_tab5_store_accounts():
     else:
         st.info("활성 매장이 없습니다. 폐점 매장에는 계정을 발급할 수 없습니다.")
 
-    st.subheader("매장 조회/수정")
+    st.subheader("매장 조회 / 관리")
     if len(stores) == 0:
         st.info("매장이 없습니다. 위에서 매장을 추가하거나, migrate_stores_to_supabase()를 실행해 Master DB 매장을 이전하세요.")
         return
     store_options_display = stores["_display"].tolist()
-    selected_display = st.selectbox("매장 선택 (조회·수정)", store_options_display, key="sa_edit_store_sel")
+    _sel_col, _btn_col = st.columns([3, 1])
+    with _sel_col:
+        selected_display = st.selectbox("매장 선택", store_options_display, key="sa_edit_store_sel")
+    with _btn_col:
+        st.write("")
+        st.write("")
+        if selected_display and st.button("🔧 이 매장 관리하기", key="sa_open_manage", type="primary", width="stretch"):
+            _row = stores[stores["_display"] == selected_display].iloc[0]
+            st.session_state["sa_editing_store_id"] = int(_row["id"])
+            st.rerun()
+
+    # 선택된 매장 요약 (상태 확인용)
     if selected_display:
-        s = stores[stores["_display"] == selected_display].iloc[0]
-        sid = s["id"]
-        _is_active = bool(s.get("is_active", True))
-        if not _is_active:
-            _closed_at = s.get("closed_at")
-            st.warning(f"⚠️ 이 매장은 **폐점 처리** 상태입니다. 운영 화면(근무표·매출·대시보드)에는 표시되지 않습니다. (폐점 시각: {_closed_at or '-'})")
-        store_users = [u for u in users_list if u.get("store_id") == sid or (u["id"], sid) in us_pairs]
-        store_users_df = pd.DataFrame(store_users) if store_users else pd.DataFrame(columns=["id", "username", "role", "store_id"])
-        with st.expander("📋 매장 정보 수정", expanded=True):
-            with st.form("store_edit_form"):
-                edit_name = st.text_input("매장명", value=s["store_name"], key="sa_edit_name")
-                edit_db = st.text_input("DB 파일명", value=s["db_filename"], key="sa_edit_db")
-                if st.form_submit_button("저장"):
-                    if edit_name and edit_name.strip() and edit_db and edit_db.strip():
-                        try:
-                            client.table("app_stores").update({
-                                "store_name": edit_name.strip(),
-                                "db_filename": edit_db.strip(),
-                            }).eq("id", int(sid)).execute()
-                            clear_data_cache()
-                            flash("매장 정보가 저장되었습니다.")
-                            st.rerun()
-                        except Exception as e:
-                            err_str = str(e).lower()
-                            if "unique" in err_str or "duplicate" in err_str:
-                                st.error("매장명 또는 DB 파일명이 이미 사용 중입니다.")
-                            else:
-                                st.error(f"수정 실패: {e}")
-                    else:
-                        st.warning("매장명과 DB 파일명을 입력하세요.")
+        _s = stores[stores["_display"] == selected_display].iloc[0]
+        _is_active = bool(_s.get("is_active", True))
+        _closed_at = _s.get("closed_at")
+        _summary_lines = [
+            f"**매장명**: {_s['store_name']}",
+            f"**DB 파일**: `{_s['db_filename']}`",
+            f"**상태**: {'🟢 운영 중' if _is_active else f'🔴 폐점 처리 ({_closed_at or '-'})'}",
+        ]
+        st.markdown(" · ".join(_summary_lines))
 
-        # ── 폐점 처리 / 재개 ─────────────────────────────────────────────
-        # 접힘 상태에서 못 찾는 경우가 있어 항상 펼침으로 노출한다. (활성/비활성 상관없이)
-        _closure_title = (
-            "🔴 매장 폐점 처리" if _is_active else "🟢 매장 재개(활성화)"
-        )
-        with st.expander(_closure_title, expanded=True):
-            if _is_active:
-                st.caption(
-                    "폐점 처리 시 이 매장은 운영 화면(근무표·매출 리포트·대시보드·매장 선택 드롭다운)에서 즉시 숨김 처리됩니다. "
-                    "**기존 데이터(주문·결제·근무·직원 배정)는 그대로 유지**되며, 다른 매장의 데이터·운영에는 영향이 없습니다. "
-                    "언제든 아래에서 재개할 수 있습니다."
-                )
-                _close_confirm = st.checkbox(
-                    f"'{s['store_name']}' 매장을 폐점 처리하는 데 동의합니다.",
-                    key=f"sa_close_confirm_{int(sid)}",
-                )
-                if st.button("🔴 이 매장 폐점 처리", key=f"sa_close_btn_{int(sid)}", type="secondary"):
-                    if not _close_confirm:
-                        st.error("위 체크박스를 선택한 후 폐점 처리할 수 있습니다.")
-                    else:
-                        try:
-                            client.table("app_stores").update({
-                                "is_active": False,
-                                "closed_at": datetime.now(timezone.utc).isoformat(),
-                            }).eq("id", int(sid)).execute()
-                            clear_data_cache()
-                            flash(f"'{s['store_name']}' 매장이 폐점 처리되었습니다.")
-                            st.rerun()
-                        except Exception as e:
-                            _msg = str(e)
-                            if "is_active" in _msg or "closed_at" in _msg or "PGRST204" in _msg:
-                                st.error(
-                                    "app_stores 테이블에 is_active/closed_at 컬럼이 없습니다. "
-                                    "SUPABASE_APP_STORES_IS_ACTIVE.sql 을 Supabase SQL Editor에서 실행한 뒤 다시 시도해 주세요."
-                                )
-                            else:
-                                st.error(f"폐점 처리 실패: {e}")
-            else:
-                st.caption(
-                    "재개 시 이 매장이 다시 운영 화면에 노출됩니다. 기존 데이터는 그대로 유지되어 있으므로 이어서 사용 가능합니다."
-                )
-                if st.button("🟢 이 매장 재개(활성화)", key=f"sa_reopen_btn_{int(sid)}", type="primary"):
-                    try:
-                        client.table("app_stores").update({
-                            "is_active": True,
-                            "closed_at": None,
-                        }).eq("id", int(sid)).execute()
-                        clear_data_cache()
-                        flash(f"'{s['store_name']}' 매장이 재개되었습니다.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"재개 실패: {e}")
+    # ── 매장 관리 팝업(모달) ──────────────────────────────
+    _editing_store_id = st.session_state.get("sa_editing_store_id")
+    if _editing_store_id is not None:
+        _target = stores[stores["id"] == _editing_store_id]
+        if _target.empty:
+            st.session_state.pop("sa_editing_store_id", None)
+        else:
+            _s_dlg = _target.iloc[0]
+            _sid_dlg = int(_s_dlg["id"])
+            _is_active_dlg = bool(_s_dlg.get("is_active", True))
+            _store_users = [u for u in users_list if u.get("store_id") == _sid_dlg or (u["id"], _sid_dlg) in us_pairs]
 
-        st.caption("계정(ID) 조회 및 비밀번호 변경")
-        for _, u in store_users_df.iterrows():
-            with st.form(f"pw_{u['id']}"):
-                st.text_input("현재 ID (조회용)", value=u.get("username", ""), disabled=True, key=f"disp_id_{u['id']}")
-                new_pw = st.text_input("새 비밀번호 (변경 시만 입력)", type="password", key=f"pw_input_{u['id']}")
-                if st.form_submit_button("비밀번호 변경"):
-                    if new_pw:
-                        try:
-                            client.table("app_users").update({
-                                "password": hashlib.sha256(new_pw.encode()).hexdigest(),
-                            }).eq("id", int(u["id"])).execute()
-                            clear_data_cache()
-                            flash("비밀번호가 변경되었습니다.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"변경 실패: {e}")
-                    else:
-                        st.warning("새 비밀번호를 입력하세요.")
+            def _render_store_manage_dialog(
+                s=_s_dlg, sid=_sid_dlg, is_active=_is_active_dlg, store_users=_store_users,
+            ) -> None:
+                # 상태 배너
+                if not is_active:
+                    _closed_at = s.get("closed_at")
+                    st.warning(f"⚠️ 이 매장은 **폐점 처리** 상태입니다. 운영 화면(근무표·매출·대시보드)에는 표시되지 않습니다. (폐점 시각: {_closed_at or '-'})")
 
-    st.subheader("매장 삭제 (이중 확인)")
-    st.caption("💡 매장을 완전히 삭제하지 않고 **일시 폐점**만 원하는 경우, 위의 '🔴 매장 폐점 처리' 를 사용하세요. 삭제는 되돌릴 수 없습니다.")
-    if len(stores) > 0:
-        del_display = st.selectbox("삭제할 매장 선택", store_options_display, key="sa_del_store_sel")
-        if del_display:
-            s = stores[stores["_display"] == del_display].iloc[0]
-            st.warning("매장 삭제 시 해당 매장 배정이 해제되고 매장 행이 삭제됩니다. 복구할 수 없습니다.")
-            confirm = st.checkbox(f"'{s['store_name']}' 매장 삭제에 동의합니다.", key="del_confirm_final")
-            if st.button("매장 삭제", key="del_btn_final"):
-                if not confirm:
-                    st.error("위 체크박스를 선택한 후 삭제할 수 있습니다.")
-                else:
-                    try:
-                        sid = int(s["id"])
-                        client.table("app_user_stores").delete().eq("store_id", sid).execute()
-                        client.table("app_users").update({"store_id": None}).eq("store_id", sid).execute()
-                        client.table("app_stores").delete().eq("id", sid).execute()
-                        clear_data_cache()
-                        db_path = os.path.join(DB_DIR, s["db_filename"])
-                        if os.path.exists(db_path):
+                # ── 매장 정보 수정 ───────────────────────────
+                st.markdown("#### 📋 매장 정보 수정")
+                with st.form(f"store_edit_form_{sid}"):
+                    edit_name = st.text_input("매장명", value=s["store_name"], key=f"sa_edit_name_{sid}")
+                    edit_db = st.text_input("DB 파일명", value=s["db_filename"], key=f"sa_edit_db_{sid}")
+                    _sc1, _sc2 = st.columns([1, 1])
+                    with _sc1:
+                        _save = st.form_submit_button("💾 저장", type="primary", width="stretch")
+                    with _sc2:
+                        _close_dlg = st.form_submit_button("닫기", width="stretch")
+                    if _save:
+                        if edit_name and edit_name.strip() and edit_db and edit_db.strip():
                             try:
-                                os.remove(db_path)
-                            except Exception:
-                                pass
-                        flash("매장이 삭제되었습니다.")
+                                client.table("app_stores").update({
+                                    "store_name": edit_name.strip(),
+                                    "db_filename": edit_db.strip(),
+                                }).eq("id", sid).execute()
+                                clear_data_cache()
+                                st.session_state.pop("sa_editing_store_id", None)
+                                flash("매장 정보가 저장되었습니다.")
+                                st.rerun()
+                            except Exception as e:
+                                err_str = str(e).lower()
+                                if "unique" in err_str or "duplicate" in err_str:
+                                    st.error("매장명 또는 DB 파일명이 이미 사용 중입니다.")
+                                else:
+                                    st.error(f"수정 실패: {e}")
+                        else:
+                            st.warning("매장명과 DB 파일명을 입력하세요.")
+                    if _close_dlg:
+                        st.session_state.pop("sa_editing_store_id", None)
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"삭제 실패: {e}")
+
+                # ── 계정 조회 및 비밀번호 변경 ─────────────────
+                st.divider()
+                st.markdown("#### 🔑 계정(ID) 조회 및 비밀번호 변경")
+                if not store_users:
+                    st.caption("이 매장에 배정된 계정이 없습니다.")
+                for u in store_users:
+                    with st.form(f"pw_{u['id']}_dlg"):
+                        st.text_input("현재 ID (조회용)", value=u.get("username", ""),
+                                      disabled=True, key=f"disp_id_{u['id']}_dlg")
+                        new_pw = st.text_input("새 비밀번호 (변경 시만 입력)", type="password",
+                                               key=f"pw_input_{u['id']}_dlg")
+                        if st.form_submit_button("비밀번호 변경"):
+                            if new_pw:
+                                try:
+                                    client.table("app_users").update({
+                                        "password": hashlib.sha256(new_pw.encode()).hexdigest(),
+                                    }).eq("id", int(u["id"])).execute()
+                                    clear_data_cache()
+                                    flash("비밀번호가 변경되었습니다.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"변경 실패: {e}")
+                            else:
+                                st.warning("새 비밀번호를 입력하세요.")
+
+                # ── Danger Zone: 폐점/재개 · 완전 삭제 ─────────
+                st.divider()
+                st.markdown("#### ⚠️ Danger Zone")
+                if is_active:
+                    st.caption(
+                        "폐점 처리 시 이 매장은 운영 화면(근무표·매출 리포트·대시보드·매장 선택 드롭다운)에서 즉시 숨김 처리됩니다. "
+                        "**기존 데이터(주문·결제·근무·직원 배정)는 그대로 유지**되며, 다른 매장의 데이터·운영에는 영향이 없습니다. "
+                        "언제든 재개할 수 있습니다."
+                    )
+                    _close_confirm = st.checkbox(
+                        f"'{s['store_name']}' 매장을 폐점 처리하는 데 동의합니다.",
+                        key=f"sa_close_confirm_dlg_{sid}",
+                    )
+                    if st.button("🔴 이 매장 폐점 처리", key=f"sa_close_btn_dlg_{sid}", type="secondary"):
+                        if not _close_confirm:
+                            st.error("위 체크박스를 선택한 후 폐점 처리할 수 있습니다.")
+                        else:
+                            try:
+                                client.table("app_stores").update({
+                                    "is_active": False,
+                                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                                }).eq("id", sid).execute()
+                                clear_data_cache()
+                                st.session_state.pop("sa_editing_store_id", None)
+                                flash(f"'{s['store_name']}' 매장이 폐점 처리되었습니다.")
+                                st.rerun()
+                            except Exception as e:
+                                _msg = str(e)
+                                if "is_active" in _msg or "closed_at" in _msg or "PGRST204" in _msg:
+                                    st.error(
+                                        "app_stores 테이블에 is_active/closed_at 컬럼이 없습니다. "
+                                        "SUPABASE_APP_STORES_IS_ACTIVE.sql 을 Supabase SQL Editor에서 실행한 뒤 다시 시도해 주세요."
+                                    )
+                                else:
+                                    st.error(f"폐점 처리 실패: {e}")
+                else:
+                    st.caption(
+                        "재개 시 이 매장이 다시 운영 화면에 노출됩니다. 기존 데이터는 그대로 유지되어 있으므로 이어서 사용 가능합니다."
+                    )
+                    if st.button("🟢 이 매장 재개(활성화)", key=f"sa_reopen_btn_dlg_{sid}", type="primary"):
+                        try:
+                            client.table("app_stores").update({
+                                "is_active": True,
+                                "closed_at": None,
+                            }).eq("id", sid).execute()
+                            clear_data_cache()
+                            st.session_state.pop("sa_editing_store_id", None)
+                            flash(f"'{s['store_name']}' 매장이 재개되었습니다.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"재개 실패: {e}")
+
+                st.markdown("---")
+                st.caption("💡 완전 삭제는 되돌릴 수 없습니다. 일시 중지가 필요하다면 위의 '폐점 처리' 를 사용하세요.")
+                _del_confirm = st.checkbox(
+                    f"'{s['store_name']}' 매장을 **완전 삭제**하는 데 동의합니다.",
+                    key=f"sa_del_confirm_dlg_{sid}",
+                )
+                if st.button("🗑️ 매장 완전 삭제", key=f"sa_del_btn_dlg_{sid}", type="secondary"):
+                    if not _del_confirm:
+                        st.error("위 체크박스를 선택한 후 삭제할 수 있습니다.")
+                    else:
+                        try:
+                            client.table("app_user_stores").delete().eq("store_id", sid).execute()
+                            client.table("app_users").update({"store_id": None}).eq("store_id", sid).execute()
+                            client.table("app_stores").delete().eq("id", sid).execute()
+                            clear_data_cache()
+                            db_path = os.path.join(DB_DIR, s["db_filename"])
+                            if os.path.exists(db_path):
+                                try:
+                                    os.remove(db_path)
+                                except Exception:
+                                    pass
+                            st.session_state.pop("sa_editing_store_id", None)
+                            flash("매장이 삭제되었습니다.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"삭제 실패: {e}")
+
+            from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+            _open_dialog(
+                f"🏬 매장 관리 · {_s_dlg['store_name']}",
+                _render_store_manage_dialog,
+                width="large",
+            )
 
 
 def _fetch_order_totals_and_margin_for_report(db_fn: str, order_ids: list[int]) -> dict[int, tuple[float, float, int | None]]:
