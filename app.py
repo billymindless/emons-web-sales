@@ -13398,7 +13398,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     if me_name:
         with st.expander("➕➖ 추가근무·휴가신청 (팝업)", expanded=False):
             st.caption("추가근무·휴가 등 신청을 팝업 창에서 바로 등록할 수 있습니다.")
-            if st.button("📤 신청 등록 팝업 열기", key="erp_calendar_adj_open", type="primary"):
+            if st.button("📤 신청 등록 팝업 열기", key="erp_calendar_adj_btn", type="primary"):
                 st.session_state["erp_calendar_adj_open"] = True
                 st.rerun(scope="fragment")
     if st.session_state.get("erp_calendar_adj_open"):
