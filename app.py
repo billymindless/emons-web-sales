@@ -12904,6 +12904,17 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     except Exception:
         pass
 
+    # 배지 <a href> 생성 시 기존 쿼리 파라미터(?auth=... 등)를 보존해야 로그인 세션이 유지된다.
+    # 로그인 토큰 auth 를 유실하면 다음 페이지 로드에서 _try_restore_from_query_params() 가 실패 → 로그아웃 처리.
+    _preserve_qp: dict[str, str] = {}
+    try:
+        for _k, _v in dict(st.query_params).items():
+            if _k == "erp_edit_shift":
+                continue
+            _preserve_qp[str(_k)] = (_v[0] if isinstance(_v, (list, tuple)) else str(_v))
+    except Exception:
+        _preserve_qp = {}
+
     st.subheader("🗓️ 월별 근무 캘린더")
     st.caption("매장·직원을 선택해 누가 언제 어디서 일하는지 한눈에 확인할 수 있습니다.")
     # 빠른 수정/삭제 직후 부분 재실행으로 전달된 완료 알림 (전체 rerun 아님 → 탭 유지)
@@ -13299,8 +13310,13 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 _is_admin_cal = role in ("store_admin", "superadmin")
                 _can_edit_sh = (_is_admin_cal or (emp == me_name)) and bool(sh.get("id"))
                 if _can_edit_sh:
+                    # href 는 기존 쿼리 파라미터(?auth=... 포함)를 모두 보존해야 함 → 유실 시 로그아웃 발생.
+                    import urllib.parse as _uparse
+                    _href_qp = dict(_preserve_qp)
+                    _href_qp["erp_edit_shift"] = str(int(sh['id']))
+                    _href_str = "?" + _uparse.urlencode(_href_qp)
                     _open_tag = (
-                        f"<a href='?erp_edit_shift={int(sh['id'])}' target='_self' "
+                        f"<a href='{_href_str}' target='_self' "
                         f"style='display:block; text-decoration:none; cursor:pointer;' "
                         f"title='클릭하여 이 근무일 수정'>"
                     )
