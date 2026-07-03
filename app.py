@@ -552,6 +552,7 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_BANK_ACCOUNTS.sql",
         "SUPABASE_APP_DEPOSITS.sql",
         "SUPABASE_APP_WORK_ADJ_LONG_SERVICE.sql",
+        "SUPABASE_APP_WORK_ADJ_EARLY_LEAVE.sql",
         "SUPABASE_APP_ATTENDANCE_CLEANUP.sql",
     ]
     ok = False
