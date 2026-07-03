@@ -552,6 +552,7 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_BANK_ACCOUNTS.sql",
         "SUPABASE_APP_DEPOSITS.sql",
         "SUPABASE_APP_WORK_ADJ_LONG_SERVICE.sql",
+        "SUPABASE_APP_ATTENDANCE_CLEANUP.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -9563,8 +9564,13 @@ _ERP_BADGE_COLORS = {
     "시차사용": "#1E88E5",
     "행사": "#8E24AA",
     "추가근무": "#6D4C41",
+    "회의": "#5E35B1",
     "정상": "#90A4AE",
     "포상시간": "#D81B60",
+    "여름휴가": "#00897B",
+    "포상": "#D81B60",
+    "장기근속": "#7B1FA2",
+    "특이사항": "#455A64",
 }
 
 # 추가근무 보상 방식 (app_overtime_claims.compensation_type)
@@ -9623,6 +9629,93 @@ def _erp_default_times_for_date(db_filename: str, d: date) -> tuple[dt_time, dt_
     if _erp_is_weekend_or_holiday(d):
         return h["weekend_start"], h["weekend_end"]
     return h["weekday_start"], h["weekday_end"]
+
+
+def _erp_intervals_overlap(a_start: int, a_end: int,
+                           b_start: int, b_end: int) -> bool:
+    """[a_start, a_end) ∩ [b_start, b_end) 이 비어있지 않으면 True.
+    분 단위 정수 입력. 단순 반개구간 교집합 판정.
+    """
+    return max(a_start, b_start) < min(a_end, b_end)
+
+
+def _erp_validate_adjustment_time(*, db_filename: str, employee_name: str,
+                                  target_date: date, start_min: int, end_min: int,
+                                  exclude_adj_id: int | None = None) -> str | None:
+    """근태 조정 신청의 시간대가 기본 근무시간·기존 승인 신청과 겹치는지 검증.
+
+    반환값이 None 이면 문제 없음, 문자열이면 사용자에게 보여줄 오류 메시지.
+    - overtime/meeting/early_leave 같이 시간대가 있는 kind 에서 호출.
+    - 기본 근무시간 (shift_start ~ shift_end) 과 겹치면 반환.
+    - 같은 직원·같은 날짜의 pending/approved app_work_adjustments 시간대와 겹치면 반환.
+    """
+    if start_min >= end_min:
+        return "종료 시간이 시작 시간보다 늦어야 합니다."
+    try:
+        _sh_s, _sh_e = _erp_shift_bounds_for_date(db_filename, employee_name, target_date)
+        _s_min = _sh_s.hour * 60 + _sh_s.minute
+        _e_min = _sh_e.hour * 60 + _sh_e.minute
+        if _erp_intervals_overlap(start_min, end_min, _s_min, _e_min):
+            return (f"입력한 시간대({_fmt_hhmm(start_min)}~{_fmt_hhmm(end_min)})"
+                    f"가 기본 근무시간({_fmt_hhmm(_s_min)}~{_fmt_hhmm(_e_min)})과 겹칩니다.")
+    except Exception:
+        pass
+    try:
+        client, err = get_supabase_client()
+        if not err and client:
+            r = client.table("app_work_adjustments")\
+                .select("id,shift_start,shift_end,status,kind")\
+                .eq("employee_name", employee_name)\
+                .eq("target_date", target_date.isoformat())\
+                .in_("status", ["pending", "approved"])\
+                .execute()
+            for row in (r.data or []):
+                if exclude_adj_id is not None and int(row.get("id") or 0) == int(exclude_adj_id):
+                    continue
+                _os = _erp_parse_time(row.get("shift_start"))
+                _oe = _erp_parse_time(row.get("shift_end"))
+                if not (_os and _oe):
+                    continue
+                _os_min = _os.hour * 60 + _os.minute
+                _oe_min = _oe.hour * 60 + _oe.minute
+                if _erp_intervals_overlap(start_min, end_min, _os_min, _oe_min):
+                    _lbl = _ERP_ADJ_KIND_LABEL.get(row.get("kind") or "etc", row.get("kind") or "")
+                    return (f"이미 등록된 {_lbl} 신청 "
+                            f"({_fmt_hhmm(_os_min)}~{_fmt_hhmm(_oe_min)})과 시간대가 겹칩니다.")
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_hhmm(total_min: int) -> str:
+    """분 단위 정수를 'HH:MM' 문자열로 포맷."""
+    total_min = max(0, int(total_min))
+    return f"{total_min // 60:02d}:{total_min % 60:02d}"
+
+
+def _erp_shift_bounds_for_date(db_filename: str, employee_name: str,
+                               d: date) -> tuple[dt_time, dt_time]:
+    """(shift_start, shift_end) — 해당 직원의 그 날짜 근무 일정.
+
+    우선순위: app_shift_schedules (해당 직원 · 해당 일자 · 시간 값 모두 존재) → 매장 기본 시각.
+    조기퇴근 등 시간 기반 계산 시 shift 실제 종료시각을 알기 위해 사용.
+    """
+    if db_filename and employee_name and d is not None:
+        try:
+            client, err = get_supabase_client()
+            if not err and client:
+                r = client.table("app_shift_schedules").select("shift_start,shift_end")\
+                    .eq("employee_name", employee_name)\
+                    .eq("shift_date", d.isoformat())\
+                    .limit(1).execute()
+                for sh in (r.data or []):
+                    ss = _erp_parse_time(sh.get("shift_start"))
+                    ee = _erp_parse_time(sh.get("shift_end"))
+                    if ss and ee:
+                        return ss, ee
+        except Exception:
+            pass
+    return _erp_default_times_for_date(db_filename, d)
 
 
 def _erp_minutes_between(t_start, t_end) -> int:
@@ -9945,36 +10038,47 @@ def _erp_overtime_claims_cached(db_filename: str, status: str | None = None) -> 
         return []
 
 
-def _erp_compute_worked_minutes(db_filename: str, employee_name: str,
-                                period_start: date, period_end: date) -> int:
-    """기간 내 직원의 '인정 근무 분(minutes)' 합산. status='approved' 만 집계.
-    - 정상/추가근무/행사: end_time - start_time (정확)
-    - 지각/조퇴: 실제 근무한 분 (start_time, end_time 기반)
-    - 연차: 480분, 반차: 240분
-    - 시차사용: +diff_minutes (휴가 사용도 근무로 인정)
-    - 포상시간: +diff_minutes
+def _erp_compute_monthly_planned_minutes(employee_name: str, year: int, month: int,
+                                         *, fallback_db: str | None = None) -> int:
+    """월간 계획 근무시간(분) 합산. 캘린더 상단 표시용.
+
+    - app_shift_schedules 전 매장 합산 (해당 직원 · 해당 월 전체, 오늘 이후 포함).
+    - shift_start/shift_end NULL 이면 fallback_db 매장 기본 시각으로 보정.
+    - 근로기준법 휴게시간 (_erp_break_min) 차감 후 순근무시간.
     """
-    logs = _erp_fetch_range("app_attendance_logs", "home_db_filename", db_filename,
-                            "log_date", period_start, period_end,
-                            extra_eq={"employee_name": employee_name})
+    if not (employee_name and year and month):
+        return 0
+    last_day = calendar.monthrange(int(year), int(month))[1]
+    period_start = date(int(year), int(month), 1)
+    period_end = date(int(year), int(month), last_day)
     total_min = 0
-    for l in logs:
-        if (l.get("status") or "approved") != "approved":
-            continue
-        wt = l.get("work_type") or ""
-        if wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
-            ss = _erp_parse_time(l.get("start_time"))
-            ee = _erp_parse_time(l.get("end_time"))
+    try:
+        client, err = get_supabase_client()
+        if err or not client:
+            return 0
+        r = client.table("app_shift_schedules")\
+            .select("shift_date,shift_start,shift_end,db_filename")\
+            .eq("employee_name", employee_name)\
+            .gte("shift_date", period_start.isoformat())\
+            .lte("shift_date", period_end.isoformat())\
+            .execute()
+        for sh in (r.data or []):
+            ss = _erp_parse_time(sh.get("shift_start"))
+            ee = _erp_parse_time(sh.get("shift_end"))
+            if not (ss and ee):
+                _sd_str = str(sh.get("shift_date") or "")[:10]
+                _sh_db = str(sh.get("db_filename") or fallback_db or "")
+                if _sd_str and _sh_db:
+                    try:
+                        ss, ee = _erp_default_times_for_date(_sh_db, date.fromisoformat(_sd_str))
+                    except Exception:
+                        pass
             if ss and ee:
-                m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
-                if m > 0:
-                    total_min += m
-        elif wt == "연차":
-            total_min += 480
-        elif wt == "반차":
-            total_min += 240
-        elif wt in ("시차사용", "포상시간"):
-            total_min += int(l.get("diff_minutes") or 0)
+                raw_m = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
+                if raw_m > 0:
+                    total_min += max(0, raw_m - _erp_break_min(raw_m))
+    except Exception:
+        return total_min
     return total_min
 
 
@@ -10343,18 +10447,19 @@ def _erp_compute_monthly_accrued(hire_date_str: str | None, as_of: date) -> int:
 
 
 def _erp_calc_shift_hours(start_t: dt_time, end_t: dt_time) -> float:
-    """근무 시작/종료 시각으로 실근무 시간(시간) 계산. 8시간 초과 시 1시간 휴게 차감."""
+    """근무 시작/종료 시각으로 순근무 시간(시간) 계산.
+    _erp_break_min 과 동일한 근로기준법 휴게시간 룰 사용:
+      - 8시간(480분) 이상 → 60분 차감
+      - 4시간(240분) 이상 ~ 8시간 미만 → 30분 차감
+      - 4시간 미만 → 차감 없음
+    """
     if not start_t or not end_t:
         return 0.0
     s_min = start_t.hour * 60 + start_t.minute
     e_min = end_t.hour * 60 + end_t.minute
-    total_min = max(0, e_min - s_min)
-    total_hours = total_min / 60.0
-    if total_hours > 8.0:
-        total_hours -= 1.0   # 8시간 초과 시 법정 휴게 1시간 차감
-    elif total_hours > 4.0:
-        total_hours -= 0.5   # 4시간 초과 시 30분 휴게 차감
-    return round(max(0.0, total_hours), 2)
+    raw_min = max(0, e_min - s_min)
+    net_min = max(0, raw_min - _erp_break_min(raw_min))
+    return round(net_min / 60.0, 2)
 
 
 def _erp_compute_leave_status(current_db: str, employee_name: str, as_of: date) -> dict:
@@ -10458,22 +10563,36 @@ def _erp_delete_row(table: str, row_id: int) -> tuple[bool, str]:
 # (스키마: SUPABASE_APP_ATTENDANCE_V2.sql)
 # =====================================================================
 
-_ERP_ADJ_KINDS = ("reward", "meeting", "summer_vacation", "long_service", "overtime", "etc")
+_ERP_ADJ_KINDS = ("overtime", "meeting", "early_leave", "summer_vacation", "reward", "long_service", "etc")
 _ERP_ADJ_KIND_LABEL = {
-    "reward": "포상",
-    "meeting": "회의",
-    "summer_vacation": "여름휴가",
-    "long_service": "장기근속",
     "overtime": "추가근무",
-    "etc": "기타",
+    "meeting": "회의",
+    "early_leave": "조기퇴근",
+    "summer_vacation": "여름휴가",
+    "reward": "포상",
+    "long_service": "장기근속",
+    "etc": "특이사항",
 }
 _ERP_ADJ_KIND_DEFAULT_SIGN = {
-    "reward": "-",
-    "meeting": "+",
-    "summer_vacation": "-",
-    "long_service": "-",
     "overtime": "+",
+    "meeting": "+",
+    "early_leave": "-",
+    "summer_vacation": "-",
+    "reward": "-",
+    "long_service": "-",
     "etc": "+",
+}
+
+# kind → app_attendance_logs.work_type 매핑 (승인 시 로그 동기화용).
+# 종전에는 sign='-' 이면 무조건 '조퇴' 였으나 kind 별로 명시적 매핑으로 변경.
+_ERP_ADJ_KIND_TO_WORK_TYPE = {
+    "overtime": "추가근무",
+    "meeting": "회의",
+    "early_leave": "조퇴",
+    "summer_vacation": "여름휴가",
+    "reward": "포상",
+    "long_service": "장기근속",
+    "etc": "특이사항",
 }
 
 
@@ -10598,98 +10717,31 @@ def _erp_find_active_period_target(db_filename: str, employee_name: str,
     return sorted(rows, key=lambda r: r.get("end_ym") or "")[-1]
 
 
-@st.cache_data(ttl=60)
-def _erp_sum_approved_adjustments(db_filename: str, employee_name: str,
-                                  period_key: str, period_kind: str = "month") -> int:
-    """승인된 신청의 minutes 합계 (분).
-    period_kind='month' → period_key='YYYY-MM' / 'year' → 'YYYY'."""
-    if not (db_filename and employee_name and period_key):
-        return 0
-    client, err = get_supabase_client()
-    if err or not client:
-        return 0
-    try:
-        q = client.table("app_work_adjustments").select("minutes,target_date")\
-            .eq("db_filename", db_filename)\
-            .eq("employee_name", employee_name)\
-            .eq("status", "approved")
-        if period_kind == "year":
-            start = f"{period_key}-01-01"
-            end = f"{period_key}-12-31"
-        else:
-            y, m = period_key.split("-")
-            last_day = calendar.monthrange(int(y), int(m))[1]
-            start = f"{period_key}-01"
-            end = f"{period_key}-{last_day:02d}"
-        q = q.gte("target_date", start).lte("target_date", end)
-        r = q.execute()
-        rows = (r.data or []) if hasattr(r, "data") else []
-        return sum(int(row.get("minutes") or 0) for row in rows)
-    except Exception:
-        return 0
-
-
-def _erp_compute_monthly_remaining_v2(db_filename: str, employee_name: str, ym: str) -> dict:
-    """월 잔여 = (월 입력 OR 연/12 fallback) - Σ승인.
-    반환 dict 키: required_min, approved_min, remaining_min, source ('month'/'year_div_12'/'none')."""
-    row_m = _erp_get_monthly_target_row(db_filename, employee_name, ym)
-    source = "none"
-    required_min = 0
-    if row_m and row_m.get("required_minutes") is not None:
-        required_min = int(row_m["required_minutes"])
-        source = "month"
-    else:
-        try:
-            year = int(ym.split("-")[0])
-        except Exception:
-            year = 0
-        row_y = _erp_get_yearly_target_row(db_filename, employee_name, year) if year else None
-        if row_y and row_y.get("required_minutes") is not None:
-            required_min = int(round(int(row_y["required_minutes"]) / 12))
-            source = "year_div_12"
-    approved_min = _erp_sum_approved_adjustments(db_filename, employee_name, ym, "month")
-    return {
-        "required_min": required_min,
-        "approved_min": approved_min,
-        "remaining_min": required_min - approved_min,
-        "source": source,
-    }
-
-
-def _erp_compute_yearly_remaining_v2(db_filename: str, employee_name: str, year: int) -> dict:
-    """연 잔여 = 연 입력 - Σ승인. 연 입력 없으면 required_min=0."""
-    row_y = _erp_get_yearly_target_row(db_filename, employee_name, year)
-    required_min = int(row_y["required_minutes"]) if (row_y and row_y.get("required_minutes") is not None) else 0
-    approved_min = _erp_sum_approved_adjustments(db_filename, employee_name, str(year), "year")
-    return {
-        "required_min": required_min,
-        "approved_min": approved_min,
-        "remaining_min": required_min - approved_min,
-    }
-
-
 def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                                   year: int, as_of: date) -> dict:
     """연도별 대시보드용 근무 breakdown (통합 카테고리).
 
-    집계 정책: **캘린더에 표시된 시간 그대로, 전 매장 합산** (db_filename 무관)
-      - attendance_logs / shift_schedules / work_adjustments 모두 employee_name 기준
-      - 같은 날 attendance_logs가 있으면 logs 우선, 없으면 shift_schedules 가산 (중복 방지)
+    ⚠️ 단일 소스 원칙 (v2.1 리팩터):
+      - 카테고리 총합(normal/overtime/short/leave)은 **app_attendance_logs 만** 참조한다.
+      - app_work_adjustments 의 승인 건은 승인 시 자동으로 log 를 생성하므로 log 에 이미 반영됨.
+      - 과거 log 미생성 승인 건은 '기존 승인 내역 캘린더 재동기화' 도구로 log 를 만들 것.
+      - additions/deductions 딕셔너리는 kind 별 상세 breakdown 을 위해서만 사용 (합산에는 미포함).
+        → 두 번 카운트되는 문제(early_leave 조퇴 log + adjustment) 해결.
 
-    카테고리 통합 정책:
-      - 연장근무: '추가근무'·'행사'·'시차사용'·'포상시간' + work_adjustments sign='+' (회의·풀근무·overtime 모두 통합)
-      - 단축근무: 지각/조퇴 표준 대비 부족분 + work_adjustments sign='-' (포상·여름휴가·기타 모두 통합)
-      - 정상근무: '정상' work_type + **시프트(app_shift_schedules) 자동 가산** (오늘 포함 과거)
-                  단, 같은 날짜에 attendance_logs가 있으면 logs 우선 (중복 방지)
+    집계 정책: **캘린더에 표시된 시간 그대로, 전 매장 합산** (db_filename 무관)
+      - attendance_logs / shift_schedules 모두 employee_name 기준
+      - 같은 날 attendance_logs가 있으면 logs 우선, 없으면 shift_schedules 가산 (중복 방지)
 
     반환 dict (단위: 분):
       - required_min      : 공통 필요근무시간
-      - deductions / additions : 상세 분류 (kind_label → minutes) — UI 상세보기용
-      - normal_min        : 정상근무 합산 (logs + shifts)
-      - overtime_min      : 연장근무 통합
-      - short_min         : 단축근무 통합
-      - leave_min         : 연차 480×n + 반차 240×n
-      - actual_total_min  : 실제 근무시간 = 정상 + 연장 + 연차 − 단축
+      - deductions / additions : 상세 분류 (kind_label → minutes) — UI 상세보기용 (합산 미포함)
+      - normal_min        : 정상근무 (logs 정상/지각/조퇴 actual + shifts logs-없는-날짜)
+      - overtime_min      : 연장근무 (logs 추가근무·회의·행사·시차사용·포상시간)
+      - short_min         : 단축근무 (logs 지각·조퇴 diff_minutes) — 디버그·표시용
+      - leave_min         : 연차 480×n + 반차 240×n (logs)
+      - actual_total_min  : 실제 근무시간 = normal + overtime + leave
+                            (사용자 수식 '실근무 + 연장 - 단축 + 연차' 와 동치.
+                             실근무=정상+단축 → (normal+short) + overtime - short + leave = normal + overtime + leave)
     """
     period_end = date(int(year), 12, 31)
 
@@ -10709,12 +10761,12 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
     today_cap = min(period_end, as_of)
 
-    # ── 조정 항목 (app_work_adjustments, sign별·kind별 분리) ────
-    # 복수 매장 지원: db_filename 필터 제거 → 모든 매장 조정 합산
+    # ── 조정 항목 breakdown (app_work_adjustments) — UI 상세 표시용 ──
+    # 총합에는 미포함 (log 를 단일 소스로 사용). kind 별 라벨→분 매핑만 채운다.
+    # deductions 의미 = '필요근무시간 자체를 줄이는 항목' (여름휴가/포상/장기근속/특이사항(-)).
+    # early_leave 는 필요시간을 줄이지 않고 실근무시간만 깎으므로 여기서 제외 (logs 조퇴 로 반영).
     deductions: dict[str, int] = {}
     additions: dict[str, int] = {}
-    overtime_adj_min = 0   # sign='+' 합산 (회의·풀근무·연장 모두)
-    short_adj_min = 0      # sign='-' 합산 (포상·여름휴가·기타 모두)
     try:
         client, err = get_supabase_client()
         if not err and client:
@@ -10730,10 +10782,10 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                 m = abs(int(r_.get("minutes") or 0))
                 label = _ERP_ADJ_KIND_LABEL.get(kind, kind)
                 if sign == "-":
-                    short_adj_min += m
+                    if kind == "early_leave":
+                        continue  # logs 조퇴 로만 카운트, 필요근무시간 감산 대상 아님
                     deductions[label] = deductions.get(label, 0) + m
                 else:
-                    overtime_adj_min += m
                     additions[label] = additions.get(label, 0) + m
     except Exception:
         pass
@@ -10799,30 +10851,23 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
         elif wt in ("추가근무", "행사"):
             overtime_min_logs += actual_min
         elif wt in ("지각", "조퇴"):
-            # 자동 단축 신청 승인 시 캘린더에 '조퇴'로 동기화된 행은
-            # work_adjustments에서 이미 카운트되므로 short 중복 방지.
-            _log_note = (l.get("note") or "")
-            _is_auto_synced = any(_log_note.startswith(t) for t in _ERP_AUTO_ADJ_TAGS)
+            # normal_min_logs: 실제 근무한 분(actual_min) 만 정상근무로 인정.
+            # short_min_logs: 표준 대비 부족분(단축시간) — 디버그·집계 카드 표시용.
             _diff_min_log = int(l.get("diff_minutes") or 0)
-            if _is_auto_synced:
-                normal_min_logs += actual_min  # 출근 시간만 정상 카운트, 단축은 adj에서
+            if _diff_min_log > 0:
+                short_min_logs += _diff_min_log
             else:
-                # 단축 시간: diff_minutes 컬럼 우선, 없으면 standard 기준으로 재계산
-                if _diff_min_log > 0:
-                    short_min_logs += _diff_min_log
-                else:
-                    try:
-                        _ld_d = date.fromisoformat(_ld_str) if _ld_str else as_of
-                        std_s, std_e = _erp_default_times_for_date(db_filename, _ld_d)
-                        _std_raw = max(0, (std_e.hour * 60 + std_e.minute)
-                                       - (std_s.hour * 60 + std_s.minute))
-                        std_min = max(0, _std_raw - _erp_break_min(_std_raw))
-                        _calc_diff = std_min - actual_min
-                        if _calc_diff > 0:
-                            short_min_logs += _calc_diff
-                    except Exception:
-                        pass
-                normal_min_logs += actual_min
+                try:
+                    _ld_d = date.fromisoformat(_ld_str) if _ld_str else as_of
+                    std_s, std_e = _erp_default_times_for_date(db_filename, _ld_d)
+                    _std_raw = max(0, (std_e.hour * 60 + std_e.minute)
+                                   - (std_s.hour * 60 + std_s.minute))
+                    std_min = max(0, _std_raw - _erp_break_min(_std_raw))
+                    if std_min > 0 and actual_min > 0 and actual_min < std_min:
+                        short_min_logs += (std_min - actual_min)
+                except Exception:
+                    pass
+            normal_min_logs += actual_min
             _debug_normal_logs.append({
                 "date": _ld_str, "type": f"log:{wt}", "h": round(actual_min / 60, 2),
                 "store": l.get("home_db_filename") or "",
@@ -10880,11 +10925,20 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
     except Exception:
         pass
 
-    # ── 통합 합산 ────────────────────────────────────────────────
+    # ── 통합 합산 (단일 소스: logs) ──────────────────────────────
+    # ⚠️ v2.1 리팩터: overtime_adj_min / short_adj_min 을 총합에 더하지 않음.
+    #  - 승인된 adjustment 는 auto-sync 로 log 를 생성하므로 logs 에 이미 포함.
+    #  - 과거 미동기화 승인 건은 '기존 승인 내역 재동기화' 도구로 log 생성 필요.
+    #
+    # 수식(사용자 지정): 실제근무 = 실근무(예정) + 연장 - 단축 + 연차
+    #  - 여기서 실근무(예정) = normal + short (실제 근무 + 단축분 = 예정 표준시간).
+    #  - 정리하면 actual = normal + overtime + leave 로 동일.
+    #  - normal_min 은 로그 기반 실제 근무한 분(조퇴/지각 log 도 partial 로 인정).
+    #  - short_min 은 표시·검증용 (수식 검증 시 short = std - normal 로 계산 후 확인).
     normal_min   = normal_min_logs + shift_normal_min
-    overtime_min = overtime_min_logs + overtime_adj_min
-    short_min    = short_min_logs + short_adj_min
-    actual_total_min = normal_min + overtime_min + leave_min - short_min
+    overtime_min = overtime_min_logs
+    short_min    = short_min_logs
+    actual_total_min = normal_min + overtime_min + leave_min
 
     return {
         "required_min": required_min,
@@ -10928,17 +10982,19 @@ def _erp_compute_shift_overage(db_filename: str, shift_date: date,
                                shift_start_t: dt_time, shift_end_t: dt_time) -> tuple[int, int, int]:
     """매장 표준 대비 차이(분) 계산.
 
-    반환: (diff_minutes, std_minutes, actual_minutes)
+    반환: (diff_minutes, std_minutes, actual_minutes) — 모두 근로기준법 휴게시간 차감 후 순근무분.
       - diff > 0 → 연장 / diff < 0 → 단축 / diff == 0 → 동일
       - 매장 표준은 _erp_default_times_for_date 기준 (평일/주말 자동 분기)
     """
     if not (shift_start_t and shift_end_t):
         return 0, 0, 0
-    actual_min = max(0, (shift_end_t.hour * 60 + shift_end_t.minute)
-                     - (shift_start_t.hour * 60 + shift_start_t.minute))
+    _actual_raw = max(0, (shift_end_t.hour * 60 + shift_end_t.minute)
+                      - (shift_start_t.hour * 60 + shift_start_t.minute))
+    actual_min = max(0, _actual_raw - _erp_break_min(_actual_raw))
     try:
         std_s, std_e = _erp_default_times_for_date(db_filename, shift_date)
-        std_min = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
+        _std_raw = max(0, (std_e.hour * 60 + std_e.minute) - (std_s.hour * 60 + std_s.minute))
+        std_min = max(0, _std_raw - _erp_break_min(_std_raw))
     except Exception:
         std_min = 0
     if std_min <= 0:
@@ -10979,28 +11035,24 @@ def _erp_upsert_auto_adjustment(*, db_filename: str, employee_name: str,
                                 work_db_filename: str | None = None,
                                 work_location_name: str | None = None,
                                 user_note: str | None = None) -> tuple[bool, str]:
-    """자동 연장(+)/단축(-) 신청 행을 pending으로 insert. 기존 [자동] 행은 사전 정리.
+    """자동 연장(+) 신청 행을 pending 으로 insert. 기존 [자동] 행은 사전 정리.
 
-    - diff > 0: kind='overtime', sign='+'
-    - diff < 0: kind='etc',      sign='-'
-    - diff == 0: no-op (True 반환)
+    - diff > 0: kind='overtime', sign='+' (연장근무)
+    - diff <= 0: no-op (단축근무 자동 신청 모드는 v2.1 에서 폐지 — 기존 자동 행만 정리)
     - user_note: 사용자가 직접 입력한 비고 (reason 끝에 ' | 비고: ...' 형식으로 결합)
     """
     diff_min = int(diff_min or 0)
-    if diff_min == 0:
-        # 차이 없어도 기존 자동 행이 있으면 정리
+    if diff_min <= 0:
         _erp_delete_existing_auto_adjustment(db_filename, employee_name, target_date, source_tag)
         return True, ""
 
     _erp_delete_existing_auto_adjustment(db_filename, employee_name, target_date, source_tag)
 
-    is_overtime = diff_min > 0
-    minutes_abs = abs(diff_min)
-    kind = "overtime" if is_overtime else "etc"
-    sign = "+" if is_overtime else "-"
-    direction = "연장" if is_overtime else "단축"
+    minutes_abs = diff_min
+    kind = "overtime"
+    sign = "+"
     reason = (
-        f"{source_tag} {direction} {_erp_fmt_hm(minutes_abs)} "
+        f"{source_tag} 연장 {_erp_fmt_hm(minutes_abs)} "
         f"(표준 {std_start_str}~{std_end_str} → 실제 {actual_start_str}~{actual_end_str})"
     )
     _note_clean = (user_note or "").strip()
@@ -11333,7 +11385,6 @@ def _erp_v2_clear_caches():
         _erp_get_yearly_target_row.clear()
         _erp_list_monthly_targets.clear()
         _erp_list_yearly_targets.clear()
-        _erp_sum_approved_adjustments.clear()
         _erp_list_my_adjustments.clear()
         _erp_list_pending_adjustments.clear()
         _erp_store_admin_names.clear()
@@ -12111,8 +12162,15 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
                     t_e = None
             with row[4]:
                 if checked and t_s and t_e:
-                    _h = _erp_calc_shift_hours(t_s, t_e)
-                    st.markdown(f"<span style='color:#2E7D32;'>{_h:.1f}h</span>", unsafe_allow_html=True)
+                    _raw_h = ((t_e.hour * 60 + t_e.minute)
+                              - (t_s.hour * 60 + t_s.minute)) / 60.0
+                    _net_h = _erp_calc_shift_hours(t_s, t_e)
+                    _brk = max(0.0, _raw_h - _net_h)
+                    st.markdown(
+                        f"<span style='color:#2E7D32;'>{_net_h:.1f}h</span>"
+                        f" <span style='color:#888;font-size:0.85em;'>(휴게 -{_brk:.1f}h)</span>",
+                        unsafe_allow_html=True,
+                    )
                 else:
                     st.markdown("<span style='color:#bbb;'>-</span>", unsafe_allow_html=True)
             edits[d.isoformat()] = (checked, t_s, t_e)
@@ -12797,17 +12855,30 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         _ct_remain_h = _cal_ctr["remaining_min"] / 60.0
         _ct_pct = _cal_ctr["percent"]
         _ct_weekly = round(_ct_target_h / 4.33, 1)
+        _ct_planned_min = _erp_compute_monthly_planned_minutes(
+            _ctr_target_emp, int(year), int(month),
+            fallback_db=_ctr_target_db,
+        )
+        _ct_planned_h = _ct_planned_min / 60.0
         if _ct_pct >= 100:
             _cc = "#E53935"
         elif _ct_pct >= 80:
             _cc = "#FB8C00"
         else:
             _cc = "#2E7D32"
+        # 계획 대비 목표 진행률 (계획이 있을 때만 표기)
+        _plan_vs_target = ""
+        if _ct_planned_h > 0 and _ct_target_h > 0:
+            _plan_pct = _ct_planned_h / _ct_target_h * 100.0
+            _plan_color = "#2E7D32" if _plan_pct >= 100 else "#FB8C00" if _plan_pct >= 80 else "#E53935"
+            _plan_vs_target = (f" <span style='color:{_plan_color}; font-size:0.82em;'>"
+                               f"(목표 대비 {_plan_pct:.0f}%)</span>")
         st.markdown(
             f"<div style='margin:6px 0 10px 0; padding:8px 12px; background:#FAFAFA;"
             f" border-left:4px solid {_cc}; border-radius:4px; font-size:0.88rem;'>"
             f"⏱️ <b>{_ctr_target_emp}</b> · {int(year)}년 {int(month)}월 카운터 &nbsp;|&nbsp; "
             f"목표 <b>{_ct_target_h:.0f}h</b> (주 {_ct_weekly:g}h) "
+            f"&nbsp;|&nbsp; 계획 <b>{_ct_planned_h:.1f}h</b>{_plan_vs_target} "
             f"&nbsp;|&nbsp; 누적 <b>{_ct_worked_h:.1f}h</b> ({_ct_pct:g}%) "
             f"&nbsp;|&nbsp; 잔여 <b style='color:{_cc}; font-size:1.1rem;'>{_ct_remain_h:+.1f}h</b>"
             f"</div>",
@@ -13129,25 +13200,39 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 extra = f" {lg.get('diff_minutes') or 0}분" if wt in ("시차적립", "시차사용") else ""
                 sn_tag = (f" <span style='font-size:0.58rem; color:{sc};"
                           f" font-weight:bold;'>({_dbf_to_sn.get(dbf,'')})</span>") if show_store_tag else ""
-                # 추가근무·회의는 시간대 표시 (없으면 diff_minutes 로 fallback)
+                # 시간대 표시:
+                #  - 추가근무/회의: start~end 범위 (연장 시간대)
+                #  - 조퇴: 실제 퇴근 시각만 (start_time = 실제 퇴근 시각, end_time = 예정 종료)
+                #  - 여름휴가/포상/장기근속/특이사항: 시간대가 있으면 표시, 없으면 diff_minutes(h)
                 _time_txt = ""
+                _st = str(lg.get("start_time") or "")[:5]
+                _et = str(lg.get("end_time") or "")[:5]
+                _dm = int(lg.get("diff_minutes") or 0)
                 if wt in ("추가근무", "회의"):
-                    _st = str(lg.get("start_time") or "")[:5]
-                    _et = str(lg.get("end_time") or "")[:5]
                     if _st and _et:
-                        _time_txt = (
-                            f" <span style='font-size:0.62rem; color:#555;'>"
-                            f"{_st}~{_et}</span>"
-                        )
-                    else:
-                        _dm = int(lg.get("diff_minutes") or 0)
-                        if _dm:
-                            _dh, _dmm = divmod(_dm, 60)
-                            _dur = f"{_dh}h{_dmm:02d}m" if _dmm else f"{_dh}h"
-                            _time_txt = (
-                                f" <span style='font-size:0.62rem; color:#777;'>"
-                                f"+{_dur}</span>"
-                            )
+                        _time_txt = (f" <span style='font-size:0.62rem; color:#555;'>"
+                                     f"{_st}~{_et}</span>")
+                    elif _dm:
+                        _dh, _dmm = divmod(_dm, 60)
+                        _dur = f"{_dh}h{_dmm:02d}m" if _dmm else f"{_dh}h"
+                        _time_txt = (f" <span style='font-size:0.62rem; color:#777;'>+{_dur}</span>")
+                elif wt == "조퇴":
+                    # end_time = 실제 퇴근시각. start_time = 근무 시작. '→HH:MM' 로 실제 퇴근시각 표시.
+                    if _et:
+                        _time_txt = (f" <span style='font-size:0.62rem; color:#555;'>"
+                                     f"→{_et}</span>")
+                    elif _dm:
+                        _dh, _dmm = divmod(_dm, 60)
+                        _dur = f"{_dh}h{_dmm:02d}m" if _dmm else f"{_dh}h"
+                        _time_txt = (f" <span style='font-size:0.62rem; color:#777;'>-{_dur}</span>")
+                elif wt in ("여름휴가", "포상", "장기근속", "특이사항"):
+                    if _st and _et:
+                        _time_txt = (f" <span style='font-size:0.62rem; color:#555;'>"
+                                     f"{_st}~{_et}</span>")
+                    elif _dm:
+                        _dh, _dmm = divmod(_dm, 60)
+                        _dur = f"{_dh}h{_dmm:02d}m" if _dmm else f"{_dh}h"
+                        _time_txt = (f" <span style='font-size:0.62rem; color:#777;'>{_dur}</span>")
                 cell.append(
                     f"<div style='margin-top:1px;'>"
                     f"<span style='background:{bc}; color:white; padding:1px 4px;"
@@ -13946,240 +14031,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         st.caption("컬러 바 = 근무 계획(shift) / 보라 = 외부 행사·박람회 / 배지 = 실제 근태 기록 / 파란 테두리 = 오늘 / 빨간 테두리 = 최소 인원 미달")
 
 
-# ---------- 탭 4: 휴무·근태 입력 ----------
-
-def _erp_tab_attendance_input(current_db: str, role: str, me_name: str):
-    st.subheader("📝 휴무·근태 입력")
-    st.caption("연차·반차·시차 등 휴무, 또는 출퇴근·지각·조퇴 기록을 유형에 맞게 입력합니다.")
-
-    today = _today_kst()
-
-    # ── 공통: 직원 선택 ───────────────────────────────────────────
-    if role in ("store_admin", "superadmin"):
-        emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
-        target_emp = st.selectbox("직원", emp_opts, key="erp_att_emp")
-    else:
-        target_emp = me_name
-        st.text_input("직원", value=me_name, disabled=True, key="erp_att_emp_fixed")
-
-    col_d, col_t = st.columns([1, 2])
-    with col_d:
-        log_date = st.date_input("날짜", value=today, key="erp_att_date")
-    with col_t:
-        # 유형 순서: 휴무 계열 → 시차 계열 → 출근기록 계열
-        _ORDERED_TYPES = ["연차", "반차", "시차사용", "시차적립", "정상", "조퇴", "지각", "추가근무", "행사"]
-        work_type = st.selectbox(
-            "근태 유형",
-            _ORDERED_TYPES,
-            key="erp_att_type",
-            help="연차·반차: 연차 차감 | 시차사용·시차적립: 시차 분수 입력 | 정상·조퇴·지각: 출퇴근 시각 입력",
-        )
-
-    std_s, std_e = _erp_default_times_for_date(current_db, log_date)
-    weekend_flag = _erp_is_weekend_or_holiday(log_date)
-    kind_label = "주말·공휴일" if weekend_flag else "주중"
-
-    # 유형별 분기 – 기본값 초기화
-    start_time = None
-    end_time = None
-    diff_min_input = 0
-    work_loc = ""
-    work_db = current_db
-    _sel_store_label = ""
-
-    # ── 그룹 A: 연차 / 반차 ── 출퇴근 시각 불필요 ────────────────
-    if work_type in ("연차", "반차"):
-        ded = _ERP_LEAVE_DEDUCTION_MAP.get(work_type, 0)
-        st.info(
-            f"📅 **{log_date.isoformat()} ({_ERP_DOW_LABELS[log_date.weekday()]})** — {kind_label}  |  "
-            f"연차 차감: **{ded}일**"
-        )
-        if weekend_flag:
-            st.warning("⚠️ 주말·공휴일 연차·반차는 저장 시 관리자 승인 대기 상태로 처리됩니다.")
-
-    # ── 그룹 B: 시차적립 / 시차사용 ── 분수만 입력 ───────────────
-    elif work_type in ("시차적립", "시차사용"):
-        st.info(f"📅 **{log_date.isoformat()} ({_ERP_DOW_LABELS[log_date.weekday()]})** — {kind_label}")
-        label = "적립할 시차 분수" if work_type == "시차적립" else "사용할 시차 분수"
-        diff_min_input = st.number_input(label, min_value=0, max_value=480, value=60, step=15, key="erp_att_diff")
-        if work_type == "시차사용":
-            remain = _erp_compute_remaining_comptime(current_db, target_emp)
-            if diff_min_input > 0 and remain >= diff_min_input:
-                st.success(f"✅ 잔여 시차 {remain}분 — 분수 조건 충족, 즉시 승인 처리됩니다.")
-            elif diff_min_input > 0:
-                st.warning(f"⚠️ 잔여 시차 {remain}분 < 신청 {diff_min_input}분 — 관리자 승인 대기 처리됩니다.")
-            else:
-                st.caption(f"💡 현재 잔여 시차: {remain}분")
-
-    # ── 그룹 C: 정상·조퇴·지각·추가근무·행사 ── 출퇴근 시각 필요 ──
-    else:
-        st.caption(
-            f"📅 {log_date.isoformat()} ({_ERP_DOW_LABELS[log_date.weekday()]}) — "
-            f"매장 기본 ({kind_label}): {std_s.strftime('%H:%M')} ~ {std_e.strftime('%H:%M')}"
-        )
-        col_t1, col_t2 = st.columns(2)
-        with col_t1:
-            start_time = _erp_time_input_30min("실제 출근 시각", value=std_s,
-                                               key=f"erp_att_start_{log_date.isoformat()}_{weekend_flag}")
-        with col_t2:
-            end_time = _erp_time_input_30min("실제 퇴근 시각", value=std_e,
-                                             key=f"erp_att_end_{log_date.isoformat()}_{weekend_flag}")
-
-        # 근무 매장 선택
-        _att_stores_df = get_supabase_stores_dataframe_cached()
-        _att_store_opts_raw = []
-        if _att_stores_df is not None and len(_att_stores_df) > 0:
-            for _, _sr in _att_stores_df.iterrows():
-                _att_store_opts_raw.append((_sr["store_name"], _sr["db_filename"]))
-        _att_store_opts_raw.append(("기타 (외부/행사)", None))
-        _att_store_labels = [s[0] for s in _att_store_opts_raw]
-        _att_home_idx = next((i for i, s in enumerate(_att_store_opts_raw) if s[1] == current_db), 0)
-
-        _sel_store_label = st.selectbox(
-            "📍 실제 근무 매장",
-            _att_store_labels,
-            index=_att_home_idx,
-            key="erp_att_work_store",
-            help="소속 매장과 다른 곳에서 근무한 경우 선택. 외부 행사는 '기타'를 선택하세요.",
-        )
-        _sel_store_idx = _att_store_labels.index(_sel_store_label)
-        work_db = _att_store_opts_raw[_sel_store_idx][1]
-        if work_db is None:
-            st.info("ℹ️ '기타(외부/행사)'로 기록됩니다. 소속 매장 집계에서 제외됩니다.")
-        elif work_db != current_db:
-            st.info(f"ℹ️ '{_sel_store_label}' 지원 근무로 기록됩니다.")
-
-        _loc_required = work_type == "행사"
-        work_loc = st.text_input(
-            f"근무 장소 상세{'  (필수)' if _loc_required else ' (선택)'}",
-            value="",
-            key="erp_att_loc",
-            placeholder="예: 롯데백화점 행사장 / 3층 팝업스토어",
-        )
-
-    note = st.text_input("비고 / 사유", value="", key="erp_att_note",
-                         placeholder="사유나 특이사항을 입력하세요")
-    submitted = st.button("💾 저장", type="primary", key="erp_att_save")
-
-    if submitted:
-        if work_type == "행사" and not (work_loc or "").strip():
-            st.error("행사 유형은 '근무 장소'를 반드시 입력해 주세요.")
-            return
-
-        leave_ded = float(_ERP_LEAVE_DEDUCTION_MAP.get(work_type, 0))
-        diff_minutes = 0
-        if work_type in ("시차적립", "시차사용"):
-            diff_minutes = int(diff_min_input)
-        elif work_type in ("조퇴", "지각"):
-            if work_type == "조퇴" and end_time:
-                diff_minutes = max(0, (std_e.hour * 60 + std_e.minute) - (end_time.hour * 60 + end_time.minute))
-            elif work_type == "지각" and start_time:
-                diff_minutes = max(0, (start_time.hour * 60 + start_time.minute) - (std_s.hour * 60 + std_s.minute))
-
-        status = "approved"
-        if work_type == "시차사용":
-            remain = _erp_compute_remaining_comptime(current_db, target_emp)
-            if remain < diff_minutes:
-                status = "pending"
-                st.warning(f"⚠️ 잔여 시차({remain}분) < 신청({diff_minutes}분). 관리자 승인 대기 상태로 저장됩니다.")
-        elif work_type in ("연차", "반차") and _erp_is_weekend_or_holiday(log_date):
-            status = "pending"
-            st.warning(
-                f"⚠️ {log_date.isoformat()}({_ERP_DOW_LABELS[log_date.weekday()]})은 주말·공휴일입니다. "
-                "매장 관리자 승인 후 최종 처리됩니다."
-            )
-
-        row = {
-            "home_db_filename": current_db,
-            "work_db_filename": work_db,
-            "work_location_name": (work_loc or "").strip() or (_sel_store_label if work_db is None else None),
-            "employee_name": target_emp,
-            "log_date": log_date.isoformat(),
-            "work_type": work_type,
-            "leave_deduction": leave_ded,
-            "diff_minutes": diff_minutes,
-            "start_time": start_time.strftime("%H:%M:%S") if start_time else None,
-            "end_time": end_time.strftime("%H:%M:%S") if end_time else None,
-            "standard_start": std_s.strftime("%H:%M:%S"),
-            "standard_end": std_e.strftime("%H:%M:%S"),
-            "status": status,
-            "note": (note or "").strip() or None,
-            "created_by": me_name,
-        }
-        ok, err = _erp_insert_row("app_attendance_logs", row)
-        if ok:
-            notify("근태 기록이 저장되었습니다.")
-        else:
-            notify(f"저장 실패: {err}", level="error")
-
-    st.divider()
-    st.markdown("##### 📋 최근 7일 내 본인/관리 근태 기록")
-    period_start = today - timedelta(days=7)
-    recent = _erp_fetch_range("app_attendance_logs", "home_db_filename", current_db, "log_date", period_start, today)
-    if role not in ("store_admin", "superadmin"):
-        recent = [r for r in recent if (r.get("employee_name") or "") == me_name]
-    if not recent:
-        st.info("최근 7일간 기록이 없습니다.")
-    else:
-        df = pd.DataFrame(recent)
-        show_cols = ["log_date", "employee_name", "work_type", "start_time", "end_time", "diff_minutes",
-                     "leave_deduction", "work_location_name", "status", "note", "created_by"]
-        df = df[[c for c in show_cols if c in df.columns]].sort_values("log_date", ascending=False)
-        st.dataframe(df, width='stretch', hide_index=True)
-
-    # ── 관리자 전용: 근태 기록 검색 및 삭제 ─────────────────────────────
-    if role in ("store_admin", "superadmin"):
-        st.divider()
-        with st.expander("🗑️ 근태 기록 검색 / 삭제 (관리자 전용)", expanded=False):
-            st.caption("특정 직원·기간의 근태 기록을 조회하고 잘못 입력된 기록을 삭제할 수 있습니다.")
-            _del_emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
-            _dc1, _dc2, _dc3 = st.columns([2, 1, 1])
-            with _dc1:
-                _del_emp = st.selectbox("직원", _del_emp_opts, key="erp_att_del_emp")
-            with _dc2:
-                _del_from = st.date_input("시작일", value=today.replace(day=1), key="erp_att_del_from")
-            with _dc3:
-                _del_to = st.date_input("종료일", value=today, key="erp_att_del_to")
-            if st.button("🔍 조회", key="erp_att_del_search"):
-                st.session_state["erp_att_del_rows"] = _erp_fetch_range(
-                    "app_attendance_logs", "home_db_filename", current_db,
-                    "log_date", _del_from, _del_to
-                )
-                st.session_state["erp_att_del_rows"] = [
-                    r for r in st.session_state["erp_att_del_rows"]
-                    if (r.get("employee_name") or "") == _del_emp
-                ]
-            _del_rows = st.session_state.get("erp_att_del_rows", [])
-            if _del_rows:
-                st.caption(f"{len(_del_rows)}건 조회됨")
-                for _dr in _del_rows:
-                    _dr_id = int(_dr["id"])
-                    _dr_cols = st.columns([1.5, 1.5, 1.5, 2, 3, 1])
-                    with _dr_cols[0]:
-                        st.markdown(f"**{str(_dr.get('log_date') or '')[:10]}**")
-                    with _dr_cols[1]:
-                        st.caption(_dr.get("work_type") or "-")
-                    with _dr_cols[2]:
-                        _ts = str(_dr.get("start_time") or "")[:5]
-                        _te = str(_dr.get("end_time") or "")[:5]
-                        st.caption(f"{_ts}~{_te}" if _ts else "-")
-                    with _dr_cols[3]:
-                        st.caption(_dr.get("work_location_name") or "-")
-                    with _dr_cols[4]:
-                        st.caption(_dr.get("note") or "-")
-                    with _dr_cols[5]:
-                        if st.button("🗑️", key=f"erp_att_del_btn_{_dr_id}", help="이 기록 삭제"):
-                            ok, e = _erp_delete_row("app_attendance_logs", _dr_id)
-                            if ok:
-                                st.session_state["erp_att_del_rows"] = [
-                                    r for r in _del_rows if int(r["id"]) != _dr_id
-                                ]
-                                st.toast(f"근태 기록 삭제 완료 ({str(_dr.get('log_date') or '')[:10]})", icon="✅")
-                                st.rerun()
-                            else:
-                                st.error(f"삭제 실패: {e}")
-            elif "erp_att_del_rows" in st.session_state:
-                st.info("조회된 기록이 없습니다.")
+# ---------- (구) 탭 4 (v2.1 리팩터에서 제거됨) ----------
+# _erp_tab_attendance_input 은 호출처가 없는 고아 함수였으므로 삭제.
+# 근태 입력은 '내 근태' 탭 (_erp_tab_my_attendance) 과 '근무일정' 탭 (_erp_tab_shift_plan) 으로 통합됨.
 
 
 # ---------- 탭 5: 추가근무 & 시차 관리 ----------
@@ -16431,12 +16285,9 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                             except Exception:
                                 _log_date_d = _today_kst()
                             _std_s, _std_e = _erp_default_times_for_date(current_db, _log_date_d)
-                            # work_type 매핑: 연장(+) → '추가근무'/'회의', 단축(-) → '조퇴' (비고로 단축 식별)
-                            if sign == "+":
-                                _wt_map = {"overtime": "추가근무", "meeting": "회의"}
-                                _wt = _wt_map.get(kind, "추가근무")
-                            else:
-                                _wt = "조퇴"
+                            # work_type 매핑: kind 별 명시화 (종전엔 sign='-' 이 무조건 '조퇴' 였음).
+                            # early_leave 만 '조퇴', 그 외 sign='-' 는 원본 kind 라벨(여름휴가/포상/장기근속/특이사항) 사용.
+                            _wt = _ERP_ADJ_KIND_TO_WORK_TYPE.get(kind, "특이사항" if sign == "-" else "추가근무")
                             _log_row = {
                                 "home_db_filename": current_db,
                                 "work_db_filename": _work_db_adj,
@@ -16536,7 +16387,8 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                                     })
                                     if _ok_rev:
                                         # 2) app_attendance_logs 에서 동일 직원·날짜·유형 레코드 삭제
-                                        _wt_del = "추가근무" if _ar_kind == "overtime" else ("회의" if _ar_kind == "meeting" else None)
+                                        # kind 별 매핑을 사용해 모든 kind 의 승인 취소 시 log 정리.
+                                        _wt_del = _ERP_ADJ_KIND_TO_WORK_TYPE.get(_ar_kind)
                                         if _wt_del:
                                             try:
                                                 _del_logs = _appr_client.table("app_attendance_logs").select("id")\
@@ -16790,7 +16642,7 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
         new_kind = st.selectbox(
             "유형",
             options=list(_ERP_ADJ_KINDS),
-            format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "기타 (±)",
+            format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "특이사항 결재 (±)",
             key="my_new_kind",
         )
     with fc2:
@@ -16800,8 +16652,11 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
             new_sign = _ERP_ADJ_KIND_DEFAULT_SIGN[new_kind]
             st.markdown(f"**부호: {new_sign}** (고정)")
 
-    # 추가근무·회의는 시간대 직접 입력 → 캘린더 자동 반영
+    # 시간대 입력 여부:
+    #  - overtime/meeting (+): 시작·종료 시간 입력 → 시프트 밖 시간대에 등록
+    #  - early_leave (-): 실제 퇴근 시각만 입력 → shift.end 와의 차이를 자동 계산
     _needs_timeslot = new_kind in ("overtime", "meeting") and new_sign == "+"
+    _is_early_leave = new_kind == "early_leave"
 
     with st.form("my_new_adj_form", clear_on_submit=True):
         if _needs_timeslot:
@@ -16817,6 +16672,25 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                 new_store_label = st.selectbox("근무지", _adj_store_labels,
                                                index=_adj_home_idx, key="my_new_store")
             new_reason = st.text_input("사유", placeholder="사유를 입력해 주세요 (선택)", key="my_new_reason")
+        elif _is_early_leave:
+            st.caption("📌 조기퇴근은 실제 퇴근 시각만 입력하면 근무일정 종료시각과의 차이가 자동으로 계산됩니다.")
+            el1, el2 = st.columns([1.2, 1])
+            with el1:
+                new_date = st.date_input("퇴근일", value=today, key="my_new_date")
+            with el2:
+                new_end = _erp_time_input_30min("실제 퇴근 시각", value=dt_time(15, 0), key="my_new_end")
+            _peek_ss, _peek_ee = _erp_shift_bounds_for_date(current_db, me_name, new_date)
+            _peek_end_min = _peek_ee.hour * 60 + _peek_ee.minute
+            _peek_actual_min = new_end.hour * 60 + new_end.minute
+            _peek_diff = _peek_end_min - _peek_actual_min
+            if _peek_diff > 0:
+                st.caption(f"➡️ 예정 종료 {_peek_ee.strftime('%H:%M')} - 실제 퇴근 {new_end.strftime('%H:%M')}"
+                           f" = **-{_peek_diff//60}h {_peek_diff%60}m** (조기퇴근)")
+            else:
+                st.caption(f"⚠️ 예정 종료({_peek_ee.strftime('%H:%M')})보다 늦게 퇴근하면 조기퇴근 신청 대상이 아닙니다.")
+            new_reason = st.text_input("사유", placeholder="예: 병원 진료, 개인 사정",
+                                       key="my_new_reason")
+            new_start = None  # 폼 저장 시 shift_bounds 로 재계산
         else:
             gc1, gc2, gc3 = st.columns([1, 1, 3])
             with gc1:
@@ -16825,17 +16699,30 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                 new_hours = st.number_input("시간(h)", min_value=0.25, max_value=744.0, step=0.5,
                                             value=1.0, key="my_new_h")
             with gc3:
-                new_reason = st.text_input("사유", placeholder="사유 (기타는 필수)", key="my_new_reason")
+                _reason_ph = "사유 (특이사항은 필수 · 예: 휴게시간 미사용, 야근 식대)" if new_kind == "etc" else "사유"
+                new_reason = st.text_input("사유", placeholder=_reason_ph, key="my_new_reason")
 
         if st.form_submit_button("📤 신청 등록", type="primary"):
             _err_msg = None
             if new_kind == "etc" and not (new_reason or "").strip():
-                _err_msg = "기타 유형은 사유를 입력해 주세요."
+                _err_msg = "특이사항 결재는 사유를 반드시 입력해 주세요."
             elif _needs_timeslot:
                 _s_min = new_start.hour * 60 + new_start.minute
                 _e_min = new_end.hour * 60 + new_end.minute
                 if _e_min <= _s_min:
                     _err_msg = "종료 시간이 시작 시간보다 늦어야 합니다."
+                else:
+                    _err_msg = _erp_validate_adjustment_time(
+                        db_filename=current_db, employee_name=me_name,
+                        target_date=new_date, start_min=_s_min, end_min=_e_min,
+                    )
+            elif _is_early_leave:
+                _shift_s, _shift_e = _erp_shift_bounds_for_date(current_db, me_name, new_date)
+                _end_min_shift = _shift_e.hour * 60 + _shift_e.minute
+                _actual_end_min = new_end.hour * 60 + new_end.minute
+                if _actual_end_min >= _end_min_shift:
+                    _err_msg = (f"실제 퇴근 시각이 예정 종료({_shift_e.strftime('%H:%M')})보다"
+                                f" 이르지 않아 조기퇴근 신청 대상이 아닙니다.")
             if _err_msg:
                 st.error(_err_msg)
             else:
@@ -16846,6 +16733,18 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                     _sel_store = next((s for s in _adj_store_opts if s[0] == new_store_label), _adj_store_opts[_adj_home_idx])
                     _work_db = _sel_store[1]
                     _work_loc = _sel_store[0] if _work_db is None else None
+                elif _is_early_leave:
+                    _shift_s, _shift_e = _erp_shift_bounds_for_date(current_db, me_name, new_date)
+                    _actual_end = new_end
+                    _total_min = ((_shift_e.hour * 60 + _shift_e.minute)
+                                  - (_actual_end.hour * 60 + _actual_end.minute))
+                    # 로그 컨벤션에 맞춰 shift_start = 근무 시작, shift_end = 실제 퇴근시각.
+                    # 이렇게 저장하면 승인 시 auto-sync log 의 start_time/end_time 이
+                    # '실제 근무한 구간' 을 표현해 다른 조퇴 log 와 동일한 방식으로 집계된다.
+                    new_start = _shift_s
+                    _new_end_final = _actual_end
+                    _work_db = current_db
+                    _work_loc = None
                 else:
                     _total_min = int(round(float(new_hours) * 60))
                     _work_db = current_db
@@ -16867,9 +16766,14 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                     payload["shift_end"] = new_end.strftime("%H:%M:%S")
                     payload["work_db_filename"] = _work_db
                     payload["work_location_name"] = _work_loc
+                elif _is_early_leave:
+                    payload["shift_start"] = new_start.strftime("%H:%M:%S")
+                    payload["shift_end"] = _new_end_final.strftime("%H:%M:%S")
+                    payload["work_db_filename"] = _work_db
+                    payload["work_location_name"] = _work_loc
 
                 ok, e = _erp_insert_row("app_work_adjustments", payload)
-                if not ok and _needs_timeslot and "PGRST204" in str(e):
+                if not ok and (_needs_timeslot or _is_early_leave) and "PGRST204" in str(e):
                     # 컬럼 미존재 시 시간대 필드 제외하고 재시도
                     _p2 = {k: v for k, v in payload.items()
                            if k not in ("shift_start", "shift_end", "work_db_filename", "work_location_name")}
@@ -16878,7 +16782,7 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                         st.warning("⚠️ 시간대 컬럼이 없어 기본 정보만 저장되었습니다. SUPABASE_APP_ATTENDANCE_V2.sql 의 3-1번 구문을 실행해 주세요.")
                 if ok:
                     _erp_v2_clear_caches()
-                    if _needs_timeslot:
+                    if _needs_timeslot or _is_early_leave:
                         flash(f"신청이 등록되었습니다. 승인 후 {new_date.isoformat()} 캘린더에 자동 반영됩니다.")
                     else:
                         flash("신청이 등록되었습니다. 매장관리자 승인 대기 중.")
@@ -16889,10 +16793,25 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
     st.divider()
 
     # ── 내 신청 내역 ──────────────────────────────────────────────
-    st.markdown(f"##### 📋 내 신청 내역 ({ym})")
-    my_list = _erp_list_my_adjustments(current_db, me_name, ym)
+    _mh_col1, _mh_col2, _mh_col3 = st.columns([1, 1, 4])
+    with _mh_col1:
+        _mh_year = st.selectbox(
+            "연도", options=list(range(year - 4, year + 2)),
+            index=4, key="my_adj_hist_year",
+        )
+    with _mh_col2:
+        _mh_month = st.selectbox(
+            "월", options=list(range(1, 13)),
+            index=month - 1, key="my_adj_hist_month",
+            format_func=lambda m: f"{m}월",
+        )
+    _hist_ym = f"{int(_mh_year):04d}-{int(_mh_month):02d}"
+    with _mh_col3:
+        st.markdown(f"##### 📋 내 신청 내역 ({_hist_ym})")
+
+    my_list = _erp_list_my_adjustments(current_db, me_name, _hist_ym)
     if not my_list:
-        st.info("이번 달에 등록한 신청이 없습니다.")
+        st.info(f"{_hist_ym} 에 등록한 신청이 없습니다.")
         return
 
     editing_id = st.session_state.get("my_adj_editing_id")
@@ -16911,8 +16830,8 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                 ec_kind = st.selectbox(
                     "유형",
                     options=list(_ERP_ADJ_KINDS),
-                    index=list(_ERP_ADJ_KINDS).index(kind) if kind in _ERP_ADJ_KINDS else 4,
-                    format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "기타 (±)",
+                    index=list(_ERP_ADJ_KINDS).index(kind) if kind in _ERP_ADJ_KINDS else list(_ERP_ADJ_KINDS).index("etc"),
+                    format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "특이사항 결재 (±)",
                     key=f"my_edit_kind_{adj_id}",
                 )
                 if ec_kind == "etc":
@@ -16945,7 +16864,7 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                     st.rerun()
                 if save_btn:
                     if ec_kind == "etc" and not (ec_reason or "").strip():
-                        st.error("기타 유형은 사유를 입력해 주세요.")
+                        st.error("특이사항 결재는 사유를 반드시 입력해 주세요.")
                     else:
                         patch = {
                             "target_date": ec_date.isoformat(),
