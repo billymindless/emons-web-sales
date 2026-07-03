@@ -5738,38 +5738,13 @@ else:
 
 def _open_dialog(title: str, render_fn, *, width: str = "large",
                  fallback_expander: bool = True) -> None:
-    """공통 팝업(모달) 헬퍼.
+    """공통 팝업(모달) 헬퍼 (app.py 내부 호환용 얇은 래퍼).
 
-    Streamlit `st.dialog` (v1.33+) 데코레이터로 팝업을 열고, 지원 안 될 경우
-    `st.expander` 로 폴백한다. 저장/취소 후에는 `render_fn` 내부에서
-    `st.rerun()` 을 호출해 팝업을 닫는 흐름.
-
-    - `render_fn`: 팝업 안 UI 를 그리는 무인자 함수.
-    - `width`: 'small' | 'medium' | 'large' (`st.dialog` width 인자).
-    - `fallback_expander`: True 면 폴백 시 expander 사용, False 면 인라인 렌더.
+    구현은 `ui_dialogs.open_dialog` 에 있음. 순환 import 방지를 위해
+    실제 로직은 별도 모듈로 분리해 두었다.
     """
-    if hasattr(st, "dialog"):
-        try:
-            try:
-                dec = st.dialog(title, width=width)
-            except TypeError:
-                # 구버전 Streamlit: width 인자 미지원
-                dec = st.dialog(title)
-
-            @dec
-            def _dlg():
-                render_fn()
-
-            _dlg()
-            return
-        except Exception:
-            # st.dialog 호출 자체가 실패하면 폴백으로 진행
-            pass
-    if fallback_expander:
-        with st.expander(f"📌 {title}", expanded=True):
-            render_fn()
-    else:
-        render_fn()
+    from ui_dialogs import open_dialog as _od  # noqa: WPS433
+    _od(title, render_fn, width=width, fallback_expander=fallback_expander)
 
 
 # ========== 로그인 페이지 ==========

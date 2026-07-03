@@ -757,7 +757,7 @@ def render_lead_management() -> None:
 
     # ── 채널톡 가져오기 · 리드 등록 폼: 팝업(모달) ──────────
     # st.dialog 기반 공통 헬퍼. 미지원 환경에서는 expander 로 폴백.
-    from app import _open_dialog  # noqa: WPS433 (circular import 방지 · lazy import)
+    from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
 
     if st.session_state.get("lead_show_import"):
         _open_dialog(
