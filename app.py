@@ -12580,157 +12580,166 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                 st.warning("YYYY-MM 형식으로 입력해 주세요.")
     _events = _erp_store_events_cached(current_db, se_ym)
     _editing_id = st.session_state.get("se_editing_id")
+
+    def _render_store_event_edit_form(ev: dict) -> None:
+        """매장 공용 일정 수정 팝업 UI. 저장/취소 시 se_editing_id 초기화 후 rerun."""
+        _ev_id = int(ev["id"])
+        _ev_start = str(ev.get("event_date") or "")[:10]
+        _ev_end = str(ev.get("end_date") or "")[:10] if ev.get("end_date") else ""
+        try:
+            _cur_start = date.fromisoformat(_ev_start)
+        except Exception:
+            _cur_start = _today
+        try:
+            _cur_end = date.fromisoformat(_ev_end) if _ev_end else _cur_start
+        except Exception:
+            _cur_end = _cur_start
+        _cur_st_s = str(ev.get("start_time") or "")[:5]
+        _cur_et_s = str(ev.get("end_time") or "")[:5]
+        _is_multi_cur = bool(_ev_end) and (_ev_end != _ev_start)
+        _has_time_cur = bool(_cur_st_s and _cur_et_s)
+
+        _rc1, _rc2 = st.columns([1, 1])
+        with _rc1:
+            _edit_span = st.radio(
+                "기간 유형", ["하루", "여러 날"],
+                index=1 if _is_multi_cur else 0,
+                horizontal=True, key=f"se_edit_span_{_ev_id}",
+            )
+        with _rc2:
+            _edit_time_mode = st.radio(
+                "시간 유형", ["종일", "시간대 지정"],
+                index=1 if _has_time_cur else 0,
+                horizontal=True, key=f"se_edit_time_mode_{_ev_id}",
+            )
+
+        with st.form(f"se_edit_form_{_ev_id}", clear_on_submit=False):
+            if _edit_span == "하루":
+                _new_start = st.date_input("날짜", value=_cur_start, key=f"se_edit_dt_{_ev_id}")
+                _new_title = st.text_input("제목", value=ev.get("title") or "", key=f"se_edit_title_{_ev_id}")
+                _new_end = _new_start
+            else:
+                _ec1a, _ec1b = st.columns(2)
+                with _ec1a:
+                    _new_start = st.date_input("시작일", value=_cur_start, key=f"se_edit_dt_s_{_ev_id}")
+                with _ec1b:
+                    _new_end = st.date_input(
+                        "종료일",
+                        value=_cur_end if _cur_end >= _cur_start else _cur_start,
+                        key=f"se_edit_dt_e_{_ev_id}",
+                    )
+                _new_title = st.text_input("제목", value=ev.get("title") or "", key=f"se_edit_title_m_{_ev_id}")
+
+            if _edit_time_mode == "시간대 지정":
+                try:
+                    _st_default = dt_time(int(_cur_st_s.split(":")[0]), int(_cur_st_s.split(":")[1])) if _cur_st_s else dt_time(18, 0)
+                except Exception:
+                    _st_default = dt_time(18, 0)
+                try:
+                    _et_default = dt_time(int(_cur_et_s.split(":")[0]), int(_cur_et_s.split(":")[1])) if _cur_et_s else dt_time(20, 0)
+                except Exception:
+                    _et_default = dt_time(20, 0)
+                _ec4, _ec5 = st.columns(2)
+                with _ec4:
+                    _new_st_t = _erp_time_input_30min("시작 시각", value=_st_default, key=f"se_edit_st_{_ev_id}")
+                with _ec5:
+                    _new_et_t = _erp_time_input_30min("종료 시각", value=_et_default, key=f"se_edit_et_{_ev_id}")
+                _new_has_time = True
+            else:
+                _new_st_t = None
+                _new_et_t = None
+                _new_has_time = False
+
+            _new_note = st.text_input("메모 (선택)", value=ev.get("note") or "", key=f"se_edit_note_{_ev_id}")
+
+            _bc1, _bc2 = st.columns([1, 1])
+            with _bc1:
+                _save_btn = st.form_submit_button("💾 저장", type="primary", width="stretch")
+            with _bc2:
+                _cancel_btn = st.form_submit_button("취소", width="stretch")
+
+        if _cancel_btn:
+            st.session_state.pop("se_editing_id", None)
+            st.rerun()
+        if _save_btn:
+            if not (_new_title or "").strip():
+                st.error("제목을 입력해 주세요.")
+            elif _new_end < _new_start:
+                st.error("종료일이 시작일보다 빠를 수 없습니다.")
+            elif _new_has_time and (_new_et_t.hour * 60 + _new_et_t.minute) <= (_new_st_t.hour * 60 + _new_st_t.minute):
+                st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
+            else:
+                _is_multi_new = (_new_end != _new_start)
+                _patch = {
+                    "event_date": _new_start.isoformat(),
+                    "end_date": _new_end.isoformat() if _is_multi_new else None,
+                    "title": _new_title.strip(),
+                    "start_time": _new_st_t.strftime("%H:%M:%S") if _new_has_time else None,
+                    "end_time": _new_et_t.strftime("%H:%M:%S") if _new_has_time else None,
+                    "note": (_new_note or "").strip() or None,
+                }
+                ok, e = _erp_update_row("app_store_events", _ev_id, _patch)
+                if not ok and ("end_date" in str(e) or "PGRST204" in str(e) or "schema cache" in str(e).lower()):
+                    _patch_legacy = {k: v for k, v in _patch.items() if k != "end_date"}
+                    ok, e = _erp_update_row("app_store_events", _ev_id, _patch_legacy)
+                if ok:
+                    _erp_store_events_cached.clear()
+                    st.session_state.pop("se_editing_id", None)
+                    flash("매장 공용 일정이 수정되었습니다.")
+                    st.rerun()
+                else:
+                    st.error(f"수정 실패: {e}")
+
     if _events:
         st.caption(f"등록된 일정 {len(_events)}건")
         for _ev in _events:
             _ev_id = int(_ev["id"])
             _ev_start = str(_ev.get("event_date") or "")[:10]
             _ev_end = str(_ev.get("end_date") or "")[:10] if _ev.get("end_date") else ""
-
-            if _editing_id == _ev_id:
-                # 인라인 수정 모드
-                try:
-                    _cur_start = date.fromisoformat(_ev_start)
-                except Exception:
-                    _cur_start = _today
-                try:
-                    _cur_end = date.fromisoformat(_ev_end) if _ev_end else _cur_start
-                except Exception:
-                    _cur_end = _cur_start
-                _cur_st_s = str(_ev.get("start_time") or "")[:5]
-                _cur_et_s = str(_ev.get("end_time") or "")[:5]
-                _is_multi_cur = bool(_ev_end) and (_ev_end != _ev_start)
-                _has_time_cur = bool(_cur_st_s and _cur_et_s)
-
-                with st.container(border=True):
-                    st.markdown(f"**✏️ 일정 수정 (#{_ev_id})**")
-                    _rc1, _rc2 = st.columns([1, 1])
-                    with _rc1:
-                        _edit_span = st.radio(
-                            "기간 유형", ["하루", "여러 날"],
-                            index=1 if _is_multi_cur else 0,
-                            horizontal=True, key=f"se_edit_span_{_ev_id}",
-                        )
-                    with _rc2:
-                        _edit_time_mode = st.radio(
-                            "시간 유형", ["종일", "시간대 지정"],
-                            index=1 if _has_time_cur else 0,
-                            horizontal=True, key=f"se_edit_time_mode_{_ev_id}",
-                        )
-
-                    with st.form(f"se_edit_form_{_ev_id}", clear_on_submit=False):
-                        if _edit_span == "하루":
-                            _ec1, _ec2 = st.columns([1, 3])
-                            with _ec1:
-                                _new_start = st.date_input("날짜", value=_cur_start, key=f"se_edit_dt_{_ev_id}")
-                            with _ec2:
-                                _new_title = st.text_input("제목", value=_ev.get("title") or "", key=f"se_edit_title_{_ev_id}")
-                            _new_end = _new_start
-                        else:
-                            _ec1a, _ec1b, _ec2 = st.columns([1, 1, 3])
-                            with _ec1a:
-                                _new_start = st.date_input("시작일", value=_cur_start, key=f"se_edit_dt_s_{_ev_id}")
-                            with _ec1b:
-                                _new_end = st.date_input(
-                                    "종료일",
-                                    value=_cur_end if _cur_end >= _cur_start else _cur_start,
-                                    key=f"se_edit_dt_e_{_ev_id}",
-                                )
-                            with _ec2:
-                                _new_title = st.text_input("제목", value=_ev.get("title") or "", key=f"se_edit_title_m_{_ev_id}")
-
-                        if _edit_time_mode == "시간대 지정":
-                            try:
-                                _st_default = dt_time(int(_cur_st_s.split(":")[0]), int(_cur_st_s.split(":")[1])) if _cur_st_s else dt_time(18, 0)
-                            except Exception:
-                                _st_default = dt_time(18, 0)
-                            try:
-                                _et_default = dt_time(int(_cur_et_s.split(":")[0]), int(_cur_et_s.split(":")[1])) if _cur_et_s else dt_time(20, 0)
-                            except Exception:
-                                _et_default = dt_time(20, 0)
-                            _ec4, _ec5 = st.columns(2)
-                            with _ec4:
-                                _new_st_t = _erp_time_input_30min("시작 시각", value=_st_default, key=f"se_edit_st_{_ev_id}")
-                            with _ec5:
-                                _new_et_t = _erp_time_input_30min("종료 시각", value=_et_default, key=f"se_edit_et_{_ev_id}")
-                            _new_has_time = True
-                        else:
-                            _new_st_t = None
-                            _new_et_t = None
-                            _new_has_time = False
-
-                        _new_note = st.text_input("메모 (선택)", value=_ev.get("note") or "", key=f"se_edit_note_{_ev_id}")
-
-                        _bc1, _bc2, _bc3 = st.columns([1, 1, 4])
-                        with _bc1:
-                            _save_btn = st.form_submit_button("💾 저장", type="primary")
-                        with _bc2:
-                            _cancel_btn = st.form_submit_button("취소")
-
-                    if _cancel_btn:
-                        st.session_state.pop("se_editing_id", None)
+            _ec = st.columns([2, 2, 1.5, 3, 0.6, 0.6])
+            with _ec[0]:
+                if _ev_end and _ev_end != _ev_start:
+                    st.markdown(f"**{_ev_start} ~ {_ev_end}**")
+                else:
+                    st.markdown(f"**{_ev_start}**")
+            with _ec[1]:
+                st.markdown(_ev.get("title") or "-")
+            with _ec[2]:
+                _ss = str(_ev.get("start_time") or "")[:5]
+                _ee = str(_ev.get("end_time") or "")[:5]
+                st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "종일")
+            with _ec[3]:
+                st.caption(_ev.get("note") or "")
+            with _ec[4]:
+                if st.button("✏️", key=f"se_edit_{_ev_id}", help="수정"):
+                    st.session_state["se_editing_id"] = _ev_id
+                    st.rerun()
+            with _ec[5]:
+                if st.button("🗑️", key=f"se_del_{_ev_id}", help="삭제"):
+                    ok, e = _erp_delete_row("app_store_events", _ev_id)
+                    if ok:
+                        _erp_store_events_cached.clear()
+                        if st.session_state.get("se_editing_id") == _ev_id:
+                            st.session_state.pop("se_editing_id", None)
+                        flash("매장 공용 일정이 삭제되었습니다.")
                         st.rerun()
-                    if _save_btn:
-                        if not (_new_title or "").strip():
-                            st.error("제목을 입력해 주세요.")
-                        elif _new_end < _new_start:
-                            st.error("종료일이 시작일보다 빠를 수 없습니다.")
-                        elif _new_has_time and (_new_et_t.hour * 60 + _new_et_t.minute) <= (_new_st_t.hour * 60 + _new_st_t.minute):
-                            st.error("종료 시각이 시작 시각보다 늦어야 합니다.")
-                        else:
-                            _is_multi_new = (_new_end != _new_start)
-                            _patch = {
-                                "event_date": _new_start.isoformat(),
-                                "end_date": _new_end.isoformat() if _is_multi_new else None,
-                                "title": _new_title.strip(),
-                                "start_time": _new_st_t.strftime("%H:%M:%S") if _new_has_time else None,
-                                "end_time": _new_et_t.strftime("%H:%M:%S") if _new_has_time else None,
-                                "note": (_new_note or "").strip() or None,
-                            }
-                            ok, e = _erp_update_row("app_store_events", _ev_id, _patch)
-                            # end_date 컬럼이 없는 구 스키마 대응
-                            if not ok and ("end_date" in str(e) or "PGRST204" in str(e) or "schema cache" in str(e).lower()):
-                                _patch_legacy = {k: v for k, v in _patch.items() if k != "end_date"}
-                                ok, e = _erp_update_row("app_store_events", _ev_id, _patch_legacy)
-                            if ok:
-                                _erp_store_events_cached.clear()
-                                st.session_state.pop("se_editing_id", None)
-                                flash("매장 공용 일정이 수정되었습니다.")
-                                st.rerun()
-                            else:
-                                st.error(f"수정 실패: {e}")
-            else:
-                _ec = st.columns([2, 2, 1.5, 3, 0.6, 0.6])
-                with _ec[0]:
-                    if _ev_end and _ev_end != _ev_start:
-                        st.markdown(f"**{_ev_start} ~ {_ev_end}**")
                     else:
-                        st.markdown(f"**{_ev_start}**")
-                with _ec[1]:
-                    st.markdown(_ev.get("title") or "-")
-                with _ec[2]:
-                    _ss = str(_ev.get("start_time") or "")[:5]
-                    _ee = str(_ev.get("end_time") or "")[:5]
-                    st.markdown(f"{_ss}~{_ee}" if _ss and _ee else "종일")
-                with _ec[3]:
-                    st.caption(_ev.get("note") or "")
-                with _ec[4]:
-                    if st.button("✏️", key=f"se_edit_{_ev_id}", help="수정"):
-                        st.session_state["se_editing_id"] = _ev_id
-                        st.rerun()
-                with _ec[5]:
-                    if st.button("🗑️", key=f"se_del_{_ev_id}", help="삭제"):
-                        ok, e = _erp_delete_row("app_store_events", _ev_id)
-                        if ok:
-                            _erp_store_events_cached.clear()
-                            if st.session_state.get("se_editing_id") == _ev_id:
-                                st.session_state.pop("se_editing_id", None)
-                            flash("매장 공용 일정이 삭제되었습니다.")
-                            st.rerun()
-                        else:
-                            st.error(f"삭제 실패: {e}")
+                        st.error(f"삭제 실패: {e}")
     else:
         st.info(f"{se_ym} 등록된 매장 공용 일정이 없습니다.")
+
+    # ── 팝업(모달): 편집 대상이 지정되어 있으면 열기 ──
+    if _editing_id:
+        _ev_target = next((e for e in (_events or []) if int(e["id"]) == _editing_id), None)
+        if _ev_target:
+            from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+            _open_dialog(
+                f"✏️ 일정 수정 #{_editing_id}",
+                lambda ev=_ev_target: _render_store_event_edit_form(ev),
+                width="medium",
+            )
+        else:
+            st.session_state.pop("se_editing_id", None)
 
     # 기간/시간 유형은 폼 외부에서 라디오 선택 → 폼 내부 입력이 즉시 반응
     sec_outer = st.columns([1, 1])
@@ -15178,87 +15187,88 @@ def render_document_library():
         if st.button("✏️ 글쓰기", type="primary", use_container_width=True, key="doc_add_btn"):
             st.session_state["doc_show_form"] = not st.session_state.get("doc_show_form", False)
 
-    # ── 글쓰기 폼 ─────────────────────────────────────────────────
-    if st.session_state.get("doc_show_form"):
-        with st.container(border=True):
-            st.subheader("📝 새 자료 등록")
-            _fa1, _fa2 = st.columns([1, 1])
-            with _fa1:
-                _existing_cats = [c for c in _cat_tree if c != "미분류"] + ["미분류"]
-                _f_cat_sel = st.selectbox("카테고리", ["직접 입력"] + _existing_cats, key="doc_f_cat_sel")
-                if _f_cat_sel == "직접 입력":
-                    _f_cat = st.text_input("새 카테고리명", key="doc_f_cat_new",
-                                           placeholder="예: 주간회의")
-                else:
-                    _f_cat = _f_cat_sel
-            with _fa2:
-                _existing_subs = sorted(
-                    [s for s in _cat_tree.get(_f_cat if "_f_cat" in dir() else "", {})
-                     if s != "__root__"]
-                ) if "_f_cat" in dir() else []
-                _f_sub_sel = st.selectbox("하위 카테고리 (선택)", ["없음", "직접 입력"] + _existing_subs,
-                                          key="doc_f_sub_sel")
-                if _f_sub_sel == "직접 입력":
-                    _f_sub = st.text_input("새 하위 카테고리명", key="doc_f_sub_new",
-                                           placeholder="예: 2026-W25")
-                elif _f_sub_sel == "없음":
-                    _f_sub = ""
-                else:
-                    _f_sub = _f_sub_sel
-
-            _f_title = st.text_input("제목 *", key="doc_f_title", placeholder="자료 제목을 입력하세요")
-            st.markdown("**내용**")
-            if _HAS_QUILL:
-                _f_content = _st_quill(
-                    placeholder="내용을 입력하거나, 다른 곳에서 서식 있는 텍스트를 붙여넣기 하세요.",
-                    html=True, key="doc_f_content",
-                )
+    # ── 글쓰기 팝업(모달) ─────────────────────────────────────────
+    def _render_doc_create_form() -> None:
+        _fa1, _fa2 = st.columns([1, 1])
+        with _fa1:
+            _existing_cats = [c for c in _cat_tree if c != "미분류"] + ["미분류"]
+            _f_cat_sel = st.selectbox("카테고리", ["직접 입력"] + _existing_cats, key="doc_f_cat_sel")
+            if _f_cat_sel == "직접 입력":
+                _f_cat = st.text_input("새 카테고리명", key="doc_f_cat_new",
+                                       placeholder="예: 주간회의")
             else:
-                _f_content = st.text_area("내용", key="doc_f_content", height=220)
-            _f_tags = st.text_input("태그 (쉼표 구분)", key="doc_f_tags",
-                                    placeholder="예: 가이드, 인사, 2026")
-            _f_file = st.file_uploader("첨부파일 (선택)", key="doc_f_file",
-                                       help="PDF, Word, Excel, 이미지 등 모든 형식 (최대 50MB)")
-            _fb1, _fb2 = st.columns([1, 5])
-            with _fb1:
-                if st.button("등록", type="primary", key="doc_f_submit"):
-                    if not _f_title.strip():
-                        st.error("제목을 입력해 주세요.")
-                    elif not _f_cat.strip():
-                        st.error("카테고리를 입력해 주세요.")
-                    else:
-                        try:
-                            _row = {
-                                "title":       _f_title.strip(),
-                                "content":     (_f_content or "").strip(),
-                                "author":      _me or "unknown",
-                                "tags":        _f_tags.strip(),
-                                "category":    _f_cat.strip(),
-                                "subcategory": _f_sub.strip(),
-                            }
-                            _res    = client.table("app_documents").insert(_row).execute()
-                            _new_id = _res.data[0]["id"] if _res.data else None
-                            if _f_file and _new_id:
-                                with st.spinner("파일 업로드 중..."):
-                                    try:
-                                        _url, _fname = _upload_file(_new_id, _f_file)
-                                        client.table("app_documents").update({
-                                            "file_url":  _url,
-                                            "file_name": _fname,
-                                            "file_size": _f_file.size,
-                                        }).eq("id", _new_id).execute()
-                                    except Exception as _ue:
-                                        st.warning(f"파일 업로드 실패 (글은 저장됨): {_ue}")
-                            st.success("자료가 등록되었습니다.")
-                            st.session_state["doc_show_form"] = False
-                            st.cache_data.clear()
-                            st.rerun()
-                        except Exception as _e:
-                            st.error(f"등록 실패: {_e}")
-            with _fb2:
-                if st.button("취소", key="doc_f_cancel"):
-                    st.session_state["doc_show_form"] = False
-                    st.rerun()
+                _f_cat = _f_cat_sel
+        with _fa2:
+            _existing_subs = sorted(
+                [s for s in _cat_tree.get(_f_cat, {}) if s != "__root__"]
+            )
+            _f_sub_sel = st.selectbox("하위 카테고리 (선택)", ["없음", "직접 입력"] + _existing_subs,
+                                      key="doc_f_sub_sel")
+            if _f_sub_sel == "직접 입력":
+                _f_sub = st.text_input("새 하위 카테고리명", key="doc_f_sub_new",
+                                       placeholder="예: 2026-W25")
+            elif _f_sub_sel == "없음":
+                _f_sub = ""
+            else:
+                _f_sub = _f_sub_sel
+
+        _f_title = st.text_input("제목 *", key="doc_f_title", placeholder="자료 제목을 입력하세요")
+        st.markdown("**내용**")
+        if _HAS_QUILL:
+            _f_content = _st_quill(
+                placeholder="내용을 입력하거나, 다른 곳에서 서식 있는 텍스트를 붙여넣기 하세요.",
+                html=True, key="doc_f_content",
+            )
+        else:
+            _f_content = st.text_area("내용", key="doc_f_content", height=220)
+        _f_tags = st.text_input("태그 (쉼표 구분)", key="doc_f_tags",
+                                placeholder="예: 가이드, 인사, 2026")
+        _f_file = st.file_uploader("첨부파일 (선택)", key="doc_f_file",
+                                   help="PDF, Word, Excel, 이미지 등 모든 형식 (최대 50MB)")
+        _fb1, _fb2 = st.columns([1, 1])
+        with _fb1:
+            if st.button("등록", type="primary", key="doc_f_submit", width="stretch"):
+                if not _f_title.strip():
+                    st.error("제목을 입력해 주세요.")
+                elif not _f_cat.strip():
+                    st.error("카테고리를 입력해 주세요.")
+                else:
+                    try:
+                        _row = {
+                            "title":       _f_title.strip(),
+                            "content":     (_f_content or "").strip(),
+                            "author":      _me or "unknown",
+                            "tags":        _f_tags.strip(),
+                            "category":    _f_cat.strip(),
+                            "subcategory": _f_sub.strip(),
+                        }
+                        _res    = client.table("app_documents").insert(_row).execute()
+                        _new_id = _res.data[0]["id"] if _res.data else None
+                        if _f_file and _new_id:
+                            with st.spinner("파일 업로드 중..."):
+                                try:
+                                    _url, _fname = _upload_file(_new_id, _f_file)
+                                    client.table("app_documents").update({
+                                        "file_url":  _url,
+                                        "file_name": _fname,
+                                        "file_size": _f_file.size,
+                                    }).eq("id", _new_id).execute()
+                                except Exception as _ue:
+                                    st.warning(f"파일 업로드 실패 (글은 저장됨): {_ue}")
+                        st.success("자료가 등록되었습니다.")
+                        st.session_state["doc_show_form"] = False
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as _e:
+                        st.error(f"등록 실패: {_e}")
+        with _fb2:
+            if st.button("취소", key="doc_f_cancel", width="stretch"):
+                st.session_state["doc_show_form"] = False
+                st.rerun()
+
+    if st.session_state.get("doc_show_form"):
+        from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+        _open_dialog("📝 새 자료 등록", _render_doc_create_form, width="large")
 
     # ── 2단 레이아웃: 카테고리 트리(좌) + 문서 목록(우) ─────────
     _lc, _rc = st.columns([1, 3], gap="medium")
@@ -15469,77 +15479,88 @@ def render_document_library():
                                 st.rerun()
 
                     if st.session_state.get(f"doc_editing_{_doc_id}"):
-                        st.markdown("---")
-                        _ea1, _ea2 = st.columns([1, 1])
-                        with _ea1:
-                            _et_cat_sel = st.selectbox(
-                                "카테고리", ["직접 입력"] + sorted(_cat_tree.keys()),
-                                index=(["직접 입력"] + sorted(_cat_tree.keys())).index(_doc_cat)
-                                if _doc_cat in _cat_tree else 0,
-                                key=f"doc_et_cat_{_doc_id}",
-                            )
-                            _et_cat = (
-                                st.text_input("새 카테고리명", value=_doc_cat, key=f"doc_et_catn_{_doc_id}")
-                                if _et_cat_sel == "직접 입력" else _et_cat_sel
-                            )
-                        with _ea2:
-                            _subs_for_edit = sorted(
-                                s for s in _cat_tree.get(_et_cat, {}) if s != "__root__"
-                            )
-                            _et_sub_sel = st.selectbox(
-                                "하위 카테고리", ["없음", "직접 입력"] + _subs_for_edit,
-                                index=(["없음", "직접 입력"] + _subs_for_edit).index(_doc_sub)
-                                if _doc_sub in _subs_for_edit else 0,
-                                key=f"doc_et_sub_{_doc_id}",
-                            )
-                            if _et_sub_sel == "직접 입력":
-                                _et_sub = st.text_input("새 하위 카테고리명", value=_doc_sub,
-                                                        key=f"doc_et_subn_{_doc_id}")
-                            elif _et_sub_sel == "없음":
-                                _et_sub = ""
-                            else:
-                                _et_sub = _et_sub_sel
+                        def _render_doc_edit_form(
+                            doc_id=_doc_id, doc_title=_doc_title, doc_content=_doc_content,
+                            doc_tags=_doc_tags, doc_cat=_doc_cat, doc_sub=_doc_sub,
+                            doc_fname=_doc_fname,
+                        ) -> None:
+                            _ea1, _ea2 = st.columns([1, 1])
+                            with _ea1:
+                                _et_cat_sel = st.selectbox(
+                                    "카테고리", ["직접 입력"] + sorted(_cat_tree.keys()),
+                                    index=(["직접 입력"] + sorted(_cat_tree.keys())).index(doc_cat)
+                                    if doc_cat in _cat_tree else 0,
+                                    key=f"doc_et_cat_{doc_id}",
+                                )
+                                _et_cat = (
+                                    st.text_input("새 카테고리명", value=doc_cat, key=f"doc_et_catn_{doc_id}")
+                                    if _et_cat_sel == "직접 입력" else _et_cat_sel
+                                )
+                            with _ea2:
+                                _subs_for_edit = sorted(
+                                    s for s in _cat_tree.get(_et_cat, {}) if s != "__root__"
+                                )
+                                _et_sub_sel = st.selectbox(
+                                    "하위 카테고리", ["없음", "직접 입력"] + _subs_for_edit,
+                                    index=(["없음", "직접 입력"] + _subs_for_edit).index(doc_sub)
+                                    if doc_sub in _subs_for_edit else 0,
+                                    key=f"doc_et_sub_{doc_id}",
+                                )
+                                if _et_sub_sel == "직접 입력":
+                                    _et_sub = st.text_input("새 하위 카테고리명", value=doc_sub,
+                                                            key=f"doc_et_subn_{doc_id}")
+                                elif _et_sub_sel == "없음":
+                                    _et_sub = ""
+                                else:
+                                    _et_sub = _et_sub_sel
 
-                        _et  = st.text_input("제목", value=_doc_title, key=f"doc_et_{_doc_id}")
-                        st.markdown("**내용**")
-                        if _HAS_QUILL:
-                            _ec = _st_quill(value=_doc_content or "", html=True, key=f"doc_ec_{_doc_id}")
-                        else:
-                            _ec = st.text_area("내용", value=_doc_content, height=200, key=f"doc_ec_{_doc_id}")
-                        _eg = st.text_input("태그", value=_doc_tags, key=f"doc_eg_{_doc_id}")
-                        _ef = st.file_uploader("첨부파일 교체 (선택)", key=f"doc_ef_{_doc_id}",
-                                               help="새 파일을 올리면 기존 파일이 교체됩니다.")
-                        if _doc_fname:
-                            st.caption(f"현재 첨부파일: 📎 {_doc_fname}")
-                        _es1, _es2 = st.columns([1, 5])
-                        with _es1:
-                            if st.button("저장", type="primary", key=f"doc_save_{_doc_id}"):
-                                try:
-                                    _upd = {
-                                        "title":       _et.strip(),
-                                        "content":     (_ec or "").strip(),
-                                        "tags":        _eg.strip(),
-                                        "category":    _et_cat.strip(),
-                                        "subcategory": _et_sub.strip(),
-                                        "updated_at":  _dtmod.datetime.utcnow().isoformat(),
-                                    }
-                                    if _ef:
-                                        with st.spinner("파일 업로드 중..."):
-                                            _nurl, _nfname = _upload_file(_doc_id, _ef)
-                                        _upd["file_url"]  = _nurl
-                                        _upd["file_name"] = _nfname
-                                        _upd["file_size"] = _ef.size
-                                    client.table("app_documents").update(_upd).eq("id", _doc_id).execute()
-                                    st.success("수정되었습니다.")
-                                    st.session_state.pop(f"doc_editing_{_doc_id}", None)
-                                    st.cache_data.clear()
+                            _et  = st.text_input("제목", value=doc_title, key=f"doc_et_{doc_id}")
+                            st.markdown("**내용**")
+                            if _HAS_QUILL:
+                                _ec = _st_quill(value=doc_content or "", html=True, key=f"doc_ec_{doc_id}")
+                            else:
+                                _ec = st.text_area("내용", value=doc_content, height=200, key=f"doc_ec_{doc_id}")
+                            _eg = st.text_input("태그", value=doc_tags, key=f"doc_eg_{doc_id}")
+                            _ef = st.file_uploader("첨부파일 교체 (선택)", key=f"doc_ef_{doc_id}",
+                                                   help="새 파일을 올리면 기존 파일이 교체됩니다.")
+                            if doc_fname:
+                                st.caption(f"현재 첨부파일: 📎 {doc_fname}")
+                            _es1, _es2 = st.columns([1, 1])
+                            with _es1:
+                                if st.button("저장", type="primary", key=f"doc_save_{doc_id}", width="stretch"):
+                                    try:
+                                        _upd = {
+                                            "title":       _et.strip(),
+                                            "content":     (_ec or "").strip(),
+                                            "tags":        _eg.strip(),
+                                            "category":    _et_cat.strip(),
+                                            "subcategory": _et_sub.strip(),
+                                            "updated_at":  _dtmod.datetime.utcnow().isoformat(),
+                                        }
+                                        if _ef:
+                                            with st.spinner("파일 업로드 중..."):
+                                                _nurl, _nfname = _upload_file(doc_id, _ef)
+                                            _upd["file_url"]  = _nurl
+                                            _upd["file_name"] = _nfname
+                                            _upd["file_size"] = _ef.size
+                                        client.table("app_documents").update(_upd).eq("id", doc_id).execute()
+                                        st.success("수정되었습니다.")
+                                        st.session_state.pop(f"doc_editing_{doc_id}", None)
+                                        st.cache_data.clear()
+                                        st.rerun()
+                                    except Exception as _e:
+                                        st.error(f"수정 실패: {_e}")
+                            with _es2:
+                                if st.button("취소", key=f"doc_edit_cancel_{doc_id}", width="stretch"):
+                                    st.session_state.pop(f"doc_editing_{doc_id}", None)
                                     st.rerun()
-                                except Exception as _e:
-                                    st.error(f"수정 실패: {_e}")
-                        with _es2:
-                            if st.button("취소", key=f"doc_edit_cancel_{_doc_id}"):
-                                st.session_state.pop(f"doc_editing_{_doc_id}", None)
-                                st.rerun()
+
+                        from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+                        _open_dialog(
+                            f"✏️ 문서 수정: {_doc_title[:40]}",
+                            _render_doc_edit_form,
+                            width="large",
+                        )
 
 
 # =====================================================================
@@ -16852,6 +16873,67 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
         return
 
     editing_id = st.session_state.get("my_adj_editing_id")
+
+    def _render_my_adj_edit_form(adj: dict) -> None:
+        """내 신청 수정 팝업 UI. 저장/취소 시 세션 키 정리 후 rerun 으로 닫힘."""
+        adj_id = int(adj["id"])
+        kind = adj.get("kind") or "etc"
+        sign = adj.get("sign") or "+"
+        minutes = int(adj.get("minutes") or 0)
+        ec_kind = st.selectbox(
+            "유형",
+            options=list(_ERP_ADJ_KINDS),
+            index=list(_ERP_ADJ_KINDS).index(kind) if kind in _ERP_ADJ_KINDS else list(_ERP_ADJ_KINDS).index("etc"),
+            format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "특이사항 결재 (±)",
+            key=f"my_edit_kind_{adj_id}",
+        )
+        if ec_kind == "etc":
+            ec_sign = st.radio("부호", ["+", "-"], horizontal=True,
+                               index=0 if sign == "+" else 1, key=f"my_edit_sign_{adj_id}")
+        else:
+            ec_sign = _ERP_ADJ_KIND_DEFAULT_SIGN[ec_kind]
+            st.markdown(f"**부호: {ec_sign}** (유형 고정)")
+
+        with st.form(f"my_edit_form_{adj_id}", clear_on_submit=False):
+            e1, e2 = st.columns([1, 1])
+            with e1:
+                try:
+                    cur_date = date.fromisoformat(str(adj.get("target_date") or "")[:10])
+                except Exception:
+                    cur_date = today
+                ec_date = st.date_input("대상 일자", value=cur_date, key=f"my_edit_date_{adj_id}")
+            with e2:
+                ec_hours = st.number_input("시간(h)", min_value=0.25, max_value=744.0, step=0.5,
+                                           value=round(minutes / 60, 2), key=f"my_edit_h_{adj_id}")
+            ec_reason = st.text_input("사유", value=adj.get("reason") or "", key=f"my_edit_reason_{adj_id}")
+            bc1, bc2 = st.columns([1, 1])
+            with bc1:
+                save_btn = st.form_submit_button("💾 저장", type="primary", width="stretch")
+            with bc2:
+                cancel_btn = st.form_submit_button("취소", width="stretch")
+        if cancel_btn:
+            st.session_state.pop("my_adj_editing_id", None)
+            st.rerun()
+        if save_btn:
+            if ec_kind == "etc" and not (ec_reason or "").strip():
+                st.error("특이사항 결재는 사유를 반드시 입력해 주세요.")
+            else:
+                patch = {
+                    "target_date": ec_date.isoformat(),
+                    "kind": ec_kind,
+                    "sign": ec_sign,
+                    "minutes": int(round(float(ec_hours) * 60)),
+                    "reason": (ec_reason or "").strip() or None,
+                }
+                ok, e = _erp_update_row("app_work_adjustments", adj_id, patch)
+                if ok:
+                    _erp_v2_clear_caches()
+                    st.session_state.pop("my_adj_editing_id", None)
+                    flash("신청이 수정되었습니다.")
+                    st.rerun()
+                else:
+                    st.error(f"수정 실패: {e}")
+
     for adj in my_list:
         adj_id = int(adj["id"])
         kind = adj.get("kind") or "etc"
@@ -16861,97 +16943,52 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
         hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
         status_label = {"pending": "🟡 대기", "approved": "🟢 승인", "rejected": "🔴 반려"}.get(status, status)
 
-        if editing_id == adj_id and status == "pending":
-            with st.container(border=True):
-                st.markdown(f"**✏️ 신청 수정 (#{adj_id})**")
-                ec_kind = st.selectbox(
-                    "유형",
-                    options=list(_ERP_ADJ_KINDS),
-                    index=list(_ERP_ADJ_KINDS).index(kind) if kind in _ERP_ADJ_KINDS else list(_ERP_ADJ_KINDS).index("etc"),
-                    format_func=lambda k: f"{_ERP_ADJ_KIND_LABEL[k]} ({_ERP_ADJ_KIND_DEFAULT_SIGN[k]})" if k != "etc" else "특이사항 결재 (±)",
-                    key=f"my_edit_kind_{adj_id}",
-                )
-                if ec_kind == "etc":
-                    ec_sign = st.radio("부호", ["+", "-"], horizontal=True,
-                                       index=0 if sign == "+" else 1, key=f"my_edit_sign_{adj_id}")
-                else:
-                    ec_sign = _ERP_ADJ_KIND_DEFAULT_SIGN[ec_kind]
-                    st.markdown(f"**부호: {ec_sign}** (유형 고정)")
-
-                with st.form(f"my_edit_form_{adj_id}", clear_on_submit=False):
-                    e1, e2, e3 = st.columns([1, 1, 3])
-                    with e1:
-                        try:
-                            cur_date = date.fromisoformat(str(adj.get("target_date") or "")[:10])
-                        except Exception:
-                            cur_date = today
-                        ec_date = st.date_input("대상 일자", value=cur_date, key=f"my_edit_date_{adj_id}")
-                    with e2:
-                        ec_hours = st.number_input("시간(h)", min_value=0.25, max_value=744.0, step=0.5,
-                                                   value=round(minutes / 60, 2), key=f"my_edit_h_{adj_id}")
-                    with e3:
-                        ec_reason = st.text_input("사유", value=adj.get("reason") or "", key=f"my_edit_reason_{adj_id}")
-                    bc1, bc2, _ = st.columns([1, 1, 4])
-                    with bc1:
-                        save_btn = st.form_submit_button("💾 저장", type="primary")
-                    with bc2:
-                        cancel_btn = st.form_submit_button("취소")
-                if cancel_btn:
-                    st.session_state.pop("my_adj_editing_id", None)
+        cols = st.columns([1, 1.3, 0.4, 1, 3, 1, 0.5, 0.5])
+        with cols[0]:
+            st.markdown(str(adj.get("target_date") or "")[:10])
+        with cols[1]:
+            st.markdown(_ERP_ADJ_KIND_LABEL.get(kind, kind))
+        with cols[2]:
+            st.markdown(f"**{sign}**")
+        with cols[3]:
+            st.markdown(hours_display)
+        with cols[4]:
+            msg = adj.get("reason") or ""
+            if status == "rejected" and adj.get("reject_reason"):
+                msg += f"  ▸ 반려 사유: {adj['reject_reason']}"
+            st.caption(msg)
+        with cols[5]:
+            st.markdown(status_label)
+        with cols[6]:
+            if status == "pending":
+                if st.button("✏️", key=f"my_adj_edit_{adj_id}", help="수정"):
+                    st.session_state["my_adj_editing_id"] = adj_id
                     st.rerun()
-                if save_btn:
-                    if ec_kind == "etc" and not (ec_reason or "").strip():
-                        st.error("특이사항 결재는 사유를 반드시 입력해 주세요.")
-                    else:
-                        patch = {
-                            "target_date": ec_date.isoformat(),
-                            "kind": ec_kind,
-                            "sign": ec_sign,
-                            "minutes": int(round(float(ec_hours) * 60)),
-                            "reason": (ec_reason or "").strip() or None,
-                        }
-                        ok, e = _erp_update_row("app_work_adjustments", adj_id, patch)
-                        if ok:
-                            _erp_v2_clear_caches()
+        with cols[7]:
+            if status == "pending":
+                if st.button("🗑️", key=f"my_adj_del_{adj_id}", help="취소(삭제)"):
+                    ok, e = _erp_delete_row("app_work_adjustments", adj_id)
+                    if ok:
+                        _erp_v2_clear_caches()
+                        if st.session_state.get("my_adj_editing_id") == adj_id:
                             st.session_state.pop("my_adj_editing_id", None)
-                            flash("신청이 수정되었습니다.")
-                            st.rerun()
-                        else:
-                            st.error(f"수정 실패: {e}")
-        else:
-            cols = st.columns([1, 1.3, 0.4, 1, 3, 1, 0.5, 0.5])
-            with cols[0]:
-                st.markdown(str(adj.get("target_date") or "")[:10])
-            with cols[1]:
-                st.markdown(_ERP_ADJ_KIND_LABEL.get(kind, kind))
-            with cols[2]:
-                st.markdown(f"**{sign}**")
-            with cols[3]:
-                st.markdown(hours_display)
-            with cols[4]:
-                msg = adj.get("reason") or ""
-                if status == "rejected" and adj.get("reject_reason"):
-                    msg += f"  ▸ 반려 사유: {adj['reject_reason']}"
-                st.caption(msg)
-            with cols[5]:
-                st.markdown(status_label)
-            with cols[6]:
-                if status == "pending":
-                    if st.button("✏️", key=f"my_adj_edit_{adj_id}", help="수정"):
-                        st.session_state["my_adj_editing_id"] = adj_id
+                        flash("신청이 취소되었습니다.")
                         st.rerun()
-            with cols[7]:
-                if status == "pending":
-                    if st.button("🗑️", key=f"my_adj_del_{adj_id}", help="취소(삭제)"):
-                        ok, e = _erp_delete_row("app_work_adjustments", adj_id)
-                        if ok:
-                            _erp_v2_clear_caches()
-                            if st.session_state.get("my_adj_editing_id") == adj_id:
-                                st.session_state.pop("my_adj_editing_id", None)
-                            flash("신청이 취소되었습니다.")
-                            st.rerun()
-                        else:
-                            st.error(f"취소 실패: {e}")
+                    else:
+                        st.error(f"취소 실패: {e}")
+
+    # ── 팝업(모달): 수정 대상이 지정되어 있고 status=pending 인 경우만 열기 ──
+    if editing_id:
+        _target = next((a for a in my_list if int(a["id"]) == editing_id), None)
+        if _target and (_target.get("status") or "pending") == "pending":
+            from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+            _open_dialog(
+                f"✏️ 신청 수정 #{editing_id}",
+                lambda adj=_target: _render_my_adj_edit_form(adj),
+                width="medium",
+            )
+        else:
+            st.session_state.pop("my_adj_editing_id", None)
 
     # ── 관리자 전용: 근태 기록 검색 / 삭제 ───────────────────────────────
     if role in ("store_admin", "superadmin"):
