@@ -11940,103 +11940,9 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     if _leave["soak_risk"]:
         st.error(f"🔴 연차 소멸 위험 — 잔여 {_annual_remain_days:g}일 / 연말까지 {int(_leave['days_until_year_end'])}일 남음. 연차 사용을 서둘러 주세요.")
 
-    # 관리자 전용 섹션을 위해 호환 변수 유지
-    _ytd_start = date(sel_year, 1, 1)
-    _monthly_target_h = _erp_get_employee_monthly_target(current_db, me_name)
-    _last_day = calendar.monthrange(today.year, today.month)[1]
-    _m_start = date(today.year, today.month, 1)
-    _m_end   = date(today.year, today.month, _last_day)
-    _weekdays_in_month = sum(
-        1 for i in range(1, _last_day + 1)
-        if not _erp_is_weekend_or_holiday(date(today.year, today.month, i))
-    )
-    _name_map = _get_app_user_display_name_map()
-    def _resolve_name(raw: str) -> str:
-        k = str(raw or "").strip()
-        return _name_map.get(k) or _name_map.get(k.lower()) or _email_local_part(k) or k
-
-    # ── 관리자 전용: 매장 전체 직원 현황 (전 매장 합산) ─────────
     if role in ("store_admin", "superadmin"):
-        st.divider()
-        st.markdown(f"##### 👥 {sel_year}년 매장 전체 직원 현황 (이번달 시프트 + 연간 누계)")
-        st.caption("'이번달 근무일·근무(h)·휴무'는 이번달 시프트 기준, '공통 필요·차감·실제·잔여'는 선택한 연도 전체 누계입니다.")
-        _employees = _erp_get_employee_names_for_store(current_db)
-        if not _employees:
-            st.info("배정된 직원이 없습니다.")
-        else:
-            # 전 매장 이번달 시프트 조회 (employee_name 기준, db_filename 무관)
-            _all_month_shifts: list = []
-            try:
-                _cli2, _e2 = get_supabase_client()
-                if not _e2 and _cli2:
-                    _r_all = _cli2.table("app_shift_schedules").select(
-                        "employee_name, shift_date, shift_start, shift_end, db_filename, work_location_name"
-                    ).gte("shift_date", _m_start.isoformat()).lte(
-                        "shift_date", _m_end.isoformat()
-                    ).execute()
-                    _all_month_shifts = list(_r_all.data or [])
-            except Exception:
-                _all_month_shifts = []
-
-            _rows = []
-            for _emp in _employees:
-                # 해당 직원의 시프트: 모든 매장에서 employee_name 이 _emp 인 행
-                _emp_shifts_all = [
-                    s for s in _all_month_shifts
-                    if _resolve_name(s.get("employee_name") or "") == _emp
-                ]
-                # 중복 제거: 같은 날짜에 여러 행이 있으면 가장 긴 근무를 대표로 사용
-                _date_seen: dict[str, float] = {}
-                for _s in _emp_shifts_all:
-                    _sd = str(_s.get("shift_date") or "")[:10]
-                    _sh = _erp_calc_shift_hours(
-                        _erp_parse_time(_s.get("shift_start")),
-                        _erp_parse_time(_s.get("shift_end")),
-                    )
-                    _date_seen[_sd] = _date_seen.get(_sd, 0) + _sh  # 같은 날 여러 매장 합산
-
-                _emp_work_days = len(_date_seen)
-                _emp_work_h = sum(_date_seen.values())
-                _emp_off = max(0, _weekdays_in_month - _emp_work_days)
-                # 연간 breakdown: 통합 정책 (단축근무 누계 통합)
-                _emp_bd = _erp_compute_yearly_breakdown(current_db, _emp, sel_year, _as_of)
-                _emp_required_min = int(_emp_bd["required_min"])
-                _emp_short_adj_min = sum(int(v) for v in (_emp_bd["deductions"] or {}).values())
-                _emp_actual_min = int(_emp_bd["actual_total_min"])
-                _emp_remain_min = (_emp_required_min - _emp_short_adj_min) - _emp_actual_min
-                _emp_leave = _erp_compute_leave_status(current_db, _emp, _as_of)
-                # 장기근속 정보
-                _eg_rows = _erp_fetch_table("app_leave_grants", {
-                    "home_db_filename": current_db, "employee_name": _emp, "year": int(sel_year),
-                })
-                _eg = _eg_rows[0] if _eg_rows else {}
-                _eg_hire = _eg.get("hire_date")
-                _eg_legal: dict = {}
-                if _eg_hire:
-                    try:
-                        _eg_legal = _erp_calc_legal_leave(date.fromisoformat(str(_eg_hire)[:10]), int(sel_year))
-                    except Exception:
-                        pass
-                _eg_yos   = _eg_legal.get("years_of_service", "-")
-                _eg_extra = _eg_legal.get("long_service_extra", 0)
-                _rows.append({
-                    "직원명": _emp,
-                    "이번달 근무일": _emp_work_days,
-                    "이번달 근무(h)": round(_emp_work_h, 1),
-                    "휴무 예정(일)": _emp_off,
-                    "공통 필요(h)": round(_emp_required_min / 60, 1) if _emp_required_min else "-",
-                    "단축근무 누계(h)": round(_emp_short_adj_min / 60, 1),
-                    "실제 근무(h)": round(_emp_actual_min / 60, 1),
-                    "잔여 필요(h)": _erp_fmt_hm(_emp_remain_min) if _emp_required_min else "미설정",
-                    "근속연수": f"{_eg_yos}년" if _eg_hire else "미등록",
-                    "장기근속+": f"+{_eg_extra}일" if _eg_extra > 0 else "-",
-                    "잔여 연차(일)": f"{_emp_leave['annual_remain']:g}",
-                })
-            import pandas as pd
-            st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
-
-        # 관리자 설정(집계 시작일 · 월 목표 근무시간)은 상단 '관리자 메뉴' 탭으로 이동함.
-        st.info("⚙️ 연간 집계 시작일 · 직원별 월 목표 근무시간 설정은 상단 [관리자 메뉴] 탭에서 관리하세요.")
+        # 관리자 설정(집계 시작일 · 월 목표 근무시간 · 직원 현황)은 상단 '관리자 메뉴' 탭으로 이동함.
+        st.info("⚙️ 연간 집계 시작일 · 직원별 월 목표 근무시간 설정 및 직원 현황은 상단 [관리자 메뉴] 탭에서 관리하세요.")
 
     # ── 대시보드 맨 하단: 내 신청 내역 ─────────────────────────
     # 근무시간 관리 탭의 히스토리를 대시보드로 옮겨 첫 화면에서 바로 확인할 수 있게 한다.
@@ -12261,6 +12167,91 @@ def _erp_tab_admin_settings(current_db: str, me_name: str, today: date):
                 st.error(f"저장 완료 {_ok}명 / 실패 {_fail}명.")
     else:
         st.info("배정된 직원이 없습니다.")
+
+    # ── 매장 전체 직원 현황 (이번달 시프트 + 연간 누계) ─────────────
+    st.divider()
+    st.markdown(f"##### 👥 {_ytarget_year}년 매장 전체 직원 현황 (이번달 시프트 + 연간 누계)")
+    st.caption("'이번달 근무일·근무(h)·휴무'는 이번달 시프트 기준, '공통 필요·차감·실제·잔여'는 선택한 연도 전체 누계입니다.")
+    _adm_today = today
+    _adm_last_day = calendar.monthrange(_adm_today.year, _adm_today.month)[1]
+    _adm_m_start = date(_adm_today.year, _adm_today.month, 1)
+    _adm_m_end   = date(_adm_today.year, _adm_today.month, _adm_last_day)
+    _adm_weekdays = sum(
+        1 for i in range(1, _adm_last_day + 1)
+        if not _erp_is_weekend_or_holiday(date(_adm_today.year, _adm_today.month, i))
+    )
+    _adm_name_map = _get_app_user_display_name_map()
+    def _adm_resolve(raw: str) -> str:
+        k = str(raw or "").strip()
+        return _adm_name_map.get(k) or _adm_name_map.get(k.lower()) or _email_local_part(k) or k
+
+    _adm_as_of = min(_adm_today, date(int(_ytarget_year), 12, 31))
+    _adm_employees = _erp_get_employee_names_for_store(current_db)
+    if not _adm_employees:
+        st.info("배정된 직원이 없습니다.")
+    else:
+        _adm_all_shifts: list = []
+        try:
+            _adm_cli, _adm_e = get_supabase_client()
+            if not _adm_e and _adm_cli:
+                _adm_r = _adm_cli.table("app_shift_schedules").select(
+                    "employee_name, shift_date, shift_start, shift_end, db_filename, work_location_name"
+                ).gte("shift_date", _adm_m_start.isoformat()).lte(
+                    "shift_date", _adm_m_end.isoformat()
+                ).execute()
+                _adm_all_shifts = list(_adm_r.data or [])
+        except Exception:
+            _adm_all_shifts = []
+
+        _adm_rows = []
+        for _adm_emp in _adm_employees:
+            _adm_emp_shifts = [
+                s for s in _adm_all_shifts
+                if _adm_resolve(s.get("employee_name") or "") == _adm_emp
+            ]
+            _adm_date_seen: dict[str, float] = {}
+            for _s in _adm_emp_shifts:
+                _sd = str(_s.get("shift_date") or "")[:10]
+                _sh = _erp_calc_shift_hours(
+                    _erp_parse_time(_s.get("shift_start")),
+                    _erp_parse_time(_s.get("shift_end")),
+                )
+                _adm_date_seen[_sd] = _adm_date_seen.get(_sd, 0) + _sh
+            _adm_work_days = len(_adm_date_seen)
+            _adm_work_h = sum(_adm_date_seen.values())
+            _adm_off = max(0, _adm_weekdays - _adm_work_days)
+            _adm_bd = _erp_compute_yearly_breakdown(current_db, _adm_emp, _ytarget_year, _adm_as_of)
+            _adm_req_min = int(_adm_bd["required_min"])
+            _adm_short_min = sum(int(v) for v in (_adm_bd["deductions"] or {}).values())
+            _adm_actual_min = int(_adm_bd["actual_total_min"])
+            _adm_remain_min = (_adm_req_min - _adm_short_min) - _adm_actual_min
+            _adm_leave = _erp_compute_leave_status(current_db, _adm_emp, _adm_as_of)
+            _adm_eg_rows = _erp_fetch_table("app_leave_grants", {
+                "home_db_filename": current_db, "employee_name": _adm_emp, "year": int(_ytarget_year),
+            })
+            _adm_eg = _adm_eg_rows[0] if _adm_eg_rows else {}
+            _adm_eg_hire = _adm_eg.get("hire_date")
+            _adm_eg_legal: dict = {}
+            if _adm_eg_hire:
+                try:
+                    _adm_eg_legal = _erp_calc_legal_leave(date.fromisoformat(str(_adm_eg_hire)[:10]), int(_ytarget_year))
+                except Exception:
+                    pass
+            _adm_rows.append({
+                "직원명": _adm_emp,
+                "이번달 근무일": _adm_work_days,
+                "이번달 근무(h)": round(_adm_work_h, 1),
+                "휴무 예정(일)": _adm_off,
+                "공통 필요(h)": round(_adm_req_min / 60, 1) if _adm_req_min else "-",
+                "단축근무 누계(h)": round(_adm_short_min / 60, 1),
+                "실제 근무(h)": round(_adm_actual_min / 60, 1),
+                "잔여 필요(h)": _erp_fmt_hm(_adm_remain_min) if _adm_req_min else "미설정",
+                "근속연수": f"{_adm_eg_legal.get('years_of_service', '-')}년" if _adm_eg_hire else "미등록",
+                "장기근속+": f"+{_adm_eg_legal.get('long_service_extra', 0)}일" if _adm_eg_legal.get("long_service_extra", 0) > 0 else "-",
+                "잔여 연차(일)": f"{_adm_leave['annual_remain']:g}",
+            })
+        import pandas as pd
+        st.dataframe(pd.DataFrame(_adm_rows), hide_index=True, use_container_width=True)
 
 
 # ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
