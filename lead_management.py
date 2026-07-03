@@ -755,14 +755,23 @@ def render_lead_management() -> None:
             st.session_state["lead_show_import"] = False
             st.session_state.pop("lead_selected_id", None)
 
-    # ── 채널톡 가져오기 패널 ─────────────────────
-    if st.session_state.get("lead_show_import"):
-        _render_import_panel()
+    # ── 채널톡 가져오기 · 리드 등록 폼: 팝업(모달) ──────────
+    # st.dialog 기반 공통 헬퍼. 미지원 환경에서는 expander 로 폴백.
+    from app import _open_dialog  # noqa: WPS433 (circular import 방지 · lazy import)
 
-    # ── 리드 등록 폼 ───────────────────────────
+    if st.session_state.get("lead_show_import"):
+        _open_dialog(
+            "📥 채널톡 유입 고객 가져오기",
+            _render_import_panel,
+            width="medium",
+        )
+
     if st.session_state.get("lead_show_form"):
-        with st.container(border=True):
-            _render_register_form()
+        _open_dialog(
+            "＋ 새 리드 등록",
+            _render_register_form,
+            width="medium",
+        )
 
     # ── Supabase 데이터 로드 ────────────────────
     supa = _supa()
@@ -832,14 +841,24 @@ def render_lead_management() -> None:
     for _l in leads_raw:
         _l["_is_customer"] = _normalize_phone(_l.get("phone") or "") in customer_phones
 
-    # ── 선택된 리드 상세 패널 (관리 버튼 클릭 시 타이틀 바로 아래로 노출) ──
+    # ── 선택된 리드 상세 패널: 팝업(모달) ────────────
+    # '관리' 버튼 클릭 시 스크롤 이동 없이 팝업으로 열림. 저장·닫기 시 자동 종료.
     _sel_id = st.session_state.get("lead_selected_id")
     if _sel_id:
         _sel = next((l for l in leads_raw if l.get("id") == _sel_id), None)
         if _sel:
-            with st.container(border=True):
-                _render_lead_detail_panel(_sel, emp_map)
-            st.divider()
+            def _render_lead_detail_dialog(lead=_sel, emp_map_=emp_map, sid=_sel_id):
+                _render_lead_detail_panel(lead, emp_map_)
+                st.divider()
+                if st.button("닫기", key=f"lead_dlg_close_{sid}", width="stretch"):
+                    st.session_state.pop("lead_selected_id", None)
+                    st.rerun()
+
+            _open_dialog(
+                f"📋 {_sel.get('name') or '리드'} 상세 관리",
+                _render_lead_detail_dialog,
+                width="large",
+            )
 
     # ── Stats 카드 (숨김 처리 — 추후 세일즈 퍼포먼스 메뉴로 이동 예정) ──
     # 통계 위젯 비활성화. 로직은 유지하여 이전 시 그대로 재사용 가능.

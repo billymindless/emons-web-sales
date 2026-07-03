@@ -5736,6 +5736,42 @@ else:
             _address_search_dialog_impl()
 
 
+def _open_dialog(title: str, render_fn, *, width: str = "large",
+                 fallback_expander: bool = True) -> None:
+    """공통 팝업(모달) 헬퍼.
+
+    Streamlit `st.dialog` (v1.33+) 데코레이터로 팝업을 열고, 지원 안 될 경우
+    `st.expander` 로 폴백한다. 저장/취소 후에는 `render_fn` 내부에서
+    `st.rerun()` 을 호출해 팝업을 닫는 흐름.
+
+    - `render_fn`: 팝업 안 UI 를 그리는 무인자 함수.
+    - `width`: 'small' | 'medium' | 'large' (`st.dialog` width 인자).
+    - `fallback_expander`: True 면 폴백 시 expander 사용, False 면 인라인 렌더.
+    """
+    if hasattr(st, "dialog"):
+        try:
+            try:
+                dec = st.dialog(title, width=width)
+            except TypeError:
+                # 구버전 Streamlit: width 인자 미지원
+                dec = st.dialog(title)
+
+            @dec
+            def _dlg():
+                render_fn()
+
+            _dlg()
+            return
+        except Exception:
+            # st.dialog 호출 자체가 실패하면 폴백으로 진행
+            pass
+    if fallback_expander:
+        with st.expander(f"📌 {title}", expanded=True):
+            render_fn()
+    else:
+        render_fn()
+
+
 # ========== 로그인 페이지 ==========
 
 def _inject_js_login_form_attributes():
