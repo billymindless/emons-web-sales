@@ -9647,22 +9647,26 @@ def _erp_intervals_overlap(a_start: int, a_end: int,
 def _erp_validate_adjustment_time(*, db_filename: str, employee_name: str,
                                   target_date: date, start_min: int, end_min: int,
                                   exclude_adj_id: int | None = None) -> str | None:
-    """근태 조정 신청의 시간대가 기본 근무시간·기존 승인 신청과 겹치는지 검증.
+    """근태 조정 신청의 시간대가 본인 근무 일정·기존 승인 신청과 겹치는지 검증.
 
     반환값이 None 이면 문제 없음, 문자열이면 사용자에게 보여줄 오류 메시지.
     - overtime/meeting/early_leave 같이 시간대가 있는 kind 에서 호출.
-    - 기본 근무시간 (shift_start ~ shift_end) 과 겹치면 반환.
+    - 본인이 app_shift_schedules 에 배정된 시간대가 있으면 그 시간대와 겹칠 때 반환.
+      (본인 배정이 없는 날짜에는 매장 기본 근무시간과의 겹침을 무시 — 본인이 근무하지
+       않는 시간이라도 추가근무·회의 등록이 가능해야 함.)
     - 같은 직원·같은 날짜의 pending/approved app_work_adjustments 시간대와 겹치면 반환.
     """
     if start_min >= end_min:
         return "종료 시간이 시작 시간보다 늦어야 합니다."
     try:
-        _sh_s, _sh_e = _erp_shift_bounds_for_date(db_filename, employee_name, target_date)
-        _s_min = _sh_s.hour * 60 + _sh_s.minute
-        _e_min = _sh_e.hour * 60 + _sh_e.minute
-        if _erp_intervals_overlap(start_min, end_min, _s_min, _e_min):
-            return (f"입력한 시간대({_fmt_hhmm(start_min)}~{_fmt_hhmm(end_min)})"
-                    f"가 기본 근무시간({_fmt_hhmm(_s_min)}~{_fmt_hhmm(_e_min)})과 겹칩니다.")
+        _sc = _erp_scheduled_shift_for_date(db_filename, employee_name, target_date)
+        if _sc is not None:
+            _sh_s, _sh_e = _sc
+            _s_min = _sh_s.hour * 60 + _sh_s.minute
+            _e_min = _sh_e.hour * 60 + _sh_e.minute
+            if _erp_intervals_overlap(start_min, end_min, _s_min, _e_min):
+                return (f"입력한 시간대({_fmt_hhmm(start_min)}~{_fmt_hhmm(end_min)})"
+                        f"가 본인 근무 일정({_fmt_hhmm(_s_min)}~{_fmt_hhmm(_e_min)})과 겹칩니다.")
     except Exception:
         pass
     try:
@@ -9698,28 +9702,45 @@ def _fmt_hhmm(total_min: int) -> str:
     return f"{total_min // 60:02d}:{total_min % 60:02d}"
 
 
+def _erp_scheduled_shift_for_date(db_filename: str, employee_name: str,
+                                  d: date) -> tuple[dt_time, dt_time] | None:
+    """(shift_start, shift_end) — app_shift_schedules 에 실제 배정이 있을 때만 반환.
+
+    배정이 없거나 시간 값이 비어 있으면 None. (매장 기본 시각으로 폴백하지 않음)
+    추가근무·회의 등 시간대 겹침 검증에 사용: 본인이 그 날짜에 근무 배정이
+    되어 있지 않으면 매장 기본 근무시간과 겹치더라도 등록을 허용한다.
+    """
+    if not (db_filename and employee_name and d is not None):
+        return None
+    try:
+        client, err = get_supabase_client()
+        if err or not client:
+            return None
+        r = client.table("app_shift_schedules").select("shift_start,shift_end")\
+            .eq("employee_name", employee_name)\
+            .eq("shift_date", d.isoformat())\
+            .limit(1).execute()
+        for sh in (r.data or []):
+            ss = _erp_parse_time(sh.get("shift_start"))
+            ee = _erp_parse_time(sh.get("shift_end"))
+            if ss and ee:
+                return ss, ee
+    except Exception:
+        pass
+    return None
+
+
 def _erp_shift_bounds_for_date(db_filename: str, employee_name: str,
                                d: date) -> tuple[dt_time, dt_time]:
     """(shift_start, shift_end) — 해당 직원의 그 날짜 근무 일정.
 
     우선순위: app_shift_schedules (해당 직원 · 해당 일자 · 시간 값 모두 존재) → 매장 기본 시각.
     조기퇴근 등 시간 기반 계산 시 shift 실제 종료시각을 알기 위해 사용.
+    (반환은 항상 tuple — 개인 배정이 없으면 매장 기본 시각으로 폴백)
     """
-    if db_filename and employee_name and d is not None:
-        try:
-            client, err = get_supabase_client()
-            if not err and client:
-                r = client.table("app_shift_schedules").select("shift_start,shift_end")\
-                    .eq("employee_name", employee_name)\
-                    .eq("shift_date", d.isoformat())\
-                    .limit(1).execute()
-                for sh in (r.data or []):
-                    ss = _erp_parse_time(sh.get("shift_start"))
-                    ee = _erp_parse_time(sh.get("shift_end"))
-                    if ss and ee:
-                        return ss, ee
-        except Exception:
-            pass
+    _sc = _erp_scheduled_shift_for_date(db_filename, employee_name, d)
+    if _sc is not None:
+        return _sc
     return _erp_default_times_for_date(db_filename, d)
 
 
