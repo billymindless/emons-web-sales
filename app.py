@@ -12038,6 +12038,13 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         # 관리자 설정(집계 시작일 · 월 목표 근무시간)은 상단 '관리자 메뉴' 탭으로 이동함.
         st.info("⚙️ 연간 집계 시작일 · 직원별 월 목표 근무시간 설정은 상단 [관리자 메뉴] 탭에서 관리하세요.")
 
+    # ── 대시보드 맨 하단: 내 신청 내역 ─────────────────────────
+    # 근무시간 관리 탭의 히스토리를 대시보드로 옮겨 첫 화면에서 바로 확인할 수 있게 한다.
+    # superadmin 은 me_name 이 비어 있으므로 렌더 대상에서 제외.
+    if me_name:
+        st.divider()
+        _erp_render_my_adj_history(current_db, me_name, today)
+
 
 # ---------- 탭: 관리자 메뉴 (설정 모음) ----------
 
@@ -13364,7 +13371,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 continue
             _editable_shifts.append(_s)
     if _editable_shifts:
-        with st.expander("✏️ 근무일 빠른 편집 (팝업)", expanded=False):
+        with st.expander("✏️ 정기 근무시간 수정 (팝업)", expanded=False):
             st.caption("아래에서 근무일을 선택하고 [편집] 버튼을 누르면 팝업 창에서 바로 수정할 수 있습니다.")
             _qe_options: list[tuple[int, str]] = []
             for _s in _editable_shifts:
@@ -13393,6 +13400,24 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 if _qe_pick_id:
                     st.session_state["erp_shift_edit_id"] = int(_qe_pick_id)
                     st.rerun(scope="fragment")
+
+    # ── ➕➖ 추가근무·휴가신청 팝업 트리거 ─────────────────────────
+    # 근무시간 관리 탭의 '신청 등록' 폼을 캘린더에서 바로 열 수 있는 팝업으로 재사용.
+    # superadmin 은 me_name 이 비어 있으므로 팝업 대상에서 제외.
+    if me_name:
+        with st.expander("➕➖ 추가근무·휴가신청 (팝업)", expanded=False):
+            st.caption("추가근무·휴가 등 신청을 팝업 창에서 바로 등록할 수 있습니다.")
+            if st.button("📤 신청 등록 팝업 열기", key="erp_calendar_adj_open", type="primary"):
+                st.session_state["erp_calendar_adj_open"] = True
+                st.rerun(scope="fragment")
+    if st.session_state.get("erp_calendar_adj_open"):
+        from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+        def _adj_dialog_body():
+            _erp_render_my_adj_form(current_db, role, me_name, today)
+            if st.button("닫기", key="erp_calendar_adj_close", width="stretch"):
+                st.session_state.pop("erp_calendar_adj_open", None)
+                st.rerun(scope="fragment")
+        _open_dialog("🧑‍💼 근무시간 관리 · 신청 등록", _adj_dialog_body, width="large")
 
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
     cal_obj = _cal.Calendar(firstweekday=6)
@@ -17119,18 +17144,11 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 st.error(f"엑셀 생성 오류: {_xls_ex}")
 
 
-def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
-    """직원·관리자 공용: 내 근태 (월·연 잔여 카드 + +/- 신청 + 내 신청 내역)."""
-    st.subheader("🧑‍💼 근무시간 관리")
-    today = _today_kst()
+def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: date) -> None:
+    """+/- 신청 등록 폼 (팝업/탭 공용). 캘린더 팝업과 근무시간 관리 탭 양쪽에서 재사용."""
     year = today.year
     month = today.month
-    ym = f"{year:04d}-{month:02d}"
-    yr = year
 
-    st.divider()
-
-    # ── +/- 신청 폼 ───────────────────────────────────────────────
     st.markdown("##### ➕➖ 신청 등록")
 
     # 근무지 목록
@@ -17295,7 +17313,11 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
                 else:
                     st.error(f"등록 실패: {e}")
 
-    st.divider()
+
+def _erp_render_my_adj_history(current_db: str, me_name: str, today: date) -> None:
+    """내 신청 내역 (연·월 선택 + 리스트 + 수정 팝업). 대시보드 하단과 근무시간 관리 탭 양쪽에서 재사용."""
+    year = today.year
+    month = today.month
 
     # ── 내 신청 내역 ──────────────────────────────────────────────
     _mh_col1, _mh_col2, _mh_col3 = st.columns([1, 1, 4])
@@ -17437,58 +17459,71 @@ def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
         else:
             st.session_state.pop("my_adj_editing_id", None)
 
-    # ── 관리자 전용: 근태 기록 검색 / 삭제 ───────────────────────────────
+
+def _erp_render_attendance_log_admin(current_db: str, me_name: str, today: date) -> None:
+    """관리자 전용: 근태 기록 검색 / 삭제 UI."""
+    with st.expander("🗑️ 근태 기록 검색 / 삭제 (관리자 전용)", expanded=False):
+        st.caption("특정 직원·기간의 근태 기록을 조회하고 잘못 입력된 기록을 삭제할 수 있습니다.")
+        _del_emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
+        _dc1, _dc2, _dc3 = st.columns([2, 1, 1])
+        with _dc1:
+            _del_emp = st.selectbox("직원", _del_emp_opts, key="erp_attdel_emp")
+        with _dc2:
+            _del_from = st.date_input("시작일", value=today.replace(day=1), key="erp_attdel_from")
+        with _dc3:
+            _del_to = st.date_input("종료일", value=today, key="erp_attdel_to")
+        if st.button("🔍 조회", key="erp_attdel_search"):
+            _fetched = _erp_fetch_range(
+                "app_attendance_logs", "home_db_filename", current_db,
+                "log_date", _del_from, _del_to
+            )
+            st.session_state["erp_attdel_rows"] = [
+                r for r in _fetched if (r.get("employee_name") or "") == _del_emp
+            ]
+        _del_rows = st.session_state.get("erp_attdel_rows", [])
+        if _del_rows:
+            st.caption(f"{len(_del_rows)}건 조회됨")
+            for _dr in _del_rows:
+                _dr_id = int(_dr["id"])
+                _dr_cols = st.columns([1.5, 1.2, 1.5, 2, 3, 1])
+                with _dr_cols[0]:
+                    st.markdown(f"**{str(_dr.get('log_date') or '')[:10]}**")
+                with _dr_cols[1]:
+                    st.caption(_dr.get("work_type") or "-")
+                with _dr_cols[2]:
+                    _ts = str(_dr.get("start_time") or "")[:5]
+                    _te = str(_dr.get("end_time") or "")[:5]
+                    st.caption(f"{_ts}~{_te}" if _ts else "-")
+                with _dr_cols[3]:
+                    st.caption(_dr.get("work_location_name") or "-")
+                with _dr_cols[4]:
+                    st.caption(_dr.get("note") or "-")
+                with _dr_cols[5]:
+                    if st.button("🗑️", key=f"erp_attdel_btn_{_dr_id}", help="이 기록 삭제"):
+                        ok, e = _erp_delete_row("app_attendance_logs", _dr_id)
+                        if ok:
+                            st.session_state["erp_attdel_rows"] = [
+                                r for r in _del_rows if int(r["id"]) != _dr_id
+                            ]
+                            st.toast(f"근태 기록 삭제 완료 ({str(_dr.get('log_date') or '')[:10]})", icon="✅")
+                            st.rerun()
+                        else:
+                            st.error(f"삭제 실패: {e}")
+        elif "erp_attdel_rows" in st.session_state:
+            st.info("조회된 기록이 없습니다.")
+
+
+def _erp_tab_my_attendance(current_db: str, role: str, me_name: str):
+    """직원·관리자 공용: 근무시간 관리 탭 = 신청 등록 폼 + 내 신청 내역 + (관리자) 근태 기록 삭제."""
+    st.subheader("🧑‍💼 근무시간 관리")
+    today = _today_kst()
+    st.divider()
+    _erp_render_my_adj_form(current_db, role, me_name, today)
+    st.divider()
+    _erp_render_my_adj_history(current_db, me_name, today)
     if role in ("store_admin", "superadmin"):
         st.divider()
-        with st.expander("🗑️ 근태 기록 검색 / 삭제 (관리자 전용)", expanded=False):
-            st.caption("특정 직원·기간의 근태 기록을 조회하고 잘못 입력된 기록을 삭제할 수 있습니다.")
-            _del_emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
-            _dc1, _dc2, _dc3 = st.columns([2, 1, 1])
-            with _dc1:
-                _del_emp = st.selectbox("직원", _del_emp_opts, key="erp_attdel_emp")
-            with _dc2:
-                _del_from = st.date_input("시작일", value=today.replace(day=1), key="erp_attdel_from")
-            with _dc3:
-                _del_to = st.date_input("종료일", value=today, key="erp_attdel_to")
-            if st.button("🔍 조회", key="erp_attdel_search"):
-                _fetched = _erp_fetch_range(
-                    "app_attendance_logs", "home_db_filename", current_db,
-                    "log_date", _del_from, _del_to
-                )
-                st.session_state["erp_attdel_rows"] = [
-                    r for r in _fetched if (r.get("employee_name") or "") == _del_emp
-                ]
-            _del_rows = st.session_state.get("erp_attdel_rows", [])
-            if _del_rows:
-                st.caption(f"{len(_del_rows)}건 조회됨")
-                for _dr in _del_rows:
-                    _dr_id = int(_dr["id"])
-                    _dr_cols = st.columns([1.5, 1.2, 1.5, 2, 3, 1])
-                    with _dr_cols[0]:
-                        st.markdown(f"**{str(_dr.get('log_date') or '')[:10]}**")
-                    with _dr_cols[1]:
-                        st.caption(_dr.get("work_type") or "-")
-                    with _dr_cols[2]:
-                        _ts = str(_dr.get("start_time") or "")[:5]
-                        _te = str(_dr.get("end_time") or "")[:5]
-                        st.caption(f"{_ts}~{_te}" if _ts else "-")
-                    with _dr_cols[3]:
-                        st.caption(_dr.get("work_location_name") or "-")
-                    with _dr_cols[4]:
-                        st.caption(_dr.get("note") or "-")
-                    with _dr_cols[5]:
-                        if st.button("🗑️", key=f"erp_attdel_btn_{_dr_id}", help="이 기록 삭제"):
-                            ok, e = _erp_delete_row("app_attendance_logs", _dr_id)
-                            if ok:
-                                st.session_state["erp_attdel_rows"] = [
-                                    r for r in _del_rows if int(r["id"]) != _dr_id
-                                ]
-                                st.toast(f"근태 기록 삭제 완료 ({str(_dr.get('log_date') or '')[:10]})", icon="✅")
-                                st.rerun()
-                            else:
-                                st.error(f"삭제 실패: {e}")
-            elif "erp_attdel_rows" in st.session_state:
-                st.info("조회된 기록이 없습니다.")
+        _erp_render_attendance_log_admin(current_db, me_name, today)
 
 
 # ---------- superadmin: 통합 캘린더 & 매장별 현황 ----------
