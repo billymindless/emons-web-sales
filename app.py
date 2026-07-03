@@ -8539,8 +8539,12 @@ def _superadmin_tab5_store_accounts():
                     else:
                         st.warning("매장명과 DB 파일명을 입력하세요.")
 
-        # ── 폐점 처리 / 재개 (신규) ───────────────────────────────────────
-        with st.expander("🔴 매장 폐점 처리 / 🟢 재개", expanded=(not _is_active)):
+        # ── 폐점 처리 / 재개 ─────────────────────────────────────────────
+        # 접힘 상태에서 못 찾는 경우가 있어 항상 펼침으로 노출한다. (활성/비활성 상관없이)
+        _closure_title = (
+            "🔴 매장 폐점 처리" if _is_active else "🟢 매장 재개(활성화)"
+        )
+        with st.expander(_closure_title, expanded=True):
             if _is_active:
                 st.caption(
                     "폐점 처리 시 이 매장은 운영 화면(근무표·매출 리포트·대시보드·매장 선택 드롭다운)에서 즉시 숨김 처리됩니다. "
