@@ -12888,33 +12888,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     @st.fragment: 빠른 수정/삭제 시 이 캘린더만 부분 재실행하여 상위 탭(근무 일정 계획 등)으로 복귀하지 않게 한다."""
     import calendar as _cal
 
-    # 캘린더 배지 <a href="?erp_edit_shift=X"> 클릭 감지 → 세션 승격 후 URL 파라미터 즉시 제거.
-    # 세션 값이 남아 있으면 하단에서 편집 팝업(open_dialog)이 자동 트리거된다.
-    try:
-        _qp_edit_val = st.query_params.get("erp_edit_shift")
-        if _qp_edit_val:
-            try:
-                st.session_state["erp_shift_edit_id"] = int(_qp_edit_val)
-            except (TypeError, ValueError):
-                pass
-            try:
-                del st.query_params["erp_edit_shift"]
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # 배지 <a href> 생성 시 기존 쿼리 파라미터(?auth=... 등)를 보존해야 로그인 세션이 유지된다.
-    # 로그인 토큰 auth 를 유실하면 다음 페이지 로드에서 _try_restore_from_query_params() 가 실패 → 로그아웃 처리.
-    _preserve_qp: dict[str, str] = {}
-    try:
-        for _k, _v in dict(st.query_params).items():
-            if _k == "erp_edit_shift":
-                continue
-            _preserve_qp[str(_k)] = (_v[0] if isinstance(_v, (list, tuple)) else str(_v))
-    except Exception:
-        _preserve_qp = {}
-
     st.subheader("🗓️ 월별 근무 캘린더")
     st.caption("매장·직원을 선택해 누가 언제 어디서 일하는지 한눈에 확인할 수 있습니다.")
     # 빠른 수정/삭제 직후 부분 재실행으로 전달된 완료 알림 (전체 rerun 아님 → 탭 유지)
@@ -13189,6 +13162,50 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     )
                     contributing_emps[(d_iso, _sname)] = store_day_shifts
 
+    # ── ✏️ 빠른 근무일 편집 (셀렉트박스) ──────────────────────────
+    # 캘린더 배지 클릭 UX 는 전체 페이지 리로드로 세션 컨텍스트가 초기화되는 문제가 있어
+    # (auth 쿼리 파라미터 유실 시 로그아웃, 유지 시에도 사이드바 메뉴/탭 리셋)
+    # Streamlit 네이티브 위젯 기반 편집 셀렉트를 대신 제공한다.
+    _is_admin_qe = role in ("store_admin", "superadmin")
+    _editable_shifts: list[dict] = []
+    for _d_iso in sorted(shifts_by_date.keys()):
+        for _s in shifts_by_date[_d_iso]:
+            if not bool(_s.get("id")):
+                continue
+            if not (_is_admin_qe or (_s.get("employee_name") == me_name)):
+                continue
+            _editable_shifts.append(_s)
+    if _editable_shifts:
+        with st.expander("✏️ 근무일 빠른 편집 (팝업)", expanded=False):
+            st.caption("아래에서 근무일을 선택하고 [편집] 버튼을 누르면 팝업 창에서 바로 수정할 수 있습니다.")
+            _qe_options: list[tuple[int, str]] = []
+            for _s in _editable_shifts:
+                _sid = int(_s.get("id") or 0)
+                _d = str(_s.get("shift_date") or "")[:10]
+                _emp = _s.get("employee_name") or ""
+                _ss = str(_s.get("shift_start") or "")[:5]
+                _ee = str(_s.get("shift_end") or "")[:5]
+                _wl = (_s.get("work_location_name") or "").strip()
+                _eff_dbf_q = _shift_effective_dbf(_s) or _s.get("_dbf") or current_db
+                _loc_lbl = _wl if _wl else (_dbf_to_sn.get(_eff_dbf_q, "") or "")
+                _label = f"{_d} · {_emp} · {_ss}~{_ee}" + (f" · {_loc_lbl}" if _loc_lbl else "")
+                _qe_options.append((_sid, _label))
+            _qe_labels = [lbl for _sid, lbl in _qe_options]
+            _qe_pick = st.selectbox(
+                "근무일 선택", _qe_labels,
+                key="erp_calendar_quick_edit_pick",
+                index=0,
+            )
+            _qe_pick_id = 0
+            for _sid, lbl in _qe_options:
+                if lbl == _qe_pick:
+                    _qe_pick_id = _sid
+                    break
+            if st.button("✏️ 편집 팝업 열기", key="erp_calendar_quick_edit_open", type="primary"):
+                if _qe_pick_id:
+                    st.session_state["erp_shift_edit_id"] = int(_qe_pick_id)
+                    st.rerun(scope="fragment")
+
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
     cal_obj = _cal.Calendar(firstweekday=6)
     weeks = cal_obj.monthdayscalendar(int(year), int(month))
@@ -13306,32 +13323,12 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     )
                 else:
                     _note_html = ""
-                # 클릭 가능 여부: 관리자 또는 본인 근무일 때만 <a> 로 감싸 편집 팝업 트리거.
-                _is_admin_cal = role in ("store_admin", "superadmin")
-                _can_edit_sh = (_is_admin_cal or (emp == me_name)) and bool(sh.get("id"))
-                if _can_edit_sh:
-                    # href 는 기존 쿼리 파라미터(?auth=... 포함)를 모두 보존해야 함 → 유실 시 로그아웃 발생.
-                    import urllib.parse as _uparse
-                    _href_qp = dict(_preserve_qp)
-                    _href_qp["erp_edit_shift"] = str(int(sh['id']))
-                    _href_str = "?" + _uparse.urlencode(_href_qp)
-                    _open_tag = (
-                        f"<a href='{_href_str}' target='_self' "
-                        f"style='display:block; text-decoration:none; cursor:pointer;' "
-                        f"title='클릭하여 이 근무일 수정'>"
-                    )
-                    _close_tag = "</a>"
-                else:
-                    _open_tag = "<div>"
-                    _close_tag = "</div>"
                 cell.append(
-                    f"{_open_tag}"
                     f"<div style='margin-top:2px; border-left:3px solid {sc};"
                     f" background:{sc}15; padding:1px 3px; border-radius:0 2px 2px 0;'>"
                     f"{sn_badge}<span style='color:{sc}; font-weight:600; font-size:0.7rem;'>{emp}</span>"
                     f"<span style='color:#666; font-size:0.65rem;'>{time_txt}</span>"
                     f"{_note_html}</div>"
-                    f"{_close_tag}"
                 )
 
             # 근태 기록 (attendance_logs) — 실근무지 기준 컬러 (work_location_name 컬럼이 있으면 우선)
