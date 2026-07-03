@@ -6449,6 +6449,80 @@ def _load_customers_region_cached(db_filename: str) -> pd.DataFrame:
         return pd.DataFrame(columns=_empty_cols)
 
 
+# ========== 대한민국 시도↔시군구 정적 매핑 ==========
+# app_customers 스키마에 sido 컬럼이 없어(Kakao API region_2depth_name 만 저장) 다면 분석에서 계층 필터를
+# 구성할 때 사용. 신규 지역 발생 시 이 dict 만 갱신하면 됨. 매핑 없는 sigungu 는 "(기타)" 로 분류.
+_KR_SIDO_SIGUNGU_MAP: dict[str, list[str]] = {
+    "서울특별시": [
+        "강남구", "강동구", "강북구", "강서구", "관악구", "광진구", "구로구", "금천구",
+        "노원구", "도봉구", "동대문구", "동작구", "마포구", "서대문구", "서초구", "성동구",
+        "성북구", "송파구", "양천구", "영등포구", "용산구", "은평구", "종로구", "중구",
+        "중랑구",
+    ],
+    "부산광역시": [
+        "강서구", "금정구", "기장군", "남구", "동구", "동래구", "부산진구", "북구",
+        "사상구", "사하구", "서구", "수영구", "연제구", "영도구", "중구", "해운대구",
+    ],
+    "대구광역시": ["남구", "달서구", "달성군", "동구", "북구", "서구", "수성구", "중구", "군위군"],
+    "인천광역시": [
+        "강화군", "계양구", "남동구", "동구", "미추홀구", "부평구", "서구", "연수구",
+        "옹진군", "중구",
+    ],
+    "광주광역시": ["광산구", "남구", "동구", "북구", "서구"],
+    "대전광역시": ["대덕구", "동구", "서구", "유성구", "중구"],
+    "울산광역시": ["남구", "동구", "북구", "울주군", "중구"],
+    "세종특별자치시": ["세종특별자치시"],
+    "경기도": [
+        "가평군", "고양시", "과천시", "광명시", "광주시", "구리시", "군포시", "김포시",
+        "남양주시", "동두천시", "부천시", "성남시", "수원시", "시흥시", "안산시", "안성시",
+        "안양시", "양주시", "양평군", "여주시", "연천군", "오산시", "용인시", "의왕시",
+        "의정부시", "이천시", "파주시", "평택시", "포천시", "하남시", "화성시",
+    ],
+    "강원특별자치도": [
+        "강릉시", "고성군", "동해시", "삼척시", "속초시", "양구군", "양양군", "영월군",
+        "원주시", "인제군", "정선군", "철원군", "춘천시", "태백시", "평창군", "홍천군",
+        "화천군", "횡성군",
+    ],
+    "충청북도": [
+        "괴산군", "단양군", "보은군", "영동군", "옥천군", "음성군", "제천시", "증평군",
+        "진천군", "청주시", "충주시",
+    ],
+    "충청남도": [
+        "계룡시", "공주시", "금산군", "논산시", "당진시", "보령시", "부여군", "서산시",
+        "서천군", "아산시", "예산군", "천안시", "청양군", "태안군", "홍성군",
+    ],
+    "전북특별자치도": [
+        "고창군", "군산시", "김제시", "남원시", "무주군", "부안군", "순창군", "완주군",
+        "익산시", "임실군", "장수군", "전주시", "정읍시", "진안군",
+    ],
+    "전라남도": [
+        "강진군", "고흥군", "곡성군", "광양시", "구례군", "나주시", "담양군", "목포시",
+        "무안군", "보성군", "순천시", "신안군", "여수시", "영광군", "영암군", "완도군",
+        "장성군", "장흥군", "진도군", "함평군", "해남군", "화순군",
+    ],
+    "경상북도": [
+        "경산시", "경주시", "고령군", "구미시", "김천시", "문경시", "봉화군", "상주시",
+        "성주군", "안동시", "영덕군", "영양군", "영주시", "영천시", "예천군", "울릉군",
+        "울진군", "의성군", "청도군", "청송군", "칠곡군", "포항시",
+    ],
+    "경상남도": [
+        "거제시", "거창군", "고성군", "김해시", "남해군", "밀양시", "사천시", "산청군",
+        "양산시", "의령군", "진주시", "창녕군", "창원시", "통영시", "하동군", "함안군",
+        "함양군", "합천군",
+    ],
+    "제주특별자치도": ["서귀포시", "제주시"],
+}
+
+# 역방향: 시군구 → 시도. 동일 시군구명이 여러 시도에 걸쳐 있는 경우("남구", "동구", "북구", "중구", "서구",
+# "고성군" 등) 는 dict 특성상 마지막 등록된 시도로 덮어써짐. 이러한 경우엔 데이터 편차가 있을 수 있으므로
+# 사용자에게는 필터 UI 로 시도를 먼저 고르게 해 명확화한다.
+_KR_SIGUNGU_TO_SIDO: dict[str, str] = {
+    sigungu: sido
+    for sido, sigungu_list in _KR_SIDO_SIGUNGU_MAP.items()
+    for sigungu in sigungu_list
+}
+
+
 def _classify_building_type(name: str | None) -> str:
     """건물명 문자열에서 대략적 건물유형(아파트/오피스텔/빌라/주택/상가/기타) 추정.
     카카오 API에는 유형 필드가 없어 명칭 키워드로 근사한다."""
@@ -6483,9 +6557,15 @@ def _classify_building_type(name: str | None) -> str:
     return "기타"
 
 
+@st.fragment
 def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map: dict | None = None) -> None:
     """마케팅 인사이트 「다면 분석」 섹션.
     여러 조건(기간·지역·건물명·건물유형·품목·이유)을 동시 적용하고, 여러 차원으로 매출을 분해한다.
+
+    @st.fragment: 이 섹션 내부 위젯 변경 시 상위(다중 기간 비교 차트 등)로 재실행이 전파되지 않도록 격리.
+    UX: 필터 위젯을 st.form 으로 감싸 검색 버튼 클릭 전까지 아무 재실행도 발생하지 않게 하고, 클릭 시에만
+    소형 스피너와 함께 필터 적용·groupby·차트 렌더링을 실행한다. (시도 계층 캐스케이딩만 form 밖에 두어
+    시도 선택이 즉시 시군구 옵션에 반영되게 한다.)
 
     merged: orders + customers merge 결과. 필요한 컬럼:
         order_date, total_amount, customer_id, address, category, visit_reason, purchase_reason, _db_fn
@@ -6538,80 +6618,12 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         if c not in df.columns:
             df[c] = None
     df["building_type"] = df["building_name"].map(_classify_building_type)
+    # 시도 파생: 정적 매핑에서 없는 시군구는 "(기타)" 로 분류
+    df["sido"] = df["sigungu"].map(_KR_SIGUNGU_TO_SIDO).fillna("(기타)")
 
-    # ── ① 필터 UI (여러 조건 동시) ─────────────────────────────────────
-    st.markdown("##### 🔎 필터 (여러 조건 동시 적용)")
-    today = _today_kst()
-    default_start = today.replace(day=1)
-    fc1, fc2 = st.columns(2)
-    with fc1:
-        f_start = st.date_input("시작일", value=default_start, key=f"{key_prefix}_mdim_start")
-    with fc2:
-        f_end = st.date_input("종료일", value=today, key=f"{key_prefix}_mdim_end")
-    if f_start > f_end:
-        f_end = f_start
-
-    # 매장 필터 (superadmin 전용)
-    f_stores: list[str] = []
-    if store_map:
-        store_options = sorted({v for v in store_map.values() if v})
-        f_stores = st.multiselect("매장", store_options, default=[],
-                                  key=f"{key_prefix}_mdim_stores",
-                                  placeholder="선택 없음 = 전체")
-
-    # 지역 필터 (cascading multiselect)
-    rc1, rc2, rc3 = st.columns(3)
-    with rc1:
-        sigungu_opts = sorted([x for x in df["sigungu"].dropna().unique() if str(x).strip()])
-        f_sigungu = st.multiselect("시군구", sigungu_opts, key=f"{key_prefix}_mdim_sigungu",
-                                    placeholder="전체")
-    with rc2:
-        _bname_pool = df if not f_sigungu else df[df["sigungu"].isin(f_sigungu)]
-        bname_opts = sorted([x for x in _bname_pool["bname"].dropna().unique() if str(x).strip()])
-        f_bname = st.multiselect("법정동", bname_opts, key=f"{key_prefix}_mdim_bname",
-                                  placeholder="전체")
-    with rc3:
-        _rn_pool = df
-        if f_sigungu:
-            _rn_pool = _rn_pool[_rn_pool["sigungu"].isin(f_sigungu)]
-        if f_bname:
-            _rn_pool = _rn_pool[_rn_pool["bname"].isin(f_bname)]
-        rn_opts = sorted([x for x in _rn_pool["road_name"].dropna().unique() if str(x).strip()])
-        f_road = st.multiselect("도로명", rn_opts, key=f"{key_prefix}_mdim_road",
-                                 placeholder="전체")
-
-    bc1, bc2 = st.columns([2, 1])
-    with bc1:
-        f_building = st.text_input(
-            "건물명·주소 검색 (부분 일치 · building_name + address 원문 동시 검색)",
-            key=f"{key_prefix}_mdim_building",
-            placeholder="예: 아너스빌, 태화강엑슬루타워, 힐스테이트 등",
-        )
-    with bc2:
-        bt_opts = sorted([x for x in df["building_type"].dropna().unique() if str(x).strip()])
-        f_btype = st.multiselect("건물유형", bt_opts, key=f"{key_prefix}_mdim_btype",
-                                  placeholder="전체")
-
-    cat_opts = sorted({
-        c.strip()
-        for v in df["category"].dropna() if str(v).strip()
-        for c in str(v).split(",") if c.strip() and c.strip() != "-"
-    })
-    cf1, cf2, cf3 = st.columns(3)
-    with cf1:
-        f_cat = st.multiselect("품목", cat_opts, key=f"{key_prefix}_mdim_cat",
-                                placeholder="전체")
-    with cf2:
-        vr_opts = sorted([x for x in df["visit_reason"].dropna().unique() if str(x).strip()])
-        f_visit = st.multiselect("방문 이유", vr_opts, key=f"{key_prefix}_mdim_visit",
-                                  placeholder="전체")
-    with cf3:
-        pr_opts = sorted([x for x in df["purchase_reason"].dropna().unique() if str(x).strip()])
-        f_purch = st.multiselect("구매 이유", pr_opts, key=f"{key_prefix}_mdim_purch",
-                                  placeholder="전체")
-
-    # ── ② 그룹화 차원 (다중 선택) ────────────────────────────────
+    # dim_map 은 옵션 라벨과 상관없이 재사용되므로 폼 밖에서 정의
     dim_map = {
+        "시도": "sido",
         "시군구": "sigungu",
         "법정동": "bname",
         "도로명": "road_name",
@@ -6623,107 +6635,216 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
     }
     if store_map and "_store" in df.columns:
         dim_map["매장"] = "_store"
-
     dim_options = list(dim_map.keys())
-    default_dims = ["시군구", "품목"]
-    f_dims = st.multiselect(
-        "그룹화 차원 (2개 이상 선택하면 다차원 피벗)",
-        dim_options,
-        default=default_dims,
-        key=f"{key_prefix}_mdim_dims",
-    )
-    metric = st.radio(
-        "측정값",
-        ["매출액(원)", "건수", "객단가(원)"],
-        horizontal=True,
-        key=f"{key_prefix}_mdim_metric",
-    )
 
-    # ── ③ 필터 적용 ────────────────────────────────────────────────
-    fdf = df[(df["_dt"] >= f_start) & (df["_dt"] <= f_end)].copy()
-    if store_map and f_stores and "_store" in fdf.columns:
-        fdf = fdf[fdf["_store"].isin(f_stores)]
-    if f_sigungu:
-        fdf = fdf[fdf["sigungu"].isin(f_sigungu)]
-    if f_bname:
-        fdf = fdf[fdf["bname"].isin(f_bname)]
-    if f_road:
-        fdf = fdf[fdf["road_name"].isin(f_road)]
-    if f_building:
-        # 건물명(카카오 API 반환값)은 도로명주소만 있는 경우 자주 비어 있으므로
-        # address 원문에서도 함께 부분 일치 검색해 누락을 방지한다.
-        needle = f_building.strip().lower().replace(" ", "")
-        _bn = fdf["building_name"].fillna("").astype(str).str.replace(" ", "", regex=False).str.lower()
-        if "address" in fdf.columns:
-            _addr = fdf["address"].fillna("").astype(str).str.replace(" ", "", regex=False).str.lower()
-            _mask = _bn.str.contains(needle, na=False) | _addr.str.contains(needle, na=False)
+    # ── ① 필터 UI (여러 조건 동시) ─────────────────────────────────────
+    st.markdown("##### 🔎 필터 (여러 조건 동시 적용)")
+    today = _today_kst()
+    default_start = today.replace(day=1)
+
+    # 시도만 form 밖: 선택 즉시 시군구 옵션 캐스케이딩 (form 내부 위젯은 form 제출 전까지 재실행 없음)
+    sido_opts = sorted([x for x in df["sido"].dropna().unique() if str(x).strip()])
+    f_sido = st.multiselect(
+        "시도 (상위 지역)", sido_opts, key=f"{key_prefix}_mdim_sido",
+        placeholder="전체 · 선택 시 하위 시군구 옵션이 자동 축소됩니다",
+    )
+    _sido_pool = df if not f_sido else df[df["sido"].isin(f_sido)]
+
+    with st.form(f"{key_prefix}_mdim_form", clear_on_submit=False):
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            f_start = st.date_input("시작일", value=default_start, key=f"{key_prefix}_mdim_start")
+        with fc2:
+            f_end = st.date_input("종료일", value=today, key=f"{key_prefix}_mdim_end")
+
+        # 매장 필터 (superadmin 전용)
+        if store_map:
+            store_options = sorted({v for v in store_map.values() if v})
+            f_stores = st.multiselect("매장", store_options, default=[],
+                                      key=f"{key_prefix}_mdim_stores",
+                                      placeholder="선택 없음 = 전체")
         else:
-            _mask = _bn.str.contains(needle, na=False)
-        fdf = fdf[_mask]
-    if f_btype:
-        fdf = fdf[fdf["building_type"].isin(f_btype)]
-    if f_visit:
-        fdf = fdf[fdf["visit_reason"].isin(f_visit)]
-    if f_purch:
-        fdf = fdf[fdf["purchase_reason"].isin(f_purch)]
+            f_stores = []
 
-    # 품목은 explode (한 주문 category="침대,매트리스" → 두 행) 후 필터
-    if "품목" in f_dims or f_cat:
-        fdf = fdf.assign(_category_expl=fdf["category"].fillna("").astype(str).str.split(","))
-        fdf = fdf.explode("_category_expl")
-        fdf["_category_expl"] = fdf["_category_expl"].astype(str).str.strip()
-        fdf = fdf[(fdf["_category_expl"] != "") & (fdf["_category_expl"] != "-")]
-        if f_cat:
-            fdf = fdf[fdf["_category_expl"].isin(f_cat)]
-    else:
-        fdf["_category_expl"] = None
+        # 지역 하위 필터 (시군구 · 법정동 · 도로명)
+        rc1, rc2, rc3 = st.columns(3)
+        with rc1:
+            sigungu_opts = sorted([x for x in _sido_pool["sigungu"].dropna().unique() if str(x).strip()])
+            f_sigungu = st.multiselect("시군구", sigungu_opts,
+                                        key=f"{key_prefix}_mdim_sigungu",
+                                        placeholder="전체 · 시도 선택으로 축소됨")
+        with rc2:
+            # form 내부 캐스케이딩은 실시간 반영이 안 되므로, 시도 pool 기준으로 옵션 노출
+            bname_opts = sorted([x for x in _sido_pool["bname"].dropna().unique() if str(x).strip()])
+            f_bname = st.multiselect("법정동", bname_opts, key=f"{key_prefix}_mdim_bname",
+                                      placeholder="전체")
+        with rc3:
+            rn_opts = sorted([x for x in _sido_pool["road_name"].dropna().unique() if str(x).strip()])
+            f_road = st.multiselect("도로명", rn_opts, key=f"{key_prefix}_mdim_road",
+                                     placeholder="전체")
 
-    if fdf.empty:
-        st.info("선택한 조건에 맞는 데이터가 없습니다.")
-        return
+        bc1, bc2 = st.columns([2, 1])
+        with bc1:
+            f_building = st.text_input(
+                "건물명·주소 검색 (부분 일치 · building_name + address 원문 동시 검색)",
+                key=f"{key_prefix}_mdim_building",
+                placeholder="예: 아너스빌, 태화강엑슬루타워, 힐스테이트 등",
+            )
+        with bc2:
+            bt_opts = sorted([x for x in df["building_type"].dropna().unique() if str(x).strip()])
+            f_btype = st.multiselect("건물유형", bt_opts, key=f"{key_prefix}_mdim_btype",
+                                      placeholder="전체")
 
-    # ── ④ 요약 지표 ────────────────────────────────────────────────
-    s1, s2, s3, s4 = st.columns(4)
-    _amount = float(fdf["total_amount"].sum())
-    _count = int(len(fdf))
-    _uniq_cust = int(fdf["customer_id"].nunique()) if "customer_id" in fdf.columns else 0
-    s1.metric("건수", f"{_count:,}건")
-    s2.metric("매출액", f"{_amount:,.0f}원")
-    s3.metric("객단가", f"{(_amount / _count if _count else 0):,.0f}원")
-    s4.metric("고객 수(중복 제외)", f"{_uniq_cust:,}명")
+        cat_opts = sorted({
+            c.strip()
+            for v in df["category"].dropna() if str(v).strip()
+            for c in str(v).split(",") if c.strip() and c.strip() != "-"
+        })
+        cf1, cf2, cf3 = st.columns(3)
+        with cf1:
+            f_cat = st.multiselect("품목", cat_opts, key=f"{key_prefix}_mdim_cat",
+                                    placeholder="전체")
+        with cf2:
+            vr_opts = sorted([x for x in df["visit_reason"].dropna().unique() if str(x).strip()])
+            f_visit = st.multiselect("방문 이유", vr_opts, key=f"{key_prefix}_mdim_visit",
+                                      placeholder="전체")
+        with cf3:
+            pr_opts = sorted([x for x in df["purchase_reason"].dropna().unique() if str(x).strip()])
+            f_purch = st.multiselect("구매 이유", pr_opts, key=f"{key_prefix}_mdim_purch",
+                                      placeholder="전체")
 
-    # ── ⑤ 피벗 집계 ────────────────────────────────────────────────
-    if not f_dims:
-        st.info("그룹화 차원을 1개 이상 선택하세요.")
-        return
-    dim_cols = [dim_map[d] for d in f_dims]
-    valid_dim_cols = [c for c in dim_cols if c in fdf.columns]
-    if not valid_dim_cols:
-        st.info("선택한 차원 컬럼을 찾을 수 없습니다.")
-        return
-
-    # NaN 방어: groupby에서 NaN 그룹이 사라지므로 '(미분류)'로 대체
-    for c in valid_dim_cols:
-        fdf[c] = fdf[c].fillna("(미분류)")
-
-    if metric == "매출액(원)":
-        agg = fdf.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "sum"))
-    elif metric == "건수":
-        agg = fdf.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "count"))
-    else:  # 객단가
-        agg = fdf.groupby(valid_dim_cols, as_index=False).agg(
-            _sum=("total_amount", "sum"),
-            _cnt=("total_amount", "count"),
+        # 그룹화 차원 (다중 선택) + 측정값
+        default_dims = ["시군구", "품목"]
+        f_dims = st.multiselect(
+            "그룹화 차원 (2개 이상 선택하면 다차원 피벗)",
+            dim_options,
+            default=default_dims,
+            key=f"{key_prefix}_mdim_dims",
         )
-        agg["값"] = agg["_sum"] / agg["_cnt"].where(agg["_cnt"] > 0, 1)
-        agg = agg.drop(columns=["_sum", "_cnt"])
-    agg = agg.sort_values("값", ascending=False)
+        metric = st.radio(
+            "측정값",
+            ["매출액(원)", "건수", "객단가(원)"],
+            horizontal=True,
+            key=f"{key_prefix}_mdim_metric",
+        )
 
-    # 컬럼명 라벨화
-    inv_map = {v: k for k, v in dim_map.items()}
-    display_df = agg.rename(columns=inv_map).rename(columns={"값": metric})
+        submitted = st.form_submit_button("🔍 검색", type="primary", width="stretch")
 
-    # 표
+    # 폼 제출 시: 검색 조건을 세션에 저장. 폼 미제출 상태로 재실행되면 아래 로직은 건너뜀.
+    _query_key = f"{key_prefix}_mdim_query"
+    if submitted:
+        _f_start_saved = f_start
+        _f_end_saved = f_end
+        if _f_start_saved > _f_end_saved:
+            _f_end_saved = _f_start_saved
+        st.session_state[_query_key] = {
+            "f_start": _f_start_saved, "f_end": _f_end_saved,
+            "f_stores": list(f_stores),
+            "f_sido": list(f_sido), "f_sigungu": list(f_sigungu),
+            "f_bname": list(f_bname), "f_road": list(f_road),
+            "f_building": (f_building or "").strip(),
+            "f_btype": list(f_btype),
+            "f_cat": list(f_cat),
+            "f_visit": list(f_visit), "f_purch": list(f_purch),
+            "f_dims": list(f_dims), "metric": metric,
+        }
+        # CSV 캐시 무효화 — 새 검색 시 이전 CSV 삭제
+        st.session_state.pop(f"{key_prefix}_mdim_csv_bytes", None)
+
+    q = st.session_state.get(_query_key)
+    if not q:
+        st.info("검색 조건을 설정한 뒤 위의 [🔍 검색] 버튼을 눌러주세요.")
+        return
+
+    with st.spinner("검색 중…"):
+        # ── ③ 필터 적용 ────────────────────────────────────────────────
+        fdf = df[(df["_dt"] >= q["f_start"]) & (df["_dt"] <= q["f_end"])].copy()
+        if store_map and q["f_stores"] and "_store" in fdf.columns:
+            fdf = fdf[fdf["_store"].isin(q["f_stores"])]
+        if q["f_sido"]:
+            fdf = fdf[fdf["sido"].isin(q["f_sido"])]
+        if q["f_sigungu"]:
+            fdf = fdf[fdf["sigungu"].isin(q["f_sigungu"])]
+        if q["f_bname"]:
+            fdf = fdf[fdf["bname"].isin(q["f_bname"])]
+        if q["f_road"]:
+            fdf = fdf[fdf["road_name"].isin(q["f_road"])]
+        if q["f_building"]:
+            # 건물명(카카오 API 반환값)은 도로명주소만 있는 경우 자주 비어 있으므로
+            # address 원문에서도 함께 부분 일치 검색해 누락을 방지한다.
+            needle = q["f_building"].lower().replace(" ", "")
+            _bn = fdf["building_name"].fillna("").astype(str).str.replace(" ", "", regex=False).str.lower()
+            if "address" in fdf.columns:
+                _addr = fdf["address"].fillna("").astype(str).str.replace(" ", "", regex=False).str.lower()
+                _mask = _bn.str.contains(needle, na=False) | _addr.str.contains(needle, na=False)
+            else:
+                _mask = _bn.str.contains(needle, na=False)
+            fdf = fdf[_mask]
+        if q["f_btype"]:
+            fdf = fdf[fdf["building_type"].isin(q["f_btype"])]
+        if q["f_visit"]:
+            fdf = fdf[fdf["visit_reason"].isin(q["f_visit"])]
+        if q["f_purch"]:
+            fdf = fdf[fdf["purchase_reason"].isin(q["f_purch"])]
+
+        # 품목은 explode (한 주문 category="침대,매트리스" → 두 행) 후 필터
+        if "품목" in q["f_dims"] or q["f_cat"]:
+            fdf = fdf.assign(_category_expl=fdf["category"].fillna("").astype(str).str.split(","))
+            fdf = fdf.explode("_category_expl")
+            fdf["_category_expl"] = fdf["_category_expl"].astype(str).str.strip()
+            fdf = fdf[(fdf["_category_expl"] != "") & (fdf["_category_expl"] != "-")]
+            if q["f_cat"]:
+                fdf = fdf[fdf["_category_expl"].isin(q["f_cat"])]
+        else:
+            fdf["_category_expl"] = None
+
+        if fdf.empty:
+            st.info("선택한 조건에 맞는 데이터가 없습니다.")
+            return
+
+        # ── ④ 요약 지표 ────────────────────────────────────────────────
+        s1, s2, s3, s4 = st.columns(4)
+        _amount = float(fdf["total_amount"].sum())
+        _count = int(len(fdf))
+        _uniq_cust = int(fdf["customer_id"].nunique()) if "customer_id" in fdf.columns else 0
+        s1.metric("건수", f"{_count:,}건")
+        s2.metric("매출액", f"{_amount:,.0f}원")
+        s3.metric("객단가", f"{(_amount / _count if _count else 0):,.0f}원")
+        s4.metric("고객 수(중복 제외)", f"{_uniq_cust:,}명")
+
+        # ── ⑤ 피벗 집계 ────────────────────────────────────────────────
+        if not q["f_dims"]:
+            st.info("그룹화 차원을 1개 이상 선택하세요.")
+            return
+        dim_cols = [dim_map[d] for d in q["f_dims"]]
+        valid_dim_cols = [c for c in dim_cols if c in fdf.columns]
+        if not valid_dim_cols:
+            st.info("선택한 차원 컬럼을 찾을 수 없습니다.")
+            return
+
+        # NaN 방어: groupby에서 NaN 그룹이 사라지므로 '(미분류)'로 대체
+        for c in valid_dim_cols:
+            fdf[c] = fdf[c].fillna("(미분류)")
+
+        _metric = q["metric"]
+        if _metric == "매출액(원)":
+            agg = fdf.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "sum"))
+        elif _metric == "건수":
+            agg = fdf.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "count"))
+        else:  # 객단가
+            agg = fdf.groupby(valid_dim_cols, as_index=False).agg(
+                _sum=("total_amount", "sum"),
+                _cnt=("total_amount", "count"),
+            )
+            agg["값"] = agg["_sum"] / agg["_cnt"].where(agg["_cnt"] > 0, 1)
+            agg = agg.drop(columns=["_sum", "_cnt"])
+        agg = agg.sort_values("값", ascending=False)
+
+        # 컬럼명 라벨화
+        inv_map = {v: k for k, v in dim_map.items()}
+        display_df = agg.rename(columns=inv_map).rename(columns={"값": _metric})
+
+    # ── 표 (spinner 밖: 위 결과는 이미 계산 완료) ─────────────────
     st.markdown("##### 📋 피벗 표 (상위 200행)")
     st.dataframe(
         display_df.head(200),
@@ -6732,60 +6853,85 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         key=f"{key_prefix}_mdim_table",
     )
 
-    # CSV 다운로드 (전체 결과)
-    csv_bytes = display_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "📥 CSV 다운로드 (전체)",
-        csv_bytes,
-        file_name=f"multi_dim_{f_start}_{f_end}.csv",
-        mime="text/csv",
-        key=f"{key_prefix}_mdim_csv",
-    )
+    # ── CSV 다운로드 (지연 인코딩: 준비 버튼 → 다운로드 버튼 2단계) ─────
+    _csv_key = f"{key_prefix}_mdim_csv_bytes"
+    _csv_ready = st.session_state.get(_csv_key)
+    _dc1, _dc2 = st.columns([1, 2])
+    with _dc1:
+        if st.button("📥 CSV 준비", key=f"{key_prefix}_mdim_csv_prep"):
+            with st.spinner("CSV 인코딩 중…"):
+                st.session_state[_csv_key] = display_df.to_csv(index=False).encode("utf-8-sig")
+                _csv_ready = st.session_state[_csv_key]
+    with _dc2:
+        if _csv_ready:
+            st.download_button(
+                "💾 다운로드 (전체 결과)",
+                _csv_ready,
+                file_name=f"multi_dim_{q['f_start']}_{q['f_end']}.csv",
+                mime="text/csv",
+                key=f"{key_prefix}_mdim_csv",
+            )
+        else:
+            st.caption("CSV 준비 버튼을 눌러 파일을 생성한 뒤 다운로드할 수 있습니다.")
 
-    # ── ⑥ 시각화 ────────────────────────────────────────────────
-    st.markdown("##### 📊 시각화")
-    _top_n = 20
-    _top = display_df.head(_top_n)
-    dim_labels = [inv_map.get(c, c) for c in valid_dim_cols]
-
-    if len(valid_dim_cols) == 1:
-        fig = px.bar(_top, x=dim_labels[0], y=metric,
-                     title=f"{dim_labels[0]}별 {metric} (상위 {min(_top_n, len(_top))})")
-        fig.update_layout(height=400, xaxis_tickangle=-45,
-                          margin=dict(t=40, b=100, l=20, r=20),
-                          xaxis_title=dim_labels[0], yaxis_title=metric)
-        fig.update_yaxes(tickformat=",")
-        st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_mdim_bar")
-    elif len(valid_dim_cols) == 2:
-        _dim1, _dim2 = dim_labels[0], dim_labels[1]
-        fig_bar = px.bar(_top, x=_dim1, y=metric, color=_dim2, barmode="group",
-                         title=f"{_dim1} × {_dim2} — {metric} (상위 {min(_top_n, len(_top))})")
-        fig_bar.update_layout(height=420, xaxis_tickangle=-45,
-                              margin=dict(t=40, b=100, l=20, r=20),
-                              xaxis_title=_dim1, yaxis_title=metric)
-        fig_bar.update_yaxes(tickformat=",")
-        st.plotly_chart(fig_bar, width="stretch", key=f"{key_prefix}_mdim_gbar")
-        try:
-            _pv = display_df.pivot_table(index=_dim1, columns=_dim2, values=metric,
-                                         aggfunc="sum", fill_value=0)
-            _top_rows = _pv.sum(axis=1).sort_values(ascending=False).head(20).index
-            _top_cols = _pv.sum(axis=0).sort_values(ascending=False).head(20).index
-            _pv = _pv.loc[_top_rows, _top_cols]
-            fig_hm = px.imshow(_pv, aspect="auto", color_continuous_scale="Blues",
-                               labels=dict(color=metric),
-                               title=f"{_dim1} × {_dim2} 히트맵 (상위 20×20)")
-            fig_hm.update_layout(height=420, margin=dict(t=40, b=20, l=20, r=20))
-            st.plotly_chart(fig_hm, width="stretch", key=f"{key_prefix}_mdim_heatmap")
-        except Exception as _e:
-            st.caption(f"히트맵 생략: {_e}")
+    # ── ⑥ 시각화 (결과 행 수가 많으면 opt-in) ─────────────────────
+    _CHART_AUTO_LIMIT = 500
+    _row_cnt = int(len(display_df))
+    _show_charts_default = _row_cnt <= _CHART_AUTO_LIMIT
+    if _show_charts_default:
+        _show_charts = True
     else:
-        try:
-            fig_tm = px.treemap(display_df.head(80), path=dim_labels, values=metric,
-                                title=f"트리맵 — {' > '.join(dim_labels)} · {metric} (상위 80)")
-            fig_tm.update_layout(height=560, margin=dict(t=40, b=20, l=20, r=20))
-            st.plotly_chart(fig_tm, width="stretch", key=f"{key_prefix}_mdim_treemap")
-        except Exception as _e:
-            st.caption(f"트리맵 생략: {_e}")
+        _show_charts = st.checkbox(
+            f"📊 차트 그리기 (결과 {_row_cnt:,}행 · 렌더링 시간이 걸릴 수 있음)",
+            value=False,
+            key=f"{key_prefix}_mdim_show_charts",
+        )
+
+    if _show_charts:
+        with st.spinner("차트 렌더링 중…"):
+            st.markdown("##### 📊 시각화")
+            _top_n = 20
+            _top = display_df.head(_top_n)
+            dim_labels = [inv_map.get(c, c) for c in valid_dim_cols]
+
+            if len(valid_dim_cols) == 1:
+                fig = px.bar(_top, x=dim_labels[0], y=_metric,
+                             title=f"{dim_labels[0]}별 {_metric} (상위 {min(_top_n, len(_top))})")
+                fig.update_layout(height=400, xaxis_tickangle=-45,
+                                  margin=dict(t=40, b=100, l=20, r=20),
+                                  xaxis_title=dim_labels[0], yaxis_title=_metric)
+                fig.update_yaxes(tickformat=",")
+                st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_mdim_bar")
+            elif len(valid_dim_cols) == 2:
+                _dim1, _dim2 = dim_labels[0], dim_labels[1]
+                fig_bar = px.bar(_top, x=_dim1, y=_metric, color=_dim2, barmode="group",
+                                 title=f"{_dim1} × {_dim2} — {_metric} (상위 {min(_top_n, len(_top))})")
+                fig_bar.update_layout(height=420, xaxis_tickangle=-45,
+                                      margin=dict(t=40, b=100, l=20, r=20),
+                                      xaxis_title=_dim1, yaxis_title=_metric)
+                fig_bar.update_yaxes(tickformat=",")
+                st.plotly_chart(fig_bar, width="stretch", key=f"{key_prefix}_mdim_gbar")
+                try:
+                    _pv = display_df.pivot_table(index=_dim1, columns=_dim2, values=_metric,
+                                                 aggfunc="sum", fill_value=0)
+                    _top_rows = _pv.sum(axis=1).sort_values(ascending=False).head(20).index
+                    _top_cols = _pv.sum(axis=0).sort_values(ascending=False).head(20).index
+                    _pv = _pv.loc[_top_rows, _top_cols]
+                    fig_hm = px.imshow(_pv, aspect="auto", color_continuous_scale="Blues",
+                                       labels=dict(color=_metric),
+                                       title=f"{_dim1} × {_dim2} 히트맵 (상위 20×20)")
+                    fig_hm.update_layout(height=420, margin=dict(t=40, b=20, l=20, r=20))
+                    st.plotly_chart(fig_hm, width="stretch", key=f"{key_prefix}_mdim_heatmap")
+                except Exception as _e:
+                    st.caption(f"히트맵 생략: {_e}")
+            else:
+                try:
+                    fig_tm = px.treemap(display_df.head(80), path=dim_labels, values=_metric,
+                                        title=f"트리맵 — {' > '.join(dim_labels)} · {_metric} (상위 80)")
+                    fig_tm.update_layout(height=560, margin=dict(t=40, b=20, l=20, r=20))
+                    st.plotly_chart(fig_tm, width="stretch", key=f"{key_prefix}_mdim_treemap")
+                except Exception as _e:
+                    st.caption(f"트리맵 생략: {_e}")
 
 
 def _render_marketing_multi_period_comparison(
