@@ -11649,13 +11649,13 @@ def render_erp_attendance():
         st.warning("매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 선택해 주세요.")
         return
 
-    # v2 메뉴 (2026-07-03 캘린더 대시보드 통합):
-    #   store_admin: 6탭 (대시보드[+캘린더] / 정기근무일정 / 추가근무·휴무 신청 / 근무시간 설정 / 신청 승인 / 월말 요약)
+    # v2 메뉴 (2026-07-03 캘린더 대시보드 통합, 2026-07-04 관리자 메뉴 분리):
+    #   store_admin: 7탭 (대시보드[+캘린더] / 정기근무일정 / 추가근무·휴무 신청 / 근무시간 설정 / 신청 승인 / 월말 요약 / 관리자 메뉴)
     #   user:        3탭 (대시보드[+캘린더] / 정기근무일정 / 추가근무·휴무 신청)
     # st.tabs 대신 segmented_control 사용: st.rerun() 호출 후에도 활성 탭 유지
     # (st.tabs는 stateless라 rerun 시 항상 첫 번째 탭으로 리셋되어 저장/수정 후 화면 이탈)
     if role == "store_admin":
-        tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청", "근무시간 설정", "신청 승인", "월말 요약"]
+        tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청", "근무시간 설정", "신청 승인", "월말 요약", "관리자 메뉴"]
     else:
         tab_labels = ["대시보드", "정기근무일정", "추가근무·휴무 신청"]
 
@@ -11685,6 +11685,8 @@ def render_erp_attendance():
             _erp_tab_adjustment_approvals(current_db, me_name)
         elif selected_tab == "월말 요약":
             _erp_tab_monthly_summary(current_db, today)
+        elif selected_tab == "관리자 메뉴":
+            _erp_tab_admin_settings(current_db, me_name, today)
     else:
         if selected_tab == "정기근무일정":
             _erp_tab_shift_plan(current_db, me_name)
@@ -12033,185 +12035,225 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
             import pandas as pd
             st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
 
-        # ── 연간 집계 시작일 설정 (관리자) ──────────────────────
-        st.divider()
-        st.markdown("##### 📅 연간 집계 시작일 설정")
-        st.caption(
-            "집계 시작일을 설정하면 해당 날짜부터 연말(12/31)까지의 근무만 집계됩니다. "
-            "예) 2026년 = 2026-06-01 → 6월~12월만 집계. "
-            "미설정 시 1월 1일부터 집계됩니다."
+        # 관리자 설정(집계 시작일 · 월 목표 근무시간)은 상단 '관리자 메뉴' 탭으로 이동함.
+        st.info("⚙️ 연간 집계 시작일 · 직원별 월 목표 근무시간 설정은 상단 [관리자 메뉴] 탭에서 관리하세요.")
+
+
+# ---------- 탭: 관리자 메뉴 (설정 모음) ----------
+
+def _erp_tab_admin_settings(current_db: str, me_name: str, today: date):
+    """매장 관리자 전용 설정 모음: 연간 집계 시작일 + 직원별 월 목표 근무시간.
+
+    원래 대시보드 하단에 함께 있었지만, 첫 화면 시야를 KPI/캘린더 중심으로 정리하기 위해
+    별도 관리자 메뉴 탭으로 이동. 대시보드와 독립된 연도 선택기를 제공한다."""
+    role = (st.session_state.get("current_user") or {}).get("role") or "user"
+    if role not in ("store_admin", "superadmin"):
+        st.warning("매장 관리자 이상만 접근할 수 있습니다.")
+        return
+
+    st.subheader("⚙️ 관리자 메뉴")
+    st.caption("매장 관리자 전용 설정 화면입니다. 저장 시 대시보드 · 잔여 근무시간 카드에 즉시 반영됩니다.")
+
+    # 연도 선택기 (대시보드와 독립: 관리자가 이번 해와 내년 목표를 함께 관리할 수 있게 함)
+    _year_opts = list(range(today.year - 1, today.year + 2))
+    _yc1, _yc2 = st.columns([2, 5])
+    with _yc1:
+        _ytarget_year = st.selectbox(
+            "📅 대상 연도",
+            _year_opts,
+            index=_year_opts.index(today.year),
+            key="erp_admin_settings_year",
         )
-        _ytarget_year = sel_year
-        _ytargets_all = _erp_list_yearly_targets(current_db, _ytarget_year)
-        _ytarget_map = {r.get("employee_name"): r for r in _ytargets_all}
-        _employees_yt = _erp_get_employee_names_for_store(current_db)
+    with _yc2:
+        st.markdown(
+            f"<div style='padding-top:30px; color:#666; font-size:0.9rem;'>"
+            f"📌 <b>{_ytarget_year}년</b> 설정 대상"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
-        if _employees_yt:
-            with st.form("erp_period_start_form"):
-                _psd_hdr = st.columns([2, 2, 2])
-                _psd_hdr[0].markdown("**직원명**")
-                _psd_hdr[1].markdown("**집계 시작일**")
-                _psd_hdr[2].markdown("**현재 설정값**")
-                _psd_edits: dict[str, date | None] = {}
-                for _emp_yt in _employees_yt:
-                    _yt_row = _ytarget_map.get(_emp_yt) or {}
-                    _raw = _yt_row.get("period_start_date")
-                    _cur_psd = None
-                    if _raw:
-                        try:
-                            _cur_psd = date.fromisoformat(str(_raw)[:10])
-                        except Exception:
-                            pass
-                    _def_psd = _cur_psd or date(_ytarget_year, 1, 1)
-                    _pc = st.columns([2, 2, 2])
-                    with _pc[0]:
-                        st.markdown(f"**{_emp_yt}**")
-                    with _pc[1]:
-                        _psd_val = st.date_input(
-                            "시작일", value=_def_psd,
-                            min_value=date(_ytarget_year, 1, 1),
-                            max_value=date(_ytarget_year, 12, 31),
-                            key=f"psd_{_ytarget_year}_{_emp_yt}",
-                            label_visibility="collapsed",
+    # ── 연간 집계 시작일 설정 ─────────────────────────────────────
+    st.divider()
+    st.markdown("##### 📅 연간 집계 시작일 설정")
+    st.caption(
+        "집계 시작일을 설정하면 해당 날짜부터 연말(12/31)까지의 근무만 집계됩니다. "
+        "예) 2026년 = 2026-06-01 → 6월~12월만 집계. "
+        "미설정 시 1월 1일부터 집계됩니다."
+    )
+    _ytargets_all = _erp_list_yearly_targets(current_db, _ytarget_year)
+    _ytarget_map = {r.get("employee_name"): r for r in _ytargets_all}
+    _employees_yt = _erp_get_employee_names_for_store(current_db)
+
+    if _employees_yt:
+        with st.form("erp_period_start_form"):
+            _psd_hdr = st.columns([2, 2, 2])
+            _psd_hdr[0].markdown("**직원명**")
+            _psd_hdr[1].markdown("**집계 시작일**")
+            _psd_hdr[2].markdown("**현재 설정값**")
+            _psd_edits: dict[str, date | None] = {}
+            for _emp_yt in _employees_yt:
+                _yt_row = _ytarget_map.get(_emp_yt) or {}
+                _raw = _yt_row.get("period_start_date")
+                _cur_psd = None
+                if _raw:
+                    try:
+                        _cur_psd = date.fromisoformat(str(_raw)[:10])
+                    except Exception:
+                        pass
+                _def_psd = _cur_psd or date(_ytarget_year, 1, 1)
+                _pc = st.columns([2, 2, 2])
+                with _pc[0]:
+                    st.markdown(f"**{_emp_yt}**")
+                with _pc[1]:
+                    _psd_val = st.date_input(
+                        "시작일", value=_def_psd,
+                        min_value=date(_ytarget_year, 1, 1),
+                        max_value=date(_ytarget_year, 12, 31),
+                        key=f"psd_{_ytarget_year}_{_emp_yt}",
+                        label_visibility="collapsed",
+                    )
+                with _pc[2]:
+                    _disp = _cur_psd.isoformat() if _cur_psd else f"{_ytarget_year}-01-01 (기본값)"
+                    st.markdown(f"<span style='color:#666; font-size:0.85rem;'>{_disp}</span>",
+                                unsafe_allow_html=True)
+                _psd_edits[_emp_yt] = _psd_val
+
+            if st.form_submit_button("💾 집계 시작일 저장", type="primary"):
+                _psd_ok, _psd_fail = 0, 0
+                for _emp_yt, _psd_v in _psd_edits.items():
+                    _yt_row = _ytarget_map.get(_emp_yt)
+                    _payload_psd = {"period_start_date": _psd_v.isoformat() if _psd_v else None}
+                    if _yt_row and _yt_row.get("id"):
+                        _ok_p, _e_p = _erp_update_row(
+                            "app_yearly_work_targets", int(_yt_row["id"]), _payload_psd
                         )
-                    with _pc[2]:
-                        _disp = _cur_psd.isoformat() if _cur_psd else f"{_ytarget_year}-01-01 (기본값)"
-                        st.markdown(f"<span style='color:#666; font-size:0.85rem;'>{_disp}</span>",
-                                    unsafe_allow_html=True)
-                    _psd_edits[_emp_yt] = _psd_val
-
-                if st.form_submit_button("💾 집계 시작일 저장", type="primary"):
-                    _psd_ok, _psd_fail = 0, 0
-                    for _emp_yt, _psd_v in _psd_edits.items():
-                        _yt_row = _ytarget_map.get(_emp_yt)
-                        _payload_psd = {"period_start_date": _psd_v.isoformat() if _psd_v else None}
-                        if _yt_row and _yt_row.get("id"):
-                            _ok_p, _e_p = _erp_update_row(
-                                "app_yearly_work_targets", int(_yt_row["id"]), _payload_psd
+                    else:
+                        _ok_p, _e_p = _erp_insert_row("app_yearly_work_targets", {
+                            "db_filename": current_db,
+                            "employee_name": _emp_yt,
+                            "year": _ytarget_year,
+                            "required_minutes": 0,
+                            **_payload_psd,
+                        })
+                    if _ok_p:
+                        _psd_ok += 1
+                    else:
+                        _psd_fail += 1
+                        if "period_start_date" in str(_e_p) or "PGRST204" in str(_e_p):
+                            st.error(
+                                "⚠️ period_start_date 컬럼이 DB에 없습니다. "
+                                "**SUPABASE_YEARLY_TARGET_PERIOD_START.sql** 을 "
+                                "Supabase 대시보드 → SQL Editor에서 실행 후 다시 시도해 주세요."
                             )
-                        else:
-                            _ok_p, _e_p = _erp_insert_row("app_yearly_work_targets", {
-                                "db_filename": current_db,
-                                "employee_name": _emp_yt,
-                                "year": _ytarget_year,
-                                "required_minutes": 0,
-                                **_payload_psd,
-                            })
-                        if _ok_p:
-                            _psd_ok += 1
-                        else:
-                            _psd_fail += 1
-                            if "period_start_date" in str(_e_p) or "PGRST204" in str(_e_p):
-                                st.error(
-                                    "⚠️ period_start_date 컬럼이 DB에 없습니다. "
-                                    "**SUPABASE_YEARLY_TARGET_PERIOD_START.sql** 을 "
-                                    "Supabase 대시보드 → SQL Editor에서 실행 후 다시 시도해 주세요."
-                                )
-                                break
-                    _erp_get_yearly_target_row.clear()
-                    _erp_list_yearly_targets.clear()
-                    if _psd_ok and not _psd_fail:
-                        flash(f"집계 시작일 저장 완료 ({_psd_ok}명)")
-                        st.rerun()
-                    elif _psd_ok:
-                        flash(f"저장 완료 {_psd_ok}명 / 실패 {_psd_fail}명", level="warning")
-
-        # ── 연간 근무시간 설정 (관리자) ──────────────────────────
-        st.divider()
-        st.markdown("##### ⚙️ 직원별 월 목표 근무시간 설정 (연간 기준 자동 계산)")
-        st.caption("월 목표를 설정하면 연간 목표(×12)가 자동으로 계산됩니다. 잔여 근무시간 카드에 즉시 반영됩니다.")
-        _emp_settings_all = _erp_employee_settings_cached(current_db)
-        _emp_map_all = {r.get("employee_name"): r for r in _emp_settings_all}
-        _employees_for_setting = _erp_get_employee_names_for_store(current_db)
-        if _employees_for_setting:
-            _preset_map = {
-                "정규직 (월 173h)": 173.0, "단시간 (월 152h)": 152.0,
-                "파트타임 (월 130h)": 130.0, "파트타임 (월 108h)": 108.0,
-                "파트타임 (월 87h)": 87.0, "파트타임 (월 65h)": 65.0,
-                "직접 입력": None,
-            }
-            _preset_types = list(_preset_map.keys())
-            _hdr = st.columns([1.5, 2, 1.5, 1.5, 1.5])
-            _hdr[0].markdown("**직원명**")
-            _hdr[1].markdown("**유형**")
-            _hdr[2].markdown("**월 목표(h)**")
-            _hdr[3].markdown("**주 환산**")
-            _hdr[4].markdown("**연간 목표**")
-            _edits: dict[str, float] = {}
-            for _emp in _employees_for_setting:
-                _saved = _emp_map_all.get(_emp, {})
-                _saved_monthly = _saved.get("monthly_target_hours")
-                if _saved_monthly:
-                    _sh = float(_saved_monthly)
-                elif _saved.get("weekly_target_hours"):
-                    _sh = round(float(_saved["weekly_target_hours"]) * 4.33, 1)
-                else:
-                    _sh = 173.0
-                _matched = next(
-                    (t for t, h in _preset_map.items() if h is not None and abs(h - _sh) < 0.5),
-                    "직접 입력",
-                )
-                _rc = st.columns([1.5, 2, 1.5, 1.5, 1.5])
-                with _rc[0]:
-                    st.markdown(f"**{_emp}**")
-                with _rc[1]:
-                    _sel = st.selectbox("유형", _preset_types,
-                                        index=_preset_types.index(_matched),
-                                        key=f"db_emp_type_{_emp}",
-                                        label_visibility="collapsed")
-                with _rc[2]:
-                    _preset_h = _preset_map.get(_sel)
-                    _default_h = _preset_h if _preset_h is not None else _sh
-                    _hval = st.number_input("월 목표(h)", min_value=10.0, max_value=300.0,
-                                            value=float(_default_h), step=1.0,
-                                            key=f"db_emp_h_{_emp}",
-                                            label_visibility="collapsed",
-                                            disabled=(_preset_h is not None))
-                with _rc[3]:
-                    st.markdown(f"<span style='color:#666;'>주 {round(float(_hval)/4.33,1):g}h</span>",
-                                unsafe_allow_html=True)
-                with _rc[4]:
-                    st.markdown(f"<span style='color:#1565C0; font-weight:600;'>연 {float(_hval)*12:.0f}h</span>",
-                                unsafe_allow_html=True)
-                _edits[_emp] = _hval
-
-            if st.button("💾 목표 근무시간 저장", type="primary", key="db_emp_save"):
-                _ok, _fail, _warn_monthly = 0, 0, False
-                for _emp, _h in _edits.items():
-                    _saved = _emp_map_all.get(_emp)
-                    _row = {
-                        "db_filename": current_db,
-                        "employee_name": _emp,
-                        "monthly_target_hours": float(_h),
-                        "weekly_target_hours": round(float(_h) / 4.33, 2),
-                        "updated_by": me_name,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    if _saved and _saved.get("id"):
-                        ok, e = _erp_update_row("app_employee_settings", int(_saved["id"]), _row)
-                    else:
-                        ok, e = _erp_insert_row("app_employee_settings", _row)
-                    if not ok and ("monthly_target_hours" in str(e) or "PGRST204" in str(e)):
-                        _row2 = {k: v for k, v in _row.items() if k != "monthly_target_hours"}
-                        if _saved and _saved.get("id"):
-                            ok, e = _erp_update_row("app_employee_settings", int(_saved["id"]), _row2)
-                        else:
-                            ok, e = _erp_insert_row("app_employee_settings", _row2)
-                        if ok:
-                            _warn_monthly = True
-                    if ok:
-                        _ok += 1
-                    else:
-                        _fail += 1
-                _erp_employee_settings_cached.clear()
-                if _fail == 0:
-                    if _warn_monthly:
-                        flash("저장 완료. monthly_target_hours 컬럼이 없어 주 단위만 저장되었습니다. SUPABASE_APP_ATTENDANCE_COUNTER.sql 을 실행해 주세요.", level="warning")
-                    else:
-                        flash(f"{_ok}명의 목표 근무시간이 저장되었습니다.")
+                            break
+                _erp_get_yearly_target_row.clear()
+                _erp_list_yearly_targets.clear()
+                if _psd_ok and not _psd_fail:
+                    flash(f"집계 시작일 저장 완료 ({_psd_ok}명)")
                     st.rerun()
+                elif _psd_ok:
+                    flash(f"저장 완료 {_psd_ok}명 / 실패 {_psd_fail}명", level="warning")
+    else:
+        st.info("배정된 직원이 없습니다.")
+
+    # ── 직원별 월 목표 근무시간 설정 ─────────────────────────────
+    st.divider()
+    st.markdown("##### ⚙️ 직원별 월 목표 근무시간 설정 (연간 기준 자동 계산)")
+    st.caption("월 목표를 설정하면 연간 목표(×12)가 자동으로 계산됩니다. 잔여 근무시간 카드에 즉시 반영됩니다.")
+    _emp_settings_all = _erp_employee_settings_cached(current_db)
+    _emp_map_all = {r.get("employee_name"): r for r in _emp_settings_all}
+    _employees_for_setting = _erp_get_employee_names_for_store(current_db)
+    if _employees_for_setting:
+        _preset_map = {
+            "정규직 (월 173h)": 173.0, "단시간 (월 152h)": 152.0,
+            "파트타임 (월 130h)": 130.0, "파트타임 (월 108h)": 108.0,
+            "파트타임 (월 87h)": 87.0, "파트타임 (월 65h)": 65.0,
+            "직접 입력": None,
+        }
+        _preset_types = list(_preset_map.keys())
+        _hdr = st.columns([1.5, 2, 1.5, 1.5, 1.5])
+        _hdr[0].markdown("**직원명**")
+        _hdr[1].markdown("**유형**")
+        _hdr[2].markdown("**월 목표(h)**")
+        _hdr[3].markdown("**주 환산**")
+        _hdr[4].markdown("**연간 목표**")
+        _edits: dict[str, float] = {}
+        for _emp in _employees_for_setting:
+            _saved = _emp_map_all.get(_emp, {})
+            _saved_monthly = _saved.get("monthly_target_hours")
+            if _saved_monthly:
+                _sh = float(_saved_monthly)
+            elif _saved.get("weekly_target_hours"):
+                _sh = round(float(_saved["weekly_target_hours"]) * 4.33, 1)
+            else:
+                _sh = 173.0
+            _matched = next(
+                (t for t, h in _preset_map.items() if h is not None and abs(h - _sh) < 0.5),
+                "직접 입력",
+            )
+            _rc = st.columns([1.5, 2, 1.5, 1.5, 1.5])
+            with _rc[0]:
+                st.markdown(f"**{_emp}**")
+            with _rc[1]:
+                _sel = st.selectbox("유형", _preset_types,
+                                    index=_preset_types.index(_matched),
+                                    key=f"admin_emp_type_{_emp}",
+                                    label_visibility="collapsed")
+            with _rc[2]:
+                _preset_h = _preset_map.get(_sel)
+                _default_h = _preset_h if _preset_h is not None else _sh
+                _hval = st.number_input("월 목표(h)", min_value=10.0, max_value=300.0,
+                                        value=float(_default_h), step=1.0,
+                                        key=f"admin_emp_h_{_emp}",
+                                        label_visibility="collapsed",
+                                        disabled=(_preset_h is not None))
+            with _rc[3]:
+                st.markdown(f"<span style='color:#666;'>주 {round(float(_hval)/4.33,1):g}h</span>",
+                            unsafe_allow_html=True)
+            with _rc[4]:
+                st.markdown(f"<span style='color:#1565C0; font-weight:600;'>연 {float(_hval)*12:.0f}h</span>",
+                            unsafe_allow_html=True)
+            _edits[_emp] = _hval
+
+        if st.button("💾 목표 근무시간 저장", type="primary", key="admin_emp_save"):
+            _ok, _fail, _warn_monthly = 0, 0, False
+            for _emp, _h in _edits.items():
+                _saved = _emp_map_all.get(_emp)
+                _row = {
+                    "db_filename": current_db,
+                    "employee_name": _emp,
+                    "monthly_target_hours": float(_h),
+                    "weekly_target_hours": round(float(_h) / 4.33, 2),
+                    "updated_by": me_name,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if _saved and _saved.get("id"):
+                    ok, e = _erp_update_row("app_employee_settings", int(_saved["id"]), _row)
                 else:
-                    st.error(f"저장 완료 {_ok}명 / 실패 {_fail}명.")
+                    ok, e = _erp_insert_row("app_employee_settings", _row)
+                if not ok and ("monthly_target_hours" in str(e) or "PGRST204" in str(e)):
+                    _row2 = {k: v for k, v in _row.items() if k != "monthly_target_hours"}
+                    if _saved and _saved.get("id"):
+                        ok, e = _erp_update_row("app_employee_settings", int(_saved["id"]), _row2)
+                    else:
+                        ok, e = _erp_insert_row("app_employee_settings", _row2)
+                    if ok:
+                        _warn_monthly = True
+                if ok:
+                    _ok += 1
+                else:
+                    _fail += 1
+            _erp_employee_settings_cached.clear()
+            if _fail == 0:
+                if _warn_monthly:
+                    flash("저장 완료. monthly_target_hours 컬럼이 없어 주 단위만 저장되었습니다. SUPABASE_APP_ATTENDANCE_COUNTER.sql 을 실행해 주세요.", level="warning")
+                else:
+                    flash(f"{_ok}명의 목표 근무시간이 저장되었습니다.")
+                st.rerun()
+            else:
+                st.error(f"저장 완료 {_ok}명 / 실패 {_fail}명.")
+    else:
+        st.info("배정된 직원이 없습니다.")
 
 
 # ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
