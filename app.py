@@ -12888,6 +12888,22 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     @st.fragment: 빠른 수정/삭제 시 이 캘린더만 부분 재실행하여 상위 탭(근무 일정 계획 등)으로 복귀하지 않게 한다."""
     import calendar as _cal
 
+    # 캘린더 배지 <a href="?erp_edit_shift=X"> 클릭 감지 → 세션 승격 후 URL 파라미터 즉시 제거.
+    # 세션 값이 남아 있으면 하단에서 편집 팝업(open_dialog)이 자동 트리거된다.
+    try:
+        _qp_edit_val = st.query_params.get("erp_edit_shift")
+        if _qp_edit_val:
+            try:
+                st.session_state["erp_shift_edit_id"] = int(_qp_edit_val)
+            except (TypeError, ValueError):
+                pass
+            try:
+                del st.query_params["erp_edit_shift"]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     st.subheader("🗓️ 월별 근무 캘린더")
     st.caption("매장·직원을 선택해 누가 언제 어디서 일하는지 한눈에 확인할 수 있습니다.")
     # 빠른 수정/삭제 직후 부분 재실행으로 전달된 완료 알림 (전체 rerun 아님 → 탭 유지)
@@ -13279,12 +13295,27 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     )
                 else:
                     _note_html = ""
+                # 클릭 가능 여부: 관리자 또는 본인 근무일 때만 <a> 로 감싸 편집 팝업 트리거.
+                _is_admin_cal = role in ("store_admin", "superadmin")
+                _can_edit_sh = (_is_admin_cal or (emp == me_name)) and bool(sh.get("id"))
+                if _can_edit_sh:
+                    _open_tag = (
+                        f"<a href='?erp_edit_shift={int(sh['id'])}' target='_self' "
+                        f"style='display:block; text-decoration:none; cursor:pointer;' "
+                        f"title='클릭하여 이 근무일 수정'>"
+                    )
+                    _close_tag = "</a>"
+                else:
+                    _open_tag = "<div>"
+                    _close_tag = "</div>"
                 cell.append(
+                    f"{_open_tag}"
                     f"<div style='margin-top:2px; border-left:3px solid {sc};"
                     f" background:{sc}15; padding:1px 3px; border-radius:0 2px 2px 0;'>"
                     f"{sn_badge}<span style='color:{sc}; font-weight:600; font-size:0.7rem;'>{emp}</span>"
                     f"<span style='color:#666; font-size:0.65rem;'>{time_txt}</span>"
                     f"{_note_html}</div>"
+                    f"{_close_tag}"
                 )
 
             # 근태 기록 (attendance_logs) — 실근무지 기준 컬러 (work_location_name 컬럼이 있으면 우선)
@@ -13343,6 +13374,169 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         html.append("</tr>")
     html.append("</tbody></table>")
     st.markdown("".join(html), unsafe_allow_html=True)
+
+    # ── ✏️ 캘린더 배지 클릭 → 즉시 편집 팝업 ─────────────────────
+    def _render_shift_quick_edit(sh: dict) -> None:
+        """캘린더에서 클릭한 근무일 편집 팝업.
+        기존 하단 expander 인라인 편집 폼과 동일한 필드·저장 로직을 재사용한다.
+        URL 조작으로 우회하는 케이스에 대비해 폼 렌더 전에 권한을 재검증한다."""
+        _sid = int(sh.get("id") or 0)
+        _sh_dbf = sh.get("db_filename") or current_db
+        _emp_name = sh.get("employee_name") or ""
+
+        # 권한 재검증 (URL 조작 방지)
+        _is_admin_dlg = role in ("store_admin", "superadmin")
+        if not (_is_admin_dlg or _emp_name == me_name):
+            st.warning("본인 근무만 수정할 수 있습니다.")
+            if st.button("닫기", key=f"erp_qs_close_deny_{_sid}", width="stretch"):
+                st.session_state.pop("erp_shift_edit_id", None)
+                st.rerun(scope="fragment")
+            return
+
+        try:
+            _sd = date.fromisoformat(str(sh.get("shift_date") or "")[:10])
+        except Exception:
+            st.error("잘못된 근무 일자입니다.")
+            if st.button("닫기", key=f"erp_qs_close_bad_{_sid}", width="stretch"):
+                st.session_state.pop("erp_shift_edit_id", None)
+                st.rerun(scope="fragment")
+            return
+
+        _cur_loc = (sh.get("work_location_name") or "").strip()
+        _cur_db_sn = _dbf_to_sn.get(_sh_dbf, "")
+        st.caption(
+            f"**{_sd.month}/{_sd.day} ({_ERP_DOW_LABELS[_sd.weekday()]}) · {_emp_name}**"
+            + (f"  |  소속: {_cur_db_sn}" if _cur_db_sn else "")
+        )
+
+        _es_def, _ee_def = _erp_default_times_for_date(_sh_dbf, _sd)
+        _ec_a, _ec_b = st.columns(2)
+        with _ec_a:
+            _e_start = _erp_time_input_30min(
+                "출근 시각",
+                value=_erp_parse_time(sh.get("shift_start")) or _es_def,
+                key=f"erp_qs_start_{_sid}",
+            )
+        with _ec_b:
+            _e_end = _erp_time_input_30min(
+                "퇴근 시각",
+                value=_erp_parse_time(sh.get("shift_end")) or _ee_def,
+                key=f"erp_qs_end_{_sid}",
+            )
+
+        # 근무 장소 (실근무지)
+        _ETC_LABEL = "기타 (외부/행사) — 직접 입력"
+        _loc_opts = list(all_store_names) + [_ETC_LABEL]
+        if _cur_loc and _cur_loc not in all_store_names:
+            _default_label = _ETC_LABEL
+        elif _cur_loc in all_store_names:
+            _default_label = _cur_loc
+        elif _cur_db_sn in all_store_names:
+            _default_label = _cur_db_sn
+        else:
+            _default_label = _loc_opts[0] if _loc_opts else _ETC_LABEL
+        try:
+            _loc_idx = _loc_opts.index(_default_label)
+        except ValueError:
+            _loc_idx = 0
+        _e_loc_sel = st.selectbox(
+            "근무 장소 (실근무지)", _loc_opts, index=_loc_idx,
+            key=f"erp_qs_loc_{_sid}",
+            help="이 일정의 실제 근무 매장. 직원 소속과 무관하게 이 값으로 캘린더에 합산됩니다.",
+        )
+        _is_etc = (_e_loc_sel == _ETC_LABEL)
+        if _is_etc:
+            _e_loc_etc = st.text_input(
+                "외부 행사명/상세 위치",
+                value=_cur_loc if _cur_loc and _cur_loc not in all_store_names else "",
+                key=f"erp_qs_loc_etc_{_sid}",
+                placeholder="예: 유에코임주박람회 / 롯데백화점 행사장",
+            )
+            _final_loc = (_e_loc_etc or "").strip()
+        else:
+            _final_loc = _e_loc_sel
+
+        _e_note = st.text_input(
+            "비고 (특별근무 · 초과근무 사유 등)",
+            value=str(sh.get("note") or ""),
+            key=f"erp_qs_note_{_sid}",
+            placeholder="예: 행사 지원 / 인수인계 야근 / 명절 특근",
+        )
+
+        _bc1, _bc2 = st.columns([1, 1])
+        with _bc1:
+            _save = st.button("💾 저장", type="primary", key=f"erp_qs_save_{_sid}", width="stretch")
+        with _bc2:
+            _cancel = st.button("취소", key=f"erp_qs_cancel_{_sid}", width="stretch")
+
+        if _cancel:
+            st.session_state.pop("erp_shift_edit_id", None)
+            st.rerun(scope="fragment")
+
+        if _save:
+            if (_e_start.hour * 60 + _e_start.minute) >= (_e_end.hour * 60 + _e_end.minute):
+                st.error("퇴근 시각이 출근 시각보다 늦어야 합니다.")
+                return
+            if _is_etc and not _final_loc:
+                st.error("외부 행사명/상세 위치를 입력해 주세요.")
+                return
+            # 소속 매장과 같으면 wloc 비움 (정합성)
+            _wloc_save: str | None = _final_loc or None
+            if _wloc_save and _wloc_save == _cur_db_sn:
+                _wloc_save = None
+            _ok, _err = _erp_update_row("app_shift_schedules", _sid, {
+                "shift_start": _e_start.strftime("%H:%M:%S"),
+                "shift_end": _e_end.strftime("%H:%M:%S"),
+                "work_location_name": _wloc_save,
+                "note": (_e_note or "").strip() or None,
+            })
+            if not _ok:
+                st.error(f"저장 실패: {_err}")
+                return
+            # 매장 표준 대비 차이 자동 보정 (기존 편집 UI 와 동일 파라미터)
+            _cal_adj_db = _sh_dbf
+            try:
+                _erp_collect_auto_adjustments(
+                    db_filename=_cal_adj_db,
+                    employee_name=_emp_name,
+                    shifts=[{
+                        "shift_date": _sd.isoformat(),
+                        "shift_start": _e_start.strftime("%H:%M:%S"),
+                        "shift_end": _e_end.strftime("%H:%M:%S"),
+                        "work_location_name": _wloc_save,
+                    }],
+                    source_tag="[자동-캘린더]",
+                    created_by=me_name,
+                    work_db_filename=_cal_adj_db,
+                    work_location_name=_wloc_save,
+                )
+            except Exception:
+                pass
+            st.session_state.pop("erp_shift_edit_id", None)
+            st.session_state["_erp_cal_flash"] = (
+                f"{_sd.isoformat()} {_emp_name} 일정이 수정되었습니다. "
+                f"표준 시간과 차이가 있으면 [정기근무일정] 상단에서 연장 신청을 확인하세요."
+            )
+            st.rerun(scope="fragment")
+
+    _edit_id_popup = st.session_state.get("erp_shift_edit_id")
+    if _edit_id_popup:
+        _target = next(
+            (s for s in all_shifts_for_rules if int(s.get("id") or 0) == int(_edit_id_popup)),
+            None,
+        )
+        if _target:
+            from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+            _tgt_date = str(_target.get("shift_date") or "")[:10]
+            _tgt_emp = _target.get("employee_name") or ""
+            _open_dialog(
+                f"✏️ 근무일 수정 — {_tgt_date} · {_tgt_emp}",
+                lambda tgt=_target: _render_shift_quick_edit(tgt),
+                width="medium",
+            )
+        else:
+            # 대상이 사라졌으면(다른 창에서 삭제 등) 세션 값 정리
+            st.session_state.pop("erp_shift_edit_id", None)
 
     # ── 🔍 인력 기준 룰 진단 ────────
     if shortage_dates or overstaff_dates:
