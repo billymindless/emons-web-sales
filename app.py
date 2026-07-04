@@ -7417,6 +7417,19 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             hovertemplate=f"%{{x}}일<br>%{{y:{_unit_fmt}}}{_unit_label}<extra>{_base_ym} (기준)</extra>",
         ))
 
+        # ── 범례용 마커 색상 안내 더미 트레이스 ─────────────────────
+        for _legend_color, _legend_name in [
+            ("#E53935", "일요일·공휴일"),
+            ("#1565C0", "토요일"),
+            ("#1B3A6B", "평일"),
+        ]:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode="markers",
+                name=_legend_name,
+                marker=dict(size=9, color=_legend_color, symbol="circle"),
+                showlegend=True,
+            ))
+
         _ytitle = f"{'누적 ' if _is_cum else ''}매출({_unit_label})"
         fig.update_layout(
             height=380, margin=dict(l=10, r=10, t=10, b=10),
@@ -7447,10 +7460,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                     "비교월 전체 누적": _fmt(_all),
                 })
             st.dataframe(pd.DataFrame(_tbl), use_container_width=True, hide_index=True)
-        st.caption(
-            "💡 기준 월(굵은 실선·마커)이 전면에, 비교 월(회색 실선)이 배경으로 표시됩니다. "
-            "마커 색상: 🔴 일요일/공휴일 · 🔵 토요일 · ⚫ 평일"
-        )
+        st.caption("💡 기준 월(굵은 실선)이 전면에, 비교 월(회색 실선)이 배경으로 표시됩니다.")
     except Exception as _e_chart:
         st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_chart}")
 
