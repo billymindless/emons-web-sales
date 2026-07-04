@@ -13476,13 +13476,12 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     # 캘린더 배지 클릭 UX 는 전체 페이지 리로드로 세션 컨텍스트가 초기화되는 문제가 있어
     # (auth 쿼리 파라미터 유실 시 로그아웃, 유지 시에도 사이드바 메뉴/탭 리셋)
     # Streamlit 네이티브 위젯 기반 편집 셀렉트를 대신 제공한다.
-    _is_admin_qe = role in ("store_admin", "superadmin")
     _editable_shifts: list[dict] = []
     for _d_iso in sorted(shifts_by_date.keys()):
         for _s in shifts_by_date[_d_iso]:
             if not bool(_s.get("id")):
                 continue
-            if not (_is_admin_qe or (_s.get("employee_name") == me_name)):
+            if _s.get("employee_name") != me_name:
                 continue
             _editable_shifts.append(_s)
     if _editable_shifts:
