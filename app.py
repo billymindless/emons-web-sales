@@ -7274,8 +7274,8 @@ def render_marketing_insights_superadmin():
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
 
 def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", key_prefix: str):
-    """일별 매출 추이 — 기준 월 1개(실선) + 비교 월 최대 12개(점선) 비교.
-    sales_df 의 transaction_date·amount 기준 일별 집계. DB/로직 변경 없음, 표시 전용."""
+    """일별 매출 추이 — 기준 월 1개(강조 실선) + 비교 월 최대 12개(회색 반투명 실선).
+    누적/일별 토글, Y축 단위(원/만원/백만원) 선택 지원."""
     import calendar as _cal
     try:
         if sales_df is None or sales_df.empty or "transaction_date" not in sales_df.columns or "amount" not in sales_df.columns:
@@ -7288,7 +7288,6 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         _sdf["_day"] = _sdf["transaction_date"].dt.day
         _sdf["_ym"] = _sdf["transaction_date"].dt.strftime("%Y-%m")
 
-        # 사용 가능 월: 매출이 있는 월 + 이번 달(데이터가 없어도 선택 가능)
         _avail_set = set(_sdf["_ym"].dropna().unique().tolist())
         _avail_set.add(today.strftime("%Y-%m"))
         _avail_yms = sorted(_avail_set, reverse=True)
@@ -7296,35 +7295,39 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             st.info("표시할 매출 데이터가 없습니다.")
             return
 
-        # 기준 월 / 비교 월 선택 UI
+        # ── UI 컨트롤 ──────────────────────────────────────────────
+        _ctrl1, _ctrl2, _ctrl3, _ctrl4 = st.columns([1, 3, 1.2, 1.2])
         _default_base = today.strftime("%Y-%m")
         if _default_base not in _avail_yms:
             _default_base = _avail_yms[0]
-        _ui_c1, _ui_c2 = st.columns([1, 3])
-        with _ui_c1:
-            _base_ym = st.selectbox(
-                "기준 월",
-                _avail_yms,
-                index=_avail_yms.index(_default_base),
-                key=f"{key_prefix}_base_ym",
-            )
+        with _ctrl1:
+            _base_ym = st.selectbox("기준 월", _avail_yms,
+                                     index=_avail_yms.index(_default_base),
+                                     key=f"{key_prefix}_base_ym")
         _other_yms = [m for m in _avail_yms if m != _base_ym]
         try:
-            _base_dt = datetime.strptime(_base_ym, "%Y-%m").date()
-            _prev_ym = (_base_dt.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+            _base_dt0 = datetime.strptime(_base_ym, "%Y-%m").date()
+            _prev_ym = (_base_dt0.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
             _default_compare = [_prev_ym] if _prev_ym in _other_yms else (_other_yms[:1])
         except Exception:
             _default_compare = _other_yms[:1]
-        with _ui_c2:
-            _compare_yms = st.multiselect(
-                "비교 월 (최대 12개 · 점선 표시)",
-                _other_yms,
-                default=_default_compare,
-                max_selections=12,
-                key=f"{key_prefix}_compare_yms",
-            )
+        with _ctrl2:
+            _compare_yms = st.multiselect("비교 월 (최대 12개)", _other_yms,
+                                           default=_default_compare, max_selections=12,
+                                           key=f"{key_prefix}_compare_yms")
+        with _ctrl3:
+            _unit_label = st.selectbox("Y축 단위", ["만원", "백만원", "원"],
+                                        key=f"{key_prefix}_unit")
+        with _ctrl4:
+            _chart_mode = st.selectbox("차트 형식", ["일별", "누적"],
+                                        key=f"{key_prefix}_mode")
 
-        # 기준 월 일별 데이터
+        # 단위 설정
+        _unit_div = {"만원": 10_000, "백만원": 1_000_000, "원": 1}[_unit_label]
+        _unit_fmt = {"만원": ",.1f", "백만원": ",.2f", "원": ",.0f"}[_unit_label]
+        _is_cum = (_chart_mode == "누적")
+
+        # ── 기준 월 데이터 ────────────────────────────────────────
         _base_dt = datetime.strptime(_base_ym, "%Y-%m").date()
         _base_year, _base_month = _base_dt.year, _base_dt.month
         _base_last_day = _cal.monthrange(_base_year, _base_month)[1]
@@ -7332,9 +7335,23 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         _base_max_day = today.day if _is_current_month else _base_last_day
         _base_days = list(range(1, _base_max_day + 1))
         _base_grp = _sdf[_sdf["_ym"] == _base_ym].groupby("_day")["amount"].sum()
-        _base_values = [float(_base_grp.get(d, 0)) for d in _base_days]
-        _base_sum = sum(_base_values)
+        _base_raw = [float(_base_grp.get(d, 0)) for d in _base_days]
+        _base_sum = sum(_base_raw)
 
+        # 누적/일별 변환
+        def _to_plot(vals):
+            if _is_cum:
+                cum = 0.0
+                out = []
+                for v in vals:
+                    cum += v
+                    out.append(cum / _unit_div)
+                return out
+            return [v / _unit_div for v in vals]
+
+        _base_plot = _to_plot(_base_raw)
+
+        # 기준 월 마커: 일요일=빨강, 토요일=파랑, 평일=다크블루
         _KR_HOLIDAYS = {
             date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
             date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6),
@@ -7353,94 +7370,87 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         }
         def _base_marker(d):
             try:
-                _d = date(_base_year, _base_month, d); _dw = _d.weekday()
-                if _d in _KR_HOLIDAYS or _dw == 6: return ("#E53935", 10)
-                if _dw == 5: return ("#1565C0", 10)
-                return ("#1B3A6B", 7)
+                _d = date(_base_year, _base_month, d)
+                _dw = _d.weekday()
+                if _d in _KR_HOLIDAYS or _dw == 6: return ("#E53935", 9)
+                if _dw == 5: return ("#1565C0", 9)
+                return ("#1B3A6B", 6)
             except Exception:
-                return ("#1B3A6B", 7)
+                return ("#1B3A6B", 6)
         _base_mc = [_base_marker(d)[0] for d in _base_days]
         _base_ms = [_base_marker(d)[1] for d in _base_days]
 
-        _PALETTE = [
-            "#9E9E9E", "#42A5F5", "#66BB6A", "#FFA726", "#AB47BC",
-            "#26C6DA", "#EC407A", "#8D6E63", "#7E57C2", "#26A69A",
-            "#FF7043", "#5C6BC0",
-        ]
-
         fig = go.Figure()
         _comp_rows = []
-        for i, cm in enumerate(_compare_yms):
+
+        # ── 비교 월: 연한 회색 실선, 마커 없음 ──────────────────────
+        _COMP_COLOR = "rgba(170,170,170,0.45)"
+        for cm in _compare_yms:
             try:
                 _cm_dt = datetime.strptime(cm, "%Y-%m").date()
             except Exception:
                 continue
             _cm_last_day = _cal.monthrange(_cm_dt.year, _cm_dt.month)[1]
-            _cm_days = list(range(1, _cm_last_day + 1))
+            _cm_days_full = list(range(1, _cm_last_day + 1))
             _cm_grp = _sdf[_sdf["_ym"] == cm].groupby("_day")["amount"].sum()
-            _cm_values = [float(_cm_grp.get(d, 0)) for d in _cm_days]
-            _cm_color = _PALETTE[i % len(_PALETTE)]
-            # 비교 월도 토요일(파란색)·일요일/공휴일(빨간색) 마커 적용
-            def _cm_marker(d, _yr=_cm_dt.year, _mo=_cm_dt.month, _base=_cm_color):
-                try:
-                    _d = date(_yr, _mo, d); _dw = _d.weekday()
-                    if _d in _KR_HOLIDAYS or _dw == 6: return ("#E53935", 8)
-                    if _dw == 5: return ("#1565C0", 8)
-                    return (_base, 5)
-                except Exception:
-                    return (_base, 5)
-            _cm_mc = [_cm_marker(d)[0] for d in _cm_days]
-            _cm_ms = [_cm_marker(d)[1] for d in _cm_days]
+            _cm_raw = [float(_cm_grp.get(d, 0)) for d in _cm_days_full]
+            _cm_plot = _to_plot(_cm_raw)
             fig.add_trace(go.Scatter(
-                x=_cm_days, y=_cm_values, mode="lines+markers",
+                x=_cm_days_full, y=_cm_plot, mode="lines",
                 name=cm,
-                line=dict(color=_cm_color, width=2, dash="dot"),
-                marker=dict(size=_cm_ms, color=_cm_mc),
-                hovertemplate="%{x}일<br>%{y:,.0f}원<extra>" + cm + "</extra>",
+                line=dict(color=_COMP_COLOR, width=1.5),
+                hovertemplate=f"%{{x}}일<br>%{{y:{_unit_fmt}}}{_unit_label}<extra>{cm}</extra>",
             ))
             _comp_rows.append({
                 "비교 월": cm,
-                "동기간 누적": sum(_cm_values[:_base_max_day]),
-                "전체 누적": sum(_cm_values),
+                "동기간 누적": sum(_cm_raw[:_base_max_day]),
+                "전체 누적": sum(_cm_raw),
             })
 
+        # ── 기준 월: 두꺼운 다크블루 실선, 마커 포함 (최상위 레이어) ─
         fig.add_trace(go.Scatter(
-            x=_base_days, y=_base_values, mode="lines+markers",
+            x=_base_days, y=_base_plot, mode="lines+markers",
             name=f"{_base_ym} (기준)",
             line=dict(color="#1B3A6B", width=3),
-            marker=dict(size=_base_ms, color=_base_mc),
-            hovertemplate="%{x}일<br>%{y:,.0f}원<extra>" + _base_ym + " (기준)</extra>",
+            marker=dict(size=_base_ms, color=_base_mc,
+                        line=dict(width=1, color="white")),
+            hovertemplate=f"%{{x}}일<br>%{{y:{_unit_fmt}}}{_unit_label}<extra>{_base_ym} (기준)</extra>",
         ))
 
+        _ytitle = f"{'누적 ' if _is_cum else ''}매출({_unit_label})"
         fig.update_layout(
-            height=360, margin=dict(l=10, r=10, t=10, b=10),
+            height=380, margin=dict(l=10, r=10, t=10, b=10),
             xaxis=dict(title="일(Day)", dtick=1 if _base_last_day <= 16 else 2,
                        tickfont=dict(size=11), gridcolor="#EEEEEE"),
-            yaxis=dict(title="매출(원)", tickformat=",", tickfont=dict(size=11), gridcolor="#EEEEEE"),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
+            yaxis=dict(title=_ytitle, tickformat=f",{'f' if _unit_div > 1 else '.0f'}",
+                       tickfont=dict(size=11), gridcolor="#EEEEEE"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1, font=dict(size=11)),
             plot_bgcolor="white", hovermode="x unified",
         )
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-        st.markdown(
-            f"**기준 월 ({_base_ym}) {_base_max_day}일까지 누적: "
-            f"{_base_sum:,.0f}원**"
-        )
+        # ── 비교 요약 테이블 ──────────────────────────────────────
+        def _fmt(v): return f"{v / _unit_div:{_unit_fmt}}{_unit_label}"
+        st.markdown(f"**기준 월 ({_base_ym}) {_base_max_day}일까지 누적: {_fmt(_base_sum)}**")
         if _comp_rows:
-            _rows = []
+            _tbl = []
             for r in _comp_rows:
                 _same = r["동기간 누적"]; _all = r["전체 누적"]
                 _diff = _base_sum - _same
                 _pct = f"{(_diff / _same * 100):+.1f}%" if _same > 0 else "-"
-                _rows.append({
+                _tbl.append({
                     "비교 월": r["비교 월"],
-                    f"동기간({_base_max_day}일)까지 누적": f"{_same:,.0f}원",
-                    "기준월 대비 차액": f"{_diff:+,.0f}원",
+                    f"동기간({_base_max_day}일) 누적": _fmt(_same),
+                    "기준월 대비 차액": _fmt(_diff),
                     "기준월 대비 %": _pct,
-                    "비교월 전체 누적": f"{_all:,.0f}원",
+                    "비교월 전체 누적": _fmt(_all),
                 })
-            st.dataframe(pd.DataFrame(_rows), width="stretch", hide_index=True)
-        st.caption("💡 기준 월은 실선, 비교 월은 점선으로 표시됩니다. 비교 월은 최대 12개까지 동시 선택 가능합니다.")
+            st.dataframe(pd.DataFrame(_tbl), use_container_width=True, hide_index=True)
+        st.caption(
+            "💡 기준 월(굵은 실선·마커)이 전면에, 비교 월(회색 실선)이 배경으로 표시됩니다. "
+            "마커 색상: 🔴 일요일/공휴일 · 🔵 토요일 · ⚫ 평일"
+        )
     except Exception as _e_chart:
         st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_chart}")
 
