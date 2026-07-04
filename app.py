@@ -16944,19 +16944,23 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         try:
                             _shift_s = str(adj.get("shift_start") or "")[:8] or None
                             _shift_e = str(adj.get("shift_end") or "")[:8] or None
-                            _work_db_adj = adj.get("work_db_filename") or current_db
+                            # home_db_filename 은 반드시 신청자(직원)의 소속 매장을 사용해야 함.
+                            # 승인자의 current_db 로 저장하면, 캘린더가 소속 매장 기준으로
+                            # 로그를 조회할 때 다른 매장 관리자가 승인한 건이 표시되지 않는다.
+                            _adj_home_db = adj.get("db_filename") or current_db
+                            _work_db_adj = adj.get("work_db_filename") or _adj_home_db
                             _work_loc_adj = adj.get("work_location_name")
                             _td_str = str(adj.get("target_date") or "")[:10]
                             try:
                                 _log_date_d = date.fromisoformat(_td_str)
                             except Exception:
                                 _log_date_d = _today_kst()
-                            _std_s, _std_e = _erp_default_times_for_date(current_db, _log_date_d)
+                            _std_s, _std_e = _erp_default_times_for_date(_adj_home_db, _log_date_d)
                             # work_type 매핑: kind 별 명시화 (종전엔 sign='-' 이 무조건 '조퇴' 였음).
                             # early_leave 만 '조퇴', 그 외 sign='-' 는 원본 kind 라벨(여름휴가/포상/장기근속/특이사항) 사용.
                             _wt = _ERP_ADJ_KIND_TO_WORK_TYPE.get(kind, "특이사항" if sign == "-" else "추가근무")
                             _log_row = {
-                                "home_db_filename": current_db,
+                                "home_db_filename": _adj_home_db,
                                 "work_db_filename": _work_db_adj,
                                 "work_location_name": _work_loc_adj,
                                 "employee_name": adj.get("employee_name"),
@@ -17097,28 +17101,43 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 _sync_rows = [r for r in _sync_rows
                               if str(r.get("target_date") or "").startswith(str(int(_sync_year)))]
 
-                # 이미 app_attendance_logs에 있는 항목 파악 (employee_name + log_date + work_type)
-                _existing_logs = _sb2.table("app_attendance_logs").select("employee_name,log_date,work_type")\
+                # 이미 app_attendance_logs에 있는 항목 파악 (id 포함, home_db_filename 검증용)
+                _existing_logs = _sb2.table("app_attendance_logs")\
+                    .select("id,employee_name,log_date,work_type,home_db_filename")\
                     .in_("work_type", ["추가근무", "회의"])\
                     .execute().data or []
-                _existing_keys = {
-                    (r.get("employee_name"), str(r.get("log_date") or "")[:10], r.get("work_type"))
+                _existing_map = {
+                    (r.get("employee_name"), str(r.get("log_date") or "")[:10], r.get("work_type")): r
                     for r in _existing_logs
                 }
 
                 _synced = 0
+                _repaired = 0
                 _skipped = 0
                 _failed = []
                 for _r in _sync_rows:
                     _wt = "추가근무" if _r.get("kind") == "overtime" else "회의"
                     _emp = _r.get("employee_name") or ""
                     _dt = str(_r.get("target_date") or "")[:10]
-                    if (_emp, _dt, _wt) in _existing_keys:
-                        _skipped += 1
+                    _r_db = _r.get("db_filename") or current_db
+                    _existing = _existing_map.get((_emp, _dt, _wt))
+                    if _existing:
+                        # 이미 존재하는 로그가 잘못된 home_db_filename 으로 저장된 경우 정정.
+                        # (구버전에서 승인자의 current_db 로 저장되어 캘린더에 안 뜨던 문제)
+                        _cur_hdb = _existing.get("home_db_filename")
+                        if _r_db and _cur_hdb != _r_db:
+                            _uok, _uerr = _erp_update_row("app_attendance_logs",
+                                                          int(_existing["id"]),
+                                                          {"home_db_filename": _r_db})
+                            if _uok:
+                                _repaired += 1
+                            else:
+                                _failed.append(f"{_emp}/{_dt} home_db 정정 실패: {_uerr}")
+                        else:
+                            _skipped += 1
                         continue
                     _shift_s = str(_r.get("shift_start") or "")[:8] or None
                     _shift_e = str(_r.get("shift_end") or "")[:8] or None
-                    _r_db = _r.get("db_filename") or current_db
                     try:
                         _log_date_d = date.fromisoformat(_dt)
                     except Exception:
@@ -17148,14 +17167,22 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         _lok, _lerr = _erp_insert_row("app_attendance_logs", _lr_min)
                     if _lok:
                         _synced += 1
-                        _existing_keys.add((_emp, _dt, _wt))
+                        _existing_map[(_emp, _dt, _wt)] = {
+                            "employee_name": _emp, "log_date": _dt,
+                            "work_type": _wt, "home_db_filename": _r_db,
+                        }
                     else:
                         _failed.append(f"{_emp}/{_dt}: {_lerr}")
 
+                _parts = []
                 if _synced:
-                    st.success(f"✅ {_synced}건 캘린더 동기화 완료 (이미 존재: {_skipped}건)")
-                elif _skipped:
-                    st.info(f"모든 항목이 이미 캘린더에 반영되어 있습니다 ({_skipped}건).")
+                    _parts.append(f"신규 반영 {_synced}건")
+                if _repaired:
+                    _parts.append(f"소속 매장 정정 {_repaired}건")
+                if _skipped:
+                    _parts.append(f"이미 존재 {_skipped}건")
+                if _parts:
+                    st.success("✅ 동기화 완료 — " + ", ".join(_parts))
                 else:
                     st.info(f"{int(_sync_year)}년 동기화할 항목이 없습니다.")
                 if _failed:
