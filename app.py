@@ -6950,11 +6950,16 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
 
     # ── 표 (spinner 밖: 위 결과는 이미 계산 완료) ─────────────────
     st.markdown("##### 📋 피벗 표 (상위 200행)")
+    _metric_col_name = q["metric"]
+    _num_fmt = "%,.0f" if _metric_col_name.startswith("객단가") else "%,d"
     st.dataframe(
         display_df.head(200),
         width="stretch",
         height=min(500, 60 + min(len(display_df), 200) * 32),
         key=f"{key_prefix}_mdim_table",
+        column_config={
+            _metric_col_name: st.column_config.NumberColumn(_metric_col_name, format=_num_fmt),
+        },
     )
 
     # ── CSV 다운로드 (지연 인코딩: 준비 버튼 → 다운로드 버튼 2단계) ─────
