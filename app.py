@@ -13486,36 +13486,40 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             if not _emp_n or (_me_aliases and _emp_n not in _me_aliases):
                 continue
             _editable_shifts.append(_s)
-    if _editable_shifts:
+    if me_name:
         with st.expander("✏️ 정기 근무시간 수정 (팝업)", expanded=False):
-            st.caption("아래에서 근무일을 선택하고 [편집] 버튼을 누르면 팝업 창에서 바로 수정할 수 있습니다.")
-            _qe_options: list[tuple[int, str]] = []
-            for _s in _editable_shifts:
-                _sid = int(_s.get("id") or 0)
-                _d = str(_s.get("shift_date") or "")[:10]
-                _emp = _s.get("employee_name") or ""
-                _ss = str(_s.get("shift_start") or "")[:5]
-                _ee = str(_s.get("shift_end") or "")[:5]
-                _wl = (_s.get("work_location_name") or "").strip()
-                _eff_dbf_q = _shift_effective_dbf(_s) or _s.get("_dbf") or current_db
-                _loc_lbl = _wl if _wl else (_dbf_to_sn.get(_eff_dbf_q, "") or "")
-                _label = f"{_d} · {_emp} · {_ss}~{_ee}" + (f" · {_loc_lbl}" if _loc_lbl else "")
-                _qe_options.append((_sid, _label))
-            _qe_labels = [lbl for _sid, lbl in _qe_options]
-            _qe_pick = st.selectbox(
-                "근무일 선택", _qe_labels,
-                key="erp_calendar_quick_edit_pick",
-                index=0,
-            )
-            _qe_pick_id = 0
-            for _sid, lbl in _qe_options:
-                if lbl == _qe_pick:
-                    _qe_pick_id = _sid
-                    break
-            if st.button("✏️ 편집 팝업 열기", key="erp_calendar_quick_edit_open", type="primary"):
-                if _qe_pick_id:
-                    st.session_state["erp_shift_edit_id"] = int(_qe_pick_id)
-                    st.rerun(scope="fragment")
+            if not _editable_shifts:
+                st.info("이번 달 등록된 본인 정기 근무일이 없습니다. "
+                        "정기 근무일정은 [정기근무일정] 탭에서 먼저 등록해 주세요.")
+            else:
+                st.caption("아래에서 근무일을 선택하고 [편집] 버튼을 누르면 팝업 창에서 바로 수정할 수 있습니다.")
+                _qe_options: list[tuple[int, str]] = []
+                for _s in _editable_shifts:
+                    _sid = int(_s.get("id") or 0)
+                    _d = str(_s.get("shift_date") or "")[:10]
+                    _emp = _s.get("employee_name") or ""
+                    _ss = str(_s.get("shift_start") or "")[:5]
+                    _ee = str(_s.get("shift_end") or "")[:5]
+                    _wl = (_s.get("work_location_name") or "").strip()
+                    _eff_dbf_q = _shift_effective_dbf(_s) or _s.get("_dbf") or current_db
+                    _loc_lbl = _wl if _wl else (_dbf_to_sn.get(_eff_dbf_q, "") or "")
+                    _label = f"{_d} · {_emp} · {_ss}~{_ee}" + (f" · {_loc_lbl}" if _loc_lbl else "")
+                    _qe_options.append((_sid, _label))
+                _qe_labels = [lbl for _sid, lbl in _qe_options]
+                _qe_pick = st.selectbox(
+                    "근무일 선택", _qe_labels,
+                    key="erp_calendar_quick_edit_pick",
+                    index=0,
+                )
+                _qe_pick_id = 0
+                for _sid, lbl in _qe_options:
+                    if lbl == _qe_pick:
+                        _qe_pick_id = _sid
+                        break
+                if st.button("✏️ 편집 팝업 열기", key="erp_calendar_quick_edit_open", type="primary"):
+                    if _qe_pick_id:
+                        st.session_state["erp_shift_edit_id"] = int(_qe_pick_id)
+                        st.rerun(scope="fragment")
 
     # ── ➕➖ 추가근무·휴가신청 팝업 트리거 ─────────────────────────
     # 근무시간 관리 탭의 '신청 등록' 폼을 캘린더에서 바로 열 수 있는 팝업으로 재사용.
