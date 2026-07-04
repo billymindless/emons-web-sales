@@ -13505,20 +13505,22 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     _loc_lbl = _wl if _wl else (_dbf_to_sn.get(_eff_dbf_q, "") or "")
                     _label = f"{_d} · {_emp} · {_ss}~{_ee}" + (f" · {_loc_lbl}" if _loc_lbl else "")
                     _qe_options.append((_sid, _label))
-                _qe_labels = [lbl for _sid, lbl in _qe_options]
-                _qe_pick = st.selectbox(
-                    "근무일 선택", _qe_labels,
-                    key="erp_calendar_quick_edit_pick",
+                # ID 자체를 selectbox 값으로 사용 (레이블은 format_func 로 표시).
+                # 문자열 레이블을 되짚어 ID를 찾던 이전 방식에서 발생하던
+                # "다른 날짜를 골라도 이전 근무일이 팝업에 뜨는" 버그를 원천 차단.
+                _qe_id_list = [_sid for _sid, _ in _qe_options]
+                _qe_id_to_label = {_sid: _lbl for _sid, _lbl in _qe_options}
+                _qe_pick_id = st.selectbox(
+                    "근무일 선택",
+                    options=_qe_id_list,
+                    format_func=lambda _sid: _qe_id_to_label.get(_sid, str(_sid)),
+                    key="erp_calendar_quick_edit_pick_id",
                     index=0,
                 )
-                _qe_pick_id = 0
-                for _sid, lbl in _qe_options:
-                    if lbl == _qe_pick:
-                        _qe_pick_id = _sid
-                        break
+                _qe_pick_id = int(_qe_pick_id or 0)
                 if st.button("✏️ 편집 팝업 열기", key="erp_calendar_quick_edit_open", type="primary"):
                     if _qe_pick_id:
-                        st.session_state["erp_shift_edit_id"] = int(_qe_pick_id)
+                        st.session_state["erp_shift_edit_id"] = _qe_pick_id
                         st.rerun(scope="fragment")
 
     # ── ➕➖ 추가근무·휴가신청 팝업 트리거 ─────────────────────────
