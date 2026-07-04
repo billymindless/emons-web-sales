@@ -6854,6 +6854,7 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         }
         # CSV 캐시 무효화 — 새 검색 시 이전 CSV 삭제
         st.session_state.pop(f"{key_prefix}_mdim_csv_bytes", None)
+        st.session_state.pop(f"{key_prefix}_mdim_detail_csv_bytes", None)
 
     q = st.session_state.get(_query_key)
     if not q:
@@ -6891,22 +6892,23 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         if q["f_purch"]:
             fdf = fdf[fdf["purchase_reason"].isin(q["f_purch"])]
 
-        # 품목은 explode (한 주문 category="침대,매트리스" → 두 행) 후 필터
-        if "품목" in q["f_dims"] or q["f_cat"]:
-            fdf = fdf.assign(_category_expl=fdf["category"].fillna("").astype(str).str.split(","))
-            fdf = fdf.explode("_category_expl")
-            fdf["_category_expl"] = fdf["_category_expl"].astype(str).str.strip()
-            fdf = fdf[(fdf["_category_expl"] != "") & (fdf["_category_expl"] != "-")]
-            if q["f_cat"]:
-                fdf = fdf[fdf["_category_expl"].isin(q["f_cat"])]
-        else:
-            fdf["_category_expl"] = None
+        # 품목 필터(f_cat): explode 없이 주문 단위 교집합 마스크로 적용
+        # → 시군구 등 다른 차원 집계 시 금액이 품목 수만큼 중복되는 것을 방지.
+        if q["f_cat"]:
+            _sel_cats = {str(c).strip() for c in q["f_cat"] if str(c).strip()}
+            def _order_has_any_cat(raw):
+                items = {c.strip() for c in str(raw or "").split(",") if c.strip() and c.strip() != "-"}
+                return bool(items & _sel_cats)
+            fdf = fdf[fdf["category"].apply(_order_has_any_cat)]
+
+        # 기본값(품목 차원 미사용 경로)
+        fdf["_category_expl"] = None
 
         if fdf.empty:
             st.info("선택한 조건에 맞는 데이터가 없습니다.")
             return
 
-        # ── ④ 요약 지표 ────────────────────────────────────────────────
+        # ── ④ 요약 지표 (항상 주문 단위 fdf 기준 — 매출 중복 없음) ─────
         s1, s2, s3, s4 = st.columns(4)
         _amount = float(fdf["total_amount"].sum())
         _count = int(len(fdf))
@@ -6920,23 +6922,43 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         if not q["f_dims"]:
             st.info("그룹화 차원을 1개 이상 선택하세요.")
             return
+
+        # 품목 차원 선택 시: 주문 금액이 품목별로 분리되어 있지 않아 매출액/객단가 분석은
+        # 중복 계상이 불가피하므로 자동으로 '건수'로 전환한다.
+        _use_item_dim = "품목" in q["f_dims"]
+        _metric = q["metric"]
+        if _use_item_dim and _metric != "건수":
+            st.info(
+                "ℹ️ 품목 차원이 포함되어 있어 측정값을 **건수**로 자동 전환했습니다. "
+                "주문 금액은 품목별로 분리되어 있지 않아 품목별 매출·객단가 분석은 지원하지 않습니다."
+            )
+            _metric = "건수"
+
+        # 피벗용 DataFrame: 품목 차원이 있을 때만 explode한 사본을 사용
+        if _use_item_dim:
+            fdf_pivot = fdf.assign(_category_expl=fdf["category"].fillna("").astype(str).str.split(","))
+            fdf_pivot = fdf_pivot.explode("_category_expl")
+            fdf_pivot["_category_expl"] = fdf_pivot["_category_expl"].astype(str).str.strip()
+            fdf_pivot = fdf_pivot[(fdf_pivot["_category_expl"] != "") & (fdf_pivot["_category_expl"] != "-")]
+        else:
+            fdf_pivot = fdf
+
         dim_cols = [dim_map[d] for d in q["f_dims"]]
-        valid_dim_cols = [c for c in dim_cols if c in fdf.columns]
+        valid_dim_cols = [c for c in dim_cols if c in fdf_pivot.columns]
         if not valid_dim_cols:
             st.info("선택한 차원 컬럼을 찾을 수 없습니다.")
             return
 
         # NaN 방어: groupby에서 NaN 그룹이 사라지므로 '(미분류)'로 대체
         for c in valid_dim_cols:
-            fdf[c] = fdf[c].fillna("(미분류)")
+            fdf_pivot[c] = fdf_pivot[c].fillna("(미분류)")
 
-        _metric = q["metric"]
         if _metric == "매출액(원)":
-            agg = fdf.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "sum"))
+            agg = fdf_pivot.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "sum"))
         elif _metric == "건수":
-            agg = fdf.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "count"))
+            agg = fdf_pivot.groupby(valid_dim_cols, as_index=False).agg(값=("total_amount", "count"))
         else:  # 객단가
-            agg = fdf.groupby(valid_dim_cols, as_index=False).agg(
+            agg = fdf_pivot.groupby(valid_dim_cols, as_index=False).agg(
                 _sum=("total_amount", "sum"),
                 _cnt=("total_amount", "count"),
             )
@@ -6950,7 +6972,7 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
 
     # ── 표 (spinner 밖: 위 결과는 이미 계산 완료) ─────────────────
     st.markdown("##### 📋 피벗 표 (상위 200행)")
-    _metric_col_name = q["metric"]
+    _metric_col_name = _metric
     _num_fmt = "%,.0f" if _metric_col_name.startswith("객단가") else "%,d"
     st.dataframe(
         display_df.head(200),
@@ -6962,26 +6984,79 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         },
     )
 
-    # ── CSV 다운로드 (지연 인코딩: 준비 버튼 → 다운로드 버튼 2단계) ─────
+    # ── CSV 다운로드 ────────────────────────────────────────────
+    # (1) 피벗 결과 CSV, (2) 주문 세부 내역 CSV (중복 없음 · 검증용)
+    st.markdown("##### 📥 CSV 다운로드")
     _csv_key = f"{key_prefix}_mdim_csv_bytes"
+    _detail_csv_key = f"{key_prefix}_mdim_detail_csv_bytes"
     _csv_ready = st.session_state.get(_csv_key)
+    _detail_csv_ready = st.session_state.get(_detail_csv_key)
+
+    # (1) 피벗 결과 CSV
     _dc1, _dc2 = st.columns([1, 2])
     with _dc1:
-        if st.button("📥 CSV 준비", key=f"{key_prefix}_mdim_csv_prep"):
+        if st.button("📥 피벗 결과 CSV 준비", key=f"{key_prefix}_mdim_csv_prep"):
             with st.spinner("CSV 인코딩 중…"):
                 st.session_state[_csv_key] = display_df.to_csv(index=False).encode("utf-8-sig")
                 _csv_ready = st.session_state[_csv_key]
     with _dc2:
         if _csv_ready:
             st.download_button(
-                "💾 다운로드 (전체 결과)",
+                "💾 피벗 결과 다운로드",
                 _csv_ready,
                 file_name=f"multi_dim_{q['f_start']}_{q['f_end']}.csv",
                 mime="text/csv",
                 key=f"{key_prefix}_mdim_csv",
             )
         else:
-            st.caption("CSV 준비 버튼을 눌러 파일을 생성한 뒤 다운로드할 수 있습니다.")
+            st.caption("피벗 결과 CSV 준비 버튼을 눌러 파일을 생성한 뒤 다운로드할 수 있습니다.")
+
+    # (2) 주문 세부 내역 CSV — 필터 적용된 주문 단위(중복 없음)
+    _dd1, _dd2 = st.columns([1, 2])
+    with _dd1:
+        if st.button("📥 세부 내역 CSV 준비", key=f"{key_prefix}_mdim_detail_csv_prep"):
+            with st.spinner("세부 내역 인코딩 중…"):
+                _detail_cols_pref = [
+                    ("order_date", "주문일"),
+                    ("_store", "매장"),
+                    ("sido", "시도"),
+                    ("sigungu", "시군구"),
+                    ("bname", "법정동"),
+                    ("road_name", "도로명"),
+                    ("building_name", "건물명"),
+                    ("building_type", "건물유형"),
+                    ("name", "고객명"),
+                    ("address", "주소"),
+                    ("category", "품목"),
+                    ("visit_reason", "방문이유"),
+                    ("purchase_reason", "구매이유"),
+                    ("total_amount", "매출액(원)"),
+                ]
+                _use_cols = [(c, l) for c, l in _detail_cols_pref if c in fdf.columns]
+                _detail_df = fdf[[c for c, _ in _use_cols]].copy()
+                _detail_df.columns = [l for _, l in _use_cols]
+                # 주문일 포맷 정리 (있는 경우)
+                if "주문일" in _detail_df.columns:
+                    _detail_df["주문일"] = pd.to_datetime(_detail_df["주문일"], errors="coerce").dt.strftime("%Y-%m-%d")
+                # 합계 검증 행 추가
+                if "매출액(원)" in _detail_df.columns:
+                    _sum_row = {col: "" for col in _detail_df.columns}
+                    _sum_row[_detail_df.columns[0]] = "합계"
+                    _sum_row["매출액(원)"] = int(round(float(_detail_df["매출액(원)"].fillna(0).sum())))
+                    _detail_df = pd.concat([_detail_df, pd.DataFrame([_sum_row])], ignore_index=True)
+                st.session_state[_detail_csv_key] = _detail_df.to_csv(index=False).encode("utf-8-sig")
+                _detail_csv_ready = st.session_state[_detail_csv_key]
+    with _dd2:
+        if _detail_csv_ready:
+            st.download_button(
+                "💾 세부 내역 다운로드",
+                _detail_csv_ready,
+                file_name=f"multi_dim_detail_{q['f_start']}_{q['f_end']}.csv",
+                mime="text/csv",
+                key=f"{key_prefix}_mdim_detail_csv",
+            )
+        else:
+            st.caption("주문 단위 원본(중복 없음). 매출액 합계가 상단 요약 카드와 일치하는지 검증에 사용하세요.")
 
     # ── ⑥ 시각화 (결과 행 수가 많으면 opt-in) ─────────────────────
     _CHART_AUTO_LIMIT = 500
