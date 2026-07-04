@@ -27566,7 +27566,7 @@ def main():
     """
     st.sidebar.markdown(clickable_logo_html, unsafe_allow_html=True)
     # 홈 버튼: 세션 상태만 초기화하고 rerun하여 로그아웃 없이 대시보드로 안전하게 복귀
-    if st.sidebar.button("🏠 첫 화면으로 (대시보드)", width='stretch', key="sidebar_home_btn"):
+    if st.sidebar.button("🏠 세일즈대시보드", width='stretch', key="sidebar_home_btn"):
         if "active_admin_page" in st.session_state:
             del st.session_state["active_admin_page"]
         st.session_state["main_tab_idx"] = 0
