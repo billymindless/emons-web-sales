@@ -6734,8 +6734,8 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         "건물유형": "building_type",
         "건물명": "building_name",
         "품목": "_category_expl",
-        "방문이유": "visit_reason",
-        "구매이유": "purchase_reason",
+        "방문 경로": "visit_reason",
+        "구매 이유": "purchase_reason",
     }
     if store_map and "_store" in df.columns:
         dim_map["매장"] = "_store"
@@ -6810,15 +6810,15 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
                                     placeholder="전체")
         with cf2:
             vr_opts = sorted([x for x in df["visit_reason"].dropna().unique() if str(x).strip()])
-            f_visit = st.multiselect("방문 이유", vr_opts, key=f"{key_prefix}_mdim_visit",
+            f_visit = st.multiselect("방문 경로", vr_opts, key=f"{key_prefix}_mdim_visit",
                                       placeholder="전체")
         with cf3:
             pr_opts = sorted([x for x in df["purchase_reason"].dropna().unique() if str(x).strip()])
             f_purch = st.multiselect("구매 이유", pr_opts, key=f"{key_prefix}_mdim_purch",
                                       placeholder="전체")
 
-        # 그룹화 차원 (다중 선택) + 측정값
-        default_dims = ["시군구", "품목"]
+        # 그룹화 차원 (다중 선택) + 측정값 — 방문 경로·구매 이유도 기본 결과 항목으로 포함
+        default_dims = ["시군구", "품목", "방문 경로", "구매 이유"]
         f_dims = st.multiselect(
             "그룹화 차원 (2개 이상 선택하면 다차원 피벗)",
             dim_options,
@@ -6943,7 +6943,10 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         else:
             fdf_pivot = fdf
 
-        dim_cols = [dim_map[d] for d in q["f_dims"]]
+        # 세션에 남은 구 라벨("방문이유"·"구매이유")도 신 라벨로 매핑해 KeyError 방지
+        _legacy_dim_alias = {"방문이유": "방문 경로", "구매이유": "구매 이유"}
+        _q_dims = [_legacy_dim_alias.get(d, d) for d in (q["f_dims"] or [])]
+        dim_cols = [dim_map[d] for d in _q_dims if d in dim_map]
         valid_dim_cols = [c for c in dim_cols if c in fdf_pivot.columns]
         if not valid_dim_cols:
             st.info("선택한 차원 컬럼을 찾을 수 없습니다.")
@@ -7028,8 +7031,8 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
                     ("name", "고객명"),
                     ("address", "주소"),
                     ("category", "품목"),
-                    ("visit_reason", "방문이유"),
-                    ("purchase_reason", "구매이유"),
+                    ("visit_reason", "방문 경로"),
+                    ("purchase_reason", "구매 이유"),
                     ("total_amount", "매출액(원)"),
                 ]
                 _use_cols = [(c, l) for c, l in _detail_cols_pref if c in fdf.columns]
