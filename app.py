@@ -13889,6 +13889,12 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             # 대상이 사라졌으면(다른 창에서 삭제 등) 세션 값 정리
             st.session_state.pop("erp_shift_edit_id", None)
 
+    # ── 아래 진단·수정·범례 섹션은 관리자(store_admin/superadmin) 전용 ─────
+    # 일반 직원 화면을 단순화하기 위해 이후 4개 섹션은 관리자에게만 노출한다.
+    _is_admin = role in ("store_admin", "superadmin")
+    if not _is_admin:
+        return
+
     # ── 🔍 인력 기준 룰 진단 ────────
     if shortage_dates or overstaff_dates:
         with st.expander("🔍 인력 기준 룰 진단 — 화면 표시와 실제 DB row 비교", expanded=False):
@@ -14063,14 +14069,10 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             else:
                 st.info("등록된 룰이 없습니다.")
 
-    # ── ✏️ 등록된 근무일 목록 수정 / 삭제 ────────
+    # ── ✏️ 등록된 근무일 목록 수정 / 삭제 (관리자 전용) ────────
     st.divider()
-    _is_admin = role in ("store_admin", "superadmin")
     with st.expander("✏️ 등록된 근무일 수정 / 삭제", expanded=False):
-        if _is_admin:
-            st.caption("**근무매장**(실제 근무한 매장)을 선택하면 해당 매장에서 일한 모든 직원(소속+파견)의 이번 달 근무일이 나옵니다. 외부 행사는 '기타 (외부/행사)' 선택.")
-        else:
-            st.caption("내 이번 달 등록 근무일 목록입니다. 소속 매장 외 타 매장(파견)·외부행사 근무도 매장을 바꿔 선택하면 수정·삭제할 수 있습니다.")
+        st.caption("**근무매장**(실제 근무한 매장)을 선택하면 해당 매장에서 일한 모든 직원(소속+파견)의 이번 달 근무일이 나옵니다. 외부 행사는 '기타 (외부/행사)' 선택.")
         # 이 섹션 자체 매장 선택 (상단 필터와 독립). '기타 (외부/행사)'는 내 매장 db에 저장.
         _qe_store_opts = all_store_names + ["기타 (외부/행사)"]
         _qe_default_store = sel_store if sel_store in all_store_names else (
