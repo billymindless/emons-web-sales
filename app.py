@@ -13520,20 +13520,29 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     # ── ➕➖ 추가근무·휴가신청 팝업 트리거 ─────────────────────────
     # 근무시간 관리 탭의 '신청 등록' 폼을 캘린더에서 바로 열 수 있는 팝업으로 재사용.
     # superadmin 은 me_name 이 비어 있으므로 팝업 대상에서 제외.
+    # 팝업 open/close 상태는 st.dialog 데코레이터가 내부적으로 관리하므로
+    # session_state 플래그 없이 버튼 클릭 시 즉시 호출한다.
     if me_name:
+        if hasattr(st, "dialog"):
+            try:
+                _dlg_dec = st.dialog("🧑‍💼 근무시간 관리 · 신청 등록", width="large")
+            except TypeError:
+                _dlg_dec = st.dialog("🧑‍💼 근무시간 관리 · 신청 등록")
+
+            @_dlg_dec
+            def _adj_dialog():
+                _erp_render_my_adj_form(current_db, role, me_name, today)
+        else:
+            _adj_dialog = None
+
         with st.expander("➕➖ 추가근무·휴가신청 (팝업)", expanded=False):
             st.caption("추가근무·휴가 등 신청을 팝업 창에서 바로 등록할 수 있습니다.")
             if st.button("📤 신청 등록 팝업 열기", key="erp_calendar_adj_btn", type="primary"):
-                st.session_state["erp_calendar_adj_open"] = True
-                st.rerun(scope="fragment")
-    if st.session_state.get("erp_calendar_adj_open"):
-        from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
-        def _adj_dialog_body():
-            _erp_render_my_adj_form(current_db, role, me_name, today)
-            if st.button("닫기", key="erp_calendar_adj_close", width="stretch"):
-                st.session_state.pop("erp_calendar_adj_open", None)
-                st.rerun(scope="fragment")
-        _open_dialog("🧑‍💼 근무시간 관리 · 신청 등록", _adj_dialog_body, width="large")
+                if _adj_dialog is not None:
+                    _adj_dialog()
+                else:
+                    st.info("이 Streamlit 버전은 팝업(st.dialog) 을 지원하지 않습니다. "
+                            "'추가근무·휴무 신청' 탭에서 등록해 주세요.")
 
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
     cal_obj = _cal.Calendar(firstweekday=6)
@@ -17260,8 +17269,11 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 st.error(f"엑셀 생성 오류: {_xls_ex}")
 
 
-def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: date) -> None:
-    """+/- 신청 등록 폼 (팝업/탭 공용). 캘린더 팝업과 근무시간 관리 탭 양쪽에서 재사용."""
+def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: date,
+                            on_success=None) -> None:
+    """+/- 신청 등록 폼 (팝업/탭 공용). 캘린더 팝업과 근무시간 관리 탭 양쪽에서 재사용.
+    on_success: 저장 성공 후 `st.rerun()` 직전 호출되는 콜백 (팝업 플래그 정리용).
+    """
     year = today.year
     month = today.month
 
@@ -17425,6 +17437,11 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
                         flash(f"신청이 등록되었습니다. 승인 후 {new_date.isoformat()} 캘린더에 자동 반영됩니다.")
                     else:
                         flash("신청이 등록되었습니다. 매장관리자 승인 대기 중.")
+                    if on_success:
+                        try:
+                            on_success()
+                        except Exception:
+                            pass
                     st.rerun()
                 else:
                     st.error(f"등록 실패: {e}")
