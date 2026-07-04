@@ -17190,6 +17190,91 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
             except Exception as _se:
                 st.error(f"동기화 오류: {_se}")
 
+    # ── 진단: 특정 날짜·직원의 로그·신청 상태 확인 ─────────────────────
+    with st.expander("🔎 캘린더 반영 진단 (특정 날짜·직원)", expanded=False):
+        st.caption(
+            "캘린더에 추가근무·회의가 안 나올 때, 실제 DB 에 어떻게 저장되어 있는지 확인합니다."
+        )
+        _diag_c1, _diag_c2 = st.columns([2, 2])
+        with _diag_c1:
+            _diag_stores = _get_supabase_stores_list() or []
+            _diag_all_emps: list[str] = []
+            for _s in _diag_stores:
+                _diag_all_emps += _erp_get_employee_names_for_store(_s.get("db_filename"))
+            _diag_all_emps = sorted(set([e for e in _diag_all_emps if e]))
+            _diag_emp = st.selectbox("직원", options=_diag_all_emps or [""],
+                                     key="diag_emp_pick")
+        with _diag_c2:
+            _diag_date = st.date_input("날짜", value=_today_kst(), key="diag_date_pick")
+
+        if st.button("🔎 조회", key="diag_run"):
+            try:
+                _sb_d = get_supabase_client_or_warn()
+                if _sb_d is None:
+                    st.stop()
+                _diag_iso = _diag_date.isoformat()
+                _adj = _sb_d.table("app_work_adjustments").select("*")\
+                    .eq("employee_name", _diag_emp)\
+                    .eq("target_date", _diag_iso)\
+                    .execute().data or []
+                _lgs = _sb_d.table("app_attendance_logs").select("*")\
+                    .eq("employee_name", _diag_emp)\
+                    .eq("log_date", _diag_iso)\
+                    .execute().data or []
+
+                st.markdown(f"**📋 app_work_adjustments** ({len(_adj)}건)")
+                if _adj:
+                    _adj_view = [{
+                        "id": a.get("id"),
+                        "kind": a.get("kind"),
+                        "sign": a.get("sign"),
+                        "minutes": a.get("minutes"),
+                        "status": a.get("status"),
+                        "db_filename": a.get("db_filename"),
+                        "shift_start": str(a.get("shift_start") or "")[:5],
+                        "shift_end": str(a.get("shift_end") or "")[:5],
+                        "reason": a.get("reason"),
+                    } for a in _adj]
+                    st.dataframe(pd.DataFrame(_adj_view), use_container_width=True,
+                                 hide_index=True)
+                else:
+                    st.info("해당 날짜·직원의 신청 내역이 없습니다.")
+
+                st.markdown(f"**📅 app_attendance_logs** ({len(_lgs)}건)")
+                if _lgs:
+                    _lg_view = [{
+                        "id": l.get("id"),
+                        "work_type": l.get("work_type"),
+                        "diff_minutes": l.get("diff_minutes"),
+                        "home_db_filename": l.get("home_db_filename"),
+                        "work_db_filename": l.get("work_db_filename"),
+                        "work_location_name": l.get("work_location_name"),
+                        "start_time": str(l.get("start_time") or "")[:5],
+                        "end_time": str(l.get("end_time") or "")[:5],
+                        "status": l.get("status"),
+                    } for l in _lgs]
+                    st.dataframe(pd.DataFrame(_lg_view), use_container_width=True,
+                                 hide_index=True)
+
+                    # home_db_filename 이 실제 등록된 매장에 속하지 않으면 경고
+                    _known_dbs = {s.get("db_filename") for s in _diag_stores}
+                    _bad = [l for l in _lgs
+                            if l.get("home_db_filename") and l.get("home_db_filename") not in _known_dbs]
+                    if _bad:
+                        st.error(
+                            f"⚠️ {len(_bad)}건의 로그가 등록되지 않은 매장 DB "
+                            f"({', '.join(sorted({l.get('home_db_filename') for l in _bad}))}) "
+                            f"로 저장되어 있어 캘린더에 표시되지 않습니다. "
+                            f"위 '기존 승인 내역 캘린더 재동기화' 버튼으로 정정하세요."
+                        )
+                else:
+                    st.warning(
+                        "⚠️ 캘린더 로그가 없습니다. 신청 내역이 있는데도 로그가 없다면, "
+                        "'기존 승인 내역 캘린더 재동기화' 버튼으로 반영해 주세요."
+                    )
+            except Exception as _diag_ex:
+                st.error(f"진단 오류: {_diag_ex}")
+
     # ── 전체 신청 내역 엑셀 내보내기 ──────────────────────────────────
     with st.expander("📊 전체 신청 내역 엑셀 다운로드", expanded=True):
         st.caption("추가근무·휴무·포상·회의·여름휴가 등 모든 신청 내역을 직원/기간/유형/상태별로 필터링해 내보냅니다.")
