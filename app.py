@@ -20706,6 +20706,33 @@ def render_admin_settings():
     st.subheader("🔧 기타 설정")
     st.info("ERP 운영 설정 항목은 추후 이 곳에 추가됩니다.")
 
+    st.divider()
+
+    # ── 🔐 비밀번호 변경 ──────────────────────────────────────
+    st.subheader("🔐 비밀번호 변경")
+    st.caption("현재 로그인 계정의 비밀번호를 변경합니다. 변경 후 다음 로그인부터 새 비밀번호를 사용하세요.")
+    with st.form("admin_settings_change_pw_form", clear_on_submit=True):
+        _cpw_new = st.text_input("새 비밀번호", type="password", key="as_new_pw")
+        _cpw_confirm = st.text_input("새 비밀번호 확인", type="password", key="as_new_pw_confirm")
+        if st.form_submit_button("비밀번호 변경", type="primary"):
+            if not _cpw_new:
+                st.error("새 비밀번호를 입력해 주세요.")
+            elif len(_cpw_new) < 6:
+                st.error("비밀번호는 6자 이상이어야 합니다.")
+            elif _cpw_new != _cpw_confirm:
+                st.error("새 비밀번호가 일치하지 않습니다.")
+            else:
+                _auth_cli, _auth_err = get_supabase_client_with_auth_session()
+                if _auth_err:
+                    st.error(f"⚠️ {_auth_err}")
+                else:
+                    try:
+                        _auth_cli.auth.update_user({"password": _cpw_new})
+                        flash("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.")
+                        st.rerun()
+                    except Exception as _cpw_e:
+                        st.error(f"비밀번호 변경에 실패했습니다: {str(_cpw_e)}")
+
 
 # 사내 게시판 섹션 레지스트리 — 나중에 일정/할일/투표 활성화 시
 # enabled=True 로 바꾸고 디스패치에 render_fn 만 연결하면 켜진다.
@@ -27625,29 +27652,30 @@ def main():
                 st.rerun()
     except Exception:
         pass
-    # 비밀번호 변경 (Supabase Auth)
-    with st.sidebar.expander("🔐 비밀번호 변경"):
-        new_pw = st.text_input("새 비밀번호", type="password", key="new_password_input")
-        new_pw_confirm = st.text_input("새 비밀번호 확인", type="password", key="new_password_confirm")
-        if st.button("비밀번호 변경", key="sidebar_change_pw_btn"):
-            if not new_pw:
-                st.error("새 비밀번호를 입력해 주세요.")
-            elif len(new_pw) < 6:
-                st.error("비밀번호는 6자 이상이어야 합니다.")
-            elif new_pw != new_pw_confirm:
-                st.error("새 비밀번호가 일치하지 않습니다.")
-            else:
-                auth_client, auth_err = get_supabase_client_with_auth_session()
-                if auth_err:
-                    st.error(f"⚠️ {auth_err}")
-                else:
-                    try:
-                        auth_client.auth.update_user({"password": new_pw})
-                        flash("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"비밀번호 변경에 실패했습니다: {str(e)}")
     st.sidebar.divider()
+    # 일반 직원 전용: 관리자 설정이 없으므로 사이드바에서 비밀번호 변경
+    if role == "user":
+        with st.sidebar.expander("🔐 비밀번호 변경"):
+            _sb_new_pw = st.text_input("새 비밀번호", type="password", key="sidebar_new_pw_input")
+            _sb_pw_confirm = st.text_input("새 비밀번호 확인", type="password", key="sidebar_new_pw_confirm")
+            if st.button("비밀번호 변경", key="sidebar_change_pw_btn"):
+                if not _sb_new_pw:
+                    st.error("새 비밀번호를 입력해 주세요.")
+                elif len(_sb_new_pw) < 6:
+                    st.error("비밀번호는 6자 이상이어야 합니다.")
+                elif _sb_new_pw != _sb_pw_confirm:
+                    st.error("새 비밀번호가 일치하지 않습니다.")
+                else:
+                    _sb_auth_cli, _sb_auth_err = get_supabase_client_with_auth_session()
+                    if _sb_auth_err:
+                        st.error(f"⚠️ {_sb_auth_err}")
+                    else:
+                        try:
+                            _sb_auth_cli.auth.update_user({"password": _sb_new_pw})
+                            flash("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.")
+                            st.rerun()
+                        except Exception as _sb_e:
+                            st.error(f"비밀번호 변경에 실패했습니다: {str(_sb_e)}")
     # 관리자 전용: 결제 변경/취소 모니터링 화면 진입 버튼
     if role in ("store_admin", "superadmin"):
         if st.sidebar.button("🚨 결제 변경/취소 모니터링", width='stretch'):
