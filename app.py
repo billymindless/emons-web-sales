@@ -13747,7 +13747,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             st.warning("본인 근무만 수정할 수 있습니다.")
             if st.button("닫기", key=f"erp_qs_close_deny_{_sid}", width="stretch"):
                 st.session_state.pop("erp_shift_edit_id", None)
-                st.rerun(scope="fragment")
+                st.rerun()
             return
 
         try:
@@ -13756,7 +13756,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             st.error("잘못된 근무 일자입니다.")
             if st.button("닫기", key=f"erp_qs_close_bad_{_sid}", width="stretch"):
                 st.session_state.pop("erp_shift_edit_id", None)
-                st.rerun(scope="fragment")
+                st.rerun()
             return
 
         _cur_loc = (sh.get("work_location_name") or "").strip()
@@ -13828,7 +13828,10 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
 
         if _cancel:
             st.session_state.pop("erp_shift_edit_id", None)
-            st.rerun(scope="fragment")
+            # @st.fragment 안 st.dialog 내부에서 st.rerun(scope="fragment") 는
+            # 다이얼로그를 정상적으로 닫지 못하는 Streamlit 이슈가 있어 전체 rerun 사용.
+            # 활성 탭(erp_main_tab_label)은 segmented_control 이 세션 상태로 유지.
+            st.rerun()
 
         if _save:
             if (_e_start.hour * 60 + _e_start.minute) >= (_e_end.hour * 60 + _e_end.minute):
@@ -13874,7 +13877,8 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 f"{_sd.isoformat()} {_emp_name} 일정이 수정되었습니다. "
                 f"표준 시간과 차이가 있으면 [정기근무일정] 상단에서 연장 신청을 확인하세요."
             )
-            st.rerun(scope="fragment")
+            # 다이얼로그 정상 종료를 위해 전체 rerun 사용 (위 취소 버튼과 동일 사유).
+            st.rerun()
 
     _edit_id_popup = st.session_state.get("erp_shift_edit_id")
     if _edit_id_popup:
