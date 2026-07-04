@@ -13477,11 +13477,13 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     # (auth 쿼리 파라미터 유실 시 로그아웃, 유지 시에도 사이드바 메뉴/탭 리셋)
     # Streamlit 네이티브 위젯 기반 편집 셀렉트를 대신 제공한다.
     _editable_shifts: list[dict] = []
+    _me_aliases = set(_get_current_user_employee_aliases(me_name)) if me_name else set()
     for _d_iso in sorted(shifts_by_date.keys()):
         for _s in shifts_by_date[_d_iso]:
             if not bool(_s.get("id")):
                 continue
-            if _s.get("employee_name") != me_name:
+            _emp_n = (_s.get("employee_name") or "").strip()
+            if not _emp_n or (_me_aliases and _emp_n not in _me_aliases):
                 continue
             _editable_shifts.append(_s)
     if _editable_shifts:
