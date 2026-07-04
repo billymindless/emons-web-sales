@@ -3281,6 +3281,110 @@ def _current_username() -> str:
     return user.get("username") or "unknown"
 
 
+# ---------- 즐겨찾기 메뉴 (app_user_preferences) ----------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_user_fav_menus(username: str) -> list:
+    """개인별 즐겨찾기 메뉴 라벨 목록 (없으면 빈 리스트).
+    Supabase app_user_preferences.fav_menus(JSONB) 에서 조회.
+    테이블 미존재/네트워크 오류 시 조용히 빈 리스트 반환하여 로그인 흐름을 막지 않는다."""
+    uname = (username or "").strip()
+    if not uname:
+        return []
+    cli, err = get_supabase_client()
+    if err or not cli:
+        return []
+    try:
+        r = cli.table("app_user_preferences").select("fav_menus").eq("username", uname).execute()
+        rows = list(r.data or [])
+        if not rows:
+            return []
+        raw = rows[0].get("fav_menus") or []
+        return [str(x) for x in raw if isinstance(x, str)]
+    except Exception:
+        return []
+
+
+def _save_user_fav_menus(username: str, menus: list) -> tuple[bool, str]:
+    """즐겨찾기 메뉴 저장 (upsert). 성공 여부와 에러 메시지 반환."""
+    uname = (username or "").strip()
+    if not uname:
+        return False, "username 없음"
+    cli, err = get_supabase_client()
+    if err or not cli:
+        return False, str(err) or "Supabase 미연결"
+    payload = {
+        "username": uname,
+        "fav_menus": [str(m) for m in (menus or []) if isinstance(m, str)],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        cli.table("app_user_preferences").upsert(payload, on_conflict="username").execute()
+        _get_user_fav_menus.clear()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _render_fav_menu_bar(username: str, tab_labels: list, tab_idx_key: str,
+                          widget_key: str | None = None) -> None:
+    """드롭다운 메뉴 selectbox 위에 즐겨찾기 바로가기 버튼 행을 렌더.
+    - favs 없음: '⭐ 즐겨찾기 메뉴 추가' 버튼만 표시
+    - favs 있음: 각 라벨을 버튼으로 배치 + ⚙️ 편집 버튼
+    - 편집 모드: multiselect + 저장/취소
+    tab_idx_key: 클릭 시 갱신할 인덱스 상태 키 (예: 'main_tab_idx').
+    widget_key: 대상 selectbox 위젯 key (예: 'main_menu_select'). 지정 시 selectbox
+                표시값도 함께 갱신해 위젯 캐시로 인한 라벨 불일치를 방지한다.
+    """
+    uname = (username or "").strip() or "unknown"
+    favs = _get_user_fav_menus(uname)
+    valid_favs = [f for f in favs if f in tab_labels]
+    edit_key = f"fav_edit_mode_{tab_idx_key}"
+
+    if valid_favs:
+        cols = st.columns(len(valid_favs) + 1)
+        for i, label in enumerate(valid_favs):
+            btn_key = f"fav_btn_{tab_idx_key}_{i}"
+            if cols[i].button(label, key=btn_key, use_container_width=True):
+                st.session_state[tab_idx_key] = tab_labels.index(label)
+                if widget_key:
+                    st.session_state[widget_key] = label
+                st.rerun()
+        if cols[-1].button("⚙️", key=f"fav_edit_toggle_{tab_idx_key}",
+                            help="즐겨찾기 편집", use_container_width=True):
+            st.session_state[edit_key] = not st.session_state.get(edit_key, False)
+            st.rerun()
+    else:
+        if st.button("⭐ 즐겨찾기 메뉴 추가", key=f"fav_add_{tab_idx_key}"):
+            st.session_state[edit_key] = True
+            st.rerun()
+
+    if st.session_state.get(edit_key):
+        with st.container(border=True):
+            new_favs = st.multiselect(
+                "즐겨찾기 메뉴 선택 (최대 5개)",
+                tab_labels,
+                default=valid_favs,
+                max_selections=5,
+                key=f"fav_select_{tab_idx_key}",
+            )
+            bc1, bc2, _ = st.columns([1, 1, 4])
+            if bc1.button("💾 저장", key=f"fav_save_{tab_idx_key}", type="primary", use_container_width=True):
+                ok, err = _save_user_fav_menus(uname, new_favs)
+                if ok:
+                    st.session_state[edit_key] = False
+                    st.toast("즐겨찾기가 저장되었습니다.", icon="⭐")
+                    st.rerun()
+                elif "app_user_preferences" in err or "does not exist" in err or "PGRST" in err:
+                    st.error("⚠️ app_user_preferences 테이블이 없습니다. "
+                             "**SUPABASE_USER_PREFERENCES.sql** 을 Supabase SQL Editor 에서 실행해 주세요.")
+                else:
+                    st.error(f"저장 실패: {err}")
+            if bc2.button("취소", key=f"fav_cancel_{tab_idx_key}", use_container_width=True):
+                st.session_state[edit_key] = False
+                st.rerun()
+
+
 def _email_local_part(value: str) -> str:
     """이메일 형식이면 @ 앞부분을, 아니면 원문을 반환. 이름 fallback 표시용."""
     v = (value or "").strip()
@@ -21895,7 +21999,11 @@ def render_superadmin():
 
     st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
     st.header("최고 관리자 메뉴")
-    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
+    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">⭐ 즐겨찾기 바로가기</p>', unsafe_allow_html=True)
+    _sa_user = st.session_state.get("current_user") or {}
+    _render_fav_menu_bar(_sa_user.get("username") or "", _SUPERADMIN_MENUS,
+                         tab_idx_key="superadmin_menu_idx", widget_key="superadmin_menu_select")
+    st.markdown('<p style="margin:0.35rem 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
     menu_sel = st.selectbox(
         "최고 관리자 메뉴",
         _SUPERADMIN_MENUS,
@@ -27705,7 +27813,10 @@ def main():
     # 상단 메뉴 선택(Sticky Header 내에 렌더링: 일반 유저/매장관리자 공통)
     st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
     st.markdown("---")
-    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
+    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">⭐ 즐겨찾기 바로가기</p>', unsafe_allow_html=True)
+    _render_fav_menu_bar(user.get("username") or "", tab_labels,
+                         tab_idx_key="main_tab_idx", widget_key="main_menu_select")
+    st.markdown('<p style="margin:0.35rem 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
     st.markdown('<p class="mobile-menu-hint" style="margin:0 0 0.35rem 0; font-size:0.8rem; color:#888;">로그아웃·비밀번호는 왼쪽 상단 ☰에서</p>', unsafe_allow_html=True)
     menu_sel = st.selectbox(
         "메뉴",
