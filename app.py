@@ -7120,6 +7120,73 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
                 except Exception as _e:
                     st.caption(f"트리맵 생략: {_e}")
 
+            # 방문 경로·구매 이유 전용 시각화 (주문 단위 fdf — 매출 중복 없음)
+            _show_vr_pr = ("visit_reason" in fdf.columns) or ("purchase_reason" in fdf.columns)
+            if _show_vr_pr:
+                st.markdown("##### 🎯 방문 경로 · 구매 이유 분석")
+                _vpc1, _vpc2 = st.columns(2)
+                # (1) 방문 경로별 건수·매출액
+                if "visit_reason" in fdf.columns:
+                    with _vpc1:
+                        _vr = fdf.copy()
+                        _vr["visit_reason"] = _vr["visit_reason"].fillna("(미기입)").astype(str).str.strip().replace("", "(미기입)")
+                        _vr_agg = _vr.groupby("visit_reason", as_index=False).agg(
+                            건수=("total_amount", "count"),
+                            매출액=("total_amount", "sum"),
+                        ).sort_values("건수", ascending=False)
+                        fig_vr = px.pie(_vr_agg, names="visit_reason", values="건수", hole=0.5,
+                                        title="방문 경로별 건수")
+                        fig_vr.update_traces(
+                            textinfo="percent+label",
+                            hovertemplate="%{label}<br>건수: %{value:,}건<br>매출액: %{customdata[0]:,.0f}원<extra></extra>",
+                            customdata=_vr_agg[["매출액"]].values,
+                        )
+                        fig_vr.update_layout(height=360, margin=dict(t=40, b=20, l=20, r=20))
+                        st.plotly_chart(fig_vr, width="stretch", key=f"{key_prefix}_mdim_visit_pie")
+                # (2) 구매 이유별 건수·매출액
+                if "purchase_reason" in fdf.columns:
+                    with _vpc2:
+                        _pr = fdf.copy()
+                        _pr["purchase_reason"] = _pr["purchase_reason"].fillna("(미기입)").astype(str).str.strip().replace("", "(미기입)")
+                        _pr_agg = _pr.groupby("purchase_reason", as_index=False).agg(
+                            건수=("total_amount", "count"),
+                            매출액=("total_amount", "sum"),
+                        ).sort_values("건수", ascending=False)
+                        fig_pr = px.pie(_pr_agg, names="purchase_reason", values="건수", hole=0.5,
+                                        title="구매 이유별 건수")
+                        fig_pr.update_traces(
+                            textinfo="percent+label",
+                            hovertemplate="%{label}<br>건수: %{value:,}건<br>매출액: %{customdata[0]:,.0f}원<extra></extra>",
+                            customdata=_pr_agg[["매출액"]].values,
+                        )
+                        fig_pr.update_layout(height=360, margin=dict(t=40, b=20, l=20, r=20))
+                        st.plotly_chart(fig_pr, width="stretch", key=f"{key_prefix}_mdim_purch_pie")
+
+                # (3) 방문 경로 × 구매 이유 조합 히트맵 (건수 기준)
+                if ("visit_reason" in fdf.columns) and ("purchase_reason" in fdf.columns):
+                    try:
+                        _cross = fdf.copy()
+                        _cross["visit_reason"] = _cross["visit_reason"].fillna("(미기입)").astype(str).str.strip().replace("", "(미기입)")
+                        _cross["purchase_reason"] = _cross["purchase_reason"].fillna("(미기입)").astype(str).str.strip().replace("", "(미기입)")
+                        _cross_pv = _cross.pivot_table(
+                            index="visit_reason", columns="purchase_reason",
+                            values="total_amount", aggfunc="count", fill_value=0,
+                        )
+                        # 상위 15×15
+                        _tr = _cross_pv.sum(axis=1).sort_values(ascending=False).head(15).index
+                        _tc = _cross_pv.sum(axis=0).sort_values(ascending=False).head(15).index
+                        _cross_pv = _cross_pv.loc[_tr, _tc]
+                        fig_cross = px.imshow(
+                            _cross_pv, aspect="auto", color_continuous_scale="Blues",
+                            labels=dict(x="구매 이유", y="방문 경로", color="건수"),
+                            title="방문 경로 × 구매 이유 조합 히트맵 (건수, 상위 15×15)",
+                            text_auto=True,
+                        )
+                        fig_cross.update_layout(height=460, margin=dict(t=40, b=20, l=20, r=20))
+                        st.plotly_chart(fig_cross, width="stretch", key=f"{key_prefix}_mdim_vp_cross_hm")
+                    except Exception as _e:
+                        st.caption(f"방문·구매 조합 히트맵 생략: {_e}")
+
 
 def _render_marketing_multi_period_comparison(
     merged_all: pd.DataFrame,
