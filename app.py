@@ -13998,12 +13998,24 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         _dh, _dmm = divmod(_dm, 60)
                         _dur = f"{_dh}h{_dmm:02d}m" if _dmm else f"{_dh}h"
                         _time_txt = (f" <span style='font-size:0.62rem; color:#777;'>{_dur}</span>")
+                # 사유(note): 승인된 신청의 사유 필드 — 본문 + 툴팁
+                _lg_note = str(lg.get("note") or "").strip()
+                if _lg_note:
+                    _lg_note_safe = (_lg_note.replace("&", "&amp;").replace("<", "&lt;")
+                                             .replace(">", "&gt;").replace('"', "&quot;"))
+                    _lg_note_html = (
+                        f"<div style='margin-left:6px; font-size:0.6rem; color:#8E24AA;"
+                        f" line-height:1.1; word-break:break-word;'"
+                        f" title='{_lg_note_safe}'>📝 {_lg_note_safe}</div>"
+                    )
+                else:
+                    _lg_note_html = ""
                 cell.append(
                     f"<div style='margin-top:1px;'>"
                     f"<span style='background:{bc}; color:white; padding:1px 4px;"
                     f" border-radius:3px; font-size:0.65rem;'>{wt}{extra}</span>"
                     f" <span style='font-size:0.68rem; color:{sc}; font-weight:600;'>{emp}</span>"
-                    f"{_time_txt}{sn_tag}</div>"
+                    f"{_time_txt}{sn_tag}{_lg_note_html}</div>"
                 )
             cell.append("</td>")
             html.append("".join(cell))
