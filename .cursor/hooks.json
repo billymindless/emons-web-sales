@@ -3,12 +3,12 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": "powershell -ExecutionPolicy Bypass -File .cursor/hooks/sync-plans-session-start.ps1"
+        "command": "bash .cursor/hooks/sync-plans-session-start.sh 2>/dev/null || powershell -ExecutionPolicy Bypass -File .cursor/hooks/sync-plans-session-start.ps1"
       }
     ],
     "sessionEnd": [
       {
-        "command": "powershell -ExecutionPolicy Bypass -File .cursor/hooks/sync-plans-session-end.ps1"
+        "command": "bash .cursor/hooks/sync-plans-session-end.sh 2>/dev/null || powershell -ExecutionPolicy Bypass -File .cursor/hooks/sync-plans-session-end.ps1"
       }
     ]
   }
