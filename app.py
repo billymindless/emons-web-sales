@@ -17737,6 +17737,8 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         "db_filename": a.get("db_filename"),
                         "shift_start": str(a.get("shift_start") or "")[:5],
                         "shift_end": str(a.get("shift_end") or "")[:5],
+                        "work_db_filename": a.get("work_db_filename") or "",
+                        "work_location_name": a.get("work_location_name") or "",
                         "reason": a.get("reason"),
                     } for a in _adj]
                     st.dataframe(pd.DataFrame(_adj_view), use_container_width=True,
@@ -18125,11 +18127,50 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
                     if _stripped_timeslot:
                         flash(f"⚠️ 신청 저장됨 (단, 시간대는 저장되지 않음). SQL 실행 후 재신청해야 캘린더에 시각이 표시됩니다.", "warning")
                     elif _needs_timeslot or _is_early_leave:
-                        flash(
+                        # 저장된 근무지도 함께 표기 + DB 실제 저장값 재조회로 검증
+                        _saved_dbf_to_store = {s["db_filename"]: s["store_name"]
+                                               for s in (_get_supabase_stores_list(include_inactive=True) or [])}
+                        # 방금 저장한 레코드를 DB 에서 재조회 (검증)
+                        _verified_wdb = payload.get("work_db_filename")
+                        _verified_wloc = payload.get("work_location_name")
+                        _mismatch = False
+                        try:
+                            _vclient, _verr = get_supabase_client()
+                            if _vclient and not _verr:
+                                _vres = _vclient.table("app_work_adjustments")\
+                                    .select("id, work_db_filename, work_location_name")\
+                                    .eq("db_filename", current_db)\
+                                    .eq("employee_name", me_name)\
+                                    .eq("target_date", new_date.isoformat())\
+                                    .order("id", desc=True).limit(1).execute()
+                                _vrow = ((_vres.data or []) if hasattr(_vres, "data") else [])
+                                if _vrow:
+                                    _verified_wdb = _vrow[0].get("work_db_filename")
+                                    _verified_wloc = _vrow[0].get("work_location_name")
+                                    if _verified_wdb != payload.get("work_db_filename") \
+                                       or _verified_wloc != payload.get("work_location_name"):
+                                        _mismatch = True
+                        except Exception:
+                            pass
+                        if _verified_wloc:
+                            _saved_ws = _verified_wloc
+                        elif _verified_wdb and _saved_dbf_to_store.get(_verified_wdb):
+                            _saved_ws = _saved_dbf_to_store[_verified_wdb]
+                        elif _verified_wdb:
+                            _saved_ws = _verified_wdb
+                        else:
+                            _saved_ws = "(근무지 저장 실패)"
+                        _msg = (
                             f"✅ 신청 완료 · {new_date.isoformat()} "
-                            f"{payload.get('shift_start', '')[:5]}~{payload.get('shift_end', '')[:5]} "
-                            f"저장됨. 승인 후 캘린더에 표시됩니다."
+                            f"{payload.get('shift_start', '')[:5]}~{payload.get('shift_end', '')[:5]} · "
+                            f"📍 {_saved_ws} 저장됨. 승인 후 캘린더에 표시됩니다."
                         )
+                        if _mismatch:
+                            _msg += (
+                                f" ⚠️ (요청: {payload.get('work_db_filename') or payload.get('work_location_name') or '-'}, "
+                                f"실제 저장: {_verified_wdb or _verified_wloc or '-'})"
+                            )
+                        flash(_msg, "warning" if _mismatch else "success")
                     else:
                         flash("신청이 등록되었습니다. 매장관리자 승인 대기 중.")
                     if on_success:
