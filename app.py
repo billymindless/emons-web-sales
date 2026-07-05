@@ -12028,14 +12028,14 @@ def render_erp_attendance():
     st.markdown("---")
 
     if selected_tab == "대시보드":
-        # 1️⃣ 근태 현황 → 2️⃣ 내 신청 내역 → 3️⃣ 월별 근무 캘린더 순으로 표시
+        # 1️⃣ 근태 현황 → 2️⃣ 월별 근무 캘린더 → 3️⃣ 내 신청 내역 순으로 표시
         _erp_tab_dashboard(current_db, role, me_name, today)
-        if me_name:
-            st.divider()
-            st.markdown("### 2️⃣ 내 신청 내역")
-            _erp_render_my_adj_history(current_db, me_name, today)
         st.divider()
         _erp_tab_calendar(current_db, role, me_name, today)
+        if me_name:
+            st.divider()
+            st.markdown("### 3️⃣ 내 신청 내역")
+            _erp_render_my_adj_history(current_db, me_name, today)
     elif role == "store_admin":
         if selected_tab == "정기근무일정":
             _erp_tab_shift_plan(current_db, me_name)
@@ -13432,7 +13432,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     @st.fragment: 빠른 수정/삭제 시 이 캘린더만 부분 재실행하여 상위 탭(근무 일정 계획 등)으로 복귀하지 않게 한다."""
     import calendar as _cal
 
-    st.markdown("### 3️⃣ 월별 근무 캘린더")
+    st.markdown("### 2️⃣ 월별 근무 캘린더")
     st.caption("매장·직원을 선택해 누가 언제 어디서 일하는지 한눈에 확인할 수 있습니다.")
     # 빠른 수정/삭제 직후 부분 재실행으로 전달된 완료 알림 (전체 rerun 아님 → 탭 유지)
     _cal_flash = st.session_state.pop("_erp_cal_flash", None)
