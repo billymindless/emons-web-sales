@@ -13939,15 +13939,26 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
 
             # 근태 기록 (attendance_logs) — 실근무지 기준 컬러 (work_location_name 컬럼이 있으면 우선)
             for lg in logs_by_date.get(d_iso, []):
-                _eff_dbf = _shift_effective_dbf(lg) or lg.get("_dbf") or current_db
+                _lg_wloc = (lg.get("work_location_name") or "").strip()
+                _lg_eff_dbf_raw = _shift_effective_dbf(lg)  # 외부 행사면 None
+                _lg_is_external = bool(_lg_wloc) and (_lg_eff_dbf_raw is None)
+                if _lg_is_external:
+                    _eff_dbf = None
+                    sc = _EXT_COLOR
+                    _eff_sn = _lg_wloc  # 배지 라벨 = 외부 근무지명 그대로
+                else:
+                    _eff_dbf = _lg_eff_dbf_raw or lg.get("_dbf") or current_db
+                    sc = store_color.get(_eff_dbf, "#555")
+                    _eff_sn = _dbf_to_sn.get(_eff_dbf, "")
                 dbf = _eff_dbf  # 배지 라벨용 호환 변수 유지
-                sc = store_color.get(_eff_dbf, "#555")
                 wt   = lg.get("work_type") or "정상"
                 bc   = _ERP_BADGE_COLORS.get(wt, "#90A4AE")
                 emp  = lg.get("employee_name") or ""
                 extra = f" {lg.get('diff_minutes') or 0}분" if wt in ("시차적립", "시차사용") else ""
+                # 태그 노출 조건: 전체 매장 뷰이거나, 외부 근무지인 경우
+                _sn_tag_visible = show_store_tag or _lg_is_external
                 sn_tag = (f" <span style='font-size:0.58rem; color:{sc};"
-                          f" font-weight:bold;'>({_dbf_to_sn.get(dbf,'')})</span>") if show_store_tag else ""
+                          f" font-weight:bold;'>({_eff_sn})</span>") if (_sn_tag_visible and _eff_sn) else ""
                 # 시간대 표시:
                 #  - 추가근무/회의: start~end 범위 (연장 시간대)
                 #  - 조퇴: 실제 퇴근 시각만 (start_time = 실제 퇴근 시각, end_time = 예정 종료)
@@ -17997,6 +18008,13 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
             with ts4:
                 new_store_label = st.selectbox("근무지", _adj_store_labels,
                                                index=_adj_home_idx, key="my_new_store")
+            # 기타(외부/행사) 선택 시 실제 외부 근무지명 텍스트 입력
+            new_ext_loc = st.text_input(
+                "외부 근무지명 (기타 선택 시 필수)",
+                key="my_new_ext_loc",
+                placeholder="예: 메종동부산, 롯데백화점 행사장, 유에코임주박람회",
+                help="근무지를 '기타 (외부/행사)'로 선택한 경우에만 사용됩니다. 이 값이 캘린더에 표시됩니다.",
+            )
             new_reason = st.text_input("사유", placeholder="사유를 입력해 주세요 (선택)", key="my_new_reason")
         elif _is_early_leave:
             st.caption("📌 조기퇴근은 실제 퇴근 시각만 입력하면 근무일정 종료시각과의 차이가 자동으로 계산됩니다.")
@@ -18042,6 +18060,10 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
                         db_filename=current_db, employee_name=me_name,
                         target_date=new_date, start_min=_s_min, end_min=_e_min,
                     )
+                # 기타(외부/행사) 선택 시 외부 근무지명 필수
+                _sel_store_check = next((s for s in _adj_store_opts if s[0] == new_store_label), None)
+                if _sel_store_check and _sel_store_check[1] is None and not (new_ext_loc or "").strip():
+                    _err_msg = "근무지를 '기타 (외부/행사)'로 선택한 경우 외부 근무지명을 입력해 주세요."
             elif _is_early_leave:
                 _shift_s, _shift_e = _erp_shift_bounds_for_date(current_db, me_name, new_date)
                 _end_min_shift = _shift_e.hour * 60 + _shift_e.minute
@@ -18058,7 +18080,8 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
                     _total_min = _e_min - _s_min
                     _sel_store = next((s for s in _adj_store_opts if s[0] == new_store_label), _adj_store_opts[_adj_home_idx])
                     _work_db = _sel_store[1]
-                    _work_loc = _sel_store[0] if _work_db is None else None
+                    # _work_db is None → 기타(외부/행사): 사용자가 입력한 외부 근무지명 사용
+                    _work_loc = (new_ext_loc or "").strip() if _work_db is None else None
                 elif _is_early_leave:
                     _shift_s, _shift_e = _erp_shift_bounds_for_date(current_db, me_name, new_date)
                     _actual_end = new_end
