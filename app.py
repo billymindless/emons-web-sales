@@ -12079,7 +12079,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
             unsafe_allow_html=True,
         )
 
-    st.subheader(f"📊 {sel_year}년 근태 현황")
+    st.markdown("### 1️⃣ 근태 현황")
 
     # ── 데이터 수집 (breakdown) ─────────────────────────────────
     _as_of = today if sel_year == today.year else date(sel_year, 12, 31)
@@ -12303,10 +12303,9 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         st.info("⚙️ 연간 집계 시작일 · 직원별 월 목표 근무시간 설정 및 직원 현황은 상단 [관리자 메뉴] 탭에서 관리하세요.")
 
     # ── 대시보드 맨 하단: 내 신청 내역 ─────────────────────────
-    # 근무시간 관리 탭의 히스토리를 대시보드로 옮겨 첫 화면에서 바로 확인할 수 있게 한다.
-    # superadmin 은 me_name 이 비어 있으므로 렌더 대상에서 제외.
     if me_name:
         st.divider()
+        st.markdown("### 3️⃣ 내 신청 내역")
         _erp_render_my_adj_history(current_db, me_name, today)
 
 
@@ -13432,7 +13431,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     @st.fragment: 빠른 수정/삭제 시 이 캘린더만 부분 재실행하여 상위 탭(근무 일정 계획 등)으로 복귀하지 않게 한다."""
     import calendar as _cal
 
-    st.subheader("🗓️ 월별 근무 캘린더")
+    st.markdown("### 2️⃣ 월별 근무 캘린더")
     st.caption("매장·직원을 선택해 누가 언제 어디서 일하는지 한눈에 확인할 수 있습니다.")
     # 빠른 수정/삭제 직후 부분 재실행으로 전달된 완료 알림 (전체 rerun 아님 → 탭 유지)
     _cal_flash = st.session_state.pop("_erp_cal_flash", None)
@@ -18224,7 +18223,7 @@ def _erp_render_my_adj_history(current_db: str, me_name: str, today: date) -> No
     month = today.month
 
     # ── 내 신청 내역 ──────────────────────────────────────────────
-    _mh_col1, _mh_col2, _mh_col3 = st.columns([1, 1, 4])
+    _mh_col1, _mh_col2 = st.columns([1, 1])
     with _mh_col1:
         _mh_year = st.selectbox(
             "연도", options=list(range(year - 4, year + 2)),
@@ -18237,8 +18236,6 @@ def _erp_render_my_adj_history(current_db: str, me_name: str, today: date) -> No
             format_func=lambda m: f"{m}월",
         )
     _hist_ym = f"{int(_mh_year):04d}-{int(_mh_month):02d}"
-    with _mh_col3:
-        st.markdown(f"##### 📋 내 신청 내역 ({_hist_ym})")
 
     my_list = _erp_list_my_adjustments(current_db, me_name, _hist_ym)
     if not my_list:
