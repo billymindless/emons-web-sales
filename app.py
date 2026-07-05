@@ -17440,9 +17440,33 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
     with st.expander("🩹 시간대 누락 승인건 보강 (추가근무·회의 시각 입력)", expanded=False):
         st.caption(
             "구버전에서 시간대 컬럼 없이 승인된 추가근무·회의 신청은 캘린더에서 "
-            "'+Xh' 형태로만 표시됩니다. 아래에서 실제 시작·종료 시각을 입력하면 "
-            "신청서와 캘린더 로그 양쪽에 즉시 반영되어 배지에 '10:00~11:00' 형태로 표시됩니다."
+            "'+Xh' 형태로만 표시됩니다. 각 행의 시작 시각만 확인·수정하면 종료 시각은 "
+            "'시작 + 신청분' 으로 자동 계산됩니다. **[일괄 저장]** 으로 한 번에 처리할 수 있습니다."
         )
+
+        def _bf_hhmm_to_s(v: str) -> str | None:
+            v = (v or "").strip()
+            if not v:
+                return None
+            try:
+                # HH:MM / HHMM / H:M 등 유연 파싱
+                _p = _erp_parse_time_loose(v)
+                if _p is None:
+                    return None
+                return f"{_p[0]:02d}:{_p[1]:02d}:00"
+            except Exception:
+                return None
+
+        def _bf_add_minutes(hhmm_s: str, add_min: int) -> str:
+            """'HH:MM:SS' + add_min → 'HH:MM:SS' (24h wrap 없이 안전 clip)."""
+            try:
+                _h, _m, _ = hhmm_s.split(":")
+                _total = int(_h) * 60 + int(_m) + int(add_min)
+                _total = max(0, min(_total, 23 * 60 + 59))
+                return f"{_total // 60:02d}:{_total % 60:02d}:00"
+            except Exception:
+                return hhmm_s
+
         try:
             _sb_bf = get_supabase_client_or_warn()
             if _sb_bf is None:
@@ -17451,18 +17475,37 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 .eq("status", "approved")\
                 .in_("kind", ["overtime", "meeting"])\
                 .execute().data or []
-            # 최신순 (target_date desc), shift_start 비어 있는 건만
             _bf_rows = [
                 r for r in _bf_rows_raw
                 if not str(r.get("shift_start") or "").strip()
                 or not str(r.get("shift_end") or "").strip()
             ]
             _bf_rows.sort(key=lambda r: str(r.get("target_date") or ""), reverse=True)
+
             if not _bf_rows:
-                st.success("✅ 시간대가 비어 있는 승인 건이 없습니다. 새로 신청되는 항목은 자동으로 시각이 표시됩니다.")
+                st.success("✅ 시간대가 비어 있는 승인 건이 없습니다. 새 신청은 자동으로 시각이 표시됩니다.")
             else:
-                st.warning(f"⚠️ 시간대 미입력 승인 건: {len(_bf_rows)}건")
-                for _bf in _bf_rows[:30]:  # 최대 30건 노출 (성능)
+                st.warning(f"⚠️ 시간대 미입력 승인 건: {len(_bf_rows)}건 (한 화면에 최대 50건)")
+                _bf_visible = _bf_rows[:50]
+
+                # 스마트 기본값 계산: 정기근무 종료시각 이후로 배치 (없으면 18:00)
+                _bf_default_starts: dict[int, str] = {}
+                for _bf in _bf_visible:
+                    _bfid = int(_bf.get("id") or 0)
+                    _emp_bf = _bf.get("employee_name") or ""
+                    _dt_bf = str(_bf.get("target_date") or "")[:10]
+                    _db_bf = _bf.get("db_filename") or current_db
+                    _default = "18:00"
+                    try:
+                        _dt_obj = date.fromisoformat(_dt_bf)
+                        _sh_s, _sh_e = _erp_shift_bounds_for_date(_db_bf, _emp_bf, _dt_obj)
+                        if _sh_e and (_sh_e.hour or _sh_e.minute):
+                            _default = _sh_e.strftime("%H:%M")
+                    except Exception:
+                        pass
+                    _bf_default_starts[_bfid] = _default
+
+                for _bf in _bf_visible:
                     _bfid = int(_bf.get("id") or 0)
                     _bf_emp = _bf.get("employee_name") or "-"
                     _bf_dt = str(_bf.get("target_date") or "")[:10]
@@ -17470,83 +17513,156 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     _bf_min = int(_bf.get("minutes") or 0)
                     _bf_hm = f"{_bf_min//60}h {_bf_min%60}m" if _bf_min % 60 else f"{_bf_min//60}h"
                     _bf_label = "추가근무" if _bf_kind == "overtime" else "회의"
+                    _bf_reason = (_bf.get("reason") or "").strip()
                     with st.container(border=True):
-                        _bfc = st.columns([1.4, 1.2, 1.4, 1.4, 1])
-                        _bfc[0].markdown(f"**{_bf_emp}** · {_bf_label} · {_bf_hm}")
+                        _bfc = st.columns([2.2, 1.1, 1.2, 1.2, 0.9])
+                        _bfc[0].markdown(
+                            f"**{_bf_emp}** · {_bf_label} · **{_bf_hm}**"
+                            + (f"  \n<span style='font-size:0.75rem;color:#666'>{_bf_reason}</span>"
+                               if _bf_reason else ""),
+                            unsafe_allow_html=True,
+                        )
                         _bfc[1].markdown(_bf_dt)
                         _bf_start_val = _bfc[2].text_input(
-                            "시작 (HH:MM)", value="18:00",
-                            key=f"bf_start_{_bfid}", placeholder="18:00",
+                            "시작 (HH:MM)",
+                            value=_bf_default_starts.get(_bfid, "18:00"),
+                            key=f"bf_start_{_bfid}",
+                            placeholder="예: 18:00 · 1800",
                         )
+                        _bf_end_default = ""
+                        _bf_start_parsed = _bf_hhmm_to_s(_bf_start_val)
+                        if _bf_start_parsed and _bf_min > 0:
+                            _bf_end_default = _bf_add_minutes(_bf_start_parsed, _bf_min)[:5]
                         _bf_end_val = _bfc[3].text_input(
-                            "종료 (HH:MM)", value="",
+                            "종료 (HH:MM)",
+                            value=_bf_end_default,
                             key=f"bf_end_{_bfid}",
-                            placeholder=f"{_bf_min//60:02d}:00 이상",
+                            placeholder=f"자동: 시작+{_bf_min}분",
                         )
                         with _bfc[4]:
-                            if st.button("💾 저장", key=f"bf_save_{_bfid}", type="primary"):
-                                # HH:MM 파싱
-                                def _hhmm_to_s(v: str) -> str | None:
-                                    v = (v or "").strip()
-                                    if not v or len(v) < 4:
-                                        return None
-                                    try:
-                                        h, m = v.split(":")[:2]
-                                        h_i, m_i = int(h), int(m)
-                                        if not (0 <= h_i < 24 and 0 <= m_i < 60):
-                                            return None
-                                        return f"{h_i:02d}:{m_i:02d}:00"
-                                    except Exception:
-                                        return None
-                                _s_str = _hhmm_to_s(_bf_start_val)
-                                _e_str = _hhmm_to_s(_bf_end_val)
-                                if not _s_str or not _e_str:
-                                    st.error("시작·종료 시각을 HH:MM 형식으로 입력하세요.")
-                                elif _e_str <= _s_str:
-                                    st.error("종료 시각이 시작보다 늦어야 합니다.")
-                                else:
-                                    # 신청서 정정
-                                    _u1_ok, _u1_err = _erp_update_row(
-                                        "app_work_adjustments", _bfid,
-                                        {"shift_start": _s_str, "shift_end": _e_str},
+                            _save_one = st.button("💾", key=f"bf_save_{_bfid}",
+                                                   help="이 건만 저장")
+
+                        # 개별 저장 처리
+                        if _save_one:
+                            _s_str = _bf_hhmm_to_s(_bf_start_val)
+                            _e_str = _bf_hhmm_to_s(_bf_end_val)
+                            if _s_str and not _e_str and _bf_min > 0:
+                                _e_str = _bf_add_minutes(_s_str, _bf_min)
+                            if not _s_str or not _e_str:
+                                st.error("시작·종료 시각을 HH:MM 형식으로 입력하세요.")
+                            elif _e_str <= _s_str:
+                                st.error("종료 시각이 시작보다 늦어야 합니다.")
+                            else:
+                                _u1_ok, _u1_err = _erp_update_row(
+                                    "app_work_adjustments", _bfid,
+                                    {"shift_start": _s_str, "shift_end": _e_str},
+                                )
+                                _wt_bf = _ERP_ADJ_KIND_TO_WORK_TYPE.get(_bf_kind, "특이사항")
+                                _log_existing = _sb_bf.table("app_attendance_logs")\
+                                    .select("id")\
+                                    .eq("employee_name", _bf_emp)\
+                                    .eq("log_date", _bf_dt)\
+                                    .eq("work_type", _wt_bf)\
+                                    .execute().data or []
+                                if _log_existing:
+                                    _u2_ok, _u2_err = _erp_update_row(
+                                        "app_attendance_logs",
+                                        int(_log_existing[0]["id"]),
+                                        {"start_time": _s_str, "end_time": _e_str},
                                     )
-                                    # 로그 정정 (또는 신규 생성)
-                                    _wt_bf = _ERP_ADJ_KIND_TO_WORK_TYPE.get(_bf_kind, "특이사항")
-                                    _log_existing = _sb_bf.table("app_attendance_logs")\
-                                        .select("id")\
-                                        .eq("employee_name", _bf_emp)\
-                                        .eq("log_date", _bf_dt)\
-                                        .eq("work_type", _wt_bf)\
-                                        .execute().data or []
-                                    if _log_existing:
-                                        _u2_ok, _u2_err = _erp_update_row(
-                                            "app_attendance_logs",
-                                            int(_log_existing[0]["id"]),
-                                            {"start_time": _s_str, "end_time": _e_str},
-                                        )
-                                    else:
-                                        # 로그가 없으면 헬퍼로 신규 생성 (신청서에 방금 저장한 시각이 반영됨)
-                                        _bf_refetch = dict(_bf)
-                                        _bf_refetch["shift_start"] = _s_str
-                                        _bf_refetch["shift_end"] = _e_str
-                                        _u2_ok, _u2_err = _erp_upsert_log_from_adjustment(
-                                            _bf_refetch, sign="+", kind=_bf_kind,
-                                            minutes=_bf_min, fallback_home_db=current_db,
-                                            created_by=me_name,
-                                        )
-                                    if _u1_ok and _u2_ok:
-                                        _erp_v2_clear_caches()
-                                        st.success(f"✅ 반영 완료: {_bf_emp} {_bf_dt} {_s_str[:5]}~{_e_str[:5]}")
-                                        st.rerun()
-                                    else:
-                                        _msgs = []
-                                        if not _u1_ok:
-                                            _msgs.append(f"신청서: {_u1_err}")
-                                        if not _u2_ok:
-                                            _msgs.append(f"로그: {_u2_err}")
-                                        st.error("일부 실패: " + " / ".join(_msgs))
-                if len(_bf_rows) > 30:
-                    st.caption(f"…이 외 {len(_bf_rows) - 30}건 더 있습니다. 위 건을 처리하면 이어서 표시됩니다.")
+                                else:
+                                    _bf_refetch = dict(_bf)
+                                    _bf_refetch["shift_start"] = _s_str
+                                    _bf_refetch["shift_end"] = _e_str
+                                    _u2_ok, _u2_err = _erp_upsert_log_from_adjustment(
+                                        _bf_refetch, sign="+", kind=_bf_kind,
+                                        minutes=_bf_min, fallback_home_db=current_db,
+                                        created_by=me_name,
+                                    )
+                                if _u1_ok and _u2_ok:
+                                    _erp_v2_clear_caches()
+                                    st.success(f"✅ {_bf_emp} {_bf_dt} {_s_str[:5]}~{_e_str[:5]}")
+                                    st.rerun()
+                                else:
+                                    _msgs = []
+                                    if not _u1_ok:
+                                        _msgs.append(f"신청서: {_u1_err}")
+                                    if not _u2_ok:
+                                        _msgs.append(f"로그: {_u2_err}")
+                                    st.error("일부 실패: " + " / ".join(_msgs))
+
+                # ── 일괄 저장 ─────────────────────────────────
+                st.divider()
+                _batch_col1, _batch_col2 = st.columns([1, 4])
+                with _batch_col1:
+                    _batch_btn = st.button("🗂️ 일괄 저장 (표시된 건 모두)", type="primary",
+                                           key="bf_batch_save")
+                with _batch_col2:
+                    st.caption("각 행의 시작 시각과 자동/수동 종료 시각으로 신청서·로그를 일괄 정정합니다.")
+
+                if _batch_btn:
+                    _bok, _bfail = 0, []
+                    for _bf in _bf_visible:
+                        _bfid = int(_bf.get("id") or 0)
+                        _s_raw = st.session_state.get(f"bf_start_{_bfid}", "")
+                        _e_raw = st.session_state.get(f"bf_end_{_bfid}", "")
+                        _bf_kind = _bf.get("kind") or "overtime"
+                        _bf_min = int(_bf.get("minutes") or 0)
+                        _bf_emp = _bf.get("employee_name") or "-"
+                        _bf_dt = str(_bf.get("target_date") or "")[:10]
+                        _s_str = _bf_hhmm_to_s(_s_raw)
+                        _e_str = _bf_hhmm_to_s(_e_raw)
+                        if _s_str and not _e_str and _bf_min > 0:
+                            _e_str = _bf_add_minutes(_s_str, _bf_min)
+                        if not _s_str or not _e_str or _e_str <= _s_str:
+                            _bfail.append(f"{_bf_emp}/{_bf_dt}: 시각 형식 오류")
+                            continue
+                        _u1_ok, _u1_err = _erp_update_row(
+                            "app_work_adjustments", _bfid,
+                            {"shift_start": _s_str, "shift_end": _e_str},
+                        )
+                        _wt_bf = _ERP_ADJ_KIND_TO_WORK_TYPE.get(_bf_kind, "특이사항")
+                        _log_existing = _sb_bf.table("app_attendance_logs")\
+                            .select("id")\
+                            .eq("employee_name", _bf_emp)\
+                            .eq("log_date", _bf_dt)\
+                            .eq("work_type", _wt_bf)\
+                            .execute().data or []
+                        if _log_existing:
+                            _u2_ok, _u2_err = _erp_update_row(
+                                "app_attendance_logs",
+                                int(_log_existing[0]["id"]),
+                                {"start_time": _s_str, "end_time": _e_str},
+                            )
+                        else:
+                            _bf_refetch = dict(_bf)
+                            _bf_refetch["shift_start"] = _s_str
+                            _bf_refetch["shift_end"] = _e_str
+                            _u2_ok, _u2_err = _erp_upsert_log_from_adjustment(
+                                _bf_refetch, sign="+", kind=_bf_kind,
+                                minutes=_bf_min, fallback_home_db=current_db,
+                                created_by=me_name,
+                            )
+                        if _u1_ok and _u2_ok:
+                            _bok += 1
+                        else:
+                            _errs = []
+                            if not _u1_ok:
+                                _errs.append(f"신청서:{_u1_err}")
+                            if not _u2_ok:
+                                _errs.append(f"로그:{_u2_err}")
+                            _bfail.append(f"{_bf_emp}/{_bf_dt}: " + " · ".join(_errs))
+                    _erp_v2_clear_caches()
+                    if _bok:
+                        st.success(f"✅ 일괄 저장 완료 {_bok}건")
+                    if _bfail:
+                        st.warning("일부 실패:\n- " + "\n- ".join(_bfail))
+                    if _bok:
+                        st.rerun()
+
+                if len(_bf_rows) > 50:
+                    st.caption(f"…이 외 {len(_bf_rows) - 50}건 더 있습니다. 위 건을 처리하면 이어서 표시됩니다.")
         except Exception as _bf_ex:
             import traceback as _tb2
             st.error(f"보강 목록 조회 오류: {type(_bf_ex).__name__}: {_bf_ex}")
