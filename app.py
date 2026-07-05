@@ -13566,6 +13566,34 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     for l in all_logs:
         l["employee_name"] = _resolve(l.get("employee_name") or "")
 
+    # ── 승인된 신청서 시간대 보강 폴백 ─────────────────────────────
+    # 로그(app_attendance_logs)의 start_time/end_time 이 누락된 경우
+    # 원 신청서(app_work_adjustments.shift_start/end) 에서 시각을 끌어와
+    # 캘린더 배지에 '20:30~21:00' 형태로 표시되도록 한다.
+    _adj_time_map: dict[tuple[str, str, str], tuple[str, str]] = {}
+    try:
+        _sb_cal, _ = get_supabase_client()
+        if _sb_cal:
+            _adj_rows = _sb_cal.table("app_work_adjustments")\
+                .select("employee_name,target_date,kind,shift_start,shift_end,status")\
+                .eq("status", "approved")\
+                .in_("kind", ["overtime", "meeting", "early_leave", "summer_vacation", "reward", "long_service"])\
+                .gte("target_date", period_start.isoformat())\
+                .lte("target_date", period_end.isoformat())\
+                .execute().data or []
+            for _ar in _adj_rows:
+                _ss_str = str(_ar.get("shift_start") or "")[:8]
+                _ee_str = str(_ar.get("shift_end") or "")[:8]
+                if not (_ss_str and _ee_str):
+                    continue
+                _wt_map = _ERP_ADJ_KIND_TO_WORK_TYPE.get(_ar.get("kind") or "etc", "특이사항")
+                _emp_res = _resolve(_ar.get("employee_name") or "")
+                _dt_res = str(_ar.get("target_date") or "")[:10]
+                if _emp_res and _dt_res:
+                    _adj_time_map[(_emp_res, _dt_res, _wt_map)] = (_ss_str, _ee_str)
+    except Exception:
+        pass
+
     # 인원 충족 체크용 전체 데이터 (매장/직원 필터 적용 전) — 항상 전 매장·전 직원 기준으로 산출
     # ⚠️ 매장 필터 후에 스냅샷하면, 다른 매장의 룰 평가 시 0명으로 계산되어 모든 매장이 인원부족으로 잡히는 버그.
     all_shifts_for_rules = all_shifts[:]
@@ -13928,6 +13956,12 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 _st = str(lg.get("start_time") or "")[:5]
                 _et = str(lg.get("end_time") or "")[:5]
                 _dm = int(lg.get("diff_minutes") or 0)
+                # 로그에 시간이 비어 있으면 원 신청서(app_work_adjustments)에서 폴백.
+                if (not _st or not _et):
+                    _fallback = _adj_time_map.get((emp, d_iso, wt))
+                    if _fallback:
+                        _st = _st or _fallback[0][:5]
+                        _et = _et or _fallback[1][:5]
                 if wt in ("추가근무", "회의"):
                     if _st and _et:
                         _time_txt = (f" <span style='font-size:0.62rem; color:#555;'>"
