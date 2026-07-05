@@ -17172,6 +17172,24 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
     st.caption("ⓘ 매장 관리자 본인이 올린 신청도 이 큐에서 직접 승인/반려할 수 있습니다.")
 
     pending = _erp_list_pending_adjustments(current_db)
+    # 근무지 표기용 매장 → 이름 매핑 (한 번만 조회)
+    _appr_stores_all = _get_supabase_stores_list(include_inactive=True) or []
+    _dbf_to_store = {s.get("db_filename"): s.get("store_name") or s.get("db_filename")
+                     for s in _appr_stores_all}
+
+    def _resolve_worksite(adj_row: dict) -> str:
+        """work_location_name(외부) 우선 → work_db_filename → db_filename 순으로 매장명 반환."""
+        _wl = (adj_row.get("work_location_name") or "").strip()
+        if _wl:
+            return _wl
+        _wdb = adj_row.get("work_db_filename")
+        if _wdb and _dbf_to_store.get(_wdb):
+            return _dbf_to_store[_wdb]
+        _hdb = adj_row.get("db_filename")
+        if _hdb and _dbf_to_store.get(_hdb):
+            return _dbf_to_store[_hdb]
+        return "-"
+
     if not pending:
         st.info("대기 중인 신청이 없습니다.")
     else:
@@ -17185,8 +17203,9 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
         _pv_ss = str(adj.get("shift_start") or "")[:5]
         _pv_ee = str(adj.get("shift_end") or "")[:5]
         _dur_txt = f"{_pv_ss}~{_pv_ee} ({hours_display})" if (_pv_ss and _pv_ee) else hours_display
+        _worksite = _resolve_worksite(adj)
         with st.container(border=True):
-            c = st.columns([1.3, 1, 0.4, 1.6, 2.6, 1, 1])
+            c = st.columns([1.3, 1, 0.4, 1.6, 1.2, 2.0, 1, 1])
             with c[0]:
                 st.markdown(f"**{adj.get('employee_name') or '-'}**")
                 st.caption(str(adj.get("created_at") or "")[:16])
@@ -17197,8 +17216,10 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
             with c[3]:
                 st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {_dur_txt}")
             with c[4]:
-                st.caption(adj.get("reason") or "")
+                st.markdown(f"📍 {_worksite}")
             with c[5]:
+                st.caption(adj.get("reason") or "")
+            with c[6]:
                 if st.button("✅ 승인", key=f"adj_ok_{adj_id}"):
                     ok, e = _erp_update_row("app_work_adjustments", adj_id, {
                         "status": "approved",
@@ -17225,7 +17246,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         st.rerun()
                     else:
                         st.error(f"승인 실패: {e}")
-            with c[6]:
+            with c[7]:
                 with st.popover("❌ 반려"):
                     reject_reason = st.text_input("반려 사유", key=f"adj_rj_reason_{adj_id}")
                     if st.button("반려 확정", key=f"adj_rj_btn_{adj_id}", type="primary"):
@@ -18220,9 +18241,16 @@ def _erp_render_my_adj_history(current_db: str, me_name: str, today: date) -> No
         _mv_ss = str(adj.get("shift_start") or "")[:5]
         _mv_ee = str(adj.get("shift_end") or "")[:5]
         _dur_disp = f"{_mv_ss}~{_mv_ee} ({hours_display})" if (_mv_ss and _mv_ee) else hours_display
+        _mv_worksite = (adj.get("work_location_name") or "").strip()
+        if not _mv_worksite:
+            _mv_stores_all = _get_supabase_stores_list(include_inactive=True) or []
+            _mv_dbf_to_store = {s.get("db_filename"): s.get("store_name") for s in _mv_stores_all}
+            _mv_worksite = (_mv_dbf_to_store.get(adj.get("work_db_filename"))
+                            or _mv_dbf_to_store.get(adj.get("db_filename"))
+                            or "-")
         status_label = {"pending": "🟡 대기", "approved": "🟢 승인", "rejected": "🔴 반려"}.get(status, status)
 
-        cols = st.columns([1, 1.3, 0.4, 1.6, 2.6, 1, 0.5, 0.5])
+        cols = st.columns([1, 1.3, 0.4, 1.6, 1.2, 2.2, 1, 0.5, 0.5])
         with cols[0]:
             st.markdown(str(adj.get("target_date") or "")[:10])
         with cols[1]:
@@ -18232,18 +18260,20 @@ def _erp_render_my_adj_history(current_db: str, me_name: str, today: date) -> No
         with cols[3]:
             st.markdown(_dur_disp)
         with cols[4]:
+            st.markdown(f"📍 {_mv_worksite}")
+        with cols[5]:
             msg = adj.get("reason") or ""
             if status == "rejected" and adj.get("reject_reason"):
                 msg += f"  ▸ 반려 사유: {adj['reject_reason']}"
             st.caption(msg)
-        with cols[5]:
-            st.markdown(status_label)
         with cols[6]:
+            st.markdown(status_label)
+        with cols[7]:
             if status == "pending":
                 if st.button("✏️", key=f"my_adj_edit_{adj_id}", help="수정"):
                     st.session_state["my_adj_editing_id"] = adj_id
                     st.rerun()
-        with cols[7]:
+        with cols[8]:
             if status == "pending":
                 if st.button("🗑️", key=f"my_adj_del_{adj_id}", help="취소(삭제)"):
                     ok, e = _erp_delete_row("app_work_adjustments", adj_id)
@@ -18440,6 +18470,10 @@ def _erp_render_superadmin_view(today: date):
             st.info("대기 중인 매장관리자 신청이 없습니다.")
         else:
             st.caption(f"대기 중 {len(sa_adj_pending)}건")
+            # 근무지 매핑 (한 번만 조회)
+            _sa_stores_all = _get_supabase_stores_list(include_inactive=True) or []
+            _sa_dbf_to_store = {s.get("db_filename"): s.get("store_name") or s.get("db_filename")
+                                for s in _sa_stores_all}
             for adj in sa_adj_pending:
                 adj_id = int(adj["id"])
                 kind = adj.get("kind") or "etc"
@@ -18449,8 +18483,13 @@ def _erp_render_superadmin_view(today: date):
                 _sv_ss = str(adj.get("shift_start") or "")[:5]
                 _sv_ee = str(adj.get("shift_end") or "")[:5]
                 _sv_dur = f"{_sv_ss}~{_sv_ee} ({hours_display})" if (_sv_ss and _sv_ee) else hours_display
+                _sv_worksite = (adj.get("work_location_name") or "").strip()
+                if not _sv_worksite:
+                    _sv_worksite = (_sa_dbf_to_store.get(adj.get("work_db_filename"))
+                                    or _sa_dbf_to_store.get(adj.get("db_filename"))
+                                    or "-")
                 with st.container(border=True):
-                    c = st.columns([1.6, 1.2, 0.4, 1.8, 2.4, 1, 1])
+                    c = st.columns([1.6, 1.2, 0.4, 1.8, 1.2, 1.8, 1, 1])
                     with c[0]:
                         st.markdown(f"**{adj.get('_store_name') or '-'}**")
                         st.caption(adj.get("employee_name") or "-")
@@ -18461,8 +18500,10 @@ def _erp_render_superadmin_view(today: date):
                     with c[3]:
                         st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {_sv_dur}")
                     with c[4]:
-                        st.caption(adj.get("reason") or "")
+                        st.markdown(f"📍 {_sv_worksite}")
                     with c[5]:
+                        st.caption(adj.get("reason") or "")
+                    with c[6]:
                         if st.button("✅ 승인", key=f"sa_adj_ok_{adj_id}", type="primary"):
                             ok, e = _erp_update_row("app_work_adjustments", adj_id, {
                                 "status": "approved",
@@ -18490,7 +18531,7 @@ def _erp_render_superadmin_view(today: date):
                                 st.rerun()
                             else:
                                 st.error(f"승인 실패: {e}")
-                    with c[6]:
+                    with c[7]:
                         with st.popover("❌ 반려"):
                             sa_rej_reason = st.text_input("반려 사유", key=f"sa_adj_rj_reason_{adj_id}")
                             if st.button("반려 확정", key=f"sa_adj_rj_btn_{adj_id}", type="primary"):
