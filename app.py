@@ -17956,6 +17956,7 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
                     payload["work_db_filename"] = _work_db
                     payload["work_location_name"] = _work_loc
 
+                _stripped_timeslot = False
                 ok, e = _erp_insert_row("app_work_adjustments", payload)
                 if not ok and (_needs_timeslot or _is_early_leave) and "PGRST204" in str(e):
                     # 컬럼 미존재 시 시간대 필드 제외하고 재시도
@@ -17963,11 +17964,32 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
                            if k not in ("shift_start", "shift_end", "work_db_filename", "work_location_name")}
                     ok, e = _erp_insert_row("app_work_adjustments", _p2)
                     if ok:
-                        st.warning("⚠️ 시간대 컬럼이 없어 기본 정보만 저장되었습니다. SUPABASE_APP_ATTENDANCE_V2.sql 의 3-1번 구문을 실행해 주세요.")
+                        _stripped_timeslot = True
+                        st.error(
+                            "❗ **시간대 컬럼(`shift_start`/`shift_end`)이 저장되지 못했습니다.** "
+                            "Supabase 스키마에 컬럼이 없거나 PostgREST 스키마 캐시가 오래된 상태입니다. "
+                            "슈퍼관리자에게 다음 SQL을 실행해달라고 요청하세요:\n\n"
+                            "```sql\n"
+                            "-- 1) 컬럼 추가 (이미 있으면 무시됨)\n"
+                            "ALTER TABLE app_work_adjustments\n"
+                            "    ADD COLUMN IF NOT EXISTS shift_start TIME,\n"
+                            "    ADD COLUMN IF NOT EXISTS shift_end   TIME,\n"
+                            "    ADD COLUMN IF NOT EXISTS work_db_filename TEXT,\n"
+                            "    ADD COLUMN IF NOT EXISTS work_location_name TEXT;\n"
+                            "-- 2) PostgREST 스키마 캐시 강제 리로드\n"
+                            "NOTIFY pgrst, 'reload schema';\n"
+                            "```"
+                        )
                 if ok:
                     _erp_v2_clear_caches()
-                    if _needs_timeslot or _is_early_leave:
-                        flash(f"신청이 등록되었습니다. 승인 후 {new_date.isoformat()} 캘린더에 자동 반영됩니다.")
+                    if _stripped_timeslot:
+                        flash(f"⚠️ 신청 저장됨 (단, 시간대는 저장되지 않음). SQL 실행 후 재신청해야 캘린더에 시각이 표시됩니다.", "warning")
+                    elif _needs_timeslot or _is_early_leave:
+                        flash(
+                            f"✅ 신청 완료 · {new_date.isoformat()} "
+                            f"{payload.get('shift_start', '')[:5]}~{payload.get('shift_end', '')[:5]} "
+                            f"저장됨. 승인 후 캘린더에 표시됩니다."
+                        )
                     else:
                         flash("신청이 등록되었습니다. 매장관리자 승인 대기 중.")
                     if on_success:
