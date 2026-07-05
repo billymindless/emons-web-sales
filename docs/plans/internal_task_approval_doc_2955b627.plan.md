@@ -1,16 +1,7 @@
 ---
 name: internal task approval doc
 overview: 사용자가 첨부 이미지처럼 요청한 "사내 업무관리·결재" 기능 요구사항을 한국어 마크다운으로 정리한 사내결제시스템.md를 워크스페이스 루트에 생성한다. 코드 변경 없이 기획·설계 문서만 산출하며, 추후 구현 단계의 입력값으로 사용한다.
-todos:
-  - id: write_md
-    content: 워크스페이스 루트에 사내결제시스템.md 생성 (§2 구조 1~11어 활용)
-    status: pending
-  - id: user_review
-    content: 사용자 검토 + 열린 질문(파일명, 알림톡 범위, 마감 배치 시점, paste 컴포넌트 선택) 확정
-    status: pending
-  - id: implementation_handoff
-    content: 확정 시 별도 작업으로 SUPABASE_APP_TASKS.sql, task_board.py, app.py 라우팅 구현 단계 정의
-    status: pending
+todos: []
 isProject: false
 ---
 
