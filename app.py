@@ -17320,7 +17320,13 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     _dt = str(_r.get("target_date") or "")[:10]
                     _r_db = _r.get("db_filename") or current_db
                     _existing = _existing_map.get((_emp, _dt, _wt))
+                    _existing_id = None
                     if _existing:
+                        try:
+                            _existing_id = int(_existing.get("id") or 0) or None
+                        except Exception:
+                            _existing_id = None
+                    if _existing and _existing_id:
                         # 이미 존재하는 로그를 신청서(app_work_adjustments) 와 일치하도록 정정.
                         #  - home_db_filename: 승인자 current_db 로 잘못 저장된 케이스
                         #  - start_time/end_time: 시간대 컬럼 도입 이전에 승인된 케이스
@@ -17344,8 +17350,11 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         if _r_min and _cur_dm != _r_min:
                             _patch["diff_minutes"] = _r_min
                         if _patch:
-                            _uok, _uerr = _erp_update_row("app_attendance_logs",
-                                                          int(_existing["id"]), _patch)
+                            try:
+                                _uok, _uerr = _erp_update_row("app_attendance_logs",
+                                                              _existing_id, _patch)
+                            except Exception as _uex:
+                                _uok, _uerr = False, str(_uex)
                             if _uok:
                                 _repaired += 1
                             else:
@@ -17353,11 +17362,18 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         else:
                             _skipped += 1
                         continue
+                    if _existing and not _existing_id:
+                        # 같은 반복 안에서 이전 iteration 이 신규 삽입한 placeholder → 중복 인식용, 스킵.
+                        _skipped += 1
+                        continue
                     # 신규 로그 생성: 헬퍼로 위임 (동일 upsert 로직 재사용)
-                    _lok, _lerr = _erp_upsert_log_from_adjustment(
-                        _r, sign=_sign_r, kind=_kind, minutes=int(_r.get("minutes") or 0),
-                        fallback_home_db=current_db, created_by=me_name,
-                    )
+                    try:
+                        _lok, _lerr = _erp_upsert_log_from_adjustment(
+                            _r, sign=_sign_r, kind=_kind, minutes=int(_r.get("minutes") or 0),
+                            fallback_home_db=current_db, created_by=me_name,
+                        )
+                    except Exception as _lex:
+                        _lok, _lerr = False, str(_lex)
                     if _lok:
                         _synced += 1
                         _existing_map[(_emp, _dt, _wt)] = {
@@ -17381,7 +17397,10 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 if _failed:
                     st.warning("일부 실패:\n" + "\n".join(_failed))
             except Exception as _se:
-                st.error(f"동기화 오류: {_se}")
+                import traceback as _tb
+                st.error(f"동기화 오류: {type(_se).__name__}: {_se}")
+                with st.expander("스택 트레이스 (디버그용)", expanded=False):
+                    st.code(_tb.format_exc(), language="text")
 
     # ── 진단: 특정 날짜·직원의 로그·신청 상태 확인 ─────────────────────
     with st.expander("🔎 캘린더 반영 진단 (특정 날짜·직원)", expanded=False):
