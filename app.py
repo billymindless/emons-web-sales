@@ -17321,30 +17321,29 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     _r_db = _r.get("db_filename") or current_db
                     _existing = _existing_map.get((_emp, _dt, _wt))
                     if _existing:
-                        # 이미 존재하는 로그가 잘못된 home_db_filename 으로 저장된 경우 정정.
-                        # (구버전에서 승인자의 current_db 로 저장되어 캘린더에 안 뜨던 문제)
+                        # 이미 존재하는 로그를 신청서(app_work_adjustments) 와 일치하도록 정정.
+                        #  - home_db_filename: 승인자 current_db 로 잘못 저장된 케이스
+                        #  - start_time/end_time: 시간대 컬럼 도입 이전에 승인된 케이스
+                        #  - diff_minutes: 음수·0 등 신청 분과 불일치인 케이스
                         _cur_hdb = _existing.get("home_db_filename")
-                        _need_repair = bool(_r_db) and _cur_hdb != _r_db
-                        # 기존 로그의 시간대·분 정보가 비어있고 신청서에는 있으면 보강
                         _r_shift_s = str(_r.get("shift_start") or "")[:8] or None
                         _r_shift_e = str(_r.get("shift_end") or "")[:8] or None
                         _r_min = int(_r.get("minutes") or 0)
-                        _cur_st = _existing.get("start_time")
-                        _cur_et = _existing.get("end_time")
+                        _cur_st = str(_existing.get("start_time") or "")[:8] or None
+                        _cur_et = str(_existing.get("end_time") or "")[:8] or None
                         _cur_dm = int(_existing.get("diff_minutes") or 0)
-                        _need_time_fill = ((_r_shift_s and not _cur_st) or
-                                           (_r_shift_e and not _cur_et) or
-                                           (_r_min and not _cur_dm))
-                        if _need_repair or _need_time_fill:
-                            _patch = {}
-                            if _need_repair:
-                                _patch["home_db_filename"] = _r_db
-                            if _r_shift_s and not _cur_st:
-                                _patch["start_time"] = _r_shift_s
-                            if _r_shift_e and not _cur_et:
-                                _patch["end_time"] = _r_shift_e
-                            if _r_min and not _cur_dm:
-                                _patch["diff_minutes"] = _r_min
+                        _patch = {}
+                        if _r_db and _cur_hdb != _r_db:
+                            _patch["home_db_filename"] = _r_db
+                        if _r_shift_s and _r_shift_s[:5] != (_cur_st or "")[:5]:
+                            _patch["start_time"] = _r_shift_s
+                        if _r_shift_e and _r_shift_e[:5] != (_cur_et or "")[:5]:
+                            _patch["end_time"] = _r_shift_e
+                        # + kind 는 항상 양수 diff, - kind 는 절대값 저장 규약.
+                        # 불일치 (예: 음수·0) 이면 신청서 값으로 정정.
+                        if _r_min and _cur_dm != _r_min:
+                            _patch["diff_minutes"] = _r_min
+                        if _patch:
                             _uok, _uerr = _erp_update_row("app_attendance_logs",
                                                           int(_existing["id"]), _patch)
                             if _uok:
@@ -17391,9 +17390,10 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
         )
         _diag_c1, _diag_c2 = st.columns([2, 2])
         with _diag_c1:
-            _diag_stores = _get_supabase_stores_list() or []
+            _diag_stores = _get_supabase_stores_list() or []               # 활성 매장 (캘린더 표시 기준)
+            _diag_stores_all = _get_supabase_stores_list(include_inactive=True) or []  # 폐점 포함
             _diag_all_emps: list[str] = []
-            for _s in _diag_stores:
+            for _s in _diag_stores_all:
                 _diag_all_emps += _erp_get_employee_names_for_store(_s.get("db_filename"))
             _diag_all_emps = sorted(set([e for e in _diag_all_emps if e]))
             _diag_emp = st.selectbox("직원", options=_diag_all_emps or [""],
@@ -17450,17 +17450,62 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     st.dataframe(pd.DataFrame(_lg_view), use_container_width=True,
                                  hide_index=True)
 
-                    # home_db_filename 이 실제 등록된 매장에 속하지 않으면 경고
-                    _known_dbs = {s.get("db_filename") for s in _diag_stores}
-                    _bad = [l for l in _lgs
-                            if l.get("home_db_filename") and l.get("home_db_filename") not in _known_dbs]
-                    if _bad:
+                    # 캘린더가 실제 조회하는 매장 목록 (활성 매장만)
+                    _active_dbs = {s.get("db_filename") for s in _diag_stores}
+                    _all_known_dbs = {s.get("db_filename") for s in _diag_stores_all}
+                    _inactive_dbs = _all_known_dbs - _active_dbs
+                    _bad_inactive = [l for l in _lgs
+                                     if l.get("home_db_filename") and l.get("home_db_filename") in _inactive_dbs]
+                    _bad_unknown = [l for l in _lgs
+                                    if l.get("home_db_filename") and l.get("home_db_filename") not in _all_known_dbs]
+                    if _bad_inactive:
                         st.error(
-                            f"⚠️ {len(_bad)}건의 로그가 등록되지 않은 매장 DB "
-                            f"({', '.join(sorted({l.get('home_db_filename') for l in _bad}))}) "
-                            f"로 저장되어 있어 캘린더에 표시되지 않습니다. "
-                            f"위 '기존 승인 내역 캘린더 재동기화' 버튼으로 정정하세요."
+                            f"⛔ {len(_bad_inactive)}건의 로그가 **폐점(비활성) 매장 DB** "
+                            f"({', '.join(sorted({l.get('home_db_filename') for l in _bad_inactive}))}) "
+                            f"로 저장되어 캘린더에 표시되지 않습니다. "
+                            f"슈퍼관리자 → 매장 관리에서 해당 매장을 다시 활성화하거나, "
+                            f"Supabase 에서 로그의 `home_db_filename` 을 활성 매장으로 이관해야 합니다."
                         )
+                    if _bad_unknown:
+                        st.error(
+                            f"⚠️ {len(_bad_unknown)}건의 로그가 등록되지 않은 매장 DB "
+                            f"({', '.join(sorted({l.get('home_db_filename') for l in _bad_unknown}))}) "
+                            f"로 저장되어 있어 캘린더에 표시되지 않습니다. "
+                            f"'기존 승인 내역 캘린더 재동기화' 를 실행하세요."
+                        )
+
+                    # 신청서 ↔ 로그 시간·분 불일치 검증
+                    _approved_adjs = [a for a in _adj if (a.get("status") == "approved")]
+                    if _approved_adjs:
+                        _mismatches: list[str] = []
+                        for _a in _approved_adjs:
+                            _wt_map = _ERP_ADJ_KIND_TO_WORK_TYPE.get(_a.get("kind") or "etc", "특이사항")
+                            _matched = next((l for l in _lgs if l.get("work_type") == _wt_map), None)
+                            if not _matched:
+                                _mismatches.append(
+                                    f"'{_wt_map}' 로그 없음 (kind={_a.get('kind')}, minutes={_a.get('minutes')})"
+                                )
+                                continue
+                            _a_ss = str(_a.get("shift_start") or "")[:5]
+                            _a_ee = str(_a.get("shift_end") or "")[:5]
+                            _l_ss = str(_matched.get("start_time") or "")[:5]
+                            _l_ee = str(_matched.get("end_time") or "")[:5]
+                            _a_min = int(_a.get("minutes") or 0)
+                            _l_min = int(_matched.get("diff_minutes") or 0)
+                            _detail_parts = []
+                            if _a_ss and _a_ss != _l_ss:
+                                _detail_parts.append(f"시작 신청={_a_ss} vs 로그={_l_ss or '(비어있음)'}")
+                            if _a_ee and _a_ee != _l_ee:
+                                _detail_parts.append(f"종료 신청={_a_ee} vs 로그={_l_ee or '(비어있음)'}")
+                            if _a_min and _a_min != _l_min:
+                                _detail_parts.append(f"분 신청={_a_min} vs 로그={_l_min}")
+                            if _detail_parts:
+                                _mismatches.append(f"'{_wt_map}' — " + " · ".join(_detail_parts))
+                        if _mismatches:
+                            st.warning(
+                                "⚠️ 신청서와 로그 데이터가 어긋납니다 — '기존 승인 내역 재동기화' 로 정정하세요:\n\n- "
+                                + "\n- ".join(_mismatches)
+                            )
                 else:
                     st.warning(
                         "⚠️ 캘린더 로그가 없습니다. 신청 내역이 있는데도 로그가 없다면, "
