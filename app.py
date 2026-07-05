@@ -11106,6 +11106,90 @@ _ERP_ADJ_KIND_TO_WORK_TYPE = {
 }
 
 
+def _erp_upsert_log_from_adjustment(
+    adj: dict,
+    *,
+    sign: str,
+    kind: str,
+    minutes: int,
+    fallback_home_db: str,
+    created_by: str,
+) -> tuple[bool, str | None]:
+    """`app_work_adjustments` 승인 건을 `app_attendance_logs` 로 upsert.
+
+    - `(employee_name, log_date, work_type)` 조합으로 기존 로그를 조회하여
+      존재하면 update, 없으면 insert (중복 방지).
+    - 캘린더는 `home_db_filename` 을 신청자 소속 매장으로 필터하므로,
+      승인자의 current_db 가 아닌 반드시 `adj.db_filename` 을 사용한다.
+    - 반환: (성공여부, 오류메시지).
+    """
+    from datetime import date as _date  # noqa: WPS433 (지역 임포트로 순환 참조 방지)
+
+    try:
+        _shift_s = str(adj.get("shift_start") or "")[:8] or None
+        _shift_e = str(adj.get("shift_end") or "")[:8] or None
+        _home_db = adj.get("db_filename") or fallback_home_db
+        _work_db = adj.get("work_db_filename") or _home_db
+        _work_loc = adj.get("work_location_name")
+        _td_str = str(adj.get("target_date") or "")[:10]
+        try:
+            _log_date_d = _date.fromisoformat(_td_str)
+        except Exception:
+            _log_date_d = _today_kst()
+        _std_s, _std_e = _erp_default_times_for_date(_home_db, _log_date_d)
+        _wt = _ERP_ADJ_KIND_TO_WORK_TYPE.get(kind, "특이사항" if sign == "-" else "추가근무")
+        _emp = adj.get("employee_name") or ""
+
+        # 기존 로그 조회 (중복 방지)
+        client, err = get_supabase_client()
+        if err or not client:
+            return False, err or "DB 클라이언트 없음"
+        existing = client.table("app_attendance_logs")\
+            .select("id")\
+            .eq("employee_name", _emp)\
+            .eq("log_date", _td_str)\
+            .eq("work_type", _wt)\
+            .execute().data or []
+
+        _payload = {
+            "home_db_filename": _home_db,
+            "work_db_filename": _work_db,
+            "work_location_name": _work_loc,
+            "employee_name": _emp,
+            "log_date": _td_str,
+            "work_type": _wt,
+            "leave_deduction": 0,
+            "diff_minutes": int(minutes or 0),
+            "start_time": _shift_s,
+            "end_time": _shift_e,
+            "standard_start": _std_s.strftime("%H:%M:%S"),
+            "standard_end": _std_e.strftime("%H:%M:%S"),
+            "status": "approved",
+            "note": adj.get("reason"),
+            "created_by": created_by,
+        }
+        if existing:
+            _uok, _uerr = _erp_update_row(
+                "app_attendance_logs", int(existing[0]["id"]), _payload
+            )
+            if not _uok and "PGRST204" in str(_uerr):
+                _min_payload = {k: v for k, v in _payload.items()
+                                if k not in ("work_db_filename", "work_location_name", "leave_deduction")}
+                _uok, _uerr = _erp_update_row(
+                    "app_attendance_logs", int(existing[0]["id"]), _min_payload
+                )
+            return _uok, _uerr
+        else:
+            _iok, _ierr = _erp_insert_row("app_attendance_logs", _payload)
+            if not _iok and "PGRST204" in str(_ierr):
+                _min_payload = {k: v for k, v in _payload.items()
+                                if k not in ("work_db_filename", "work_location_name", "leave_deduction")}
+                _iok, _ierr = _erp_insert_row("app_attendance_logs", _min_payload)
+            return _iok, _ierr
+    except Exception as _ex:
+        return False, str(_ex)
+
+
 @st.cache_data(ttl=60)
 def _erp_get_monthly_target_row(db_filename: str, employee_name: str, ym: str) -> dict | None:
     """app_monthly_work_targets 단일 행. (db, emp, ym) UNIQUE."""
@@ -17048,16 +17132,12 @@ def _erp_tab_period_targets(current_db: str, me_name: str):
 
 
 def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
-    """매장관리자: 직원 신청 승인/반려 큐."""
+    """매장관리자: 직원 신청 승인/반려 큐 (본인 신청 자가 승인 포함)."""
     st.subheader("📥 신청 승인")
     st.caption("직원이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청을 검토합니다. 승인 시 해당 직원의 월·연 잔여 시간에 즉시 반영됩니다.")
-    st.caption("ⓘ 매장 관리자 본인의 신청은 이 큐에 표시되지 않으며 통합관리자(superadmin) 승인 대상입니다.")
+    st.caption("ⓘ 매장 관리자 본인이 올린 신청도 이 큐에서 직접 승인/반려할 수 있습니다.")
 
-    _admin_names = set(_erp_store_admin_names(current_db))
-    pending = [
-        p for p in _erp_list_pending_adjustments(current_db)
-        if str(p.get("employee_name") or "").strip() not in _admin_names
-    ]
+    pending = _erp_list_pending_adjustments(current_db)
     if not pending:
         st.info("대기 중인 신청이 없습니다.")
     else:
@@ -17090,53 +17170,20 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     })
                     if ok:
                         _erp_v2_clear_caches()
-                        # 캘린더(app_attendance_logs)에 자동 반영 — 연장(+)·단축(-) 모두 비고와 함께
-                        try:
-                            _shift_s = str(adj.get("shift_start") or "")[:8] or None
-                            _shift_e = str(adj.get("shift_end") or "")[:8] or None
-                            # home_db_filename 은 반드시 신청자(직원)의 소속 매장을 사용해야 함.
-                            # 승인자의 current_db 로 저장하면, 캘린더가 소속 매장 기준으로
-                            # 로그를 조회할 때 다른 매장 관리자가 승인한 건이 표시되지 않는다.
-                            _adj_home_db = adj.get("db_filename") or current_db
-                            _work_db_adj = adj.get("work_db_filename") or _adj_home_db
-                            _work_loc_adj = adj.get("work_location_name")
-                            _td_str = str(adj.get("target_date") or "")[:10]
-                            try:
-                                _log_date_d = date.fromisoformat(_td_str)
-                            except Exception:
-                                _log_date_d = _today_kst()
-                            _std_s, _std_e = _erp_default_times_for_date(_adj_home_db, _log_date_d)
-                            # work_type 매핑: kind 별 명시화 (종전엔 sign='-' 이 무조건 '조퇴' 였음).
-                            # early_leave 만 '조퇴', 그 외 sign='-' 는 원본 kind 라벨(여름휴가/포상/장기근속/특이사항) 사용.
-                            _wt = _ERP_ADJ_KIND_TO_WORK_TYPE.get(kind, "특이사항" if sign == "-" else "추가근무")
-                            _log_row = {
-                                "home_db_filename": _adj_home_db,
-                                "work_db_filename": _work_db_adj,
-                                "work_location_name": _work_loc_adj,
-                                "employee_name": adj.get("employee_name"),
-                                "log_date": _td_str,
-                                "work_type": _wt,
-                                "leave_deduction": 0,
-                                "diff_minutes": minutes,
-                                "start_time": _shift_s,
-                                "end_time": _shift_e,
-                                "standard_start": _std_s.strftime("%H:%M:%S"),
-                                "standard_end": _std_e.strftime("%H:%M:%S"),
-                                "status": "approved",
-                                "note": adj.get("reason"),
-                                "created_by": me_name,
-                            }
-                            _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_row)
-                            if not _log_ok:
-                                _log_min = {k: v for k, v in _log_row.items()
-                                            if k not in ("work_db_filename", "work_location_name", "leave_deduction")}
-                                _log_ok, _log_err = _erp_insert_row("app_attendance_logs", _log_min)
-                            if _log_ok:
-                                st.toast(f"📅 캘린더 반영: {adj.get('employee_name')} {_td_str} ({sign}{_wt})", icon="📅")
-                            else:
-                                st.error(f"❌ 캘린더 반영 실패: {_log_err}")
-                        except Exception as _sync_ex:
-                            st.error(f"❌ 캘린더 반영 중 예외: {_sync_ex}")
+                        # 캘린더(app_attendance_logs) 자동 upsert — 중복 방지 로직 포함
+                        _log_ok, _log_err = _erp_upsert_log_from_adjustment(
+                            adj, sign=sign, kind=kind, minutes=minutes,
+                            fallback_home_db=current_db, created_by=me_name,
+                        )
+                        _wt_show = _ERP_ADJ_KIND_TO_WORK_TYPE.get(kind, kind)
+                        _td_show = str(adj.get("target_date") or "")[:10]
+                        if _log_ok:
+                            st.toast(
+                                f"📅 캘린더 반영: {adj.get('employee_name')} {_td_show} ({sign}{_wt_show})",
+                                icon="📅",
+                            )
+                        elif _log_err:
+                            st.error(f"❌ 캘린더 반영 실패: {_log_err}")
                         flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
                         st.rerun()
                     else:
@@ -17233,7 +17280,8 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
     st.divider()
     with st.expander("🔄 기존 승인 내역 캘린더 재동기화", expanded=False):
         st.caption(
-            "과거에 승인된 추가근무·회의 신청 중 캘린더(app_attendance_logs)에 반영되지 않은 항목을 일괄 동기화합니다."
+            "과거에 승인된 신청(추가근무·회의·조기퇴근·여름휴가·포상·장기근속·특이사항) 중 "
+            "캘린더(app_attendance_logs)에 반영되지 않았거나 시간대가 비어 있는 항목을 일괄 동기화·보강합니다."
         )
         _sync_year = st.number_input("대상 연도", min_value=2020, max_value=2100,
                                      value=_today_kst().year, step=1, key="sync_year")
@@ -17242,19 +17290,18 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 _sb2 = get_supabase_client_or_warn()
                 if _sb2 is None:
                     st.stop()
-                # 해당 연도 추가근무·회의 승인 내역 전체 조회
+                # 해당 연도 전체 kind 승인 내역 조회 (조기퇴근·여름휴가·포상·장기근속·특이사항 포함)
                 _sync_rows = _sb2.table("app_work_adjustments").select("*")\
                     .eq("status", "approved")\
-                    .in_("kind", ["overtime", "meeting"])\
-                    .eq("sign", "+")\
+                    .in_("kind", list(_ERP_ADJ_KIND_TO_WORK_TYPE.keys()))\
                     .execute().data or []
                 _sync_rows = [r for r in _sync_rows
                               if str(r.get("target_date") or "").startswith(str(int(_sync_year)))]
 
-                # 이미 app_attendance_logs에 있는 항목 파악 (id 포함, home_db_filename 검증용)
+                # 이미 app_attendance_logs 에 있는 항목 파악 (id 포함, home_db_filename 검증용)
                 _existing_logs = _sb2.table("app_attendance_logs")\
-                    .select("id,employee_name,log_date,work_type,home_db_filename")\
-                    .in_("work_type", ["추가근무", "회의"])\
+                    .select("id,employee_name,log_date,work_type,home_db_filename,diff_minutes,start_time,end_time")\
+                    .in_("work_type", list(_ERP_ADJ_KIND_TO_WORK_TYPE.values()))\
                     .execute().data or []
                 _existing_map = {
                     (r.get("employee_name"), str(r.get("log_date") or "")[:10], r.get("work_type")): r
@@ -17266,7 +17313,9 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                 _skipped = 0
                 _failed = []
                 for _r in _sync_rows:
-                    _wt = "추가근무" if _r.get("kind") == "overtime" else "회의"
+                    _kind = _r.get("kind") or "etc"
+                    _sign_r = _r.get("sign") or "+"
+                    _wt = _ERP_ADJ_KIND_TO_WORK_TYPE.get(_kind, "특이사항")
                     _emp = _r.get("employee_name") or ""
                     _dt = str(_r.get("target_date") or "")[:10]
                     _r_db = _r.get("db_filename") or current_db
@@ -17275,46 +17324,41 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         # 이미 존재하는 로그가 잘못된 home_db_filename 으로 저장된 경우 정정.
                         # (구버전에서 승인자의 current_db 로 저장되어 캘린더에 안 뜨던 문제)
                         _cur_hdb = _existing.get("home_db_filename")
-                        if _r_db and _cur_hdb != _r_db:
+                        _need_repair = bool(_r_db) and _cur_hdb != _r_db
+                        # 기존 로그의 시간대·분 정보가 비어있고 신청서에는 있으면 보강
+                        _r_shift_s = str(_r.get("shift_start") or "")[:8] or None
+                        _r_shift_e = str(_r.get("shift_end") or "")[:8] or None
+                        _r_min = int(_r.get("minutes") or 0)
+                        _cur_st = _existing.get("start_time")
+                        _cur_et = _existing.get("end_time")
+                        _cur_dm = int(_existing.get("diff_minutes") or 0)
+                        _need_time_fill = ((_r_shift_s and not _cur_st) or
+                                           (_r_shift_e and not _cur_et) or
+                                           (_r_min and not _cur_dm))
+                        if _need_repair or _need_time_fill:
+                            _patch = {}
+                            if _need_repair:
+                                _patch["home_db_filename"] = _r_db
+                            if _r_shift_s and not _cur_st:
+                                _patch["start_time"] = _r_shift_s
+                            if _r_shift_e and not _cur_et:
+                                _patch["end_time"] = _r_shift_e
+                            if _r_min and not _cur_dm:
+                                _patch["diff_minutes"] = _r_min
                             _uok, _uerr = _erp_update_row("app_attendance_logs",
-                                                          int(_existing["id"]),
-                                                          {"home_db_filename": _r_db})
+                                                          int(_existing["id"]), _patch)
                             if _uok:
                                 _repaired += 1
                             else:
-                                _failed.append(f"{_emp}/{_dt} home_db 정정 실패: {_uerr}")
+                                _failed.append(f"{_emp}/{_dt} 정정 실패: {_uerr}")
                         else:
                             _skipped += 1
                         continue
-                    _shift_s = str(_r.get("shift_start") or "")[:8] or None
-                    _shift_e = str(_r.get("shift_end") or "")[:8] or None
-                    try:
-                        _log_date_d = date.fromisoformat(_dt)
-                    except Exception:
-                        _log_date_d = _today_kst()
-                    _std_s, _std_e = _erp_default_times_for_date(_r_db, _log_date_d)
-                    _lr = {
-                        "home_db_filename": _r_db,
-                        "work_db_filename": _r.get("work_db_filename") or _r_db,
-                        "work_location_name": _r.get("work_location_name"),
-                        "employee_name": _emp,
-                        "log_date": _dt,
-                        "work_type": _wt,
-                        "leave_deduction": 0,
-                        "diff_minutes": int(_r.get("minutes") or 0),
-                        "start_time": _shift_s,
-                        "end_time": _shift_e,
-                        "standard_start": _std_s.strftime("%H:%M:%S"),
-                        "standard_end": _std_e.strftime("%H:%M:%S"),
-                        "status": "approved",
-                        "note": _r.get("reason"),
-                        "created_by": me_name,
-                    }
-                    _lok, _lerr = _erp_insert_row("app_attendance_logs", _lr)
-                    if not _lok:
-                        _lr_min = {k: v for k, v in _lr.items()
-                                   if k not in ("work_db_filename", "work_location_name", "leave_deduction")}
-                        _lok, _lerr = _erp_insert_row("app_attendance_logs", _lr_min)
+                    # 신규 로그 생성: 헬퍼로 위임 (동일 upsert 로직 재사용)
+                    _lok, _lerr = _erp_upsert_log_from_adjustment(
+                        _r, sign=_sign_r, kind=_kind, minutes=int(_r.get("minutes") or 0),
+                        fallback_home_db=current_db, created_by=me_name,
+                    )
                     if _lok:
                         _synced += 1
                         _existing_map[(_emp, _dt, _wt)] = {
@@ -18016,8 +18060,13 @@ def _erp_render_superadmin_view(today: date):
             st.info("표시할 데이터가 없습니다.")
 
     with sa_tabs[3]:
-        st.markdown("##### 🧑‍💼 전 매장 매장관리자 근태 신청 승인 (superadmin 전용)")
-        st.caption("매장 관리자 본인이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청입니다. 승인 시 해당 매장관리자의 월·연 잔여 시간에 반영됩니다.")
+        st.markdown("##### 🧑‍💼 전 매장 매장관리자 근태 신청 승인 (superadmin 백업)")
+        st.caption(
+            "매장 관리자 본인이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청입니다. "
+            "매장 관리자는 [신청 승인] 큐에서 본인 신청도 직접 승인 가능하며, "
+            "여기서는 superadmin 이 대신 승인·반려할 수 있는 백업 경로입니다. "
+            "승인 시 캘린더(app_attendance_logs)에 자동 반영됩니다."
+        )
         sa_adj_pending = []
         for _, sr in stores_df.iterrows():
             dbf = sr["db_filename"]
@@ -18060,6 +18109,21 @@ def _erp_render_superadmin_view(today: date):
                             })
                             if ok:
                                 _erp_v2_clear_caches()
+                                # 캘린더(app_attendance_logs) 자동 반영 — 매장관리자 승인 경로와 동일 로직
+                                _log_sync_ok, _log_sync_err = _erp_upsert_log_from_adjustment(
+                                    adj, sign=sign, kind=kind, minutes=minutes,
+                                    fallback_home_db=current_db,
+                                    created_by=_get_current_user_display_name() or "superadmin",
+                                )
+                                if _log_sync_ok:
+                                    st.toast(
+                                        f"📅 캘린더 반영: {adj.get('employee_name')} "
+                                        f"{str(adj.get('target_date') or '')[:10]} "
+                                        f"({sign}{_ERP_ADJ_KIND_TO_WORK_TYPE.get(kind, kind)})",
+                                        icon="📅",
+                                    )
+                                elif _log_sync_err:
+                                    st.error(f"❌ 캘린더 반영 실패: {_log_sync_err}")
                                 flash(f"승인: {adj.get('employee_name')} {sign}{hours_display}")
                                 st.rerun()
                             else:
