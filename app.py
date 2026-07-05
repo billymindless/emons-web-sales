@@ -17182,8 +17182,11 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
         sign = adj.get("sign") or "+"
         minutes = int(adj.get("minutes") or 0)
         hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
+        _pv_ss = str(adj.get("shift_start") or "")[:5]
+        _pv_ee = str(adj.get("shift_end") or "")[:5]
+        _dur_txt = f"{_pv_ss}~{_pv_ee} ({hours_display})" if (_pv_ss and _pv_ee) else hours_display
         with st.container(border=True):
-            c = st.columns([1.3, 1, 0.4, 1.2, 3, 1, 1])
+            c = st.columns([1.3, 1, 0.4, 1.6, 2.6, 1, 1])
             with c[0]:
                 st.markdown(f"**{adj.get('employee_name') or '-'}**")
                 st.caption(str(adj.get("created_at") or "")[:16])
@@ -17192,7 +17195,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
             with c[2]:
                 st.markdown(f"### {sign}")
             with c[3]:
-                st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {hours_display}")
+                st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {_dur_txt}")
             with c[4]:
                 st.caption(adj.get("reason") or "")
             with c[5]:
@@ -18214,9 +18217,12 @@ def _erp_render_my_adj_history(current_db: str, me_name: str, today: date) -> No
         status = adj.get("status") or "pending"
         minutes = int(adj.get("minutes") or 0)
         hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
+        _mv_ss = str(adj.get("shift_start") or "")[:5]
+        _mv_ee = str(adj.get("shift_end") or "")[:5]
+        _dur_disp = f"{_mv_ss}~{_mv_ee} ({hours_display})" if (_mv_ss and _mv_ee) else hours_display
         status_label = {"pending": "🟡 대기", "approved": "🟢 승인", "rejected": "🔴 반려"}.get(status, status)
 
-        cols = st.columns([1, 1.3, 0.4, 1, 3, 1, 0.5, 0.5])
+        cols = st.columns([1, 1.3, 0.4, 1.6, 2.6, 1, 0.5, 0.5])
         with cols[0]:
             st.markdown(str(adj.get("target_date") or "")[:10])
         with cols[1]:
@@ -18224,7 +18230,7 @@ def _erp_render_my_adj_history(current_db: str, me_name: str, today: date) -> No
         with cols[2]:
             st.markdown(f"**{sign}**")
         with cols[3]:
-            st.markdown(hours_display)
+            st.markdown(_dur_disp)
         with cols[4]:
             msg = adj.get("reason") or ""
             if status == "rejected" and adj.get("reject_reason"):
@@ -18440,8 +18446,11 @@ def _erp_render_superadmin_view(today: date):
                 sign = adj.get("sign") or "+"
                 minutes = int(adj.get("minutes") or 0)
                 hours_display = f"{minutes//60}h {minutes%60}m" if minutes % 60 else f"{minutes//60}h"
+                _sv_ss = str(adj.get("shift_start") or "")[:5]
+                _sv_ee = str(adj.get("shift_end") or "")[:5]
+                _sv_dur = f"{_sv_ss}~{_sv_ee} ({hours_display})" if (_sv_ss and _sv_ee) else hours_display
                 with st.container(border=True):
-                    c = st.columns([1.6, 1.2, 0.4, 1.4, 3, 1, 1])
+                    c = st.columns([1.6, 1.2, 0.4, 1.8, 2.4, 1, 1])
                     with c[0]:
                         st.markdown(f"**{adj.get('_store_name') or '-'}**")
                         st.caption(adj.get("employee_name") or "-")
@@ -18450,7 +18459,7 @@ def _erp_render_superadmin_view(today: date):
                     with c[2]:
                         st.markdown(f"### {sign}")
                     with c[3]:
-                        st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {hours_display}")
+                        st.markdown(f"{_ERP_ADJ_KIND_LABEL.get(kind, kind)} · {_sv_dur}")
                     with c[4]:
                         st.caption(adj.get("reason") or "")
                     with c[5]:
