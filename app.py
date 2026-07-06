@@ -253,18 +253,18 @@ def _inject_branding_css():
 
 
 # 최고 관리자 메뉴 라벨 (사이드바 내비게이션 + render_superadmin 공용)
+# 공지사항 관리는 ⚙️ 관리자 설정으로 이동됨 (매장 관리자도 접근 가능하도록)
 _SUPERADMIN_MENUS = [
     "① 전 지점 통합 대시보드",
     "② 매장별 직원 평가 현황 (HR)",
-    "③ 📢 공지사항 관리",
-    "④ 원클릭 데이터 백업 (CSV)",
-    "⑤ 매장 계정 관리",
-    "⑥ 전 지점 마케팅 분석",
-    "⑦ 미수금(잔금) 레포트",
-    "⑧ 결제수단별 집계표",
-    "⑨ 💰 입금 관리",
-    "⑩ ⚠️ 데이터 초기화 (Danger Zone)",
-    "⑪ FAQ (도움말)",
+    "③ 원클릭 데이터 백업 (CSV)",
+    "④ 매장 계정 관리",
+    "⑤ 전 지점 마케팅 분석",
+    "⑥ 미수금(잔금) 레포트",
+    "⑦ 결제수단별 집계표",
+    "⑧ 💰 입금 관리",
+    "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
+    "⑩ FAQ (도움말)",
 ]
 
 
@@ -321,7 +321,13 @@ def _inject_dual_nav_css():
         }
         /* 사이드바 내부 컬럼 간격 축소 (아이콘 레일 ↔ 메뉴 밀착) */
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
-            gap: 0.35rem !important;
+            gap: 0.25rem !important;
+        }
+        /* 아이콘 레일 컬럼 자체를 좁게: 버튼이 컬럼 폭을 꽉 채우므로
+           컬럼이 좁아지면 박스도 가로로 타이트해짐 (세로 높이는 그대로) */
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child {
+            flex: 0 0 3.6rem !important;
+            max-width: 3.6rem !important;
         }
         /* ── ERP 아이콘 레일 (좌측 첫 번째 컬럼) ── */
         .erp-rail-title {
@@ -329,25 +335,17 @@ def _inject_dual_nav_css():
             text-align: center; letter-spacing: 0.02em; margin: 2px 0 4px 0;
         }
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button {
-            padding: 0.1rem 0 !important;      /* 상·하 각 1.6px */
+            padding: 0.35rem 0 !important;     /* 세로 여백 원복 (ERP 타이틀 표시 확보) */
             font-size: 1.15rem !important;     /* 아이콘 크기 유지 */
             line-height: 1.1 !important;
             border: 1px solid #D6E4F5 !important;
             background: #FFFFFF !important;
-            border-radius: 8px !important;
-            min-height: 30px !important;       /* 40px → 30px 축소 */
-            height: 30px !important;
+            border-radius: 10px !important;
+            min-width: 0 !important;
         }
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button:hover {
             background: #E3F2FD !important;
             border-color: #1565C0 !important;
-        }
-        /* 아이콘 레일 박스 사이 세로 간격 축소 (기본 ~16px → 4px) */
-        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child [data-testid="stVerticalBlock"] {
-            gap: 0.25rem !important;
-        }
-        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child [data-testid="stElementContainer"] {
-            margin-bottom: 0 !important;
         }
         /* ── 세일즈 메뉴 라디오 (좌측 두 번째 컬럼) ── */
         .sales-nav-title {
@@ -6464,26 +6462,40 @@ def get_latest_active_notice():
         conn.close()
 
 
-def get_recent_notices(limit: int = 5):
+def get_recent_notices(limit: int = 5, viewer_store_ids=None):
     """최근 공지사항 limit건 반환. (id, title, content, external_link, message, created_at).
-    1순위 Supabase app_notices (클라우드·로컬 공통 영구 저장). 실패·미생성 시 로컬 SQLite Notices fallback."""
+    1순위 Supabase app_notices (클라우드·로컬 공통 영구 저장). 실패·미생성 시 로컬 SQLite Notices fallback.
+    viewer_store_ids: 조회자가 속한 매장 id 목록. None이면 전체 공지 반환(superadmin 등),
+    지정 시 '전체매장 공지(store_ids IS NULL)' + '해당 매장 대상 공지'만 반환."""
     # 1) Supabase 우선 조회
     try:
         client, err = get_supabase_client()
         if client and not err:
-            r = (
-                client.table("app_notices")
-                .select("id, title, content, external_link, message, created_at")
-                .eq("is_active", True)
-                .order("created_at", desc=True)
-                .limit(int(limit))
-                .execute()
-            )
+            def _query(with_store_filter: bool):
+                q = (
+                    client.table("app_notices")
+                    .select("id, title, content, external_link, message, created_at, store_ids")
+                    .eq("is_active", True)
+                )
+                if with_store_filter and viewer_store_ids:
+                    _ors = ["store_ids.is.null"] + [f"store_ids.cs.{{{int(sid)}}}" for sid in viewer_store_ids]
+                    q = q.or_(",".join(_ors))
+                return q.order("created_at", desc=True).limit(int(limit)).execute()
+            try:
+                r = _query(True)
+            except Exception as e:
+                if "store_ids" in str(e) or "schema cache" in str(e):
+                    # store_ids 컬럼 미생성(마이그레이션 전) — 필터 없이 하위호환 조회
+                    r = client.table("app_notices").select(
+                        "id, title, content, external_link, message, created_at"
+                    ).eq("is_active", True).order("created_at", desc=True).limit(int(limit)).execute()
+                else:
+                    raise
             rows = r.data or []
             if rows:
                 return pd.DataFrame(rows)
             # Supabase 연결은 됐으나 공지 0건 → fallback 시도하지 않고 빈 DF 반환
-            return pd.DataFrame(columns=["id", "title", "content", "external_link", "message", "created_at"])
+            return pd.DataFrame(columns=["id", "title", "content", "external_link", "message", "created_at", "store_ids"])
     except Exception:
         # app_notices 테이블 미생성 등: 로컬 fallback
         pass
@@ -6510,8 +6522,19 @@ def get_recent_notices(limit: int = 5):
 
 
 def _render_recent_notices_section():
-    """전사 공지사항 섹션: 최근 3~5건을 expander로 표시, 외부 링크는 새 창에서 열기."""
-    notices = get_recent_notices(5)
+    """공지사항 섹션: 최근 3~5건을 expander로 표시, 외부 링크는 새 창에서 열기.
+    superadmin은 전체 공지, 그 외에는 전체매장 공지 + 본인 소속 매장 대상 공지만 표시."""
+    current_user = st.session_state.get("current_user") or {}
+    role = (current_user.get("role") or "user").strip()
+    if role == "superadmin":
+        viewer_store_ids = None
+    else:
+        allowed = current_user.get("allowed_stores") or []
+        ids = {s[0] for s in allowed}
+        if not ids and current_user.get("store_id"):
+            ids = {current_user["store_id"]}
+        viewer_store_ids = ids or None
+    notices = get_recent_notices(5, viewer_store_ids=viewer_store_ids)
     if len(notices) == 0:
         return
     st.subheader("📌 최근 공지사항")
@@ -8855,20 +8878,71 @@ def _superadmin_tab2_hr_store_employees():
     )
 
 
-def _superadmin_tab3_notices():
-    """③ 전체 매장 공지사항 관리: 제목/내용/외부링크 등록·목록·삭제.
+def _render_notice_admin_section():
+    """📢 공지사항 등록/관리 (⚙️ 관리자 설정 내부, store_admin/superadmin 공용).
+    - superadmin: '전체매장' 또는 '매장별'(다중 선택) 공지 등록·모든 공지 삭제 가능.
+    - store_admin: 본인 관리 매장 전용 공지만 등록(관리 매장이 여럿이면 다중 선택) 가능.
+      목록에는 전체매장 공지(읽기 전용)와 본인 매장 공지가 함께 표시되며, 삭제는 본인 매장 공지만 가능.
     Supabase app_notices 우선 사용 (클라우드·로컬 공통). 미생성 시 안내 후 로컬 SQLite fallback."""
-    # Supabase 연결 확인
+    current_user = st.session_state.get("current_user") or {}
+    role = (current_user.get("role") or "user").strip()
+
     client, err = get_supabase_client()
     _use_supabase = bool(client and not err)
+
+    all_stores = _get_supabase_stores_list()
+    store_name_by_id = {s["id"]: s["store_name"] for s in all_stores}
+
+    if role == "superadmin":
+        my_stores = all_stores
+    else:
+        allowed = current_user.get("allowed_stores") or []
+        allowed_ids = {s[0] for s in allowed}
+        if not allowed_ids and current_user.get("store_id"):
+            allowed_ids = {current_user["store_id"]}
+        my_stores = [s for s in all_stores if s["id"] in allowed_ids]
+    my_store_ids = {s["id"] for s in my_stores}
 
     st.subheader("📢 공지사항 등록")
     with st.form("notice_add_form"):
         title = st.text_input("제목 *", placeholder="공지 제목을 입력하세요")
         content = st.text_area("내용 *", placeholder="공지 내용을 입력하세요")
         external_link = st.text_input("외부 링크(URL)", placeholder="유튜브, 회의록 등 URL (선택)")
+
+        scope_choice = "전체매장"
+        picked_store_ids: list[int] = []
+        if role == "superadmin":
+            scope_choice = st.radio(
+                "공지 대상", ["전체매장", "매장별"], horizontal=True, key="notice_scope_choice",
+            )
+            if scope_choice == "매장별":
+                picked_store_ids = st.multiselect(
+                    "대상 매장 선택 (다중 선택 가능)",
+                    options=[s["id"] for s in all_stores],
+                    format_func=lambda sid: store_name_by_id.get(sid, str(sid)),
+                    key="notice_scope_stores",
+                )
+        else:
+            scope_choice = "매장별"
+            if len(my_stores) > 1:
+                picked_store_ids = st.multiselect(
+                    "대상 매장 선택 (본인 관리 매장 중 다중 선택 가능)",
+                    options=[s["id"] for s in my_stores],
+                    format_func=lambda sid: store_name_by_id.get(sid, str(sid)),
+                    default=[s["id"] for s in my_stores],
+                    key="notice_scope_stores_admin",
+                )
+            elif my_stores:
+                picked_store_ids = [my_stores[0]["id"]]
+            st.caption("매장 관리자는 본인이 관리하는 매장에만 공지를 등록할 수 있습니다.")
+
         if st.form_submit_button("공지 등록"):
-            if title and title.strip() and content and content.strip():
+            if not (title and title.strip() and content and content.strip()):
+                st.warning("제목과 내용을 입력하세요.")
+            elif scope_choice == "매장별" and not picked_store_ids:
+                st.warning("대상 매장을 선택하세요.")
+            else:
+                store_ids_to_save = None if scope_choice == "전체매장" else picked_store_ids
                 _inserted = False
                 if _use_supabase:
                     try:
@@ -8878,17 +8952,21 @@ def _superadmin_tab3_notices():
                             "external_link": (external_link.strip() or None),
                             "message": content.strip(),
                             "is_active": True,
+                            "store_ids": store_ids_to_save,
                         }).execute()
                         _inserted = True
                     except Exception as e:
                         _msg = str(e)
-                        if "app_notices" in _msg or "schema cache" in _msg:
+                        if "store_ids" in _msg or "schema cache" in _msg:
+                            st.error("⚠️ **Supabase에 app_notices.store_ids 컬럼이 없습니다.** "
+                                     "Supabase 대시보드 → SQL Editor에서 **SUPABASE_APP_NOTICES_STORE_SCOPE.sql** 파일 내용을 실행해 주세요.")
+                        elif "app_notices" in _msg:
                             st.error("⚠️ **Supabase에 app_notices 테이블이 없습니다.** "
                                      "Supabase 대시보드 → SQL Editor에서 **SUPABASE_APP_NOTICES.sql** 파일 내용을 실행해 주세요.")
                         else:
                             st.error(f"Supabase 등록 실패: {e}")
                 if not _inserted and not _use_supabase:
-                    # 로컬 fallback (Supabase 연결 자체가 안 될 때)
+                    # 로컬 fallback (Supabase 연결 자체가 안 될 때) — 매장 구분 미지원
                     try:
                         conn = get_master_conn()
                         conn.execute(
@@ -8903,8 +8981,6 @@ def _superadmin_tab3_notices():
                 if _inserted:
                     flash("공지사항이 등록되었습니다.")
                     st.rerun()
-            else:
-                st.warning("제목과 내용을 입력하세요.")
 
     st.subheader("공지사항 목록 (삭제)")
     notices = pd.DataFrame()
@@ -8913,7 +8989,7 @@ def _superadmin_tab3_notices():
         try:
             r = (
                 client.table("app_notices")
-                .select("id, title, content, external_link, message, created_at")
+                .select("id, title, content, external_link, message, created_at, store_ids")
                 .order("created_at", desc=True)
                 .execute()
             )
@@ -8921,11 +8997,26 @@ def _superadmin_tab3_notices():
             _source = "supabase"
         except Exception as e:
             _msg = str(e)
-            if "app_notices" in _msg or "schema cache" in _msg:
-                st.warning("⚠️ Supabase app_notices 테이블 미생성 — 로컬 공지사항만 표시됩니다. "
-                           "영구 저장하려면 SQL Editor에서 **SUPABASE_APP_NOTICES.sql**을 실행하세요.")
-            else:
-                st.warning(f"Supabase 조회 실패 — 로컬 fallback: {e}")
+            if "store_ids" in _msg:
+                # store_ids 컬럼 미생성 시 하위호환: 컬럼 없이 재조회
+                try:
+                    r = (
+                        client.table("app_notices")
+                        .select("id, title, content, external_link, message, created_at")
+                        .order("created_at", desc=True)
+                        .execute()
+                    )
+                    notices = pd.DataFrame(r.data or [])
+                    notices["store_ids"] = None
+                    _source = "supabase"
+                except Exception:
+                    pass
+            if _source != "supabase":
+                if "app_notices" in _msg or "schema cache" in _msg:
+                    st.warning("⚠️ Supabase app_notices 테이블 미생성 — 로컬 공지사항만 표시됩니다. "
+                               "영구 저장하려면 SQL Editor에서 **SUPABASE_APP_NOTICES.sql**을 실행하세요.")
+                else:
+                    st.warning(f"Supabase 조회 실패 — 로컬 fallback: {e}")
     if notices.empty and _source != "supabase":
         conn = get_master_conn()
         try:
@@ -8933,16 +9024,35 @@ def _superadmin_tab3_notices():
                 "SELECT id, title, content, external_link, created_at FROM Notices ORDER BY created_at DESC",
                 conn,
             )
+            notices["store_ids"] = None
         finally:
             conn.close()
     if len(notices) == 0:
         st.info("등록된 공지가 없습니다.")
         return
+
+    if role != "superadmin":
+        def _visible(sids):
+            if not sids:
+                return True  # 전체매장 공지는 모두에게 노출 (읽기 전용)
+            return bool(set(sids) & my_store_ids)
+        notices = notices[notices["store_ids"].apply(_visible)]
+        if len(notices) == 0:
+            st.info("등록된 공지가 없습니다.")
+            return
+
     for _, row in notices.iterrows():
         t = (row.get("title") or "").strip() or "(제목 없음)"
         _created_raw = row.get("created_at") or ""
         dt = str(_created_raw)[:10]
-        with st.expander(f"📌 {dt} — {t}"):
+        sids = row.get("store_ids")
+        if not sids:
+            scope_label = "🌐 전체매장"
+            can_delete = (role == "superadmin")
+        else:
+            scope_label = "🏪 " + ", ".join(store_name_by_id.get(sid, str(sid)) for sid in sids)
+            can_delete = (role == "superadmin") or bool(set(sids) & my_store_ids)
+        with st.expander(f"📌 {dt} — {t} [{scope_label}]"):
             body = (row.get("content") or row.get("message") or "").strip()
             if body:
                 st.write(body)
@@ -8955,7 +9065,9 @@ def _superadmin_tab3_notices():
                     'font-weight:500;">🔗 링크 열기</a>',
                     unsafe_allow_html=True,
                 )
-            if st.button("삭제", key=f"notice_del_{row['id']}"):
+            if not can_delete:
+                st.caption("전체매장 공지는 최고관리자만 삭제할 수 있습니다.")
+            elif st.button("삭제", key=f"notice_del_{row['id']}"):
                 _deleted = False
                 if _source == "supabase" and _use_supabase:
                     try:
@@ -8977,7 +9089,7 @@ def _superadmin_tab3_notices():
 
 
 def _superadmin_tab4_backup_csv():
-    """④ 원클릭 데이터 백업: 기간 지정 후 전 매장 매출/결제 내역 CSV 다운로드 (한글 깨짐 방지).
+    """③ 원클릭 데이터 백업: 기간 지정 후 전 매장 매출/결제 내역 CSV 다운로드 (한글 깨짐 방지).
     고객명, 연락처, 품목, 총판매금액, 결제금액, 미수금, 결제수단, 온누리승인번호, 판매일자, 배송일자, 매장명, 판매담당자, 특이사항 등 전체 컬럼 포함. 매장 목록은 Supabase app_stores 전용."""
     stores = get_supabase_stores_dataframe_cached()
     if len(stores) == 0:
@@ -9209,7 +9321,7 @@ def _superadmin_tab_unpaid_report():
 
 
 def _superadmin_tab5_store_accounts():
-    """⑤ 매장 계정 관리: Supabase app_stores / app_users만 사용. 매장 생성·수정·삭제·폐점/재개 및 계정 발급·비밀번호 변경."""
+    """④ 매장 계정 관리: Supabase app_stores / app_users만 사용. 매장 생성·수정·삭제·폐점/재개 및 계정 발급·비밀번호 변경."""
     client, err = get_supabase_client()
     if err or not client:
         st.error(f"Supabase 연결이 필요합니다: {err or '연결 실패'}")
@@ -21862,6 +21974,12 @@ def render_admin_settings():
 
     st.divider()
 
+    # ── 공지사항 관리 (전체매장/매장별) ──────────────────────────
+    with st.expander("📢 공지사항 관리", expanded=False):
+        _render_notice_admin_section()
+
+    st.divider()
+
     # ── 카카오 채널 / 알림톡 ───────────────────────────────────
     st.subheader("📲 카카오 채널 / 알림톡")
 
@@ -22286,7 +22404,7 @@ def render_employee_management():
             "배정 매장 (여러 개 선택 가능)",
             store_options,
             key="emp_stores",
-            help="등록된 매장 목록에서 선택합니다. 매장이 없으면 최고관리자 메뉴 → ⑤ 매장 계정 관리에서 먼저 매장을 추가하세요.",
+            help="등록된 매장 목록에서 선택합니다. 매장이 없으면 최고관리자 메뉴 → ④ 매장 계정 관리에서 먼저 매장을 추가하세요.",
         )
         emp_role_choice = st.selectbox(
             "부여 권한",
@@ -23326,23 +23444,21 @@ def render_superadmin():
         _superadmin_tab1_integrated_dashboard()
     elif menu_sel == "② 매장별 직원 평가 현황 (HR)":
         _superadmin_tab2_hr_store_employees()
-    elif menu_sel == "③ 📢 공지사항 관리":
-        _superadmin_tab3_notices()
-    elif menu_sel == "④ 원클릭 데이터 백업 (CSV)":
+    elif menu_sel == "③ 원클릭 데이터 백업 (CSV)":
         _superadmin_tab4_backup_csv()
-    elif menu_sel == "⑤ 매장 계정 관리":
+    elif menu_sel == "④ 매장 계정 관리":
         _superadmin_tab5_store_accounts()
-    elif menu_sel == "⑥ 전 지점 마케팅 분석":
+    elif menu_sel == "⑤ 전 지점 마케팅 분석":
         render_marketing_insights_superadmin()
-    elif menu_sel == "⑦ 미수금(잔금) 레포트":
+    elif menu_sel == "⑥ 미수금(잔금) 레포트":
         _superadmin_tab_unpaid_report()
-    elif menu_sel == "⑧ 결제수단별 집계표":
+    elif menu_sel == "⑦ 결제수단별 집계표":
         render_monthly_payment_report(is_superadmin=True)
-    elif menu_sel == "⑨ 💰 입금 관리":
+    elif menu_sel == "⑧ 💰 입금 관리":
         render_deposit_management()
-    elif menu_sel == "⑩ ⚠️ 데이터 초기화 (Danger Zone)":
+    elif menu_sel == "⑨ ⚠️ 데이터 초기화 (Danger Zone)":
         _superadmin_tab_danger_zone_data_reset()
-    elif menu_sel == "⑪ FAQ (도움말)":
+    elif menu_sel == "⑩ FAQ (도움말)":
         render_faq_page()
 
 
