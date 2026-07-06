@@ -308,54 +308,86 @@ def _inject_dual_nav_css():
     st.markdown(
         """
         <style>
-        /* ── 사이드바: 블루 톤 + 폭 확장 ── */
+        /* ══════════════════════════════════════
+           사이드바 전체 = 블루 (ERP 레일 배경)
+           세일즈 메뉴 패널만 흰색 오버레이
+           ══════════════════════════════════════ */
+        section[data-testid="stSidebar"] > div:first-child,
+        section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+            background: #1565C0 !important;
+        }
         section[data-testid="stSidebar"] {
-            background: #F4F8FE !important;
-            border-right: 1px solid #BBDEFB !important;
+            border-right: 2px solid #0D47A1 !important;
+        }
+        /* 사이드바 상단 로고 영역도 블루 배경 유지 */
+        section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+            background: #1565C0 !important;
         }
         @media (min-width: 768px) {
             section[data-testid="stSidebar"] {
-                min-width: 23rem !important;
-                width: 23rem !important;
+                min-width: 22rem !important;
+                width: 22rem !important;
             }
         }
-        /* 사이드바 내부 컬럼 간격 축소 (아이콘 레일 ↔ 메뉴 밀착) */
+
+        /* ── 컬럼 레이아웃: 레일 폭 고정, 간격 없음 ── */
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
-            gap: 0.25rem !important;
+            gap: 0 !important;
+            align-items: stretch !important;
         }
-        /* 아이콘 레일 컬럼 자체를 좁게: 버튼이 컬럼 폭을 꽉 채우므로
-           컬럼이 좁아지면 박스도 가로로 타이트해짐 (세로 높이는 그대로) */
+
+        /* ── ERP 아이콘 레일 컬럼 (첫 번째) ── */
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child {
-            flex: 0 0 3rem !important;
-            max-width: 3rem !important;
-            min-width: 3rem !important;
-            overflow: visible !important;   /* ERP 타이틀 텍스트가 잘리지 않도록 */
+            flex: 0 0 3.2rem !important;
+            max-width: 3.2rem !important;
+            min-width: 3.2rem !important;
+            background: transparent !important;  /* 사이드바 블루를 그대로 사용 */
+            padding: 0 0.2rem !important;
+            overflow: visible !important;
         }
-        /* ── ERP 아이콘 레일 (좌측 첫 번째 컬럼) ── */
+
+        /* ERP 타이틀 텍스트 */
         .erp-rail-title {
-            font-size: 0.66rem; font-weight: 800; color: #0D47A1;
-            text-align: center; letter-spacing: 0; margin: 2px 0 4px 0;
+            font-size: 0.65rem; font-weight: 800; color: #FFFFFF !important;
+            text-align: center; letter-spacing: 0.04em; margin: 4px 0 6px 0;
             white-space: nowrap; overflow: visible;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.25);
         }
+
+        /* ERP 레일 아이콘 버튼: 투명 배경 + 흰색 아이콘 */
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button {
-            padding: 0.35rem 0 !important;     /* 세로 여백 유지 (ERP 타이틀 표시 확보) */
-            font-size: 1rem !important;        /* 좁아진 박스 폭에 맞춰 아이콘 소폭 축소 */
+            padding: 0.4rem 0 !important;
+            font-size: 1.1rem !important;
             line-height: 1.1 !important;
-            border: 1px solid #D6E4F5 !important;
-            background: #FFFFFF !important;
+            border: 1px solid rgba(255,255,255,0.25) !important;
+            background: rgba(255,255,255,0.08) !important;
             border-radius: 10px !important;
             min-width: 0 !important;
             width: 100% !important;
+            color: #FFFFFF !important;
+            filter: brightness(1.1);
         }
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button:hover {
-            background: #E3F2FD !important;
-            border-color: #1565C0 !important;
+            background: rgba(255,255,255,0.22) !important;
+            border-color: rgba(255,255,255,0.6) !important;
         }
-        /* ── 세일즈 메뉴 라디오 (좌측 두 번째 컬럼) ── */
+
+        /* ── 세일즈 메뉴 컬럼 (두 번째): 흰색 패널 ── */
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:last-child {
+            background: #FFFFFF !important;
+            border-radius: 12px 12px 0 0 !important;
+            padding: 0.5rem 0.5rem 1rem 0.5rem !important;
+            flex: 1 1 0 !important;
+            box-shadow: -2px 0 8px rgba(13,71,161,0.12) !important;
+        }
+
+        /* 세일즈 메뉴 타이틀 */
         .sales-nav-title {
             font-size: 0.68rem; font-weight: 700; color: #0D47A1;
-            letter-spacing: 0.02em; margin: 2px 0 4px 2px;
+            letter-spacing: 0.02em; margin: 2px 0 6px 2px;
         }
+
+        /* 라디오 메뉴 */
         section[data-testid="stSidebar"] [role="radiogroup"] { gap: 1px !important; }
         section[data-testid="stSidebar"] [role="radiogroup"] > label {
             padding: 5px 8px !important;
@@ -363,6 +395,7 @@ def _inject_dual_nav_css():
             margin: 0 !important;
             width: 100% !important;
             transition: background 0.12s ease;
+            color: #1A2A44 !important;
         }
         section[data-testid="stSidebar"] [role="radiogroup"] > label:hover {
             background: #E3F2FD !important;
@@ -614,7 +647,7 @@ def _render_left_dual_nav(user: dict, role: str) -> None:
         </div>
         """
         st.markdown(clickable_logo_html, unsafe_allow_html=True)
-        c_rail, c_nav = st.columns([1, 2.8], gap="small")
+        c_rail, c_nav = st.columns([1, 2.8], gap="small")  # CSS로 gap=0 처리됨
         with c_rail:
             _render_erp_icon_rail(role)
         with c_nav:
