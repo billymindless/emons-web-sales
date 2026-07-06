@@ -326,22 +326,26 @@ def _inject_dual_nav_css():
         /* 아이콘 레일 컬럼 자체를 좁게: 버튼이 컬럼 폭을 꽉 채우므로
            컬럼이 좁아지면 박스도 가로로 타이트해짐 (세로 높이는 그대로) */
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child {
-            flex: 0 0 3.6rem !important;
-            max-width: 3.6rem !important;
+            flex: 0 0 3rem !important;
+            max-width: 3rem !important;
+            min-width: 3rem !important;
+            overflow: visible !important;   /* ERP 타이틀 텍스트가 잘리지 않도록 */
         }
         /* ── ERP 아이콘 레일 (좌측 첫 번째 컬럼) ── */
         .erp-rail-title {
-            font-size: 0.62rem; font-weight: 700; color: #0D47A1;
-            text-align: center; letter-spacing: 0.02em; margin: 2px 0 4px 0;
+            font-size: 0.66rem; font-weight: 800; color: #0D47A1;
+            text-align: center; letter-spacing: 0; margin: 2px 0 4px 0;
+            white-space: nowrap; overflow: visible;
         }
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button {
-            padding: 0.35rem 0 !important;     /* 세로 여백 원복 (ERP 타이틀 표시 확보) */
-            font-size: 1.15rem !important;     /* 아이콘 크기 유지 */
+            padding: 0.35rem 0 !important;     /* 세로 여백 유지 (ERP 타이틀 표시 확보) */
+            font-size: 1rem !important;        /* 좁아진 박스 폭에 맞춰 아이콘 소폭 축소 */
             line-height: 1.1 !important;
             border: 1px solid #D6E4F5 !important;
             background: #FFFFFF !important;
             border-radius: 10px !important;
             min-width: 0 !important;
+            width: 100% !important;
         }
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button:hover {
             background: #E3F2FD !important;
