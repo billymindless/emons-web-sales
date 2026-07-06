@@ -11083,6 +11083,101 @@ def _erp_fetch_range(table: str, db_col: str, db_filename: str, date_col: str, s
                                    start.isoformat(), end.isoformat(), extra_key)
 
 
+@st.cache_data(ttl=60)
+def _erp_fetch_range_multi_cached(table: str, db_col: str, db_filenames_key: tuple,
+                                  date_col: str, start_iso: str, end_iso: str,
+                                  extra_key: tuple) -> list:
+    """여러 매장(db_filename)을 .in_() 로 한 번에 범위 조회하는 배치 캐시 본체.
+    매장별 순차 쿼리(N회)를 1회로 줄여 캘린더 콜드 로딩을 단축한다."""
+    client, err = get_supabase_client()
+    if err or not client or not db_filenames_key:
+        return []
+    try:
+        q = (client.table(table).select("*")
+             .in_(db_col, list(db_filenames_key))
+             .gte(date_col, start_iso).lte(date_col, end_iso))
+        for k, v in extra_key:
+            if v is not None:
+                q = q.eq(k, v)
+        r = q.order(date_col).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception as e:
+        st.caption(f"⚠️ {table} 범위 배치 조회 실패: {e}")
+        return []
+
+
+def _erp_fetch_range_multi(table: str, db_col: str, db_filenames: list, date_col: str,
+                           start: date, end: date, extra_eq: dict | None = None) -> list:
+    """여러 매장 날짜 범위 배치 조회 (60초 캐시). 각 행에는 db_col 값이 포함되어
+    호출부에서 매장 귀속을 그대로 판별할 수 있다."""
+    extra_key = tuple(sorted((extra_eq or {}).items(), key=lambda x: x[0]))
+    return _erp_fetch_range_multi_cached(table, db_col, tuple(db_filenames), date_col,
+                                         start.isoformat(), end.isoformat(), extra_key)
+
+
+@st.cache_data(ttl=300)
+def _erp_fetch_table_multi_cached(table: str, db_col: str, db_filenames_key: tuple,
+                                  order: str | None) -> list:
+    """여러 매장 단순 조회 배치 캐시 본체 (근무기준 룰 등 저빈도 변경 데이터, 300초)."""
+    client, err = get_supabase_client()
+    if err or not client or not db_filenames_key:
+        return []
+    try:
+        q = client.table(table).select("*").in_(db_col, list(db_filenames_key))
+        if order:
+            q = q.order(order)
+        r = q.execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
+def _erp_fetch_table_multi(table: str, db_col: str, db_filenames: list,
+                           order: str | None = None) -> list:
+    """여러 매장 단순 조회 배치 (300초 캐시)."""
+    return _erp_fetch_table_multi_cached(table, db_col, tuple(db_filenames), order)
+
+
+@st.cache_data(ttl=120)
+def _erp_store_events_multi_cached(db_filenames_key: tuple, ym_key: str) -> list:
+    """여러 매장 공용 일정을 한 번에 조회하는 배치 캐시 (120초). ym_key='YYYY-MM'.
+    다일정(end_date)이 해당 월에 걸치면 포함. 각 행에 db_filename 포함."""
+    if not db_filenames_key or not ym_key:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        y, m = ym_key.split("-")
+        start = date(int(y), int(m), 1)
+        last_day = calendar.monthrange(int(y), int(m))[1]
+        end = date(int(y), int(m), last_day)
+        r = (client.table("app_store_events").select("*")
+             .in_("db_filename", list(db_filenames_key))
+             .lte("event_date", end.isoformat())
+             .order("event_date").execute())
+        rows = (r.data or []) if hasattr(r, "data") else []
+        out = []
+        for row in rows:
+            ev_start_s = str(row.get("event_date") or "")[:10]
+            if not ev_start_s:
+                continue
+            ev_end_s = str(row.get("end_date") or "")[:10] if row.get("end_date") else ""
+            try:
+                ev_end_date = date.fromisoformat(ev_end_s) if ev_end_s else date.fromisoformat(ev_start_s)
+            except Exception:
+                ev_end_date = date.fromisoformat(ev_start_s)
+            if ev_end_date >= start:
+                out.append(row)
+        return out
+    except Exception:
+        return []
+
+
+def _erp_store_events_multi(db_filenames: list, ym_key: str) -> list:
+    return _erp_store_events_multi_cached(tuple(db_filenames), ym_key)
+
+
 def _erp_count_active_at(shifts: list, slot_start: dt_time, slot_end: dt_time) -> int:
     """shifts(같은 날짜)에서 [slot_start, slot_end)와 겹치는 인원 수."""
     s0 = slot_start.hour * 60 + slot_start.minute
@@ -11383,6 +11478,13 @@ def _erp_invalidate_fetch_caches(table: str) -> None:
         _erp_fetch_range_cached.clear()
     except Exception:
         pass
+    # 배치(.in_) 캐시도 함께 무효화 (쓰기 후 캘린더 stale 방지)
+    for _fn in (_erp_fetch_range_multi_cached, _erp_fetch_table_multi_cached,
+                _erp_store_events_multi_cached):
+        try:
+            _fn.clear()
+        except Exception:
+            pass
     if table == "app_attendance_logs":
         try:
             _erp_compute_remaining_comptime.clear()
@@ -13896,22 +13998,24 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     all_events: list = []
     rules_by_store_dow: dict = {}
     _ym_key = f"{int(year):04d}-{int(month):02d}"
-    for dbf in target_dbs:
-        _sh = _erp_fetch_range("app_shift_schedules", "db_filename", dbf,
-                               "shift_date", period_start, period_end)
-        for s in _sh:
-            s["_dbf"] = dbf
-        all_shifts += _sh
-        _lg = _erp_fetch_range("app_attendance_logs", "home_db_filename", dbf,
-                               "log_date", period_start, period_end)
-        for l in _lg:
-            l["_dbf"] = dbf
-        all_logs += _lg
-        for _ev in _erp_store_events_cached(dbf, _ym_key):
-            _ev["_dbf"] = dbf
-            all_events.append(_ev)
-        for r in _erp_fetch_table("app_staffing_rules", {"db_filename": dbf}):
-            rules_by_store_dow.setdefault((dbf, int(r.get("day_of_week") or 0)), []).append(r)
+    # 매장별 순차 쿼리(4×N회) 대신 .in_() 배치 조회로 테이블당 1회만 조회.
+    _target_set = set(target_dbs)
+    for s in _erp_fetch_range_multi("app_shift_schedules", "db_filename", target_dbs,
+                                    "shift_date", period_start, period_end):
+        s["_dbf"] = s.get("db_filename")
+        all_shifts.append(s)
+    for l in _erp_fetch_range_multi("app_attendance_logs", "home_db_filename", target_dbs,
+                                    "log_date", period_start, period_end):
+        l["_dbf"] = l.get("home_db_filename")
+        all_logs.append(l)
+    for _ev in _erp_store_events_multi(target_dbs, _ym_key):
+        _ev["_dbf"] = _ev.get("db_filename")
+        all_events.append(_ev)
+    for r in _erp_fetch_table_multi("app_staffing_rules", "db_filename", target_dbs):
+        _rdbf = r.get("db_filename")
+        if _rdbf not in _target_set:
+            continue
+        rules_by_store_dow.setdefault((_rdbf, int(r.get("day_of_week") or 0)), []).append(r)
 
     # 표시명 정규화: 기존 데이터의 employee_name이 이메일이어도 app_users.name(예: 김승찬)으로 표시
     _name_map = _get_app_user_display_name_map()
