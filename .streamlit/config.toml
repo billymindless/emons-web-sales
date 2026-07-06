@@ -1,9 +1,9 @@
 [theme]
-# momo — 에몬스 울산전시장 브랜드 테마 (네이비 블루)
-primaryColor = "#1B3A6B"
+# momo — 에몬스 울산전시장 브랜드 테마 (블루 통일)
+primaryColor = "#1565C0"
 backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F0F2F6"
-textColor = "#262730"
+secondaryBackgroundColor = "#EAF2FB"
+textColor = "#1A2A44"
 
 [browser]
 gatherUsageStats = false

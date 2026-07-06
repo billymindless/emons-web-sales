@@ -184,8 +184,8 @@ def _inject_mobile_css():
 
 
 def _inject_branding_css():
-    """Streamlit 기본 로고·footer·툴바·햄버거 메뉴 숨김 + 네이비 블루 브랜딩 CSS 주입.
-    버튼·링크·강조색은 네이비 블루(#1B3A6B)로 통일.
+    """Streamlit 기본 로고·footer·툴바·햄버거 메뉴 숨김 + 블루 브랜딩 CSS 주입.
+    버튼·링크·강조색은 브랜드 블루(#1565C0)로 통일.
     배경색 등 기존 레이아웃은 유지."""
     st.markdown(
         """
@@ -217,39 +217,398 @@ def _inject_branding_css():
             z-index: 10000 !important;
         }
 
-        /* ── 네이비 블루 브랜딩 ── */
+        /* ── 브랜드 블루 브랜딩 ── */
         /* 기본 버튼 */
         .stButton > button[kind="primary"],
         .stButton > button[data-testid="baseButton-primary"] {
-            background-color: #1B3A6B !important;
-            border-color: #1B3A6B !important;
+            background-color: #1565C0 !important;
+            border-color: #1565C0 !important;
             color: #ffffff !important;
         }
         .stButton > button[kind="primary"]:hover,
         .stButton > button[data-testid="baseButton-primary"]:hover {
-            background-color: #142d55 !important;
-            border-color: #142d55 !important;
+            background-color: #0D47A1 !important;
+            border-color: #0D47A1 !important;
         }
         /* 링크 컬러 */
-        a { color: #1B3A6B !important; }
-        a:hover { color: #142d55 !important; }
+        a { color: #1565C0 !important; }
+        a:hover { color: #0D47A1 !important; }
         /* 탭 선택 언더라인 */
         [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
-            border-bottom-color: #1B3A6B !important;
-            color: #1B3A6B !important;
+            border-bottom-color: #1565C0 !important;
+            color: #1565C0 !important;
         }
         /* 진행 표시줄 */
-        .stProgress > div > div > div { background-color: #1B3A6B !important; }
+        .stProgress > div > div > div { background-color: #1565C0 !important; }
         /* 슬라이더 */
-        [data-testid="stSlider"] [role="slider"] { background-color: #1B3A6B !important; }
+        [data-testid="stSlider"] [role="slider"] { background-color: #1565C0 !important; }
         /* 체크박스·라디오 강조 */
         [data-testid="stCheckbox"] svg, [data-testid="stRadio"] svg {
-            fill: #1B3A6B !important;
+            fill: #1565C0 !important;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+# 최고 관리자 메뉴 라벨 (사이드바 내비게이션 + render_superadmin 공용)
+_SUPERADMIN_MENUS = [
+    "① 전 지점 통합 대시보드",
+    "② 매장별 직원 평가 현황 (HR)",
+    "③ 📢 공지사항 관리",
+    "④ 원클릭 데이터 백업 (CSV)",
+    "⑤ 매장 계정 관리",
+    "⑥ 전 지점 마케팅 분석",
+    "⑦ 미수금(잔금) 레포트",
+    "⑧ 결제수단별 집계표",
+    "⑨ 💰 입금 관리",
+    "⑩ ⚠️ 데이터 초기화 (Danger Zone)",
+    "⑪ FAQ (도움말)",
+]
+
+
+def _get_sales_tab_labels(role: str) -> list[str]:
+    """일반/매장관리자 세일즈 메뉴 라벨. main() 콘텐츠 디스패치 인덱스와 1:1 대응."""
+    if role == "store_admin":
+        return [
+            "1. 대시보드",
+            "2. 마케팅 인사이트",
+            "3. 리드고객 관리",
+            "4. 엘리베이터 사이즈 점검",
+            "5. 새로운 매출 등록",
+            "6. 고객 및 잔금 관리",
+            "7. 입금 관리",
+            "8. 매장 관리자 메뉴",
+            "9. 결제수단별 집계표",
+            "10. 고객 CRM 자동화",
+            "11. 세일즈 퍼포먼스",
+            "12. 전시품 판매 검증",
+            "13. FAQ (도움말)",
+        ]
+    return [
+        "1. 대시보드",
+        "2. 마케팅 인사이트",
+        "3. 리드고객 관리",
+        "4. 엘리베이터 사이즈 점검",
+        "5. 새로운 매출 등록",
+        "6. 고객 및 잔금 관리",
+        "7. 입금 관리",
+        "8. 결제수단별 집계표",
+        "9. 전시품 판매 검증",
+        "10. FAQ (도움말)",
+    ]
+
+
+def _inject_dual_nav_css():
+    """좌측 듀얼 내비게이션(ERP 아이콘 레일 + 세일즈 메뉴) 및 블루 사이드바 스타일.
+    - 사이드바 폭을 넓혀 2컬럼(아이콘 레일 + 메뉴)이 안정적으로 들어가게 함
+    - 아이콘 레일 버튼: 이모지 중심 정렬, 컴팩트
+    - 세일즈 메뉴 라디오: 풀폭 메뉴 항목처럼 표시"""
+    st.markdown(
+        """
+        <style>
+        /* ── 사이드바: 블루 톤 + 폭 확장 ── */
+        section[data-testid="stSidebar"] {
+            background: #F4F8FE !important;
+            border-right: 1px solid #BBDEFB !important;
+        }
+        @media (min-width: 768px) {
+            section[data-testid="stSidebar"] {
+                min-width: 23rem !important;
+                width: 23rem !important;
+            }
+        }
+        /* 사이드바 내부 컬럼 간격 축소 (아이콘 레일 ↔ 메뉴 밀착) */
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+            gap: 0.35rem !important;
+        }
+        /* ── ERP 아이콘 레일 (좌측 첫 번째 컬럼) ── */
+        .erp-rail-title {
+            font-size: 0.62rem; font-weight: 700; color: #0D47A1;
+            text-align: center; letter-spacing: 0.02em; margin: 2px 0 4px 0;
+        }
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button {
+            padding: 0.35rem 0 !important;
+            font-size: 1.15rem !important;
+            line-height: 1.1 !important;
+            border: 1px solid #D6E4F5 !important;
+            background: #FFFFFF !important;
+            border-radius: 10px !important;
+            min-height: 40px !important;
+        }
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button:hover {
+            background: #E3F2FD !important;
+            border-color: #1565C0 !important;
+        }
+        /* ── 세일즈 메뉴 라디오 (좌측 두 번째 컬럼) ── */
+        .sales-nav-title {
+            font-size: 0.68rem; font-weight: 700; color: #0D47A1;
+            letter-spacing: 0.02em; margin: 2px 0 4px 2px;
+        }
+        section[data-testid="stSidebar"] [role="radiogroup"] { gap: 1px !important; }
+        section[data-testid="stSidebar"] [role="radiogroup"] > label {
+            padding: 5px 8px !important;
+            border-radius: 6px !important;
+            margin: 0 !important;
+            width: 100% !important;
+            transition: background 0.12s ease;
+        }
+        section[data-testid="stSidebar"] [role="radiogroup"] > label:hover {
+            background: #E3F2FD !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_nav_favorites(uname: str, labels: list, idx_key: str, radio_key: str) -> None:
+    """세일즈 메뉴 상단 즐겨찾기 바로가기 (사용자 지정, 세로 배치).
+    ⭐ 레일 버튼이 fav_edit_mode_* 플래그를 켜면 편집 UI 표시.
+    저장소는 기존 app_user_preferences.fav_menus 재사용."""
+    edit_key = f"fav_edit_mode_{idx_key}"
+    favs = [f for f in _get_user_fav_menus(uname) if f in labels]
+
+    if favs and not st.session_state.get(edit_key):
+        for i, label in enumerate(favs):
+            if st.button(f"⭐ {label}", key=f"navfav_{idx_key}_{i}", use_container_width=True):
+                st.session_state[idx_key] = labels.index(label)
+                st.session_state[radio_key] = label
+                st.session_state.pop("active_admin_page", None)
+                st.rerun()
+
+    if st.session_state.get(edit_key):
+        with st.container(border=True):
+            st.caption("⭐ 자주 쓰는 메뉴 선택 (최대 5개)")
+            new_favs = st.multiselect(
+                "즐겨찾기", labels, default=favs, max_selections=5,
+                key=f"favms_{idx_key}", label_visibility="collapsed",
+            )
+            b1, b2 = st.columns(2)
+            if b1.button("💾 저장", key=f"favsave_{idx_key}", type="primary", use_container_width=True):
+                ok, err = _save_user_fav_menus(uname, new_favs)
+                if ok:
+                    st.session_state[edit_key] = False
+                    st.toast("즐겨찾기가 저장되었습니다.", icon="⭐")
+                    st.rerun()
+                elif "app_user_preferences" in str(err) or "does not exist" in str(err) or "PGRST" in str(err):
+                    st.error("app_user_preferences 테이블이 없습니다. SUPABASE_USER_PREFERENCES.sql 을 실행해 주세요.")
+                else:
+                    st.error(f"저장 실패: {err}")
+            if b2.button("취소", key=f"favcancel_{idx_key}", use_container_width=True):
+                st.session_state[edit_key] = False
+                st.rerun()
+
+
+def _render_erp_icon_rail(role: str) -> None:
+    """좌측 첫 번째 패널: ERP·관리자 섹션 아이콘 레일 (세로 아이콘 버튼).
+    클릭 시 active_admin_page 를 설정하여 해당 화면으로 라우팅."""
+    st.markdown("<div class='erp-rail-title'>ERP</div>", unsafe_allow_html=True)
+
+    def _go(page: str):
+        st.session_state["active_admin_page"] = page
+        st.session_state.pop("mm_queried", None)
+        st.rerun()
+
+    if st.button("🏠", key="rail_home", help="홈 (대시보드)", use_container_width=True):
+        st.session_state.pop("active_admin_page", None)
+        st.session_state["main_tab_idx"] = 0
+        st.session_state["superadmin_menu_idx"] = 0
+        for _k in ("nav_radio_main_tab_idx", "nav_radio_superadmin_menu_idx"):
+            st.session_state.pop(_k, None)
+        st.rerun()
+    if st.button("🗓️", key="rail_erp", help="근태 관리", use_container_width=True):
+        _go("erp_attendance")
+    if st.button("📧", key="rail_mail", help="메일 관리", use_container_width=True):
+        _go("gmail_manager")
+    if st.button("📁", key="rail_doc", help="자료실", use_container_width=True):
+        _go("document_library")
+    if st.button("📋", key="rail_board", help="사내업무/게시판", use_container_width=True):
+        _go("internal_board")
+    if role in ("store_admin", "superadmin"):
+        if st.button("💬", key="rail_msg", help="메시지 발송", use_container_width=True):
+            _go("send_message")
+        if st.button("📢", key="rail_voc", help="고객의 소리(VOC)", use_container_width=True):
+            _go("voc_dashboard")
+        if st.button("📈", key="rail_hr", help="인력 효율 분석", use_container_width=True):
+            _go("employee_analytics")
+        if st.button("🚨", key="rail_paymon", help="결제 변경/취소 모니터링", use_container_width=True):
+            _go("payment_monitor")
+        if st.button("💳", key="rail_margin", help="마진 모니터링", use_container_width=True):
+            _go("margin_monitor")
+        if st.button("🗑️", key="rail_del", help="주문 삭제 요청 관리", use_container_width=True):
+            _go("delete_requests")
+        if st.button("⚙️", key="rail_settings", help="관리자 설정", use_container_width=True):
+            _go("admin_settings")
+    if role == "superadmin":
+        if st.button("👥", key="rail_emp", help="직원 관리", use_container_width=True):
+            _go("employee_management")
+    # 즐겨찾기 편집 토글 (세일즈 메뉴 상단 즐겨찾기 바 편집 모드 on)
+    _fav_idx_key = "superadmin_menu_idx" if role == "superadmin" else "main_tab_idx"
+    if st.button("⭐", key="rail_fav", help="자주 쓰는 메뉴 설정", use_container_width=True):
+        _ek = f"fav_edit_mode_{_fav_idx_key}"
+        st.session_state[_ek] = not st.session_state.get(_ek, False)
+        st.rerun()
+    if st.button("🚪", key="rail_logout", help="로그아웃", use_container_width=True):
+        try:
+            client, _ = get_supabase_client()
+            if client:
+                client.auth.sign_out()
+        except Exception:
+            pass
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        st.rerun()
+
+
+def _render_primary_nav(user: dict, role: str) -> None:
+    """좌측 두 번째 패널: 세일즈(또는 최고관리자) 메뉴 + 매장 정보 + 알림."""
+    # 매장 선택 (다매장, superadmin 제외)
+    allowed_stores = user.get("allowed_stores") or []
+    if role != "superadmin" and len(allowed_stores) > 1:
+        options = [s[2] for s in allowed_stores]
+        current_sid = user.get("store_id")
+        current_idx = next((i for i, s in enumerate(allowed_stores) if s[0] == current_sid), 0)
+        sel_idx = st.selectbox(
+            "매장 선택", range(len(options)),
+            format_func=lambda i: options[i], index=current_idx, key="sidebar_store_sel",
+        )
+        if sel_idx != current_idx:
+            st.session_state.current_user["store_id"] = allowed_stores[sel_idx][0]
+            st.session_state.current_user["db_filename"] = allowed_stores[sel_idx][1]
+            st.session_state.current_db = allowed_stores[sel_idx][1]
+            st.rerun()
+
+    store_display = get_store_display_name(user)
+    st.markdown(
+        f"<div style='padding:0.2rem 0 0.3rem 0;'>"
+        f"<p style='margin:0; font-size:1.0rem; font-weight:700; color:#0D47A1;'>{html.escape(store_display)}</p>"
+        f"<p style='margin:0.1rem 0 0 0; font-size:0.78rem; color:#5F6368;'>👤 {html.escape(user['username'])}</p>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # 🔔 인앱 알림 배지
+    try:
+        import task_board as _tb_noti  # noqa: WPS433
+        _noti_uname = user.get("username") or ""
+        _noti_cnt = _tb_noti.count_unread_notifications(_noti_uname) if _noti_uname else 0
+        if _noti_cnt > 0:
+            st.markdown(
+                f"<div style='background:#ef4444; color:white; border-radius:8px;"
+                f" padding:5px 10px; font-weight:700; font-size:0.85rem;"
+                f" text-align:center; margin-bottom:5px;'>🔔 미확인 알림 {_noti_cnt}건</div>",
+                unsafe_allow_html=True,
+            )
+            _recent_notis = _tb_noti.load_my_notifications_cached(_noti_uname, unread_only=True, limit=3)
+            for _noti in _recent_notis:
+                st.markdown(
+                    f"<div style='background:#fef2f2; border-left:3px solid #ef4444;"
+                    f" padding:4px 8px; border-radius:4px; margin-bottom:3px;"
+                    f" font-size:0.75rem;'>🔵 {_noti.get('message','')}</div>",
+                    unsafe_allow_html=True,
+                )
+            if st.button("✅ 모두 읽음 처리", key="sidebar_noti_read_all", use_container_width=True):
+                _tb_noti.mark_all_read(_noti_uname)
+                st.rerun()
+    except Exception:
+        pass
+
+    st.divider()
+
+    if role == "superadmin":
+        labels = _SUPERADMIN_MENUS
+        idx_key = "superadmin_menu_idx"
+    else:
+        labels = _get_sales_tab_labels(role)
+        idx_key = "main_tab_idx"
+
+    if idx_key not in st.session_state:
+        st.session_state[idx_key] = 0
+    if st.session_state[idx_key] >= len(labels):
+        st.session_state[idx_key] = 0
+
+    radio_key = f"nav_radio_{idx_key}"
+    _uname = user.get("username") or ""
+
+    # 즐겨찾기 바로가기 (사용자 지정)
+    _render_nav_favorites(_uname, labels, idx_key, radio_key)
+
+    st.markdown("<div class='sales-nav-title'>📋 메뉴</div>", unsafe_allow_html=True)
+
+    # 라디오 위젯 초기값을 현재 인덱스와 동기화
+    _cur_idx = st.session_state[idx_key]
+    if radio_key not in st.session_state:
+        st.session_state[radio_key] = labels[_cur_idx]
+    elif st.session_state[radio_key] not in labels:
+        st.session_state[radio_key] = labels[_cur_idx]
+
+    def _on_nav_change():
+        # 세일즈 메뉴 선택 시, 열려있던 ERP/관리자 화면 라우팅 해제
+        st.session_state.pop("active_admin_page", None)
+
+    sel = st.radio(
+        "메뉴", labels, key=radio_key,
+        label_visibility="collapsed", on_change=_on_nav_change,
+    )
+    st.session_state[idx_key] = labels.index(sel)
+
+    # 일반 직원 전용: 비밀번호 변경 (관리자 설정이 없으므로 여기 제공)
+    if role == "user":
+        with st.expander("🔐 비밀번호 변경"):
+            _sb_new_pw = st.text_input("새 비밀번호", type="password", key="sidebar_new_pw_input")
+            _sb_pw_confirm = st.text_input("새 비밀번호 확인", type="password", key="sidebar_new_pw_confirm")
+            if st.button("비밀번호 변경", key="sidebar_change_pw_btn"):
+                if not _sb_new_pw:
+                    st.error("새 비밀번호를 입력해 주세요.")
+                elif len(_sb_new_pw) < 6:
+                    st.error("비밀번호는 6자 이상이어야 합니다.")
+                elif _sb_new_pw != _sb_pw_confirm:
+                    st.error("새 비밀번호가 일치하지 않습니다.")
+                else:
+                    _sb_auth_cli, _sb_auth_err = get_supabase_client_with_auth_session()
+                    if _sb_auth_err:
+                        st.error(f"⚠️ {_sb_auth_err}")
+                    else:
+                        try:
+                            _sb_auth_cli.auth.update_user({"password": _sb_new_pw})
+                            flash("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.")
+                            st.rerun()
+                        except Exception as _sb_e:
+                            st.error(f"비밀번호 변경에 실패했습니다: {str(_sb_e)}")
+
+
+def _render_left_dual_nav(user: dict, role: str) -> None:
+    """좌측 듀얼 사이드바 렌더: [로고] + [ERP 아이콘 레일 | 세일즈 메뉴]."""
+    with st.sidebar:
+        raw_logo_html = _common_logo_html(
+            _resolve_logo_path(), fallback_id="emons-logo-fallback-sidebar",
+        )
+        clickable_logo_html = f"""
+        <div style="cursor:pointer;"
+             onclick="(function(){{
+                 try {{
+                     var u = new URL(window.location.href);
+                     u.searchParams.set('home', '1');
+                     window.location.href = u.toString();
+                 }} catch(e2) {{
+                     window.location.href = window.location.pathname + '?home=1';
+                 }}
+             }})();">
+        {raw_logo_html}
+        </div>
+        """
+        st.markdown(clickable_logo_html, unsafe_allow_html=True)
+        c_rail, c_nav = st.columns([1, 2.8], gap="small")
+        with c_rail:
+            _render_erp_icon_rail(role)
+        with c_nav:
+            _render_primary_nav(user, role)
 
 
 # ========== Supabase 연결 (st.secrets 기반) ==========
@@ -22839,41 +23198,16 @@ def render_faq_page():
 
 
 def render_superadmin():
-    _SUPERADMIN_MENUS = [
-        "① 전 지점 통합 대시보드",
-        "② 매장별 직원 평가 현황 (HR)",
-        "③ 📢 공지사항 관리",
-        "④ 원클릭 데이터 백업 (CSV)",
-        "⑤ 매장 계정 관리",
-        "⑥ 전 지점 마케팅 분석",
-        "⑦ 미수금(잔금) 레포트",
-        "⑧ 결제수단별 집계표",
-        "⑨ 💰 입금 관리",
-        "⑩ ⚠️ 데이터 초기화 (Danger Zone)",
-        "⑪ FAQ (도움말)",
-    ]
+    # 최고 관리자 메뉴는 좌측 사이드바(_render_left_dual_nav)에서 선택.
+    # 여기서는 선택된 인덱스로 콘텐츠만 디스패치한다.
     if "superadmin_menu_idx" not in st.session_state:
         st.session_state["superadmin_menu_idx"] = 0
     if st.session_state["superadmin_menu_idx"] >= len(_SUPERADMIN_MENUS):
         st.session_state["superadmin_menu_idx"] = 0
 
-    st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
+    menu_sel = _SUPERADMIN_MENUS[st.session_state["superadmin_menu_idx"]]
     st.header("최고 관리자 메뉴")
-    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">⭐ 즐겨찾기 바로가기</p>', unsafe_allow_html=True)
-    _sa_user = st.session_state.get("current_user") or {}
-    _render_fav_menu_bar(_sa_user.get("username") or "", _SUPERADMIN_MENUS,
-                         tab_idx_key="superadmin_menu_idx", widget_key="superadmin_menu_select")
-    st.markdown('<p style="margin:0.35rem 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
-    menu_sel = st.selectbox(
-        "최고 관리자 메뉴",
-        _SUPERADMIN_MENUS,
-        index=st.session_state["superadmin_menu_idx"],
-        key="superadmin_menu_select",
-        label_visibility="collapsed",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.session_state["superadmin_menu_idx"] = _SUPERADMIN_MENUS.index(menu_sel)
+    st.caption(f"현재 메뉴: {menu_sel}")
     st.divider()
 
     if menu_sel == "① 전 지점 통합 대시보드":
@@ -28273,6 +28607,7 @@ def main():
     _inject_mobile_css()
     _inject_favicon()
     _inject_branding_css()
+    _inject_dual_nav_css()
     _consume_flash()
 
     # ========== 자동 로그인 복구 (30일 토큰) ==========
@@ -28320,10 +28655,10 @@ def main():
                 padding: 0 !important;
             }
         }
-        /* PC: 본문이 고정 헤더에 가려지지 않도록 상단 패딩 */
+        /* PC: 상단 여백 (좌측 사이드바 내비로 이동, 고정 헤더 미사용) */
         @media (min-width: 768px) {
             .block-container {
-                padding-top: 6rem !important;
+                padding-top: 2.5rem !important;
             }
         }
         /* 모바일: Streamlit stHeader(2.5rem) 바로 아래에서 콘텐츠 시작 */
@@ -28379,176 +28714,9 @@ def main():
         st.rerun()
         return
 
-    # 로그인 후 사이드바: 좌측 상단 공통 로고(emons-log.svg / emons-logo.svg 우선, 에러 시 빨간 메시지)
-    # 로고를 클릭하면 항상 현재 토큰을 포함한 URL(?home=1&auth=...)로 이동하여
-    # 새 세션이 열리더라도 URL 토큰으로 즉시 로그인 복구 후 대시보드(홈)로 돌아오도록 처리.
-    raw_logo_html = _common_logo_html(
-        _resolve_logo_path(),
-        fallback_id="emons-logo-fallback-sidebar",
-    )
-    clickable_logo_html = f"""
-    <div style="cursor:pointer;"
-         onclick="(function(){{ 
-             try {{
-                 var u = new URL(window.location.href);
-                 u.searchParams.set('home', '1');
-                 window.location.href = u.toString();
-             }} catch(e2) {{
-                 window.location.href = window.location.pathname + '?home=1';
-             }}
-         }})();">
-    {raw_logo_html}
-    </div>
-    """
-    st.sidebar.markdown(clickable_logo_html, unsafe_allow_html=True)
-    # 홈 버튼: 세션 상태만 초기화하고 rerun하여 로그아웃 없이 대시보드로 안전하게 복귀
-    if st.sidebar.button("🏠 세일즈대시보드", width='stretch', key="sidebar_home_btn"):
-        if "active_admin_page" in st.session_state:
-            del st.session_state["active_admin_page"]
-        st.session_state["main_tab_idx"] = 0
-        st.rerun()
-    # 한 직원이 여러 매장: 매장 선택 드롭다운 (superadmin 제외)
-    allowed_stores = user.get("allowed_stores") or []
-    if role != "superadmin" and len(allowed_stores) > 1:
-        options = [s[2] for s in allowed_stores]
-        current_sid = user.get("store_id")
-        current_idx = next((i for i, s in enumerate(allowed_stores) if s[0] == current_sid), 0)
-        sel_idx = st.sidebar.selectbox(
-            "매장 선택",
-            range(len(options)),
-            format_func=lambda i: options[i],
-            index=current_idx,
-            key="sidebar_store_sel",
-        )
-        if sel_idx != current_idx:
-            st.session_state.current_user["store_id"] = allowed_stores[sel_idx][0]
-            st.session_state.current_user["db_filename"] = allowed_stores[sel_idx][1]
-            st.session_state.current_db = allowed_stores[sel_idx][1]
-            st.rerun()
-    store_display = get_store_display_name(user)
-    st.sidebar.markdown(
-        f"<div style='padding:0.4rem 0; border-radius:0.4rem;'>"
-        f"<p style='margin:0; font-size:1.1rem; font-weight:600;'>{html.escape(store_display)}</p>"
-        f"<p style='margin:0.2rem 0 0 0; font-size:0.85rem; color:#666;'>👤 ID: {html.escape(user['username'])}</p>"
-        f"</div>",
-        unsafe_allow_html=True
-    )
-    st.sidebar.divider()
-    # 🔔 인앱 알림 배지
-    try:
-        import task_board as _tb_noti  # noqa: WPS433
-        _noti_uname = user.get("username") or ""
-        _noti_cnt = _tb_noti.count_unread_notifications(_noti_uname) if _noti_uname else 0
-        if _noti_cnt > 0:
-            st.sidebar.markdown(
-                f"<div style='background:#ef4444; color:white; border-radius:8px;"
-                f" padding:6px 14px; font-weight:700; font-size:0.95rem;"
-                f" text-align:center; margin-bottom:6px;'>"
-                f"🔔 미확인 알림 {_noti_cnt}건</div>",
-                unsafe_allow_html=True,
-            )
-            # 최신 알림 미리보기 (최대 3건)
-            _recent_notis = _tb_noti.load_my_notifications_cached(_noti_uname, unread_only=True, limit=3)
-            for _noti in _recent_notis:
-                st.sidebar.markdown(
-                    f"<div style='background:#fef2f2; border-left:3px solid #ef4444;"
-                    f" padding:5px 10px; border-radius:4px; margin-bottom:4px;"
-                    f" font-size:0.8rem;'>🔵 {_noti.get('message','')}</div>",
-                    unsafe_allow_html=True,
-                )
-            if st.sidebar.button("✅ 모두 읽음 처리", key="sidebar_noti_read_all"):
-                _tb_noti.mark_all_read(_noti_uname)
-                st.rerun()
-    except Exception:
-        pass
-    st.sidebar.divider()
-    # 일반 직원 전용: 관리자 설정이 없으므로 사이드바에서 비밀번호 변경
-    if role == "user":
-        with st.sidebar.expander("🔐 비밀번호 변경"):
-            _sb_new_pw = st.text_input("새 비밀번호", type="password", key="sidebar_new_pw_input")
-            _sb_pw_confirm = st.text_input("새 비밀번호 확인", type="password", key="sidebar_new_pw_confirm")
-            if st.button("비밀번호 변경", key="sidebar_change_pw_btn"):
-                if not _sb_new_pw:
-                    st.error("새 비밀번호를 입력해 주세요.")
-                elif len(_sb_new_pw) < 6:
-                    st.error("비밀번호는 6자 이상이어야 합니다.")
-                elif _sb_new_pw != _sb_pw_confirm:
-                    st.error("새 비밀번호가 일치하지 않습니다.")
-                else:
-                    _sb_auth_cli, _sb_auth_err = get_supabase_client_with_auth_session()
-                    if _sb_auth_err:
-                        st.error(f"⚠️ {_sb_auth_err}")
-                    else:
-                        try:
-                            _sb_auth_cli.auth.update_user({"password": _sb_new_pw})
-                            flash("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하세요.")
-                            st.rerun()
-                        except Exception as _sb_e:
-                            st.error(f"비밀번호 변경에 실패했습니다: {str(_sb_e)}")
-    # 관리자 전용: 결제 변경/취소 모니터링 화면 진입 버튼
-    if role in ("store_admin", "superadmin"):
-        if st.sidebar.button("🚨 결제 변경/취소 모니터링", width='stretch'):
-            st.session_state["active_admin_page"] = "payment_monitor"
-            st.session_state.pop("mm_queried", None)
-        if st.sidebar.button("📊 마진 모니터링", width='stretch'):
-            st.session_state["active_admin_page"] = "margin_monitor"
-            st.session_state.pop("mm_queried", None)
-        _del_db = st.session_state.get("current_db")
-        _pending_del_count = len(_fetch_pending_delete_requests(_del_db, _current_username())) if _del_db else 0
-        _del_btn_label = f"🗑️ 주문 삭제 요청 관리 ({_pending_del_count}건)" if _pending_del_count > 0 else "🗑️ 주문 삭제 요청 관리"
-        if st.sidebar.button(_del_btn_label, width='stretch'):
-            st.session_state["active_admin_page"] = "delete_requests"
-    # 최고 관리자 전용: 직원 계정 관리 및 발령
-    if role == "superadmin":
-        if st.sidebar.button("👥 직원 관리", width='stretch'):
-            st.session_state["active_admin_page"] = "employee_management"
-
-    # ERP 섹션 (전 역할 공통: 근태 관리)
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**📋 ERP**")
-    if st.sidebar.button("🗓️ 근태 관리", width='stretch'):
-        st.session_state["active_admin_page"] = "erp_attendance"
-    if st.sidebar.button("📧 메일관리", width='stretch'):
-        st.session_state["active_admin_page"] = "gmail_manager"
-    if st.sidebar.button("📁 자료실", width='stretch'):
-        st.session_state["active_admin_page"] = "document_library"
-    if role in ("store_admin", "superadmin"):
-        if st.sidebar.button("💬 메시지 발송", width='stretch'):
-            st.session_state["active_admin_page"] = "send_message"
-        if st.sidebar.button("📊 고객의 소리(VOC)", width='stretch'):
-            st.session_state["active_admin_page"] = "voc_dashboard"
-        if st.sidebar.button("📈 인력 효율 분석", width='stretch'):
-            st.session_state["active_admin_page"] = "employee_analytics"
-        if st.sidebar.button("⚙️ 관리자 설정", width='stretch'):
-            st.session_state["active_admin_page"] = "admin_settings"
-    # 사내 업무판 (전 역할 노출)
-    try:
-        from task_board import count_unread_notifications as _count_unread  # noqa: WPS433
-        _cu = st.session_state.get("current_user") or {}
-        _me_uname = _cu.get("username") or _cu.get("email") or ""
-        _unread_n = _count_unread(_me_uname) if _me_uname else 0
-    except Exception:
-        _unread_n = 0
-    _badge = f"  🔔 {_unread_n}" if _unread_n > 0 else ""
-    if st.sidebar.button(f"📋 사내업무/게시판{_badge}", width='stretch'):
-        st.session_state["active_admin_page"] = "internal_board"
-
-    st.sidebar.markdown("---")
-    if st.sidebar.button("🚪 로그아웃", width='stretch'):
-        try:
-            client, _ = get_supabase_client()
-            if client:
-                client.auth.sign_out()
-        except Exception:
-            pass
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        # URL에 보존된 ?auth= 토큰도 함께 정리 (자동 재로그인 차단)
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
-        st.rerun()
+    # 로그인 후 좌측 듀얼 내비게이션: [ERP 아이콘 레일 | 세일즈 메뉴]
+    # 로고 클릭 시 ?home=1 로 이동해 세션 복구 후 대시보드로 복귀.
+    _render_left_dual_nav(user, role)
 
     # 관리자 전용 모니터링 화면 라우팅
     if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "payment_monitor":
@@ -28623,36 +28791,9 @@ def main():
         render_superadmin()
         return
 
-    # 일반/매장 관리자: 메뉴를 상단 셀렉트로 노출 (모바일에서도 잘 보이게), 넘버링 및 그룹 구분
-    if role == "store_admin":
-        tab_labels = [
-            "1. 대시보드",
-            "2. 마케팅 인사이트",
-            "3. 리드고객 관리",
-            "4. 엘리베이터 사이즈 점검",
-            "5. 새로운 매출 등록",
-            "6. 고객 및 잔금 관리",
-            "7. 입금 관리",
-            "8. 매장 관리자 메뉴",
-            "9. 결제수단별 집계표",
-            "10. 고객 CRM 자동화",
-            "11. 세일즈 퍼포먼스",
-            "12. 전시품 판매 검증",
-            "13. FAQ (도움말)",
-        ]
-    else:
-        tab_labels = [
-            "1. 대시보드",
-            "2. 마케팅 인사이트",
-            "3. 리드고객 관리",
-            "4. 엘리베이터 사이즈 점검",
-            "5. 새로운 매출 등록",
-            "6. 고객 및 잔금 관리",
-            "7. 입금 관리",
-            "8. 결제수단별 집계표",
-            "9. 전시품 판매 검증",
-            "10. FAQ (도움말)",
-        ]
+    # 일반/매장 관리자: 세일즈 메뉴는 좌측 사이드바(_render_left_dual_nav)에서 선택.
+    # 여기서는 선택된 인덱스로 콘텐츠만 디스패치한다.
+    tab_labels = _get_sales_tab_labels(role)
     if "main_tab_idx" not in st.session_state:
         st.session_state["main_tab_idx"] = 0
     if st.session_state["main_tab_idx"] >= len(tab_labels):
@@ -28671,24 +28812,7 @@ def main():
                 st.error("⚠️ **Supabase RLS 정책 오류**: " + err_text + " — 해당 테이블에 INSERT를 허용하는 RLS 정책을 추가해 주세요.")
         else:
             st.error("⚠️ **Supabase 연결 실패**: " + err_text + " — .streamlit/secrets.toml의 [supabase] url, key를 확인해 주세요.")
-    # 상단 메뉴 선택(Sticky Header 내에 렌더링: 일반 유저/매장관리자 공통)
-    st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown('<p style="margin:0 0 0.25rem 0; font-size:0.85rem; color:#666;">⭐ 즐겨찾기 바로가기</p>', unsafe_allow_html=True)
-    _render_fav_menu_bar(user.get("username") or "", tab_labels,
-                         tab_idx_key="main_tab_idx", widget_key="main_menu_select")
-    st.markdown('<p style="margin:0.35rem 0 0.25rem 0; font-size:0.85rem; color:#666;">📱 메뉴 선택</p>', unsafe_allow_html=True)
-    st.markdown('<p class="mobile-menu-hint" style="margin:0 0 0.35rem 0; font-size:0.8rem; color:#888;">로그아웃·비밀번호는 왼쪽 상단 ☰에서</p>', unsafe_allow_html=True)
-    menu_sel = st.selectbox(
-        "메뉴",
-        tab_labels,
-        index=st.session_state["main_tab_idx"],
-        key="main_menu_select",
-        label_visibility="collapsed",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-    idx = tab_labels.index(menu_sel)
-    st.session_state["main_tab_idx"] = idx
+    idx = st.session_state["main_tab_idx"]
     st.session_state["current_menu"] = idx
     # 로그인 직후 1회: 내 알림 배너 (주문 수정 / 매출 배분 알림) — 일반 직원용
     _db_fn_for_notif = st.session_state.get("current_db") or (user.get("db_filename") if role != "superadmin" else None)
