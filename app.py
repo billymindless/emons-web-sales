@@ -528,10 +528,18 @@ def _render_primary_nav(user: dict, role: str) -> None:
             st.rerun()
 
     store_display = get_store_display_name(user)
+    _display_name = (
+        (user.get("name") or "").strip()
+        or _resolve_app_user_display_name(
+            user_id=user.get("id"),
+            username=user.get("username"),
+        )
+        or user.get("username", "")
+    )
     st.markdown(
         f"<div style='padding:0.2rem 0 0.3rem 0;'>"
         f"<p style='margin:0; font-size:1.0rem; font-weight:700; color:#0D47A1;'>{html.escape(store_display)}</p>"
-        f"<p style='margin:0.1rem 0 0 0; font-size:0.78rem; color:#5F6368;'>👤 {html.escape(user['username'])}</p>"
+        f"<p style='margin:0.1rem 0 0 0; font-size:0.78rem; color:#5F6368;'>👤 {html.escape(_display_name)}</p>"
         f"</div>",
         unsafe_allow_html=True,
     )
