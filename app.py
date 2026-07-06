@@ -329,17 +329,25 @@ def _inject_dual_nav_css():
             text-align: center; letter-spacing: 0.02em; margin: 2px 0 4px 0;
         }
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button {
-            padding: 0.35rem 0 !important;
-            font-size: 1.15rem !important;
+            padding: 0.1rem 0 !important;      /* 상·하 각 1.6px */
+            font-size: 1.15rem !important;     /* 아이콘 크기 유지 */
             line-height: 1.1 !important;
             border: 1px solid #D6E4F5 !important;
             background: #FFFFFF !important;
-            border-radius: 10px !important;
-            min-height: 40px !important;
+            border-radius: 8px !important;
+            min-height: 30px !important;       /* 40px → 30px 축소 */
+            height: 30px !important;
         }
         section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child .stButton > button:hover {
             background: #E3F2FD !important;
             border-color: #1565C0 !important;
+        }
+        /* 아이콘 레일 박스 사이 세로 간격 축소 (기본 ~16px → 4px) */
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child [data-testid="stVerticalBlock"] {
+            gap: 0.25rem !important;
+        }
+        section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div:first-child [data-testid="stElementContainer"] {
+            margin-bottom: 0 !important;
         }
         /* ── 세일즈 메뉴 라디오 (좌측 두 번째 컬럼) ── */
         .sales-nav-title {
