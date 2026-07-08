@@ -109,9 +109,27 @@ def _format_phone_display(phone: str) -> str:
     return phone or ""
 
 
+# 리드 담당 매장 선택에서 제외할 이름 키워드
+# - 전시장: 채널톡 법인명(실제 매장 아님)
+# - 양산/평산: 폐점 매장 (is_active 누락 시에도 숨김)
+_LEAD_STORE_EXCLUDE_KEYWORDS: tuple[str, ...] = ("전시장", "양산", "평산")
+
+
+def _is_lead_selectable_store(store_name: str) -> bool:
+    """리드 UI에 노출할 실제 운영 매장인지 판별."""
+    sn = str(store_name or "").strip()
+    if not sn or sn in ("미지정", "전체", "(미지정)"):
+        return False
+    return not any(k in sn for k in _LEAD_STORE_EXCLUDE_KEYWORDS)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _get_store_name_list() -> list[str]:
-    """활성 매장명 목록 (app_stores). 리드 등록 담당 매장 선택용."""
+    """활성 운영 매장명 목록 (리드 담당 매장 선택용).
+
+    - is_active=False 제외
+    - 법인명(전시장)·폐점(양산/평산) 키워드 제외 → 울산삼산점·울산학성점만 노출
+    """
     supa = _supa()
     if not supa:
         return []
@@ -129,8 +147,9 @@ def _get_store_name_list() -> list[str]:
             sn = str(r.get("store_name") or "").strip()
             if not sn:
                 continue
-            # is_active 컬럼 없으면 포함, False 만 제외
             if r.get("is_active") is False:
+                continue
+            if not _is_lead_selectable_store(sn):
                 continue
             names.append(sn)
         return names
@@ -144,7 +163,11 @@ def _get_store_name_list() -> list[str]:
                 .data
                 or []
             )
-            return [str(r.get("store_name") or "").strip() for r in rows if r.get("store_name")]
+            return [
+                str(r.get("store_name") or "").strip()
+                for r in rows
+                if r.get("store_name") and _is_lead_selectable_store(r.get("store_name"))
+            ]
         except Exception:
             return []
 
@@ -421,17 +444,22 @@ def _inline_save_stage(lead_id: int, key: str) -> None:
 
 def _inline_save_store(lead_id: int, key: str) -> None:
     """리드 목록 inline selectbox — store_name 즉시 저장."""
-    new_val = (st.session_state.get(key) or "").strip() or None
+    new_val = (st.session_state.get(key) or "").strip()
+    # NOT NULL 컬럼 대비: 미지정은 '미지정' 문자열로 저장
+    save_val = new_val if new_val else "미지정"
+    if not _is_lead_selectable_store(save_val) and save_val != "미지정":
+        st.toast("❌ 선택할 수 없는 매장입니다 (법인명/폐점)", icon="⚠️")
+        return
     supa = _supa()
     if not supa:
         st.toast("❌ DB 연결 실패", icon="⚠️")
         return
     try:
         supa.table("app_leads").update({
-            "store_name": new_val,
+            "store_name": save_val,
             "updated_at": _now_iso(),
         }).eq("id", lead_id).execute()
-        st.toast(f"매장 저장: {new_val or '미지정'}", icon="✅")
+        st.toast(f"매장 저장: {save_val}", icon="✅")
     except Exception as e:
         st.toast(f"❌ 매장 저장 실패: {str(e)[:60]}", icon="⚠️")
 
@@ -1128,7 +1156,15 @@ def render_lead_management() -> None:
     _emp_name_to_id = {v: k for k, v in emp_map.items()}
     _stage_keys_list = list(LEAD_STAGES.keys())
     _employees_by_store = _get_employees_by_store()
-    _store_options_master = sorted(_employees_by_store.keys())
+    # 운영 매장만 (법인명·폐점 제외). 기존 리드에 저장된 값은 행별 옵션에만 보존.
+    _store_options_master = sorted(
+        sn for sn in _employees_by_store.keys() if _is_lead_selectable_store(sn)
+    )
+    # app_stores 활성 목록과 합집합 (직원 매핑에 없어도 선택 가능)
+    for _sn in _get_store_name_list():
+        if _sn not in _store_options_master:
+            _store_options_master.append(_sn)
+    _store_options_master = sorted(_store_options_master)
 
     # 매장별 직원 매핑이 비어있으면 진단 안내
     if not _employees_by_store and not _emp_all_names:
@@ -1210,14 +1246,19 @@ def render_lead_management() -> None:
                     unsafe_allow_html=True,
                 )
 
-        # 매장 — 인라인 selectbox (직원이 등록된 매장 중 선택)
+        # 매장 — 인라인 selectbox (운영 매장만: 삼산·학성)
         with _rc[5]:
             _store_key = f"inline_store_{_lid}"
-            # 옵션: (미지정) + 직원 등록 매장 목록 + 현재 값(목록에 없으면 보존)
+            # 옵션: (미지정) + 운영 매장. 법인명(전시장)·폐점(양산/평산)은 목록에서 제외.
             _row_store_options = [""] + list(_store_options_master)
-            if _store and _store not in _row_store_options:
-                _row_store_options.append(_store)
-            _cur_store_idx = _row_store_options.index(_store) if _store in _row_store_options else 0
+            _display_store = _store if _is_lead_selectable_store(_store) else ""
+            if _display_store and _display_store not in _row_store_options:
+                _row_store_options.append(_display_store)
+            _cur_store_idx = (
+                _row_store_options.index(_display_store)
+                if _display_store in _row_store_options
+                else 0
+            )
             st.selectbox(
                 "매장",
                 _row_store_options,
@@ -1314,14 +1355,9 @@ def _render_import_panel() -> None:
 
 def _render_register_form() -> None:
     user = st.session_state.get("current_user") or {}
-    default_store = _resolve_default_store_name(user)
-    store_options = _get_store_name_list()
-    # 소속 매장이 목록에 없으면 맨 앞에 추가 (폐점/미등록 대비)
-    if default_store and default_store not in store_options:
-        store_options = [default_store] + store_options
-    if not store_options:
-        store_options = [default_store] if default_store else ["전체"]
-    _store_index = store_options.index(default_store) if default_store in store_options else 0
+    # 기본값: (미지정). 본인 소속 매장은 목록에만 포함되고 자동 선택하지 않음.
+    store_options = [""] + _get_store_name_list()
+    _store_index = 0
 
     # 담당 직원 멀티셀렉트 옵션 — 매출 등록과 동일하게 직원 이름 기준
     emp_map = _get_employee_map()
@@ -1368,7 +1404,8 @@ def _render_register_form() -> None:
             "담당 매장",
             options=store_options,
             index=_store_index,
-            help="기본값은 본인 소속 매장입니다. 다른 매장도 선택할 수 있습니다.",
+            format_func=lambda s: s if s else "(미지정)",
+            help="기본값은 (미지정)입니다. 울산삼산점·울산학성점만 선택할 수 있습니다.",
         )
         memo_in = st.text_area("상담 메모", height=80, placeholder="예: 토레도 소파 4인용 가격 문의")
         cc3, cc4 = st.columns(2)
@@ -1402,7 +1439,7 @@ def _render_register_form() -> None:
                 name=name_in or "",
                 memo=memo_in or "",
                 lead_source=lead_source,
-                store_name=store_in or "전체",
+                store_name=store_in or "미지정",
                 employee_id=first_emp_id,
                 next_contact_date=str(next_in),
                 send_now=send_now,
