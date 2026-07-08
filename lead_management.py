@@ -109,6 +109,102 @@ def _format_phone_display(phone: str) -> str:
     return phone or ""
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_store_name_list() -> list[str]:
+    """활성 매장명 목록 (app_stores). 리드 등록 담당 매장 선택용."""
+    supa = _supa()
+    if not supa:
+        return []
+    try:
+        rows = (
+            supa.table("app_stores")
+            .select("store_name,is_active")
+            .order("store_name")
+            .execute()
+            .data
+            or []
+        )
+        names = []
+        for r in rows:
+            sn = str(r.get("store_name") or "").strip()
+            if not sn:
+                continue
+            # is_active 컬럼 없으면 포함, False 만 제외
+            if r.get("is_active") is False:
+                continue
+            names.append(sn)
+        return names
+    except Exception:
+        try:
+            rows = (
+                supa.table("app_stores")
+                .select("store_name")
+                .order("store_name")
+                .execute()
+                .data
+                or []
+            )
+            return [str(r.get("store_name") or "").strip() for r in rows if r.get("store_name")]
+        except Exception:
+            return []
+
+
+def _resolve_default_store_name(user: dict | None = None) -> str:
+    """현재 로그인 직원의 소속 매장명. store_name → store_id 조회 → current_db 순."""
+    user = user or (st.session_state.get("current_user") or {})
+    # 1) 세션/유저에 store_name 이 있으면 우선
+    for key in ("store_name",):
+        v = str(user.get(key) or "").strip()
+        if v:
+            return v
+    v = str(st.session_state.get("current_store_name") or "").strip()
+    if v:
+        return v
+
+    # 2) store_id → app_stores
+    sid = user.get("store_id")
+    if sid:
+        try:
+            supa = _supa()
+            if supa:
+                r = (
+                    supa.table("app_stores")
+                    .select("store_name")
+                    .eq("id", int(sid))
+                    .maybe_single()
+                    .execute()
+                )
+                data = r.data if hasattr(r, "data") else None
+                if isinstance(data, dict) and data.get("store_name"):
+                    return str(data["store_name"]).strip()
+        except Exception:
+            pass
+
+    # 3) current_db (db_filename) → app_stores
+    db_fn = (
+        user.get("db_filename")
+        or st.session_state.get("current_db")
+        or ""
+    )
+    if db_fn:
+        try:
+            supa = _supa()
+            if supa:
+                r = (
+                    supa.table("app_stores")
+                    .select("store_name")
+                    .eq("db_filename", str(db_fn))
+                    .maybe_single()
+                    .execute()
+                )
+                data = r.data if hasattr(r, "data") else None
+                if isinstance(data, dict) and data.get("store_name"):
+                    return str(data["store_name"]).strip()
+        except Exception:
+            pass
+    return ""
+
+
 # ──────────────────────────────────────────────
 # 직원 매핑 (담당직원 표시용)
 # ──────────────────────────────────────────────
@@ -1218,7 +1314,14 @@ def _render_import_panel() -> None:
 
 def _render_register_form() -> None:
     user = st.session_state.get("current_user") or {}
-    default_store = user.get("store_name") or st.session_state.get("current_store_name") or ""
+    default_store = _resolve_default_store_name(user)
+    store_options = _get_store_name_list()
+    # 소속 매장이 목록에 없으면 맨 앞에 추가 (폐점/미등록 대비)
+    if default_store and default_store not in store_options:
+        store_options = [default_store] + store_options
+    if not store_options:
+        store_options = [default_store] if default_store else ["전체"]
+    _store_index = store_options.index(default_store) if default_store in store_options else 0
 
     # 담당 직원 멀티셀렉트 옵션 — 매출 등록과 동일하게 직원 이름 기준
     emp_map = _get_employee_map()
@@ -1261,7 +1364,12 @@ def _render_register_form() -> None:
             default=_default_emp_names,
             help="매출 등록과 동일하게 여러 명을 선택하면 1/n 실적 분배 대상이 됩니다.",
         )
-        store_in = st.text_input("담당 매장", value=default_store, placeholder="예: 울산삼산점")
+        store_in = st.selectbox(
+            "담당 매장",
+            options=store_options,
+            index=_store_index,
+            help="기본값은 본인 소속 매장입니다. 다른 매장도 선택할 수 있습니다.",
+        )
         memo_in = st.text_area("상담 메모", height=80, placeholder="예: 토레도 소파 4인용 가격 문의")
         cc3, cc4 = st.columns(2)
         with cc3:
