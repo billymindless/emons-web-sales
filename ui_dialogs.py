@@ -12,22 +12,27 @@ from typing import Callable
 import streamlit as st
 
 
-def open_dialog(title: str, render_fn: Callable[[], None], *,
-                width: str = "large",
-                fallback_expander: bool = True) -> None:
+def open_dialog(
+    title: str,
+    render_fn: Callable[[], None],
+    *,
+    width: str = "large",
+    fallback_expander: bool = True,
+    on_dismiss: Callable[[], None] | str | None = None,
+) -> None:
     """`st.dialog` 로 팝업을 연다. 미지원 환경에서는 `st.expander` 로 폴백.
 
     - `render_fn`: 팝업 안 UI 를 그리는 무인자 함수.
       저장/취소 마지막에 `st.rerun()` 호출해 팝업을 닫는다.
     - `width`: 'small' | 'medium' | 'large' (`st.dialog` width 인자).
     - `fallback_expander`: True 면 폴백 시 expander 로, False 면 인라인 렌더.
+    - `on_dismiss`: X/ESC/바깥 클릭으로 닫을 때 호출할 콜백 또는 "rerun".
+      Streamlit 1.48+ 에서 지원. 미지원 시 dismissible=False 로 X 를 숨겨
+      폼 내 취소 버튼으로만 닫히게 한다 (세션 플래그 잔존 방지).
     """
     if hasattr(st, "dialog"):
         try:
-            try:
-                dec = st.dialog(title, width=width)
-            except TypeError:
-                dec = st.dialog(title)
+            dec = _build_dialog_decorator(title, width=width, on_dismiss=on_dismiss)
 
             @dec
             def _dlg():
@@ -42,3 +47,42 @@ def open_dialog(title: str, render_fn: Callable[[], None], *,
             render_fn()
     else:
         render_fn()
+
+
+def _build_dialog_decorator(
+    title: str,
+    *,
+    width: str,
+    on_dismiss: Callable[[], None] | str | None,
+):
+    """Streamlit 버전별 st.dialog 인자 호환을 맞춘 decorator 반환."""
+
+    def _try(**kwargs):
+        return st.dialog(title, **kwargs)
+
+    # 1) width + on_dismiss
+    if on_dismiss is not None:
+        try:
+            return _try(width=width, on_dismiss=on_dismiss)
+        except TypeError:
+            pass
+        # 2) on_dismiss only (width 미지원)
+        try:
+            return _try(on_dismiss=on_dismiss)
+        except TypeError:
+            pass
+        # 3) on_dismiss 미지원 → X 숨김 (취소 버튼으로만 닫기)
+        try:
+            return _try(width=width, dismissible=False)
+        except TypeError:
+            pass
+        try:
+            return _try(dismissible=False)
+        except TypeError:
+            pass
+
+    # 4) width only / bare
+    try:
+        return _try(width=width)
+    except TypeError:
+        return _try()

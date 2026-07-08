@@ -6251,14 +6251,15 @@ else:
 
 
 def _open_dialog(title: str, render_fn, *, width: str = "large",
-                 fallback_expander: bool = True) -> None:
+                 fallback_expander: bool = True, on_dismiss=None) -> None:
     """공통 팝업(모달) 헬퍼 (app.py 내부 호환용 얇은 래퍼).
 
     구현은 `ui_dialogs.open_dialog` 에 있음. 순환 import 방지를 위해
     실제 로직은 별도 모듈로 분리해 두었다.
     """
     from ui_dialogs import open_dialog as _od  # noqa: WPS433
-    _od(title, render_fn, width=width, fallback_expander=fallback_expander)
+    _od(title, render_fn, width=width, fallback_expander=fallback_expander,
+        on_dismiss=on_dismiss)
 
 
 # ========== 로그인 페이지 ==========

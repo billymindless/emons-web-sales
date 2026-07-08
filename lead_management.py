@@ -757,13 +757,24 @@ def render_lead_management() -> None:
 
     # ── 채널톡 가져오기 · 리드 등록 폼: 팝업(모달) ──────────
     # st.dialog 기반 공통 헬퍼. 미지원 환경에서는 expander 로 폴백.
+    # X/ESC 닫기 시에도 세션 플래그를 지워야 다른 버튼 클릭 시 재오픈되지 않음.
     from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+
+    def _dismiss_lead_import() -> None:
+        st.session_state["lead_show_import"] = False
+
+    def _dismiss_lead_form() -> None:
+        st.session_state["lead_show_form"] = False
+
+    def _dismiss_lead_detail() -> None:
+        st.session_state.pop("lead_selected_id", None)
 
     if st.session_state.get("lead_show_import"):
         _open_dialog(
             "📥 채널톡 유입 고객 가져오기",
             _render_import_panel,
             width="medium",
+            on_dismiss=_dismiss_lead_import,
         )
 
     if st.session_state.get("lead_show_form"):
@@ -771,6 +782,7 @@ def render_lead_management() -> None:
             "＋ 새 리드 등록",
             _render_register_form,
             width="medium",
+            on_dismiss=_dismiss_lead_form,
         )
 
     # ── Supabase 데이터 로드 ────────────────────
@@ -858,6 +870,7 @@ def render_lead_management() -> None:
                 f"📋 {_sel.get('name') or '리드'} 상세 관리",
                 _render_lead_detail_dialog,
                 width="large",
+                on_dismiss=_dismiss_lead_detail,
             )
 
     # ── Stats 카드 (숨김 처리 — 추후 세일즈 퍼포먼스 메뉴로 이동 예정) ──
