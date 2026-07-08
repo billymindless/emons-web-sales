@@ -115,18 +115,31 @@ def _format_phone_display(phone: str) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _get_employee_map() -> dict[int, str]:
-    """employee_id → 직원 이름 (전체)."""
+    """employee_id → 직원 이름 (전체).
+
+    app_users 에는 store_name 컬럼이 없고 store_id 만 있음.
+    존재하지 않는 컬럼을 select 하면 PostgREST 가 실패하고 빈 dict 가 되어
+    담당 직원 multiselect 가 'No options to select' 로 비활성화됨.
+    """
     supa = _supa()
     if not supa:
         return {}
     try:
-        rows = supa.table("app_users").select("id,name,username,store_name").execute().data or []
+        rows = supa.table("app_users").select("id,name,username").execute().data or []
         return {
             int(r["id"]): (r.get("name") or r.get("username") or f"#{r['id']}")
             for r in rows if r.get("id")
         }
     except Exception:
-        return {}
+        # 폴백: 최소 컬럼만
+        try:
+            rows = supa.table("app_users").select("id,username").execute().data or []
+            return {
+                int(r["id"]): (r.get("username") or f"#{r['id']}")
+                for r in rows if r.get("id")
+            }
+        except Exception:
+            return {}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -164,12 +177,17 @@ def _get_employees_by_store() -> dict[str, list[str]]:
     except Exception:
         pass
 
-    # 2) app_users.store_name 직접 (1차 결과가 비었을 때)
+    # 2) app_users.store_id → app_stores.store_name (1차 결과가 비었을 때)
     if not out:
         try:
-            users = supa.table("app_users").select("id,name,username,store_name").execute().data or []
+            stores = supa.table("app_stores").select("id,store_name").execute().data or []
+            store_id_to_name = {
+                int(s["id"]): str(s.get("store_name") or "").strip()
+                for s in stores if s.get("id")
+            }
+            users = supa.table("app_users").select("id,name,username,store_id").execute().data or []
             for u in users:
-                sn = str(u.get("store_name") or "").strip()
+                sn = store_id_to_name.get(int(u.get("store_id") or 0), "")
                 un = (u.get("name") or u.get("username") or "").strip()
                 if sn and un:
                     out.setdefault(sn, set()).add(un)
@@ -1215,6 +1233,11 @@ def _render_register_form() -> None:
             _default_emp_names = [_cur_name]
 
     st.markdown("#### ＋ 새 리드 등록")
+    if not _emp_name_list:
+        st.warning(
+            "담당 직원 목록을 불러오지 못했습니다. "
+            "매장 관리자 메뉴에서 직원이 등록되어 있는지 확인해 주세요."
+        )
     with st.form("lead_register_form_v2", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
