@@ -12761,9 +12761,9 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     _value_css = "font-size:1.7rem; font-weight:700; line-height:1.2; margin:0;"
     _sub_css   = "font-size:0.72rem; color:#777; margin-top:4px; line-height:1.3;"
 
-    # ── 상단 3카드: 공통 필요 / 단축근무 누계 / 잔여 필요 ──────
+    # ── 상단 2카드: 공통 필요 / 단축근무 누계 ──────────────────
     st.markdown("##### 🎯 연간 필요 근무시간")
-    r1c1, r1c2, r1c3 = st.columns(3)
+    r1c1, r1c2 = st.columns(2)
     with r1c1:
         st.markdown(
             f"<div style='background:#E3F2FD; {_card_css}'>"
@@ -12779,16 +12779,6 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
             f"<div style='{_label_css}'>(−) 단축근무 누계 (통합)</div>"
             f"<div style='{_value_css} color:#E65100;'>{_erp_fmt_hm(total_short_adj_min)}</div>"
             f"<div style='{_sub_css}'>포상·여름휴가·기타 차감 통합</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with r1c3:
-        _rem_color = "#C62828" if remaining_required_min > 0 else "#2E7D32"
-        st.markdown(
-            f"<div style='background:#FFEBEE; {_card_css}'>"
-            f"<div style='{_label_css}'>🎯 잔여 필요근무시간</div>"
-            f"<div style='{_value_css} color:{_rem_color};'>{_erp_fmt_hm(remaining_required_min)}</div>"
-            f"<div style='{_sub_css}'>= 공통 − 단축 − 실제근무</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -12857,37 +12847,16 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         else:
             st.info("정상근무 내역이 없습니다.")
 
-    # ── 하단 3카드: 정상근무 / 연장근무 / 실제 근무시간 ────────
+    # ── 하단: 정상근무 1카드 ─────────────────────────────────
     st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
     st.markdown("##### ⏱️ 실제 근무시간 (캘린더 기준)")
-    r2c1, r2c2, r2c3 = st.columns(3)
-    with r2c1:
+    with st.container():
         _sub_normal = f"시프트 자동 {_erp_fmt_hm(shift_normal_min)} + 연차/반차 {_erp_fmt_hm(leave_min)}"
         st.markdown(
             f"<div style='background:#E8F5E9; {_card_css}'>"
             f"<div style='{_label_css}'>(+) 정상근무</div>"
             f"<div style='{_value_css} color:#1B5E20;'>{_erp_fmt_hm(normal_min)}</div>"
             f"<div style='{_sub_css}'>{_sub_normal}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with r2c2:
-        _add_detail = ", ".join(f"{k} {_erp_fmt_hm(v)}" for k, v in sorted(additions.items(), key=lambda x: -x[1])[:3]) if additions else "추가근무·행사·회의·풀근무 통합"
-        st.markdown(
-            f"<div style='background:#E8F5E9; {_card_css}'>"
-            f"<div style='{_label_css}'>(+) 연장근무 (통합)</div>"
-            f"<div style='{_value_css} color:#1B5E20;'>{_erp_fmt_hm(overtime_min)}</div>"
-            f"<div style='{_sub_css}'>{_add_detail}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with r2c3:
-        _act_color = "#2E7D32" if actual_total_min > 0 else "#777"
-        st.markdown(
-            f"<div style='background:#FFEBEE; {_card_css}'>"
-            f"<div style='{_label_css}'>✅ 실제 근무시간</div>"
-            f"<div style='{_value_css} color:{_act_color};'>{_erp_fmt_hm(actual_total_min)}</div>"
-            f"<div style='{_sub_css}'>= 정상 + 연장 + 연차 − 단축</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
