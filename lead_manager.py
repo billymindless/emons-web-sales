@@ -200,8 +200,9 @@ def _log_outbound_message(
     """
     아웃바운드 메시지 발송 성공 시 app_chat_history에 자동 기록.
 
-    Solapi 수신(message-received) 웹훅이 비활성화되어 있으므로, 보낸 메시지는
+    Solapi 공식 웹훅에는 고객 인바운드 이벤트가 없어, 보낸 메시지는
     발송 함수에서 직접 INSERT해야 상담 이력이 단일 테이블에 누적된다.
+    (수신은 /webhook/solapi/message-received 파이프라인으로 별도 저장)
 
     Args:
         phone: 수신자 전화번호 (정규화 전/후 모두 허용)

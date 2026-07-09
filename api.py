@@ -4,6 +4,7 @@
 
 현재 제공 엔드포인트:
   POST /webhook/solapi/friend-added     — Solapi 카카오채널 친구추가 이벤트 수신
+  POST /webhook/solapi/message-received — 고객 인바운드 메시지 저장 (Solapi 공식 미지원 이벤트 포함, 외부 POST 수신용)
   POST /webhook/sms/deposit             — 기업은행 입금 SMS 수신
   POST /webhook/imweb/member            — 아임웹 신규 회원가입 이벤트 수신
   POST /webhook/imweb/order             — 아임웹 주문/배송 이벤트 수신
@@ -138,13 +139,18 @@ def _verify_solapi_secret(request: Request) -> bool:
     """
     Solapi 웹훅 위조 방지 검증.
     환경변수 SOLAPI_WEBHOOK_SECRET 설정 시 X-Solapi-Secret 헤더와 비교.
+    공식 문서: 헤더 값은 secret 문자열의 SHA1 hex.
+    하위 호환: 평문 secret 직접 비교도 허용.
     미설정 시 검증 통과 (개발·테스트 환경 허용).
     """
     expected = os.environ.get("SOLAPI_WEBHOOK_SECRET", "")
     if not expected:
         return True
-    received = request.headers.get("x-solapi-secret", "")
-    return hmac.compare_digest(expected, received)
+    received = (request.headers.get("x-solapi-secret") or "").strip()
+    if not received:
+        return False
+    expected_sha1 = hashlib.sha1(expected.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(received, expected_sha1) or hmac.compare_digest(received, expected)
 
 
 # ──────────────────────────────────────────────
@@ -174,14 +180,238 @@ def _normalize_phone(phone: str) -> str:
 # FastAPI 라우터
 # ──────────────────────────────────────────────
 
-@app.post("/webhook/solapi/message-received", include_in_schema=False)
+@app.post("/webhook/solapi/message-received", summary="Solapi/외부 고객 수신 메시지 저장")
 @app.post("/webhook/solapi/message_received", include_in_schema=False)
-async def solapi_message_received_stub(request: Request) -> JSONResponse:
+async def solapi_message_received(request: Request) -> JSONResponse:
     """
-    Solapi 수신 웹훅 stub — 실제 처리 없이 200 OK만 반환.
-    Solapi 콘솔에서 웹훅을 삭제하기 전까지 실패 횟수 누적 방지용.
+    고객 인바운드 메시지 수신 → app_customer_messages + app_chat_history 저장.
+
+    중요:
+      Solapi 공식 웹훅 이벤트는 SINGLE-REPORT / GROUP-REPORT / FAX-RECEIVE 만 지원하며
+      '고객이 카카오채널로 보낸 메시지' 이벤트는 공식 문서에 없음.
+      이 엔드포인트는 Solapi 지원 여부와 무관하게, 외부(또는 향후 연동)에서
+      POST 로 넘겨준 수신 메시지를 우리 DB에 저장하는 수신 파이프라인이다.
+
+    매칭 우선순위:
+      1) kakao_user_key → kakao_mapping / app_customers.kakao_user_key
+      2) phone → app_customers.phone1/phone2
+      3) 매칭 실패해도 phone 기준으로 이력만 저장 (customer_id=null)
+
+    페이로드 예시 (object 또는 array 모두 허용):
+      {
+        "userKey": "...",
+        "phone": "01012345678",
+        "text": "문의 내용",
+        "messageId": "optional",
+        "channel": "kakao"
+      }
     """
-    return JSONResponse({"ok": True, "skipped": True})
+    if not _verify_solapi_secret(request):
+        logger.warning("message-received: Solapi Secret 검증 실패")
+        return JSONResponse({"status": "error", "reason": "unauthorized"}, status_code=401)
+
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+
+    items: list[dict] = []
+    if isinstance(raw, list):
+        items = [x for x in raw if isinstance(x, dict)]
+    elif isinstance(raw, dict):
+        # Solapi 리포트 배열이 data/messages 로 감싸진 경우도 허용
+        nested = raw.get("data") or raw.get("messages") or raw.get("events")
+        if isinstance(nested, list):
+            items = [x for x in nested if isinstance(x, dict)]
+        else:
+            items = [raw]
+    else:
+        items = []
+
+    if not items:
+        # Solapi 재시도 방지: 빈 본문도 200
+        return JSONResponse({"ok": True, "saved": 0, "reason": "empty_payload"})
+
+    headers = _supa_headers()
+    saved = 0
+    results: list[dict] = []
+
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for item in items:
+            data = item.get("data") if isinstance(item.get("data"), dict) else item
+            msg = data.get("message") if isinstance(data.get("message"), dict) else data
+
+            user_key = str(
+                data.get("userKey")
+                or data.get("user_key")
+                or msg.get("userKey")
+                or msg.get("user_key")
+                or ""
+            ).strip()
+            phone_raw = str(
+                data.get("phone")
+                or data.get("phoneNumber")
+                or data.get("from")
+                or msg.get("phone")
+                or msg.get("from")
+                or msg.get("mobileNumber")
+                or ""
+            ).strip()
+            text = str(
+                data.get("text")
+                or data.get("message")
+                or data.get("body")
+                or data.get("content")
+                or msg.get("text")
+                or msg.get("body")
+                or msg.get("content")
+                or ""
+            ).strip()
+            if isinstance(data.get("message"), dict):
+                text = text or str(msg.get("text") or msg.get("body") or "").strip()
+            message_id = str(
+                data.get("messageId")
+                or data.get("message_id")
+                or msg.get("messageId")
+                or msg.get("id")
+                or ""
+            ).strip()
+            channel = str(
+                data.get("channel")
+                or data.get("type")
+                or msg.get("channel")
+                or "kakao"
+            ).strip() or "kakao"
+
+            digits = _normalize_phone(phone_raw)
+            if not text and not digits and not user_key:
+                results.append({"ok": False, "reason": "no_content"})
+                continue
+
+            customer_id: int | None = None
+            store_name: str | None = None
+
+            if headers:
+                try:
+                    # 1) user_key 매칭
+                    if user_key:
+                        map_resp = await client.get(
+                            _supa_url("kakao_mapping")
+                            + f"?kakao_user_key=eq.{user_key}&select=customer_id,store_name&limit=1",
+                            headers=headers,
+                        )
+                        if map_resp.status_code < 300 and map_resp.json():
+                            row = map_resp.json()[0]
+                            customer_id = row.get("customer_id")
+                            store_name = row.get("store_name")
+                        if not customer_id:
+                            cust_resp = await client.get(
+                                _supa_url("app_customers")
+                                + f"?kakao_user_key=eq.{user_key}&select=id,store_name,phone1&limit=1",
+                                headers=headers,
+                            )
+                            if cust_resp.status_code < 300 and cust_resp.json():
+                                crow = cust_resp.json()[0]
+                                customer_id = crow.get("id")
+                                store_name = crow.get("store_name")
+                                if not digits:
+                                    digits = _normalize_phone(str(crow.get("phone1") or ""))
+
+                    # 2) phone 매칭
+                    if not customer_id and digits:
+                        variants = _phone_variants(digits)
+                        or_parts: list[str] = []
+                        for v in variants:
+                            or_parts.append(f"phone1.eq.{v}")
+                            or_parts.append(f"phone2.eq.{v}")
+                        or_filter = "(" + ",".join(or_parts) + ")"
+                        cust_resp = await client.get(
+                            _supa_url("app_customers")
+                            + f"?or={or_filter}&select=id,store_name,phone1&limit=1",
+                            headers=headers,
+                        )
+                        if cust_resp.status_code < 300 and cust_resp.json():
+                            crow = cust_resp.json()[0]
+                            customer_id = crow.get("id")
+                            store_name = crow.get("store_name")
+
+                    # 3) app_customer_messages inbound 저장
+                    msg_row = {
+                        "customer_id": customer_id,
+                        "store_name": store_name,
+                        "phone": digits or None,
+                        "message_type": "inbound",
+                        "channel": channel if channel in ("alimtalk", "friendtalk", "sms", "kakao") else "kakao",
+                        "status": "received",
+                        "solapi_msg_id": message_id or None,
+                        "message_body": (text or "")[:2000],
+                        "sent_by": "customer",
+                        "direction": "inbound",
+                        "kakao_user_key": user_key or None,
+                    }
+                    ins = await client.post(
+                        _supa_url("app_customer_messages"),
+                        headers=headers,
+                        json=msg_row,
+                    )
+                    msg_ok = ins.status_code in (200, 201)
+                    if not msg_ok:
+                        logger.warning(
+                            "inbound app_customer_messages insert failed: %s %s",
+                            ins.status_code,
+                            (ins.text or "")[:200],
+                        )
+
+                    # 4) app_chat_history 통합 이력 (phone 있을 때만)
+                    hist_ok = False
+                    if digits:
+                        hist_row = {
+                            "customer_phone": digits,
+                            "channel": "카카오톡",
+                            "chat_id": message_id or None,
+                            "summary": (text or "")[:200] or "(수신 메시지)",
+                            "full_text": text or "",
+                            "handled_by": "customer_inbound",
+                        }
+                        hins = await client.post(
+                            _supa_url("app_chat_history"),
+                            headers=headers,
+                            json=hist_row,
+                        )
+                        hist_ok = hins.status_code in (200, 201)
+                        if not hist_ok:
+                            logger.warning(
+                                "inbound app_chat_history insert failed: %s %s",
+                                hins.status_code,
+                                (hins.text or "")[:200],
+                            )
+
+                    if msg_ok or hist_ok:
+                        saved += 1
+                    results.append({
+                        "ok": bool(msg_ok or hist_ok),
+                        "customer_id": customer_id,
+                        "phone": digits or None,
+                        "user_key": user_key or None,
+                        "message_saved": msg_ok,
+                        "history_saved": hist_ok,
+                    })
+                except Exception as e:
+                    logger.warning("message-received item failed: %s", e)
+                    results.append({"ok": False, "reason": str(e)[:120]})
+            else:
+                results.append({"ok": False, "reason": "supabase_not_configured"})
+
+    return JSONResponse({
+        "ok": True,
+        "saved": saved,
+        "total": len(items),
+        "results": results[:20],
+        "note": (
+            "Solapi official webhooks do not include customer inbound kakao messages; "
+            "this endpoint stores whatever inbound payload is POSTed here."
+        ),
+    }, status_code=200)
 
 
 @app.post("/webhook/solapi/friend-added", summary="Solapi 친구추가 이벤트 수신")
