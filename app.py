@@ -25877,16 +25877,30 @@ def render_customer_balance():
             )
             if selected_cid:
                 cid = selected_cid
-                # 선택된 고객과 동일한 이름+전화번호를 가진 모든 customer_id 수집 (중복 등록 시 모든 주문 조회)
+                # 선택된 고객과 동일한 전화번호를 가진 모든 customer_id 수집.
+                # (이름 접두어/오타로 같은 사람이 다중 등록된 케이스 대응 → 주문 통합 조회)
                 sel_row = customers_unique[customers_unique["id"] == cid].iloc[0]
                 _sel_name = str(sel_row.get("name") or "")
-                _sel_phone = str(sel_row.get("phone1") or "")
-                all_cids = customers[
-                    (customers["name"].fillna("") == _sel_name) &
-                    (customers["phone1"].fillna("") == _sel_phone)
-                ]["id"].tolist()
+                _sel_phone = str(sel_row.get("phone1") or "").strip()
+                if _sel_phone:
+                    all_cids = customers[
+                        customers["phone1"].fillna("").astype(str).str.strip() == _sel_phone
+                    ]["id"].tolist()
+                else:
+                    # phone1 이 비어 있으면 이름 완전 일치로만 병합 (오작동 방지)
+                    all_cids = customers[
+                        customers["name"].fillna("") == _sel_name
+                    ]["id"].tolist()
                 if not all_cids:
                     all_cids = [cid]
+                # 병합된 별칭 customer_id 를 UI 에 안내 (다른 이름으로 저장된 케이스 감지)
+                if len(all_cids) > 1:
+                    _alias_names = customers[customers["id"].isin(all_cids)]["name"].fillna("").unique().tolist()
+                    if len(_alias_names) > 1:
+                        st.info(
+                            f"ℹ️ 동일 전화번호({_sel_phone})로 이름이 다르게 저장된 고객 {len(all_cids)}건을 통합 조회했습니다: "
+                            + ", ".join(f"'{n}'" for n in _alias_names)
+                        )
 
                 # ── 카카오 채널 상태 배지 및 발송 UI ──────────────────
                 try:
