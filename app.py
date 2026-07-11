@@ -20772,8 +20772,10 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             new_amount = st.number_input("변경 후 금액(원)", min_value=0, step=1000,
                                          value=int(orig.get("amount") or 0), key=f"pcr_amt_{order_id}")
         with cc2:
-            new_method = st.text_input("변경 후 수단", value=str(orig.get("method") or ""),
-                                       key=f"pcr_meth_{order_id}")
+            _orig_method = str(orig.get("method") or "")
+            _meth_idx = PAYMENT_METHOD_OPTIONS.index(_orig_method) if _orig_method in PAYMENT_METHOD_OPTIONS else 0
+            new_method = st.selectbox("변경 후 수단", options=PAYMENT_METHOD_OPTIONS,
+                                      index=_meth_idx, key=f"pcr_meth_{order_id}")
         with cc3:
             new_onnuri = st.text_input("온누리/승인번호(선택)", value="",
                                        key=f"pcr_onnuri_{order_id}")
