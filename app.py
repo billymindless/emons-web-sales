@@ -8303,7 +8303,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         _base_dow_avg["amount"] = _base_dow_avg["amount"] / _unit_div
         _base_dow_avg["label"] = _base_dow_avg["_dow"].map(lambda x: _DOW_LABELS[x])
         _base_dow_avg["color"] = _base_dow_avg["_dow"].map(
-            lambda x: "#E53935" if x == 6 else ("#1565C0" if x == 5 else "#1B3A6B")
+            lambda x: "#E53935" if x >= 5 else "#1B3A6B"
         )
 
         fig_dow = go.Figure()
