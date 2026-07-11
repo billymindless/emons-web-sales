@@ -285,6 +285,7 @@ def _get_sales_tab_labels(role: str) -> list[str]:
             "11. 세일즈 퍼포먼스",
             "12. 전시품 판매 검증",
             "13. FAQ (도움말)",
+            "14. AI 세일즈 리포트",
         ]
     return [
         "1. 대시보드",
@@ -23534,6 +23535,217 @@ def _faq_filter_items(query: str) -> list[dict[str, str]]:
     return out
 
 
+def render_ai_sales_reports():
+    """AI 세일즈 리포트 (Phase 1 · 데이터 미리보기).
+
+    docs/plans/AI_WEEKLY_SALES_REPORT_PLAN.md 의 1단계 산출물.
+    Supabase 조회 + pandas 집계 결과를 표/지표로 미리 검증한다.
+    AI 요약 · Markdown 문서 생성은 Phase 2에서 추가.
+    """
+    st.header("📊 AI 세일즈 리포트")
+    st.caption("Phase 1 · 데이터 미리보기 — AI 요약/문서 생성은 다음 단계에서 활성화됩니다.")
+
+    try:
+        import sales_report_service as srs  # noqa: WPS433
+    except Exception as _e:
+        st.error(f"sales_report_service 모듈 로드 실패: {_e}")
+        return
+
+    role = st.session_state.get("user", {}).get("role", "user")
+    current_db = st.session_state.get("current_db")
+
+    c1, c2, c3 = st.columns([1.2, 1.5, 2])
+    with c1:
+        period_type = st.radio("기간 유형", ["주간", "월간"], horizontal=True, key="ai_report_period_type")
+    with c2:
+        if period_type == "주간":
+            default_anchor = _today_kst() - timedelta(days=7)
+            anchor = st.date_input("주 시작일 기준 (임의 요일 선택)", value=default_anchor, key="ai_report_week_anchor")
+            start, end = srs.resolve_weekly_period(anchor)
+        else:
+            default_anchor = (_today_kst().replace(day=1) - timedelta(days=1))
+            anchor = st.date_input("월 임의일 선택", value=default_anchor, key="ai_report_month_anchor")
+            start, end = srs.resolve_monthly_period(anchor)
+        st.caption(f"대상 기간: **{start.isoformat()} ~ {end.isoformat()}** (총 {(end - start).days + 1}일)")
+    with c3:
+        stores = _get_supabase_stores_list() or []
+        store_options: list[tuple[str, str]] = [("all", "전 매장 통합")]
+        if role == "superadmin":
+            store_options += [(s["db_filename"], s["store_name"]) for s in stores if s.get("db_filename")]
+        elif current_db:
+            _cur_name = next((s["store_name"] for s in stores if s.get("db_filename") == current_db), current_db)
+            store_options = [(current_db, _cur_name)]
+        _labels = [f"{k} · {n}" if k != "all" else n for k, n in store_options]
+        _sel = st.selectbox("매장 범위", range(len(store_options)), format_func=lambda i: _labels[i],
+                            key="ai_report_store_idx")
+        sel_key, sel_name = store_options[_sel]
+
+    run = st.button("🔍 데이터 미리보기 생성", type="primary", key="ai_report_build_btn")
+
+    if not run:
+        st.info("상단 조건을 선택한 뒤 '데이터 미리보기 생성'을 눌러 주세요.")
+        return
+
+    with st.spinner(f"데이터 집계 중… ({sel_name}, {start.isoformat()}~{end.isoformat()})"):
+        try:
+            dataset = srs.build_dataset(
+                period_type=("weekly" if period_type == "주간" else "monthly"),
+                start=start, end=end, store_key=sel_key,
+            )
+        except Exception as _e:
+            st.error(f"데이터셋 생성 실패: {_e}")
+            return
+
+    st.success(f"완료 · 대상: {dataset['store_name']} · {dataset['start_date']} ~ {dataset['end_date']}")
+
+    kpi = dataset["kpi"]
+    st.markdown("### 1️⃣ 핵심 KPI")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    _prev = kpi.get("prev_period") or {}
+    _yoy = kpi.get("prev_year") or {}
+    _fmt_pct = lambda v: (f"{v:+.1f}%" if isinstance(v, (int, float)) else "-")
+    with k1:
+        st.metric("순매출 (sales)", f"{kpi['sales_amount']:,}원",
+                  _fmt_pct(_prev.get("sales_diff_pct")))
+    with k2:
+        st.metric("판매건수", f"{kpi['sales_count']:,}건")
+    with k3:
+        st.metric("객단가", f"{kpi['aov']:,}원",
+                  _fmt_pct(_prev.get("aov_diff_pct")))
+    with k4:
+        st.metric("마진율", f"{kpi['margin_rate'] * 100:.1f}%")
+    with k5:
+        st.metric("실수납액", f"{kpi['payments_amount']:,}원")
+
+    with st.expander("전기 · 전년 비교 세부", expanded=False):
+        _rows = [{
+            "구간": "이번 기간", "기간": f"{dataset['start_date']} ~ {dataset['end_date']}",
+            "순매출": kpi["sales_amount"], "판매건수": kpi["sales_count"],
+            "객단가": kpi["aov"], "마진율(%)": round(kpi["margin_rate"] * 100, 1),
+            "실수납": kpi["payments_amount"],
+        }]
+        if _prev:
+            _rows.append({
+                "구간": "직전 동기간(WoW/MoM)", "기간": f"{_prev['start_date']} ~ {_prev['end_date']}",
+                "순매출": _prev["sales_amount"], "판매건수": _prev["sales_count"],
+                "객단가": _prev["aov"], "마진율(%)": round(_prev["margin_rate"] * 100, 1),
+                "실수납": _prev["payments_amount"],
+            })
+        if _yoy:
+            _rows.append({
+                "구간": "전년 동기간(YoY)", "기간": f"{_yoy['start_date']} ~ {_yoy['end_date']}",
+                "순매출": _yoy["sales_amount"], "판매건수": _yoy["sales_count"],
+                "객단가": _yoy["aov"], "마진율(%)": round(_yoy["margin_rate"] * 100, 1),
+                "실수납": _yoy["payments_amount"],
+            })
+        else:
+            st.caption("전년 동기간 데이터 없음 — YoY 섹션은 리포트에서 생략됩니다.")
+        st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### 2️⃣ 직원별 매출 Top 5")
+    _emp = dataset.get("by_employee") or []
+    if _emp:
+        st.dataframe(pd.DataFrame(_emp).rename(columns={
+            "name": "직원", "sales": "순매출(1/n 배분)", "count": "참여 건수"}),
+            use_container_width=True, hide_index=True)
+    else:
+        st.info("직원별 매출 데이터 없음")
+
+    st.markdown("### 3️⃣ 지역 · 아파트/건물")
+    g1, g2 = st.columns(2)
+    with g1:
+        st.caption("지역 (시군구 Top 5)")
+        _r = dataset.get("by_region") or []
+        if _r:
+            st.dataframe(pd.DataFrame(_r).rename(columns={
+                "region": "시군구", "sales": "매출", "count": "건수"}),
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("데이터 없음")
+    with g2:
+        st.caption("아파트/건물 (Top 10)")
+        _b = dataset.get("by_building") or []
+        if _b:
+            st.dataframe(pd.DataFrame(_b).rename(columns={
+                "name": "건물명", "sales": "매출", "count": "건수"}),
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("건물명 매핑된 데이터 없음 (카카오 지오코딩 필요)")
+
+    st.markdown("### 4️⃣ 유입 경로 · 구매 이유 · 카테고리")
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        st.caption("방문 경로")
+        _v = dataset.get("by_visit_reason") or []
+        if _v:
+            st.dataframe(pd.DataFrame(_v).rename(columns={
+                "visit_reason": "방문경로", "count": "건수", "sales": "매출", "share_pct": "비중(%)"}),
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("데이터 없음")
+    with r2:
+        st.caption("구매 이유")
+        _p = dataset.get("by_purchase_reason") or []
+        if _p:
+            st.dataframe(pd.DataFrame(_p).rename(columns={
+                "purchase_reason": "구매이유", "count": "건수", "sales": "매출", "share_pct": "비중(%)"}),
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("데이터 없음")
+    with r3:
+        st.caption("카테고리 (건수 · 비중)")
+        _c = dataset.get("by_category") or []
+        if _c:
+            st.dataframe(pd.DataFrame(_c).rename(columns={
+                "category": "카테고리", "count": "건수", "share_pct": "비중(%)"}),
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("데이터 없음")
+
+    with st.expander("방문×구매 조합 Top 5", expanded=False):
+        _m = dataset.get("visit_purchase_matrix_top5") or []
+        if _m:
+            st.dataframe(pd.DataFrame(_m).rename(columns={
+                "visit_reason": "방문경로", "purchase_reason": "구매이유",
+                "count": "건수", "sales": "매출"}),
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("데이터 없음")
+
+    st.markdown("### 5️⃣ 결제수단별 실수납")
+    _pm = dataset.get("by_payment_method") or []
+    if _pm:
+        st.dataframe(pd.DataFrame(_pm).rename(columns={
+            "payment_method": "결제수단", "amount": "금액", "count": "건수"}),
+            use_container_width=True, hide_index=True)
+    else:
+        st.info("데이터 없음")
+
+    st.markdown("### 6️⃣ 리드 활동")
+    _l = dataset.get("leads") or {}
+    if _l:
+        _lc = st.columns(5)
+        _lc[0].metric("신규 리드", f"{_l.get('new_leads', 0)}건")
+        _lc[1].metric("계약 완료", f"{_l.get('closed_deals', 0)}건")
+        _lc[2].metric("전환율", f"{_l.get('conversion_rate', 0) * 100:.1f}%")
+        _lc[3].metric("평균 클로징",
+                      f"{_l.get('avg_closing_days')}일" if _l.get('avg_closing_days') is not None else "-")
+        _lc[4].metric("사후관리율", f"{_l.get('followup_rate', 0) * 100:.1f}%")
+
+    st.markdown("### 7️⃣ 리스크")
+    _risk = dataset.get("risks") or {}
+    _u10 = _risk.get("unpaid_d10") or []
+    st.metric("전체 미수금 스냅샷", f"{_risk.get('total_unpaid', 0):,}원")
+    if _u10:
+        st.caption("배송 D-10 이내 잔금 있는 주문 (상위 20건)")
+        st.dataframe(pd.DataFrame(_u10), use_container_width=True, hide_index=True)
+    else:
+        st.info("D-10 이내 미수금 없음")
+
+    with st.expander("🧪 원본 dataset JSON (디버그)", expanded=False):
+        st.json(dataset)
+
+
 def render_faq_page():
     """전역 메뉴 FAQ: 검색 + 목록. 항목은 APP_FAQ_ITEMS에서 유지보수."""
     st.header("❓ FAQ (도움말)")
@@ -29235,6 +29447,8 @@ def main():
         render_display_sales_audit()
     elif role == "store_admin" and idx == 12:
         render_faq_page()
+    elif role == "store_admin" and idx == 13:
+        render_ai_sales_reports()
     elif role == "user" and idx == 9:
         render_faq_page()
 
