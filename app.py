@@ -2596,20 +2596,106 @@ def _invalidate_todos_local(db_filename: str):
 
 
 def clear_data_cache():
-    """
-    전체 데이터 캐시 무효화. 주문/결제/매장/직원 등 저장·수정·삭제 직후 호출하면
-    load_orders_cached, get_supabase_stores_dataframe_cached, _get_supabase_stores_list 등이 다음 조회 시 최신값을 가져옴.
-    세션 내 가용성 캐시(_supa_orders_avail, _supa_app_tables_avail)도 함께 초기화하여 최신 상태 반영.
+    """주문·결제·매장·직원 등 세일즈 도메인 데이터 캐시를 타깃 무효화.
+
+    Phase 1 성능 개선(P0-1): 기존 ``st.cache_data.clear()`` 전역 clear 를 제거하고
+    관련 캐시 함수만 개별적으로 ``.clear()`` 호출.
+      - 이유: 전역 clear 는 ERP(60~180s)·즐겨찾기(300s)·인력분석(300s)·문서(30s) 등
+        무관한 도메인 캐시까지 모두 무효화해 CRUD 1건 후 다음 페이지 콜드 스타트 유발.
+      - 이제 세일즈 CRUD 후에도 ERP/문서/즐겨찾기 캐시는 유지되어 재렌더가 훨씬 빠름.
+
+    새 코드는 도메인별 헬퍼(:func:`_invalidate_orders`, :func:`_invalidate_customers` …) 사용 권장.
     """
     if "_todos_local" in st.session_state:
         st.session_state["_todos_local"] = {}
-    # 세션 캐시 가용성 플래그 초기화 (테이블 구조 변경 시 재확인)
     for _k in ("_supa_orders_avail", "_supa_app_tables_avail"):
         st.session_state.pop(_k, None)
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
+
+    # Phase 1: 알려진 도메인 캐시 함수만 개별 clear (전역 st.cache_data.clear() 대체).
+    # 세일즈·매장·직원·고객·삭제요청 캐시를 포함 — 기존 clear_data_cache() 호출부가
+    # 기대하던 모든 갱신 시나리오를 유지하되, ERP/즐겨찾기/문서/인력분석/첨부 캐시는
+    # 무관하므로 유지되어 재렌더 속도 향상.
+    _domain_caches = (
+        # 세일즈 (주문·결제·매출·PH)
+        "_load_orders_supabase",
+        "_load_payments_supabase",
+        "load_orders_cached",
+        "load_payments_cached",
+        "load_sales_cached",
+        "load_sales_with_employees_cached",
+        "load_payment_history_dashboard_cached",
+        "_get_store_order_ids_cached",
+        "_cached_store_aov_30d",
+        "_cached_employee_monthly_max",
+        "_count_orders_on_date",
+        # 고객
+        "load_customers_cached",
+        "_load_customers_region_cached",
+        # 매장
+        "_get_supabase_stores_list_raw",
+        "_get_supabase_store_by_db_filename",
+        "_get_store_name_by_db",
+        "_get_supabase_store_assigned_employee_names",
+        # 직원·사용자
+        "_get_supabase_users_list",
+        "_get_supabase_user_store_ids",
+        "_get_supabase_user_allowed_stores",
+        "_get_supabase_employee_list_with_stores",
+        # 삭제 요청
+        "_fetch_pending_delete_requests",
+        # To-do
+        "load_todos_cached",
+    )
+    _g = globals()
+    for _name in _domain_caches:
+        _fn = _g.get(_name)
+        if _fn is None:
+            continue
+        try:
+            _fn.clear()
+        except Exception:
+            pass
+
+
+def _invalidate_orders() -> None:
+    """주문 CRUD 후 호출. 주문 · 매출 · 결제 통합 캐시 무효화."""
+    for _name in ("_load_orders_supabase", "load_orders_cached", "load_sales_cached",
+                  "load_sales_with_employees_cached", "_get_store_order_ids_cached",
+                  "_cached_store_aov_30d", "_cached_employee_monthly_max",
+                  "_count_orders_on_date"):
+        _fn = globals().get(_name)
+        if _fn is None:
+            continue
+        try:
+            _fn.clear()
+        except Exception:
+            pass
+
+
+def _invalidate_payments() -> None:
+    """결제 CRUD 후 호출. 결제 · 결제내역 · 매출(잔금 반영) 캐시 무효화."""
+    for _name in ("_load_payments_supabase", "load_payments_cached",
+                  "load_payment_history_dashboard_cached",
+                  "load_sales_cached", "load_orders_cached", "_load_orders_supabase"):
+        _fn = globals().get(_name)
+        if _fn is None:
+            continue
+        try:
+            _fn.clear()
+        except Exception:
+            pass
+
+
+def _invalidate_customers() -> None:
+    """고객 CRUD 후 호출. 고객 목록 · 지역 캐시 무효화."""
+    for _name in ("load_customers_cached", "_load_customers_region_cached"):
+        _fn = globals().get(_name)
+        if _fn is None:
+            continue
+        try:
+            _fn.clear()
+        except Exception:
+            pass
 
 
 def _ensure_tenant_schema(conn: sqlite3.Connection):
@@ -2774,7 +2860,10 @@ def _supabase_orders_payments_available() -> bool:
         return False
 
 
+@st.cache_data(ttl=1800)
 def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | None = None, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
+    """app_orders 조회. 30분 캐시 — CRUD 후 clear_data_cache() 로 즉시 무효화.
+    load_payments_supabase 와 동일한 캐시 정책 (대칭성 확보)."""
     if not db_filename:
         return pd.DataFrame()
     client, err = get_supabase_client()
@@ -11073,9 +11162,10 @@ def _erp_overtime_claims_cached(db_filename: str, status: str | None = None) -> 
         return []
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def _erp_compute_monthly_planned_minutes(employee_name: str, year: int, month: int,
                                          *, fallback_db: str | None = None) -> int:
-    """월간 계획 근무시간(분) 합산. 캘린더 상단 표시용.
+    """월간 계획 근무시간(분) 합산. 캘린더 상단 표시용. 120s 캐시 (근무 일정 변경 시 _erp_invalidate_fetch_caches 로 무효화).
 
     - app_shift_schedules 전 매장 합산 (해당 직원 · 해당 월 전체, 오늘 이후 포함).
     - shift_start/shift_end NULL 이면 fallback_db 매장 기본 시각으로 보정.
@@ -11117,9 +11207,11 @@ def _erp_compute_monthly_planned_minutes(employee_name: str, year: int, month: i
     return total_min
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                                    year: int, month: int) -> dict:
     """월 카운터 = 월 목표 - 누적 인정 시간. 반환: target_min, worked_min, remaining_min, percent.
+    120s 캐시 (근태/근무일정 변경 시 _erp_invalidate_fetch_caches 로 무효화).
 
     집계 정책 (yearly_breakdown과 동일):
       - app_attendance_logs + app_shift_schedules 모두 포함
@@ -11656,6 +11748,16 @@ def _erp_invalidate_fetch_caches(table: str) -> None:
             _erp_compute_remaining_comptime.clear()
         except Exception:
             pass
+    # 근태 집계 함수 캐시도 관련 테이블 변경 시 무효화 (P0-3)
+    if table in ("app_attendance_logs", "app_shift_schedules", "app_work_adjustments",
+                 "app_leave_grants", "app_employee_settings"):
+        for _fn in (_erp_compute_monthly_planned_minutes,
+                    _erp_compute_monthly_remaining,
+                    _erp_compute_yearly_breakdown):
+            try:
+                _fn.clear()
+            except Exception:
+                pass
 
 
 def _erp_insert_row(table: str, row: dict) -> tuple[bool, str]:
@@ -11938,9 +12040,11 @@ def _erp_find_active_period_target(db_filename: str, employee_name: str,
     return sorted(rows, key=lambda r: r.get("end_ym") or "")[-1]
 
 
+@st.cache_data(ttl=180, show_spinner=False)
 def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                                   year: int, as_of: date) -> dict:
     """연도별 대시보드용 근무 breakdown (통합 카테고리).
+    180s 캐시 (근태/신청 변경 시 _erp_invalidate_fetch_caches 로 무효화).
 
     ⚠️ 단일 소스 원칙 (v2.1 리팩터):
       - 카테고리 총합(normal/overtime/short/leave)은 **app_attendance_logs 만** 참조한다.
@@ -16755,7 +16859,10 @@ def render_document_library():
                                     st.warning(f"파일 업로드 실패 (글은 저장됨): {_ue}")
                         st.success("자료가 등록되었습니다.")
                         st.session_state["doc_show_form"] = False
-                        st.cache_data.clear()
+                        try:
+                            _fetch_docs.clear()
+                        except Exception:
+                            pass
                         st.rerun()
                     except Exception as _e:
                         st.error(f"등록 실패: {_e}")
@@ -16967,7 +17074,10 @@ def render_document_library():
                                     client.table("app_documents").delete().eq("id", _doc_id).execute()
                                     for _k in (f"doc_del_confirm_{_doc_id}", f"doc_expanded_{_doc_id}"):
                                         st.session_state.pop(_k, None)
-                                    st.cache_data.clear()
+                                    try:
+                                        _fetch_docs.clear()
+                                    except Exception:
+                                        pass
                                     st.rerun()
                                 except Exception as _e:
                                     st.error(f"삭제 실패: {_e}")
@@ -17044,7 +17154,10 @@ def render_document_library():
                                         client.table("app_documents").update(_upd).eq("id", doc_id).execute()
                                         st.success("수정되었습니다.")
                                         st.session_state.pop(f"doc_editing_{doc_id}", None)
-                                        st.cache_data.clear()
+                                        try:
+                                            _fetch_docs.clear()
+                                        except Exception:
+                                            pass
                                         st.rerun()
                                     except Exception as _e:
                                         st.error(f"수정 실패: {_e}")
@@ -28947,8 +29060,10 @@ def main():
     user = st.session_state.current_user
     role = user["role"]
 
-    # 세션 유지 하트비트: 5분(300,000ms)마다 rerun으로 Streamlit Cloud 세션 만료 방지
-    st_autorefresh(interval=300_000, limit=None, key="session_keepalive")
+    # 세션 유지 하트비트: 15분(900,000ms)마다 rerun.
+    # (Phase1 성능 개선 — 기존 5분 → 15분: 캐시 재검증·풀 rerun 빈도 감소.
+    #  Streamlit Cloud 세션 만료(30분+)에도 충분한 간격)
+    st_autorefresh(interval=900_000, limit=None, key="session_keepalive")
 
     # 쿼리 파라미터를 이용한 홈 이동(?home=1) 처리:
     # 로고 클릭 시 언제든지 메인 대시보드/홈으로 돌아갈 수 있도록,

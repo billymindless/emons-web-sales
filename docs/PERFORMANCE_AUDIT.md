@@ -1,8 +1,39 @@
 # 프로그램 로딩 성능 점검 (Performance Audit)
 
 > 작성일: 2026-07-10
+> 마지막 갱신: 2026-07-11 (Phase 1 적용 완료)
 > 대상: `emons-web-sales` Streamlit 앱 (`app.py` 및 부속 모듈)
 > 목적: 앱 전역 로딩·렌더 병목을 식별하고, 우선순위별 개선 방향을 정리한 실행 지향 문서
+
+## 진행 현황
+
+| Phase | 상태 | 커밋 |
+|-------|------|------|
+| Phase 1 (P0 + Phase1-5 + P3-1) | ✅ 완료 (2026-07-11) | 아래 상세 참조 |
+| Phase 2 | ⏳ 대기 | - |
+| Phase 3 | ⏳ 대기 | - |
+
+### Phase 1 적용 내역
+
+1. **P0-1** `clear_data_cache()` 리팩터 완료
+   - `st.cache_data.clear()` 전역 clear 제거
+   - 세일즈·고객·매장·직원·To-do 도메인 캐시만 개별 `.clear()` 호출 (24개 함수)
+   - 도메인별 헬퍼 신설: `_invalidate_orders()`, `_invalidate_payments()`, `_invalidate_customers()`
+2. **P0-2** `_load_orders_supabase` 에 `@st.cache_data(ttl=1800)` 추가 (payments 와 대칭)
+3. **P0-3** ERP 집계 3함수 캐싱
+   - `_erp_compute_monthly_planned_minutes` (ttl=120)
+   - `_erp_compute_monthly_remaining` (ttl=120)
+   - `_erp_compute_yearly_breakdown` (ttl=180)
+   - `_erp_invalidate_fetch_caches` 에 무효화 훅 추가
+4. **Phase1-5** `st_autorefresh` interval 5분 → 15분
+5. **P3-1** 문서함 3개 `st.cache_data.clear()` → `_fetch_docs.clear()` 국소화
+
+### Phase 1 예상 체감 개선
+
+- 저장 후 재렌더: **1–3초 단축** (ERP/문서/즐겨찾기 캐시 유지)
+- 근태 재진입: **1–2초 단축** (집계 함수 캐시 히트)
+- 홈 마진 모니터 · 백업 · 잔금 UI: **0.5–3초 단축** (`_load_orders_supabase` 캐시 히트)
+- 5분 → 15분 주기 완화로 유휴 시간 rerun 부담 감소
 
 ---
 
