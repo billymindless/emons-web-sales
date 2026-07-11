@@ -19,6 +19,7 @@ import calendar
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
@@ -26,6 +27,23 @@ from typing import Any
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_region_from_address(address: Any) -> str | None:
+    """주소 문자열에서 시군구(구/군) 추출. app.py extract_region() 미러링.
+
+    우선순위: 구/군 (예: '남구', '울주군')  ← 지역 표에서는 시군구가 가장 유용.
+    없으면 None (호출자가 '(지역 미기입)' 등으로 처리).
+    """
+    if not isinstance(address, str):
+        return None
+    s = address.strip()
+    if not s:
+        return None
+    m = re.search(r"([가-힣]+[구군])\b", s)
+    if m:
+        return m.group(1)
+    return None
 
 
 # ────────────────────────────────────────────────────────────────
@@ -241,8 +259,35 @@ def _fetch_payments(store_keys: list[str], start: date, end: date) -> pd.DataFra
         return pd.DataFrame()
 
 
+def _fetch_customers_by_ids(customer_ids: list[int]) -> pd.DataFrame:
+    """app_customers 를 customer_id 목록으로 조회 (매장 필터 없이).
+
+    이유: orders.customer_id 가 다른 매장의 store_name 으로 등록된 고객을 참조할 수 있음
+    (이관·중복등록·재구매 등). store_name 필터로 조회하면 merge 실패로 지역이 '미기입' 처리됨.
+    id in_ 방식은 매장 격리 안전 (orders 는 이미 매장 필터됨).
+    """
+    if not customer_ids:
+        return pd.DataFrame()
+    client = _get_client()
+    if client is None:
+        return pd.DataFrame()
+    _cols = "id, store_name, name, phone1, address, sigungu, bname, road_name, building_name"
+    # Supabase in_() 는 URL 길이 제한 있으므로 청크 단위로 조회
+    _CHUNK = 500
+    rows: list[dict] = []
+    for i in range(0, len(customer_ids), _CHUNK):
+        _batch = customer_ids[i:i + _CHUNK]
+        try:
+            r = client.table("app_customers").select(_cols).in_("id", _batch).execute()
+            rows.extend((r.data or []) if hasattr(r, "data") else [])
+        except Exception as _e:
+            logger.warning("_fetch_customers_by_ids batch failed (%d ids): %s", len(_batch), _e)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+# Backward-compat: 이전 사용처 (없음). 새 구현으로 위임.
 def _fetch_customers(store_names: list[str]) -> pd.DataFrame:
-    """app_customers.store_name 기준 조회. 지역·건물명 컬럼 포함."""
+    """(deprecated) store_name 기반 조회 — 지역 커버리지 저하로 build_dataset 에서는 미사용."""
     client = _get_client()
     if client is None or not store_names:
         return pd.DataFrame()
@@ -400,17 +445,32 @@ def group_by_employee(sales: pd.DataFrame, orders: pd.DataFrame, top: int = 5) -
 
 
 def group_by_region(orders: pd.DataFrame, customers: pd.DataFrame, top: int = 5) -> list[dict]:
-    """시군구별 매출·건수."""
+    """시군구별 매출·건수.
+
+    지역 결정 우선순위:
+      1) app_customers.sigungu (카카오 지오코딩 파생, 정확)
+      2) app_customers.address 문자열에서 '~구/~군' 정규식 파생 (fallback)
+      3) '(지역 미기입)'
+    """
     if orders.empty or customers.empty:
         return []
-    cust = customers[["id", "sigungu"]].rename(columns={"id": "customer_id"})
+    _need = ["id", "sigungu", "address"]
+    _use_cols = [c for c in _need if c in customers.columns]
+    cust = customers[_use_cols].rename(columns={"id": "customer_id"})
     df = orders.merge(cust, on="customer_id", how="left")
-    df["sigungu"] = df["sigungu"].fillna("(지역 미기입)")
+    # sigungu 우선, 없으면 address 정규식 파생
+    _sigungu = df["sigungu"].astype("object") if "sigungu" in df.columns else pd.Series([None] * len(df))
+    _addr = df["address"] if "address" in df.columns else pd.Series([None] * len(df))
+    _resolved = _sigungu.where(
+        _sigungu.notna() & (_sigungu.astype(str).str.strip() != ""),
+        _addr.map(_extract_region_from_address),
+    )
+    df["_region"] = _resolved.fillna("(지역 미기입)")
     df["_amount"] = _to_num(df["total_amount"])
-    grp = df.groupby("sigungu", as_index=False).agg(sales=("_amount", "sum"), count=("id", "count"))
+    grp = df.groupby("_region", as_index=False).agg(sales=("_amount", "sum"), count=("id", "count"))
     grp["sales"] = grp["sales"].round().astype(int)
     grp = grp.sort_values("sales", ascending=False).head(top)
-    return grp.rename(columns={"sigungu": "region"}).to_dict(orient="records")
+    return grp.rename(columns={"_region": "region"}).to_dict(orient="records")
 
 
 def group_by_building(orders: pd.DataFrame, customers: pd.DataFrame, top: int = 10) -> list[dict]:
@@ -622,7 +682,12 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
     orders = _fetch_orders(store_keys, start, end)
     sales = _fetch_sales(store_keys, start, end)
     payments = _fetch_payments(store_keys, start, end)
-    customers = _fetch_customers(store_names)
+    # 고객은 orders.customer_id 로 조회 (매장 필터 무관, merge 커버리지 최대화)
+    if not orders.empty and "customer_id" in orders.columns:
+        _cids = pd.to_numeric(orders["customer_id"], errors="coerce").dropna().astype(int).unique().tolist()
+    else:
+        _cids = []
+    customers = _fetch_customers_by_ids(_cids)
     leads = _fetch_leads(store_names, start, end)
 
     kpi_now = compute_kpi(sales, orders, payments)
