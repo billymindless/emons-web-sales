@@ -23690,9 +23690,6 @@ def _render_building_alias_admin():
     )
 
     role = st.session_state.get("user", {}).get("role", "user")
-    if role not in ("store_admin", "superadmin"):
-        st.info("관리자만 이 기능을 사용할 수 있습니다.")
-        return
 
     client, err = get_supabase_client()
     if err or client is None:
