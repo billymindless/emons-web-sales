@@ -8054,7 +8054,8 @@ def render_marketing_insights_superadmin():
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
 
 def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", key_prefix: str):
-    """일별 매출 추이 — 기준 월 1개(강조 실선) + 비교 월 최대 12개(회색 반투명 실선).
+    """일별 매출 추이 — 기준 월 1개(강조 실선) + 비교 월 최대 12개(회색 점선).
+    주말/공휴일 vrect 배경 음영, 요일별 평균 바 차트 포함.
     누적/일별 토글, Y축 단위(원/만원/백만원) 선택 지원."""
     import calendar as _cal
     try:
@@ -8067,6 +8068,8 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         _sdf["amount"] = pd.to_numeric(_sdf["amount"], errors="coerce").fillna(0)
         _sdf["_day"] = _sdf["transaction_date"].dt.day
         _sdf["_ym"] = _sdf["transaction_date"].dt.strftime("%Y-%m")
+        _sdf["_date"] = _sdf["transaction_date"].dt.date
+        _sdf["_dow"] = _sdf["transaction_date"].dt.weekday   # 0=월 … 6=일
 
         _avail_set = set(_sdf["_ym"].dropna().unique().tolist())
         _avail_set.add(today.strftime("%Y-%m"))
@@ -8107,13 +8110,46 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         _unit_fmt = {"만원": ",.1f", "백만원": ",.2f", "원": ",.0f"}[_unit_label]
         _is_cum = (_chart_mode == "누적")
 
-        # ── 기준 월 데이터 ────────────────────────────────────────
+        # ── [Step 1] 기준 월 데이터 전처리 ──────────────────────────
+        _KR_HOLIDAYS = {
+            date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
+            date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6),
+            date(2025, 6, 6), date(2025, 8, 15),
+            date(2025, 10, 3), date(2025, 10, 5), date(2025, 10, 6),
+            date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
+            date(2025, 12, 25),
+            date(2026, 1, 1),
+            date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
+            date(2026, 3, 1), date(2026, 3, 2),
+            date(2026, 5, 5), date(2026, 5, 24),
+            date(2026, 6, 3), date(2026, 6, 6), date(2026, 8, 15),
+            date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26), date(2026, 9, 28),
+            date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9),
+            date(2026, 12, 25),
+        }
+
         _base_dt = datetime.strptime(_base_ym, "%Y-%m").date()
         _base_year, _base_month = _base_dt.year, _base_dt.month
         _base_last_day = _cal.monthrange(_base_year, _base_month)[1]
         _is_current_month = (_base_ym == today.strftime("%Y-%m"))
         _base_max_day = today.day if _is_current_month else _base_last_day
         _base_days = list(range(1, _base_max_day + 1))
+
+        # is_weekend 파생변수: 토(5)/일(6) 또는 공휴일
+        def _day_info(d: int) -> dict:
+            try:
+                _d = date(_base_year, _base_month, d)
+                _dw = _d.weekday()
+                _is_hol = (_d in _KR_HOLIDAYS)
+                _is_sun = (_dw == 6)
+                _is_sat = (_dw == 5)
+                return {"date": _d, "dow": _dw, "is_holiday": _is_hol,
+                        "is_weekend": (_is_sat or _is_sun or _is_hol)}
+            except Exception:
+                return {"date": None, "dow": -1, "is_holiday": False, "is_weekend": False}
+
+        _base_day_meta = {d: _day_info(d) for d in _base_days}
+
         _base_grp = _sdf[_sdf["_ym"] == _base_ym].groupby("_day")["amount"].sum()
         _base_raw = [float(_base_grp.get(d, 0)) for d in _base_days]
         _base_sum = sum(_base_raw)
@@ -8131,40 +8167,23 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
 
         _base_plot = _to_plot(_base_raw)
 
-        # 기준 월 마커: 일요일=빨강, 토요일=파랑, 평일=다크블루
-        _KR_HOLIDAYS = {
-            date(2025, 1, 1), date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
-            date(2025, 3, 1), date(2025, 5, 5), date(2025, 5, 6),
-            date(2025, 6, 6), date(2025, 8, 15),
-            date(2025, 10, 3), date(2025, 10, 5), date(2025, 10, 6),
-            date(2025, 10, 7), date(2025, 10, 8), date(2025, 10, 9),
-            date(2025, 12, 25),
-            date(2026, 1, 1),
-            date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
-            date(2026, 3, 1), date(2026, 3, 2),
-            date(2026, 5, 5), date(2026, 5, 24),
-            date(2026, 6, 3), date(2026, 6, 6), date(2026, 8, 15),
-            date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26), date(2026, 9, 28),
-            date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9),
-            date(2026, 12, 25),
-        }
-        def _base_marker(d):
-            try:
-                _d = date(_base_year, _base_month, d)
-                _dw = _d.weekday()
-                if _d in _KR_HOLIDAYS or _dw == 6: return ("#E53935", 9)
-                if _dw == 5: return ("#1565C0", 9)
-                return ("#1B3A6B", 6)
-            except Exception:
-                return ("#1B3A6B", 6)
-        _base_mc = [_base_marker(d)[0] for d in _base_days]
-        _base_ms = [_base_marker(d)[1] for d in _base_days]
+        # ── [Step 2] 기준 월 마커 색상: 일/공휴일=빨강, 토=파랑, 평일=다크블루 ─
+        def _marker_style(d: int):
+            meta = _base_day_meta[d]
+            if meta["is_holiday"] or meta["dow"] == 6:
+                return "#E53935", 9
+            if meta["dow"] == 5:
+                return "#1565C0", 9
+            return "#1B3A6B", 6
+
+        _base_mc = [_marker_style(d)[0] for d in _base_days]
+        _base_ms = [_marker_style(d)[1] for d in _base_days]
 
         fig = go.Figure()
         _comp_rows = []
 
-        # ── 비교 월: 연한 회색 실선, 마커 없음 ──────────────────────
-        _COMP_COLOR = "rgba(170,170,170,0.45)"
+        # ── [Step 2] 비교 월: 회색 점선(dash='dot'), 마커 없음 ──────
+        _COMP_COLOR = "rgba(150,150,150,0.4)"
         for cm in _compare_yms:
             try:
                 _cm_dt = datetime.strptime(cm, "%Y-%m").date()
@@ -8178,7 +8197,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             fig.add_trace(go.Scatter(
                 x=_cm_days_full, y=_cm_plot, mode="lines",
                 name=cm,
-                line=dict(color=_COMP_COLOR, width=1.5),
+                line=dict(color=_COMP_COLOR, width=1.5, dash="dot"),
                 hovertemplate=f"%{{x}}일<br>%{{y:{_unit_fmt}}}{_unit_label}<extra>{cm}</extra>",
             ))
             _comp_rows.append({
@@ -8187,7 +8206,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                 "전체 누적": sum(_cm_raw),
             })
 
-        # ── 기준 월: 두꺼운 다크블루 실선, 마커 포함 (최상위 레이어) ─
+        # ── [Step 2] 기준 월: 두꺼운 다크블루 실선 + 마커 (최상위 레이어) ─
         fig.add_trace(go.Scatter(
             x=_base_days, y=_base_plot, mode="lines+markers",
             name=f"{_base_ym} (기준)",
@@ -8197,7 +8216,32 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             hovertemplate=f"%{{x}}일<br>%{{y:{_unit_fmt}}}{_unit_label}<extra>{_base_ym} (기준)</extra>",
         ))
 
-        # ── 범례용 마커 색상 안내 더미 트레이스 ─────────────────────
+        # ── [Step 3] 주말/공휴일 세로 배경 음영 (add_vrect, layer='below') ─
+        # 연속된 주말 구간을 묶어서 하나의 vrect 로 처리 (토+일 → 1개 vrect)
+        _wknd_groups: list[tuple[int, int]] = []
+        _in_group = False
+        _grp_start = 0
+        for _d in _base_days:
+            if _base_day_meta[_d]["is_weekend"]:
+                if not _in_group:
+                    _grp_start = _d
+                    _in_group = True
+            else:
+                if _in_group:
+                    _wknd_groups.append((_grp_start, _d - 1))
+                    _in_group = False
+        if _in_group:
+            _wknd_groups.append((_grp_start, _base_days[-1]))
+
+        for (_gs, _ge) in _wknd_groups:
+            fig.add_vrect(
+                x0=_gs - 0.5, x1=_ge + 0.5,
+                fillcolor="rgba(255,0,0,0.07)",
+                layer="below",
+                line_width=0,
+            )
+
+        # ── 범례용 더미 트레이스 ────────────────────────────────────
         for _legend_color, _legend_name in [
             ("#E53935", "일요일·공휴일"),
             ("#1565C0", "토요일"),
@@ -8210,18 +8254,92 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                 showlegend=True,
             ))
 
-        _ytitle = f"{'누적 ' if _is_cum else ''}매출({_unit_label})"
+        # ── [Step 4] Y축: 소수점 제거, 단위 명시 ────────────────────
+        _ytitle = f"{'누적 ' if _is_cum else ''}매출 ({_unit_label})"
         fig.update_layout(
             height=380, margin=dict(l=10, r=10, t=10, b=10),
             xaxis=dict(title="일(Day)", dtick=1 if _base_last_day <= 16 else 2,
                        tickfont=dict(size=11), gridcolor="#EEEEEE"),
-            yaxis=dict(title=_ytitle, tickformat=f",{'f' if _unit_div > 1 else '.0f'}",
+            yaxis=dict(title=_ytitle, tickformat=",.0f",
                        tickfont=dict(size=11), gridcolor="#EEEEEE"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02,
                         xanchor="right", x=1, font=dict(size=11)),
             plot_bgcolor="white", hovermode="x unified",
         )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+        # ── [Step 5] 요일별 평균 매출 바 차트 ────────────────────────
+        _DOW_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+        _all_dows_df = pd.DataFrame({"_dow": range(7)})
+
+        # 기준 월: 날짜별 일매출 합산 후 요일별 평균
+        _base_raw_sdf = _sdf[_sdf["_ym"] == _base_ym].copy()
+        if not _base_raw_sdf.empty:
+            _base_daily = _base_raw_sdf.groupby(["_date", "_dow"])["amount"].sum().reset_index()
+            _base_dow_avg = _base_daily.groupby("_dow")["amount"].mean().reset_index()
+        else:
+            _base_dow_avg = pd.DataFrame({"_dow": range(7), "amount": [0.0] * 7})
+
+        _base_dow_avg = _all_dows_df.merge(_base_dow_avg, on="_dow", how="left").fillna({"amount": 0.0})
+        _base_dow_avg["amount"] = _base_dow_avg["amount"] / _unit_div
+        _base_dow_avg["label"] = _base_dow_avg["_dow"].map(lambda x: _DOW_LABELS[x])
+        _base_dow_avg["color"] = _base_dow_avg["_dow"].map(
+            lambda x: "#E53935" if x == 6 else ("#1565C0" if x == 5 else "#1B3A6B")
+        )
+
+        fig_dow = go.Figure()
+        fig_dow.add_trace(go.Bar(
+            x=_base_dow_avg["label"].tolist(),
+            y=_base_dow_avg["amount"].tolist(),
+            marker_color=_base_dow_avg["color"].tolist(),
+            name=f"{_base_ym} (기준)",
+            hovertemplate=f"%{{x}}<br>일평균: %{{y:{_unit_fmt}}}{_unit_label}<extra>{_base_ym}</extra>",
+        ))
+
+        # 비교 월 요일 평균 (최대 3개, 회색 반투명)
+        _cm_colors = [
+            "rgba(150,150,150,0.45)", "rgba(120,120,120,0.35)", "rgba(90,90,90,0.3)",
+        ]
+        for _ci, cm in enumerate(_compare_yms[:3]):
+            _cm_raw_sdf = _sdf[_sdf["_ym"] == cm].copy()
+            if _cm_raw_sdf.empty:
+                continue
+            _cm_daily = _cm_raw_sdf.groupby(["_date", "_dow"])["amount"].sum().reset_index()
+            _cm_dow_avg = _cm_daily.groupby("_dow")["amount"].mean().reset_index()
+            _cm_dow_avg = _all_dows_df.merge(_cm_dow_avg, on="_dow", how="left").fillna({"amount": 0.0})
+            _cm_dow_avg["amount"] = _cm_dow_avg["amount"] / _unit_div
+            _cm_dow_avg["label"] = _cm_dow_avg["_dow"].map(lambda x: _DOW_LABELS[x])
+            fig_dow.add_trace(go.Bar(
+                x=_cm_dow_avg["label"].tolist(),
+                y=_cm_dow_avg["amount"].tolist(),
+                marker_color=_cm_colors[_ci % len(_cm_colors)],
+                name=f"{cm}",
+                hovertemplate=f"%{{x}}<br>일평균: %{{y:{_unit_fmt}}}{_unit_label}<extra>{cm}</extra>",
+            ))
+
+        fig_dow.update_layout(
+            height=260,
+            margin=dict(l=10, r=10, t=36, b=10),
+            title=dict(text=f"요일별 평균 매출 — {_base_ym} 기준 (주말 강조)", font_size=13),
+            xaxis=dict(
+                title="요일", tickfont=dict(size=12),
+                categoryorder="array", categoryarray=_DOW_LABELS,
+            ),
+            yaxis=dict(title=f"일평균 ({_unit_label})", tickformat=",.0f", tickfont=dict(size=11)),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                        xanchor="right", x=1, font=dict(size=11)),
+            plot_bgcolor="white",
+            barmode="group",
+        )
+        # 주말 구간 배경 음영 (토=5, 일=6)
+        for _wknd_label in ["토", "일"]:
+            fig_dow.add_vrect(
+                x0=_DOW_LABELS.index(_wknd_label) - 0.5,
+                x1=_DOW_LABELS.index(_wknd_label) + 0.5,
+                fillcolor="rgba(255,0,0,0.07)",
+                layer="below", line_width=0,
+            )
+        st.plotly_chart(fig_dow, use_container_width=True, config={"displayModeBar": False})
 
         # ── 비교 요약 테이블 ──────────────────────────────────────
         def _fmt(v): return f"{v / _unit_div:{_unit_fmt}}{_unit_label}"
@@ -8240,7 +8358,10 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                     "비교월 전체 누적": _fmt(_all),
                 })
             st.dataframe(pd.DataFrame(_tbl), use_container_width=True, hide_index=True)
-        st.caption("💡 기준 월(굵은 실선)이 전면에, 비교 월(회색 실선)이 배경으로 표시됩니다.")
+        st.caption(
+            "💡 기준 월(굵은 실선·컬러 마커)이 전면에, 비교 월(회색 점선)이 배경으로 표시됩니다. "
+            "붉은 음영 = 주말·공휴일 구간."
+        )
     except Exception as _e_chart:
         st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_chart}")
 
