@@ -608,23 +608,31 @@ def compute_lead_kpi(leads: pd.DataFrame) -> dict:
 
 
 def collect_risks(store_keys: list[str], today: date) -> dict:
-    """미수금 D-10 이내 · 전체 미수금 집계 (기간 무관, 스냅샷).
+    """실질 회수 대상 미수금 스냅샷.
 
-    app_orders.balance_status 대신 sales.unpaid_balance 를 신뢰 가능한 소스로 사용.
+    app.py 대시보드('배송 D-10 이내 + 잔금>0') 정의를 확장:
+      - 배송일이 (오늘 - 10)일 ~ (오늘 + 10)일 사이의 잔금
+      - 완납·이상결제(balance_status) 는 제외
+      - 총계는 이 범위 안의 회수 대상만 합산 (매장 개설 이래 총액은 부적절)
+
+    반환:
+      total_unpaid: 회수 대상 범위(D-10 과거·미래) 미수금 총액
+      total_unpaid_all: 매장 전체 미완결 잔금 (참고용, 초기 이관·부실 포함 가능)
+      unpaid_d10: 우선 회수 대상 상위 리스트 (배송 지남 ~ D+10)
     """
     client = _get_client()
     if client is None or not store_keys:
-        return {"unpaid_d10": [], "total_unpaid": 0}
+        return {"unpaid_d10": [], "total_unpaid": 0, "total_unpaid_all": 0}
     try:
         r = client.table("app_orders").select(
             "id, db_filename, customer_id, delivery_date, total_amount, balance_status"
         ).in_("db_filename", store_keys).execute()
         orders = pd.DataFrame((r.data or []))
         if orders.empty:
-            return {"unpaid_d10": [], "total_unpaid": 0}
+            return {"unpaid_d10": [], "total_unpaid": 0, "total_unpaid_all": 0}
     except Exception:
-        return {"unpaid_d10": [], "total_unpaid": 0}
-    # 잔금 있는 주문
+        return {"unpaid_d10": [], "total_unpaid": 0, "total_unpaid_all": 0}
+
     try:
         r2 = client.table("app_payments").select("order_id, amount")\
             .in_("db_filename", store_keys).execute()
@@ -641,15 +649,25 @@ def collect_risks(store_keys: list[str], today: date) -> dict:
     else:
         orders["paid"] = 0
     orders["balance"] = orders["_tot"] - orders["paid"]
-    unpaid = orders[orders["balance"] > 0].copy()
-    total_unpaid = int(unpaid["balance"].sum()) if not unpaid.empty else 0
 
-    # D-10 (배송일이 오늘 이전, 오늘 - 10 이내)
+    # balance_status 로 완납·이상결제 제외 (app.py 관례: '미납' 이 회수 대상)
+    if "balance_status" in orders.columns:
+        _bs = orders["balance_status"].fillna("").astype(str).str.strip()
+        orders = orders[~_bs.isin(["완납", "이상결제"])].copy()
+
+    unpaid = orders[orders["balance"] > 0].copy()
+    total_unpaid_all = int(unpaid["balance"].sum()) if not unpaid.empty else 0
+
+    # 회수 대상 범위: 배송일 (오늘 - 10) ~ (오늘 + 10) — app.py 대시보드 관례
     unpaid["delivery_date"] = pd.to_datetime(unpaid["delivery_date"], errors="coerce").dt.date
-    _d10 = unpaid[(unpaid["delivery_date"].notna()) &
-                  (unpaid["delivery_date"] >= today - timedelta(days=10)) &
-                  (unpaid["delivery_date"] <= today)].copy()
-    _d10 = _d10.sort_values("balance", ascending=False).head(20)
+    _range_lo = today - timedelta(days=10)
+    _range_hi = today + timedelta(days=10)
+    _in_range = unpaid[(unpaid["delivery_date"].notna()) &
+                       (unpaid["delivery_date"] >= _range_lo) &
+                       (unpaid["delivery_date"] <= _range_hi)].copy()
+    total_unpaid = int(_in_range["balance"].sum()) if not _in_range.empty else 0
+
+    _top = _in_range.sort_values("balance", ascending=False).head(20)
     unpaid_d10 = [
         {
             "order_id": int(r["id"]),
@@ -657,9 +675,13 @@ def collect_risks(store_keys: list[str], today: date) -> dict:
             "delivery_date": r["delivery_date"].isoformat() if pd.notna(r["delivery_date"]) else None,
             "balance": int(r["balance"]),
         }
-        for _, r in _d10.iterrows()
+        for _, r in _top.iterrows()
     ]
-    return {"unpaid_d10": unpaid_d10, "total_unpaid": total_unpaid}
+    return {
+        "unpaid_d10": unpaid_d10,
+        "total_unpaid": total_unpaid,           # 회수 대상 (D-10 ~ D+10)
+        "total_unpaid_all": total_unpaid_all,   # 참고: 매장 전체 미완결 잔금
+    }
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1063,11 +1085,14 @@ def render_markdown(dataset: dict, ai_summary: dict | None = None) -> str:
         lines.append("_(AI 요약 미생성)_\n")
 
     # 7. 리스크 · 미수금
-    lines.append("\n## 7. 리스크 · 미수금 스냅샷\n")
+    lines.append("\n## 7. 리스크 · 미수금 회수 대상\n")
     risks = dataset.get("risks") or {}
-    lines.append(f"- **전체 미수금:** {_fmt_krw(risks.get('total_unpaid'))}")
+    lines.append(f"- **회수 대상 미수금 (배송 D-10 ~ D+10):** {_fmt_krw(risks.get('total_unpaid'))}")
+    if risks.get("total_unpaid_all") is not None:
+        lines.append(f"- **전체 미완결 잔금 (참고):** {_fmt_krw(risks.get('total_unpaid_all'))} "
+                     "_※ 매장 개설 이래 초기 이관·부실 데이터 포함 가능_")
     u10 = risks.get("unpaid_d10") or []
-    lines.append(f"- **D-10 이내 잔금 있는 주문:** {len(u10)}건")
+    lines.append(f"- **우선 회수 대상 건수 (D-10 지남 ~ D+10):** {len(u10)}건")
     if u10:
         lines.append("")
         lines.append(_md_table(u10[:10], [

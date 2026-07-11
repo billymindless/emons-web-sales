@@ -23740,15 +23740,22 @@ def _render_ai_sales_reports_new(srs):
                       f"{_l.get('avg_closing_days')}일" if _l.get('avg_closing_days') is not None else "-")
         _lc[4].metric("사후관리율", f"{_l.get('followup_rate', 0) * 100:.1f}%")
 
-    st.markdown("### 7️⃣ 리스크")
+    st.markdown("### 7️⃣ 리스크 (미수금 회수 대상)")
     _risk = dataset.get("risks") or {}
     _u10 = _risk.get("unpaid_d10") or []
-    st.metric("전체 미수금 스냅샷", f"{_risk.get('total_unpaid', 0):,}원")
+    _rc1, _rc2 = st.columns(2)
+    with _rc1:
+        st.metric("회수 대상 미수금", f"{_risk.get('total_unpaid', 0):,}원",
+                  help="배송일 D-10 ~ D+10 · 잔금>0 · 완납·이상결제 제외 (app.py 대시보드 정의와 일관)")
+    with _rc2:
+        _all_val = _risk.get("total_unpaid_all", 0)
+        st.metric("전체 미완결 잔금 (참고)", f"{_all_val:,}원",
+                  help="매장 개설 이래 잔금>0 인 모든 미완결 주문 합. 초기 이관·부실 데이터 포함 가능")
     if _u10:
-        st.caption("배송 D-10 이내 잔금 있는 주문 (상위 20건)")
+        st.caption("우선 회수 대상 (D-10 지남 ~ D+10 이내, 상위 20건)")
         st.dataframe(pd.DataFrame(_u10), use_container_width=True, hide_index=True)
     else:
-        st.info("D-10 이내 미수금 없음")
+        st.info("회수 대상 미수금 없음")
 
     with st.expander("🧪 원본 dataset JSON (디버그)", expanded=False):
         st.json(dataset)
