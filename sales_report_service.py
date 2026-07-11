@@ -316,6 +316,38 @@ def _fetch_leads(store_names: list[str], start: date, end: date) -> pd.DataFrame
         return pd.DataFrame()
 
 
+def _fetch_building_aliases(store_names: list[str]) -> dict[str, str]:
+    """app_building_aliases 조회 → {keyword: canonical_building_name} dict 반환.
+
+    신규 입주 아파트처럼 카카오 도로명이 아직 없어 building_name 이 NULL 인 고객을
+    관리자가 수동 매핑한 별칭 사전. group_by_building() 의 alias fallback 에 사용.
+    테이블이 없거나 매장별 매핑이 하나도 없으면 빈 dict 반환 (조용히 무시).
+    """
+    if not store_names:
+        return {}
+    client = _get_client()
+    if client is None:
+        return {}
+    try:
+        r = (
+            client.table("app_building_aliases")
+            .select("keyword, building_name")
+            .in_("store_name", store_names)
+            .execute()
+        )
+        rows = (r.data or []) if hasattr(r, "data") else []
+    except Exception as _e:
+        logger.info("_fetch_building_aliases skipped (table missing or query failed): %s", _e)
+        return {}
+    result: dict[str, str] = {}
+    for row in rows:
+        _kw = (row.get("keyword") or "").strip()
+        _bn = (row.get("building_name") or "").strip()
+        if _kw and _bn:
+            result[_kw] = _bn
+    return result
+
+
 def _fetch_stores_list(include_inactive: bool = False) -> list[dict]:
     """app_stores 조회 (app.py 의존성 없이 self-contained)."""
     # 1) Streamlit 캐시 활용
@@ -473,13 +505,40 @@ def group_by_region(orders: pd.DataFrame, customers: pd.DataFrame, top: int = 5)
     return grp.rename(columns={"_region": "region"}).to_dict(orient="records")
 
 
-def group_by_building(orders: pd.DataFrame, customers: pd.DataFrame, top: int = 10) -> list[dict]:
-    """건물명(아파트/오피스텔) 별 매출·건수."""
+def group_by_building(
+    orders: pd.DataFrame,
+    customers: pd.DataFrame,
+    top: int = 10,
+    aliases: dict[str, str] | None = None,
+) -> list[dict]:
+    """건물명(아파트/오피스텔) 별 매출·건수.
+
+    building_name 이 비어있는 행에 대해 aliases({keyword: canonical_name}) 를
+    address 문자열 부분 일치로 적용하는 fallback 을 지원.
+    신규 입주 아파트처럼 카카오 도로명이 아직 없는 주소를 관리자 매핑으로 통합한다.
+    """
     if orders.empty or customers.empty:
         return []
-    cust = customers[["id", "building_name"]].rename(columns={"id": "customer_id"})
+    _cust_cols = ["id", "building_name"]
+    if "address" in customers.columns:
+        _cust_cols.append("address")
+    cust = customers[_cust_cols].rename(columns={"id": "customer_id"})
     df = orders.merge(cust, on="customer_id", how="left")
     df["building_name"] = df["building_name"].fillna("").astype(str).str.strip()
+
+    if aliases and "address" in df.columns:
+        _addr = df["address"].fillna("").astype(str)
+        remaining = df["building_name"] == ""
+        # 긴 키워드 우선 매칭 (예: '달천이파크1차' 를 '달천이파크' 보다 먼저 시도)
+        for kw in sorted(aliases.keys(), key=len, reverse=True):
+            if not remaining.any():
+                break
+            canonical = aliases[kw]
+            hit = remaining & _addr.str.contains(re.escape(kw), case=False, na=False)
+            if hit.any():
+                df.loc[hit, "building_name"] = canonical
+                remaining = remaining & ~hit
+
     df = df[df["building_name"] != ""]
     if df.empty:
         return []
@@ -711,6 +770,7 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
         _cids = []
     customers = _fetch_customers_by_ids(_cids)
     leads = _fetch_leads(store_names, start, end)
+    building_aliases = _fetch_building_aliases(store_names)
 
     kpi_now = compute_kpi(sales, orders, payments)
 
@@ -762,7 +822,7 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
         "kpi": kpi_now,
         "by_employee": group_by_employee(sales, orders),
         "by_region": group_by_region(orders, customers),
-        "by_building": group_by_building(orders, customers),
+        "by_building": group_by_building(orders, customers, aliases=building_aliases),
         "by_category": group_by_category(orders),
         "by_visit_reason": group_by_visit_reason(orders),
         "by_purchase_reason": group_by_purchase_reason(orders),

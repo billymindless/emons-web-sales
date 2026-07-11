@@ -23674,6 +23674,136 @@ def _faq_filter_items(query: str) -> list[dict[str, str]]:
     return out
 
 
+def _render_building_alias_admin():
+    """건물명 별칭(alias) 관리 UI.
+
+    신규 입주 아파트처럼 카카오 도로명 주소가 아직 생성되지 않아
+    app_customers.building_name 이 NULL 인 고객들을, 관리자가 수동으로
+    '주소 부분 일치 키워드 → 정식 건물명'으로 매핑하여
+    AI 세일즈 리포트 「아파트/건물 Top」 집계에 반영한다.
+    """
+    st.markdown("### 🏢 건물명 별칭(alias) 관리")
+    st.caption(
+        "신규 입주 아파트처럼 도로명 주소가 없어 자동 지오코딩이 안 된 고객을, "
+        "주소 키워드로 정식 건물명에 통합 매핑합니다. "
+        "예: 주소에 '달천이파크'가 포함된 고객 매출을 모두 '달천이파크1차아파트'로 집계."
+    )
+
+    role = st.session_state.get("user", {}).get("role", "user")
+    if role not in ("store_admin", "superadmin"):
+        st.info("관리자만 이 기능을 사용할 수 있습니다.")
+        return
+
+    client, err = get_supabase_client()
+    if err or client is None:
+        st.error(f"Supabase 연결 불가: {err}")
+        return
+
+    current_db = st.session_state.get("current_db")
+    if role == "superadmin":
+        _stores = _get_supabase_stores_list(include_inactive=False) or []
+        _opts = {s.get("store_name"): s for s in _stores if s.get("store_name")}
+        _sel_name = st.selectbox("대상 매장", list(_opts.keys()), key="alias_admin_store_sel")
+        store_name = _sel_name or ""
+    else:
+        store_name = _get_current_store_name_for_customers(current_db) if current_db else ""
+        if not store_name:
+            st.warning("현재 매장 정보를 확인할 수 없습니다.")
+            return
+        st.caption(f"대상 매장: **{store_name}**")
+
+    try:
+        r = (
+            client.table("app_building_aliases")
+            .select("id, keyword, building_name, created_at, updated_at")
+            .eq("store_name", store_name)
+            .order("building_name")
+            .execute()
+        )
+        rows = (r.data or []) if hasattr(r, "data") else []
+    except Exception as _e:
+        st.error(
+            f"별칭 목록 조회 실패: {_e}\n\n"
+            "`SUPABASE_APP_BUILDING_ALIASES.sql` 을 Supabase SQL Editor 에서 먼저 실행하세요."
+        )
+        return
+
+    st.markdown("#### ➕ 새 별칭 등록")
+    with st.form(key="alias_add_form", clear_on_submit=True):
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            new_kw = st.text_input(
+                "주소 키워드",
+                placeholder="예: 달천이파크",
+                help="app_customers.address 에 이 키워드가 포함된 고객이 매핑 대상이 됩니다.",
+            )
+        with fc2:
+            new_bn = st.text_input(
+                "정식 건물명",
+                placeholder="예: 달천이파크1차아파트",
+                help="리포트 집계 결과에 표시될 통합 이름.",
+            )
+        _add = st.form_submit_button("추가", type="primary")
+        if _add:
+            _kw_clean = (new_kw or "").strip()
+            _bn_clean = (new_bn or "").strip()
+            if not _kw_clean or not _bn_clean:
+                st.warning("키워드와 정식 건물명을 모두 입력해 주세요.")
+            else:
+                try:
+                    client.table("app_building_aliases").upsert(
+                        {
+                            "store_name": store_name,
+                            "keyword": _kw_clean,
+                            "building_name": _bn_clean,
+                            "updated_at": datetime.now().isoformat(),
+                        },
+                        on_conflict="store_name,keyword",
+                    ).execute()
+                    st.success(f"'{_kw_clean}' → '{_bn_clean}' 매핑을 저장했습니다.")
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"저장 실패: {_e}")
+
+    st.markdown("#### 📋 등록된 별칭 목록")
+    if not rows:
+        st.info("등록된 별칭이 없습니다. 위에서 새 별칭을 추가하세요.")
+        return
+
+    _df = pd.DataFrame(rows).rename(columns={
+        "id": "ID",
+        "keyword": "주소 키워드",
+        "building_name": "정식 건물명",
+        "created_at": "생성",
+        "updated_at": "수정",
+    })
+    st.dataframe(
+        _df[["ID", "주소 키워드", "정식 건물명", "수정"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("#### 🗑️ 별칭 삭제")
+    _opt_map = {
+        f"{row['keyword']} → {row['building_name']} (#{row['id']})": row["id"]
+        for row in rows
+    }
+    _sel_label = st.selectbox(
+        "삭제할 별칭 선택",
+        list(_opt_map.keys()),
+        key="alias_admin_del_sel",
+    )
+    if st.button("삭제", key="alias_admin_del_btn", type="secondary"):
+        _sel_id = _opt_map.get(_sel_label)
+        if _sel_id:
+            try:
+                client.table("app_building_aliases").delete().eq("id", _sel_id).execute()
+                st.success("별칭이 삭제되었습니다.")
+                st.rerun()
+            except Exception as _e:
+                st.error(f"삭제 실패: {_e}")
+
+
 def render_ai_sales_reports():
     """AI 세일즈 리포트 (Phase 2 · AI 요약 + 문서 생성/저장/다운로드).
 
@@ -23688,12 +23818,16 @@ def render_ai_sales_reports():
         st.error(f"sales_report_service 모듈 로드 실패: {_e}")
         return
 
-    tab_new, tab_saved = st.tabs(["🆕 새 리포트 생성", "📂 저장된 리포트"])
+    tab_new, tab_saved, tab_alias = st.tabs(
+        ["🆕 새 리포트 생성", "📂 저장된 리포트", "🏢 건물명 별칭 관리"]
+    )
 
     with tab_new:
         _render_ai_sales_reports_new(srs)
     with tab_saved:
         _render_ai_sales_reports_saved(srs)
+    with tab_alias:
+        _render_building_alias_admin()
 
 
 def _render_ai_sales_reports_new(srs):
@@ -26948,7 +27082,7 @@ def render_customer_balance():
                                                     "phone2": st.session_state.get(f"{edit_prefix}_phone2") or None,
                                                     "address": st.session_state.get(f"{edit_prefix}_address") or None,
                                                 }
-                                                # 주소가 있으면 카카오 지오코딩으로 위도/경도 자동 업데이트
+                                                # 주소가 있으면 카카오 지오코딩으로 위도/경도 + 지역 컬럼 자동 업데이트
                                                 _upd_addr = upd_cust.get("address")
                                                 if _upd_addr:
                                                     try:
@@ -26956,6 +27090,10 @@ def render_customer_balance():
                                                         if _geo:
                                                             upd_cust["latitude"] = _geo["latitude"]
                                                             upd_cust["longitude"] = _geo["longitude"]
+                                                            for _k in ("sigungu", "bname", "road_name", "building_name"):
+                                                                _v = _geo.get(_k)
+                                                                if _v:
+                                                                    upd_cust[_k] = _v
                                                     except Exception:
                                                         pass
                                                 sc.table("app_customers").update(upd_cust).eq("store_name", store_name).eq("id", cid).execute()
