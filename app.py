@@ -23625,6 +23625,14 @@ def _render_ai_sales_reports_new(srs):
     with k5:
         st.metric("실수납액", f"{kpi['payments_amount']:,}원")
 
+    def _fmt_krw_col(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+        """지정 컬럼을 '1,234,567원' 형식 문자열로 변환 (천 단위 쉼표)."""
+        df = df.copy()
+        for c in cols:
+            if c in df.columns:
+                df[c] = df[c].apply(lambda v: f"{int(v):,}원" if pd.notna(v) and v != "" else "-")
+        return df
+
     with st.expander("전기 · 전년 비교 세부", expanded=False):
         _rows = [{
             "구간": "이번 기간", "기간": f"{dataset['start_date']} ~ {dataset['end_date']}",
@@ -23648,14 +23656,17 @@ def _render_ai_sales_reports_new(srs):
             })
         else:
             st.caption("전년 동기간 데이터 없음 — YoY 섹션은 리포트에서 생략됩니다.")
-        st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+        _cmp_df = _fmt_krw_col(pd.DataFrame(_rows), ["순매출", "객단가", "실수납"])
+        st.dataframe(_cmp_df, use_container_width=True, hide_index=True)
 
     st.markdown("### 2️⃣ 직원별 매출 Top 5")
     _emp = dataset.get("by_employee") or []
     if _emp:
-        st.dataframe(pd.DataFrame(_emp).rename(columns={
-            "name": "직원", "sales": "순매출(1/n 배분)", "count": "참여 건수"}),
-            use_container_width=True, hide_index=True)
+        _emp_df = _fmt_krw_col(
+            pd.DataFrame(_emp).rename(columns={"name": "직원", "sales": "순매출(1/n 배분)", "count": "참여 건수"}),
+            ["순매출(1/n 배분)"]
+        )
+        st.dataframe(_emp_df, use_container_width=True, hide_index=True)
     else:
         st.info("직원별 매출 데이터 없음")
 
@@ -23665,18 +23676,22 @@ def _render_ai_sales_reports_new(srs):
         st.caption("지역 (시군구 Top 5)")
         _r = dataset.get("by_region") or []
         if _r:
-            st.dataframe(pd.DataFrame(_r).rename(columns={
-                "region": "시군구", "sales": "매출", "count": "건수"}),
-                use_container_width=True, hide_index=True)
+            _r_df = _fmt_krw_col(
+                pd.DataFrame(_r).rename(columns={"region": "시군구", "sales": "매출", "count": "건수"}),
+                ["매출"]
+            )
+            st.dataframe(_r_df, use_container_width=True, hide_index=True)
         else:
             st.info("데이터 없음")
     with g2:
         st.caption("아파트/건물 (Top 10)")
         _b = dataset.get("by_building") or []
         if _b:
-            st.dataframe(pd.DataFrame(_b).rename(columns={
-                "name": "건물명", "sales": "매출", "count": "건수"}),
-                use_container_width=True, hide_index=True)
+            _b_df = _fmt_krw_col(
+                pd.DataFrame(_b).rename(columns={"name": "건물명", "sales": "매출", "count": "건수"}),
+                ["매출"]
+            )
+            st.dataframe(_b_df, use_container_width=True, hide_index=True)
         else:
             st.info("건물명 매핑된 데이터 없음 (카카오 지오코딩 필요)")
 
@@ -23686,18 +23701,22 @@ def _render_ai_sales_reports_new(srs):
         st.caption("방문 경로")
         _v = dataset.get("by_visit_reason") or []
         if _v:
-            st.dataframe(pd.DataFrame(_v).rename(columns={
-                "visit_reason": "방문경로", "count": "건수", "sales": "매출", "share_pct": "비중(%)"}),
-                use_container_width=True, hide_index=True)
+            _v_df = _fmt_krw_col(
+                pd.DataFrame(_v).rename(columns={"visit_reason": "방문경로", "count": "건수", "sales": "매출", "share_pct": "비중(%)"}),
+                ["매출"]
+            )
+            st.dataframe(_v_df, use_container_width=True, hide_index=True)
         else:
             st.info("데이터 없음")
     with r2:
         st.caption("구매 이유")
         _p = dataset.get("by_purchase_reason") or []
         if _p:
-            st.dataframe(pd.DataFrame(_p).rename(columns={
-                "purchase_reason": "구매이유", "count": "건수", "sales": "매출", "share_pct": "비중(%)"}),
-                use_container_width=True, hide_index=True)
+            _p_df = _fmt_krw_col(
+                pd.DataFrame(_p).rename(columns={"purchase_reason": "구매이유", "count": "건수", "sales": "매출", "share_pct": "비중(%)"}),
+                ["매출"]
+            )
+            st.dataframe(_p_df, use_container_width=True, hide_index=True)
         else:
             st.info("데이터 없음")
     with r3:
@@ -23713,19 +23732,22 @@ def _render_ai_sales_reports_new(srs):
     with st.expander("방문×구매 조합 Top 5", expanded=False):
         _m = dataset.get("visit_purchase_matrix_top5") or []
         if _m:
-            st.dataframe(pd.DataFrame(_m).rename(columns={
-                "visit_reason": "방문경로", "purchase_reason": "구매이유",
-                "count": "건수", "sales": "매출"}),
-                use_container_width=True, hide_index=True)
+            _m_df = _fmt_krw_col(
+                pd.DataFrame(_m).rename(columns={"visit_reason": "방문경로", "purchase_reason": "구매이유", "count": "건수", "sales": "매출"}),
+                ["매출"]
+            )
+            st.dataframe(_m_df, use_container_width=True, hide_index=True)
         else:
             st.info("데이터 없음")
 
     st.markdown("### 5️⃣ 결제수단별 실수납")
     _pm = dataset.get("by_payment_method") or []
     if _pm:
-        st.dataframe(pd.DataFrame(_pm).rename(columns={
-            "payment_method": "결제수단", "amount": "금액", "count": "건수"}),
-            use_container_width=True, hide_index=True)
+        _pm_df = _fmt_krw_col(
+            pd.DataFrame(_pm).rename(columns={"payment_method": "결제수단", "amount": "금액", "count": "건수"}),
+            ["금액"]
+        )
+        st.dataframe(_pm_df, use_container_width=True, hide_index=True)
     else:
         st.info("데이터 없음")
 
@@ -23753,7 +23775,8 @@ def _render_ai_sales_reports_new(srs):
                   help="매장 개설 이래 잔금>0 인 모든 미완결 주문 합. 초기 이관·부실 데이터 포함 가능")
     if _u10:
         st.caption("우선 회수 대상 (D-10 지남 ~ D+10 이내, 상위 20건)")
-        st.dataframe(pd.DataFrame(_u10), use_container_width=True, hide_index=True)
+        _u10_df = _fmt_krw_col(pd.DataFrame(_u10), ["balance"])
+        st.dataframe(_u10_df, use_container_width=True, hide_index=True)
     else:
         st.info("회수 대상 미수금 없음")
 
