@@ -8179,16 +8179,35 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         _base_mc = [_marker_style(d)[0] for d in _base_days]
         _base_ms = [_marker_style(d)[1] for d in _base_days]
 
+        # ── 월별 공유 색상 팔레트 (두 차트 공통) ────────────────────
+        _SHARED_PALETTE = [
+            "rgba(255,127,14,0.85)",   # 주황
+            "rgba(44,160,44,0.85)",    # 초록
+            "rgba(148,103,189,0.85)",  # 보라
+            "rgba(23,190,207,0.85)",   # 청록
+            "rgba(188,189,34,0.85)",   # 올리브
+            "rgba(227,119,194,0.85)",  # 핑크
+            "rgba(140,86,75,0.85)",    # 갈색
+            "rgba(214,39,40,0.75)",    # 빨강
+            "rgba(31,119,180,0.70)",   # 파랑
+            "rgba(127,127,127,0.75)",  # 회색
+            "rgba(174,199,232,0.90)",  # 연파랑
+            "rgba(255,187,120,0.90)",  # 연주황
+        ]
+        # 비교 월 → 색상 매핑 (두 차트에서 동일하게 참조)
+        _ym_color_map = {cm: _SHARED_PALETTE[i % len(_SHARED_PALETTE)]
+                         for i, cm in enumerate(_compare_yms)}
+
         fig = go.Figure()
         _comp_rows = []
 
-        # ── [Step 2] 비교 월: 회색 점선(dash='dot'), 마커 없음 ──────
-        _COMP_COLOR = "rgba(150,150,150,0.4)"
+        # ── [Step 2] 비교 월: 팔레트 색상 점선(dash='dot'), 마커 없음 ─
         for cm in _compare_yms:
             try:
                 _cm_dt = datetime.strptime(cm, "%Y-%m").date()
             except Exception:
                 continue
+            _cm_color = _ym_color_map[cm]
             _cm_last_day = _cal.monthrange(_cm_dt.year, _cm_dt.month)[1]
             _cm_days_full = list(range(1, _cm_last_day + 1))
             _cm_grp = _sdf[_sdf["_ym"] == cm].groupby("_day")["amount"].sum()
@@ -8197,7 +8216,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             fig.add_trace(go.Scatter(
                 x=_cm_days_full, y=_cm_plot, mode="lines",
                 name=cm,
-                line=dict(color=_COMP_COLOR, width=1.5, dash="dot"),
+                line=dict(color=_cm_color, width=1.5, dash="dot"),
                 hovertemplate=f"%{{x}}일<br>%{{y:{_unit_fmt}}}{_unit_label}<extra>{cm}</extra>",
             ))
             _comp_rows.append({
@@ -8296,22 +8315,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             hovertemplate=f"%{{x}}<br>일평균: %{{y:{_unit_fmt}}}{_unit_label}<extra>{_base_ym}</extra>",
         ))
 
-        # 비교 월 요일 평균 (최대 3개, 회색 반투명)
-        # 비교 월마다 구분 가능한 색상 팔레트 (최대 12개)
-        _cm_colors = [
-            "rgba(255,127,14,0.75)",   # 주황
-            "rgba(44,160,44,0.75)",    # 초록
-            "rgba(148,103,189,0.75)",  # 보라
-            "rgba(23,190,207,0.75)",   # 청록
-            "rgba(188,189,34,0.75)",   # 올리브
-            "rgba(227,119,194,0.75)",  # 핑크
-            "rgba(140,86,75,0.75)",    # 갈색
-            "rgba(214,39,40,0.65)",    # 빨강
-            "rgba(31,119,180,0.60)",   # 파랑 계열
-            "rgba(127,127,127,0.65)",  # 회색
-            "rgba(174,199,232,0.80)",  # 연파랑
-            "rgba(255,187,120,0.80)",  # 연주황
-        ]
+        # 비교 월 요일 평균 — 공유 팔레트(_ym_color_map) 사용
         for _ci, cm in enumerate(_compare_yms[:12]):
             _cm_raw_sdf = _sdf[_sdf["_ym"] == cm].copy()
             if _cm_raw_sdf.empty:
@@ -8324,7 +8328,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             fig_dow.add_trace(go.Bar(
                 x=_cm_dow_avg["label"].tolist(),
                 y=_cm_dow_avg["amount"].tolist(),
-                marker_color=_cm_colors[_ci % len(_cm_colors)],
+                marker_color=_ym_color_map.get(cm, _SHARED_PALETTE[_ci % len(_SHARED_PALETTE)]),
                 name=f"{cm}",
                 hovertemplate=f"%{{x}}<br>일평균: %{{y:{_unit_fmt}}}{_unit_label}<extra>{cm}</extra>",
             ))
