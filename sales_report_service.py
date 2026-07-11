@@ -154,21 +154,73 @@ def _fetch_orders(store_keys: list[str], start: date, end: date) -> pd.DataFrame
         return pd.DataFrame()
 
 
+def _sales_tenant_column() -> str | None:
+    """secrets.supabase.sales_tenant_column 값 반환. 없으면 None (order_id 기반 격리 사용).
+
+    app.py 의 _sales_tenant_column() 미러링 — Streamlit secrets 우선, 환경변수 fallback.
+    """
+    # Streamlit 컨텍스트
+    try:
+        import streamlit as st  # noqa: WPS433
+        val = (st.secrets.get("supabase") or {}).get("sales_tenant_column")
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    except Exception:
+        pass
+    # 독립 실행: 환경변수 fallback
+    env_val = os.environ.get("SUPABASE_SALES_TENANT_COLUMN", "").strip()
+    return env_val or None
+
+
+def _fetch_valid_order_ids(store_keys: list[str]) -> set[int]:
+    """매장의 유효 order_id 집합 (sales 2차 격리용)."""
+    client = _get_client()
+    if client is None or not store_keys:
+        return set()
+    try:
+        r = client.table("app_orders").select("id")\
+            .in_("db_filename", store_keys).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return {int(x["id"]) for x in rows if x.get("id") is not None}
+    except Exception:
+        return set()
+
+
 def _fetch_sales(store_keys: list[str], start: date, end: date) -> pd.DataFrame:
-    """sales (매출 원장) 조회 — 순매출 기준."""
+    """sales (매출 원장) 조회 — 순매출 기준.
+
+    app.py 의 load_sales_with_employees_cached + _filter_sales_to_store_orders 로직 미러링.
+    - sales_tenant_column 이 secrets/env 에 설정돼 있으면 그 컬럼으로 서버 필터
+    - 없으면 서버 필터 없이 transaction_date 로만 조회 후 pandas 로 order_id 교집합 필터
+    """
     client = _get_client()
     if client is None or not store_keys:
         return pd.DataFrame()
+    tenant_col = _sales_tenant_column()
     try:
-        q = client.table("sales").select("*")\
-            .in_("db_filename", store_keys)\
-            .gte("transaction_date", start.isoformat())\
-            .lte("transaction_date", end.isoformat())
+        q = client.table("sales").select(
+            "transaction_date, amount, order_id, note, employee_names"
+        )
+        if tenant_col:
+            q = q.in_(tenant_col, store_keys)
+        q = q.gte("transaction_date", start.isoformat())
+        q = q.lte("transaction_date", end.isoformat())
         r = q.execute()
         rows = (r.data or []) if hasattr(r, "data") else []
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
-    except Exception:
+    except Exception as _e:
+        logger.warning("_fetch_sales query failed: %s", _e)
         return pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    # 2차 격리 (tenant_col 없을 때)
+    if not tenant_col and "order_id" in df.columns:
+        valid_oids = _fetch_valid_order_ids(store_keys)
+        if not valid_oids:
+            return df.iloc[0:0].copy()
+        _oid = pd.to_numeric(df["order_id"], errors="coerce")
+        df = df[_oid.isin(valid_oids)].copy()
+    return df
 
 
 def _fetch_payments(store_keys: list[str], start: date, end: date) -> pd.DataFrame:
