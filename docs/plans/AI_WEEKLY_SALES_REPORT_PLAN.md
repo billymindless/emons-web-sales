@@ -476,14 +476,48 @@ jobs:
 
 ---
 
-## 13. 다음 단계 (본 계획서 승인 후)
+## 13. 구현 진행 상황
 
-1. **Q1~Q7 결정 확정** (사용자 확인)
-2. **Phase 1 스켈레톤 커밋:**
-   - `SUPABASE_APP_SALES_REPORTS.sql`
-   - `sales_report_service.py` (build_dataset · render_markdown · call_gemini 뼈대)
-   - `api.py` `POST /generate-sales-report` (단일 매장 · 단일 기간)
-3. **단위 테스트:** 특정 매장·기간에 대해 로컬에서 리포트 1건 수동 생성 · 결과 검증
-4. **Streamlit UI:** 목록 · 열람 · 다운로드 (Excel 없이 Markdown만)
-5. **스케줄러 활성화:** Render Cron
-6. **Phase 2:** Excel 워크북 · 월간 리포트
+### ✅ Phase 1 완료 (커밋 `d492cf9`)
+- `SUPABASE_APP_SALES_REPORTS.sql` 생성 · Supabase 에 적용 필요
+- `sales_report_service.py` — `build_dataset` + 7개 `group_by_*` + WoW/YoY
+- `render_ai_sales_reports()` 임시 미리보기 UI (매장관리자 세일즈 메뉴 14번)
+
+### ✅ Phase 2 완료
+- `sales_report_service.call_gemini()` — Gemini 1.5 Flash JSON, api.py VOC 패턴 재사용
+- `sales_report_service.render_markdown()` — 7개 섹션 완전한 Markdown 문서
+- `save_report`, `list_reports`, `load_report`, `generate_and_save_report` — Supabase upsert/조회
+- `render_ai_sales_reports()` 확장 — 새 리포트/저장된 리포트 2탭, AI 요약, Markdown 다운로드
+- `api.py` 신규 엔드포인트:
+  - `POST /generate-sales-report` (단일)
+  - `POST /generate-weekly-reports` (전 매장 + all, 크론)
+  - `POST /generate-monthly-reports` (전 매장 + all, 크론)
+  - 인증: `Authorization: Bearer $CRON_SECRET`
+
+### 🔜 남은 작업 (사용자 확인 후 진행)
+
+1. **환경변수 설정 (Render 대시보드):**
+   - `GEMINI_API_KEY` — Gemini 1.5 Flash API 키 (없으면 AI 없이 저장 동작)
+   - `CRON_SECRET` — 크론 인증용 임의 문자열 (미설정 시 인증 통과)
+   - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` — 기존 값 그대로
+
+2. **DB 스키마 적용:** Supabase SQL Editor 에서 `SUPABASE_APP_SALES_REPORTS.sql` 실행
+
+3. **Render Cron 등록 (`render.yaml`):**
+   ```yaml
+   - type: cron
+     name: weekly-sales-report
+     schedule: "0 6 * * 5"       # 매 금요일 06:00 UTC = 15:00 KST
+     command: "curl -X POST https://<api-host>/generate-weekly-reports -H 'Authorization: Bearer $CRON_SECRET'"
+
+   - type: cron
+     name: monthly-sales-report
+     schedule: "30 15 1 * *"     # 매월 1일 15:30 UTC = 익일 00:30 KST
+     command: "curl -X POST https://<api-host>/generate-monthly-reports -H 'Authorization: Bearer $CRON_SECRET'"
+   ```
+
+4. **Phase 3 (선택):**
+   - Excel 워크북 (openpyxl · 5~7시트)
+   - PDF 출력 (reportlab, 신규 의존성)
+   - 이메일 자동 발송 (관리자 대상, gmail_manager 재사용)
+   - Slack/카카오톡 알림 (급락 지표 감지)

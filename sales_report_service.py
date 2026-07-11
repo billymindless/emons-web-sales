@@ -16,11 +16,16 @@ app.py 의 기존 함수와 로직을 최대한 재사용하되, ``import app`` 
 from __future__ import annotations
 
 import calendar
+import json
+import logging
+import os
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -87,13 +92,41 @@ def year_ago_period(start: date, end: date) -> tuple[date, date]:
 # ────────────────────────────────────────────────────────────────
 # Supabase 조회 (app.py 함수 재사용)
 # ────────────────────────────────────────────────────────────────
+_STANDALONE_CLIENT = None
+
+
 def _get_client():
-    """app.py 의 Supabase 싱글톤 재사용."""
-    from app import get_supabase_client
-    client, err = get_supabase_client()
-    if err or not client:
+    """Supabase 클라이언트 반환.
+
+    우선순위:
+      1) app.get_supabase_client() (Streamlit 컨텍스트)
+      2) 환경변수 SUPABASE_URL + SUPABASE_SERVICE_KEY 로 직접 초기화 (api.py/CLI 컨텍스트)
+    """
+    # 1) Streamlit 컨텍스트
+    try:
+        from app import get_supabase_client  # noqa: WPS433
+        client, err = get_supabase_client()
+        if not err and client:
+            return client
+    except Exception:
+        pass
+
+    # 2) 독립 실행 (api.py / cron)
+    global _STANDALONE_CLIENT
+    if _STANDALONE_CLIENT is not None:
+        return _STANDALONE_CLIENT
+    url = os.environ.get("SUPABASE_URL", "")
+    key = (os.environ.get("SUPABASE_SERVICE_KEY", "")
+           or os.environ.get("SUPABASE_KEY", ""))
+    if not url or not key:
         return None
-    return client
+    try:
+        from supabase import create_client  # noqa: WPS433
+        _STANDALONE_CLIENT = create_client(url, key)
+        return _STANDALONE_CLIENT
+    except Exception as _e:
+        logger.warning("standalone supabase client init failed: %s", _e)
+        return None
 
 
 def _fetch_orders(store_keys: list[str], start: date, end: date) -> pd.DataFrame:
@@ -186,10 +219,33 @@ def _fetch_leads(store_names: list[str], start: date, end: date) -> pd.DataFrame
         return pd.DataFrame()
 
 
+def _fetch_stores_list(include_inactive: bool = False) -> list[dict]:
+    """app_stores 조회 (app.py 의존성 없이 self-contained)."""
+    # 1) Streamlit 캐시 활용
+    try:
+        from app import _get_supabase_stores_list  # noqa: WPS433
+        _r = _get_supabase_stores_list(include_inactive=include_inactive)
+        if _r:
+            return _r
+    except Exception:
+        pass
+    # 2) 독립 조회
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        q = client.table("app_stores").select("db_filename, store_name, is_active")
+        if not include_inactive:
+            q = q.eq("is_active", True)
+        r = q.execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        return []
+
+
 def _store_keys_and_names(store_key: str) -> tuple[list[str], list[str], str]:
     """store_key ('all' | db_filename) → (db_filenames, store_names, display_name)."""
-    from app import _get_supabase_stores_list  # noqa: WPS433
-    stores = _get_supabase_stores_list() or []
+    stores = _fetch_stores_list()
     if store_key == "all":
         keys = [s["db_filename"] for s in stores if s.get("db_filename")]
         names = [s["store_name"] for s in stores if s.get("store_name")]
@@ -581,6 +637,471 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
     return dataset
 
 
+# ────────────────────────────────────────────────────────────────
+# AI 요약 (Gemini 1.5 Flash) — api.py 의 VOC 패턴 재사용
+# ────────────────────────────────────────────────────────────────
+def _compact_dataset_for_prompt(dataset: dict, top: int = 5) -> dict:
+    """LLM 프롬프트용 축약본. 원본 리스트를 Top N 으로 잘라 토큰 사용량 최소화."""
+    kpi = dataset.get("kpi") or {}
+    return {
+        "store_name": dataset.get("store_name"),
+        "period_type": dataset.get("period_type"),
+        "start_date": dataset.get("start_date"),
+        "end_date": dataset.get("end_date"),
+        "kpi": {
+            "sales_amount": kpi.get("sales_amount"),
+            "sales_count": kpi.get("sales_count"),
+            "aov": kpi.get("aov"),
+            "margin_rate_pct": round((kpi.get("margin_rate") or 0) * 100, 1),
+            "payments_amount": kpi.get("payments_amount"),
+            "prev_period": {
+                "sales_diff_pct": (kpi.get("prev_period") or {}).get("sales_diff_pct"),
+                "aov_diff_pct": (kpi.get("prev_period") or {}).get("aov_diff_pct"),
+            },
+            "prev_year": ({
+                "sales_diff_pct": (kpi.get("prev_year") or {}).get("sales_diff_pct"),
+                "aov_diff_pct": (kpi.get("prev_year") or {}).get("aov_diff_pct"),
+            } if kpi.get("prev_year") else None),
+        },
+        "by_employee_top": (dataset.get("by_employee") or [])[:top],
+        "by_region_top": (dataset.get("by_region") or [])[:top],
+        "by_building_top": (dataset.get("by_building") or [])[:top],
+        "by_category_top": (dataset.get("by_category") or [])[:top],
+        "by_visit_reason_top": (dataset.get("by_visit_reason") or [])[:top],
+        "by_purchase_reason_top": (dataset.get("by_purchase_reason") or [])[:top],
+        "visit_purchase_matrix_top5": dataset.get("visit_purchase_matrix_top5") or [],
+        "leads": dataset.get("leads") or {},
+        "risks": {
+            "total_unpaid": (dataset.get("risks") or {}).get("total_unpaid"),
+            "unpaid_d10_count": len((dataset.get("risks") or {}).get("unpaid_d10") or []),
+        },
+    }
+
+
+_AI_SYSTEM_PROMPT = (
+    "당신은 가구 매장 판매 데이터 분석가입니다. "
+    "제공된 JSON 지표를 바탕으로 경영진용 리포트 요약을 작성하세요. "
+    "사실 기반, 객관적, 실행 가능한 톤. "
+    "반드시 다음 스키마의 JSON 만 출력하세요 (다른 텍스트·마크다운 없이):\n"
+    "{\n"
+    '  "executive": string,           // 3~5문장의 종합 요약\n'
+    '  "highlights": string[],        // 최대 3개, 각 1문장. 잘 된 지표\n'
+    '  "risks": string[],             // 최대 3개, 각 1문장. 주의할 지표\n'
+    '  "actions": string[]            // 최대 5개, 다음 기간 실행 항목\n'
+    "}"
+)
+
+
+def call_gemini(dataset: dict, api_key: str | None = None, timeout: float = 25.0) -> dict:
+    """Gemini 1.5 Flash 로 dataset 을 요약해 JSON 반환.
+
+    반환 dict:
+        {"ok": bool, "data": {executive, highlights, risks, actions}, "error": str | None}
+
+    실패 시 ok=False. 호출자는 리포트 문서에서 AI 섹션을 fallback 텍스트로 대체.
+    """
+    key = api_key or os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        return {"ok": False, "data": None, "error": "GEMINI_API_KEY 환경변수 미설정"}
+
+    try:
+        import httpx  # noqa: WPS433 (지역 import — api.py 관례 일치)
+    except ImportError as _ie:
+        return {"ok": False, "data": None, "error": f"httpx 미설치: {_ie}"}
+
+    compact = _compact_dataset_for_prompt(dataset)
+    user_prompt = (
+        f"매장: {compact['store_name']}\n"
+        f"기간유형: {compact['period_type']}\n"
+        f"기간: {compact['start_date']} ~ {compact['end_date']}\n"
+        f"지표(JSON):\n{json.dumps(compact, ensure_ascii=False, indent=2)}"
+    )
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-1.5-flash:generateContent?key={key}"
+    )
+    body = {
+        "systemInstruction": {"parts": [{"text": _AI_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.3,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(url, json=body)
+            r.raise_for_status()
+        raw = r.json()
+        text = raw["candidates"][0]["content"]["parts"][0]["text"]
+        data = json.loads(text)
+    except Exception as _e:
+        logger.warning("Gemini call failed: %s", _e)
+        return {"ok": False, "data": None, "error": str(_e)}
+
+    # 기본 필드 방어
+    def _s_list(x: Any, cap: int) -> list[str]:
+        if isinstance(x, list):
+            return [str(i).strip() for i in x if str(i).strip()][:cap]
+        return []
+
+    normalized = {
+        "executive": str(data.get("executive") or "").strip(),
+        "highlights": _s_list(data.get("highlights"), 3),
+        "risks": _s_list(data.get("risks"), 3),
+        "actions": _s_list(data.get("actions"), 5),
+    }
+    if not normalized["executive"]:
+        return {"ok": False, "data": None, "error": "executive 필드 비어있음"}
+    return {"ok": True, "data": normalized, "error": None}
+
+
+# ────────────────────────────────────────────────────────────────
+# Markdown 렌더링
+# ────────────────────────────────────────────────────────────────
+def _fmt_krw(v: Any) -> str:
+    try:
+        return f"{int(v):,}원"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _fmt_pct(v: Any, digits: int = 1) -> str:
+    if v is None or isinstance(v, bool):
+        return "-"
+    try:
+        return f"{float(v):+.{digits}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _md_table(rows: list[dict], columns: list[tuple[str, str]]) -> str:
+    """rows(list[dict]) + columns([(key, label)]) → Markdown 표."""
+    if not rows:
+        return "_데이터 없음_\n"
+    header = "| " + " | ".join(lbl for _, lbl in columns) + " |"
+    sep = "| " + " | ".join("---" for _ in columns) + " |"
+    body: list[str] = []
+    for r in rows:
+        cells: list[str] = []
+        for k, _ in columns:
+            v = r.get(k, "")
+            if isinstance(v, float):
+                cells.append(f"{v:,.1f}")
+            elif isinstance(v, int):
+                cells.append(f"{v:,}")
+            else:
+                cells.append(str(v))
+        body.append("| " + " | ".join(cells) + " |")
+    return "\n".join([header, sep, *body]) + "\n"
+
+
+def render_markdown(dataset: dict, ai_summary: dict | None = None) -> str:
+    """dataset + ai_summary → 최종 리포트 Markdown 문자열.
+
+    ai_summary 가 None 이거나 실패 시 AI 섹션은 안내문으로 대체.
+    """
+    kpi = dataset.get("kpi") or {}
+    prev = kpi.get("prev_period") or {}
+    yoy = kpi.get("prev_year") or {}
+
+    period_label = "주간" if dataset.get("period_type") == "weekly" else "월간"
+    title = (
+        f"# {dataset.get('store_name', '')} {period_label} 세일즈 리포트\n"
+        f"### 기간: {dataset.get('start_date')} ~ {dataset.get('end_date')}\n"
+        f"_생성일시: {dataset.get('generated_at', '')}_\n"
+    )
+
+    lines: list[str] = [title]
+
+    # 1. Executive Summary (AI)
+    lines.append("\n## 1. 이번 " + period_label + " 요약\n")
+    if ai_summary and ai_summary.get("executive"):
+        lines.append(ai_summary["executive"] + "\n")
+    else:
+        lines.append("_(AI 요약 미생성 — 데이터 섹션을 참고하세요.)_\n")
+
+    # 2. 핵심 KPI
+    lines.append("\n## 2. 핵심 KPI\n")
+    kpi_rows = [{
+        "지표": "순매출 (sales.amount)",
+        "이번 기간": _fmt_krw(kpi.get("sales_amount")),
+        "WoW/MoM": _fmt_pct(prev.get("sales_diff_pct")),
+        "YoY": (_fmt_pct(yoy.get("sales_diff_pct")) if yoy else "N/A"),
+    }, {
+        "지표": "판매건수",
+        "이번 기간": f"{kpi.get('sales_count', 0):,}건",
+        "WoW/MoM": (f"{kpi.get('sales_count', 0) - prev.get('sales_count', 0):+,}건" if prev else "-"),
+        "YoY": ((f"{kpi.get('sales_count', 0) - yoy.get('sales_count', 0):+,}건") if yoy else "N/A"),
+    }, {
+        "지표": "객단가",
+        "이번 기간": _fmt_krw(kpi.get("aov")),
+        "WoW/MoM": _fmt_pct(prev.get("aov_diff_pct")),
+        "YoY": (_fmt_pct(yoy.get("aov_diff_pct")) if yoy else "N/A"),
+    }, {
+        "지표": "마진율",
+        "이번 기간": f"{(kpi.get('margin_rate') or 0) * 100:.1f}%",
+        "WoW/MoM": (f"{((kpi.get('margin_rate') or 0) - (prev.get('margin_rate') or 0)) * 100:+.1f}%p" if prev else "-"),
+        "YoY": ((f"{((kpi.get('margin_rate') or 0) - (yoy.get('margin_rate') or 0)) * 100:+.1f}%p") if yoy else "N/A"),
+    }, {
+        "지표": "실수납액",
+        "이번 기간": _fmt_krw(kpi.get("payments_amount")),
+        "WoW/MoM": "-",
+        "YoY": "-",
+    }]
+    lines.append(_md_table(kpi_rows, [("지표", "지표"), ("이번 기간", "이번 기간"),
+                                         ("WoW/MoM", "WoW/MoM"), ("YoY", "YoY")]))
+    if not yoy:
+        lines.append("_※ 전년 동기간 데이터가 없어 YoY 는 생략됩니다._\n")
+
+    # 3. 매출 분포
+    lines.append("\n## 3. 매출 분포\n")
+
+    lines.append("\n### 3.1 직원별 (Top 5, 1/n 배분)\n")
+    lines.append(_md_table(
+        dataset.get("by_employee") or [],
+        [("name", "직원"), ("sales", "순매출(원)"), ("count", "참여 건수")]))
+
+    lines.append("\n### 3.2 지역별 (시군구 Top 5)\n")
+    lines.append(_md_table(
+        dataset.get("by_region") or [],
+        [("region", "시군구"), ("sales", "매출(원)"), ("count", "건수")]))
+
+    lines.append("\n### 3.3 아파트/건물별 (Top 10)\n")
+    lines.append(_md_table(
+        dataset.get("by_building") or [],
+        [("name", "건물명"), ("sales", "매출(원)"), ("count", "건수")]))
+
+    lines.append("\n### 3.4 카테고리 (건수 · 비중)\n")
+    lines.append(_md_table(
+        dataset.get("by_category") or [],
+        [("category", "카테고리"), ("count", "건수"), ("share_pct", "비중(%)")]))
+
+    lines.append("\n### 3.5 결제수단별 실수납\n")
+    lines.append(_md_table(
+        dataset.get("by_payment_method") or [],
+        [("payment_method", "결제수단"), ("amount", "금액(원)"), ("count", "건수")]))
+
+    # 4. 고객 유입 · 구매 동기
+    lines.append("\n## 4. 고객 유입 · 구매 동기\n")
+
+    lines.append("\n### 4.1 방문 경로\n")
+    lines.append(_md_table(
+        dataset.get("by_visit_reason") or [],
+        [("visit_reason", "방문경로"), ("count", "건수"), ("sales", "매출(원)"), ("share_pct", "비중(%)")]))
+
+    lines.append("\n### 4.2 구매 이유\n")
+    lines.append(_md_table(
+        dataset.get("by_purchase_reason") or [],
+        [("purchase_reason", "구매이유"), ("count", "건수"), ("sales", "매출(원)"), ("share_pct", "비중(%)")]))
+
+    lines.append("\n### 4.3 방문 × 구매 조합 Top 5\n")
+    lines.append(_md_table(
+        dataset.get("visit_purchase_matrix_top5") or [],
+        [("visit_reason", "방문경로"), ("purchase_reason", "구매이유"),
+         ("count", "건수"), ("sales", "매출(원)")]))
+
+    # 5. 리드 활동
+    lines.append("\n## 5. 리드 활동\n")
+    lead = dataset.get("leads") or {}
+    if lead:
+        lines.append(_md_table([{
+            "신규 리드": f"{lead.get('new_leads', 0)}건",
+            "계약 완료": f"{lead.get('closed_deals', 0)}건",
+            "전환율": f"{(lead.get('conversion_rate') or 0) * 100:.1f}%",
+            "평균 클로징(일)": (f"{lead.get('avg_closing_days')}일"
+                                if lead.get('avg_closing_days') is not None else "-"),
+            "사후관리율": f"{(lead.get('followup_rate') or 0) * 100:.1f}%",
+        }], [
+            ("신규 리드", "신규 리드"),
+            ("계약 완료", "계약 완료"),
+            ("전환율", "전환율"),
+            ("평균 클로징(일)", "평균 클로징(일)"),
+            ("사후관리율", "사후관리율"),
+        ]))
+    else:
+        lines.append("_데이터 없음_\n")
+
+    # 6. AI 하이라이트 · 위험 · 액션
+    lines.append("\n## 6. AI 분석 하이라이트\n")
+    if ai_summary:
+        if ai_summary.get("highlights"):
+            lines.append("\n**✅ 잘 된 지표**\n")
+            for h in ai_summary["highlights"]:
+                lines.append(f"- {h}")
+            lines.append("")
+        if ai_summary.get("risks"):
+            lines.append("\n**⚠️ 주의 지표**\n")
+            for r in ai_summary["risks"]:
+                lines.append(f"- {r}")
+            lines.append("")
+        if ai_summary.get("actions"):
+            lines.append("\n**🎯 다음 기간 액션 제안**\n")
+            for a in ai_summary["actions"]:
+                lines.append(f"- {a}")
+            lines.append("")
+    else:
+        lines.append("_(AI 요약 미생성)_\n")
+
+    # 7. 리스크 · 미수금
+    lines.append("\n## 7. 리스크 · 미수금 스냅샷\n")
+    risks = dataset.get("risks") or {}
+    lines.append(f"- **전체 미수금:** {_fmt_krw(risks.get('total_unpaid'))}")
+    u10 = risks.get("unpaid_d10") or []
+    lines.append(f"- **D-10 이내 잔금 있는 주문:** {len(u10)}건")
+    if u10:
+        lines.append("")
+        lines.append(_md_table(u10[:10], [
+            ("order_id", "주문ID"),
+            ("customer_id", "고객ID"),
+            ("delivery_date", "배송일"),
+            ("balance", "잔금(원)"),
+        ]))
+
+    # Footer
+    lines.append("\n---\n")
+    lines.append(f"_생성 시각: {dataset.get('generated_at', '')} · "
+                 f"매장: {dataset.get('store_name', '')} · "
+                 f"기간유형: {dataset.get('period_type', '')}_\n")
+
+    return "\n".join(lines)
+
+
+# ────────────────────────────────────────────────────────────────
+# Supabase 저장 · 조회
+# ────────────────────────────────────────────────────────────────
+def _report_title(dataset: dict) -> str:
+    period_label = "주간" if dataset.get("period_type") == "weekly" else "월간"
+    return (
+        f"[{period_label}] {dataset.get('store_name', '')} · "
+        f"{dataset.get('start_date')} ~ {dataset.get('end_date')}"
+    )
+
+
+def save_report(dataset: dict, markdown_body: str, ai_summary: dict | None,
+                status: str = "success", error_message: str | None = None,
+                generated_by: str = "manual") -> tuple[bool, str | None]:
+    """app_sales_reports 테이블 upsert.
+
+    Returns:
+        (ok, error_message_or_none)
+    """
+    client = _get_client()
+    if client is None:
+        return False, "Supabase 클라이언트 없음"
+    payload = {
+        "period_type": dataset.get("period_type"),
+        "start_date": dataset.get("start_date"),
+        "end_date": dataset.get("end_date"),
+        "store_key": dataset.get("store_key"),
+        "store_name": dataset.get("store_name"),
+        "title": _report_title(dataset),
+        "markdown_body": markdown_body,
+        "metrics": {k: v for k, v in dataset.items() if k != "ai_summary"},
+        "ai_summary": ai_summary,
+        "status": status,
+        "error_message": error_message,
+        "generated_by": generated_by,
+    }
+    try:
+        client.table("app_sales_reports").upsert(
+            payload,
+            on_conflict="period_type,start_date,end_date,store_key",
+        ).execute()
+        return True, None
+    except Exception as _e:
+        logger.error("save_report failed: %s", _e)
+        return False, str(_e)
+
+
+def list_reports(store_key: str | None = None, period_type: str | None = None,
+                 limit: int = 30) -> pd.DataFrame:
+    """저장된 리포트 목록 (최신순)."""
+    client = _get_client()
+    if client is None:
+        return pd.DataFrame()
+    try:
+        q = client.table("app_sales_reports").select(
+            "id, period_type, start_date, end_date, store_key, store_name, title, "
+            "status, error_message, generated_by, generated_at, ai_summary"
+        )
+        if store_key:
+            q = q.eq("store_key", store_key)
+        if period_type:
+            q = q.eq("period_type", period_type)
+        r = q.order("generated_at", desc=True).limit(limit).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception as _e:
+        logger.warning("list_reports failed: %s", _e)
+        return pd.DataFrame()
+
+
+def load_report(report_id: int) -> dict | None:
+    """단일 리포트 전체 로드 (markdown_body 포함)."""
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        r = client.table("app_sales_reports").select("*").eq("id", report_id).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        return rows[0] if rows else None
+    except Exception as _e:
+        logger.warning("load_report failed: %s", _e)
+        return None
+
+
+def generate_and_save_report(period_type: str, start: date, end: date, store_key: str,
+                             generated_by: str = "manual",
+                             use_ai: bool = True) -> dict:
+    """엔드-투-엔드 리포트 생성 파이프라인.
+
+    1) build_dataset
+    2) call_gemini (use_ai=True 이면)
+    3) render_markdown
+    4) save_report
+
+    Returns:
+        {"ok": bool, "dataset": dict, "markdown": str,
+         "ai_summary": dict | None, "ai_error": str | None,
+         "save_error": str | None}
+    """
+    dataset = build_dataset(period_type, start, end, store_key)
+
+    ai_summary: dict | None = None
+    ai_error: str | None = None
+    if use_ai:
+        _ai = call_gemini(dataset)
+        if _ai["ok"]:
+            ai_summary = _ai["data"]
+        else:
+            ai_error = _ai["error"]
+
+    markdown = render_markdown(dataset, ai_summary)
+
+    save_status = "success" if ai_summary else ("failed" if use_ai else "success")
+    save_err = ai_error if use_ai and not ai_summary else None
+    ok, save_error = save_report(
+        dataset=dataset,
+        markdown_body=markdown,
+        ai_summary=ai_summary,
+        status=save_status,
+        error_message=save_err,
+        generated_by=generated_by,
+    )
+
+    return {
+        "ok": ok,
+        "dataset": dataset,
+        "markdown": markdown,
+        "ai_summary": ai_summary,
+        "ai_error": ai_error,
+        "save_error": save_error,
+    }
+
+
 __all__ = [
     "resolve_weekly_period",
     "resolve_monthly_period",
@@ -599,4 +1120,10 @@ __all__ = [
     "compute_lead_kpi",
     "collect_risks",
     "build_dataset",
+    "call_gemini",
+    "render_markdown",
+    "save_report",
+    "list_reports",
+    "load_report",
+    "generate_and_save_report",
 ]

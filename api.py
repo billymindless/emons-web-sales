@@ -2070,6 +2070,212 @@ async def run_lead_care() -> JSONResponse:
     return JSONResponse({"ok": True, "processed": len(leads), "sent": sent, "failed": failed})
 
 
+# ──────────────────────────────────────────────
+# AI 세일즈 리포트 엔드포인트
+# 관련 계획서: docs/plans/AI_WEEKLY_SALES_REPORT_PLAN.md
+# ──────────────────────────────────────────────
+
+def _verify_cron_secret(request: Request) -> bool:
+    """Bearer <CRON_SECRET> 검증. 미설정 시 통과 (개발 편의)."""
+    expected = os.environ.get("CRON_SECRET", "")
+    if not expected:
+        return True
+    auth = (request.headers.get("authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        return False
+    return hmac.compare_digest(auth.split(" ", 1)[1].strip(), expected)
+
+
+def _resolve_report_period(period_type: str, start_str: str | None,
+                           end_str: str | None) -> tuple[date, date]:
+    """요청 파라미터 → (start, end) 결정. 미지정 시 직전 완료 주/월."""
+    from sales_report_service import (  # noqa: WPS433
+        resolve_weekly_period,
+        resolve_monthly_period,
+    )
+    if start_str and end_str:
+        return (
+            datetime.strptime(start_str, "%Y-%m-%d").date(),
+            datetime.strptime(end_str, "%Y-%m-%d").date(),
+        )
+    if period_type == "weekly":
+        return resolve_weekly_period(None)
+    return resolve_monthly_period(None)
+
+
+@app.post("/generate-sales-report", summary="AI 세일즈 리포트 단일 생성")
+async def generate_sales_report(request: Request) -> JSONResponse:
+    """단일 매장·단일 기간 리포트 생성 · 저장.
+
+    Body:
+      {
+        "period_type": "weekly" | "monthly",
+        "start_date": "YYYY-MM-DD" (선택),
+        "end_date":   "YYYY-MM-DD" (선택),
+        "store_key":  "<db_filename>" | "all",
+        "use_ai":     true
+      }
+    """
+    if not _verify_cron_secret(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return JSONResponse({"ok": False, "error": "supabase not configured"}, status_code=500)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    period_type = str(body.get("period_type") or "weekly").lower()
+    if period_type not in ("weekly", "monthly"):
+        return JSONResponse({"ok": False, "error": "invalid period_type"}, status_code=400)
+    store_key = str(body.get("store_key") or "all")
+    use_ai = bool(body.get("use_ai", True))
+
+    try:
+        start, end = _resolve_report_period(period_type, body.get("start_date"), body.get("end_date"))
+    except Exception as _e:
+        return JSONResponse({"ok": False, "error": f"date parse failed: {_e}"}, status_code=400)
+
+    try:
+        from sales_report_service import generate_and_save_report  # noqa: WPS433
+    except Exception as _e:
+        return JSONResponse({"ok": False, "error": f"import failed: {_e}"}, status_code=500)
+
+    try:
+        result = generate_and_save_report(
+            period_type=period_type, start=start, end=end,
+            store_key=store_key, generated_by="cron", use_ai=use_ai,
+        )
+    except Exception as _e:
+        logger.error("generate-sales-report failed: %s", _e, exc_info=True)
+        return JSONResponse({"ok": False, "error": str(_e)}, status_code=500)
+
+    return JSONResponse({
+        "ok": bool(result.get("ok")),
+        "period_type": period_type,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "store_key": store_key,
+        "store_name": (result.get("dataset") or {}).get("store_name"),
+        "ai_included": result.get("ai_summary") is not None,
+        "ai_error": result.get("ai_error"),
+        "save_error": result.get("save_error"),
+    })
+
+
+@app.post("/generate-weekly-reports", summary="매주 금요일 크론: 전 매장 + 통합 주간 리포트 일괄 생성")
+async def generate_weekly_reports(request: Request) -> JSONResponse:
+    """모든 매장 각각 + 'all' 통합에 대해 지난 주(월~일) 주간 리포트 생성.
+
+    Render Cron 또는 GitHub Actions 에서 매 금요일 15:00 KST 호출.
+    """
+    if not _verify_cron_secret(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return JSONResponse({"ok": False, "error": "supabase not configured"}, status_code=500)
+
+    try:
+        from sales_report_service import (  # noqa: WPS433
+            generate_and_save_report,
+            resolve_weekly_period,
+            _fetch_stores_list,
+        )
+    except Exception as _e:
+        return JSONResponse({"ok": False, "error": f"import failed: {_e}"}, status_code=500)
+
+    start, end = resolve_weekly_period(None)
+    stores = _fetch_stores_list() or []
+    store_keys = [s["db_filename"] for s in stores if s.get("db_filename")] + ["all"]
+
+    results: list[dict] = []
+    ok_count = 0
+    for sk in store_keys:
+        try:
+            r = generate_and_save_report(
+                period_type="weekly", start=start, end=end,
+                store_key=sk, generated_by="cron", use_ai=True,
+            )
+            _ok = bool(r.get("ok"))
+            if _ok:
+                ok_count += 1
+            results.append({
+                "store_key": sk,
+                "ok": _ok,
+                "ai_included": r.get("ai_summary") is not None,
+                "ai_error": r.get("ai_error"),
+                "save_error": r.get("save_error"),
+            })
+        except Exception as _e:
+            logger.error("weekly report failed for %s: %s", sk, _e, exc_info=True)
+            results.append({"store_key": sk, "ok": False, "error": str(_e)})
+
+    logger.info("generate-weekly-reports 완료: total=%d ok=%d", len(store_keys), ok_count)
+    return JSONResponse({
+        "ok": True,
+        "period_type": "weekly",
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "total": len(store_keys),
+        "success": ok_count,
+        "results": results,
+    })
+
+
+@app.post("/generate-monthly-reports", summary="매월 1일 크론: 전 매장 + 통합 월간 리포트 일괄 생성")
+async def generate_monthly_reports(request: Request) -> JSONResponse:
+    """전월(1일~말일) 월간 리포트 일괄 생성. 매월 1일 KST 새벽에 크론 호출."""
+    if not _verify_cron_secret(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return JSONResponse({"ok": False, "error": "supabase not configured"}, status_code=500)
+
+    try:
+        from sales_report_service import (  # noqa: WPS433
+            generate_and_save_report,
+            resolve_monthly_period,
+            _fetch_stores_list,
+        )
+    except Exception as _e:
+        return JSONResponse({"ok": False, "error": f"import failed: {_e}"}, status_code=500)
+
+    start, end = resolve_monthly_period(None)
+    stores = _fetch_stores_list() or []
+    store_keys = [s["db_filename"] for s in stores if s.get("db_filename")] + ["all"]
+
+    results: list[dict] = []
+    ok_count = 0
+    for sk in store_keys:
+        try:
+            r = generate_and_save_report(
+                period_type="monthly", start=start, end=end,
+                store_key=sk, generated_by="cron", use_ai=True,
+            )
+            _ok = bool(r.get("ok"))
+            if _ok:
+                ok_count += 1
+            results.append({
+                "store_key": sk,
+                "ok": _ok,
+                "ai_included": r.get("ai_summary") is not None,
+                "ai_error": r.get("ai_error"),
+                "save_error": r.get("save_error"),
+            })
+        except Exception as _e:
+            logger.error("monthly report failed for %s: %s", sk, _e, exc_info=True)
+            results.append({"store_key": sk, "ok": False, "error": str(_e)})
+
+    logger.info("generate-monthly-reports 완료: total=%d ok=%d", len(store_keys), ok_count)
+    return JSONResponse({
+        "ok": True,
+        "period_type": "monthly",
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "total": len(store_keys),
+        "success": ok_count,
+        "results": results,
+    })
+
+
 @app.get("/health", summary="헬스체크")
 async def health() -> JSONResponse:
     return JSONResponse({

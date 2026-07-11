@@ -23536,14 +23536,12 @@ def _faq_filter_items(query: str) -> list[dict[str, str]]:
 
 
 def render_ai_sales_reports():
-    """AI 세일즈 리포트 (Phase 1 · 데이터 미리보기).
+    """AI 세일즈 리포트 (Phase 2 · AI 요약 + 문서 생성/저장/다운로드).
 
-    docs/plans/AI_WEEKLY_SALES_REPORT_PLAN.md 의 1단계 산출물.
-    Supabase 조회 + pandas 집계 결과를 표/지표로 미리 검증한다.
-    AI 요약 · Markdown 문서 생성은 Phase 2에서 추가.
+    docs/plans/AI_WEEKLY_SALES_REPORT_PLAN.md 의 1~2단계 산출물.
     """
     st.header("📊 AI 세일즈 리포트")
-    st.caption("Phase 1 · 데이터 미리보기 — AI 요약/문서 생성은 다음 단계에서 활성화됩니다.")
+    st.caption("주간/월간 세일즈 리포트를 AI로 자동 요약하고, 저장·다운로드합니다.")
 
     try:
         import sales_report_service as srs  # noqa: WPS433
@@ -23551,6 +23549,16 @@ def render_ai_sales_reports():
         st.error(f"sales_report_service 모듈 로드 실패: {_e}")
         return
 
+    tab_new, tab_saved = st.tabs(["🆕 새 리포트 생성", "📂 저장된 리포트"])
+
+    with tab_new:
+        _render_ai_sales_reports_new(srs)
+    with tab_saved:
+        _render_ai_sales_reports_saved(srs)
+
+
+def _render_ai_sales_reports_new(srs):
+    """새 리포트 생성 탭 — 조건 선택 → 미리보기 → AI 요약 + 저장."""
     role = st.session_state.get("user", {}).get("role", "user")
     current_db = st.session_state.get("current_db")
 
@@ -23744,6 +23752,148 @@ def render_ai_sales_reports():
 
     with st.expander("🧪 원본 dataset JSON (디버그)", expanded=False):
         st.json(dataset)
+
+    # ── AI 요약 + 저장 ────────────────────────────────
+    st.divider()
+    st.markdown("### 8️⃣ AI 요약 · 문서 저장")
+    _has_key = bool(os.environ.get("GEMINI_API_KEY", ""))
+    if not _has_key:
+        try:
+            _has_key = bool(st.secrets.get("gemini", {}).get("api_key", ""))
+        except Exception:
+            _has_key = False
+    if not _has_key:
+        st.warning("⚠️ `GEMINI_API_KEY` 환경변수가 설정되지 않아 AI 요약을 생성할 수 없습니다. "
+                   "'AI 없이 저장'을 사용하거나 서버 환경변수에 키를 추가해 주세요.")
+
+    ab1, ab2 = st.columns(2)
+    with ab1:
+        gen_with_ai = st.button("🤖 AI 요약 생성 + 저장", type="primary",
+                                key="ai_report_gen_ai_btn", disabled=not _has_key)
+    with ab2:
+        gen_no_ai = st.button("💾 AI 없이 저장 (데이터만)", key="ai_report_gen_no_ai_btn")
+
+    if gen_with_ai or gen_no_ai:
+        _use_ai = bool(gen_with_ai)
+        _me = st.session_state.get("user", {}).get("username") or "manual"
+        with st.spinner(f"리포트 생성 중… ({dataset['store_name']}, "
+                        f"{dataset['start_date']}~{dataset['end_date']}"
+                        + (", AI 요약 포함" if _use_ai else ", AI 스킵") + ")"):
+            # AI 키 secrets 우선 반영
+            if _use_ai:
+                try:
+                    _sk = st.secrets.get("gemini", {}).get("api_key", "")
+                    if _sk and not os.environ.get("GEMINI_API_KEY"):
+                        os.environ["GEMINI_API_KEY"] = _sk
+                except Exception:
+                    pass
+            result = srs.generate_and_save_report(
+                period_type=("weekly" if period_type == "주간" else "monthly"),
+                start=start, end=end, store_key=sel_key,
+                generated_by=_me, use_ai=_use_ai,
+            )
+        if result.get("ai_error"):
+            st.warning(f"AI 요약 실패 (데이터 섹션만 저장됨): {result['ai_error']}")
+        if not result.get("ok"):
+            st.error(f"저장 실패: {result.get('save_error')}")
+        else:
+            st.success(f"✅ 저장 완료 — '{dataset['store_name']}' · "
+                       f"{dataset['start_date']}~{dataset['end_date']} "
+                       + ("(AI 요약 포함)" if result.get("ai_summary") else "(AI 없음)"))
+            _md = result.get("markdown") or ""
+            st.download_button(
+                "📥 Markdown 다운로드",
+                data=_md.encode("utf-8"),
+                file_name=(f"{dataset['store_name']}_{dataset['period_type']}_"
+                           f"{dataset['start_date']}_{dataset['end_date']}.md"),
+                mime="text/markdown",
+                key="ai_report_dl_new",
+            )
+            with st.expander("📄 리포트 미리보기", expanded=True):
+                st.markdown(_md)
+
+
+def _render_ai_sales_reports_saved(srs):
+    """저장된 리포트 목록 · 열람 · 재생성."""
+    role = st.session_state.get("user", {}).get("role", "user")
+    current_db = st.session_state.get("current_db")
+
+    stores = _get_supabase_stores_list() or []
+    store_options: list[tuple[str, str]] = [("__any__", "(모든 매장)"), ("all", "전 매장 통합")]
+    if role == "superadmin":
+        store_options += [(s["db_filename"], s["store_name"]) for s in stores if s.get("db_filename")]
+    elif current_db:
+        _cur_name = next((s["store_name"] for s in stores if s.get("db_filename") == current_db), current_db)
+        store_options = [("__any__", "(모든 매장)"), ("all", "전 매장 통합"),
+                         (current_db, _cur_name)]
+
+    fc1, fc2 = st.columns([2, 2])
+    with fc1:
+        _labels = [n for _, n in store_options]
+        _idx = st.selectbox("매장 범위", range(len(store_options)),
+                            format_func=lambda i: _labels[i], key="ai_report_saved_store_idx")
+        sel_key = store_options[_idx][0]
+    with fc2:
+        period_sel = st.selectbox("기간 유형", ["(전체)", "주간", "월간"], key="ai_report_saved_period")
+
+    _period_arg = None
+    if period_sel == "주간":
+        _period_arg = "weekly"
+    elif period_sel == "월간":
+        _period_arg = "monthly"
+    _store_arg = None if sel_key == "__any__" else sel_key
+
+    with st.spinner("저장된 리포트 조회 중…"):
+        df = srs.list_reports(store_key=_store_arg, period_type=_period_arg, limit=50)
+    if df.empty:
+        st.info("저장된 리포트가 없습니다. 상단 '새 리포트 생성' 탭에서 만들어 보세요.")
+        return
+
+    _view = df[["id", "title", "period_type", "start_date", "end_date",
+                "store_name", "status", "generated_by", "generated_at"]].rename(columns={
+        "id": "ID", "title": "제목", "period_type": "기간유형",
+        "start_date": "시작", "end_date": "종료", "store_name": "매장",
+        "status": "상태", "generated_by": "생성자", "generated_at": "생성시각",
+    })
+    st.dataframe(_view, use_container_width=True, hide_index=True)
+
+    _ids = df["id"].tolist()
+    if not _ids:
+        return
+    _sel_id = st.selectbox("열람할 리포트 선택", _ids,
+                           format_func=lambda i: str(df[df["id"] == i].iloc[0]["title"]),
+                           key="ai_report_saved_sel_id")
+
+    with st.spinner("리포트 로드 중…"):
+        report = srs.load_report(int(_sel_id))
+    if not report:
+        st.error("리포트를 불러오지 못했습니다.")
+        return
+
+    _md = report.get("markdown_body") or "_(본문 없음)_"
+    _title = report.get("title") or "report"
+    _fname = (f"{report.get('store_name', 'report')}_{report.get('period_type', '')}_"
+              f"{report.get('start_date', '')}_{report.get('end_date', '')}.md")
+
+    dcol1, dcol2 = st.columns([1, 2])
+    with dcol1:
+        st.download_button(
+            "📥 Markdown 다운로드",
+            data=_md.encode("utf-8"),
+            file_name=_fname,
+            mime="text/markdown",
+            key=f"ai_report_dl_saved_{_sel_id}",
+        )
+    with dcol2:
+        if report.get("status") == "failed":
+            st.warning(f"AI 요약 실패로 저장됨: {report.get('error_message')}")
+        elif report.get("ai_summary"):
+            st.caption("✅ AI 요약 포함")
+        else:
+            st.caption("AI 요약 없음 (데이터만)")
+
+    with st.expander("📄 본문", expanded=True):
+        st.markdown(_md)
 
 
 def render_faq_page():
