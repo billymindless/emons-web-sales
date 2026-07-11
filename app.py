@@ -8297,10 +8297,22 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         ))
 
         # 비교 월 요일 평균 (최대 3개, 회색 반투명)
+        # 비교 월마다 구분 가능한 색상 팔레트 (최대 12개)
         _cm_colors = [
-            "rgba(150,150,150,0.45)", "rgba(120,120,120,0.35)", "rgba(90,90,90,0.3)",
+            "rgba(255,127,14,0.75)",   # 주황
+            "rgba(44,160,44,0.75)",    # 초록
+            "rgba(148,103,189,0.75)",  # 보라
+            "rgba(23,190,207,0.75)",   # 청록
+            "rgba(188,189,34,0.75)",   # 올리브
+            "rgba(227,119,194,0.75)",  # 핑크
+            "rgba(140,86,75,0.75)",    # 갈색
+            "rgba(214,39,40,0.65)",    # 빨강
+            "rgba(31,119,180,0.60)",   # 파랑 계열
+            "rgba(127,127,127,0.65)",  # 회색
+            "rgba(174,199,232,0.80)",  # 연파랑
+            "rgba(255,187,120,0.80)",  # 연주황
         ]
-        for _ci, cm in enumerate(_compare_yms[:3]):
+        for _ci, cm in enumerate(_compare_yms[:12]):
             _cm_raw_sdf = _sdf[_sdf["_ym"] == cm].copy()
             if _cm_raw_sdf.empty:
                 continue
