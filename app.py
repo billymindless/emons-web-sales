@@ -23832,20 +23832,28 @@ def _render_ai_sales_reports_new(srs):
     role = st.session_state.get("user", {}).get("role", "user")
     current_db = st.session_state.get("current_db")
 
-    c1, c2, c3 = st.columns([1.2, 1.5, 2])
+    c1, c2 = st.columns([2, 2])
     with c1:
-        period_type = st.radio("기간 유형", ["주간", "월간"], horizontal=True, key="ai_report_period_type")
-    with c2:
-        if period_type == "주간":
-            default_anchor = _today_kst() - timedelta(days=7)
-            anchor = st.date_input("주 시작일 기준 (임의 요일 선택)", value=default_anchor, key="ai_report_week_anchor")
-            start, end = srs.resolve_weekly_period(anchor)
+        _today = _today_kst()
+        _default_start = _today.replace(day=1)
+        _default_end = _today
+        _range = st.date_input(
+            "분석 기간 선택",
+            value=(_default_start, _default_end),
+            min_value=date(2020, 1, 1),
+            max_value=date(2099, 12, 31),
+            key="ai_report_daterange",
+        )
+        if isinstance(_range, (list, tuple)) and len(_range) == 2:
+            start, end = _range[0], _range[1]
+        elif isinstance(_range, (list, tuple)) and len(_range) == 1:
+            start = end = _range[0]
         else:
-            default_anchor = (_today_kst().replace(day=1) - timedelta(days=1))
-            anchor = st.date_input("월 임의일 선택", value=default_anchor, key="ai_report_month_anchor")
-            start, end = srs.resolve_monthly_period(anchor)
-        st.caption(f"대상 기간: **{start.isoformat()} ~ {end.isoformat()}** (총 {(end - start).days + 1}일)")
-    with c3:
+            start = end = _range
+        _days = (end - start).days + 1
+        _period_type = "monthly" if _days >= 20 else "weekly"
+        st.caption(f"대상 기간: **{start.isoformat()} ~ {end.isoformat()}** (총 {_days}일)")
+    with c2:
         stores = _get_supabase_stores_list() or []
         store_options: list[tuple[str, str]] = [("all", "전 매장 통합")]
         if role == "superadmin":
@@ -23861,13 +23869,13 @@ def _render_ai_sales_reports_new(srs):
     run = st.button("🔍 데이터 미리보기 생성", type="primary", key="ai_report_build_btn")
 
     if not run:
-        st.info("상단 조건을 선택한 뒤 '데이터 미리보기 생성'을 눌러 주세요.")
+        st.info("분석 기간과 매장을 선택한 뒤 '데이터 미리보기 생성'을 눌러 주세요.")
         return
 
     with st.spinner(f"데이터 집계 중… ({sel_name}, {start.isoformat()}~{end.isoformat()})"):
         try:
             dataset = srs.build_dataset(
-                period_type=("weekly" if period_type == "주간" else "monthly"),
+                period_type=_period_type,
                 start=start, end=end, store_key=sel_key,
             )
         except Exception as _e:
@@ -24088,7 +24096,7 @@ def _render_ai_sales_reports_new(srs):
                 except Exception:
                     pass
             result = srs.generate_and_save_report(
-                period_type=("weekly" if period_type == "주간" else "monthly"),
+                period_type=_period_type,
                 start=start, end=end, store_key=sel_key,
                 generated_by=_me, use_ai=_use_ai,
             )
