@@ -293,7 +293,7 @@ def _fetch_customers_by_ids(customer_ids: list[int]) -> pd.DataFrame:
     client = _get_client()
     if client is None:
         return pd.DataFrame()
-    _cols = "id, store_name, name, phone1, address, sigungu, bname, road_name, building_name"
+    _cols = "id, store_name, name, phone1, address, sigungu, bname, road_name, building_name, latitude, longitude"
     # Supabase in_() 는 URL 길이 제한 있으므로 청크 단위로 조회
     _CHUNK = 500
     rows: list[dict] = []
@@ -562,12 +562,17 @@ def group_by_building(
     부분 일치로 적용한다. building_name 이 이미 채워진 행도 포함하여 전체 행에
     적용하므로, 카카오 지오코딩 결과가 다양하더라도 관리자 매핑으로 통합할 수 있다.
     긴 키워드가 짧은 키워드보다 우선 적용되며, 한 번 매핑된 행은 재매핑되지 않는다.
+
+    좌표 전파: 주소 텍스트에 건물명이 빠져있어도(예: "103동 1702호"만 기재) 동일한
+    위경도(지오코딩 결과)를 가진 다른 고객이 이미 건물명을 확정했다면 그 이름을
+    전파한다. 마케팅 인사이트 지도가 위경도로 마커를 묶는 방식과 결과를 맞추기 위함.
     """
     if orders.empty or customers.empty:
         return []
     _cust_cols = ["id", "building_name"]
-    if "address" in customers.columns:
-        _cust_cols.append("address")
+    for _c in ("address", "latitude", "longitude"):
+        if _c in customers.columns:
+            _cust_cols.append(_c)
     cust = customers[_cust_cols].rename(columns={"id": "customer_id"})
     df = orders.merge(cust, on="customer_id", how="left")
     df["building_name"] = df["building_name"].fillna("").astype(str).str.strip()
@@ -587,6 +592,24 @@ def group_by_building(
             if hit.any():
                 df.loc[hit, "building_name"] = canonical
                 already_mapped = already_mapped | hit
+
+    if "latitude" in df.columns and "longitude" in df.columns:
+        _lat = pd.to_numeric(df["latitude"], errors="coerce")
+        _lon = pd.to_numeric(df["longitude"], errors="coerce")
+        _has_geo = _lat.notna() & _lon.notna()
+        _coord_key = _lat.round(5).astype(str) + "," + _lon.round(5).astype(str)
+        _resolved = _has_geo & (df["building_name"] != "")
+        if _resolved.any():
+            # 좌표별 이미 확정된 건물명 하나를 대표값으로 선정 (최빈값)
+            _coord_to_name = (
+                df.loc[_resolved].groupby(_coord_key[_resolved])["building_name"]
+                .agg(lambda s: s.value_counts().idxmax())
+            )
+            _need_fill = _has_geo & (df["building_name"] == "")
+            _mapped_name = _coord_key.map(_coord_to_name)
+            _fillable = _need_fill & _mapped_name.notna()
+            if _fillable.any():
+                df.loc[_fillable, "building_name"] = _mapped_name[_fillable]
 
     df = df[df["building_name"] != ""]
     if df.empty:
