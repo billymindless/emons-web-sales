@@ -476,20 +476,33 @@ def group_by_employee(sales: pd.DataFrame, orders: pd.DataFrame, top: int = 5) -
     return grp.to_dict(orient="records")
 
 
-def group_by_region(orders: pd.DataFrame, customers: pd.DataFrame, top: int = 5) -> list[dict]:
-    """시군구별 매출·건수.
+def group_by_region(sales: pd.DataFrame, orders: pd.DataFrame, customers: pd.DataFrame, top: int = 5) -> list[dict]:
+    """시군구별 순매출(sales 원장 기준)·건수.
+
+    KPI 「순매출」과 동일한 sales.amount 를 sales.order_id → orders.customer_id →
+    customers.sigungu 경로로 조인하여 집계한다 (기존에는 orders.total_amount를 사용해
+    KPI 순매출과 합계가 어긋나는 문제가 있었음).
 
     지역 결정 우선순위:
       1) app_customers.sigungu (카카오 지오코딩 파생, 정확)
       2) app_customers.address 문자열에서 '~구/~군' 정규식 파생 (fallback)
       3) '(지역 미기입)'
+
+    Top(N-1)개 지역 + 나머지를 합산한 '기타' 1행으로 구성하여, 표시되는 합계가
+    항상 전체 순매출과 일치하도록 한다 (기존 단순 head(top) 은 나머지 지역이
+    누락되어 합계가 실제보다 작게 나오는 문제가 있었음).
     """
-    if orders.empty or customers.empty:
+    if sales.empty or orders.empty or customers.empty:
         return []
+    _omap = (
+        orders[["id", "customer_id"]].rename(columns={"id": "order_id"})
+        if "customer_id" in orders.columns else pd.DataFrame(columns=["order_id", "customer_id"])
+    )
+    df = sales.merge(_omap, on="order_id", how="left")
     _need = ["id", "sigungu", "address"]
     _use_cols = [c for c in _need if c in customers.columns]
     cust = customers[_use_cols].rename(columns={"id": "customer_id"})
-    df = orders.merge(cust, on="customer_id", how="left")
+    df = df.merge(cust, on="customer_id", how="left")
     # sigungu 우선, 없으면 address 정규식 파생
     _sigungu = df["sigungu"].astype("object") if "sigungu" in df.columns else pd.Series([None] * len(df))
     _addr = df["address"] if "address" in df.columns else pd.Series([None] * len(df))
@@ -498,10 +511,21 @@ def group_by_region(orders: pd.DataFrame, customers: pd.DataFrame, top: int = 5)
         _addr.map(_extract_region_from_address),
     )
     df["_region"] = _resolved.fillna("(지역 미기입)")
-    df["_amount"] = _to_num(df["total_amount"])
-    grp = df.groupby("_region", as_index=False).agg(sales=("_amount", "sum"), count=("id", "count"))
+    df["_amount"] = _to_num(df["amount"])
+    grp = df.groupby("_region", as_index=False).agg(sales=("_amount", "sum"), count=("order_id", "nunique"))
     grp["sales"] = grp["sales"].round().astype(int)
-    grp = grp.sort_values("sales", ascending=False).head(top)
+    grp = grp.sort_values("sales", ascending=False)
+    if len(grp) > top:
+        _head = grp.head(top - 1)
+        _rest = grp.iloc[top - 1:]
+        _other = pd.DataFrame([{
+            "_region": f"기타 ({len(_rest)}개 지역)",
+            "sales": int(_rest["sales"].sum()),
+            "count": int(_rest["count"].sum()),
+        }])
+        grp = pd.concat([_head, _other], ignore_index=True)
+    else:
+        grp = grp.head(top)
     return grp.rename(columns={"_region": "region"}).to_dict(orient="records")
 
 
@@ -825,7 +849,7 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
         "generated_at": pd.Timestamp.now(tz="Asia/Seoul").isoformat(),
         "kpi": kpi_now,
         "by_employee": group_by_employee(sales, orders),
-        "by_region": group_by_region(orders, customers),
+        "by_region": group_by_region(sales, orders, customers),
         "by_building": group_by_building(orders, customers, aliases=building_aliases),
         "by_category": group_by_category(orders),
         "by_visit_reason": group_by_visit_reason(orders),
