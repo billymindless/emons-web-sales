@@ -416,7 +416,7 @@ def _render_nav_favorites(uname: str, labels: list, idx_key: str, radio_key: str
 
     if favs and not st.session_state.get(edit_key):
         for i, label in enumerate(favs):
-            if st.button(f"⭐ {label}", key=f"navfav_{idx_key}_{i}", use_container_width=True):
+            if st.button(f"⭐ {label}", key=f"navfav_{idx_key}_{i}", width="stretch"):
                 st.session_state[idx_key] = labels.index(label)
                 st.session_state[radio_key] = label
                 st.session_state.pop("active_admin_page", None)
@@ -430,7 +430,7 @@ def _render_nav_favorites(uname: str, labels: list, idx_key: str, radio_key: str
                 key=f"favms_{idx_key}", label_visibility="collapsed",
             )
             b1, b2 = st.columns(2)
-            if b1.button("💾 저장", key=f"favsave_{idx_key}", type="primary", use_container_width=True):
+            if b1.button("💾 저장", key=f"favsave_{idx_key}", type="primary", width="stretch"):
                 ok, err = _save_user_fav_menus(uname, new_favs)
                 if ok:
                     st.session_state[edit_key] = False
@@ -440,7 +440,7 @@ def _render_nav_favorites(uname: str, labels: list, idx_key: str, radio_key: str
                     st.error("app_user_preferences 테이블이 없습니다. SUPABASE_USER_PREFERENCES.sql 을 실행해 주세요.")
                 else:
                     st.error(f"저장 실패: {err}")
-            if b2.button("취소", key=f"favcancel_{idx_key}", use_container_width=True):
+            if b2.button("취소", key=f"favcancel_{idx_key}", width="stretch"):
                 st.session_state[edit_key] = False
                 st.rerun()
 
@@ -455,46 +455,46 @@ def _render_erp_icon_rail(role: str) -> None:
         st.session_state.pop("mm_queried", None)
         st.rerun()
 
-    if st.button("🏠", key="rail_home", help="홈 (대시보드)", use_container_width=True):
+    if st.button("🏠", key="rail_home", help="홈 (대시보드)", width="stretch"):
         st.session_state.pop("active_admin_page", None)
         st.session_state["main_tab_idx"] = 0
         st.session_state["superadmin_menu_idx"] = 0
         for _k in ("nav_radio_main_tab_idx", "nav_radio_superadmin_menu_idx"):
             st.session_state.pop(_k, None)
         st.rerun()
-    if st.button("🗓️", key="rail_erp", help="근태 관리", use_container_width=True):
+    if st.button("🗓️", key="rail_erp", help="근태 관리", width="stretch"):
         _go("erp_attendance")
-    if st.button("📧", key="rail_mail", help="메일 관리", use_container_width=True):
+    if st.button("📧", key="rail_mail", help="메일 관리", width="stretch"):
         _go("gmail_manager")
-    if st.button("📁", key="rail_doc", help="자료실", use_container_width=True):
+    if st.button("📁", key="rail_doc", help="자료실", width="stretch"):
         _go("document_library")
-    if st.button("📋", key="rail_board", help="사내업무/게시판", use_container_width=True):
+    if st.button("📋", key="rail_board", help="사내업무/게시판", width="stretch"):
         _go("internal_board")
     if role in ("store_admin", "superadmin"):
-        if st.button("💬", key="rail_msg", help="메시지 발송", use_container_width=True):
+        if st.button("💬", key="rail_msg", help="메시지 발송", width="stretch"):
             _go("send_message")
-        if st.button("📢", key="rail_voc", help="고객의 소리(VOC)", use_container_width=True):
+        if st.button("📢", key="rail_voc", help="고객의 소리(VOC)", width="stretch"):
             _go("voc_dashboard")
-        if st.button("📈", key="rail_hr", help="인력 효율 분석", use_container_width=True):
+        if st.button("📈", key="rail_hr", help="인력 효율 분석", width="stretch"):
             _go("employee_analytics")
-        if st.button("🚨", key="rail_paymon", help="결제 변경/취소 모니터링", use_container_width=True):
+        if st.button("🚨", key="rail_paymon", help="결제 변경/취소 모니터링", width="stretch"):
             _go("payment_monitor")
-        if st.button("💳", key="rail_margin", help="마진 모니터링", use_container_width=True):
+        if st.button("💳", key="rail_margin", help="마진 모니터링", width="stretch"):
             _go("margin_monitor")
-        if st.button("🗑️", key="rail_del", help="주문 삭제 요청 관리", use_container_width=True):
+        if st.button("🗑️", key="rail_del", help="주문 삭제 요청 관리", width="stretch"):
             _go("delete_requests")
-        if st.button("⚙️", key="rail_settings", help="관리자 설정", use_container_width=True):
+        if st.button("⚙️", key="rail_settings", help="관리자 설정", width="stretch"):
             _go("admin_settings")
     if role == "superadmin":
-        if st.button("👥", key="rail_emp", help="직원 관리", use_container_width=True):
+        if st.button("👥", key="rail_emp", help="직원 관리", width="stretch"):
             _go("employee_management")
     # 즐겨찾기 편집 토글 (세일즈 메뉴 상단 즐겨찾기 바 편집 모드 on)
     _fav_idx_key = "superadmin_menu_idx" if role == "superadmin" else "main_tab_idx"
-    if st.button("⭐", key="rail_fav", help="자주 쓰는 메뉴 설정", use_container_width=True):
+    if st.button("⭐", key="rail_fav", help="자주 쓰는 메뉴 설정", width="stretch"):
         _ek = f"fav_edit_mode_{_fav_idx_key}"
         st.session_state[_ek] = not st.session_state.get(_ek, False)
         st.rerun()
-    if st.button("🚪", key="rail_logout", help="로그아웃", use_container_width=True):
+    if st.button("🚪", key="rail_logout", help="로그아웃", width="stretch"):
         try:
             client, _ = get_supabase_client()
             if client:
@@ -565,7 +565,7 @@ def _render_primary_nav(user: dict, role: str) -> None:
                     f" font-size:0.75rem;'>🔵 {_noti.get('message','')}</div>",
                     unsafe_allow_html=True,
                 )
-            if st.button("✅ 모두 읽음 처리", key="sidebar_noti_read_all", use_container_width=True):
+            if st.button("✅ 모두 읽음 처리", key="sidebar_noti_read_all", width="stretch"):
                 _tb_noti.mark_all_read(_noti_uname)
                 st.rerun()
     except Exception:
@@ -3845,13 +3845,13 @@ def _render_fav_menu_bar(username: str, tab_labels: list, tab_idx_key: str,
         cols = st.columns(len(valid_favs) + 1)
         for i, label in enumerate(valid_favs):
             btn_key = f"fav_btn_{tab_idx_key}_{i}"
-            if cols[i].button(label, key=btn_key, use_container_width=True):
+            if cols[i].button(label, key=btn_key, width="stretch"):
                 st.session_state[tab_idx_key] = tab_labels.index(label)
                 if widget_key:
                     st.session_state[widget_key] = label
                 st.rerun()
         if cols[-1].button("⚙️", key=f"fav_edit_toggle_{tab_idx_key}",
-                            help="즐겨찾기 편집", use_container_width=True):
+                            help="즐겨찾기 편집", width="stretch"):
             st.session_state[edit_key] = not st.session_state.get(edit_key, False)
             st.rerun()
     else:
@@ -3869,7 +3869,7 @@ def _render_fav_menu_bar(username: str, tab_labels: list, tab_idx_key: str,
                 key=f"fav_select_{tab_idx_key}",
             )
             bc1, bc2, _ = st.columns([1, 1, 4])
-            if bc1.button("💾 저장", key=f"fav_save_{tab_idx_key}", type="primary", use_container_width=True):
+            if bc1.button("💾 저장", key=f"fav_save_{tab_idx_key}", type="primary", width="stretch"):
                 ok, err = _save_user_fav_menus(uname, new_favs)
                 if ok:
                     st.session_state[edit_key] = False
@@ -3880,7 +3880,7 @@ def _render_fav_menu_bar(username: str, tab_labels: list, tab_idx_key: str,
                              "**SUPABASE_USER_PREFERENCES.sql** 을 Supabase SQL Editor 에서 실행해 주세요.")
                 else:
                     st.error(f"저장 실패: {err}")
-            if bc2.button("취소", key=f"fav_cancel_{tab_idx_key}", use_container_width=True):
+            if bc2.button("취소", key=f"fav_cancel_{tab_idx_key}", width="stretch"):
                 st.session_state[edit_key] = False
                 st.rerun()
 
@@ -5094,7 +5094,7 @@ def _render_order_cost_verify(db_filename: str, order_id: int):
                 "payment_date": "결제일", "amount": "결제금액",
                 "payment_method": "결제수단", "card_company": "카드사", "fee_amount": "수수료"
             })
-            st.dataframe(disp_p, use_container_width=True)
+            st.dataframe(disp_p, width="stretch")
     else:
         st.caption("등록된 결제 내역이 없습니다.")
 
@@ -7001,7 +7001,7 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
             return
         m = _create_folium_map(map_data, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_single")
         if m:
-            st_folium(m, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_single")
+            st_folium(m, returned_objects=[], width="stretch", key=f"{key_prefix}_map_single")
     else:
         col1, col2 = st.columns(2)
         year1_opts = [str(y) for y in years]
@@ -7027,7 +7027,7 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
                     else:
                         m1 = _create_folium_map(md1, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_m1")
                         if m1:
-                            st_folium(m1, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_left")
+                            st_folium(m1, returned_objects=[], width="stretch", key=f"{key_prefix}_map_left")
         with col2:
             st.caption(f"📅 {y2}년")
             if len(df2) == 0:
@@ -7043,7 +7043,7 @@ def _render_regional_sales_map_section(merged: pd.DataFrame, key_prefix: str = "
                     else:
                         m2 = _create_folium_map(md2, _MAP_CENTER, _MAP_ZOOM, f"{key_prefix}_m2")
                         if m2:
-                            st_folium(m2, returned_objects=[], use_container_width=True, key=f"{key_prefix}_map_right")
+                            st_folium(m2, returned_objects=[], width="stretch", key=f"{key_prefix}_map_right")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -7971,7 +7971,7 @@ def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str,
         map_data = map_data.nlargest(_MAP_MARKER_LIMIT, "total_amount")
     m = _create_folium_map(map_data, _MAP_CENTER, _MAP_ZOOM, key_prefix)
     if m:
-        st_folium(m, returned_objects=[], use_container_width=True, key=f"{key_prefix}_single_map")
+        st_folium(m, returned_objects=[], width="stretch", key=f"{key_prefix}_single_map")
 
 
 @st.fragment
@@ -8285,7 +8285,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                         xanchor="right", x=1, font=dict(size=11)),
             plot_bgcolor="white", hovermode="x unified",
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
         # ── [Step 5] 요일별 평균 매출 바 차트 ────────────────────────
         _DOW_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
@@ -8355,7 +8355,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                 fillcolor="rgba(255,0,0,0.07)",
                 layer="below", line_width=0,
             )
-        st.plotly_chart(fig_dow, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_dow, width="stretch", config={"displayModeBar": False})
 
         # ── 비교 요약 테이블 ──────────────────────────────────────
         def _fmt(v): return f"{v / _unit_div:{_unit_fmt}}{_unit_label}"
@@ -8373,7 +8373,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                     "기준월 대비 %": _pct,
                     "비교월 전체 누적": _fmt(_all),
                 })
-            st.dataframe(pd.DataFrame(_tbl), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
         st.caption(
             "💡 기준 월(굵은 실선·컬러 마커)이 전면에, 비교 월(회색 점선)이 배경으로 표시됩니다. "
             "붉은 음영 = 주말·공휴일 구간."
@@ -13084,8 +13084,8 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
                     lambda x: f"{int(x) // 60}h {int(x) % 60:02d}m"
                 )
                 st.dataframe(_dup_multi.rename(columns={"count": "건수"})[["날짜", "건수", "합산"]],
-                             use_container_width=True, hide_index=True)
-            st.dataframe(_dbg_df.drop(columns=["_min"]), use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
+            st.dataframe(_dbg_df.drop(columns=["_min"]), width="stretch", hide_index=True)
         else:
             st.info("정상근무 내역이 없습니다.")
 
@@ -13447,7 +13447,7 @@ def _erp_tab_admin_settings(current_db: str, me_name: str, today: date):
                 "잔여 연차(일)": f"{_adm_leave['annual_remain']:g}",
             })
         import pandas as pd
-        st.dataframe(pd.DataFrame(_adm_rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(_adm_rows), hide_index=True, width="stretch")
 
 
 # ---------- 탭 1: 근무 일정 계획 (store_admin) ----------
@@ -13897,7 +13897,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                                 _sa, _sb = st.columns(2)
                                 with _sa:
                                     if st.button("저장", key=f"erp_rule_save_{rid}",
-                                                 type="primary", use_container_width=True):
+                                                 type="primary", width="stretch"):
                                         patch = {
                                             "min_staff": int(_new_min),
                                             "optimal_staff": int(_new_opt) if _new_opt else None,
@@ -13916,7 +13916,7 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                                             st.rerun()
                                 with _sb:
                                     if st.button("취소", key=f"erp_rule_cancel_{rid}",
-                                                 use_container_width=True):
+                                                 width="stretch"):
                                         st.session_state.pop(_edit_key, None)
                                         st.rerun()
                     else:
@@ -13932,12 +13932,12 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
                             _btn_col_a, _btn_col_b = st.columns(2)
                             with _btn_col_a:
                                 if st.button("수정", key=f"erp_rule_edit_btn_{form_key}_{rid}",
-                                             use_container_width=True):
+                                             width="stretch"):
                                     st.session_state[_edit_key] = rid
                                     st.rerun()
                             with _btn_col_b:
                                 if st.button("삭제", key=f"erp_rule_del_{form_key}_{rid}",
-                                             use_container_width=True):
+                                             width="stretch"):
                                     for _did in all_ids:
                                         _erp_delete_row("app_staffing_rules", _did)
                                     st.session_state.pop(_edit_key, None)
@@ -15067,7 +15067,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     subset=["매장", "요일", "시작", "종료"], keep=False
                 )
                 df_diag["⚠ 중복"] = dup_mask.map(lambda x: "🔴" if x else "")
-                st.dataframe(df_diag, use_container_width=True, hide_index=True)
+                st.dataframe(df_diag, width="stretch", hide_index=True)
                 if dup_mask.any():
                     st.error(
                         "🔴 표시된 행은 같은 매장·요일·시간대에 row가 여러 개 존재합니다. "
@@ -15155,7 +15155,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     )
                     st.dataframe(
                         pd.DataFrame(_shift_dup_rows),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
 
                 # ── 🔬 부족/과다 사유 상세: 카운트에 합산된 직원 목록
@@ -15201,7 +15201,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     df_flag = pd.DataFrame(_flag_rows).sort_values(
                         ["날짜", "매장(카운트 대상)", "직원"], kind="stable"
                     )
-                    st.dataframe(df_flag, use_container_width=True, hide_index=True)
+                    st.dataframe(df_flag, width="stretch", hide_index=True)
                     st.caption(
                         "🔎 박성진 등 특정 직원이 보이지 않는다면: 그 직원의 시프트의 "
                         "**`work_location_name`이 다른 매장 또는 외부 행사로 지정**되어 해당 매장에 합산되지 않은 것입니다. "
@@ -16493,7 +16493,7 @@ def render_send_message():
                 height=160,
                 placeholder="발송할 메시지를 입력하세요.",
             )
-            submitted = st.form_submit_button("📤 발송", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("📤 발송", type="primary", width="stretch")
 
         if submitted:
             if not to_phone.strip():
@@ -16644,7 +16644,7 @@ def render_voc_dashboard():
                     color_discrete_sequence=_px.colors.qualitative.Pastel,
                 )
                 _fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
-                st.plotly_chart(_fig_pie, use_container_width=True)
+                st.plotly_chart(_fig_pie, width="stretch")
             else:
                 st.info("카테고리 데이터가 없습니다.")
 
@@ -16663,7 +16663,7 @@ def render_voc_dashboard():
                 showlegend=False, margin=dict(t=10, b=10, l=10, r=10), height=300,
             )
             _fig_bar.update_traces(textposition="outside")
-            st.plotly_chart(_fig_bar, use_container_width=True)
+            st.plotly_chart(_fig_bar, width="stretch")
 
         # ── 신제품 아이디어 리스트 ───────────────────────────────
         _ideas = _df[_df["product_idea"].fillna("").str.strip() != ""][["analyzed_at", "product_idea", "summary"]].copy()
@@ -16693,7 +16693,7 @@ def render_voc_dashboard():
         ]
         _display_df["분석일시"] = _pd_voc.to_datetime(_display_df["분석일시"]).dt.strftime("%Y-%m-%d %H:%M")
         _display_df["클레임"] = _display_df["클레임"].map({True: "🚨 클레임", False: "정상", None: ""})
-        st.dataframe(_display_df, use_container_width=True, hide_index=True)
+        st.dataframe(_display_df, width="stretch", hide_index=True)
 
     # ── 과거 데이터 일괄 임포트 (엑셀 업로드) ───────────────────
     st.divider()
@@ -16924,7 +16924,7 @@ def render_document_library():
         _search = st.text_input("", placeholder="🔍  제목, 내용, 작성자로 검색",
                                 key="doc_search", label_visibility="collapsed")
     with _top2:
-        if st.button("✏️ 글쓰기", type="primary", use_container_width=True, key="doc_add_btn"):
+        if st.button("✏️ 글쓰기", type="primary", width="stretch", key="doc_add_btn"):
             st.session_state["doc_show_form"] = not st.session_state.get("doc_show_form", False)
 
     # ── 글쓰기 팝업(모달) ─────────────────────────────────────────
@@ -17022,7 +17022,7 @@ def render_document_library():
         _all_count = len(_docs)
         _all_style = "background:#4a6cf7;color:#fff;" if _sel_cat == "전체" else "background:#f0f4ff;color:#4a6cf7;"
         if st.button(f"전체  ({_all_count})", key="doc_cat_all",
-                     use_container_width=True):
+                     width="stretch"):
             st.session_state.update({"doc_sel_cat": "전체", "doc_sel_sub": ""})
             st.rerun()
         # 카테고리별 버튼
@@ -17030,7 +17030,7 @@ def render_document_library():
             _cat_total = sum(_cat_tree[_cat].values())
             _is_active = (_sel_cat == _cat)
             if st.button(f"📁 {_cat}  ({_cat_total})", key=f"doc_cat_{_cat}",
-                         use_container_width=True,
+                         width="stretch",
                          type="primary" if _is_active else "secondary"):
                 _new_sub = "" if _sel_cat != _cat else _sel_sub
                 st.session_state.update({"doc_sel_cat": _cat, "doc_sel_sub": _new_sub})
@@ -17043,7 +17043,7 @@ def render_document_library():
                     if st.button(
                         f"  └ {_sub}  ({_sub_cnt})",
                         key=f"doc_sub_{_cat}_{_sub}",
-                        use_container_width=True,
+                        width="stretch",
                         type="primary" if _is_sub_active else "secondary",
                     ):
                         st.session_state.update({"doc_sel_cat": _cat, "doc_sel_sub": _sub})
@@ -17409,7 +17409,7 @@ def render_gmail_manager():
             _inp_addr = st.text_input("Gmail 주소", placeholder="example@gmail.com", key="gm_inp_addr")
             _inp_pwd  = st.text_input("앱 비밀번호", placeholder="xxxx xxxx xxxx xxxx",
                                       type="password", key="gm_inp_pwd")
-            if st.button("연결", type="primary", use_container_width=True, key="gm_connect_btn"):
+            if st.button("연결", type="primary", width="stretch", key="gm_connect_btn"):
                 _a = _inp_addr.strip()
                 _p = _inp_pwd.replace(" ", "").strip()
                 if not _a or "@" not in _a:
@@ -17446,11 +17446,11 @@ def render_gmail_manager():
             unsafe_allow_html=True,
         )
     with _top2:
-        if st.button("🔄 새로고침", key="gm_refresh", use_container_width=True):
+        if st.button("🔄 새로고침", key="gm_refresh", width="stretch"):
             st.session_state.pop("gm_inbox_cache", None)
             st.rerun()
     with _top3:
-        if st.button("연결 해제", key="gm_disconnect", use_container_width=True):
+        if st.button("연결 해제", key="gm_disconnect", width="stretch"):
             _gm.delete_user_credentials(_me)
             st.session_state.pop("gm_inbox_cache", None)
             st.rerun()
@@ -17507,7 +17507,7 @@ def render_gmail_manager():
             with _bc1:
                 pass
             with _bc2:
-                if st.button("열기", key=f"gm_open_{_uid}", use_container_width=True):
+                if st.button("열기", key=f"gm_open_{_uid}", width="stretch"):
                     _k = f"gm_body_{_uid}"
                     if _k in st.session_state:
                         st.session_state.pop(_k)
@@ -17515,7 +17515,7 @@ def render_gmail_manager():
                         with st.spinner(""):
                             st.session_state[_k] = _gm.get_message_body(_gaddr, _gpwd, _uid)
             with _bc3:
-                if st.button("🗑️ 삭제", key=f"gm_del_{_uid}", use_container_width=True):
+                if st.button("🗑️ 삭제", key=f"gm_del_{_uid}", width="stretch"):
                     st.session_state[f"gm_del_confirm_{_uid}"] = True
 
             if st.session_state.get(f"gm_del_confirm_{_uid}"):
@@ -17563,7 +17563,7 @@ def render_gmail_manager():
             _sq = st.text_input("검색어", placeholder="보낸사람, 제목, 내용으로 검색  예) SUBJECT 견적",
                                 key="gm_search_q", label_visibility="collapsed")
         with _sq2c:
-            _do_search = st.button("검색", type="primary", key="gm_search_btn", use_container_width=True)
+            _do_search = st.button("검색", type="primary", key="gm_search_btn", width="stretch")
 
         if _do_search and _sq.strip():
             with st.spinner("검색 중..."):
@@ -17594,7 +17594,7 @@ def render_gmail_manager():
                 )
                 _soc1, _soc2 = st.columns([5, 1])
                 with _soc2:
-                    if st.button("열기", key=f"gm_sr_open_{_suid}", use_container_width=True):
+                    if st.button("열기", key=f"gm_sr_open_{_suid}", width="stretch"):
                         _sk = f"gm_sr_body_{_suid}"
                         if _sk in st.session_state:
                             st.session_state.pop(_sk)
@@ -17626,7 +17626,7 @@ def render_gmail_manager():
                               key="gm_send_body", label_visibility="collapsed")
         _pc1, _pc2 = st.columns([1, 5])
         with _pc1:
-            if st.button("📤 보내기", type="primary", key="gm_send_btn", use_container_width=True):
+            if st.button("📤 보내기", type="primary", key="gm_send_btn", width="stretch"):
                 if not _to.strip():
                     st.error("받는 사람을 입력해 주세요.")
                 elif not _subj.strip():
@@ -17776,7 +17776,7 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
 
     df_summary = pd.DataFrame(summary_rows)
     st.caption("화면에는 직원별 전체 근무 합계가 표시됩니다. 매장별 세부 내역은 엑셀 다운로드에서 확인하세요.")
-    st.dataframe(df_summary, use_container_width=True, hide_index=True)
+    st.dataframe(df_summary, width="stretch", hide_index=True)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -18613,7 +18613,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         "work_location_name": a.get("work_location_name") or "",
                         "reason": a.get("reason"),
                     } for a in _adj]
-                    st.dataframe(pd.DataFrame(_adj_view), use_container_width=True,
+                    st.dataframe(pd.DataFrame(_adj_view), width="stretch",
                                  hide_index=True)
                 else:
                     st.info("해당 날짜·직원의 신청 내역이 없습니다.")
@@ -18631,7 +18631,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                         "end_time": str(l.get("end_time") or "")[:5],
                         "status": l.get("status"),
                     } for l in _lgs]
-                    st.dataframe(pd.DataFrame(_lg_view), use_container_width=True,
+                    st.dataframe(pd.DataFrame(_lg_view), width="stretch",
                                  hide_index=True)
 
                     # 캘린더가 실제 조회하는 매장 목록 (활성 매장만)
@@ -18804,7 +18804,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     st.success(
                         f"✅ {len(_xls_records)}건 · 총 {_total_h}h ({_total_min}분) — 아래 버튼으로 다운로드"
                     )
-                    st.dataframe(_xls_df, use_container_width=True, hide_index=True)
+                    st.dataframe(_xls_df, width="stretch", hide_index=True)
                     st.download_button(
                         label=f"⬇️ 엑셀 다운로드 ({_emp_tag} · {_st_tag} · {_xls_start} ~ {_xls_end})",
                         data=_buf,
@@ -19901,7 +19901,7 @@ def render_employee_analytics():
         merged_a["인당매출(원)"] = merged_a.apply(lambda r: int(r["총매출(원)"] / r["재직인원"]) if r["재직인원"] > 0 else 0, axis=1)
         merged_a["인당마진(원)"] = merged_a.apply(lambda r: int(r["총마진(원)"] / r["재직인원"]) if r["재직인원"] > 0 else 0, axis=1)
 
-        st.dataframe(merged_a, hide_index=True, use_container_width=True)
+        st.dataframe(merged_a, hide_index=True, width="stretch")
         if not merged_a.empty:
             try:
                 import altair as alt
@@ -19912,14 +19912,14 @@ def render_employee_analytics():
                         base_a.mark_line(color="#3B82F6", point=True).encode(
                             y=alt.Y("총매출(원):Q"), tooltip=["연월", "총매출(원)", "재직인원"]
                         ).properties(title="월별 총매출", height=240),
-                        use_container_width=True,
+                        width="stretch",
                     )
                 with c2:
                     st.altair_chart(
                         base_a.mark_bar(color="#F59E0B", opacity=0.8).encode(
                             y=alt.Y("재직인원:Q"), tooltip=["연월", "재직인원", "신규입사"]
                         ).properties(title="월별 재직인원", height=240),
-                        use_container_width=True,
+                        width="stretch",
                     )
             except Exception:
                 pass
@@ -19982,7 +19982,7 @@ def render_employee_analytics():
             avg_rev = int(sum(order_dow[i]) / len(order_dow[i])) if order_dow[i] else 0
             dow_rows.append({"요일": lbl, "평균근무인원": avg_emp, "평균매출(원)": avg_rev})
         dow_df = pd.DataFrame(dow_rows)
-        st.dataframe(dow_df, hide_index=True, use_container_width=True)
+        st.dataframe(dow_df, hide_index=True, width="stretch")
 
         has_att = any(att_dow[i] for i in range(7))
         if has_att:
@@ -20004,7 +20004,7 @@ def render_employee_analytics():
                 st.altair_chart(
                     alt.layer(bar_b, line_b).resolve_scale(y="independent")
                     .properties(title="요일별 인원(빨간선) vs 매출(막대)", height=300),
-                    use_container_width=True,
+                    width="stretch",
                 )
             except Exception:
                 pass
@@ -20076,7 +20076,7 @@ def render_employee_analytics():
         if not roi_df.empty:
             roi_df["매출순위"] = roi_df["매출(원)"].rank(ascending=False, method="min").astype(int)
             roi_df["마진율순위"] = roi_df["마진율(%)"].rank(ascending=False, method="min").astype(int)
-            st.dataframe(roi_df.sort_values("매출(원)", ascending=False), hide_index=True, use_container_width=True)
+            st.dataframe(roi_df.sort_values("매출(원)", ascending=False), hide_index=True, width="stretch")
 
             hrs_avail = roi_df["시간당매출(원)"].dropna()
             if len(roi_df) > 1 and not hrs_avail.empty:
@@ -20089,7 +20089,7 @@ def render_employee_analytics():
                     )
                     avg_rev_c = roi_df["매출(원)"].mean()
                     avg_line_c = alt.Chart(pd.DataFrame({"y": [avg_rev_c]})).mark_rule(color="red", strokeDash=[4, 4]).encode(y="y:Q")
-                    st.altair_chart((scatter_c + avg_line_c).properties(title="실근무시간 vs 매출 (빨간선=매장평균)", height=300), use_container_width=True)
+                    st.altair_chart((scatter_c + avg_line_c).properties(title="실근무시간 vs 매출 (빨간선=매장평균)", height=300), width="stretch")
                 except Exception:
                     pass
 
@@ -20137,7 +20137,7 @@ def render_employee_analytics():
                         "시급(원)": st.column_config.NumberColumn("시급(원)", min_value=0, step=100),
                     },
                     hide_index=True,
-                    use_container_width=True,
+                    width="stretch",
                     key="ea_d_salary_editor",
                 )
                 if st.button("💾 급여 저장", key="ea_d_save_sal"):
@@ -20183,7 +20183,7 @@ def render_employee_analytics():
 
         if extra_pay_rows:
             ep_df = pd.DataFrame(extra_pay_rows)
-            st.dataframe(ep_df, hide_index=True, use_container_width=True)
+            st.dataframe(ep_df, hide_index=True, width="stretch")
 
             dm_last = _cal.monthrange(int(d_year), int(d_month))[1]
             dm_start = f"{d_year}-{d_month:02d}-01"
@@ -20231,7 +20231,7 @@ def render_employee_analytics():
             if lroi_rows:
                 lroi_df = pd.DataFrame(lroi_rows)
                 st.markdown("##### LROI (매출 ÷ 총인건비) & 인건비 효율")
-                st.dataframe(lroi_df, hide_index=True, use_container_width=True)
+                st.dataframe(lroi_df, hide_index=True, width="stretch")
                 total_labor_all = lroi_df["총인건비(원)"].sum()
                 total_rev_all = lroi_df["매출(원)"].sum()
                 mc1, mc2, mc3, mc4 = st.columns(4)
@@ -20633,8 +20633,8 @@ def _render_task_gantt(tasks: list[dict], assignees_map: dict):
     )
 
     st.caption("💡 차트를 좌우로 드래그하거나, 하단/브라우저 가로 스크롤로 6개월 이상 일정을 확인할 수 있습니다. 완료된 업무는 크로스 해치(╳) 패턴으로 표시됩니다.")
-    # use_container_width=False → 위에서 강제한 width(일자×32px)로 그려져 브라우저 가로 스크롤 활성화
-    st.plotly_chart(fig, use_container_width=False)
+    # width="content" → 위에서 강제한 width(일자×32px)로 그려져 브라우저 가로 스크롤 활성화
+    st.plotly_chart(fig, width="content")
 
 
 def _today_kst_safe() -> date:
@@ -20691,14 +20691,14 @@ def _open_attachment_lightbox(img_bytes: bytes, name: str | None = None):
 
             @dialog_dec
             def _dlg():
-                st.image(img_bytes, use_container_width=True)
+                st.image(img_bytes, width="stretch")
 
             _dlg()
             return
         except Exception:
             pass
     with st.expander(f"🔍 {title}", expanded=True):
-        st.image(img_bytes, use_container_width=True)
+        st.image(img_bytes, width="stretch")
 
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg")
@@ -20744,7 +20744,7 @@ def _render_attachment_inline(a: dict, key_suffix: str):
         return
     aid = a.get("id", "")
     if _is_image_attachment(a):
-        st.image(data, caption=name, use_container_width=True)
+        st.image(data, caption=name, width="stretch")
         if st.button("🔍 크게 보기", key=f"open_img_{aid}_{key_suffix}"):
             _open_attachment_lightbox(data, name)
     else:
@@ -20768,7 +20768,7 @@ def _render_upload_preview(files: list, cols_per_row: int = 4):
     for i, f in enumerate(files):
         with cols[i % len(cols)]:
             if _is_image_upload(f):
-                st.image(f, caption=f.name, use_container_width=True)
+                st.image(f, caption=f.name, width="stretch")
             else:
                 st.markdown(f"📄 **{f.name}**")
                 size = getattr(f, "size", None)
@@ -22128,7 +22128,7 @@ def render_deposit_management():
             "매장": r.get("store_name") or "미분류",
             "매출 연결": link_txt,
         })
-    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True)
 
     # ── 건별 관리 (매출 연결 / 매장 지정 / 삭제) ────────────────────
     with st.expander("🔧 입금 건 관리 (매출 연결 · 매장 지정 · 삭제)", expanded=False):
@@ -22261,7 +22261,7 @@ def render_admin_settings():
                 "사용자명": u.get("username"),
                 "휴대폰": u.get("phone") or "(미입력)",
             } for u in pending]
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             st.caption("위 직원들은 인앱 알림만 받습니다. 본인 카카오톡에서 회사 채널을 친구 추가해 주세요.")
     else:
         st.success("전 직원 카카오 채널 친구추가 완료 ✅")
@@ -22318,7 +22318,7 @@ def render_admin_settings():
                 "별칭": a.get("account_alias") or "-",
                 "사용": "✅" if a.get("is_active", True) else "❌",
             } for a in accounts]),
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
 
     _stores = _get_supabase_stores_list()
@@ -23776,7 +23776,7 @@ def _render_building_alias_admin():
     })
     st.dataframe(
         _df[["ID", "주소 키워드", "정식 건물명", "수정"]],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -23935,7 +23935,7 @@ def _render_ai_sales_reports_new(srs):
         else:
             st.caption("전년 동기간 데이터 없음 — YoY 섹션은 리포트에서 생략됩니다.")
         _cmp_df = _fmt_krw_col(pd.DataFrame(_rows), ["순매출", "객단가", "실수납"])
-        st.dataframe(_cmp_df, use_container_width=True, hide_index=True)
+        st.dataframe(_cmp_df, width="stretch", hide_index=True)
 
     st.markdown("### 2️⃣ 직원별 매출 Top 5")
     _emp = dataset.get("by_employee") or []
@@ -23944,7 +23944,7 @@ def _render_ai_sales_reports_new(srs):
             pd.DataFrame(_emp).rename(columns={"name": "직원", "sales": "순매출(1/n 배분)", "count": "참여 건수"}),
             ["순매출(1/n 배분)"]
         )
-        st.dataframe(_emp_df, use_container_width=True, hide_index=True)
+        st.dataframe(_emp_df, width="stretch", hide_index=True)
     else:
         st.info("직원별 매출 데이터 없음")
 
@@ -23958,7 +23958,7 @@ def _render_ai_sales_reports_new(srs):
                 pd.DataFrame(_r).rename(columns={"region": "시군구", "sales": "매출", "count": "건수"}),
                 ["매출"]
             )
-            st.dataframe(_r_df, use_container_width=True, hide_index=True)
+            st.dataframe(_r_df, width="stretch", hide_index=True)
         else:
             st.info("데이터 없음")
     with g2:
@@ -23969,7 +23969,7 @@ def _render_ai_sales_reports_new(srs):
                 pd.DataFrame(_b).rename(columns={"name": "건물명", "sales": "매출", "count": "건수"}),
                 ["매출"]
             )
-            st.dataframe(_b_df, use_container_width=True, hide_index=True)
+            st.dataframe(_b_df, width="stretch", hide_index=True)
         else:
             st.info("건물명 매핑된 데이터 없음 (카카오 지오코딩 필요)")
 
@@ -23983,7 +23983,7 @@ def _render_ai_sales_reports_new(srs):
                 pd.DataFrame(_v).rename(columns={"visit_reason": "방문경로", "count": "건수", "sales": "매출", "share_pct": "비중(%)"}),
                 ["매출"]
             )
-            st.dataframe(_v_df, use_container_width=True, hide_index=True)
+            st.dataframe(_v_df, width="stretch", hide_index=True)
         else:
             st.info("데이터 없음")
     with r2:
@@ -23994,7 +23994,7 @@ def _render_ai_sales_reports_new(srs):
                 pd.DataFrame(_p).rename(columns={"purchase_reason": "구매이유", "count": "건수", "sales": "매출", "share_pct": "비중(%)"}),
                 ["매출"]
             )
-            st.dataframe(_p_df, use_container_width=True, hide_index=True)
+            st.dataframe(_p_df, width="stretch", hide_index=True)
         else:
             st.info("데이터 없음")
     with r3:
@@ -24003,7 +24003,7 @@ def _render_ai_sales_reports_new(srs):
         if _c:
             st.dataframe(pd.DataFrame(_c).rename(columns={
                 "category": "카테고리", "count": "건수", "share_pct": "비중(%)"}),
-                use_container_width=True, hide_index=True)
+                width="stretch", hide_index=True)
         else:
             st.info("데이터 없음")
 
@@ -24014,7 +24014,7 @@ def _render_ai_sales_reports_new(srs):
                 pd.DataFrame(_m).rename(columns={"visit_reason": "방문경로", "purchase_reason": "구매이유", "count": "건수", "sales": "매출"}),
                 ["매출"]
             )
-            st.dataframe(_m_df, use_container_width=True, hide_index=True)
+            st.dataframe(_m_df, width="stretch", hide_index=True)
         else:
             st.info("데이터 없음")
 
@@ -24025,7 +24025,7 @@ def _render_ai_sales_reports_new(srs):
             pd.DataFrame(_pm).rename(columns={"payment_method": "결제수단", "amount": "금액", "count": "건수"}),
             ["금액"]
         )
-        st.dataframe(_pm_df, use_container_width=True, hide_index=True)
+        st.dataframe(_pm_df, width="stretch", hide_index=True)
     else:
         st.info("데이터 없음")
 
@@ -24054,7 +24054,7 @@ def _render_ai_sales_reports_new(srs):
     if _u10:
         st.caption("우선 회수 대상 (D-10 지남 ~ D+10 이내, 상위 20건)")
         _u10_df = _fmt_krw_col(pd.DataFrame(_u10), ["balance"])
-        st.dataframe(_u10_df, use_container_width=True, hide_index=True)
+        st.dataframe(_u10_df, width="stretch", hide_index=True)
     else:
         st.info("회수 대상 미수금 없음")
 
@@ -24163,7 +24163,7 @@ def _render_ai_sales_reports_saved(srs):
         "start_date": "시작", "end_date": "종료", "store_name": "매장",
         "status": "상태", "generated_by": "생성자", "generated_at": "생성시각",
     })
-    st.dataframe(_view, use_container_width=True, hide_index=True)
+    st.dataframe(_view, width="stretch", hide_index=True)
 
     _ids = df["id"].tolist()
     if not _ids:
@@ -26372,7 +26372,7 @@ def render_sales_kpi_dashboard() -> None:
     show_cols = [c for c in ["등록일", "유입 경로", "단계", "계약금액", "다음 연락", "사후관리"] if c in display_df.columns]
     if "등록일" in display_df.columns:
         display_df["등록일"] = display_df["등록일"].str[:10]
-    st.dataframe(display_df[show_cols] if show_cols else display_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_df[show_cols] if show_cols else display_df, width="stretch", hide_index=True)
 
 
 def _render_chat_history_section(customer_id: int, phone: str, customer_name: str) -> None:
@@ -26707,7 +26707,7 @@ def render_customer_balance():
                     with _kk_col2:
                         _kk_btn_cols = st.columns(2)
                         with _kk_btn_cols[0]:
-                            if st.button("📨 채널 초대 문자 발송", key=f"kakao_invite_{cid}", use_container_width=True):
+                            if st.button("📨 채널 초대 문자 발송", key=f"kakao_invite_{cid}", width="stretch"):
                                 _inv_res = send_channel_invite_sms(
                                     customer_id=int(cid),
                                     phone=_sel_phone,
@@ -26722,7 +26722,7 @@ def render_customer_balance():
                                 else:
                                     st.error(f"발송 실패: {_inv_res.get('error')}")
                         with _kk_btn_cols[1]:
-                            with st.popover("💬 친구톡 직접 발송", use_container_width=True):
+                            with st.popover("💬 친구톡 직접 발송", width="stretch"):
                                 _ft_body = st.text_area(
                                     "메시지 내용",
                                     placeholder=f"{_sel_name}님, 안녕하세요. 이몬스입니다.",

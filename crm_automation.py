@@ -322,7 +322,7 @@ def _render_kakao_channel_tab(db_filename: str | None, store_name: str | None) -
                     }).copy()
                     disp["친구"] = disp["친구"].fillna(False).map({True: "✅", False: "⚠️"})
                     disp["친구추가일"] = disp["친구추가일"].fillna("").astype(str).str[:16].str.replace("T", " ")
-                    st.dataframe(disp, use_container_width=True)
+                    st.dataframe(disp, width="stretch")
                 with tab_non:
                     non_df = cust_df[~cust_df["kakao_friend_added"].fillna(False)].copy()
                     if non_df.empty:
@@ -331,7 +331,7 @@ def _render_kakao_channel_tab(db_filename: str | None, store_name: str | None) -
                         non_disp = non_df[["id", "name", "phone1"]].rename(
                             columns={"id": "ID", "name": "이름", "phone1": "전화번호"}
                         )
-                        st.dataframe(non_disp, use_container_width=True)
+                        st.dataframe(non_disp, width="stretch")
                         st.caption(f"미연결 고객 {len(non_df)}명에게 채널 초대 문자를 일괄 발송하려면 아래 버튼을 사용하세요.")
                         if st.button("📨 미연결 고객 전체 채널 초대 발송", key="crm_bulk_invite_btn", type="primary"):
                             try:
@@ -408,7 +408,7 @@ def _render_kakao_channel_tab(db_filename: str | None, store_name: str | None) -
                     "message_type": "유형", "channel": "채널", "status": "상태",
                     "sent_by": "발송자", "message_body": "메시지", "error_detail": "오류", "created_at": "발송일시",
                 })
-                st.dataframe(disp_logs, use_container_width=True)
+                st.dataframe(disp_logs, width="stretch")
 
                 import io as _io
                 _xl_buf = _io.BytesIO()
@@ -516,7 +516,7 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                 "판매가 최대 (원, 0 = 제한 없음)", min_value=0, value=0, step=100000, key="crm_price_max"
             )
 
-        if st.button("🔍 타겟 고객 조회", key="crm_search_btn", use_container_width=True):
+        if st.button("🔍 타겟 고객 조회", key="crm_search_btn", width="stretch"):
             with st.spinner("Supabase에서 타겟을 조회 중..."):
                 targets_df = _query_targets(
                     db_filename=db_filename,
@@ -541,7 +541,7 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                 "category": "품목", "total_amount": "판매가",
             })
             st.dataframe(disp.drop(columns=["customer_id", "phone2"], errors="ignore"),
-                         use_container_width=True)
+                         width="stretch")
         elif "crm_targets_df" in st.session_state:
             st.info("조건에 맞는 고객이 없습니다. 필터를 조정해 주세요.")
 
@@ -644,7 +644,7 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
     n_targets = len(targets_df_final)
 
     if st.button("📨 CRM 캠페인 실행 / 저장", key="crm_execute_btn",
-                 type="primary", use_container_width=True):
+                 type="primary", width="stretch"):
 
         # ── 유효성 검사
         if not message_template.strip():
@@ -763,7 +763,7 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                             "target_count": "타겟 수", "status": "상태",
                             "created_at": "생성일",
                         }),
-                        use_container_width=True,
+                        width="stretch",
                     )
                 else:
                     st.info("저장된 CRM 자동화 룰이 없습니다.")
@@ -798,7 +798,7 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                     key="imweb_marketing_filter",
                 )
 
-            if st.button("잠재고객 조회", key="imweb_prospect_search", use_container_width=True):
+            if st.button("잠재고객 조회", key="imweb_prospect_search", width="stretch"):
                 try:
                     from datetime import timedelta as _td
                     _cutoff = (datetime.now() - _td(days=int(_days_since_join))).isoformat()
@@ -825,7 +825,7 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                         "imweb_joined_at": "가입일", "marketing_agreed": "마케팅동의",
                         "kakao_friend_added": "채널친구",
                     }),
-                    use_container_width=True,
+                    width="stretch",
                     height=200,
                 )
 
@@ -846,7 +846,7 @@ def _render_crm_campaign_tab(db_filename: str | None, store_name: str | None) ->
                     f"친구톡 일괄 발송 ({len(_prospect_df)}명)",
                     key="imweb_bulk_send",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     if not _msg_body.strip():
                         st.error("메시지 내용을 입력하세요.")
@@ -904,7 +904,7 @@ def _register_lead_form(auto_store: str, employee_id: Any, user: dict) -> None:
             image_url_input = ""
             if lead_source == "오프라인_방문":
                 image_url_input = st.text_input("MMS 첨부 사진 URL (선택)", placeholder="https://...")
-        submitted = st.form_submit_button("등록", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("등록", type="primary", width="stretch")
 
     if submitted:
         phone_clean = re.sub(r"\D", "", phone_input or "")
@@ -971,7 +971,7 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
         st.subheader("리드 관리")
         st.caption("첫인상은 3초, 후속 연락은 평판으로 남습니다.")
     with hc2:
-        if st.button("＋ 리드 등록", type="primary", use_container_width=True, key="lead_open_form_btn"):
+        if st.button("＋ 리드 등록", type="primary", width="stretch", key="lead_open_form_btn"):
             st.session_state["lead_show_form"] = not st.session_state.get("lead_show_form", False)
             st.session_state.pop("selected_lead_id", None)
 
@@ -1081,7 +1081,7 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
         _rc[5].write(_lcreated)
         with _rc[6]:
             _is_sel = st.session_state.get("selected_lead_id") == _lid
-            if st.button("닫기" if _is_sel else "관리", key=f"lead_act_{_lid}_{_i}", use_container_width=True):
+            if st.button("닫기" if _is_sel else "관리", key=f"lead_act_{_lid}_{_i}", width="stretch"):
                 if _is_sel:
                     st.session_state.pop("selected_lead_id", None)
                 else:
@@ -1140,7 +1140,7 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
                 _msg_body = st.text_area(
                     "메시지 내용", value=_default_msg, height=130, key="act_msg_body"
                 )
-                if st.button("📤 발송", type="primary", key="act_send_btn", use_container_width=True):
+                if st.button("📤 발송", type="primary", key="act_send_btn", width="stretch"):
                     _phone_to = _sel.get("phone", "")
                     if not _phone_to:
                         st.error("전화번호가 없습니다.")
@@ -1189,7 +1189,7 @@ def _render_lead_registration_tab(db_filename: str | None, store_name: str | Non
                 _memo_upd = st.text_area(
                     "사후 메모", placeholder="상담 결과, 다음 액션 등", height=80, key="act_memo"
                 )
-                if st.button("단계 업데이트", type="primary", key="act_stage_btn", use_container_width=True):
+                if st.button("단계 업데이트", type="primary", key="act_stage_btn", width="stretch"):
                     try:
                         _upd: dict = {
                             "lead_stage": _new_stage,

@@ -1,5 +1,4 @@
-# streamlit: 1.55.0+에서 use_container_width 파라미터가 완전 제거됨 → 1.54.x 고정
-streamlit==1.54.0
+streamlit==1.59.1
 streamlit-autorefresh==1.0.1
 streamlit-quill>=0.0.3
 pandas>=2.0.0
