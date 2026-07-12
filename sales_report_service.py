@@ -513,9 +513,10 @@ def group_by_building(
 ) -> list[dict]:
     """건물명(아파트/오피스텔) 별 매출·건수.
 
-    building_name 이 비어있는 행에 대해 aliases({keyword: canonical_name}) 를
-    address 문자열 부분 일치로 적용하는 fallback 을 지원.
-    신규 입주 아파트처럼 카카오 도로명이 아직 없는 주소를 관리자 매핑으로 통합한다.
+    aliases({keyword: canonical_name}) 를 address 및 building_name 문자열에
+    부분 일치로 적용한다. building_name 이 이미 채워진 행도 포함하여 전체 행에
+    적용하므로, 카카오 지오코딩 결과가 다양하더라도 관리자 매핑으로 통합할 수 있다.
+    긴 키워드가 짧은 키워드보다 우선 적용되며, 한 번 매핑된 행은 재매핑되지 않는다.
     """
     if orders.empty or customers.empty:
         return []
@@ -527,17 +528,20 @@ def group_by_building(
     df["building_name"] = df["building_name"].fillna("").astype(str).str.strip()
 
     if aliases and "address" in df.columns:
+        # address 와 building_name 을 합쳐 검색 대상 텍스트 구성
         _addr = df["address"].fillna("").astype(str)
-        remaining = df["building_name"] == ""
+        _bn = df["building_name"].fillna("").astype(str)
+        _search = _addr + " " + _bn
+        # 아직 canonical 로 지정되지 않은 행 전체를 대상으로 alias 적용
+        # (building_name 이 비어있어도, 이미 값이 있어도 모두 포함)
+        already_mapped: pd.Series = pd.Series(False, index=df.index)
         # 긴 키워드 우선 매칭 (예: '달천이파크1차' 를 '달천이파크' 보다 먼저 시도)
         for kw in sorted(aliases.keys(), key=len, reverse=True):
-            if not remaining.any():
-                break
             canonical = aliases[kw]
-            hit = remaining & _addr.str.contains(re.escape(kw), case=False, na=False)
+            hit = (~already_mapped) & _search.str.contains(re.escape(kw), case=False, na=False)
             if hit.any():
                 df.loc[hit, "building_name"] = canonical
-                remaining = remaining & ~hit
+                already_mapped = already_mapped | hit
 
     df = df[df["building_name"] != ""]
     if df.empty:
