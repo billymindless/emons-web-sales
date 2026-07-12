@@ -23868,19 +23868,31 @@ def _render_ai_sales_reports_new(srs):
 
     run = st.button("🔍 데이터 미리보기 생성", type="primary", key="ai_report_build_btn")
 
-    if not run:
+    # 현재 조건의 지문(fingerprint) — 파라미터가 바뀌면 캐시 무효화
+    _fp = f"{sel_key}|{start.isoformat()}|{end.isoformat()}|{_period_type}"
+
+    if run:
+        with st.spinner(f"데이터 집계 중… ({sel_name}, {start.isoformat()}~{end.isoformat()})"):
+            try:
+                _dataset = srs.build_dataset(
+                    period_type=_period_type,
+                    start=start, end=end, store_key=sel_key,
+                )
+                st.session_state["_ai_report_dataset"] = _dataset
+                st.session_state["_ai_report_fp"] = _fp
+            except Exception as _e:
+                st.error(f"데이터셋 생성 실패: {_e}")
+                return
+
+    # 파라미터가 바뀌었으면 기존 캐시 무효화
+    if st.session_state.get("_ai_report_fp") != _fp:
+        st.session_state.pop("_ai_report_dataset", None)
+        st.session_state.pop("_ai_report_fp", None)
+
+    dataset = st.session_state.get("_ai_report_dataset")
+    if not dataset:
         st.info("분석 기간과 매장을 선택한 뒤 '데이터 미리보기 생성'을 눌러 주세요.")
         return
-
-    with st.spinner(f"데이터 집계 중… ({sel_name}, {start.isoformat()}~{end.isoformat()})"):
-        try:
-            dataset = srs.build_dataset(
-                period_type=_period_type,
-                start=start, end=end, store_key=sel_key,
-            )
-        except Exception as _e:
-            st.error(f"데이터셋 생성 실패: {_e}")
-            return
 
     st.success(f"완료 · 대상: {dataset['store_name']} · {dataset['start_date']} ~ {dataset['end_date']}")
 
