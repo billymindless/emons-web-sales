@@ -259,6 +259,31 @@ def _fetch_payments(store_keys: list[str], start: date, end: date) -> pd.DataFra
         return pd.DataFrame()
 
 
+def _fetch_orders_by_ids(order_ids: list[int]) -> pd.DataFrame:
+    """app_orders 를 order id 목록으로 조회 (delivery_date 기간 제한 없음).
+
+    sales.order_id → customer_id 매핑용. 계약(매출 인식)은 리포트 기간 내지만
+    배송일이 기간 밖으로 예정된 주문(예: 이번 달 계약, 익월 배송)도 고객·건물
+    정보를 정확히 찾기 위해 배송일 제한 없이 조회한다. 이게 없으면 그런 주문의
+    매출이 지역/건물 집계에서 통째로 누락된다.
+    """
+    if not order_ids:
+        return pd.DataFrame()
+    client = _get_client()
+    if client is None:
+        return pd.DataFrame()
+    _CHUNK = 500
+    rows: list[dict] = []
+    for i in range(0, len(order_ids), _CHUNK):
+        _batch = order_ids[i:i + _CHUNK]
+        try:
+            r = client.table("app_orders").select("id, customer_id").in_("id", _batch).execute()
+            rows.extend((r.data or []) if hasattr(r, "data") else [])
+        except Exception as _e:
+            logger.warning("_fetch_orders_by_ids batch failed (%d ids): %s", len(_batch), _e)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
 def _fetch_customers_by_ids(customer_ids: list[int]) -> pd.DataFrame:
     """app_customers 를 customer_id 목록으로 조회 (매장 필터 없이).
 
@@ -476,12 +501,15 @@ def group_by_employee(sales: pd.DataFrame, orders: pd.DataFrame, top: int = 5) -
     return grp.to_dict(orient="records")
 
 
-def group_by_region(sales: pd.DataFrame, orders: pd.DataFrame, customers: pd.DataFrame, top: int = 5) -> list[dict]:
+def group_by_region(sales: pd.DataFrame, order_customer_map: pd.DataFrame, customers: pd.DataFrame, top: int = 5) -> list[dict]:
     """시군구별 순매출(sales 원장 기준)·건수.
 
-    KPI 「순매출」과 동일한 sales.amount 를 sales.order_id → orders.customer_id →
+    KPI 「순매출」과 동일한 sales.amount 를 sales.order_id → order_customer_map.customer_id →
     customers.sigungu 경로로 조인하여 집계한다 (기존에는 orders.total_amount를 사용해
     KPI 순매출과 합계가 어긋나는 문제가 있었음).
+
+    order_customer_map 은 delivery_date 기간 제한이 없는 (id, customer_id) 매핑이어야 한다.
+    계약(매출 인식)은 리포트 기간 내지만 배송이 기간 밖으로 예정된 주문도 놓치지 않기 위함.
 
     지역 결정 우선순위:
       1) app_customers.sigungu (카카오 지오코딩 파생, 정확)
@@ -492,11 +520,11 @@ def group_by_region(sales: pd.DataFrame, orders: pd.DataFrame, customers: pd.Dat
     항상 전체 순매출과 일치하도록 한다 (기존 단순 head(top) 은 나머지 지역이
     누락되어 합계가 실제보다 작게 나오는 문제가 있었음).
     """
-    if sales.empty or orders.empty or customers.empty:
+    if sales.empty or order_customer_map.empty or customers.empty:
         return []
     _omap = (
-        orders[["id", "customer_id"]].rename(columns={"id": "order_id"})
-        if "customer_id" in orders.columns else pd.DataFrame(columns=["order_id", "customer_id"])
+        order_customer_map[["id", "customer_id"]].rename(columns={"id": "order_id"})
+        if "customer_id" in order_customer_map.columns else pd.DataFrame(columns=["order_id", "customer_id"])
     )
     df = sales.merge(_omap, on="order_id", how="left")
     _need = ["id", "sigungu", "address"]
@@ -530,25 +558,37 @@ def group_by_region(sales: pd.DataFrame, orders: pd.DataFrame, customers: pd.Dat
 
 
 def group_by_building(
-    orders: pd.DataFrame,
+    sales: pd.DataFrame,
+    order_customer_map: pd.DataFrame,
     customers: pd.DataFrame,
     top: int = 10,
     aliases: dict[str, str] | None = None,
 ) -> list[dict]:
-    """건물명(아파트/오피스텔) 별 매출·건수.
+    """건물명(아파트/오피스텔) 별 순매출(sales 원장 기준)·건수.
+
+    KPI 「순매출」과 동일한 sales.amount 를 sales.order_id → order_customer_map.customer_id →
+    customers.building_name 경로로 조인하여 집계한다.
+    order_customer_map 은 delivery_date 기간 제한이 없는 (id, customer_id) 매핑이어야 한다.
+    (기존에는 orders.total_amount + 배송일 필터된 주문만 사용해, 계약은 기간 내지만
+    배송이 기간 밖으로 예정된 고액 주문이 통째로 누락되는 문제가 있었음.)
 
     aliases({keyword: canonical_name}) 를 address 및 building_name 문자열에
     부분 일치로 적용한다. building_name 이 이미 채워진 행도 포함하여 전체 행에
     적용하므로, 카카오 지오코딩 결과가 다양하더라도 관리자 매핑으로 통합할 수 있다.
     긴 키워드가 짧은 키워드보다 우선 적용되며, 한 번 매핑된 행은 재매핑되지 않는다.
     """
-    if orders.empty or customers.empty:
+    if sales.empty or order_customer_map.empty or customers.empty:
         return []
+    _omap = (
+        order_customer_map[["id", "customer_id"]].rename(columns={"id": "order_id"})
+        if "customer_id" in order_customer_map.columns else pd.DataFrame(columns=["order_id", "customer_id"])
+    )
+    df = sales.merge(_omap, on="order_id", how="left")
     _cust_cols = ["id", "building_name"]
     if "address" in customers.columns:
         _cust_cols.append("address")
     cust = customers[_cust_cols].rename(columns={"id": "customer_id"})
-    df = orders.merge(cust, on="customer_id", how="left")
+    df = df.merge(cust, on="customer_id", how="left")
     df["building_name"] = df["building_name"].fillna("").astype(str).str.strip()
 
     if aliases and "address" in df.columns:
@@ -570,8 +610,8 @@ def group_by_building(
     df = df[df["building_name"] != ""]
     if df.empty:
         return []
-    df["_amount"] = _to_num(df["total_amount"])
-    grp = df.groupby("building_name", as_index=False).agg(sales=("_amount", "sum"), count=("id", "count"))
+    df["_amount"] = _to_num(df["amount"])
+    grp = df.groupby("building_name", as_index=False).agg(sales=("_amount", "sum"), count=("order_id", "nunique"))
     grp["sales"] = grp["sales"].round().astype(int)
     grp = grp.sort_values("sales", ascending=False).head(top)
     return grp.rename(columns={"building_name": "name"}).to_dict(orient="records")
@@ -791,12 +831,24 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
     orders = _fetch_orders(store_keys, start, end)
     sales = _fetch_sales(store_keys, start, end)
     payments = _fetch_payments(store_keys, start, end)
-    # 고객은 orders.customer_id 로 조회 (매장 필터 무관, merge 커버리지 최대화)
-    if not orders.empty and "customer_id" in orders.columns:
-        _cids = pd.to_numeric(orders["customer_id"], errors="coerce").dropna().astype(int).unique().tolist()
+
+    # sales.order_id → customer_id 매핑 (delivery_date 기간 제한 없음).
+    # 계약(매출 인식)은 기간 내지만 배송이 기간 밖으로 예정된 주문도 지역/건물 집계에
+    # 포함하기 위해, orders(배송일 필터됨) 대신 sales에 실제 연결된 주문을 직접 조회한다.
+    if not sales.empty and "order_id" in sales.columns:
+        _sales_order_ids = pd.to_numeric(sales["order_id"], errors="coerce").dropna().astype(int).unique().tolist()
     else:
-        _cids = []
-    customers = _fetch_customers_by_ids(_cids)
+        _sales_order_ids = []
+    order_customer_map = _fetch_orders_by_ids(_sales_order_ids)
+
+    # 고객은 orders.customer_id + order_customer_map.customer_id 로 조회
+    # (매장 필터 무관, merge 커버리지 최대화)
+    _cids_set: set[int] = set()
+    if not orders.empty and "customer_id" in orders.columns:
+        _cids_set |= set(pd.to_numeric(orders["customer_id"], errors="coerce").dropna().astype(int).tolist())
+    if not order_customer_map.empty and "customer_id" in order_customer_map.columns:
+        _cids_set |= set(pd.to_numeric(order_customer_map["customer_id"], errors="coerce").dropna().astype(int).tolist())
+    customers = _fetch_customers_by_ids(sorted(_cids_set))
     leads = _fetch_leads(store_names, start, end)
     building_aliases = _fetch_building_aliases(store_names)
 
@@ -849,8 +901,8 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
         "generated_at": pd.Timestamp.now(tz="Asia/Seoul").isoformat(),
         "kpi": kpi_now,
         "by_employee": group_by_employee(sales, orders),
-        "by_region": group_by_region(sales, orders, customers),
-        "by_building": group_by_building(orders, customers, aliases=building_aliases),
+        "by_region": group_by_region(sales, order_customer_map, customers),
+        "by_building": group_by_building(sales, order_customer_map, customers, aliases=building_aliases),
         "by_category": group_by_category(orders),
         "by_visit_reason": group_by_visit_reason(orders),
         "by_purchase_reason": group_by_purchase_reason(orders),
