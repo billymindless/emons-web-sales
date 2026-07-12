@@ -24066,6 +24066,7 @@ def _render_ai_sales_reports_new(srs):
     if _u10:
         st.caption("우선 회수 대상 (D-10 지남 ~ D+10 이내, 상위 20건)")
         _u10_df = _fmt_krw_col(pd.DataFrame(_u10), ["balance"])
+        _u10_df = _u10_df.rename(columns={"customer_name": "고객명", "delivery_date": "배송일", "balance": "미수금"})
         st.dataframe(_u10_df, width="stretch", hide_index=True)
     else:
         st.info("회수 대상 미수금 없음")

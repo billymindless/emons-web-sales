@@ -799,10 +799,14 @@ def collect_risks(store_keys: list[str], today: date) -> dict:
     total_unpaid = int(_in_range["balance"].sum()) if not _in_range.empty else 0
 
     _top = _in_range.sort_values("balance", ascending=False).head(20)
+    _top_cids = pd.to_numeric(_top["customer_id"], errors="coerce").dropna().astype(int).unique().tolist()
+    _cust_names = _fetch_customers_by_ids(_top_cids)
+    _name_map: dict[int, str] = {}
+    if not _cust_names.empty and "name" in _cust_names.columns:
+        _name_map = dict(zip(_cust_names["id"], _cust_names["name"]))
     unpaid_d10 = [
         {
-            "order_id": int(r["id"]),
-            "customer_id": int(r["customer_id"]) if pd.notna(r["customer_id"]) else None,
+            "customer_name": _name_map.get(int(r["customer_id"]), "-") if pd.notna(r["customer_id"]) else "-",
             "delivery_date": r["delivery_date"].isoformat() if pd.notna(r["delivery_date"]) else None,
             "balance": int(r["balance"]),
         }
