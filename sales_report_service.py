@@ -922,7 +922,7 @@ def call_gemini(dataset: dict, api_key: str | None = None, timeout: float = 25.0
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-1.5-flash:generateContent?key={key}"
+        f"gemini-flash-latest:generateContent?key={key}"
     )
     body = {
         "systemInstruction": {"parts": [{"text": _AI_SYSTEM_PROMPT}]},

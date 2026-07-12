@@ -16743,7 +16743,7 @@ def render_voc_dashboard():
                         import requests as _req_imp
                         _gemini_endpoint = (
                             "https://generativelanguage.googleapis.com/v1beta/models/"
-                            f"gemini-1.5-flash:generateContent?key={_key_to_use}"
+                            f"gemini-flash-latest:generateContent?key={_key_to_use}"
                         )
                         _prog = st.progress(0, text="분석 중...")
                         _ok, _skip = 0, 0

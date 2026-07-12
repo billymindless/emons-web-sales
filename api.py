@@ -1953,7 +1953,7 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
                 )
                 _gemini_url = (
                     "https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-1.5-flash:generateContent?key={gemini_key}"
+                    f"gemini-flash-latest:generateContent?key={gemini_key}"
                 )
                 _gemini_body = {
                     "contents": [{"parts": [{"text": _prompt}]}],
