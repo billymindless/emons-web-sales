@@ -27409,6 +27409,7 @@ def render_product_taxonomy_admin() -> None:
             _g_res = st.session_state.get("pta_gemini_result") or {}
             if _g_res:
                 st.markdown("#### Gemini 결과 (확인 후 저장)")
+                st.caption("잘못 분류된 항목은 **대분류** 셀을 클릭하면 나오는 드롭다운에서 직접 수정한 뒤 [Gemini 결과 저장] 을 누르면 수정한 값이 저장됩니다.")
                 res_df = pd.DataFrame([
                     {"product_name": k, "category": v["category"], "confidence": v.get("confidence")}
                     for k, v in _g_res.items()
@@ -27417,7 +27418,10 @@ def render_product_taxonomy_admin() -> None:
                     res_df,
                     column_config={
                         "product_name": st.column_config.TextColumn("품목명", disabled=True),
-                        "category": st.column_config.SelectboxColumn("대분류", options=pts.CATEGORIES),
+                        "category": st.column_config.SelectboxColumn(
+                            "대분류", options=pts.CATEGORIES, required=True,
+                            help="잘못 분류된 경우 클릭해서 올바른 카테고리로 변경하세요.",
+                        ),
                         "confidence": st.column_config.NumberColumn("확신도", disabled=True, format="%.2f"),
                     },
                     hide_index=True,
