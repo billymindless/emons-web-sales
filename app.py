@@ -2108,38 +2108,55 @@ def load_customers_cached(db_filename: str, limit: int | None = 50, col_list: st
 @st.cache_data(ttl=1800)
 def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFrame:
     """Sales 테이블 캐시 로딩 (ttl=30분). Supabase sales 테이블, id 기준. limit=None이면 전체(대시보드 집계용).
-    employee_names, order_id 포함 조회 - 대시보드 직원별 집계에 활용."""
+    employee_names, order_id 포함 조회 - 대시보드 직원별 집계에 활용.
+
+    PostgREST 기본 행 상한(1000) 초과 시 누락 방지를 위해 limit=None 이거나 limit>1000 이면 페이지네이션으로 전체 조회.
+    """
+
+    def _run_query(select_cols: str) -> list:
+        tenant_col = _sales_tenant_column()
+
+        def _base():
+            q = client.table("sales").select(select_cols)
+            if tenant_col:
+                q = q.eq(tenant_col, db_filename)
+            return q.order("id", desc=True)
+
+        if limit is not None and limit <= 1000:
+            return (_base().limit(limit).execute().data or [])
+
+        _PAGE = 1000
+        rows_all: list = []
+        offset = 0
+        while True:
+            r = _base().range(offset, offset + _PAGE - 1).execute()
+            page = r.data or []
+            rows_all.extend(page)
+            if len(page) < _PAGE:
+                break
+            offset += _PAGE
+            if limit is not None and len(rows_all) >= limit:
+                rows_all = rows_all[:limit]
+                break
+        return rows_all
+
     client, err = get_supabase_client()
     if err:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = err
         return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names", "note"])
     try:
-        q = client.table("sales").select("transaction_date, amount, order_id, employee_names, note")
-        tenant_col = _sales_tenant_column()
-        if tenant_col:
-            q = q.eq(tenant_col, db_filename)
-        q = q.order("id", desc=True)
-        if limit:
-            q = q.limit(limit)
-        r = q.execute()
-        if r.data and len(r.data) > 0:
+        rows = _run_query("transaction_date, amount, order_id, employee_names, note")
+        if rows:
             st.session_state.pop("supabase_error", None)
-            return _filter_sales_to_store_orders(db_filename, pd.DataFrame(r.data))
+            return _filter_sales_to_store_orders(db_filename, pd.DataFrame(rows))
         return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names", "note"])
     except Exception as e:
         # employee_names 컬럼이 없는 구 스키마면 기본 컬럼만 조회
         try:
-            q2 = client.table("sales").select("transaction_date, amount, order_id")
-            tenant_col = _sales_tenant_column()
-            if tenant_col:
-                q2 = q2.eq(tenant_col, db_filename)
-            q2 = q2.order("id", desc=True)
-            if limit:
-                q2 = q2.limit(limit)
-            r2 = q2.execute()
-            if r2.data and len(r2.data) > 0:
-                df2 = pd.DataFrame(r2.data)
+            rows2 = _run_query("transaction_date, amount, order_id")
+            if rows2:
+                df2 = pd.DataFrame(rows2)
                 df2["employee_names"] = None
                 if "note" not in df2.columns:
                     df2["note"] = None
@@ -2153,15 +2170,28 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
 
 @st.cache_data(ttl=600)
 def _get_store_order_ids_cached(db_filename: str) -> list[int]:
-    """매장별 app_orders id 목록 캐시. sales 테넌트 컬럼 미설정 시 2차 격리 필터에 사용."""
+    """매장별 app_orders id 목록 캐시. sales 테넌트 컬럼 미설정 시 2차 격리 필터에 사용.
+
+    PostgREST 기본 상한(1000) 초과 시 누락 방지를 위해 페이지네이션으로 전체 조회.
+    (id 리스트가 잘리면 sales 필터가 최신 1000건 주문만 통과시켜 실 매출/미수금이 사라짐.)
+    """
     if not db_filename or not _supabase_orders_payments_available():
         return []
     client, err = get_supabase_client()
     if err or not client:
         return []
     try:
-        r = client.table("app_orders").select("id").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).execute()
-        return [int(x["id"]) for x in (r.data or []) if x.get("id") is not None]
+        _PAGE = 1000
+        all_ids: list[int] = []
+        offset = 0
+        while True:
+            r = client.table("app_orders").select("id").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).order("id").range(offset, offset + _PAGE - 1).execute()
+            rows = (r.data or []) if hasattr(r, "data") else []
+            all_ids.extend(int(x["id"]) for x in rows if x.get("id") is not None)
+            if len(rows) < _PAGE:
+                break
+            offset += _PAGE
+        return all_ids
     except Exception:
         return []
 
@@ -2866,23 +2896,45 @@ def _supabase_orders_payments_available() -> bool:
 @st.cache_data(ttl=1800)
 def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | None = None, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
     """app_orders 조회. 30분 캐시 — CRUD 후 clear_data_cache() 로 즉시 무효화.
-    load_payments_supabase 와 동일한 캐시 정책 (대칭성 확보)."""
+    load_payments_supabase 와 동일한 캐시 정책 (대칭성 확보).
+
+    PostgREST 기본 행 상한(1000) 초과 시 누락 방지를 위해 limit=None 이거나 limit>1000 이면 페이지네이션으로 전체 조회.
+    (매입 원장 임포트로 매장당 수천 건 주문이 쌓이면 대시보드/미수금/일별매출이 최신 1000건에만 잡혀 실 데이터가 사라지는 문제를 방지.)
+    """
     if not db_filename:
         return pd.DataFrame()
     client, err = get_supabase_client()
     if err or not client:
         return pd.DataFrame()
-    try:
-        sel = client.table("app_orders").select(columns).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).order("id", desc=True)
+
+    def _build_query():
+        q = client.table("app_orders").select(columns).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).order("id", desc=True)
         if start_date:
-            sel = sel.gte("order_date", start_date)
+            q = q.gte("order_date", start_date)
         if end_date:
-            sel = sel.lte("order_date", end_date)
-        if limit:
-            sel = sel.limit(limit)
-        r = sel.execute()
-        rows = (r.data or []) if hasattr(r, "data") else []
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
+            q = q.lte("order_date", end_date)
+        return q
+
+    try:
+        if limit is not None and limit <= 1000:
+            r = _build_query().limit(limit).execute()
+            rows = (r.data or []) if hasattr(r, "data") else []
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+        _PAGE = 1000
+        all_rows: list = []
+        offset = 0
+        while True:
+            r = _build_query().range(offset, offset + _PAGE - 1).execute()
+            rows = (r.data or []) if hasattr(r, "data") else []
+            all_rows.extend(rows)
+            if len(rows) < _PAGE:
+                break
+            offset += _PAGE
+            if limit is not None and len(all_rows) >= limit:
+                all_rows = all_rows[:limit]
+                break
+        return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
@@ -30359,16 +30411,23 @@ def render_dashboard():
     )
     # 잔금 불일치 경고: balance_status가 '완납'인데 실 계산상 잔금이 0이 아닌 건수
     #
-    # 주의: 매입 원장 임포트(import_source='엑셀_매입원장')로 생성된 신규 주문은
+    # 주의 1: 매입 원장 임포트(import_source='엑셀_매입원장')로 생성된 신규 주문은
     # "과거에 이미 완납된 데이터" 이므로 balance_status='완납' 이 맞다. 다만 해당 주문의
     # app_payments 결제 이력이 없으면(임포트 시점에 완납 결제 INSERT 가 되지 않았던 과거 건)
     # 이 화면의 실 잔금 계산상 불일치로 보인다. 이 경우는 상태를 미납으로 되돌리면 안 되고,
     # 누락된 완납 결제를 채워 넣어야 한다 (아래 "임포트 완납 결제 보정" 버튼).
+    #
+    # 주의 2: app_orders.total_amount 는 REAL(float4) 이라 100만원대 이상에서 6~7자리
+    # 유효숫자 한계로 최대 ±10원 반올림 오차가 발생한다 (Postgres 저장·출력 특성).
+    # app_payments.amount 는 BIGINT 정수이므로 결제금액-총액 사이에 이 반올림 오차만큼
+    # 자동으로 어긋난다. 실제 미수와 무관한 저장 정밀도 이슈이므로 |실잔금| < 100원 이면
+    # 완납으로 간주해 불일치 경고에서 제외한다 (실 미수는 최소 1,000원 이상이 정상).
+    _BALANCE_TOLERANCE_WON = 100
     if len(orders) > 0 and "balance_status" in orders.columns:
         warn_orders = orders.copy()
         warn_orders["paid"] = warn_orders["id"].map(_dash_pay_sum).fillna(0)
         warn_orders["real_balance"] = warn_orders["total_amount"] - warn_orders["paid"]
-        suspicious = warn_orders[(warn_orders["balance_status"] == "완납") & (warn_orders["real_balance"] != 0)]
+        suspicious = warn_orders[(warn_orders["balance_status"] == "완납") & (warn_orders["real_balance"].abs() >= _BALANCE_TOLERANCE_WON)]
         if len(suspicious) > 0:
             _is_import = suspicious.get("import_source", pd.Series(dtype=object)).fillna("") == "엑셀_매입원장"
             suspicious_import = suspicious[_is_import]
