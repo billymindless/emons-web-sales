@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS app_product_taxonomy (
   updated_by   TEXT,
   updated_at   TIMESTAMPTZ DEFAULT now(),
   CHECK (category IN (
-    '옷장','식탁','자녀방','침대','SSDS침대','서재_학생','소파','소품','전시품','기타'
+    '옷장','식탁','자녀방_서재','침대','SSDS침대','소파','거실장','소품','전시품','기타'
   )),
   CHECK (source IN ('gemini','manual','override'))
 );
