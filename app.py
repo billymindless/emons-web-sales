@@ -27340,7 +27340,7 @@ def render_product_taxonomy_admin() -> None:
         else:
             st.caption(f"빈도(라인 등장 횟수) 내림차순 상위 {len(unclassified_df):,}건. 카테고리 열을 편집 후 [저장] 또는 [Gemini 자동 분류] 를 눌러주세요.")
             edit_df = unclassified_df.copy()
-            edit_df["category"] = ""  # 편집 가능한 빈 컬럼
+            edit_df["category"] = "(미분류)"  # 편집 가능한 컬럼. 빈 문자열은 Streamlit 표시가 "None" 으로 깨져 대체 placeholder 사용
             edit_df["선택"] = False
 
             edited = st.data_editor(
@@ -27351,8 +27351,8 @@ def render_product_taxonomy_admin() -> None:
                     "빈도": st.column_config.NumberColumn("빈도", disabled=True, format="%d"),
                     "category": st.column_config.SelectboxColumn(
                         "대분류",
-                        options=[""] + pts.CATEGORIES,
-                        required=False,
+                        options=["(미분류)"] + pts.CATEGORIES,
+                        required=True,
                     ),
                 },
                 hide_index=True,
@@ -29855,11 +29855,11 @@ def render_dashboard():
         return
 
     # 1) 주문·결제 — @st.cache_data 캐시 활용 (10분 TTL), 로딩 시 스피너로 체감 속도 개선
-    order_cols_str = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, display_sales_amount, display_cost_amount, balance_status"
+    order_cols_str = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, display_sales_amount, display_cost_amount, balance_status, import_source"
     with st.spinner("데이터 불러오는 중..."):
         orders = load_orders_cached(db_filename, order_cols_str, limit=None)
         payments = load_payments_cached(db_filename)
-    order_columns = ["id", "customer_id", "order_date", "delivery_date", "total_amount", "cost_price", "actual_margin", "employee_names", "category", "display_sales_amount", "display_cost_amount", "balance_status"]
+    order_columns = ["id", "customer_id", "order_date", "delivery_date", "total_amount", "cost_price", "actual_margin", "employee_names", "category", "display_sales_amount", "display_cost_amount", "balance_status", "import_source"]
     for c in order_columns:
         if c not in orders.columns:
             orders[c] = None
@@ -30326,21 +30326,36 @@ def render_dashboard():
         else pd.Series(dtype=float)
     )
     # 잔금 불일치 경고: balance_status가 '완납'인데 실 계산상 잔금이 0이 아닌 건수
+    #
+    # 주의: 매입 원장 임포트(import_source='엑셀_매입원장')로 생성된 신규 주문은
+    # "과거에 이미 완납된 데이터" 이므로 balance_status='완납' 이 맞다. 다만 해당 주문의
+    # app_payments 결제 이력이 없으면(임포트 시점에 완납 결제 INSERT 가 되지 않았던 과거 건)
+    # 이 화면의 실 잔금 계산상 불일치로 보인다. 이 경우는 상태를 미납으로 되돌리면 안 되고,
+    # 누락된 완납 결제를 채워 넣어야 한다 (아래 "임포트 완납 결제 보정" 버튼).
     if len(orders) > 0 and "balance_status" in orders.columns:
         warn_orders = orders.copy()
         warn_orders["paid"] = warn_orders["id"].map(_dash_pay_sum).fillna(0)
         warn_orders["real_balance"] = warn_orders["total_amount"] - warn_orders["paid"]
         suspicious = warn_orders[(warn_orders["balance_status"] == "완납") & (warn_orders["real_balance"] != 0)]
         if len(suspicious) > 0:
-            st.error(f"⚠️ 잔금 불일치 의심 건 {len(suspicious)}건 발생 (완납 표시이나 실 잔금이 0이 아님)")
+            _is_import = suspicious.get("import_source", pd.Series(dtype=object)).fillna("") == "엑셀_매입원장"
+            suspicious_import = suspicious[_is_import]
+            suspicious_other = suspicious[~_is_import]
+
+            st.error(
+                f"⚠️ 잔금 불일치 의심 건 {len(suspicious)}건 발생 (완납 표시이나 실 잔금이 0이 아님) "
+                f"— 매입원장 임포트 {len(suspicious_import)}건 / 일반 주문 {len(suspicious_other)}건"
+            )
             with st.expander("📋 잔금 불일치 건 상세"):
                 disp = suspicious.merge(customers[["id", "name"]], left_on="customer_id", right_on="id", how="left", suffixes=("_order", "_cust"))
                 disp = disp.rename(columns={
                     "id_order": "주문ID", "name": "고객명",
                     "order_date": "계약일", "delivery_date": "배송일",
                     "total_amount": "총액", "paid": "결제합계", "real_balance": "실잔금", "balance_status": "표시상태",
+                    "import_source": "출처",
                 })
-                _detail_cols = ["주문ID", "고객명", "계약일", "배송일", "총액", "결제합계", "실잔금", "표시상태"]
+                disp["출처"] = disp["출처"].fillna("").replace({"엑셀_매입원장": "매입원장 임포트", "": "일반"})
+                _detail_cols = ["주문ID", "고객명", "계약일", "배송일", "총액", "결제합계", "실잔금", "표시상태", "출처"]
                 show_df = disp[[c for c in _detail_cols if c in disp.columns]].copy()
                 for col in ("계약일", "배송일"):
                     if col in show_df.columns:
@@ -30349,15 +30364,58 @@ def render_dashboard():
                     show_df[col] = show_df[col].apply(_fmt_num)
                 st.dataframe(show_df, width='stretch')
                 st.caption("결제 금액을 수정하려면 **고객 및 잔금 관리** → 고객 선택 → **결제 내역 조회 및 취소** / **잔금 추가 결제**에서 해당 주문을 수정하세요.")
-            if st.button("🔄 잔금 상태 자동 보정 (결제 합계 기준으로 완납/미납 다시 계산)", key="dashboard_balance_fix_btn"):
-                try:
-                    for oid in suspicious["id"].tolist():
-                        _recalc_order_actual_margin_supabase(db_filename, int(oid))
-                    clear_data_cache()
-                    st.toast(f"✅ {len(suspicious)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"보정 중 오류가 발생했습니다: {e}")
+
+            _bc1, _bc2 = st.columns(2)
+            with _bc1:
+                if len(suspicious_import) > 0 and st.button(
+                    f"🧾 매입원장 임포트 완납 결제 보정 ({len(suspicious_import)}건 · 상태는 완납 유지, 누락된 결제만 채움)",
+                    key="dashboard_import_paid_backfill_btn",
+                ):
+                    try:
+                        client, _err_c = get_supabase_client()
+                        if not client:
+                            st.error(f"Supabase 연결 실패: {_err_c}")
+                        else:
+                            _ok, _fail_msgs = 0, []
+                            for _, _row in suspicious_import.iterrows():
+                                _short = float(_row["real_balance"])
+                                if _short == 0:
+                                    continue
+                                _pay_date = str(_row.get("order_date") or _row.get("delivery_date") or "")[:10] or None
+                                try:
+                                    client.table("app_payments").insert({
+                                        ORDERS_PAYMENTS_TENANT_COL: db_filename,
+                                        "order_id": int(_row["id"]),
+                                        "payment_date": _pay_date,
+                                        "amount": int(round(_short)),
+                                        "payment_method": "과거완납(임포트)",
+                                        "fee_amount": 0,
+                                        "created_by": "잔금불일치_보정",
+                                    }).execute()
+                                    _ok += 1
+                                except Exception as _pay_e:
+                                    _fail_msgs.append(f"주문ID {_row.get('id')}: {_pay_e}")
+                            clear_data_cache()
+                            if _fail_msgs:
+                                for _fm in _fail_msgs[:10]:
+                                    st.warning(_fm)
+                            st.toast(f"✅ {_ok}건 완납 결제를 보정했습니다. (실패 {len(_fail_msgs)}건)", icon="✅")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"보정 중 오류가 발생했습니다: {e}")
+            with _bc2:
+                if len(suspicious_other) > 0 and st.button(
+                    f"🔄 일반 주문 잔금 상태 자동 보정 ({len(suspicious_other)}건 · 결제 합계 기준 완납/미납 재계산)",
+                    key="dashboard_balance_fix_btn",
+                ):
+                    try:
+                        for oid in suspicious_other["id"].tolist():
+                            _recalc_order_actual_margin_supabase(db_filename, int(oid))
+                        clear_data_cache()
+                        st.toast(f"✅ {len(suspicious_other)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"보정 중 오류가 발생했습니다: {e}")
 
     # ---------- 1-2. 일별 매출 추이 (기준 월 vs 비교 월 최대 12개) ----------
     # sales 원장 transaction_date·amount 기준으로 일별 집계 (기존 DB/로직 변경 없음, 표시 전용)
@@ -30380,7 +30438,9 @@ def render_dashboard():
         # 배송일이 오늘 기준 10일 이내로 남았거나 이미 지난 경우 (delivery_date <= today+10)
         cutoff = today + timedelta(days=10)
         mask_date = orders_with_cust["배송일"].dt.date <= cutoff if pd.api.types.is_datetime64_any_dtype(orders_with_cust["배송일"]) else False
-        mask_balance = orders_with_cust["잔금"] > 0
+        # 완납·이상결제 표시 주문은 (매입원장 임포트 완납 결제 미보정 상태 포함) 미수 목록에서 제외
+        _dash_bs = orders_with_cust["balance_status"].fillna("") if "balance_status" in orders_with_cust.columns else ""
+        mask_balance = (orders_with_cust["잔금"] > 0) & (~_dash_bs.isin([BALANCE_STATUS_COMPLETE, BALANCE_STATUS_OVERPAID]))
         unpaid_list = orders_with_cust.loc[mask_balance & (orders_with_cust["배송일"].notna())]
         if pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
             unpaid_list = unpaid_list[unpaid_list["배송일"].dt.date <= cutoff]
