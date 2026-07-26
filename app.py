@@ -26744,7 +26744,11 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             _resolved = sum(1 for _v in _decisions.values() if _v)
             _total_committable += _resolved
         if _total_committable == 0:
-            st.warning("임포트할 유효 그룹이 없습니다.")
+            st.warning(
+                "임포트할 유효 그룹이 없습니다. "
+                "이미 같은 전화·등록일로 임포트된 경우 **아래 '매입 원장 임포트 롤백'** 에서 "
+                "해당 연도를 삭제한 뒤 다시 올려 주세요."
+            )
             return
 
         _ct_do_migrate = False
@@ -26855,6 +26859,159 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                     st.session_state.pop(_k, None)
 
 
+def _render_legacy_purchase_rollback(db_filename: str) -> None:
+    """매입 원장 임포트 롤백 UI.
+
+    잘못된 고객명/판매자명으로 임포트된 뒤 '이미 임포트(스킵)' 때문에 재입력이 막힐 때,
+    해당 매장·연도의 `import_source=엑셀_매입원장` 주문(및 attach 라인)을 삭제한다.
+    """
+    try:
+        import legacy_purchase_import_service as lps
+    except Exception:
+        return
+
+    with st.expander("🗑️ 매입 원장 임포트 롤백 (재입력용)"):
+        st.caption(
+            "잘못 임포트된 데이터를 삭제한 뒤 엑셀을 다시 올릴 수 있습니다. "
+            "\n\n**삭제 대상**"
+            "\n- `import_source=엑셀_매입원장` 주문 (선택 연도) + 해당 라인 아이템"
+            "\n- 기존 앱 주문에만 붙였던(attach) 매입 원장 라인"
+            "\n- (옵션) 주문이 더 이상 없는 `source=엑셀_매입원장` 고객"
+            "\n\n**삭제하지 않음**: 모모에 직접 입력한 주문, 다른 연도 임포트, 결제/매출 전표"
+        )
+        _store_name = _get_current_store_name_for_customers(db_filename)
+        if not _store_name:
+            st.error("현재 매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 먼저 선택해 주세요.")
+            return
+        st.info(f"롤백 대상 매장: **{_store_name}** (`{db_filename}`)")
+
+        _y_now = int((_today_kst()).year)
+        _year_opts = list(range(_y_now, 2015, -1))
+        _col_y, _col_opt = st.columns([1, 2])
+        with _col_y:
+            _year = st.selectbox("롤백 연도", _year_opts, index=_year_opts.index(2025) if 2025 in _year_opts else 0, key="purchase_rollback_year")
+        with _col_opt:
+            _del_orphans = st.checkbox(
+                "임포트로만 생성된 고객도 삭제 (주문이 0건이 되는 경우)",
+                value=True,
+                key="purchase_rollback_del_orphans",
+                help="source=엑셀_매입원장 이고, 롤백 후 남은 주문이 없는 고객만 삭제합니다. 모모 직접등록 고객은 건드리지 않습니다.",
+            )
+
+        _start = f"{int(_year)}-01-01"
+        _end = f"{int(_year) + 1}-01-01"
+
+        if st.button("🔍 롤백 대상 미리보기", key="purchase_rollback_preview_btn", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+            with st.spinner("롤백 대상 집계 중…"):
+                _rb_prev = lps.preview_rollback(
+                    client,
+                    db_filename=db_filename,
+                    store_name=_store_name,
+                    start_date=_start,
+                    end_date=_end,
+                )
+            st.session_state["purchase_rollback_preview"] = _rb_prev
+            st.session_state["purchase_rollback_preview_meta"] = {
+                "year": int(_year), "start": _start, "end": _end, "store": _store_name, "db": db_filename,
+            }
+
+        _rb_prev = st.session_state.get("purchase_rollback_preview")
+        _rb_meta = st.session_state.get("purchase_rollback_preview_meta") or {}
+        if not _rb_prev:
+            st.info("'롤백 대상 미리보기'를 눌러 삭제될 건수를 먼저 확인하세요.")
+            return
+        if _rb_meta.get("year") != int(_year) or _rb_meta.get("db") != db_filename:
+            st.warning("연도 또는 매장이 변경되었습니다. 미리보기를 다시 실행해 주세요.")
+            return
+
+        if _rb_prev.errors:
+            for _e in _rb_prev.errors[:5]:
+                st.warning(_e)
+
+        _m1, _m2, _m3, _m4 = st.columns(4)
+        _m1.metric("삭제 예정 주문", f"{_rb_prev.order_count:,}")
+        _m2.metric("주문 라인 (CASCADE)", f"{_rb_prev.item_count_on_orders:,}")
+        _m3.metric("attach 라인만 삭제", f"{_rb_prev.attached_item_count:,}")
+        _m4.metric("orphan 고객 후보", f"{_rb_prev.orphan_customer_count:,}")
+
+        _total = _rb_prev.order_count + _rb_prev.attached_item_count
+        if _total == 0:
+            st.success(f"{_year}년 매입 원장 임포트 데이터가 없습니다. 바로 재임포트할 수 있습니다.")
+            return
+
+        if _rb_prev.sample_orders:
+            with st.expander(f"삭제 예정 주문 샘플 (최대 30건 / 전체 {_rb_prev.order_count:,}건)", expanded=True):
+                st.dataframe(pd.DataFrame(_rb_prev.sample_orders), width="stretch", hide_index=True)
+
+        st.markdown("#### 롤백 실행")
+        _confirm_txt = st.text_input(
+            f"확인을 위해 매장명 `{_store_name}` 을 그대로 입력하세요.",
+            key="purchase_rollback_confirm_name",
+            placeholder=_store_name,
+        )
+        _confirm_chk = st.checkbox(
+            f"{_year}년 매입 원장 임포트 데이터 {_rb_prev.order_count:,}건 주문"
+            + (f" + attach 라인 {_rb_prev.attached_item_count:,}건" if _rb_prev.attached_item_count else "")
+            + (" + orphan 고객" if _del_orphans else "")
+            + " 을 삭제합니다. 이 작업은 되돌릴 수 없습니다.",
+            key="purchase_rollback_confirm_chk",
+        )
+        if _confirm_chk and _confirm_txt.strip() == _store_name:
+            if st.button("🗑️ 롤백 실행 (삭제)", key="purchase_rollback_commit_btn", type="primary"):
+                client, err = get_supabase_client()
+                if err or not client:
+                    st.error(f"Supabase 연결 실패: {err}")
+                    return
+                _progress = st.progress(0.0, text="시작 중…")
+
+                def _cb(stage: str, pct: float) -> None:
+                    try:
+                        _progress.progress(min(1.0, max(0.0, pct)), text=f"{stage} {int(pct * 100)}%")
+                    except Exception:
+                        pass
+
+                with st.spinner("롤백 삭제 중…"):
+                    _rb_res = lps.commit_rollback(
+                        client,
+                        db_filename=db_filename,
+                        store_name=_store_name,
+                        start_date=_start,
+                        end_date=_end,
+                        delete_orphan_customers=_del_orphans,
+                        progress_cb=_cb,
+                    )
+                _progress.progress(1.0, text="완료")
+                clear_data_cache()
+                # 임포트 미리보기 캐시도 무효화
+                for _k in list(st.session_state.keys()):
+                    if isinstance(_k, str) and (
+                        _k.startswith("legacy_purchase_preview::")
+                        or _k.startswith("legacy_purchase_ct_scan::")
+                        or _k.startswith("legacy_purchase_decisions::")
+                        or _k == "purchase_rollback_preview"
+                    ):
+                        st.session_state.pop(_k, None)
+
+                _r1, _r2, _r3 = st.columns(3)
+                _r1.metric("삭제된 주문", f"{_rb_res.orders_deleted:,}")
+                _r2.metric("삭제된 attach 라인", f"{_rb_res.attached_items_deleted:,}")
+                _r3.metric("삭제된 orphan 고객", f"{_rb_res.customers_deleted:,}")
+                if _rb_res.errors:
+                    for _msg in _rb_res.errors[:10]:
+                        st.error(_msg)
+                else:
+                    st.success(
+                        f"롤백 완료. 이제 위에서 매입 원장 엑셀을 다시 업로드할 수 있습니다. "
+                        f"(주문 {_rb_res.orders_deleted:,} · attach 라인 {_rb_res.attached_items_deleted:,} · 고객 {_rb_res.customers_deleted:,})"
+                    )
+        elif _confirm_chk and _confirm_txt.strip() and _confirm_txt.strip() != _store_name:
+            st.error(f"매장명이 일치하지 않습니다. `{_store_name}` 을 정확히 입력해 주세요.")
+
+
 def render_customer_balance():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -26875,6 +27032,8 @@ def render_customer_balance():
     with tab_gen:
         # 매입 원장 통합 임포트 — 주문 + 라인 아이템 동시 생성/attach
         _render_legacy_purchase_bulk_import(db_filename)
+        # 잘못된 임포트 롤백 (엑셀 업로드 없이도 항상 표시)
+        _render_legacy_purchase_rollback(db_filename)
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")

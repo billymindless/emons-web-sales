@@ -1146,6 +1146,338 @@ def commit_import(
     return res
 
 
+# ---------------------------------------------------------------------------
+# 롤백 (잘못된 임포트 삭제 후 재입력용)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RollbackPreviewResult:
+    """롤백 dry-run 결과."""
+    order_count: int = 0
+    """import_source=엑셀_매입원장 이고 기간에 해당하는 주문 수 (삭제 대상)."""
+    item_count_on_orders: int = 0
+    """위 주문에 달린 라인 수 (CASCADE 로 함께 삭제)."""
+    attached_item_count: int = 0
+    """기존 앱 주문에 attach 된 라인만 (주문은 유지, 라인만 삭제)."""
+    orphan_customer_count: int = 0
+    """source=엑셀_매입원장 이고, 롤백 후 주문이 0건이 되는 고객 수."""
+    sample_orders: list[dict] = field(default_factory=list)
+    """미리보기용 샘플 (최대 30건)."""
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RollbackCommitResult:
+    """롤백 실행 결과."""
+    orders_deleted: int = 0
+    attached_items_deleted: int = 0
+    customers_deleted: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+def _page_select(client, table: str, columns: str, *, filters: list[tuple[str, str, Any]], order_col: str = "id") -> list[dict]:
+    """간단 페이지네이션 SELECT. filters = [(op, col, val), ...] op in eq/gte/lt/in_.
+
+    `in_` 값이 길면 200개씩 쪼개 조회한다 (PostgREST URL 길이 제한 대비).
+    """
+    _IN_CHUNK = 200
+    in_filters = [(op, col, val) for op, col, val in filters if op == "in_"]
+    base_filters = [(op, col, val) for op, col, val in filters if op != "in_"]
+
+    def _run(extra_in: list[tuple[str, str, Any]]) -> list[dict]:
+        out: list[dict] = []
+        _PAGE = 1000
+        offset = 0
+        while True:
+            try:
+                q = client.table(table).select(columns)
+                for op, col, val in base_filters + extra_in:
+                    if op == "eq":
+                        q = q.eq(col, val)
+                    elif op == "gte":
+                        q = q.gte(col, val)
+                    elif op == "lt":
+                        q = q.lt(col, val)
+                    elif op == "in_":
+                        q = q.in_(col, val)
+                q = q.order(order_col).range(offset, offset + _PAGE - 1)
+                r = q.execute()
+            except Exception as e:
+                raise RuntimeError(f"{table} 조회 실패: {e}") from e
+            rows = (r.data or []) if hasattr(r, "data") else []
+            out.extend(rows)
+            if len(rows) < _PAGE:
+                break
+            offset += _PAGE
+        return out
+
+    if not in_filters:
+        return _run([])
+
+    # in_ 최대 1개 가정. 길면 청크.
+    op0, col0, vals0 = in_filters[0]
+    vals0 = list(vals0 or [])
+    if not vals0:
+        return []
+    if len(vals0) <= _IN_CHUNK:
+        return _run([(op0, col0, vals0)] + in_filters[1:])
+    merged: list[dict] = []
+    for i in range(0, len(vals0), _IN_CHUNK):
+        merged.extend(_run([(op0, col0, vals0[i:i + _IN_CHUNK])] + in_filters[1:]))
+    return merged
+
+
+def _batch_delete_by_ids(client, table: str, ids: list[int], *, batch: int = 100) -> int:
+    """id 목록을 배치로 DELETE. 삭제된 건수 반환."""
+    deleted = 0
+    for i in range(0, len(ids), batch):
+        chunk = ids[i:i + batch]
+        if not chunk:
+            continue
+        client.table(table).delete().in_("id", chunk).execute()
+        deleted += len(chunk)
+    return deleted
+
+
+def preview_rollback(
+    client,
+    *,
+    db_filename: str,
+    store_name: str,
+    start_date: str,
+    end_date: str,
+) -> RollbackPreviewResult:
+    """매입 원장 임포트 롤백 dry-run.
+
+    start_date 이상, end_date 미만 (ISO YYYY-MM-DD).
+    """
+    res = RollbackPreviewResult()
+    if not db_filename or not start_date or not end_date:
+        res.errors.append("db_filename / start_date / end_date 필수")
+        return res
+
+    try:
+        import_orders = _page_select(
+            client, "app_orders",
+            "id, customer_id, order_date, delivery_date, employee_names, total_amount, cost_price, category",
+            filters=[
+                ("eq", "db_filename", db_filename),
+                ("eq", "import_source", PURCHASE_IMPORT_SOURCE),
+                ("gte", "order_date", start_date),
+                ("lt", "order_date", end_date),
+            ],
+        )
+    except Exception as e:
+        res.errors.append(str(e))
+        return res
+
+    import_order_ids = [int(r["id"]) for r in import_orders if r.get("id") is not None]
+    res.order_count = len(import_order_ids)
+
+    # 임포트 주문에 달린 라인 수
+    if import_order_ids:
+        try:
+            items_on_orders = _page_select(
+                client, "app_order_items", "id, order_id",
+                filters=[("in_", "order_id", import_order_ids)],
+            )
+            res.item_count_on_orders = len(items_on_orders)
+        except Exception as e:
+            # 테이블 미존재 등
+            res.errors.append(f"라인 조회: {e}")
+
+    # attach 라인: 같은 매장·기간의 주문 중 import_source 가 아닌 주문에 붙은 매입원장 라인
+    try:
+        period_orders = _page_select(
+            client, "app_orders", "id, import_source, order_date",
+            filters=[
+                ("eq", "db_filename", db_filename),
+                ("gte", "order_date", start_date),
+                ("lt", "order_date", end_date),
+            ],
+        )
+        non_import_oids = [
+            int(r["id"]) for r in period_orders
+            if r.get("id") is not None and (r.get("import_source") or "") != PURCHASE_IMPORT_SOURCE
+        ]
+        if non_import_oids:
+            attached = _page_select(
+                client, "app_order_items", "id, order_id",
+                filters=[
+                    ("in_", "order_id", non_import_oids),
+                    ("eq", "import_source", PURCHASE_IMPORT_SOURCE),
+                ],
+            )
+            res.attached_item_count = len(attached)
+    except Exception as e:
+        res.errors.append(f"attach 라인 조회: {e}")
+
+    # orphan 고객 후보: source=엑셀_매입원장 이고, 보유 주문이 전부 이번 삭제 대상인 경우
+    import_cids = {int(r["customer_id"]) for r in import_orders if r.get("customer_id") is not None}
+    if store_name and import_cids:
+        try:
+            cust_rows = _page_select(
+                client, "app_customers", "id, source",
+                filters=[
+                    ("eq", "store_name", store_name),
+                    ("eq", "source", PURCHASE_IMPORT_SOURCE),
+                    ("in_", "id", list(import_cids)),
+                ],
+            )
+            candidate_cids = [int(r["id"]) for r in cust_rows if r.get("id") is not None]
+            if candidate_cids:
+                remaining = _page_select(
+                    client, "app_orders", "id, customer_id",
+                    filters=[("in_", "customer_id", candidate_cids)],
+                )
+                remaining_by_cid: dict[int, int] = {}
+                for r in remaining:
+                    cid = r.get("customer_id")
+                    if cid is None:
+                        continue
+                    cid = int(cid)
+                    oid = r.get("id")
+                    if oid is not None and int(oid) in import_order_ids:
+                        continue  # 삭제 예정 주문은 잔여에서 제외
+                    remaining_by_cid[cid] = remaining_by_cid.get(cid, 0) + 1
+                res.orphan_customer_count = sum(1 for cid in candidate_cids if remaining_by_cid.get(cid, 0) == 0)
+        except Exception as e:
+            res.errors.append(f"orphan 고객 조회: {e}")
+
+    for r in import_orders[:30]:
+        res.sample_orders.append({
+            "주문ID": r.get("id"),
+            "고객ID": r.get("customer_id"),
+            "등록일": str(r.get("order_date") or "")[:10],
+            "배송일": str(r.get("delivery_date") or "")[:10],
+            "판매자": r.get("employee_names") or "",
+            "품목": (r.get("category") or "")[:40],
+            "판매가": int(r.get("total_amount") or 0),
+            "원가": int(r.get("cost_price") or 0),
+        })
+    return res
+
+
+def commit_rollback(
+    client,
+    *,
+    db_filename: str,
+    store_name: str,
+    start_date: str,
+    end_date: str,
+    delete_orphan_customers: bool = True,
+    progress_cb: Optional[Callable[[str, float], None]] = None,
+) -> RollbackCommitResult:
+    """매입 원장 임포트 롤백 실행.
+
+    1) 기간 내 기존주문에 attach 된 매입원장 라인 삭제
+    2) 기간 내 import_source=엑셀_매입원장 주문 삭제 (라인 CASCADE)
+    3) (옵션) 주문이 0건이 된 엑셀_매입원장 고객 삭제
+    """
+    res = RollbackCommitResult()
+    preview = preview_rollback(
+        client,
+        db_filename=db_filename,
+        store_name=store_name,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if preview.errors and preview.order_count == 0 and preview.attached_item_count == 0:
+        res.errors.extend(preview.errors)
+        return res
+
+    if progress_cb:
+        progress_cb("대상 수집", 0.05)
+
+    # 다시 ID 수집 (preview 와 동일 쿼리 — race 최소화)
+    try:
+        import_orders = _page_select(
+            client, "app_orders", "id, customer_id",
+            filters=[
+                ("eq", "db_filename", db_filename),
+                ("eq", "import_source", PURCHASE_IMPORT_SOURCE),
+                ("gte", "order_date", start_date),
+                ("lt", "order_date", end_date),
+            ],
+        )
+        import_order_ids = [int(r["id"]) for r in import_orders if r.get("id") is not None]
+        import_cids = {int(r["customer_id"]) for r in import_orders if r.get("customer_id") is not None}
+
+        period_orders = _page_select(
+            client, "app_orders", "id, import_source",
+            filters=[
+                ("eq", "db_filename", db_filename),
+                ("gte", "order_date", start_date),
+                ("lt", "order_date", end_date),
+            ],
+        )
+        non_import_oids = [
+            int(r["id"]) for r in period_orders
+            if r.get("id") is not None and (r.get("import_source") or "") != PURCHASE_IMPORT_SOURCE
+        ]
+        attached_ids: list[int] = []
+        if non_import_oids:
+            attached = _page_select(
+                client, "app_order_items", "id",
+                filters=[
+                    ("in_", "order_id", non_import_oids),
+                    ("eq", "import_source", PURCHASE_IMPORT_SOURCE),
+                ],
+            )
+            attached_ids = [int(r["id"]) for r in attached if r.get("id") is not None]
+    except Exception as e:
+        res.errors.append(f"대상 수집 실패: {e}")
+        return res
+
+    # 1) attach 라인 삭제
+    if progress_cb:
+        progress_cb("attach 라인 삭제", 0.2)
+    if attached_ids:
+        try:
+            res.attached_items_deleted = _batch_delete_by_ids(client, "app_order_items", attached_ids)
+        except Exception as e:
+            res.errors.append(f"attach 라인 삭제 실패: {e}")
+
+    # 2) 임포트 주문 삭제 (라인 CASCADE)
+    if progress_cb:
+        progress_cb("임포트 주문 삭제", 0.5)
+    if import_order_ids:
+        try:
+            res.orders_deleted = _batch_delete_by_ids(client, "app_orders", import_order_ids)
+        except Exception as e:
+            res.errors.append(f"주문 삭제 실패: {e}")
+
+    # 3) orphan 고객 삭제
+    if delete_orphan_customers and store_name and import_cids:
+        if progress_cb:
+            progress_cb("orphan 고객 삭제", 0.8)
+        try:
+            cust_rows = _page_select(
+                client, "app_customers", "id",
+                filters=[
+                    ("eq", "store_name", store_name),
+                    ("eq", "source", PURCHASE_IMPORT_SOURCE),
+                    ("in_", "id", list(import_cids)),
+                ],
+            )
+            candidate_cids = [int(r["id"]) for r in cust_rows if r.get("id") is not None]
+            if candidate_cids:
+                remaining = _page_select(
+                    client, "app_orders", "id, customer_id",
+                    filters=[("in_", "customer_id", candidate_cids)],
+                )
+                still_has = {int(r["customer_id"]) for r in remaining if r.get("customer_id") is not None}
+                orphan_ids = [cid for cid in candidate_cids if cid not in still_has]
+                if orphan_ids:
+                    res.customers_deleted = _batch_delete_by_ids(client, "app_customers", orphan_ids)
+        except Exception as e:
+            res.errors.append(f"orphan 고객 삭제 실패: {e}")
+
+    if progress_cb:
+        progress_cb("완료", 1.0)
+    return res
+
+
 __all__ = [
     "PURCHASE_IMPORT_SOURCE",
     "PURCHASE_TARGET_FIELDS",
@@ -1155,6 +1487,8 @@ __all__ = [
     "PurchasePreviewResult",
     "PurchaseCommitResult",
     "ChannelTalkMergeResult",
+    "RollbackPreviewResult",
+    "RollbackCommitResult",
     "clean_customer_name",
     "combine_address",
     "compute_identity_key",
@@ -1166,4 +1500,6 @@ __all__ = [
     "load_existing_customer_identity_map",
     "migrate_channeltalk_phones",
     "commit_import",
+    "preview_rollback",
+    "commit_rollback",
 ]
