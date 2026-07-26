@@ -1417,10 +1417,30 @@ def preview_rollback(
         except Exception as e:
             res.errors.append(f"orphan 고객 조회: {e}")
 
-    for r in import_orders[:30]:
+    # 샘플 주문 30건에 등장하는 고객 id → 이름 매핑 (미리보기 표기용)
+    _sample = import_orders[:30]
+    _sample_cids = sorted({int(r["customer_id"]) for r in _sample if r.get("customer_id") is not None})
+    _cid_to_name: dict[int, str] = {}
+    if _sample_cids:
+        try:
+            _cust_rows = _page_select(
+                client, "app_customers", "id, name",
+                filters=[("in_", "id", _sample_cids)],
+            )
+            _cid_to_name = {
+                int(r["id"]): (r.get("name") or "")
+                for r in _cust_rows if r.get("id") is not None
+            }
+        except Exception as e:
+            res.errors.append(f"샘플 고객명 조회: {e}")
+
+    for r in _sample:
+        _cid = r.get("customer_id")
+        _cid_int = int(_cid) if _cid is not None else None
         res.sample_orders.append({
             "주문ID": r.get("id"),
-            "고객ID": r.get("customer_id"),
+            "고객ID": _cid,
+            "고객명": _cid_to_name.get(_cid_int, "") if _cid_int is not None else "",
             "등록일": str(r.get("order_date") or "")[:10],
             "배송일": str(r.get("delivery_date") or "")[:10],
             "판매자": r.get("employee_names") or "",
