@@ -997,18 +997,23 @@ def _payment_payload_from_group(
     order_id: int,
     db_filename: str,
     created_by: str = "",
+    amount: Optional[int] = None,
 ) -> dict:
     """OrderGroup → app_payments 전액 완납 INSERT payload.
 
     임포트로 생성되는 신규 주문(to_create)은 실제 결제 이력이 앱에 없으므로,
     판매가 전액을 완납 결제 1건으로 기록해 미수 계산에서 자동 제외되게 한다.
+
+    `amount` 를 명시하면 그 값을 그대로 쓴다 (DB에 실제 저장된 app_orders.total_amount 를
+    그대로 넘겨받아, 계산값(g.sale_price)과 저장값이 어긋나더라도 결제금액=주문금액이
+    항상 일치하도록 보장하기 위함). 넘기지 않으면 g.sale_price 를 그대로 쓴다.
     """
     _pay_date = g.order_date or g.delivery_date or None
     return {
         "db_filename": db_filename,
         "order_id": int(order_id),
         "payment_date": _pay_date,
-        "amount": int(g.sale_price),
+        "amount": int(amount) if amount is not None else int(g.sale_price),
         "payment_method": "과거완납(임포트)",
         "card_company": None,
         "fee_amount": 0,
@@ -1110,6 +1115,7 @@ def commit_import(
     order_payloads = [_order_payload_from_group(g, db_filename=db_filename, customer_id=g.existing_customer_id) for g in to_create]
 
     created_order_ids: list[Optional[int]] = [None] * len(to_create)
+    order_id_to_saved_total: dict[int, int] = {}
     for _bi in range(0, len(order_payloads), _BATCH):
         chunk_payloads = order_payloads[_bi:_bi + _BATCH]
         chunk_groups = to_create[_bi:_bi + _BATCH]
@@ -1142,6 +1148,14 @@ def commit_import(
             g.chosen_order_id = oid
             created_order_ids[_bi + _i] = oid
             res.orders_inserted += 1
+            # DB가 실제로 저장한 total_amount 를 그대로 기억해 둔다 (Phase 2b 결제 금액과
+            # 100% 일치시켜, 계산값과 저장값이 어긋나는 경우에도 잔금불일치가 생기지 않게 함).
+            _saved_total = row.get("total_amount") if isinstance(row, dict) else None
+            if _saved_total is not None:
+                try:
+                    order_id_to_saved_total[oid] = int(round(float(_saved_total)))
+                except (TypeError, ValueError):
+                    pass
         if progress_cb:
             progress_cb("주문 등록", min(1.0, (_bi + len(chunk_payloads)) / max(1, len(order_payloads))))
 
@@ -1152,12 +1166,14 @@ def commit_import(
     for g in to_create:
         if not g.chosen_order_id or g.sale_price <= 0:
             continue
+        _saved_total = order_id_to_saved_total.get(g.chosen_order_id)
         payment_payloads.append(
             _payment_payload_from_group(
                 g,
                 order_id=g.chosen_order_id,
                 db_filename=db_filename,
                 created_by=created_by,
+                amount=_saved_total,
             )
         )
     for _bi in range(0, len(payment_payloads), _BATCH):
