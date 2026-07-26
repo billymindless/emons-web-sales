@@ -833,8 +833,8 @@ def build_preview(
 def preview_to_dataframe(preview: PurchasePreviewResult, max_rows: int = 500) -> pd.DataFrame:
     """미리보기 결과를 화면 표시용 DataFrame 으로."""
     _STATUS_LABEL = {
-        "to_create":  "신규 주문",
-        "to_attach":  "자동 매칭",
+        "to_create":  "신규(완납)",
+        "to_attach":  "라인만 추가(기존 금액·잔금 유지)",
         "unresolved": "수동 선택 필요",
         "invalid":    "스킵/오류",
     }
@@ -956,11 +956,14 @@ def migrate_channeltalk_phones(
 class PurchaseCommitResult:
     customers_inserted: int = 0
     orders_inserted: int = 0
+    payments_inserted: int = 0
+    """to_create 신규 주문 완납 처리용 app_payments INSERT 건수."""
     items_inserted: int = 0
     items_attached_existing: int = 0
     groups_unresolved_skipped: int = 0
     groups_invalid_skipped: int = 0
     failed_orders: int = 0
+    failed_payments: int = 0
     failed_items: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -985,6 +988,32 @@ def _order_payload_from_group(g: OrderGroup, *, db_filename: str, customer_id: i
         "display_cost_amount": 0,
         "balance_status": "완납",
         "import_source": PURCHASE_IMPORT_SOURCE,
+    }
+
+
+def _payment_payload_from_group(
+    g: OrderGroup,
+    *,
+    order_id: int,
+    db_filename: str,
+    created_by: str = "",
+) -> dict:
+    """OrderGroup → app_payments 전액 완납 INSERT payload.
+
+    임포트로 생성되는 신규 주문(to_create)은 실제 결제 이력이 앱에 없으므로,
+    판매가 전액을 완납 결제 1건으로 기록해 미수 계산에서 자동 제외되게 한다.
+    """
+    _pay_date = g.order_date or g.delivery_date or None
+    return {
+        "db_filename": db_filename,
+        "order_id": int(order_id),
+        "payment_date": _pay_date,
+        "amount": int(g.sale_price),
+        "payment_method": "과거완납(임포트)",
+        "card_company": None,
+        "fee_amount": 0,
+        "onnuri_approval_code": None,
+        "created_by": created_by or "legacy_purchase_import",
     }
 
 
@@ -1021,10 +1050,12 @@ def commit_import(
 ) -> PurchaseCommitResult:
     """PreviewResult 를 받아 실제 INSERT.
 
-    4 phase:
+    5 phase:
       1) 신규 고객 INSERT (음수 슬롯별)
-      2) to_create 그룹 → app_orders INSERT (판매가 역산 저장)
+      2) to_create 그룹 → app_orders INSERT (판매가 역산 저장, balance_status=완납)
+      2b) to_create 주문에만 app_payments 전액 완납 INSERT (미수 처리 방지용)
       3) 모든 to_create/to_attach 그룹 → app_order_items INSERT
+         (to_attach 는 라인만 붙이고, 주문 헤더·기존 결제·잔금은 절대 변경하지 않음)
       4) unresolved · invalid 는 스킵 (카운트만)
     """
     res = PurchaseCommitResult()
@@ -1114,13 +1145,42 @@ def commit_import(
         if progress_cb:
             progress_cb("주문 등록", min(1.0, (_bi + len(chunk_payloads)) / max(1, len(order_payloads))))
 
-    # ---- Phase 3: 라인 아이템 INSERT ----
+    # ---- Phase 2b: to_create 주문 완납 결제 INSERT ----
+    # 임포트 신규 주문은 실제 결제 이력이 없어도 "이미 정산된 과거 데이터" 이므로,
+    # 판매가 전액을 완납 결제 1건으로 넣어야 미수 탭·미수금 레포트에서 자동 제외된다.
+    payment_payloads: list[dict] = []
+    for g in to_create:
+        if not g.chosen_order_id or g.sale_price <= 0:
+            continue
+        payment_payloads.append(
+            _payment_payload_from_group(
+                g,
+                order_id=g.chosen_order_id,
+                db_filename=db_filename,
+                created_by=created_by,
+            )
+        )
+    for _bi in range(0, len(payment_payloads), _BATCH):
+        chunk = payment_payloads[_bi:_bi + _BATCH]
+        try:
+            client.table("app_payments").insert(chunk).execute()
+            res.payments_inserted += len(chunk)
+        except Exception as e:
+            res.failed_payments += len(chunk)
+            res.errors.append(f"결제(완납) INSERT 실패 ({len(chunk)}건): {e}")
+        if progress_cb:
+            progress_cb("결제(완납) 저장", min(1.0, (_bi + len(chunk)) / max(1, len(payment_payloads))))
+
+    # ---- Phase 3: 라인 아이템 INSERT (to_attach 는 라인만 추가, 헤더·결제·잔금 불변) ----
     item_payloads: list[dict] = []
     for g in preview.groups:
         if g.match_status not in ("to_create", "to_attach"):
             continue
         if not g.chosen_order_id:
             continue
+        # to_attach: 기존 앱 주문에 라인만 추가한다.
+        # app_orders(total_amount·cost_price·balance_status) 및 app_payments 는 절대 UPDATE 하지 않는다.
+        # 잔금이 남은 주문(미납) 이라도 임포트로 완납 처리되지 않도록 방어.
         item_payloads.extend(_item_payloads_from_group(g, order_id=g.chosen_order_id, db_filename=db_filename))
         if g.match_status == "to_attach":
             res.items_attached_existing += len(g.items)
@@ -1157,6 +1217,8 @@ class RollbackPreviewResult:
     """import_source=엑셀_매입원장 이고 기간에 해당하는 주문 수 (삭제 대상)."""
     item_count_on_orders: int = 0
     """위 주문에 달린 라인 수 (CASCADE 로 함께 삭제)."""
+    payment_count_on_orders: int = 0
+    """위 주문에 붙은 결제 수 (임포트 완납 결제 등 → 주문 삭제 전 선삭제 대상)."""
     attached_item_count: int = 0
     """기존 앱 주문에 attach 된 라인만 (주문은 유지, 라인만 삭제)."""
     orphan_customer_count: int = 0
@@ -1170,6 +1232,7 @@ class RollbackPreviewResult:
 class RollbackCommitResult:
     """롤백 실행 결과."""
     orders_deleted: int = 0
+    payments_deleted: int = 0
     attached_items_deleted: int = 0
     customers_deleted: int = 0
     errors: list[str] = field(default_factory=list)
@@ -1286,6 +1349,16 @@ def preview_rollback(
             # 테이블 미존재 등
             res.errors.append(f"라인 조회: {e}")
 
+        # 임포트 주문에 붙은 결제 수 (완납 결제 포함) — 주문 삭제 전 선삭제 대상
+        try:
+            pays_on_orders = _page_select(
+                client, "app_payments", "id, order_id",
+                filters=[("in_", "order_id", import_order_ids)],
+            )
+            res.payment_count_on_orders = len(pays_on_orders)
+        except Exception as e:
+            res.errors.append(f"결제 조회: {e}")
+
     # attach 라인: 같은 매장·기간의 주문 중 import_source 가 아닌 주문에 붙은 매입원장 라인
     try:
         period_orders = _page_select(
@@ -1371,8 +1444,10 @@ def commit_rollback(
     """매입 원장 임포트 롤백 실행.
 
     1) 기간 내 기존주문에 attach 된 매입원장 라인 삭제
-    2) 기간 내 import_source=엑셀_매입원장 주문 삭제 (라인 CASCADE)
-    3) (옵션) 주문이 0건이 된 엑셀_매입원장 고객 삭제
+    2) 기간 내 import_source=엑셀_매입원장 주문의 결제(app_payments) 선삭제
+       (완납 결제는 order_id FK 로 붙어 있으므로 주문 삭제 전에 먼저 정리)
+    3) 기간 내 import_source=엑셀_매입원장 주문 삭제 (라인 CASCADE)
+    4) (옵션) 주문이 0건이 된 엑셀_매입원장 고객 삭제
     """
     res = RollbackCommitResult()
     preview = preview_rollback(
@@ -1431,23 +1506,38 @@ def commit_rollback(
 
     # 1) attach 라인 삭제
     if progress_cb:
-        progress_cb("attach 라인 삭제", 0.2)
+        progress_cb("attach 라인 삭제", 0.15)
     if attached_ids:
         try:
             res.attached_items_deleted = _batch_delete_by_ids(client, "app_order_items", attached_ids)
         except Exception as e:
             res.errors.append(f"attach 라인 삭제 실패: {e}")
 
-    # 2) 임포트 주문 삭제 (라인 CASCADE)
+    # 2) 임포트 주문의 결제(app_payments) 선삭제 — 주문 FK 로 붙어 있으므로 먼저 정리
     if progress_cb:
-        progress_cb("임포트 주문 삭제", 0.5)
+        progress_cb("임포트 결제 삭제", 0.35)
+    if import_order_ids:
+        try:
+            pay_rows = _page_select(
+                client, "app_payments", "id",
+                filters=[("in_", "order_id", import_order_ids)],
+            )
+            pay_ids = [int(r["id"]) for r in pay_rows if r.get("id") is not None]
+            if pay_ids:
+                res.payments_deleted = _batch_delete_by_ids(client, "app_payments", pay_ids)
+        except Exception as e:
+            res.errors.append(f"임포트 결제 삭제 실패: {e}")
+
+    # 3) 임포트 주문 삭제 (라인 CASCADE)
+    if progress_cb:
+        progress_cb("임포트 주문 삭제", 0.6)
     if import_order_ids:
         try:
             res.orders_deleted = _batch_delete_by_ids(client, "app_orders", import_order_ids)
         except Exception as e:
             res.errors.append(f"주문 삭제 실패: {e}")
 
-    # 3) orphan 고객 삭제
+    # 4) orphan 고객 삭제
     if delete_orphan_customers and store_name and import_cids:
         if progress_cb:
             progress_cb("orphan 고객 삭제", 0.8)

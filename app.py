@@ -26556,6 +26556,8 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             "\n\n**매칭 규칙**: 앱에 이미 등록된 주문은 `(고객, 등록일)` 후보가 "
             "**1건이면 자동 매칭**, 2건 이상이면 아래에서 **수동 선택** 합니다. "
             "**회수** 주문구분 라인은 자동 스킵됩니다. "
+            "\n\n**잔금 처리**: 신규 주문(모모에 없던 건)은 **판매가 전액 완납 결제**로 저장되어 미수 목록에 잡히지 않습니다. "
+            "이미 앱에 등록된 주문에 매칭될 때는 **판매금액·원가·잔금·기존 결제**를 절대 덮어쓰지 않고 **라인 아이템만 추가**합니다."
             "\n\n**사전 준비**: `app_order_items` 테이블이 필요합니다 — `SUPABASE_APP_ORDER_ITEMS.sql` 을 먼저 실행하세요."
         )
         _store_name = _get_current_store_name_for_customers(db_filename)
@@ -26831,13 +26833,14 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             _progress.progress(1.0, text="완료")
             clear_data_cache()
 
-            _rr1, _rr2, _rr3 = st.columns(3)
+            _rr1, _rr2, _rr3, _rr4 = st.columns(4)
             _rr1.metric("신규 고객 등록", f"{result.customers_inserted:,}")
             _rr2.metric("신규 주문 등록", f"{result.orders_inserted:,}")
-            _rr3.metric("라인 아이템 저장", f"{result.items_inserted:,}")
-            if result.failed_orders or result.failed_items or result.errors:
+            _rr3.metric("완납 결제 저장", f"{result.payments_inserted:,}")
+            _rr4.metric("라인 아이템 저장", f"{result.items_inserted:,}")
+            if result.failed_orders or result.failed_payments or result.failed_items or result.errors:
                 st.warning(
-                    f"실패: 주문 {result.failed_orders}건 / 라인 {result.failed_items}건. "
+                    f"실패: 주문 {result.failed_orders}건 / 결제 {result.failed_payments}건 / 라인 {result.failed_items}건. "
                     f"스킵: 수동미결정 {result.groups_unresolved_skipped}건 / 무효 {result.groups_invalid_skipped}건."
                 )
                 for _msg in result.errors[:10]:
@@ -26932,11 +26935,12 @@ def _render_legacy_purchase_rollback(db_filename: str) -> None:
             for _e in _rb_prev.errors[:5]:
                 st.warning(_e)
 
-        _m1, _m2, _m3, _m4 = st.columns(4)
+        _m1, _m2, _m3, _m4, _m5 = st.columns(5)
         _m1.metric("삭제 예정 주문", f"{_rb_prev.order_count:,}")
-        _m2.metric("주문 라인 (CASCADE)", f"{_rb_prev.item_count_on_orders:,}")
-        _m3.metric("attach 라인만 삭제", f"{_rb_prev.attached_item_count:,}")
-        _m4.metric("orphan 고객 후보", f"{_rb_prev.orphan_customer_count:,}")
+        _m2.metric("주문 결제 선삭제", f"{_rb_prev.payment_count_on_orders:,}")
+        _m3.metric("주문 라인 (CASCADE)", f"{_rb_prev.item_count_on_orders:,}")
+        _m4.metric("attach 라인만 삭제", f"{_rb_prev.attached_item_count:,}")
+        _m5.metric("orphan 고객 후보", f"{_rb_prev.orphan_customer_count:,}")
 
         _total = _rb_prev.order_count + _rb_prev.attached_item_count
         if _total == 0:
@@ -26996,17 +27000,18 @@ def _render_legacy_purchase_rollback(db_filename: str) -> None:
                     ):
                         st.session_state.pop(_k, None)
 
-                _r1, _r2, _r3 = st.columns(3)
+                _r1, _r2, _r3, _r4 = st.columns(4)
                 _r1.metric("삭제된 주문", f"{_rb_res.orders_deleted:,}")
-                _r2.metric("삭제된 attach 라인", f"{_rb_res.attached_items_deleted:,}")
-                _r3.metric("삭제된 orphan 고객", f"{_rb_res.customers_deleted:,}")
+                _r2.metric("삭제된 결제", f"{_rb_res.payments_deleted:,}")
+                _r3.metric("삭제된 attach 라인", f"{_rb_res.attached_items_deleted:,}")
+                _r4.metric("삭제된 orphan 고객", f"{_rb_res.customers_deleted:,}")
                 if _rb_res.errors:
                     for _msg in _rb_res.errors[:10]:
                         st.error(_msg)
                 else:
                     st.success(
                         f"롤백 완료. 이제 위에서 매입 원장 엑셀을 다시 업로드할 수 있습니다. "
-                        f"(주문 {_rb_res.orders_deleted:,} · attach 라인 {_rb_res.attached_items_deleted:,} · 고객 {_rb_res.customers_deleted:,})"
+                        f"(주문 {_rb_res.orders_deleted:,} · 결제 {_rb_res.payments_deleted:,} · attach 라인 {_rb_res.attached_items_deleted:,} · 고객 {_rb_res.customers_deleted:,})"
                     )
         elif _confirm_chk and _confirm_txt.strip() and _confirm_txt.strip() != _store_name:
             st.error(f"매장명이 일치하지 않습니다. `{_store_name}` 을 정확히 입력해 주세요.")
@@ -28320,7 +28325,8 @@ def render_customer_balance():
                                     st.error(f"요청 전송 실패: {req_err}")
 
     # ---------- 탭 2·3·4 공통 데이터: 1회만 로드 후 각 탭에서 재사용 ----------
-    order_cols_d10 = "id, customer_id, order_date, delivery_date, total_amount, display_sales_amount, cost_price, category, employee_names"
+    # balance_status: 완납·이상결제는 미수 대상에서 제외 (임포트 완납 주문 포함)
+    order_cols_d10 = "id, customer_id, order_date, delivery_date, total_amount, display_sales_amount, cost_price, category, employee_names, balance_status"
     _shared_orders_d10 = load_orders_cached(db_filename, order_cols_d10, limit=None)
     _shared_payments_d10 = load_payments_cached(db_filename)
     # 탭2·3·4는 id, name, phone1만 사용 → 불필요 컬럼 제외
@@ -28352,7 +28358,9 @@ def render_customer_balance():
                 mask_date = orders["delivery_date"].notna()
             else:
                 mask_date = orders["delivery_date"].notna() & (orders["delivery_date"].dt.date >= today) & (orders["delivery_date"].dt.date <= d10_end)
-            mask_balance = orders["balance"] > 0
+            # 완납·이상결제로 표시된 주문은 잔금 계산 오차와 무관하게 미수 대상에서 제외
+            _bs_col = orders["balance_status"].fillna("") if "balance_status" in orders.columns else ""
+            mask_balance = (orders["balance"] > 0) & (~_bs_col.isin([BALANCE_STATUS_COMPLETE, BALANCE_STATUS_OVERPAID]))
             list_d10 = orders[mask_balance & mask_date].copy()
             if len(list_d10) > 0:
                 list_d10["배송일"] = list_d10["delivery_date"].dt.strftime("%Y-%m-%d") if pd.api.types.is_datetime64_any_dtype(list_d10["delivery_date"]) else list_d10["delivery_date"].astype(str)
@@ -28379,7 +28387,9 @@ def render_customer_balance():
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
             orders = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
             mask_past = orders["delivery_date"].notna() & (orders["delivery_date"].dt.date < today)
-            mask_balance = orders["balance"] > 0
+            # 완납·이상결제 주문은 배송일이 지났어도 미결 대상에서 제외
+            _bs_col_o = orders["balance_status"].fillna("") if "balance_status" in orders.columns else ""
+            mask_balance = (orders["balance"] > 0) & (~_bs_col_o.isin([BALANCE_STATUS_COMPLETE, BALANCE_STATUS_OVERPAID]))
             list_overdue = orders[mask_balance & mask_past].copy()
             if len(list_overdue) > 0:
                 list_overdue["배송일"] = list_overdue["delivery_date"].dt.strftime("%Y-%m-%d")
