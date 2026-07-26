@@ -30335,8 +30335,16 @@ def render_dashboard():
             st.error(f"⚠️ 잔금 불일치 의심 건 {len(suspicious)}건 발생 (완납 표시이나 실 잔금이 0이 아님)")
             with st.expander("📋 잔금 불일치 건 상세"):
                 disp = suspicious.merge(customers[["id", "name"]], left_on="customer_id", right_on="id", how="left", suffixes=("_order", "_cust"))
-                disp = disp.rename(columns={"id_order": "주문ID", "name": "고객명", "total_amount": "총액", "paid": "결제합계", "real_balance": "실잔금", "balance_status": "표시상태"})
-                show_df = disp[["주문ID", "고객명", "총액", "결제합계", "실잔금", "표시상태"]].copy()
+                disp = disp.rename(columns={
+                    "id_order": "주문ID", "name": "고객명",
+                    "order_date": "계약일", "delivery_date": "배송일",
+                    "total_amount": "총액", "paid": "결제합계", "real_balance": "실잔금", "balance_status": "표시상태",
+                })
+                _detail_cols = ["주문ID", "고객명", "계약일", "배송일", "총액", "결제합계", "실잔금", "표시상태"]
+                show_df = disp[[c for c in _detail_cols if c in disp.columns]].copy()
+                for col in ("계약일", "배송일"):
+                    if col in show_df.columns:
+                        show_df[col] = pd.to_datetime(show_df[col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-")
                 for col in ("총액", "결제합계", "실잔금"):
                     show_df[col] = show_df[col].apply(_fmt_num)
                 st.dataframe(show_df, width='stretch')
