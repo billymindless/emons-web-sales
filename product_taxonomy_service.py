@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 import pandas as pd
@@ -204,6 +205,30 @@ _SYSTEM_PROMPT = (
     "예시: {\"디망스침대협탁\":\"침대\",\"디망스침대확장형사이드쿠션\":\"침대\",\"거울\":\"소품\",\"SSDS침대머리판\":\"SSDS침대\",\"TV장1800\":\"거실장\"}"
 )
 
+# 'SSDS침대' 규칙 기반 강제 분류: Gemini 판단에 앞서 결정적으로 확정한다.
+# 조건: 소괄호() 안에 '1100'/'SS'/'DS'/'WS' 표기가 있고, 그 앞부분에 '침대' 또는 '매트리스' 가 포함되며,
+#       '식탁'/'옷장' 등 다른 가구 키워드가 이름에 없어야 한다.
+_SSDS_BED_KEYWORDS = ("침대", "매트리스")
+_SSDS_EXCLUDE_KEYWORDS = ("식탁", "옷장")
+_SSDS_SIZE_TOKENS = ("1100", "SS", "DS", "WS")
+_PAREN_CONTENT_RE = re.compile(r"\(([^)]*)\)")
+
+
+def _apply_ssds_size_rule(name: str) -> Optional[str]:
+    """소괄호 안 SS/DS/WS/1100 표기 + 앞선 '침대'/'매트리스' → 'SSDS침대' 강제 분류. 아니면 None."""
+    if not name:
+        return None
+    if any(kw in name for kw in _SSDS_EXCLUDE_KEYWORDS):
+        return None
+    for m in _PAREN_CONTENT_RE.finditer(name):
+        content_upper = m.group(1).upper()
+        if not any(tok in content_upper for tok in _SSDS_SIZE_TOKENS):
+            continue
+        prefix = name[:m.start()]
+        if any(kw in prefix for kw in _SSDS_BED_KEYWORDS):
+            return "SSDS침대"
+    return None
+
 
 def classify_with_gemini(
     names: list[str],
@@ -215,25 +240,41 @@ def classify_with_gemini(
     """품목명 리스트를 Gemini 로 배치 분류.
 
     반환: {product_name: (category, confidence)}.
+    - 'SSDS침대' 규칙(소괄호 안 SS/DS/WS/1100 + 앞선 침대·매트리스 표기)에 걸리면
+      Gemini 호출 없이 확정 분류한다 (`_apply_ssds_size_rule`).
     - 결과가 없거나 허용 카테고리 밖이면 ('기타', 0.0).
-    - API 키 없거나 오류 시 전체 이름을 ('기타', 0.0) 로 채움.
+    - API 키 없거나 오류 시 나머지 이름을 ('기타', 0.0) 로 채움.
     """
     if not names:
         return {}
-    key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
 
     allowed = set(CATEGORIES)
     result: dict[str, tuple[str, float]] = {}
 
+    remaining: list[str] = []
+    for n in names:
+        forced = _apply_ssds_size_rule(n)
+        if forced:
+            result[n] = (forced, 1.0)
+        else:
+            remaining.append(n)
+
+    if not remaining:
+        return result
+
+    key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+
     if not key:
-        logger.warning("classify_with_gemini: GEMINI_API_KEY 미설정 → 전체 '기타' 반환")
-        return {n: ("기타", 0.0) for n in names}
+        logger.warning("classify_with_gemini: GEMINI_API_KEY 미설정 → 나머지 전체 '기타' 반환")
+        result.update({n: ("기타", 0.0) for n in remaining})
+        return result
 
     try:
         import httpx
     except ImportError:
-        logger.warning("httpx 미설치 → 전체 '기타' 반환")
-        return {n: ("기타", 0.0) for n in names}
+        logger.warning("httpx 미설치 → 나머지 전체 '기타' 반환")
+        result.update({n: ("기타", 0.0) for n in remaining})
+        return result
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -269,7 +310,7 @@ def classify_with_gemini(
 
     seen: set[str] = set()
     dedup = []
-    for n in names:
+    for n in remaining:
         if n in seen:
             continue
         seen.add(n)
