@@ -169,6 +169,34 @@ def clean_customer_name(raw: Any) -> tuple[str, str, str]:
     return s.rstrip("*").strip(), "", ""
 
 
+def _normalize_name_key(name: Any) -> str:
+    """이름 기반 identity 키 정규화. 공백 제거 + 소문자.
+
+    예: '울산삼산리빙 (법)' → '울산삼산리빙(법)'
+    """
+    if name is None:
+        return ""
+    s = _clean_str(name)
+    if not s:
+        return ""
+    return re.sub(r"\s+", "", s).lower()
+
+
+def compute_identity_key(phone_digits: str, customer_name: Any) -> str:
+    """그룹핑·매칭용 통합 identity key.
+
+    - phone_digits 가 있으면 phone_digits 그대로
+    - 없으면 `NAME:<정규화된 이름>` (매장 전시·전화번호 미기입 고객용)
+    - 둘 다 없으면 빈 문자열
+    """
+    if phone_digits:
+        return phone_digits
+    n = _normalize_name_key(customer_name)
+    if n:
+        return f"NAME:{n}"
+    return ""
+
+
 def combine_address(addr1: Any, addr2: Any) -> str:
     """도로명(주소1) + 상세(주소2) 결합. 이미 포함이면 중복 방지."""
     a1 = _clean_str(addr1)
@@ -310,8 +338,12 @@ class LineItem:
 
 @dataclass
 class OrderGroup:
-    """1개의 매출 주문. (phone1_digits, order_date, ship_number) 3튜플 = 1 그룹."""
-    # 그룹핑 키
+    """1개의 매출 주문. (identity_key, order_date, ship_number) 3튜플 = 1 그룹.
+
+    identity_key = phone1 digits (있으면) 또는 `NAME:정규화된 이름` (매장 전시·전화 미기입).
+    """
+    # 그룹핑·매칭 키
+    identity_key: str
     phone1_digits: str
     order_date: Optional[str]
     ship_number: str
@@ -340,7 +372,12 @@ class OrderGroup:
 
     @property
     def group_key(self) -> tuple:
-        return (self.phone1_digits, self.order_date or "", self.ship_number or "")
+        return (self.identity_key, self.order_date or "", self.ship_number or "")
+
+    @property
+    def is_display_customer(self) -> bool:
+        """전화번호 없이 이름으로만 식별되는 고객 (예: 매장 전시)."""
+        return self.identity_key.startswith("NAME:")
 
     def summary_label(self) -> str:
         _od = self.order_date or "?"
@@ -381,14 +418,18 @@ def group_orders(
         ship_number_raw = row.get("ship_number")
         ship_number = _clean_str(ship_number_raw) if ship_number_raw is not None else ""
 
-        # 필수: phone1_digits, order_date, unit_cost > 0
+        _name_parsed, _tag_parsed, _suffix_parsed = clean_customer_name(row.get("customer_name"))
+        # identity_key: 전화번호가 우선, 없으면 이름 기반 (매장 전시 등)
+        identity_key = compute_identity_key(phone1_digits, _name_parsed)
+
+        # 필수: identity(전화 or 이름), order_date, unit_cost > 0
         # 출고번호는 있으면 3튜플, 없으면 2튜플 그룹핑
         unit_cost = _to_int(row.get("unit_cost"))
         quantity = _to_int(row.get("quantity")) or 1
 
         problems: list[str] = []
-        if not phone1_digits:
-            problems.append("전화1 없음")
+        if not identity_key:
+            problems.append("전화1·고객명 모두 없음")
         if not order_date:
             problems.append("등록일 파싱 실패")
         if unit_cost <= 0:
@@ -397,17 +438,17 @@ def group_orders(
             stats["skipped_invalid"] += 1
             continue
 
-        # 그룹핑 키: 출고번호가 있으면 3튜플(구 원장), 없으면 2튜플(신 양식)
-        key = (phone1_digits, order_date, ship_number)
+        # 그룹핑 키: identity_key (전화 or NAME:이름) + 등록일 + 출고번호(옵션)
+        key = (identity_key, order_date, ship_number)
         group = groups.get(key)
         if group is None:
-            _name, _tag, _suffix = clean_customer_name(row.get("customer_name"))
             group = OrderGroup(
+                identity_key=identity_key,
                 phone1_digits=phone1_digits,
                 order_date=order_date,
                 ship_number=ship_number,
-                customer_name=_name or "미입력",
-                customer_tag=_tag,
+                customer_name=_name_parsed or "미입력",
+                customer_tag=_tag_parsed,
                 phone1=phone1_raw,
                 phone2=_clean_str(row.get("phone2")),
                 address=combine_address(row.get("address"), row.get("address2")),
@@ -477,6 +518,44 @@ class PurchasePreviewResult:
     total_sale_amount: int = 0
     total_cost_amount: int = 0
     yearly_stats: list[dict] = field(default_factory=list)
+
+
+def load_existing_customer_identity_map(client, store_name: str) -> dict[str, int]:
+    """매장 스코프 identity_key → customer_id 매핑.
+
+    - phone1 이 있는 고객: `phone_digits` → id
+    - phone1 이 비어있는 고객 (매장 전시 등): `NAME:정규화된 이름` → id
+
+    같은 키로 여러 row 가 있으면 가장 작은 id (가장 오래된 등록) 채택.
+    """
+    if not store_name:
+        return {}
+    result: dict[str, int] = {}
+    _PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            q = client.table("app_customers").select("id, name, phone1") \
+                .eq("store_name", store_name).order("id").range(offset, offset + _PAGE - 1)
+            r = q.execute()
+        except Exception as e:
+            logger.warning("load_existing_customer_identity_map failed: %s", e)
+            break
+        rows = (r.data or []) if hasattr(r, "data") else []
+        for row in rows:
+            _id = row.get("id")
+            if _id is None:
+                continue
+            _id = int(_id)
+            key = compute_identity_key(normalize_phone(row.get("phone1")), row.get("name"))
+            if not key:
+                continue
+            if key not in result or _id < result[key]:
+                result[key] = _id
+        if len(rows) < _PAGE:
+            break
+        offset += _PAGE
+    return result
 
 
 def _fetch_existing_orders(client, db_filename: str) -> dict[tuple[int, str], list[dict]]:
@@ -604,17 +683,16 @@ def build_preview(
     groups : `group_orders` 결과
     store_name : 대상 매장명 (app_customers.store_name)
     db_filename : 대상 매장 파일명 (app_orders.db_filename)
-    existing_customers_by_phone : {phone1_digits: customer_id}. 미지정 시 새로 로드.
+    existing_customers_by_phone : {identity_key: customer_id}. 미지정 시 새로 로드.
+        identity_key = phone_digits (전화 있는 고객) 또는 `NAME:정규화된 이름` (전화 없는 매장 전시 등).
     """
-    from legacy_import_service import load_existing_customer_phone_map  # 지연 임포트
-
     result = PurchasePreviewResult()
     result.group_count = len(groups)
     if not groups:
         return result
 
     if existing_customers_by_phone is None:
-        existing_customers_by_phone = load_existing_customer_phone_map(client, store_name)
+        existing_customers_by_phone = load_existing_customer_identity_map(client, store_name)
 
     existing_orders_by_cid_date = _fetch_existing_orders(client, db_filename)
     existing_ship_numbers = _fetch_existing_items_ship_numbers(client, db_filename)
@@ -634,16 +712,16 @@ def build_preview(
             result.groups.append(g)
             continue
 
-        # 고객 매칭
-        existing_cid = existing_customers_by_phone.get(g.phone1_digits)
+        # 고객 매칭 (identity_key 기반: 전화 우선, 없으면 이름 기반)
+        existing_cid = existing_customers_by_phone.get(g.identity_key)
         if existing_cid is not None:
             g.existing_customer_id = int(existing_cid)
             result.matched_customer_count += 1
-        elif g.phone1_digits in session_new_phone_to_slot:
-            g.existing_customer_id = session_new_phone_to_slot[g.phone1_digits]
+        elif g.identity_key in session_new_phone_to_slot:
+            g.existing_customer_id = session_new_phone_to_slot[g.identity_key]
             result.matched_customer_count += 1  # 세션 내 재사용도 매칭으로 카운트
         else:
-            session_new_phone_to_slot[g.phone1_digits] = next_slot
+            session_new_phone_to_slot[g.identity_key] = next_slot
             g.existing_customer_id = next_slot
             next_slot -= 1
             result.new_customer_count += 1
@@ -706,8 +784,10 @@ def preview_to_dataframe(preview: PurchasePreviewResult, max_rows: int = 500) ->
     }
     rows = []
     for g in preview.groups[:max_rows]:
+        _id_type = "매장 전시" if g.is_display_customer else "전화 매칭"
         rows.append({
             "상태": _STATUS_LABEL.get(g.match_status, g.match_status),
+            "식별": _id_type,
             "고객명": g.customer_name + (f"[{g.customer_tag}]" if g.customer_tag else ""),
             "전화1": g.phone1,
             "등록일": g.order_date or "",
@@ -1021,11 +1101,13 @@ __all__ = [
     "ChannelTalkMergeResult",
     "clean_customer_name",
     "combine_address",
+    "compute_identity_key",
     "parse_excel",
     "auto_suggest_mapping",
     "group_orders",
     "build_preview",
     "preview_to_dataframe",
+    "load_existing_customer_identity_map",
     "migrate_channeltalk_phones",
     "commit_import",
 ]
