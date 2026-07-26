@@ -188,7 +188,8 @@ def count_all_product_names(client, *, db_filename: Optional[str] = None) -> int
 
 _SYSTEM_PROMPT = (
     "너는 가구 매장의 매입 원장 품목명을 대분류 카테고리 1개로 분류하는 분류기다. "
-    "출력은 오직 JSON 오브젝트로만, 각 키가 입력 품목명, 값이 카테고리다. "
+    "출력은 오직 JSON 문자열 배열로만 답한다. 배열의 각 원소는 입력 품목명 리스트와 "
+    "동일한 개수·동일한 순서로, i번째 원소가 i번째 품목명의 카테고리다 (품목명 자체는 출력하지 않는다).\n"
     "허용 카테고리는 다음 10개 중 하나로만 답한다.\n"
     "['옷장','식탁','자녀방_서재','침대','SSDS침대','소파','거실장','소품','전시품','기타']\n\n"
     "분류 힌트:\n"
@@ -199,19 +200,28 @@ _SYSTEM_PROMPT = (
     "- 'SSDS침대': 이름에 'SSDS' 가 포함되거나 SSDS 브랜드의 침대류 및 부속(협탁·머리판·확장옵션 포함).\n"
     "- '소파': 소파·리클라이너·소파테이블.\n"
     "- '거실장': TV장·거실 수납장·사이드보드 등 거실용 수납 가구.\n"
-    "- '소품': 거울·조명·화병·러그 등 세트에 속하지 않는 단품 소품. 침대 세트에 명확히 속하는 협탁·수납함은 '침대' 로 분류.\n"
+    "- '소품': 거울·조명·화병·러그·티테이블 등 세트에 속하지 않는 단품 소품. 침대 세트에 명확히 속하는 협탁·수납함은 '침대' 로 분류.\n"
     "- '전시품': 이름에 '전시' 표기가 있는 항목.\n"
     "- '기타': 위 어느 것에도 명확히 해당하지 않는 부자재·배송비·설치비 등.\n\n"
-    "예시: {\"디망스침대협탁\":\"침대\",\"디망스침대확장형사이드쿠션\":\"침대\",\"거울\":\"소품\",\"SSDS침대머리판\":\"SSDS침대\",\"TV장1800\":\"거실장\"}"
+    "예시 — 입력 [\"디망스침대협탁\",\"거울\",\"SSDS침대머리판\",\"TV장1800\"] → 출력 [\"침대\",\"소품\",\"SSDS침대\",\"거실장\"]"
 )
 
-# 'SSDS침대' 규칙 기반 강제 분류: Gemini 판단에 앞서 결정적으로 확정한다.
-# 조건: 소괄호() 안에 '1100'/'SS'/'DS'/'WS' 표기가 있고, 그 앞부분에 '침대' 또는 '매트리스' 가 포함되며,
-#       '식탁'/'옷장' 등 다른 가구 키워드가 이름에 없어야 한다.
+# 규칙 기반 강제 분류: Gemini 호출에 앞서 결정적으로 확정한다 (문자열 패턴이 명확한 경우).
+# 1) 'SSDS침대' 규칙: 소괄호() 안에 '1100'/'SS'/'DS'/'WS' 표기가 있고, 그 앞부분에 '침대' 또는 '매트리스' 가
+#    포함되며, '식탁'/'옷장' 등 다른 가구 키워드가 이름에 없어야 한다.
+# 2) 키워드 강제 규칙: 아래 순서대로 첫 매칭 키워드의 카테고리로 무조건 분류한다.
 _SSDS_BED_KEYWORDS = ("침대", "매트리스")
 _SSDS_EXCLUDE_KEYWORDS = ("식탁", "옷장")
 _SSDS_SIZE_TOKENS = ("1100", "SS", "DS", "WS")
 _PAREN_CONTENT_RE = re.compile(r"\(([^)]*)\)")
+
+_FORCE_KEYWORD_RULES: list[tuple[str, str]] = [
+    ("티테이블", "소품"),
+    ("거실장", "거실장"),
+    ("소파", "소파"),
+    ("식탁", "식탁"),
+    ("매트리스", "침대"),
+]
 
 
 def _apply_ssds_size_rule(name: str) -> Optional[str]:
@@ -230,6 +240,21 @@ def _apply_ssds_size_rule(name: str) -> Optional[str]:
     return None
 
 
+def _apply_keyword_rules(name: str) -> Optional[str]:
+    """단순 키워드 포함 시 무조건 해당 카테고리로 강제 분류 (사용자 지정 규칙). 순서대로 첫 매칭 적용."""
+    if not name:
+        return None
+    for keyword, category in _FORCE_KEYWORD_RULES:
+        if keyword in name:
+            return category
+    return None
+
+
+def _apply_rule_based_category(name: str) -> Optional[str]:
+    """규칙 기반 카테고리 확정: SSDS 규격 규칙 → 키워드 강제 규칙 순으로 확인."""
+    return _apply_ssds_size_rule(name) or _apply_keyword_rules(name)
+
+
 def classify_with_gemini(
     names: list[str],
     api_key: Optional[str] = None,
@@ -240,9 +265,9 @@ def classify_with_gemini(
     """품목명 리스트를 Gemini 로 배치 분류.
 
     반환: {product_name: (category, confidence)}.
-    - 'SSDS침대' 규칙(소괄호 안 SS/DS/WS/1100 + 앞선 침대·매트리스 표기)에 걸리면
-      Gemini 호출 없이 확정 분류한다 (`_apply_ssds_size_rule`).
-    - 결과가 없거나 허용 카테고리 밖이면 ('기타', 0.0).
+    - 규칙 기반 강제 분류(`_apply_rule_based_category`: SSDS 규격 표기, 티테이블/거실장/소파/식탁/매트리스
+      키워드)에 걸리면 Gemini 호출 없이 확정 분류한다.
+    - 나머지는 Gemini 응답을 그대로 신뢰한다. 응답이 허용 카테고리 밖이거나 파싱 실패 시에만 ('기타', 0.0).
     - API 키 없거나 오류 시 나머지 이름을 ('기타', 0.0) 로 채움.
     """
     if not names:
@@ -253,7 +278,7 @@ def classify_with_gemini(
 
     remaining: list[str] = []
     for n in names:
-        forced = _apply_ssds_size_rule(n)
+        forced = _apply_rule_based_category(n)
         if forced:
             result[n] = (forced, 1.0)
         else:
@@ -281,9 +306,16 @@ def classify_with_gemini(
         f"{model}:generateContent?key={key}"
     )
 
-    def _one_batch(chunk: list[str]) -> dict[str, str]:
+    def _one_batch(chunk: list[str]) -> Optional[list[str]]:
+        """chunk 와 동일 개수·순서의 카테고리 배열을 반환. 실패/개수불일치 시 None.
+
+        (품목명을 JSON 키로 되돌려받는 방식은 LLM이 원문을 살짝 바꿔 반환하면
+        문자열이 어긋나 전부 매칭 실패 → 전부 '기타' 로 빠지는 문제가 있어,
+        입력 순서에 대응하는 배열 방식 + enum 스키마로 대체한다.)
+        """
         user_prompt = (
-            "다음 품목명들을 카테고리로 분류하라. JSON 오브젝트로만 답하라.\n"
+            "다음 품목명 리스트를 각각 카테고리로 분류하라. "
+            "입력과 동일한 개수·동일한 순서의 JSON 문자열 배열로만 답하라 (품목명은 출력하지 않는다).\n"
             + json.dumps(chunk, ensure_ascii=False)
         )
         body = {
@@ -292,6 +324,10 @@ def classify_with_gemini(
             "generationConfig": {
                 "temperature": 0.0,
                 "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING", "enum": CATEGORIES},
+                },
             },
         }
         try:
@@ -301,12 +337,16 @@ def classify_with_gemini(
             raw = r.json()
             text = raw["candidates"][0]["content"]["parts"][0]["text"]
             data = json.loads(text)
-            if not isinstance(data, dict):
-                return {}
-            return {str(k): str(v) for k, v in data.items()}
+            if not isinstance(data, list) or len(data) != len(chunk):
+                logger.warning(
+                    "Gemini 응답 개수 불일치: 요청 %d개 → 응답 %r",
+                    len(chunk), data if not isinstance(data, list) else f"{len(data)}개",
+                )
+                return None
+            return [str(x) for x in data]
         except Exception as e:
             logger.warning("Gemini 분류 배치 실패 (%d개): %s", len(chunk), e)
-            return {}
+            return None
 
     seen: set[str] = set()
     dedup = []
@@ -318,12 +358,15 @@ def classify_with_gemini(
 
     for i in range(0, len(dedup), max(1, batch)):
         chunk = dedup[i:i + batch]
-        raw_map = _one_batch(chunk)
-        for name in chunk:
-            cat = raw_map.get(name, "").strip()
+        cats = _one_batch(chunk)
+        if cats is None:
+            # 배치 실패/개수 불일치 시에만 '기타' 로 채운다 (Gemini 응답을 받은 경우는 그대로 신뢰).
+            result.update({n: ("기타", 0.0) for n in chunk})
+            continue
+        for name, cat in zip(chunk, cats):
+            cat = (cat or "").strip()
             if cat not in allowed:
-                cat = "기타"
-                conf = 0.0
+                cat, conf = "기타", 0.0
             else:
                 conf = 0.9  # Gemini 는 확신도를 안 주므로 정상 응답이면 고정 0.9
             result[name] = (cat, conf)
