@@ -26490,6 +26490,213 @@ def _render_chat_history_section(customer_id: int, phone: str, customer_name: st
                     st.error("저장에 실패했습니다. Supabase 연결을 확인하세요.")
 
 
+def _render_legacy_order_bulk_import(db_filename: str) -> None:
+    """과거 구매내역(주문+결제) 일괄 임포트 UI.
+
+    - 엑셀 업로드 → 컬럼 매핑(자동 제안, 사용자가 수정 가능) → 마진 역산 판매가 미리보기
+    - "임포트 확정" 을 눌러야 실제 INSERT. 그 전까지 DB 변경 없음.
+    - phone1(숫자만) 기준으로 매장 내 재구매 고객 통합. 완납 처리.
+    - import_source='엑셀_과거이력' 태그로 롤백/식별 가능.
+    """
+    try:
+        import legacy_import_service as lis  # 지역 임포트: 앱 부팅 시 실패 방지
+    except Exception as _e:
+        return  # 모듈이 아직 배포되지 않은 환경에서는 조용히 스킵
+
+    with st.expander("📚 과거 구매내역 일괄 임포트 (주문·결제 포함)"):
+        st.caption(
+            "출고가 기준 엑셀을 판매가 기준으로 역산하여 저장합니다. "
+            "전화번호(phone1)가 같으면 재구매 고객으로 자동 통합됩니다. "
+            "모든 주문은 **완납** 상태로 저장되며, `import_source='엑셀_과거이력'` 태그가 붙어 나중에 식별할 수 있습니다."
+        )
+        _store_name = _get_current_store_name_for_customers(db_filename)
+        if not _store_name:
+            st.error("현재 매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 먼저 선택해 주세요.")
+            return
+        st.info(f"저장 대상 매장: **{_store_name}** (`{db_filename}`)")
+
+        excel_upload = st.file_uploader(
+            "엑셀 파일 (.xlsx)", type=["xlsx"], key="legacy_order_excel_upload",
+            help="첫번째 시트가 사용됩니다. 컬럼 매핑은 업로드 후 아래에서 확인/수정할 수 있습니다.",
+        )
+        if excel_upload is None:
+            return
+
+        # 세션에 파싱 결과 캐시 (재실행마다 파싱 반복 방지)
+        _cache_key = f"legacy_import_df::{excel_upload.name}::{excel_upload.size}"
+        if _cache_key not in st.session_state:
+            try:
+                st.session_state[_cache_key] = lis.parse_excel(excel_upload.getvalue())
+            except Exception as _e:
+                st.error(f"엑셀 파일을 읽을 수 없습니다: {_e}")
+                return
+        df_raw = st.session_state[_cache_key]
+        if df_raw is None or df_raw.empty:
+            st.warning("엑셀에 데이터 행이 없습니다.")
+            return
+
+        st.markdown(f"**총 {len(df_raw):,}행** · 컬럼 {len(df_raw.columns)}개")
+        with st.expander("원본 미리보기 (앞 10행)", expanded=False):
+            st.dataframe(df_raw.head(10), width="stretch", hide_index=True)
+
+        st.markdown("#### 1. 컬럼 매핑")
+        st.caption("엑셀의 각 컬럼을 어떤 필드로 사용할지 선택하세요. `-`를 선택하면 해당 필드는 비웁니다.")
+        _cols_options = ["-"] + list(df_raw.columns)
+        _suggested = lis.auto_suggest_mapping(list(df_raw.columns))
+        mapping: dict[str, str] = {}
+        _map_cols = st.columns(3)
+        for _idx, (fkey, flabel, freq) in enumerate(lis.TARGET_FIELDS):
+            with _map_cols[_idx % 3]:
+                default = _suggested.get(fkey, "-")
+                sel = st.selectbox(
+                    f"{flabel}" + (" *" if freq else ""),
+                    _cols_options,
+                    index=_cols_options.index(default) if default in _cols_options else 0,
+                    key=f"legacy_map::{fkey}::{excel_upload.name}",
+                )
+                if sel != "-":
+                    mapping[fkey] = sel
+
+        st.markdown("#### 2. 임포트 옵션")
+        _c1, _c2 = st.columns([1, 2])
+        with _c1:
+            margin_pct = st.number_input(
+                "마진율 (%) — 판매가 기준",
+                min_value=0.0, max_value=95.0, value=20.0, step=1.0,
+                help="판매가 = 출고가 / (1 - 마진율). 기본 20% → 출고가/0.8",
+                key=f"legacy_margin::{excel_upload.name}",
+            )
+        with _c2:
+            _default_kinds = sorted(lis.DEFAULT_ORDER_KIND_ALLOWED)
+            _all_kinds_in_file = []
+            if "order_kind" in mapping:
+                _all_kinds_in_file = sorted({
+                    str(v).strip() for v in df_raw[mapping["order_kind"]].dropna().unique()
+                    if str(v).strip()
+                })
+            kind_options = sorted(set(_default_kinds) | set(_all_kinds_in_file))
+            if not kind_options:
+                kind_options = _default_kinds
+            allowed_kinds = st.multiselect(
+                "포함할 주문구분 값 (선택하지 않으면 필터 없음)",
+                options=kind_options,
+                default=[k for k in _default_kinds if k in kind_options],
+                help="주문구분 컬럼 매핑이 있을 때만 필터됩니다. 예: '주문'만 포함하고 '회수/교환'은 제외.",
+                key=f"legacy_kinds::{excel_upload.name}",
+            )
+
+        # 필수 필드 검증
+        _missing_required = [flabel for fkey, flabel, freq in lis.TARGET_FIELDS if freq and fkey not in mapping]
+        if _missing_required:
+            st.error(f"필수 매핑 누락: {', '.join(_missing_required)}")
+            return
+
+        st.markdown("#### 3. 미리보기 (dry-run)")
+        if st.button("🔍 미리보기 생성", key=f"legacy_preview_btn::{excel_upload.name}", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+            with st.spinner("기존 고객·주문 로드 중…"):
+                _existing_phones = lis.load_existing_customer_phone_map(client, _store_name)
+                _existing_fps = lis.load_existing_order_fingerprints(client, db_filename)
+            with st.spinner(f"미리보기 계산 중… ({len(df_raw):,}행)"):
+                preview = lis.build_preview(
+                    df_raw, mapping,
+                    margin_rate=margin_pct / 100.0,
+                    order_kind_allowed=(set(allowed_kinds) if allowed_kinds else None),
+                    existing_customers_by_phone=_existing_phones,
+                    existing_order_fingerprints=_existing_fps,
+                )
+            st.session_state[f"legacy_preview::{excel_upload.name}"] = preview
+
+        preview = st.session_state.get(f"legacy_preview::{excel_upload.name}")
+        if not preview:
+            st.info("'미리보기 생성' 을 눌러 임포트 결과를 먼저 확인해 주세요.")
+            return
+
+        _s1, _s2, _s3, _s4 = st.columns(4)
+        _s1.metric("전체 행", f"{preview.total_input:,}")
+        _s2.metric("임포트 대상 (유효)", f"{preview.total_valid:,}")
+        _s3.metric("신규 고객", f"{preview.total_new_customer:,}")
+        _s4.metric("기존 고객 매칭", f"{preview.total_matched_customer:,}")
+        _s5, _s6, _s7, _s8 = st.columns(4)
+        _s5.metric("주문구분 필터로 제외", f"{preview.total_skipped_kind:,}")
+        _s6.metric("주문 지문 중복 스킵", f"{preview.total_duplicate_orders:,}")
+        _s7.metric("오류 (제외)", f"{preview.total_invalid:,}")
+        _s8.metric("총 판매가(역산) 합", f"{preview.total_sale_amount:,}원")
+
+        if preview.yearly_stats:
+            st.caption("연도별 분포")
+            _y_df = pd.DataFrame(preview.yearly_stats)
+            _y_df["sales"] = _y_df["sales"].map(lambda v: f"{int(v):,}원")
+            _y_df = _y_df.rename(columns={"year": "연도", "count": "건수", "sales": "판매가 합"})
+            st.dataframe(_y_df, width="content", hide_index=True)
+
+        if preview.invalid_samples:
+            with st.expander(f"⚠️ 오류 샘플 (최대 20건 표시, 총 {preview.total_invalid}건)"):
+                st.dataframe(pd.DataFrame(preview.invalid_samples), width="stretch", hide_index=True)
+
+        with st.expander("임포트 대상 행 미리보기 (최대 500건)", expanded=False):
+            st.dataframe(lis.preview_to_dataframe(preview, max_rows=500), width="stretch", hide_index=True)
+
+        st.markdown("#### 4. 임포트 확정")
+        if preview.total_valid == 0:
+            st.warning("임포트할 유효 행이 없습니다.")
+            return
+        _confirm = st.checkbox(
+            f"위 내용대로 {preview.total_valid:,}건을 매장 [{_store_name}] 에 저장하겠습니다.",
+            key=f"legacy_confirm::{excel_upload.name}",
+        )
+        if _confirm and st.button("✅ 임포트 실행", key=f"legacy_commit_btn::{excel_upload.name}", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+            _current_user = st.session_state.get("current_user") or {}
+            _created_by = _current_user.get("name") or _current_user.get("username") or "legacy_import"
+            _progress = st.progress(0.0, text="시작 중…")
+            def _cb(stage: str, pct: float) -> None:
+                try:
+                    _progress.progress(min(1.0, max(0.0, pct)), text=f"{stage} {int(pct * 100)}%")
+                except Exception:
+                    pass
+            with st.spinner("DB 저장 중…"):
+                result = lis.commit_import(
+                    client, preview,
+                    store_name=_store_name,
+                    db_filename=db_filename,
+                    created_by=_created_by,
+                    margin_rate=margin_pct / 100.0,
+                    progress_cb=_cb,
+                )
+            _progress.progress(1.0, text="완료")
+            clear_data_cache()
+            _r1, _r2, _r3 = st.columns(3)
+            _r1.metric("고객 신규 등록", f"{result.customers_inserted:,}")
+            _r2.metric("주문 등록", f"{result.orders_inserted:,}")
+            _r3.metric("결제(완납) 등록", f"{result.payments_inserted:,}")
+            if result.failed_customers or result.failed_orders or result.errors:
+                st.warning(
+                    f"실패: 고객 {result.failed_customers}건 / 주문 {result.failed_orders}건. "
+                    f"스킵: 중복 {result.duplicates_skipped}건 / 오류 {result.invalid_skipped}건."
+                )
+                for _msg in result.errors[:10]:
+                    st.error(_msg)
+            else:
+                st.success(
+                    f"임포트 완료. 고객 {result.customers_inserted}건 · 주문 {result.orders_inserted}건 · 결제 {result.payments_inserted}건."
+                )
+            # 세션 캐시 초기화 (동일 파일 재처리 방지)
+            for _k in list(st.session_state.keys()):
+                if isinstance(_k, str) and (
+                    _k.startswith(f"legacy_preview::{excel_upload.name}")
+                    or _k.startswith(f"legacy_confirm::{excel_upload.name}")
+                    or _k == _cache_key
+                ):
+                    st.session_state.pop(_k, None)
+
+
 def render_customer_balance():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -26610,6 +26817,9 @@ def render_customer_balance():
                                     st.error(f"엑셀 등록 중 오류: {detail}")
                 except Exception as e:
                     st.error(f"엑셀 파일을 읽을 수 없습니다: {e}")
+
+        # 과거 구매내역(주문+결제) 일괄 임포트 — 출고가 → 판매가 역산, 재구매 phone1 통합
+        _render_legacy_order_bulk_import(db_filename)
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")
