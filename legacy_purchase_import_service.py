@@ -10,7 +10,7 @@
     · (customer_id, order_date) 앱 후보 0건 → to_create (신규 주문 생성)
     · 후보 1건 → to_attach (자동 매칭, 라인만 attach)
     · 후보 2건+ → unresolved (UI 에서 사용자가 수동 선택)
-- 마진 역산: `판매가 = 출고가 / (1 - 0.20)` (기존 `legacy_import_service.compute_sale_price` 재사용).
+- 마진 역산: `판매가 = 출고가 / (1 - 0.20)` (판매가 기준 마진율).
 - 회수 라인은 스킵, 매장분은 일반 주문과 동일 처리.
 - 채널톡_자동가입 매장(store_name=CHANNEL_TALK_DEFAULT_STORE) 의 phone1 을
   대상 매장으로 사전 이관하는 유틸(`migrate_channeltalk_phones`) 을 제공.
@@ -28,14 +28,70 @@ from typing import Any, Callable, Optional
 
 import pandas as pd
 
-from legacy_import_service import (
-    DEFAULT_MARGIN_RATE,
-    compute_sale_price,
-    normalize_phone,
-    parse_date,
-)
-
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 공용 헬퍼 (구 legacy_import_service 에서 인라인화)
+# ---------------------------------------------------------------------------
+
+DEFAULT_MARGIN_RATE = 0.20
+"""판매가 기준 마진율 기본값. 판매가 = 출고가 / (1 - MARGIN_RATE)."""
+
+
+def normalize_phone(raw: Any) -> str:
+    """전화번호 문자열에서 숫자만 추출 (dedup 키)."""
+    if raw is None:
+        return ""
+    try:
+        if isinstance(raw, float) and pd.isna(raw):
+            return ""
+    except Exception:
+        pass
+    return re.sub(r"\D", "", str(raw))
+
+
+def compute_sale_price(cost: float, margin_rate: float = DEFAULT_MARGIN_RATE) -> int:
+    """판매가 기준 마진율로 출고가 → 판매가 역산.
+
+    margin_rate = (sale - cost) / sale  →  sale = cost / (1 - margin_rate)
+    반환은 원 단위 정수 (반올림).
+    """
+    try:
+        c = float(cost or 0)
+    except (TypeError, ValueError):
+        return 0
+    if c <= 0:
+        return 0
+    denom = 1.0 - float(margin_rate)
+    if denom <= 0:
+        return 0
+    return int(round(c / denom))
+
+
+def parse_date(raw: Any) -> Optional[str]:
+    """다양한 포맷을 ISO 문자열(YYYY-MM-DD) 로 정규화. 실패 시 None."""
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, float) and pd.isna(raw):
+            return None
+    except Exception:
+        pass
+    if isinstance(raw, (datetime, pd.Timestamp)):
+        return raw.date().isoformat()
+    if isinstance(raw, date):
+        return raw.isoformat()
+    s = str(raw).strip()
+    if not s or s.lower() in ("nan", "nat", "none"):
+        return None
+    try:
+        dt = pd.to_datetime(s, errors="coerce")
+        if pd.notna(dt):
+            return dt.date().isoformat()
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -855,10 +911,10 @@ def migrate_channeltalk_phones(
     if not ct_rows:
         return res
 
-    # 대상 매장에 이미 있는 digits 조회
+    # 대상 매장에 이미 있는 digits 조회 (identity_key 맵의 phone 계열만 필요)
     try:
-        from legacy_import_service import load_existing_customer_phone_map
-        target_map = load_existing_customer_phone_map(client, target_store)
+        _identity_map = load_existing_customer_identity_map(client, target_store)
+        target_map = {k: v for k, v in _identity_map.items() if not k.startswith("NAME:")}
     except Exception as e:
         res.errors.append(f"대상 매장 phone 조회 실패: {e}")
         target_map = {}
