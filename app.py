@@ -27130,11 +27130,12 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             _progress.progress(1.0, text="완료")
             clear_data_cache()
 
-            _rr1, _rr2, _rr3, _rr4 = st.columns(4)
+            _rr1, _rr2, _rr3, _rr4, _rr5 = st.columns(5)
             _rr1.metric("신규 고객 등록", f"{result.customers_inserted:,}")
             _rr2.metric("신규 주문 등록", f"{result.orders_inserted:,}")
             _rr3.metric("완납 결제 저장", f"{result.payments_inserted:,}")
             _rr4.metric("라인 아이템 저장", f"{result.items_inserted:,}")
+            _rr5.metric("기존고객 주소 보완", f"{result.customers_address_filled:,}")
             if result.failed_orders or result.failed_payments or result.failed_items or result.errors:
                 st.warning(
                     f"실패: 주문 {result.failed_orders}건 / 결제 {result.failed_payments}건 / 라인 {result.failed_items}건. "
@@ -27145,7 +27146,8 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             else:
                 st.success(
                     f"임포트 완료 · 고객 {result.customers_inserted}건 · 신규주문 {result.orders_inserted}건 · "
-                    f"라인 {result.items_inserted}건 (기존주문 attach {result.items_attached_existing}건 포함)."
+                    f"라인 {result.items_inserted}건 (기존주문 attach {result.items_attached_existing}건 포함) · "
+                    f"기존고객 주소 보완 {result.customers_address_filled}건."
                 )
             for _k in list(st.session_state.keys()):
                 if isinstance(_k, str) and (

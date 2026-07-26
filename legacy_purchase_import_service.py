@@ -955,6 +955,8 @@ def migrate_channeltalk_phones(
 @dataclass
 class PurchaseCommitResult:
     customers_inserted: int = 0
+    customers_address_filled: int = 0
+    """기존 고객 중 주소가 비어있어 엑셀 주소로 보완된 건수 (기존 값이 있으면 덮어쓰지 않음)."""
     orders_inserted: int = 0
     payments_inserted: int = 0
     """to_create 신규 주문 완납 처리용 app_payments INSERT 건수."""
@@ -1057,6 +1059,8 @@ def commit_import(
 
     5 phase:
       1) 신규 고객 INSERT (음수 슬롯별)
+      1b) 기존 고객 주소 보완 (app_customers.address 가 비어있는 경우에만, 엑셀 주소로 채움.
+          기존에 값이 있으면 절대 덮어쓰지 않음)
       2) to_create 그룹 → app_orders INSERT (판매가 역산 저장, balance_status=완납)
       2b) to_create 주문에만 app_payments 전액 완납 INSERT (미수 처리 방지용)
       3) 모든 to_create/to_attach 그룹 → app_order_items INSERT
@@ -1067,6 +1071,16 @@ def commit_import(
     if client is None or not store_name or not db_filename:
         res.errors.append("client/store_name/db_filename 필수")
         return res
+
+    # 기존(이미 DB에 있던) 고객 → 엑셀 주소 매핑. Phase 1 의 신규 슬롯 교체 전에 캡처해야
+    # 이번에 새로 생성되는 고객이 섞여 들어가지 않는다.
+    existing_cid_to_address: dict[int, str] = {}
+    for g in preview.groups:
+        if g.match_status == "invalid":
+            continue
+        cid = g.existing_customer_id
+        if cid is not None and cid > 0 and g.address:
+            existing_cid_to_address.setdefault(cid, g.address)
 
     # ---- Phase 1: 신규 고객 INSERT ----
     slot_to_group: dict[int, OrderGroup] = {}
@@ -1109,6 +1123,34 @@ def commit_import(
             real = slot_to_real_cid.get(g.existing_customer_id)
             if real is not None:
                 g.existing_customer_id = real
+
+    # ---- Phase 1b: 기존 고객 주소 보완 (빈 값만) ----
+    if existing_cid_to_address:
+        _addr_ids = list(existing_cid_to_address.keys())
+        for _bi in range(0, len(_addr_ids), _BATCH):
+            chunk_ids = _addr_ids[_bi:_bi + _BATCH]
+            try:
+                resp = client.table("app_customers").select("id, address").in_("id", chunk_ids).execute()
+                rows = (resp.data or []) if hasattr(resp, "data") else []
+            except Exception as e:
+                res.errors.append(f"기존 고객 주소 조회 실패 ({len(chunk_ids)}건): {e}")
+                continue
+            for row in rows:
+                _cid = row.get("id")
+                if _cid is None:
+                    continue
+                _cid = int(_cid)
+                _cur_addr = row.get("address")
+                if _cur_addr and str(_cur_addr).strip():
+                    continue  # 기존 값이 있으면 보존 (덮어쓰지 않음)
+                _new_addr = existing_cid_to_address.get(_cid)
+                if not _new_addr:
+                    continue
+                try:
+                    client.table("app_customers").update({"address": _new_addr}).eq("id", _cid).execute()
+                    res.customers_address_filled += 1
+                except Exception as e:
+                    res.errors.append(f"고객#{_cid} 주소 보완 실패: {e}")
 
     # ---- Phase 2: to_create 그룹 → app_orders INSERT ----
     to_create = [g for g in preview.groups if g.match_status == "to_create" and g.existing_customer_id is not None and g.existing_customer_id > 0]
