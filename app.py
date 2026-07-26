@@ -27378,10 +27378,11 @@ def render_product_taxonomy_admin() -> None:
                 else:
                     api_key = (
                         os.environ.get("GEMINI_API_KEY", "")
-                        or st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+                        or (st.secrets.get("gemini", {}).get("api_key", "") if hasattr(st, "secrets") else "")
+                        or (st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else "")
                     )
                     if not api_key:
-                        st.error("GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다. .streamlit/secrets.toml 또는 배포 환경변수를 확인해 주세요.")
+                        st.error("GEMINI_API_KEY 가 설정되어 있지 않습니다. .streamlit/secrets.toml 의 [gemini] api_key 또는 환경변수 GEMINI_API_KEY 를 확인해 주세요.")
                     else:
                         with st.spinner(f"Gemini 분류 중… ({len(names):,}건)"):
                             gemini_out = pts.classify_with_gemini(names, api_key=api_key)
