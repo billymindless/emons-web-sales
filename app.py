@@ -5116,12 +5116,52 @@ def _render_order_cost_verify(db_filename: str, order_id: int):
         st.success("✅ 원가·마진 검증 이상 없음")
 
 
+def _render_order_line_items(db_filename: str, order_id: int) -> None:
+    """주문에 연결된 라인 아이템(app_order_items) 을 읽기 전용 테이블로 표시.
+
+    매입 원장 임포트로 저장된 품명·품번·수량·출고가·부가세 상세를 보여준다.
+    테이블/데이터가 없으면 조용히 아무 것도 표시하지 않음.
+    """
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return
+        r = sc.table("app_order_items").select(
+            "product_code, product_name, quantity, unit_cost, line_cost, vat, line_total, ship_number, item_note, order_kind"
+        ).eq("order_id", int(order_id)).order("id").execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+    except Exception:
+        # 테이블 미존재 등: 조용히 스킵 (SUPABASE_APP_ORDER_ITEMS.sql 미실행 환경)
+        return
+    if not rows:
+        return
+    _df = pd.DataFrame(rows).rename(columns={
+        "product_code": "품번",
+        "product_name": "품명",
+        "quantity": "수량",
+        "unit_cost": "출고가",
+        "line_cost": "주문금액",
+        "vat": "부가세",
+        "line_total": "합계",
+        "ship_number": "출고번호",
+        "item_note": "품목비고",
+        "order_kind": "구분",
+    })
+    _sum_qty = int(_df["수량"].sum()) if "수량" in _df else 0
+    _sum_cost = int(_df["주문금액"].sum()) if "주문금액" in _df else 0
+    _sum_total = int(_df["합계"].sum()) if "합계" in _df else 0
+    st.markdown(f"##### 📦 매입 원장 라인 아이템 ({len(_df)}건 · 수량 합 {_sum_qty:,} · 매입금액 합 {_sum_cost:,}원 · 합계 {_sum_total:,}원)")
+    st.dataframe(_df, width="stretch", hide_index=True)
+
+
 def _render_order_audit_trail(db_filename: str, order_id: int):
     """주문(Order) 기준 변경 이력(AuditLogs) + 관련 결제 영수증 표시 공통 UI.
     Supabase 환경: app_edit_requests 테이블에서 이력 조회. SQLite 환경: AuditLogs 테이블 사용."""
     # ── 원가·매출액 검증 패널 ──
     _render_order_cost_verify(db_filename, order_id)
     st.divider()
+    # ── 매입 원장 라인 아이템 (있는 경우만) ──
+    _render_order_line_items(db_filename, order_id)
     logs = pd.DataFrame()
     # ── Supabase 경로 ──
     if _supabase_orders_payments_available():
@@ -26697,6 +26737,326 @@ def _render_legacy_order_bulk_import(db_filename: str) -> None:
                     st.session_state.pop(_k, None)
 
 
+def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
+    """매입 원장(엑셀) 통합 임포트 UI.
+
+    - 매입 원장 = 주문 헤더(고객·계약일·판매자) + 라인 아이템(품명·품번·수량·출고가) 통합 문서.
+    - 그룹핑 키: (phone1_digits, 등록일, 출고번호) 3튜플 = 1개 매출 주문.
+    - 앱에 이미 등록된 주문과 (고객, 등록일) 로 자동 매칭. 후보 다수면 사용자가 수동 선택.
+    - 회수 라인은 스킵, 매장분은 일반 주문과 동일 처리.
+    - `import_source='엑셀_매입원장'` 태그 및 새 `app_order_items` 테이블에 라인 저장.
+    """
+    try:
+        import legacy_purchase_import_service as lps
+    except Exception:
+        return
+
+    with st.expander("📦 매입 원장 통합 임포트 (주문 + 라인 아이템)"):
+        st.caption(
+            "매입 원장 엑셀 하나로 **고객 · 매출 주문 · 라인 아이템** 을 한 번에 저장합니다. "
+            "그룹핑 키는 `(전화1, 등록일, 출고번호)` 3튜플이며, 앱에 이미 등록된 주문은 "
+            "`(고객, 등록일)` 후보가 **1건이면 자동 매칭**, 2건 이상이면 아래에서 **수동 선택** 합니다. "
+            "**회수** 라인은 자동 스킵됩니다. "
+            "`app_order_items` 테이블이 필요합니다 — `SUPABASE_APP_ORDER_ITEMS.sql` 을 먼저 실행하세요."
+        )
+        _store_name = _get_current_store_name_for_customers(db_filename)
+        if not _store_name:
+            st.error("현재 매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 먼저 선택해 주세요.")
+            return
+        st.info(f"저장 대상 매장: **{_store_name}** (`{db_filename}`)")
+
+        excel_upload = st.file_uploader(
+            "매입 원장 엑셀 (.xlsx)", type=["xlsx"], key="legacy_purchase_excel_upload",
+            help="첫번째 시트가 사용됩니다. 헤더는 2행, 3행 TOTAL 요약행은 자동 제거됩니다.",
+        )
+        if excel_upload is None:
+            return
+
+        _cache_key = f"legacy_purchase_df::{excel_upload.name}::{excel_upload.size}"
+        if _cache_key not in st.session_state:
+            try:
+                st.session_state[_cache_key] = lps.parse_excel(excel_upload.getvalue())
+            except Exception as _e:
+                st.error(f"엑셀 파일을 읽을 수 없습니다: {_e}")
+                return
+        df_raw = st.session_state[_cache_key]
+        if df_raw is None or df_raw.empty:
+            st.warning("엑셀에 데이터 행이 없습니다.")
+            return
+
+        st.markdown(f"**총 {len(df_raw):,}행** · 컬럼 {len(df_raw.columns)}개")
+        with st.expander("원본 미리보기 (앞 10행)", expanded=False):
+            st.dataframe(df_raw.head(10), width="stretch", hide_index=True)
+
+        st.markdown("#### 1. 컬럼 매핑")
+        st.caption("자동 제안값을 확인하고 필요 시 수정하세요. `-` 는 해당 필드를 비웁니다.")
+        _cols_options = ["-"] + list(df_raw.columns)
+        _suggested = lps.auto_suggest_mapping(list(df_raw.columns))
+        mapping: dict[str, str] = {}
+        _map_cols = st.columns(3)
+        for _idx, (fkey, flabel, freq) in enumerate(lps.PURCHASE_TARGET_FIELDS):
+            with _map_cols[_idx % 3]:
+                default = _suggested.get(fkey, "-")
+                sel = st.selectbox(
+                    f"{flabel}" + (" *" if freq else ""),
+                    _cols_options,
+                    index=_cols_options.index(default) if default in _cols_options else 0,
+                    key=f"legacy_purchase_map::{fkey}::{excel_upload.name}",
+                )
+                if sel != "-":
+                    mapping[fkey] = sel
+
+        st.markdown("#### 2. 임포트 옵션")
+        _c1, _c2 = st.columns([1, 2])
+        with _c1:
+            margin_pct = st.number_input(
+                "마진율 (%) — 판매가 기준",
+                min_value=0.0, max_value=95.0, value=20.0, step=1.0,
+                help="판매가 = 출고가 / (1 - 마진율). 기본 20% → 출고가/0.8 = 출고가×1.25",
+                key=f"legacy_purchase_margin::{excel_upload.name}",
+            )
+        with _c2:
+            st.caption("**주문구분 필터**: 회수 라인은 자동 스킵됩니다. 그 외(주문·매장분·기타) 는 모두 포함됩니다.")
+
+        _missing_required = [flabel for fkey, flabel, freq in lps.PURCHASE_TARGET_FIELDS if freq and fkey not in mapping]
+        if _missing_required:
+            st.error(f"필수 매핑 누락: {', '.join(_missing_required)}")
+            return
+
+        st.markdown("#### 3. 미리보기 (dry-run)")
+        if st.button("🔍 미리보기 생성", key=f"legacy_purchase_preview_btn::{excel_upload.name}", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+            with st.spinner(f"그룹핑 및 매칭 계산 중… ({len(df_raw):,}행)"):
+                groups, gstats = lps.group_orders(df_raw, mapping, margin_rate=margin_pct / 100.0)
+                preview = lps.build_preview(
+                    client, groups,
+                    store_name=_store_name,
+                    db_filename=db_filename,
+                )
+                preview.skipped_return = gstats["skipped_return"]
+                preview.skipped_invalid = gstats["skipped_invalid"]
+                preview.total_lines = gstats["total_lines"]
+            # 채널톡 스캔 (읽기 전용)
+            phones_set = {g.phone1_digits for g in groups if g.phone1_digits}
+            with st.spinner("채널톡_자동가입 매장 스캔 중…"):
+                ct_scan = lps.migrate_channeltalk_phones(client, _store_name, phones_set, dry_run=True)
+            st.session_state[f"legacy_purchase_preview::{excel_upload.name}"] = preview
+            st.session_state[f"legacy_purchase_ct_scan::{excel_upload.name}"] = ct_scan
+            st.session_state[f"legacy_purchase_margin_pct::{excel_upload.name}"] = margin_pct
+
+        preview = st.session_state.get(f"legacy_purchase_preview::{excel_upload.name}")
+        if not preview:
+            st.info("'미리보기 생성' 을 눌러 임포트 결과를 먼저 확인해 주세요.")
+            return
+
+        _s1, _s2, _s3, _s4 = st.columns(4)
+        _s1.metric("총 라인 수", f"{preview.total_lines:,}")
+        _s2.metric("주문 그룹 (headers)", f"{preview.group_count:,}")
+        _s3.metric("회수 스킵 (라인)", f"{preview.skipped_return:,}")
+        _s4.metric("파싱 오류 (라인)", f"{preview.skipped_invalid:,}")
+
+        _s5, _s6, _s7, _s8 = st.columns(4)
+        _s5.metric("신규 고객", f"{preview.new_customer_count:,}")
+        _s6.metric("기존 고객 매칭", f"{preview.matched_customer_count:,}")
+        _s7.metric("총 매입금액 합", f"{preview.total_cost_amount:,}원")
+        _s8.metric("총 판매가(역산) 합", f"{preview.total_sale_amount:,}원")
+
+        _r1, _r2, _r3, _r4 = st.columns(4)
+        _r1.metric("신규 주문 생성", f"{preview.to_create_count:,}")
+        _r2.metric("자동 매칭 (attach)", f"{preview.to_attach_count:,}")
+        _r3.metric("수동 선택 필요", f"{preview.unresolved_count:,}")
+        _r4.metric("이미 임포트 (스킵)", f"{preview.invalid_count:,}")
+
+        if preview.yearly_stats:
+            st.caption("연도별 분포")
+            _y_df = pd.DataFrame(preview.yearly_stats)
+            _y_df["sales"] = _y_df["sales"].map(lambda v: f"{int(v):,}원")
+            _y_df["cost"] = _y_df["cost"].map(lambda v: f"{int(v):,}원")
+            _y_df = _y_df.rename(columns={"year": "연도", "count": "주문건수", "sales": "판매가 합", "cost": "매입금액 합"})
+            st.dataframe(_y_df, width="content", hide_index=True)
+
+        ct_scan = st.session_state.get(f"legacy_purchase_ct_scan::{excel_upload.name}")
+        if ct_scan and (ct_scan.scanned > 0 or ct_scan.errors):
+            _would_migrate = max(0, ct_scan.scanned - ct_scan.already_in_target)
+            st.markdown("#### 3-1. 채널톡_자동가입 매장 phone 이관")
+            _cc1, _cc2, _cc3 = st.columns(3)
+            _cc1.metric("스캔한 채널톡 phone", f"{ct_scan.scanned:,}")
+            _cc2.metric("대상 매장에 이미 존재", f"{ct_scan.already_in_target:,}")
+            _cc3.metric("이관 예정 (dry-run)", f"{_would_migrate:,}")
+            if _would_migrate > 0:
+                st.caption(
+                    f"채널톡 매장에서 대상 매장으로 {_would_migrate}건을 이관하면 매칭율이 개선될 수 있습니다. "
+                    "임포트 확정 시 자동 이관을 원하면 아래 체크박스를 켜세요."
+                )
+            if ct_scan.errors:
+                for _e in ct_scan.errors[:3]:
+                    st.warning(_e)
+
+        with st.expander(f"주문 그룹 미리보기 (최대 500건, 총 {preview.group_count:,}건)", expanded=False):
+            st.dataframe(lps.preview_to_dataframe(preview, max_rows=500), width="stretch", hide_index=True)
+
+        # ── unresolved 그룹 수동 매핑 ──
+        if preview.unresolved_count > 0:
+            st.markdown("#### 3-2. 수동 매칭 필요 그룹")
+            st.caption(
+                f"동일 (고객, 등록일) 에 앱 주문이 2건 이상 존재하는 그룹입니다 ({preview.unresolved_count}건). "
+                "각 그룹에 대해 후보 중 하나를 선택하거나, '신규 주문으로 등록'을 선택할 수 있습니다."
+            )
+            _unresolved = [g for g in preview.groups if g.match_status == "unresolved"]
+            _decisions_key = f"legacy_purchase_decisions::{excel_upload.name}"
+            _decisions: dict[str, str] = st.session_state.get(_decisions_key, {})
+            for _ug in _unresolved[:100]:  # UI 부하 방지: 최대 100건 노출
+                gk = f"{_ug.phone1_digits}::{_ug.order_date}::{_ug.ship_number}"
+                _label_hdr = f"{_ug.customer_name} · {_ug.order_date} · 출고#{_ug.ship_number} · {len(_ug.items)}라인 · 매입 {_ug.total_line_cost:,}원"
+                _options = ["(신규 주문으로 등록)"]
+                _option_ids = [None]
+                for meta in _ug.candidate_orders_meta:
+                    _dd = str(meta.get("delivery_date") or "-")[:10]
+                    _tot = int(meta.get("total_amount") or 0)
+                    _cat = str(meta.get("category") or "-")
+                    _options.append(f"#{meta.get('id')} · {_cat[:20]} · 배송 {_dd} · 판매 {_tot:,}원")
+                    _option_ids.append(meta.get("id"))
+                _prev = _decisions.get(gk)
+                _default_idx = 0
+                if _prev is not None:
+                    try:
+                        _default_idx = _option_ids.index(int(_prev)) if _prev != "new" else 0
+                    except ValueError:
+                        _default_idx = 0
+                _sel_idx = st.selectbox(
+                    _label_hdr, list(range(len(_options))),
+                    format_func=lambda i, _opts=_options: _opts[i],
+                    index=_default_idx,
+                    key=f"legacy_purchase_decision::{gk}::{excel_upload.name}",
+                )
+                _chosen = _option_ids[_sel_idx]
+                _decisions[gk] = "new" if _chosen is None else str(_chosen)
+            st.session_state[_decisions_key] = _decisions
+            if len(_unresolved) > 100:
+                st.warning(f"목록이 길어 앞 100건만 UI에 노출됩니다. 나머지 {len(_unresolved) - 100}건은 임포트 시 자동으로 '신규 주문' 처리됩니다.")
+
+        st.markdown("#### 4. 임포트 확정")
+        _total_committable = preview.to_create_count + preview.to_attach_count
+        if preview.unresolved_count > 0:
+            _decisions = st.session_state.get(f"legacy_purchase_decisions::{excel_upload.name}", {})
+            _resolved = sum(1 for _v in _decisions.values() if _v)
+            _total_committable += _resolved
+        if _total_committable == 0:
+            st.warning("임포트할 유효 그룹이 없습니다.")
+            return
+
+        _ct_do_migrate = False
+        if ct_scan and (ct_scan.scanned - ct_scan.already_in_target) > 0:
+            _ct_do_migrate = st.checkbox(
+                f"채널톡_자동가입 매장의 phone1 을 [{_store_name}] 매장으로 자동 이관 (이관 예정 최대 {ct_scan.scanned - ct_scan.already_in_target}건)",
+                value=True,
+                key=f"legacy_purchase_ct_migrate::{excel_upload.name}",
+            )
+
+        _confirm = st.checkbox(
+            f"위 결과대로 매장 [{_store_name}] 에 저장하겠습니다.",
+            key=f"legacy_purchase_confirm::{excel_upload.name}",
+        )
+        if _confirm and st.button("✅ 임포트 실행", key=f"legacy_purchase_commit_btn::{excel_upload.name}", type="primary"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+                return
+
+            # unresolved 결정 반영
+            _decisions = st.session_state.get(f"legacy_purchase_decisions::{excel_upload.name}", {})
+            for g in preview.groups:
+                if g.match_status != "unresolved":
+                    continue
+                gk = f"{g.phone1_digits}::{g.order_date}::{g.ship_number}"
+                dec = _decisions.get(gk)
+                if dec and dec != "new":
+                    try:
+                        _cid = int(dec)
+                        if _cid in g.candidate_order_ids:
+                            g.match_status = "to_attach"
+                            g.chosen_order_id = _cid
+                            continue
+                    except ValueError:
+                        pass
+                # 기본값: 신규 주문
+                g.match_status = "to_create"
+
+            # 카운터 재계산 (표시용, 실제로는 commit_import 이 다시 계산)
+            preview.to_create_count = sum(1 for g in preview.groups if g.match_status == "to_create")
+            preview.to_attach_count = sum(1 for g in preview.groups if g.match_status == "to_attach")
+            preview.unresolved_count = 0
+
+            _current_user = st.session_state.get("current_user") or {}
+            _created_by = _current_user.get("name") or _current_user.get("username") or "legacy_purchase_import"
+            _progress = st.progress(0.0, text="시작 중…")
+            def _cb(stage: str, pct: float) -> None:
+                try:
+                    _progress.progress(min(1.0, max(0.0, pct)), text=f"{stage} {int(pct * 100)}%")
+                except Exception:
+                    pass
+
+            # (선택) 채널톡 이관 먼저 실행
+            if _ct_do_migrate:
+                phones_set = {g.phone1_digits for g in preview.groups if g.phone1_digits and g.match_status in ("to_create", "to_attach")}
+                with st.spinner("채널톡_자동가입 매장 phone 이관 중…"):
+                    mg = lps.migrate_channeltalk_phones(client, _store_name, phones_set, dry_run=False)
+                st.caption(f"채널톡 이관 완료: {mg.migrated}건 이관 / {mg.already_in_target}건 이미 존재.")
+                if mg.errors:
+                    for _e in mg.errors[:3]:
+                        st.warning(_e)
+                # 이관 후 phone map 재로드 → to_create 그룹의 existing_customer_id 재매핑
+                if mg.migrated > 0:
+                    from legacy_import_service import load_existing_customer_phone_map
+                    _refreshed = load_existing_customer_phone_map(client, _store_name)
+                    for g in preview.groups:
+                        if g.match_status in ("to_create",) and (g.existing_customer_id is None or g.existing_customer_id < 0):
+                            _cid = _refreshed.get(g.phone1_digits)
+                            if _cid is not None:
+                                g.existing_customer_id = int(_cid)
+
+            with st.spinner("DB 저장 중…"):
+                result = lps.commit_import(
+                    client, preview,
+                    store_name=_store_name,
+                    db_filename=db_filename,
+                    created_by=_created_by,
+                    progress_cb=_cb,
+                )
+            _progress.progress(1.0, text="완료")
+            clear_data_cache()
+
+            _rr1, _rr2, _rr3 = st.columns(3)
+            _rr1.metric("신규 고객 등록", f"{result.customers_inserted:,}")
+            _rr2.metric("신규 주문 등록", f"{result.orders_inserted:,}")
+            _rr3.metric("라인 아이템 저장", f"{result.items_inserted:,}")
+            if result.failed_orders or result.failed_items or result.errors:
+                st.warning(
+                    f"실패: 주문 {result.failed_orders}건 / 라인 {result.failed_items}건. "
+                    f"스킵: 수동미결정 {result.groups_unresolved_skipped}건 / 무효 {result.groups_invalid_skipped}건."
+                )
+                for _msg in result.errors[:10]:
+                    st.error(_msg)
+            else:
+                st.success(
+                    f"임포트 완료 · 고객 {result.customers_inserted}건 · 신규주문 {result.orders_inserted}건 · "
+                    f"라인 {result.items_inserted}건 (기존주문 attach {result.items_attached_existing}건 포함)."
+                )
+            for _k in list(st.session_state.keys()):
+                if isinstance(_k, str) and (
+                    _k.startswith(f"legacy_purchase_preview::{excel_upload.name}")
+                    or _k.startswith(f"legacy_purchase_confirm::{excel_upload.name}")
+                    or _k.startswith(f"legacy_purchase_ct_scan::{excel_upload.name}")
+                    or _k.startswith(f"legacy_purchase_decisions::{excel_upload.name}")
+                    or _k.startswith(f"legacy_purchase_decision::")
+                    or _k == _cache_key
+                ):
+                    st.session_state.pop(_k, None)
+
+
 def render_customer_balance():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -26820,6 +27180,9 @@ def render_customer_balance():
 
         # 과거 구매내역(주문+결제) 일괄 임포트 — 출고가 → 판매가 역산, 재구매 phone1 통합
         _render_legacy_order_bulk_import(db_filename)
+
+        # 매입 원장 통합 임포트 — 주문 + 라인 아이템 동시 생성/attach
+        _render_legacy_purchase_bulk_import(db_filename)
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")

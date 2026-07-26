@@ -7,3 +7,6 @@ __pycache__/
 venv/
 __pycache__/
 *.pyc
+
+# 매입/매출 원장 샘플 (실제 고객 PII 포함, 커밋 금지)
+samples/
