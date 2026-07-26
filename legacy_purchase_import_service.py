@@ -49,28 +49,32 @@ CHANNEL_TALK_DEFAULT_STORE = os.environ.get("CHANNEL_TALK_DEFAULT_STORE", "채�
 """api.py 와 동일. 채널톡 자동가입 고객이 저장되는 스토어명."""
 
 # 매입 원장 표준 필드 정의: (필드키, 한글라벨, 필수여부)
+# 최종 업로드 양식(14컬럼) 기준으로 필수 필드를 최소화.
+# `ship_number`, `quantity`, `product_code`, `line_cost`, `line_total` 은 있으면 사용,
+# 없으면 2튜플 그룹핑 + 수량 1 기본값으로 동작한다.
 PURCHASE_TARGET_FIELDS: list[tuple[str, str, bool]] = [
-    # 주문 헤더
-    ("order_date",     "등록일 (계약일)",   True),
-    ("delivery_date",  "배송일",           False),
-    ("customer_name",  "고객명",           True),
-    ("phone1",         "전화1",            True),
-    ("phone2",         "전화2",            False),
-    ("address",        "주소1 (도로명)",    False),
-    ("address2",       "주소2 (상세/아파트)", False),
-    ("employee_names", "판매자 (담당자)",   False),
-    ("ship_number",    "출고번호",         True),
-    ("order_kind",     "주문구분",         True),
-    ("order_status",   "주문상태",         False),
-    # 라인 아이템
-    ("product_name",   "품명",             True),
-    ("product_code",   "품번",             False),
-    ("quantity",       "주문수(수량)",      True),
-    ("unit_cost",      "출고가 (단가)",     True),
-    ("line_cost",      "주문금액 (VAT별도)", False),
-    ("vat",            "부가세",           False),
-    ("line_total",     "합계 (VAT포함)",    False),
-    ("item_note",      "품목비고",         False),
+    # 주문 헤더 (필수)
+    ("order_date",     "등록일 (계약일)",     True),
+    ("customer_name",  "고객명",              True),
+    ("phone1",         "전화1",               True),
+    ("product_name",   "품명",                True),
+    ("unit_cost",      "출고가 (단가)",       True),
+    # 주문 헤더 (옵션)
+    ("delivery_date",  "배송일",             False),
+    ("phone2",         "전화2",              False),
+    ("address",        "주소1 (도로명)",      False),
+    ("address2",       "주소2 (상세/아파트)",  False),
+    ("employee_names", "판매자 (담당자)",     False),
+    ("order_kind",     "주문구분",           False),
+    ("order_status",   "주문상태",           False),
+    # 라인 아이템 (옵션)
+    ("ship_number",    "출고번호",           False),
+    ("product_code",   "품번",               False),
+    ("quantity",       "주문수(수량)",       False),
+    ("line_cost",      "주문금액 (VAT별도)",  False),
+    ("vat",            "부가세",             False),
+    ("line_total",     "합계 (VAT포함)",     False),
+    ("item_note",      "품목비고",           False),
 ]
 
 # 매핑 힌트 (엑셀 헤더 → 표준 필드)
@@ -184,30 +188,57 @@ def combine_address(addr1: Any, addr2: Any) -> str:
 # 엑셀 파싱
 # ---------------------------------------------------------------------------
 
+_HEADER_MARKER_COLS = {"등록일", "주문구분", "고객명", "전화1", "출고가", "품명"}
+
+
+def _detect_header_row(bio: io.BytesIO, sheet_name: Any) -> int:
+    """엑셀의 앞 5행을 훑어 헤더로 보이는 첫 행 index(0-based) 를 반환.
+
+    - 신규 최종 양식(14컬럼): Row 0 이 바로 헤더
+    - 구 원장 양식(40컬럼): Row 0 제목, Row 1 헤더
+    """
+    bio.seek(0)
+    _probe = pd.read_excel(bio, sheet_name=sheet_name, header=None, engine="openpyxl", dtype=object, nrows=5)
+    if isinstance(_probe, dict):
+        _first = next(iter(_probe.values()))
+        _probe = _first if isinstance(_first, pd.DataFrame) else pd.DataFrame()
+    for i in range(min(5, len(_probe))):
+        cells = {_clean_str(v) for v in _probe.iloc[i].tolist()}
+        if len(_HEADER_MARKER_COLS & cells) >= 3:
+            return i
+    return 0  # 기본: 첫 행
+
+
 def parse_excel(file_bytes: bytes, sheet_name: Any = 0) -> pd.DataFrame:
     """매입 원장 엑셀 파싱.
 
-    파일 구조: Row 0 = 제목, Row 1 = 헤더, Row 2 = TOTAL, Row 3+ = 데이터.
-    → header=1 로 읽고, 첫 데이터 행이 TOTAL 이면 제거.
+    자동 지원:
+      - 최종 양식(14컬럼): Row 0 = 헤더, Row 1+ = 데이터
+      - 구 원장(40컬럼): Row 0 = 제목, Row 1 = 헤더, Row 2 = TOTAL, Row 3+ = 데이터
+
+    헤더 위치는 앞 5행에서 `등록일/주문구분/고객명/전화1/출고가/품명` 중 3개 이상을
+    포함한 첫 행으로 판단. TOTAL 요약 행은 상단에서 자동 제거.
     """
     bio = io.BytesIO(file_bytes)
-    df = pd.read_excel(bio, sheet_name=sheet_name, header=1, engine="openpyxl", dtype=object)
+    header_row = _detect_header_row(bio, sheet_name)
+    bio.seek(0)
+    df = pd.read_excel(bio, sheet_name=sheet_name, header=header_row, engine="openpyxl", dtype=object)
     if isinstance(df, dict):
         _first = next(iter(df.values()))
         df = _first if isinstance(_first, pd.DataFrame) else pd.DataFrame()
     df.columns = [_clean_str(c) for c in df.columns]
     if df.empty:
         return df
-    # TOTAL 요약 행 제거: 등록일 컬럼(있으면)이 비어있거나, 셀 값 중 하나가 'TOTAL'
+
+    # TOTAL 요약 행 제거 (상단 최대 3행 검사)
     def _looks_like_total(row) -> bool:
         for v in row.values:
             s = _clean_str(v).upper()
             if s in _TOTAL_MARKERS:
                 return True
         return False
-    # 최상단 몇 행만 검사 (요약행은 통상 파일 상단)
     drop_idx = []
-    for _i, (_ix, _row) in enumerate(df.head(3).iterrows()):
+    for _ix, _row in df.head(3).iterrows():
         if _looks_like_total(_row):
             drop_idx.append(_ix)
     if drop_idx:
@@ -350,7 +381,8 @@ def group_orders(
         ship_number_raw = row.get("ship_number")
         ship_number = _clean_str(ship_number_raw) if ship_number_raw is not None else ""
 
-        # 필수: phone1_digits, order_date, ship_number, unit_cost > 0
+        # 필수: phone1_digits, order_date, unit_cost > 0
+        # 출고번호는 있으면 3튜플, 없으면 2튜플 그룹핑
         unit_cost = _to_int(row.get("unit_cost"))
         quantity = _to_int(row.get("quantity")) or 1
 
@@ -359,14 +391,13 @@ def group_orders(
             problems.append("전화1 없음")
         if not order_date:
             problems.append("등록일 파싱 실패")
-        if not ship_number:
-            problems.append("출고번호 없음")
         if unit_cost <= 0:
             problems.append("출고가 없음")
         if problems:
             stats["skipped_invalid"] += 1
             continue
 
+        # 그룹핑 키: 출고번호가 있으면 3튜플(구 원장), 없으면 2튜플(신 양식)
         key = (phone1_digits, order_date, ship_number)
         group = groups.get(key)
         if group is None:
@@ -521,6 +552,42 @@ def _fetch_existing_items_ship_numbers(client, db_filename: str) -> set[str]:
     return out
 
 
+def _fetch_purchase_imported_pairs(client, db_filename: str) -> set[tuple[int, str]]:
+    """`import_source='엑셀_매입원장'` 태그된 app_orders 의 (customer_id, order_date) 지문.
+
+    출고번호가 없는 신규 양식(2튜플 그룹핑) 재실행 시 중복 방지용.
+    """
+    out: set[tuple[int, str]] = set()
+    if not db_filename:
+        return out
+    _PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            q = client.table("app_orders").select("customer_id, order_date") \
+                .eq("db_filename", db_filename) \
+                .eq("import_source", PURCHASE_IMPORT_SOURCE) \
+                .order("id").range(offset, offset + _PAGE - 1)
+            r = q.execute()
+        except Exception as e:
+            logger.info("_fetch_purchase_imported_pairs: %s", e)
+            break
+        rows = (r.data or []) if hasattr(r, "data") else []
+        for row in rows:
+            cid = row.get("customer_id")
+            od = row.get("order_date")
+            if cid is None or not od:
+                continue
+            try:
+                out.add((int(cid), str(od)[:10]))
+            except (TypeError, ValueError):
+                pass
+        if len(rows) < _PAGE:
+            break
+        offset += _PAGE
+    return out
+
+
 def build_preview(
     client,
     groups: list[OrderGroup],
@@ -551,6 +618,7 @@ def build_preview(
 
     existing_orders_by_cid_date = _fetch_existing_orders(client, db_filename)
     existing_ship_numbers = _fetch_existing_items_ship_numbers(client, db_filename)
+    imported_pairs = _fetch_purchase_imported_pairs(client, db_filename)
 
     # 세션 신규 고객 슬롯 (음수 id)
     session_new_phone_to_slot: dict[str, int] = {}
@@ -558,7 +626,7 @@ def build_preview(
     yearly: dict[int, dict] = {}
 
     for g in groups:
-        # 이미 임포트된 출고번호면 스킵 (재실행 안전)
+        # 이미 임포트된 출고번호면 스킵 (3튜플/구 원장 재실행 안전)
         if g.ship_number and g.ship_number in existing_ship_numbers:
             g.match_status = "invalid"
             g.reason = f"이미 임포트된 출고번호 (ship_number={g.ship_number})"
@@ -579,6 +647,16 @@ def build_preview(
             g.existing_customer_id = next_slot
             next_slot -= 1
             result.new_customer_count += 1
+
+        # 2튜플 그룹핑(출고번호 없음) 재실행 안전: 매입원장 태그된 동일 (cid, order_date) 존재 시 스킵
+        if not g.ship_number and g.existing_customer_id is not None and g.existing_customer_id > 0:
+            _pair = (int(g.existing_customer_id), g.order_date or "")
+            if _pair in imported_pairs:
+                g.match_status = "invalid"
+                g.reason = f"이미 매입원장으로 임포트된 (고객#{g.existing_customer_id}, {g.order_date}) 그룹"
+                result.invalid_count += 1
+                result.groups.append(g)
+                continue
 
         # 앱 후보 주문 조회 (DB 실존 고객만 대상, 세션 신규 슬롯은 무조건 to_create)
         if g.existing_customer_id is not None and g.existing_customer_id >= 0:
