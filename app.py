@@ -27339,9 +27339,23 @@ def render_product_taxonomy_admin() -> None:
             st.success("모든 품목이 분류되었습니다. 새 임포트가 발생하면 여기에 목록이 다시 채워집니다.")
         else:
             st.caption(f"빈도(라인 등장 횟수) 내림차순 상위 {len(unclassified_df):,}건. 카테고리 열을 편집 후 [저장] 또는 [Gemini 자동 분류] 를 눌러주세요.")
+
+            _sel_ver = st.session_state.setdefault("pta_uncls_select_version", 0)
+            _sc1, _sc2, _sc3 = st.columns([1, 1, 3])
+            with _sc1:
+                if st.button("☑️ 전체 선택", key="pta_select_all_btn"):
+                    st.session_state["pta_uncls_select_default"] = True
+                    st.session_state["pta_uncls_select_version"] = _sel_ver + 1
+                    st.rerun()
+            with _sc2:
+                if st.button("⬜ 전체 해제", key="pta_deselect_all_btn"):
+                    st.session_state["pta_uncls_select_default"] = False
+                    st.session_state["pta_uncls_select_version"] = _sel_ver + 1
+                    st.rerun()
+
             edit_df = unclassified_df.copy()
             edit_df["category"] = "(미분류)"  # 편집 가능한 컬럼. 빈 문자열은 Streamlit 표시가 "None" 으로 깨져 대체 placeholder 사용
-            edit_df["선택"] = False
+            edit_df["선택"] = bool(st.session_state.get("pta_uncls_select_default", False))
 
             edited = st.data_editor(
                 edit_df[["선택", "product_name", "빈도", "category"]],
@@ -27357,7 +27371,7 @@ def render_product_taxonomy_admin() -> None:
                 },
                 hide_index=True,
                 width="stretch",
-                key="pta_uncls_editor",
+                key=f"pta_uncls_editor_{st.session_state['pta_uncls_select_version']}",
             )
 
             _ac1, _ac2, _ac3 = st.columns([1, 1, 2])
