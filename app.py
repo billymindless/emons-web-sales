@@ -481,6 +481,8 @@ def _render_erp_icon_rail(role: str) -> None:
             _go("payment_monitor")
         if st.button("💳", key="rail_margin", help="마진 모니터링", width="stretch"):
             _go("margin_monitor")
+        if st.button("🏷️", key="rail_taxonomy", help="품목 분류 관리 (Gemini)", width="stretch"):
+            _go("product_taxonomy")
         if st.button("🗑️", key="rail_del", help="주문 삭제 요청 관리", width="stretch"):
             _go("delete_requests")
         if st.button("⚙️", key="rail_settings", help="관리자 설정", width="stretch"):
@@ -7291,6 +7293,19 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
     # 시도 파생: 정적 매핑에서 없는 시군구는 "(기타)" 로 분류
     df["sido"] = df["sigungu"].map(_KR_SIGUNGU_TO_SIDO).fillna("(기타)")
 
+    # order_id 컬럼 정규화: merge 시 orders.id ↔ customers.id 충돌로 `id_x` 가 되는 경우 방어
+    if "_order_id" not in df.columns:
+        for _oid_src in ("id", "id_x", "order_id"):
+            if _oid_src in df.columns:
+                df["_order_id"] = df[_oid_src]
+                break
+
+    # taxonomy 매핑 로드 (실패해도 빈 dict 로 진행)
+    try:
+        _tax_map = _cached_taxonomy_map()
+    except Exception:
+        _tax_map = {}
+
     # dim_map 은 옵션 라벨과 상관없이 재사용되므로 폼 밖에서 정의
     dim_map = {
         "시도": "sido",
@@ -7300,12 +7315,17 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         "건물유형": "building_type",
         "건물명": "building_name",
         "품목": "_category_expl",
+        "품목명(라인)": "_line_product_name",
+        "품목 대분류": "_line_tax_cat",
         "방문 경로": "visit_reason",
         "구매 이유": "purchase_reason",
     }
     if store_map and "_store" in df.columns:
         dim_map["매장"] = "_store"
     dim_options = list(dim_map.keys())
+
+    # 라인아이템 기반 차원은 _order_id 가 있어야 사용 가능
+    _line_dim_available = "_order_id" in df.columns
 
     # ── ① 필터 UI (여러 조건 동시) ─────────────────────────────────────
     st.markdown("##### 🔎 필터 (여러 조건 동시 적용)")
@@ -7383,6 +7403,33 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
             f_purch = st.multiselect("구매 이유", pr_opts, key=f"{key_prefix}_mdim_purch",
                                       placeholder="전체")
 
+        # ── 라인 아이템(임포트된 매입 원장) 기반 검색 ─────────────────
+        st.markdown("###### 🧾 라인 아이템(품목명) 검색")
+        pcf1, pcf2 = st.columns([2, 2])
+        with pcf1:
+            f_product_query = st.text_input(
+                "품목명 포함 검색 (공백 구분 다중 키워드 · AND)",
+                key=f"{key_prefix}_mdim_product_q",
+                placeholder="예: 디망스 협탁 → '디망스'와 '협탁' 모두 포함된 라인",
+                help="app_order_items.product_name 을 부분 일치(대소문자 무관)로 검색합니다.",
+                disabled=not _line_dim_available,
+            )
+        with pcf2:
+            try:
+                import product_taxonomy_service as _pts  # 카테고리 도메인 참조
+                _tax_options = _pts.CATEGORIES
+            except Exception:
+                _tax_options = []
+            f_tax_cat = st.multiselect(
+                "품목 대분류 (자동 분류)",
+                _tax_options,
+                key=f"{key_prefix}_mdim_tax_cat",
+                placeholder="전체 · 분류되지 않은 라인은 '기타'로 취급",
+                disabled=not _line_dim_available,
+            )
+        if not _line_dim_available:
+            st.caption("주문 id(_order_id) 를 확인할 수 없어 라인 아이템 검색이 비활성화되어 있습니다.")
+
         # 그룹화 차원 (다중 선택) + 측정값 — 방문 경로·구매 이유도 기본 결과 항목으로 포함
         default_dims = ["시군구", "품목", "방문 경로", "구매 이유"]
         f_dims = st.multiselect(
@@ -7416,6 +7463,8 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
             "f_btype": list(f_btype),
             "f_cat": list(f_cat),
             "f_visit": list(f_visit), "f_purch": list(f_purch),
+            "f_product_query": (f_product_query or "").strip(),
+            "f_tax_cat": list(f_tax_cat),
             "f_dims": list(f_dims), "metric": metric,
         }
         # CSV 캐시 무효화 — 새 검색 시 이전 CSV 삭제
@@ -7469,6 +7518,49 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
 
         # 기본값(품목 차원 미사용 경로)
         fdf["_category_expl"] = None
+        # 라인 차원 placeholder (라인 explode 경로에서 채워짐)
+        fdf["_line_product_name"] = None
+        fdf["_line_tax_cat"] = None
+
+        # ── 라인 아이템(품목명·대분류) 필터 및 라인 explode ─────────
+        # 활성 조건: 검색어/대분류 필터가 있거나, 그룹화 차원에 라인 컬럼이 포함된 경우
+        _line_query = str(q.get("f_product_query") or "").strip()
+        _line_tax_cat = q.get("f_tax_cat") or []
+        _line_dims_active = any(d in ("품목명(라인)", "품목 대분류") for d in (q.get("f_dims") or []))
+        _line_needed = bool(_line_query or _line_tax_cat or _line_dims_active)
+
+        _items_df: pd.DataFrame | None = None
+        if _line_needed and "_order_id" in fdf.columns and not fdf.empty:
+            try:
+                import product_taxonomy_service as _pts
+                _client_for_items, _err_items = get_supabase_client()
+                if _client_for_items is not None:
+                    _oid_pool = [int(x) for x in fdf["_order_id"].dropna().tolist()]
+                    _items_df = _pts.load_order_items_batched(
+                        _client_for_items, _oid_pool,
+                        columns="order_id, product_name, quantity, line_cost, line_total",
+                    )
+            except Exception as _line_e:
+                st.warning(f"라인 아이템 조회 실패: {_line_e}")
+                _items_df = None
+
+        # (1) 필터 적용: 검색어/대분류 활성 시 매칭 order_id 만 남김
+        if (_line_query or _line_tax_cat) and _items_df is not None and not _items_df.empty:
+            _items = _items_df.copy()
+            _items["product_name"] = _items["product_name"].fillna("").astype(str)
+            _items["_tax_cat"] = _items["product_name"].map(_tax_map).fillna("기타")
+
+            _match = pd.Series(True, index=_items.index)
+            if _line_query:
+                _kws = [w.strip() for w in _line_query.split() if w.strip()]
+                for w in _kws:
+                    _match &= _items["product_name"].str.contains(w, case=False, na=False)
+            if _line_tax_cat:
+                _match &= _items["_tax_cat"].isin(list(_line_tax_cat))
+            _matched_items = _items[_match]
+
+            _keep_oids = set(int(x) for x in _matched_items["order_id"].dropna().unique())
+            fdf = fdf[fdf["_order_id"].isin(_keep_oids)]
 
         if fdf.empty:
             st.info("선택한 조건에 맞는 데이터가 없습니다.")
@@ -7492,16 +7584,60 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
         # 품목 차원 선택 시: 주문 금액이 품목별로 분리되어 있지 않아 매출액/객단가 분석은
         # 중복 계상이 불가피하므로 자동으로 '건수'로 전환한다.
         _use_item_dim = "품목" in q["f_dims"]
+        _use_line_dim = any(d in ("품목명(라인)", "품목 대분류") for d in q["f_dims"])
         _metric = q["metric"]
-        if _use_item_dim and _metric != "건수":
+        if _use_item_dim and not _use_line_dim and _metric != "건수":
             st.info(
                 "ℹ️ 품목 차원이 포함되어 있어 측정값을 **건수**로 자동 전환했습니다. "
                 "주문 금액은 품목별로 분리되어 있지 않아 품목별 매출·객단가 분석은 지원하지 않습니다."
             )
             _metric = "건수"
 
-        # 피벗용 DataFrame: 품목 차원이 있을 때만 explode한 사본을 사용
-        if _use_item_dim:
+        # 피벗용 DataFrame:
+        #  - 라인 차원(품목명/대분류) 사용 시: order 를 라인 단위로 explode 하고 metric 은 라인 line_total(원)
+        #  - 품목 차원(orders.category) 사용 시: category 콤마 explode
+        #  - 그 외: order 단위 그대로
+        if _use_line_dim:
+            _items_for_pivot = _items_df
+            if _items_for_pivot is None or _items_for_pivot.empty:
+                # 아직 로드되지 않았거나 실패 → 이 시점에서 조회 시도
+                try:
+                    import product_taxonomy_service as _pts
+                    _client_for_items, _ = get_supabase_client()
+                    if _client_for_items is not None:
+                        _items_for_pivot = _pts.load_order_items_batched(
+                            _client_for_items, [int(x) for x in fdf["_order_id"].dropna().tolist()],
+                            columns="order_id, product_name, quantity, line_cost, line_total",
+                        )
+                except Exception:
+                    _items_for_pivot = None
+
+            if _items_for_pivot is None or _items_for_pivot.empty:
+                st.info("라인 아이템 데이터가 없어 품목명/대분류 차원 집계를 표시할 수 없습니다.")
+                return
+
+            _items_join = _items_for_pivot.copy()
+            _items_join["product_name"] = _items_join["product_name"].fillna("").astype(str)
+            _items_join["_line_product_name"] = _items_join["product_name"]
+            _items_join["_line_tax_cat"] = _items_join["product_name"].map(_tax_map).fillna("기타")
+            for _num_col in ("line_total", "line_cost"):
+                if _num_col in _items_join.columns:
+                    _items_join[_num_col] = pd.to_numeric(_items_join[_num_col], errors="coerce").fillna(0)
+            # line 매출: line_total 우선, 없으면 line_cost
+            if "line_total" in _items_join.columns:
+                _items_join["_line_amount"] = _items_join["line_total"].where(
+                    _items_join["line_total"] > 0, _items_join.get("line_cost", 0),
+                )
+            else:
+                _items_join["_line_amount"] = _items_join.get("line_cost", 0)
+
+            fdf_pivot = fdf.merge(
+                _items_join[["order_id", "_line_product_name", "_line_tax_cat", "_line_amount"]],
+                left_on="_order_id", right_on="order_id", how="inner",
+            )
+            # 라인 explode 후에는 total_amount 를 line_amount 로 대체하여 중복 계상 방지
+            fdf_pivot["total_amount"] = fdf_pivot["_line_amount"]
+        elif _use_item_dim:
             fdf_pivot = fdf.assign(_category_expl=fdf["category"].fillna("").astype(str).str.split(","))
             fdf_pivot = fdf_pivot.explode("_category_expl")
             fdf_pivot["_category_expl"] = fdf_pivot["_category_expl"].astype(str).str.strip()
@@ -7885,6 +8021,102 @@ def _render_marketing_multi_period_comparison(
             fig_b3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
             st.plotly_chart(fig_b3, width='stretch', key=f"{key_prefix}_category_top10_b")
             st.dataframe(cat_b[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_b", height=min(280, 50 + len(cat_b) * 32))
+
+    # ---------- ③-2 카테고리 대분류 × 라인 품목명 Top N (임포트 매입 원장 기반) ----------
+    st.subheader("③-2 카테고리 대분류 × 인기 라인 품목명 (Top 5)")
+    st.caption(
+        "매입 원장 임포트로 저장된 라인아이템(app_order_items)의 품목명을, "
+        "품목 분류 관리(Gemini) 로 매핑한 대분류별로 매출 상위 5개씩 나열합니다."
+    )
+
+    def _order_id_col(_df: pd.DataFrame) -> str | None:
+        for _c in ("id_x", "id", "order_id"):
+            if _c in _df.columns:
+                return _c
+        return None
+
+    def _render_line_category_ranking(_df_period: pd.DataFrame, _label: str, _key: str) -> None:
+        _oid_col = _order_id_col(_df_period)
+        if _oid_col is None or _df_period.empty:
+            st.info("주문 데이터에서 order_id 를 찾을 수 없어 라인 랭킹을 표시할 수 없습니다.")
+            return
+
+        _oids = [int(x) for x in _df_period[_oid_col].dropna().unique().tolist()]
+        if not _oids:
+            st.info("데이터 없음")
+            return
+        # 지나치게 큰 조회 방지 (매출 상위만 표시하므로 400건 정도면 충분)
+        _oids_capped = _oids[:400]
+
+        try:
+            import product_taxonomy_service as _pts
+            client, _err_c = get_supabase_client()
+            if client is None:
+                st.warning(f"Supabase 연결 실패: {_err_c}")
+                return
+            _items = _pts.load_order_items_batched(
+                client, _oids_capped,
+                columns="order_id, product_name, quantity, line_cost, line_total",
+            )
+            _tax = _cached_taxonomy_map()
+        except Exception as _e:
+            st.warning(f"라인 아이템/분류 조회 실패: {_e}")
+            return
+
+        if _items is None or _items.empty:
+            st.info("이 기간의 라인 아이템이 없습니다.")
+            return
+
+        _items = _items.copy()
+        _items["product_name"] = _items["product_name"].fillna("").astype(str).str.strip()
+        _items = _items[_items["product_name"] != ""]
+        if _items.empty:
+            st.info("데이터 없음")
+            return
+        _items["대분류"] = _items["product_name"].map(_tax).fillna("기타")
+        for _num_col in ("quantity", "line_cost", "line_total"):
+            if _num_col in _items.columns:
+                _items[_num_col] = pd.to_numeric(_items[_num_col], errors="coerce").fillna(0)
+        if "line_total" in _items.columns:
+            _items["매출"] = _items["line_total"].where(
+                _items["line_total"] > 0, _items.get("line_cost", 0),
+            )
+        else:
+            _items["매출"] = _items.get("line_cost", 0)
+
+        _rank = (
+            _items.groupby(["대분류", "product_name"], as_index=False)
+            .agg(라인수=("product_name", "count"), 판매수량=("quantity", "sum"), 매출=("매출", "sum"))
+            .sort_values(["대분류", "매출"], ascending=[True, False])
+        )
+        _top = _rank.groupby("대분류", as_index=False).head(5).reset_index(drop=True)
+        _top["매출"] = _top["매출"].astype(float).round(0)
+
+        _uncls_ct = int((_top["대분류"] == "기타").sum())
+        if _uncls_ct > 0:
+            st.warning(f"⚠️ 미분류 라인 {_uncls_ct:,}개가 '기타' 로 묶였습니다. [품목 분류 관리] 메뉴에서 분류해 주세요.")
+
+        st.dataframe(
+            _top[["대분류", "product_name", "라인수", "판매수량", "매출"]].rename(
+                columns={"product_name": "품목명"}
+            ),
+            width="stretch", hide_index=True, key=f"{key_prefix}_line_rank_{_key}",
+            column_config={
+                "매출": st.column_config.NumberColumn("매출(원)", format="%,d"),
+                "라인수": st.column_config.NumberColumn("라인수", format="%,d"),
+                "판매수량": st.column_config.NumberColumn("판매수량", format="%,d"),
+            },
+        )
+        if len(_oids) > len(_oids_capped):
+            st.caption(f"※ 성능 상한: 상위 {len(_oids_capped):,}건만 조회 (전체 {len(_oids):,}건)")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption(f"기간 A: {label_a}")
+        _render_line_category_ranking(df_period_a, label_a, "a")
+    with c2:
+        st.caption(f"기간 B: {label_b}")
+        _render_line_category_ranking(df_period_b, label_b, "b")
 
     # ---------- ④ 지역별 매출 분포 지도 (Folium 좌우 비교) ----------
     st.subheader("④ 지역별 매출 분포 지도")
@@ -27017,6 +27249,268 @@ def _render_legacy_purchase_rollback(db_filename: str) -> None:
             st.error(f"매장명이 일치하지 않습니다. `{_store_name}` 을 정확히 입력해 주세요.")
 
 
+# ---------------------------------------------------------------------------
+# 품목 분류 관리 (Gemini 배치 · 관리자 전용)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _cached_taxonomy_map() -> dict[str, str]:
+    """load_taxonomy_map 캐시 래퍼 (전 사용자 공유)."""
+    import product_taxonomy_service as pts
+    client, _ = get_supabase_client()
+    if client is None:
+        return {}
+    return pts.load_taxonomy_map(client)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_unclassified_df(db_filename: str | None, limit: int = 2000) -> pd.DataFrame:
+    """미분류 product_name DataFrame (관리자 UI 캐시)."""
+    import product_taxonomy_service as pts
+    client, _ = get_supabase_client()
+    if client is None:
+        return pd.DataFrame(columns=["product_name", "빈도", "최근등장"])
+    return pts.find_unclassified_product_names(client, db_filename=db_filename, limit=limit)
+
+
+def _invalidate_taxonomy_caches() -> None:
+    try:
+        _cached_taxonomy_map.clear()
+    except Exception:
+        pass
+    try:
+        _cached_unclassified_df.clear()
+    except Exception:
+        pass
+
+
+def render_product_taxonomy_admin() -> None:
+    """품목 분류 관리 — Gemini 배치 + 수동 편집.
+
+    - store_admin / superadmin 전용.
+    - 대상 매장: 현재 세션의 current_db (없으면 '전체').
+    """
+    import product_taxonomy_service as pts
+
+    current_user = st.session_state.get("current_user") or {}
+    role = current_user.get("role", "user")
+    if role not in ("store_admin", "superadmin"):
+        st.warning("관리자만 접근할 수 있습니다.")
+        return
+
+    st.header("품목 분류 관리 (Gemini 자동 분류)")
+    st.caption(
+        "매입 원장에서 임포트된 라인 아이템의 품목명(product_name)을 대분류 카테고리 1개로 매핑합니다. "
+        "다면분석 · 마케팅 인사이트 · AI 리포트가 이 매핑을 참조합니다."
+    )
+
+    client, err = get_supabase_client()
+    if err or client is None:
+        st.error(f"Supabase 연결 실패: {err}")
+        return
+
+    db_filename = st.session_state.get("current_db")
+    _all_dbs = (role == "superadmin") and st.toggle("전체 매장 대상으로 조회", value=False, key="pta_all_dbs")
+    scope_db = None if _all_dbs else db_filename
+    if not scope_db and not _all_dbs:
+        st.info("매장을 먼저 선택하거나 상단에서 '전체 매장 대상' 을 켜세요.")
+        return
+
+    # ---- 통계 ----
+    with st.spinner("현황 조회 중…"):
+        total_names = pts.count_all_product_names(client, db_filename=scope_db)
+        tax_map = _cached_taxonomy_map()
+        unclassified_df = _cached_unclassified_df(scope_db)
+    classified_ct = int(pd.Series(list(tax_map.keys())).isin(pd.Series([n for n in tax_map.keys()])).sum()) if tax_map else 0
+    unclassified_ct = int(len(unclassified_df))
+
+    _c1, _c2, _c3 = st.columns(3)
+    _c1.metric("등장한 품목명(고유)", f"{total_names:,}")
+    _c2.metric("분류 완료", f"{len(tax_map):,}")
+    _c3.metric("미분류", f"{unclassified_ct:,}")
+
+    st.markdown("---")
+    tab_new, tab_all = st.tabs(["미분류 · Gemini 배치", "분류 결과 · 재분류"])
+
+    # ======================== 미분류 · 배치 ========================
+    with tab_new:
+        st.subheader("미분류 목록")
+        if unclassified_df.empty:
+            st.success("모든 품목이 분류되었습니다. 새 임포트가 발생하면 여기에 목록이 다시 채워집니다.")
+        else:
+            st.caption(f"빈도(라인 등장 횟수) 내림차순 상위 {len(unclassified_df):,}건. 카테고리 열을 편집 후 [저장] 또는 [Gemini 자동 분류] 를 눌러주세요.")
+            edit_df = unclassified_df.copy()
+            edit_df["category"] = ""  # 편집 가능한 빈 컬럼
+            edit_df["선택"] = False
+
+            edited = st.data_editor(
+                edit_df[["선택", "product_name", "빈도", "category"]],
+                column_config={
+                    "선택": st.column_config.CheckboxColumn("선택"),
+                    "product_name": st.column_config.TextColumn("품목명", disabled=True),
+                    "빈도": st.column_config.NumberColumn("빈도", disabled=True, format="%d"),
+                    "category": st.column_config.SelectboxColumn(
+                        "대분류",
+                        options=[""] + pts.CATEGORIES,
+                        required=False,
+                    ),
+                },
+                hide_index=True,
+                width="stretch",
+                key="pta_uncls_editor",
+            )
+
+            _ac1, _ac2, _ac3 = st.columns([1, 1, 2])
+            with _ac1:
+                gemini_btn = st.button("🤖 Gemini 자동 분류 (선택 항목)", type="primary", key="pta_gemini_btn")
+            with _ac2:
+                save_btn = st.button("💾 저장 (수동/편집)", key="pta_manual_save")
+            with _ac3:
+                if st.button("🔄 목록 새로고침", key="pta_refresh"):
+                    _invalidate_taxonomy_caches()
+                    st.rerun()
+
+            if gemini_btn:
+                selected = edited[edited["선택"] == True]  # noqa: E712
+                names = [str(n) for n in selected["product_name"].tolist() if str(n).strip()]
+                if not names:
+                    st.warning("먼저 [선택] 열의 체크박스로 대상을 지정하세요.")
+                else:
+                    api_key = (
+                        os.environ.get("GEMINI_API_KEY", "")
+                        or st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+                    )
+                    if not api_key:
+                        st.error("GEMINI_API_KEY 환경변수가 설정되어 있지 않습니다. .streamlit/secrets.toml 또는 배포 환경변수를 확인해 주세요.")
+                    else:
+                        with st.spinner(f"Gemini 분류 중… ({len(names):,}건)"):
+                            gemini_out = pts.classify_with_gemini(names, api_key=api_key)
+                        # 결과 병합해 저장 페이지 세션에 보관 → 사용자가 확인 후 [저장]
+                        st.session_state["pta_gemini_result"] = {
+                            k: {"category": v[0], "confidence": v[1]} for k, v in gemini_out.items()
+                        }
+                        st.success(f"Gemini 응답 수신: {len(gemini_out):,}건. 아래 결과 표에서 확인·수정 후 [저장] 을 눌러주세요.")
+
+            _g_res = st.session_state.get("pta_gemini_result") or {}
+            if _g_res:
+                st.markdown("#### Gemini 결과 (확인 후 저장)")
+                res_df = pd.DataFrame([
+                    {"product_name": k, "category": v["category"], "confidence": v.get("confidence")}
+                    for k, v in _g_res.items()
+                ])
+                res_edited = st.data_editor(
+                    res_df,
+                    column_config={
+                        "product_name": st.column_config.TextColumn("품목명", disabled=True),
+                        "category": st.column_config.SelectboxColumn("대분류", options=pts.CATEGORIES),
+                        "confidence": st.column_config.NumberColumn("확신도", disabled=True, format="%.2f"),
+                    },
+                    hide_index=True,
+                    width="stretch",
+                    key="pta_gemini_editor",
+                )
+                _sc1, _sc2 = st.columns([1, 1])
+                with _sc1:
+                    if st.button("💾 Gemini 결과 저장", type="primary", key="pta_gemini_save"):
+                        mapping = {
+                            r["product_name"]: (r["category"], r.get("confidence") or 0.9)
+                            for _, r in res_edited.iterrows()
+                            if r["product_name"] and r["category"] in pts.CATEGORIES
+                        }
+                        upserted, errors = pts.upsert_classifications(
+                            client, mapping,
+                            source="gemini", updated_by=current_user.get("username", ""),
+                        )
+                        for _msg in errors[:5]:
+                            st.warning(_msg)
+                        st.success(f"{upserted:,}건 저장 완료.")
+                        st.session_state.pop("pta_gemini_result", None)
+                        _invalidate_taxonomy_caches()
+                        st.rerun()
+                with _sc2:
+                    if st.button("결과 폐기", key="pta_gemini_discard"):
+                        st.session_state.pop("pta_gemini_result", None)
+                        st.rerun()
+
+            if save_btn:
+                # data_editor 의 category 컬럼에 값이 입력된 항목을 수동 저장
+                manual = edited[edited["category"].isin(pts.CATEGORIES)]
+                if manual.empty:
+                    st.warning("저장할 항목이 없습니다. [카테고리] 를 직접 선택하거나 [Gemini 자동 분류] 를 먼저 실행하세요.")
+                else:
+                    mapping = {
+                        str(r["product_name"]): (str(r["category"]), None)
+                        for _, r in manual.iterrows()
+                    }
+                    upserted, errors = pts.upsert_classifications(
+                        client, mapping,
+                        source="manual", updated_by=current_user.get("username", ""),
+                    )
+                    for _msg in errors[:5]:
+                        st.warning(_msg)
+                    st.success(f"수동 분류 {upserted:,}건 저장 완료.")
+                    _invalidate_taxonomy_caches()
+                    st.rerun()
+
+    # ======================== 분류 결과 · 재분류 ========================
+    with tab_all:
+        st.subheader("분류 결과")
+        full = pts.load_taxonomy_full(client)
+        if full.empty:
+            st.info("아직 분류 결과가 없습니다.")
+            return
+
+        _fc1, _fc2 = st.columns([2, 2])
+        with _fc1:
+            _q = st.text_input("품목명 검색 (부분일치)", key="pta_full_q")
+        with _fc2:
+            _cat_sel = st.multiselect("카테고리 필터", pts.CATEGORIES, key="pta_full_cat")
+
+        view = full.copy()
+        if _q.strip():
+            view = view[view["product_name"].astype(str).str.contains(_q.strip(), case=False, na=False)]
+        if _cat_sel:
+            view = view[view["category"].isin(_cat_sel)]
+
+        st.caption(f"표시 {len(view):,}건 / 전체 {len(full):,}건. 카테고리 열을 변경 후 [재분류 저장] 을 누르세요.")
+        view_edited = st.data_editor(
+            view[["product_name", "category", "source", "confidence", "updated_by", "updated_at"]].reset_index(drop=True),
+            column_config={
+                "product_name": st.column_config.TextColumn("품목명", disabled=True),
+                "category": st.column_config.SelectboxColumn("대분류", options=pts.CATEGORIES),
+                "source": st.column_config.TextColumn("출처", disabled=True),
+                "confidence": st.column_config.NumberColumn("확신도", disabled=True, format="%.2f"),
+                "updated_by": st.column_config.TextColumn("수정자", disabled=True),
+                "updated_at": st.column_config.TextColumn("수정시각", disabled=True),
+            },
+            hide_index=True,
+            width="stretch",
+            key="pta_full_editor",
+        )
+
+        if st.button("💾 재분류 저장 (변경된 항목만)", type="primary", key="pta_override_save"):
+            # 변경 diff: 원본 view 와 view_edited 의 category 비교
+            before = view.set_index("product_name")["category"].to_dict()
+            changed = {
+                str(r["product_name"]): (str(r["category"]), None)
+                for _, r in view_edited.iterrows()
+                if r["product_name"] and r["category"] in pts.CATEGORIES
+                and before.get(str(r["product_name"])) != str(r["category"])
+            }
+            if not changed:
+                st.info("변경된 항목이 없습니다.")
+            else:
+                upserted, errors = pts.upsert_classifications(
+                    client, changed,
+                    source="override", updated_by=current_user.get("username", ""),
+                )
+                for _msg in errors[:5]:
+                    st.warning(_msg)
+                st.success(f"재분류 {upserted:,}건 저장 완료.")
+                _invalidate_taxonomy_caches()
+                st.rerun()
+
+
 def render_customer_balance():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -30219,6 +30713,10 @@ def main():
     # 관리자 전용: 마진 모니터링
     if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "margin_monitor":
         render_margin_monitor()
+        return
+
+    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "product_taxonomy":
+        render_product_taxonomy_admin()
         return
 
     # 관리자 전용: 주문 삭제 요청 관리 화면 라우팅
