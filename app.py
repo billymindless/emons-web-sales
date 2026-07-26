@@ -7990,10 +7990,23 @@ def _render_marketing_multi_period_comparison(
 
     # ---------- ③ 카테고리별 인기 품목 Top 10: 가로형 막대 또는 DataFrame ----------
     st.subheader("③ 카테고리별 인기 품목 (Top 10)")
+    st.caption(
+        "app_orders.category 값이 매입 원장 임포트로 들어온 원본 품목명(예: '공용평상형침대깔판(QK)…')이면, "
+        "품목 분류 관리(taxonomy) 매핑으로 정규화된 대분류로 바꿔서 집계합니다. "
+        "모모 직접 등록 주문처럼 이미 카테고리로 깨끗하게 저장된 값은 그대로 사용합니다."
+    )
+    _tax_map_c3 = _cached_taxonomy_map()
+
+    def _normalize_category_str(raw: str) -> str:
+        raw = (raw or "").strip()
+        if not raw:
+            return raw
+        return _tax_map_c3.get(raw, raw)
+
     c1, c2 = st.columns(2)
     with c1:
         st.caption(f"기간 A: {label_a}")
-        cats_a = df_period_a["category"].fillna("").str.split(",").explode().str.strip()
+        cats_a = df_period_a["category"].fillna("").map(_normalize_category_str).str.split(",").explode().str.strip()
         cats_a = cats_a[cats_a != ""]
         cat_a = cats_a.value_counts().reset_index().head(10)
         cat_a.columns = ["품목", "판매건수"]
@@ -8008,7 +8021,7 @@ def _render_marketing_multi_period_comparison(
             st.dataframe(cat_a[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_a", height=min(280, 50 + len(cat_a) * 32))
     with c2:
         st.caption(f"기간 B: {label_b}")
-        cats_b = df_period_b["category"].fillna("").str.split(",").explode().str.strip()
+        cats_b = df_period_b["category"].fillna("").map(_normalize_category_str).str.split(",").explode().str.strip()
         cats_b = cats_b[cats_b != ""]
         cat_b = cats_b.value_counts().reset_index().head(10)
         cat_b.columns = ["품목", "판매건수"]
