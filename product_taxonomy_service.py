@@ -260,6 +260,13 @@ def _apply_ssds_size_rule(name: str) -> Optional[str]:
     return None
 
 
+GENERIC_RULE_PRIORITY_THRESHOLD = 500
+"""이 값 이상의 priority 를 가진 DB 키워드 규칙은 내장 종류 키워드 규칙(소파·식탁 등)보다
+나중에 검사된다. 포괄 브랜드 규칙(예: '디망스'→침대)을 900 으로 등록하면 '디망스소파' 는
+내장 '소파' 규칙으로 올바르게 분류되고, '디망스Q-1500' 처럼 종류 단어가 없는 이름만
+브랜드 규칙으로 분류된다."""
+
+
 def _keyword_matches(keyword: str, name: str) -> bool:
     """키워드 매칭. '+' 가 포함되면 AND 조합: 모든 조각이 품목명에 포함돼야 매칭.
 
@@ -273,24 +280,39 @@ def _keyword_matches(keyword: str, name: str) -> bool:
     return keyword in name
 
 
-def _apply_keyword_rules(name: str, extra_rules: Optional[list[tuple[str, str]]] = None) -> Optional[str]:
-    """단순 키워드 포함 시 무조건 해당 카테고리로 강제 분류. 순서대로 첫 매칭 적용.
+def _apply_keyword_rules(name: str, extra_rules: Optional[list[tuple]] = None) -> Optional[str]:
+    """키워드 포함 시 무조건 해당 카테고리로 강제 분류. 순서대로 첫 매칭 적용.
 
-    extra_rules(관리자가 DB에 등록한 브랜드/키워드 사전)를 하드코딩 규칙보다 먼저 검사한다.
-    extra_rules 의 키워드는 '+' AND 조합 문법을 지원한다 (`_keyword_matches` 참조).
+    extra_rules 는 (keyword, category) 또는 (keyword, category, priority) 튜플 리스트.
+    - priority < GENERIC_RULE_PRIORITY_THRESHOLD(500): 내장 규칙보다 **먼저** 검사 (구체 규칙).
+    - priority >= 500: 내장 종류 키워드 규칙(소파·식탁 등) **뒤에** 검사 (포괄 브랜드 fallback).
+    - priority 미지정(2-튜플)은 100 으로 간주.
+    키워드는 '+' AND 조합 문법을 지원한다 (`_keyword_matches` 참조).
     """
     if not name:
         return None
-    for keyword, category in (extra_rules or []):
+    pre_rules: list[tuple[str, str]] = []
+    post_rules: list[tuple[str, str]] = []
+    for entry in (extra_rules or []):
+        keyword, category = entry[0], entry[1]
+        try:
+            prio = int(entry[2]) if len(entry) > 2 and entry[2] is not None else 100
+        except (TypeError, ValueError):
+            prio = 100
+        (pre_rules if prio < GENERIC_RULE_PRIORITY_THRESHOLD else post_rules).append((keyword, category))
+    for keyword, category in pre_rules:
         if _keyword_matches(keyword, name):
             return category
     for keyword, category in _FORCE_KEYWORD_RULES:
         if keyword in name:
             return category
+    for keyword, category in post_rules:
+        if _keyword_matches(keyword, name):
+            return category
     return None
 
 
-def _apply_rule_based_category(name: str, extra_rules: Optional[list[tuple[str, str]]] = None) -> Optional[str]:
+def _apply_rule_based_category(name: str, extra_rules: Optional[list[tuple]] = None) -> Optional[str]:
     """규칙 기반 카테고리 확정: SSDS 규격 규칙 → 키워드 강제 규칙 순으로 확인."""
     return _apply_ssds_size_rule(name) or _apply_keyword_rules(name, extra_rules)
 
@@ -301,7 +323,7 @@ def classify_with_gemini(
     model: str = "gemini-flash-latest",
     timeout: float = 30.0,
     batch: int = 30,
-    extra_rules: Optional[list[tuple[str, str]]] = None,
+    extra_rules: Optional[list[tuple]] = None,
 ) -> dict[str, tuple[str, float]]:
     """품목명 리스트를 Gemini 로 배치 분류.
 
@@ -487,10 +509,11 @@ def delete_classification(client, product_name: str) -> bool:
 # 브랜드/키워드 사전 (app_product_keyword_rules)
 # ---------------------------------------------------------------------------
 
-def load_keyword_rules(client) -> list[tuple[str, str]]:
-    """활성 키워드 규칙을 (keyword, category) 리스트로 반환 (priority 오름차순).
+def load_keyword_rules(client) -> list[tuple[str, str, int]]:
+    """활성 키워드 규칙을 (keyword, category, priority) 리스트로 반환 (priority 오름차순).
 
     `classify_with_gemini(extra_rules=...)` 에 그대로 전달하는 용도.
+    priority >= GENERIC_RULE_PRIORITY_THRESHOLD(500) 규칙은 내장 규칙 뒤에 검사된다.
     테이블 미생성 등 오류 시 빈 리스트 (하드코딩 규칙만 동작).
     """
     if client is None:
@@ -509,7 +532,10 @@ def load_keyword_rules(client) -> list[tuple[str, str]]:
         if str(r.get("keyword") or "").strip() and r.get("category") in allowed
     ]
     valid.sort(key=lambda r: (int(r.get("priority") or 100), str(r.get("keyword"))))
-    return [(str(r["keyword"]).strip(), str(r["category"])) for r in valid]
+    return [
+        (str(r["keyword"]).strip(), str(r["category"]), int(r.get("priority") or 100))
+        for r in valid
+    ]
 
 
 def load_keyword_rules_full(client) -> pd.DataFrame:
@@ -581,8 +607,12 @@ def reapply_keyword_rule_to_existing(
 ) -> tuple[int, list[str]]:
     """키워드 규칙을 이미 분류된 기존 taxonomy 건에 소급 적용.
 
-    - 대상: product_name 이 keyword 에 매칭('+' AND 조합 지원)되고, 현재 category 가 다르며,
+    - 대상: product_name 이 keyword 에 매칭('+' AND 조합 지원)되고,
       source 가 'gemini' 또는 'rule' 인 건 (자동 분류 결과만 교정).
+    - 적용할 카테고리는 keyword 의 category 를 그대로 쓰지 않고, 분류 시점과 동일한
+      전체 규칙 파이프라인(`_apply_rule_based_category`: SSDS → 구체 DB 규칙 → 내장 규칙
+      → 포괄 DB 규칙)으로 재계산한다. 포괄 브랜드 규칙(priority>=500)을 소급 적용해도
+      '디망스소파' 같은 이름이 내장 '소파' 규칙 대신 브랜드 규칙으로 덮이지 않는다.
     - `source='manual'`/`'override'` 로 관리자가 직접 확정한 분류는 절대 덮어쓰지 않는다.
     반환: (수정 건수, 오류 리스트)
     """
@@ -595,15 +625,20 @@ def reapply_keyword_rule_to_existing(
         rows = _page_select(client, TAXONOMY_TABLE, "product_name, category, source")
     except Exception as e:
         return 0, [f"기존 분류 조회 실패: {e}"]
-    targets = [
-        str(r["product_name"]) for r in rows
-        if r.get("product_name") and _keyword_matches(keyword, str(r["product_name"]))
-        and r.get("source") in ("gemini", "rule")
-        and r.get("category") != category
-    ]
-    if not targets:
+
+    all_rules = load_keyword_rules(client)
+    mapping: dict[str, tuple[str, float]] = {}
+    for r in rows:
+        name = str(r.get("product_name") or "")
+        if not name or not _keyword_matches(keyword, name):
+            continue
+        if r.get("source") not in ("gemini", "rule"):
+            continue
+        final_cat = _apply_rule_based_category(name, all_rules) or category
+        if r.get("category") != final_cat:
+            mapping[name] = (final_cat, 1.0)
+    if not mapping:
         return 0, []
-    mapping = {name: (category, 1.0) for name in targets}
     return upsert_classifications(client, mapping, source="rule", updated_by=updated_by)
 
 
@@ -633,6 +668,7 @@ __all__ = [
     "TAXONOMY_TABLE",
     "ITEMS_TABLE",
     "KEYWORD_RULES_TABLE",
+    "GENERIC_RULE_PRIORITY_THRESHOLD",
     "load_taxonomy_map",
     "load_taxonomy_full",
     "find_unclassified_product_names",

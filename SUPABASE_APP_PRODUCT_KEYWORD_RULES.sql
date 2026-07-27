@@ -9,6 +9,10 @@
 --     예: '노블앙+1100' → 이름에 '노블앙' 과 '1100' 이 둘 다 있어야 매칭.
 --   - priority 가 작을수록 먼저 검사한다 (동일 이름에 여러 키워드가 포함될 때
 --     더 구체적인 규칙을 먼저 두기 위함). 기본값 100.
+--   - priority >= 500 인 규칙은 코드 내장 종류 키워드 규칙(소파·식탁 등)보다
+--     "나중에" 검사되는 포괄(fallback) 규칙이다. 여러 카테고리에 걸치는 브랜드는
+--     포괄 규칙을 900 으로 등록하면 '디망스소파' 같은 이름이 내장 '소파' 규칙으로
+--     먼저 분류되고, 종류 단어가 없는 이름만 브랜드 규칙으로 분류된다.
 --   - 신규/미분류 품목에는 다음 분류 시도부터 즉시 적용된다.
 --   - 이미 app_product_taxonomy 에 저장된 기존 건에는 관리 UI의
 --     "기존 분류에도 적용" 버튼으로 소급 적용한다 (source='manual'/'override' 인
@@ -35,7 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_app_product_keyword_rules_priority ON app_product
 CREATE INDEX IF NOT EXISTS idx_app_product_keyword_rules_active   ON app_product_keyword_rules(is_active);
 
 COMMENT ON TABLE  app_product_keyword_rules          IS '품목명에 특정 키워드가 포함되면 즉시 카테고리를 확정하는 관리자 편집 규칙.';
-COMMENT ON COLUMN app_product_keyword_rules.priority IS '작을수록 먼저 검사됨 (기본 100).';
+COMMENT ON COLUMN app_product_keyword_rules.priority IS '작을수록 먼저 검사됨 (기본 100). 500 이상은 내장 종류 키워드 규칙 뒤에 검사되는 포괄(fallback) 규칙.';
 
 ALTER TABLE app_product_keyword_rules ENABLE ROW LEVEL SECURITY;
 
