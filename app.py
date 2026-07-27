@@ -27430,7 +27430,7 @@ def render_product_taxonomy_admin() -> None:
     _c3.metric("미분류", f"{unclassified_ct:,}")
 
     st.markdown("---")
-    tab_new, tab_all = st.tabs(["미분류 · Gemini 배치", "분류 결과 · 재분류"])
+    tab_new, tab_rules, tab_all = st.tabs(["미분류 · Gemini 배치", "브랜드/키워드 사전", "분류 결과 · 재분류"])
 
     # ======================== 미분류 · 배치 ========================
     with tab_new:
@@ -27499,7 +27499,8 @@ def render_product_taxonomy_admin() -> None:
                         st.error("GEMINI_API_KEY 가 설정되어 있지 않습니다. .streamlit/secrets.toml 의 [gemini] api_key 또는 환경변수 GEMINI_API_KEY 를 확인해 주세요.")
                     else:
                         with st.spinner(f"Gemini 분류 중… ({len(names):,}건)"):
-                            gemini_out = pts.classify_with_gemini(names, api_key=api_key)
+                            _kw_rules = pts.load_keyword_rules(client)
+                            gemini_out = pts.classify_with_gemini(names, api_key=api_key, extra_rules=_kw_rules)
                         # 결과 병합해 저장 페이지 세션에 보관 → 사용자가 확인 후 [저장]
                         st.session_state["pta_gemini_result"] = {
                             k: {"category": v[0], "confidence": v[1]} for k, v in gemini_out.items()
@@ -27570,6 +27571,137 @@ def render_product_taxonomy_admin() -> None:
                     st.success(f"수동 분류 {upserted:,}건 저장 완료.")
                     _invalidate_taxonomy_caches()
                     st.rerun()
+
+    # ======================== 브랜드/키워드 사전 ========================
+    with tab_rules:
+        st.subheader("브랜드/키워드 사전")
+        st.caption(
+            "품목명에 **키워드가 포함되면 Gemini 호출 없이 즉시 해당 카테고리로 확정**하는 규칙입니다. "
+            "'디망스'처럼 가구 종류 단어가 없는 브랜드/모델명을 등록해 두면, 사이즈·색상 코드가 붙어 "
+            "문자열이 조금씩 달라도 부분일치로 전부 자동 분류됩니다. 우선순위 숫자가 작을수록 먼저 검사됩니다. "
+            "\n\n**사전 준비**: `SUPABASE_APP_PRODUCT_KEYWORD_RULES.sql` 을 Supabase SQL Editor 에서 먼저 실행하세요."
+        )
+
+        with st.form(key="pta_kw_add_form", clear_on_submit=True):
+            _kf1, _kf2, _kf3 = st.columns([2, 1, 1])
+            with _kf1:
+                _kw_new = st.text_input("키워드 (브랜드/모델명 등)", placeholder="예: 디망스")
+            with _kf2:
+                _kw_cat = st.selectbox("카테고리", pts.CATEGORIES)
+            with _kf3:
+                _kw_prio = st.number_input("우선순위", min_value=1, max_value=999, value=100, step=1)
+            _kw_note = st.text_input("메모 (선택)", placeholder="예: 디망스 침대 라인업")
+            _kw_reapply = st.checkbox(
+                "이미 자동 분류된 기존 품목에도 즉시 적용 (관리자가 수동 확정한 분류는 보존)",
+                value=True,
+            )
+            _kw_submit = st.form_submit_button("➕ 키워드 등록", type="primary")
+
+        if _kw_submit:
+            if not (_kw_new or "").strip():
+                st.error("키워드를 입력해 주세요.")
+            else:
+                ok, msg = pts.save_keyword_rule(
+                    client, _kw_new, _kw_cat,
+                    priority=int(_kw_prio), note=_kw_note,
+                    updated_by=current_user.get("username", ""),
+                )
+                if not ok:
+                    st.error(msg)
+                else:
+                    _applied_msg = ""
+                    if _kw_reapply:
+                        _n_fixed, _re_errors = pts.reapply_keyword_rule_to_existing(
+                            client, _kw_new, _kw_cat,
+                            updated_by=current_user.get("username", ""),
+                        )
+                        for _msg in _re_errors[:5]:
+                            st.warning(_msg)
+                        _applied_msg = f" · 기존 분류 {_n_fixed:,}건 소급 수정"
+                    _invalidate_taxonomy_caches()
+                    st.success(f"키워드 '{_kw_new.strip()}' → {_kw_cat} 등록 완료{_applied_msg}.")
+
+        rules_df = pts.load_keyword_rules_full(client)
+        if rules_df.empty:
+            st.info("등록된 키워드 규칙이 없습니다. 위에서 첫 키워드를 등록해 보세요.")
+        else:
+            st.markdown(f"##### 등록된 키워드 규칙 ({len(rules_df):,}건)")
+            rules_edited = st.data_editor(
+                rules_df[["keyword", "category", "priority", "note", "is_active"]].reset_index(drop=True),
+                column_config={
+                    "keyword": st.column_config.TextColumn("키워드", disabled=True),
+                    "category": st.column_config.SelectboxColumn("카테고리", options=pts.CATEGORIES),
+                    "priority": st.column_config.NumberColumn("우선순위", min_value=1, max_value=999, step=1),
+                    "note": st.column_config.TextColumn("메모"),
+                    "is_active": st.column_config.CheckboxColumn("활성"),
+                },
+                hide_index=True,
+                width="stretch",
+                key="pta_kw_editor",
+            )
+            if st.button("💾 변경사항 저장", key="pta_kw_save"):
+                before = rules_df.set_index("keyword")[["category", "priority", "note", "is_active"]].to_dict("index")
+                n_saved, has_err = 0, False
+                for _, r in rules_edited.iterrows():
+                    kw = str(r["keyword"])
+                    b = before.get(kw)
+                    if b is None:
+                        continue
+                    changed = (
+                        str(b.get("category")) != str(r["category"])
+                        or int(b.get("priority") or 100) != int(r["priority"] or 100)
+                        or str(b.get("note") or "") != str(r["note"] or "")
+                        or bool(b.get("is_active")) != bool(r["is_active"])
+                    )
+                    if not changed:
+                        continue
+                    ok, msg = pts.save_keyword_rule(
+                        client, kw, str(r["category"]),
+                        priority=int(r["priority"] or 100),
+                        note=str(r["note"] or ""),
+                        is_active=bool(r["is_active"]),
+                        updated_by=current_user.get("username", ""),
+                    )
+                    if ok:
+                        n_saved += 1
+                    else:
+                        has_err = True
+                        st.warning(msg)
+                if n_saved:
+                    _invalidate_taxonomy_caches()
+                    st.success(f"{n_saved:,}건 저장 완료.")
+                    st.rerun()
+                elif not has_err:
+                    st.info("변경된 항목이 없습니다.")
+
+            _kb1, _kb2 = st.columns(2)
+            with _kb1:
+                _del_kw = st.selectbox(
+                    "삭제할 키워드", ["(선택)"] + rules_df["keyword"].astype(str).tolist(),
+                    key="pta_kw_del_sel",
+                )
+                if st.button("🗑️ 키워드 삭제", key="pta_kw_del_btn") and _del_kw != "(선택)":
+                    if pts.delete_keyword_rule(client, _del_kw):
+                        _invalidate_taxonomy_caches()
+                        st.success(f"'{_del_kw}' 삭제 완료.")
+                        st.rerun()
+                    else:
+                        st.error("삭제 실패.")
+            with _kb2:
+                _re_kw = st.selectbox(
+                    "기존 분류에 소급 적용할 키워드", ["(선택)"] + rules_df["keyword"].astype(str).tolist(),
+                    key="pta_kw_reapply_sel",
+                )
+                if st.button("🔁 기존 분류에 적용", key="pta_kw_reapply_btn") and _re_kw != "(선택)":
+                    _row = rules_df[rules_df["keyword"].astype(str) == _re_kw].iloc[0]
+                    _n_fixed, _re_errors = pts.reapply_keyword_rule_to_existing(
+                        client, _re_kw, str(_row["category"]),
+                        updated_by=current_user.get("username", ""),
+                    )
+                    for _msg in _re_errors[:5]:
+                        st.warning(_msg)
+                    _invalidate_taxonomy_caches()
+                    st.success(f"'{_re_kw}' → {_row['category']} 소급 적용: {_n_fixed:,}건 수정.")
 
     # ======================== 분류 결과 · 재분류 ========================
     with tab_all:

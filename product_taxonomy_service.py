@@ -35,6 +35,7 @@ CATEGORIES: list[str] = [
 
 TAXONOMY_TABLE = "app_product_taxonomy"
 ITEMS_TABLE = "app_order_items"
+KEYWORD_RULES_TABLE = "app_product_keyword_rules"
 
 
 # ---------------------------------------------------------------------------
@@ -259,19 +260,25 @@ def _apply_ssds_size_rule(name: str) -> Optional[str]:
     return None
 
 
-def _apply_keyword_rules(name: str) -> Optional[str]:
-    """단순 키워드 포함 시 무조건 해당 카테고리로 강제 분류 (사용자 지정 규칙). 순서대로 첫 매칭 적용."""
+def _apply_keyword_rules(name: str, extra_rules: Optional[list[tuple[str, str]]] = None) -> Optional[str]:
+    """단순 키워드 포함 시 무조건 해당 카테고리로 강제 분류. 순서대로 첫 매칭 적용.
+
+    extra_rules(관리자가 DB에 등록한 브랜드/키워드 사전)를 하드코딩 규칙보다 먼저 검사한다.
+    """
     if not name:
         return None
+    for keyword, category in (extra_rules or []):
+        if keyword and keyword in name:
+            return category
     for keyword, category in _FORCE_KEYWORD_RULES:
         if keyword in name:
             return category
     return None
 
 
-def _apply_rule_based_category(name: str) -> Optional[str]:
+def _apply_rule_based_category(name: str, extra_rules: Optional[list[tuple[str, str]]] = None) -> Optional[str]:
     """규칙 기반 카테고리 확정: SSDS 규격 규칙 → 키워드 강제 규칙 순으로 확인."""
-    return _apply_ssds_size_rule(name) or _apply_keyword_rules(name)
+    return _apply_ssds_size_rule(name) or _apply_keyword_rules(name, extra_rules)
 
 
 def classify_with_gemini(
@@ -280,12 +287,13 @@ def classify_with_gemini(
     model: str = "gemini-flash-latest",
     timeout: float = 30.0,
     batch: int = 30,
+    extra_rules: Optional[list[tuple[str, str]]] = None,
 ) -> dict[str, tuple[str, float]]:
     """품목명 리스트를 Gemini 로 배치 분류.
 
     반환: {product_name: (category, confidence)}.
-    - 규칙 기반 강제 분류(`_apply_rule_based_category`: SSDS 규격 표기 + `_FORCE_KEYWORD_RULES`
-      키워드 목록)에 걸리면 Gemini 호출 없이 확정 분류한다.
+    - 규칙 기반 강제 분류(`_apply_rule_based_category`: SSDS 규격 표기 + extra_rules(DB 키워드 사전)
+      + `_FORCE_KEYWORD_RULES` 키워드 목록)에 걸리면 Gemini 호출 없이 확정 분류한다.
     - 나머지는 Gemini 응답을 그대로 신뢰한다. 응답이 허용 카테고리 밖이거나 파싱 실패 시에만 ('기타', 0.0).
       Gemini 는 '기타' 를 최후의 수단으로만 쓰도록 프롬프트에서 지시받는다 (`_SYSTEM_PROMPT`).
     - API 키 없거나 오류 시 나머지 이름을 ('기타', 0.0) 로 채움.
@@ -298,7 +306,7 @@ def classify_with_gemini(
 
     remaining: list[str] = []
     for n in names:
-        forced = _apply_rule_based_category(n)
+        forced = _apply_rule_based_category(n, extra_rules)
         if forced:
             result[n] = (forced, 1.0)
         else:
@@ -414,7 +422,7 @@ def upsert_classifications(
     errors: list[str] = []
     if client is None or not mapping:
         return 0, errors
-    if source not in ("gemini", "manual", "override"):
+    if source not in ("gemini", "manual", "override", "rule"):
         errors.append(f"허용되지 않은 source: {source}")
         return 0, errors
 
@@ -462,6 +470,130 @@ def delete_classification(client, product_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 브랜드/키워드 사전 (app_product_keyword_rules)
+# ---------------------------------------------------------------------------
+
+def load_keyword_rules(client) -> list[tuple[str, str]]:
+    """활성 키워드 규칙을 (keyword, category) 리스트로 반환 (priority 오름차순).
+
+    `classify_with_gemini(extra_rules=...)` 에 그대로 전달하는 용도.
+    테이블 미생성 등 오류 시 빈 리스트 (하드코딩 규칙만 동작).
+    """
+    if client is None:
+        return []
+    try:
+        rows = _page_select(
+            client, KEYWORD_RULES_TABLE, "keyword, category, priority",
+            filters=[("eq", "is_active", True)],
+        )
+    except Exception as e:
+        logger.warning("keyword rules 로드 실패: %s", e)
+        return []
+    allowed = set(CATEGORIES)
+    valid = [
+        r for r in rows
+        if str(r.get("keyword") or "").strip() and r.get("category") in allowed
+    ]
+    valid.sort(key=lambda r: (int(r.get("priority") or 100), str(r.get("keyword"))))
+    return [(str(r["keyword"]).strip(), str(r["category"])) for r in valid]
+
+
+def load_keyword_rules_full(client) -> pd.DataFrame:
+    """키워드 규칙 전체를 DataFrame 으로 반환 (관리 UI 용, 비활성 포함)."""
+    _cols = ["id", "keyword", "category", "priority", "note", "is_active", "updated_by", "updated_at"]
+    if client is None:
+        return pd.DataFrame(columns=_cols)
+    try:
+        rows = _page_select(client, KEYWORD_RULES_TABLE, ", ".join(_cols))
+    except Exception as e:
+        logger.warning("keyword rules 전체 로드 실패: %s", e)
+        return pd.DataFrame(columns=_cols)
+    if not rows:
+        return pd.DataFrame(columns=_cols)
+    df = pd.DataFrame(rows)
+    return df.sort_values(["priority", "keyword"]).reset_index(drop=True)
+
+
+def save_keyword_rule(
+    client,
+    keyword: str,
+    category: str,
+    *,
+    priority: int = 100,
+    note: str = "",
+    is_active: bool = True,
+    updated_by: str = "",
+) -> tuple[bool, str]:
+    """키워드 규칙 UPSERT (keyword UNIQUE 기준). 반환: (성공여부, 오류메시지)."""
+    keyword = (keyword or "").strip()
+    if client is None or not keyword:
+        return False, "client/keyword 필수"
+    if category not in set(CATEGORIES):
+        return False, f"허용되지 않은 category: {category!r}"
+    payload = {
+        "keyword": keyword,
+        "category": category,
+        "priority": int(priority),
+        "note": (note or "").strip() or None,
+        "is_active": bool(is_active),
+        "updated_by": updated_by or None,
+    }
+    try:
+        client.table(KEYWORD_RULES_TABLE).upsert(payload, on_conflict="keyword").execute()
+        return True, ""
+    except Exception as e:
+        return False, f"키워드 규칙 저장 실패 ({keyword!r}): {e}"
+
+
+def delete_keyword_rule(client, keyword: str) -> bool:
+    """키워드 규칙 삭제."""
+    keyword = (keyword or "").strip()
+    if client is None or not keyword:
+        return False
+    try:
+        client.table(KEYWORD_RULES_TABLE).delete().eq("keyword", keyword).execute()
+        return True
+    except Exception as e:
+        logger.warning("키워드 규칙 삭제 실패 (%s): %s", keyword, e)
+        return False
+
+
+def reapply_keyword_rule_to_existing(
+    client,
+    keyword: str,
+    category: str,
+    *,
+    updated_by: str = "",
+) -> tuple[int, list[str]]:
+    """키워드 규칙을 이미 분류된 기존 taxonomy 건에 소급 적용.
+
+    - 대상: product_name 에 keyword 가 포함되고, 현재 category 가 다르며,
+      source 가 'gemini' 또는 'rule' 인 건 (자동 분류 결과만 교정).
+    - `source='manual'`/`'override'` 로 관리자가 직접 확정한 분류는 절대 덮어쓰지 않는다.
+    반환: (수정 건수, 오류 리스트)
+    """
+    keyword = (keyword or "").strip()
+    if client is None or not keyword:
+        return 0, ["client/keyword 필수"]
+    if category not in set(CATEGORIES):
+        return 0, [f"허용되지 않은 category: {category!r}"]
+    try:
+        rows = _page_select(client, TAXONOMY_TABLE, "product_name, category, source")
+    except Exception as e:
+        return 0, [f"기존 분류 조회 실패: {e}"]
+    targets = [
+        str(r["product_name"]) for r in rows
+        if r.get("product_name") and keyword in str(r["product_name"])
+        and r.get("source") in ("gemini", "rule")
+        and r.get("category") != category
+    ]
+    if not targets:
+        return 0, []
+    mapping = {name: (category, 1.0) for name in targets}
+    return upsert_classifications(client, mapping, source="rule", updated_by=updated_by)
+
+
+# ---------------------------------------------------------------------------
 # 배치 로드 (다면분석·마케팅 인사이트 공용)
 # ---------------------------------------------------------------------------
 
@@ -486,6 +618,7 @@ __all__ = [
     "CATEGORIES",
     "TAXONOMY_TABLE",
     "ITEMS_TABLE",
+    "KEYWORD_RULES_TABLE",
     "load_taxonomy_map",
     "load_taxonomy_full",
     "find_unclassified_product_names",
@@ -493,5 +626,10 @@ __all__ = [
     "classify_with_gemini",
     "upsert_classifications",
     "delete_classification",
+    "load_keyword_rules",
+    "load_keyword_rules_full",
+    "save_keyword_rule",
+    "delete_keyword_rule",
+    "reapply_keyword_rule_to_existing",
     "load_order_items_batched",
 ]
