@@ -260,15 +260,29 @@ def _apply_ssds_size_rule(name: str) -> Optional[str]:
     return None
 
 
+def _keyword_matches(keyword: str, name: str) -> bool:
+    """키워드 매칭. '+' 가 포함되면 AND 조합: 모든 조각이 품목명에 포함돼야 매칭.
+
+    예: '노블앙+1100' → 이름에 '노블앙' 과 '1100' 이 둘 다 (위치·띄어쓰기 무관) 있어야 True.
+    """
+    if not keyword or not name:
+        return False
+    if "+" in keyword:
+        parts = [p.strip() for p in keyword.split("+") if p.strip()]
+        return bool(parts) and all(p in name for p in parts)
+    return keyword in name
+
+
 def _apply_keyword_rules(name: str, extra_rules: Optional[list[tuple[str, str]]] = None) -> Optional[str]:
     """단순 키워드 포함 시 무조건 해당 카테고리로 강제 분류. 순서대로 첫 매칭 적용.
 
     extra_rules(관리자가 DB에 등록한 브랜드/키워드 사전)를 하드코딩 규칙보다 먼저 검사한다.
+    extra_rules 의 키워드는 '+' AND 조합 문법을 지원한다 (`_keyword_matches` 참조).
     """
     if not name:
         return None
     for keyword, category in (extra_rules or []):
-        if keyword and keyword in name:
+        if _keyword_matches(keyword, name):
             return category
     for keyword, category in _FORCE_KEYWORD_RULES:
         if keyword in name:
@@ -567,7 +581,7 @@ def reapply_keyword_rule_to_existing(
 ) -> tuple[int, list[str]]:
     """키워드 규칙을 이미 분류된 기존 taxonomy 건에 소급 적용.
 
-    - 대상: product_name 에 keyword 가 포함되고, 현재 category 가 다르며,
+    - 대상: product_name 이 keyword 에 매칭('+' AND 조합 지원)되고, 현재 category 가 다르며,
       source 가 'gemini' 또는 'rule' 인 건 (자동 분류 결과만 교정).
     - `source='manual'`/`'override'` 로 관리자가 직접 확정한 분류는 절대 덮어쓰지 않는다.
     반환: (수정 건수, 오류 리스트)
@@ -583,7 +597,7 @@ def reapply_keyword_rule_to_existing(
         return 0, [f"기존 분류 조회 실패: {e}"]
     targets = [
         str(r["product_name"]) for r in rows
-        if r.get("product_name") and keyword in str(r["product_name"])
+        if r.get("product_name") and _keyword_matches(keyword, str(r["product_name"]))
         and r.get("source") in ("gemini", "rule")
         and r.get("category") != category
     ]

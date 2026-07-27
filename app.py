@@ -27579,13 +27579,16 @@ def render_product_taxonomy_admin() -> None:
             "품목명에 **키워드가 포함되면 Gemini 호출 없이 즉시 해당 카테고리로 확정**하는 규칙입니다. "
             "'디망스'처럼 가구 종류 단어가 없는 브랜드/모델명을 등록해 두면, 사이즈·색상 코드가 붙어 "
             "문자열이 조금씩 달라도 부분일치로 전부 자동 분류됩니다. 우선순위 숫자가 작을수록 먼저 검사됩니다. "
+            "\n\n**AND 조합**: 키워드에 `+` 를 쓰면 모든 단어가 포함될 때만 매칭됩니다. "
+            "예: `노블앙+1100` → SSDS침대 (우선순위 10), `노블앙` → 침대 (우선순위 900) 로 등록하면 "
+            "'노블앙 매트리스(1100)' 은 SSDS침대, '노블앙Q-1500' 은 침대로 분류됩니다. "
             "\n\n**사전 준비**: `SUPABASE_APP_PRODUCT_KEYWORD_RULES.sql` 을 Supabase SQL Editor 에서 먼저 실행하세요."
         )
 
         with st.form(key="pta_kw_add_form", clear_on_submit=True):
             _kf1, _kf2, _kf3 = st.columns([2, 1, 1])
             with _kf1:
-                _kw_new = st.text_input("키워드 (브랜드/모델명 등)", placeholder="예: 디망스")
+                _kw_new = st.text_input("키워드 (브랜드/모델명 · `+` AND 조합 가능)", placeholder="예: 디망스 또는 노블앙+1100")
             with _kf2:
                 _kw_cat = st.selectbox("카테고리", pts.CATEGORIES)
             with _kf3:
