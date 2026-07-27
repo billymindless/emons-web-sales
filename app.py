@@ -26921,6 +26921,39 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             st.error(f"필수 매핑 누락: {', '.join(_missing_required)}")
             return
 
+        st.markdown("#### 2-1. 주소만 보완 (선택 · 이미 임포트된 고객용)")
+        st.caption(
+            "**이미 앱에 등록된 고객 중 주소가 비어있는 경우만** 이 엑셀의 주소로 채웁니다. "
+            "주문·결제·라인 아이템은 전혀 조회·수정하지 않으며, 이미 주소가 있으면 절대 덮어쓰지 않습니다. "
+            "'이미 임포트됨' 으로 스킵되는 데이터에도 동일하게 적용되므로, 과거에 주소 없이 임포트된 엑셀을 "
+            "그대로 재업로드해서 주소만 보완할 수 있습니다."
+        )
+        if st.button("🏠 주소만 보완 실행", key=f"legacy_purchase_addr_backfill_btn::{excel_upload.name}"):
+            client, err = get_supabase_client()
+            if err or not client:
+                st.error(f"Supabase 연결 실패: {err}")
+            else:
+                with st.spinner(f"주소 보완 중… ({len(df_raw):,}행)"):
+                    _addr_groups, _ = lps.group_orders(df_raw, mapping)
+                    addr_result = lps.backfill_customer_addresses(
+                        client, _addr_groups, store_name=_store_name,
+                    )
+                clear_data_cache()
+                _a1, _a2, _a3, _a4 = st.columns(4)
+                _a1.metric("엑셀 고유 고객수", f"{addr_result.scanned_customers:,}")
+                _a2.metric("기존 고객 매칭", f"{addr_result.matched_existing:,}")
+                _a3.metric("주소 보완됨", f"{addr_result.address_filled:,}")
+                _a4.metric("이미 주소 있음", f"{addr_result.already_had_address:,}")
+                if addr_result.errors:
+                    for _e in addr_result.errors[:5]:
+                        st.warning(_e)
+                else:
+                    st.success(
+                        f"주소 보완 완료 · {addr_result.address_filled}건 채움 "
+                        f"(기존 값 있던 {addr_result.already_had_address}건 보존 · "
+                        f"매칭 안 됨 {addr_result.not_matched}건 · 엑셀에 주소 없음 {addr_result.no_address_in_excel}건)."
+                    )
+
         st.markdown("#### 3. 미리보기 (dry-run)")
         if st.button("🔍 미리보기 생성", key=f"legacy_purchase_preview_btn::{excel_upload.name}", type="primary"):
             client, err = get_supabase_client()

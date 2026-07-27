@@ -1646,6 +1646,104 @@ def commit_rollback(
     return res
 
 
+# ---------------------------------------------------------------------------
+# 주소만 보완 (이미 임포트된/기존 고객 대상 — 주문·결제·라인 아이템 불변)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AddressBackfillResult:
+    scanned_customers: int = 0
+    """엑셀에서 추출된 고유 식별자(전화 또는 이름) 수."""
+    matched_existing: int = 0
+    """앱에 이미 등록된 고객과 매칭된 수."""
+    address_filled: int = 0
+    """실제로 주소가 비어있어 채워진 수."""
+    already_had_address: int = 0
+    """이미 주소가 있어 보존(건드리지 않음)한 수."""
+    no_address_in_excel: int = 0
+    """엑셀에도 주소가 없어 채울 수 없었던 수."""
+    not_matched: int = 0
+    """앱에서 매칭되는 기존 고객을 찾지 못한 수 (전화번호 다름, 미등록 등)."""
+    errors: list[str] = field(default_factory=list)
+
+
+def backfill_customer_addresses(
+    client,
+    groups: list[OrderGroup],
+    *,
+    store_name: str,
+) -> AddressBackfillResult:
+    """이미 앱에 등록된 고객의 빈 주소만 엑셀 주소로 보완한다.
+
+    `commit_import` 의 중복 임포트 방지 로직(출고번호/등록일 기준 invalid 판정)과
+    완전히 무관하게 동작하므로, 이미 임포트를 마친 엑셀을 그대로 재업로드해도
+    정상적으로 주소를 보완할 수 있다. 주문·결제·라인 아이템은 절대 조회·수정하지 않고,
+    `app_customers.address` 가 이미 채워져 있으면 절대 덮어쓰지 않는다.
+    """
+    res = AddressBackfillResult()
+    if client is None or not store_name:
+        res.errors.append("client/store_name 필수")
+        return res
+
+    all_identities: set[str] = {g.identity_key for g in groups if g.identity_key}
+    identity_to_address: dict[str, str] = {}
+    for g in groups:
+        if not g.identity_key or not g.address:
+            continue
+        identity_to_address.setdefault(g.identity_key, g.address)
+    res.scanned_customers = len(all_identities)
+    res.no_address_in_excel = len(all_identities) - len(identity_to_address)
+    if not identity_to_address:
+        return res
+
+    try:
+        existing_map = load_existing_customer_identity_map(client, store_name)
+    except Exception as e:
+        res.errors.append(f"기존 고객 조회 실패: {e}")
+        return res
+
+    cid_to_address: dict[int, str] = {}
+    for identity_key, addr in identity_to_address.items():
+        cid = existing_map.get(identity_key)
+        if cid is None:
+            res.not_matched += 1
+            continue
+        res.matched_existing += 1
+        cid_to_address.setdefault(int(cid), addr)
+
+    if not cid_to_address:
+        return res
+
+    _BATCH = 100
+    _ids = list(cid_to_address.keys())
+    for _bi in range(0, len(_ids), _BATCH):
+        chunk_ids = _ids[_bi:_bi + _BATCH]
+        try:
+            resp = client.table("app_customers").select("id, address").in_("id", chunk_ids).execute()
+            rows = (resp.data or []) if hasattr(resp, "data") else []
+        except Exception as e:
+            res.errors.append(f"고객 주소 조회 실패 ({len(chunk_ids)}건): {e}")
+            continue
+        for row in rows:
+            _cid = row.get("id")
+            if _cid is None:
+                continue
+            _cid = int(_cid)
+            _cur_addr = row.get("address")
+            if _cur_addr and str(_cur_addr).strip():
+                res.already_had_address += 1
+                continue
+            _new_addr = cid_to_address.get(_cid)
+            if not _new_addr:
+                continue
+            try:
+                client.table("app_customers").update({"address": _new_addr}).eq("id", _cid).execute()
+                res.address_filled += 1
+            except Exception as e:
+                res.errors.append(f"고객#{_cid} 주소 보완 실패: {e}")
+    return res
+
+
 __all__ = [
     "PURCHASE_IMPORT_SOURCE",
     "PURCHASE_TARGET_FIELDS",
@@ -1654,6 +1752,7 @@ __all__ = [
     "OrderGroup",
     "PurchasePreviewResult",
     "PurchaseCommitResult",
+    "AddressBackfillResult",
     "ChannelTalkMergeResult",
     "RollbackPreviewResult",
     "RollbackCommitResult",
@@ -1668,6 +1767,7 @@ __all__ = [
     "load_existing_customer_identity_map",
     "migrate_channeltalk_phones",
     "commit_import",
+    "backfill_customer_addresses",
     "preview_rollback",
     "commit_rollback",
 ]
