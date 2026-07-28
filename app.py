@@ -11789,6 +11789,236 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
     }
 
 
+def _erp_build_attendance_audit_rows(employee_name: str, fallback_db: str,
+                                     start: date, end: date) -> list:
+    """일자별 근무시간 상세 감사 행 (엑셀 다운로드용).
+
+    카운터(_erp_compute_monthly_remaining)와 **완전히 동일한 수식**으로 일자별 인정 시간을
+    분해해, 캘린더에 표시되는 시프트·로그와 카운터에 실제 반영된 시간의 차이를
+    행 단위로 드러낸다. '카운터누락시프트(h)' > 0 인 날짜가 불일치의 원인 날짜다
+    (같은 날 승인 로그가 있으면 시프트를 무시하는 현행 정책 때문)."""
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    today_d = date.today()
+    shifts_by_date: dict = {}
+    logs_by_date: dict = {}
+    try:
+        _rs = client.table("app_shift_schedules")\
+            .select("shift_date,shift_start,shift_end,db_filename,work_location_name")\
+            .eq("employee_name", employee_name)\
+            .gte("shift_date", start.isoformat())\
+            .lte("shift_date", end.isoformat())\
+            .execute()
+        for sh in (_rs.data or []):
+            _sd = str(sh.get("shift_date") or "")[:10]
+            if _sd:
+                shifts_by_date.setdefault(_sd, []).append(sh)
+    except Exception:
+        pass
+    try:
+        _rl = client.table("app_attendance_logs").select("*")\
+            .eq("employee_name", employee_name)\
+            .gte("log_date", start.isoformat())\
+            .lte("log_date", end.isoformat())\
+            .execute()
+        for l in (_rl.data or []):
+            _ld = str(l.get("log_date") or "")[:10]
+            if _ld:
+                logs_by_date.setdefault(_ld, []).append(l)
+    except Exception:
+        pass
+
+    rows: list = []
+    for d_iso in sorted(set(shifts_by_date) | set(logs_by_date)):
+        try:
+            d_obj = date.fromisoformat(d_iso)
+        except Exception:
+            continue
+        # ── 시프트 인정 분 (휴게 차감, NULL 시각은 매장 기본시각 폴백) ──
+        shift_min = 0
+        shift_txts: list = []
+        for sh in shifts_by_date.get(d_iso, []):
+            ss = _erp_parse_time(sh.get("shift_start"))
+            ee = _erp_parse_time(sh.get("shift_end"))
+            if not ss or not ee:
+                try:
+                    ss, ee = _erp_default_times_for_date(str(sh.get("db_filename") or fallback_db), d_obj)
+                except Exception:
+                    ss = ee = None
+            if ss and ee:
+                _raw = (ee.hour * 60 + ee.minute) - (ss.hour * 60 + ss.minute)
+                _m = max(0, _raw - _erp_break_min(_raw)) if _raw > 0 else 0
+                shift_min += _m
+                shift_txts.append(f"{ss.strftime('%H:%M')}~{ee.strftime('%H:%M')}")
+            else:
+                shift_txts.append("(시각 미입력)")
+        # ── 로그별 인정 분 (카운터와 동일 수식) ─────────────────────
+        log_min = 0
+        log_txts: list = []
+        note_parts: list = []
+        has_approved_log = False
+        for l in logs_by_date.get(d_iso, []):
+            wt = l.get("work_type") or ""
+            status = l.get("status") or "approved"
+            _ss = _erp_parse_time(l.get("start_time"))
+            _ee = _erp_parse_time(l.get("end_time"))
+            _dm = int(l.get("diff_minutes") or 0)
+            rec = 0
+            if wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+                if _ss and _ee:
+                    _raw = max(0, (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute))
+                    rec = max(0, _raw - _erp_break_min(_raw))
+                if rec == 0:
+                    _std_s = _erp_parse_time(l.get("standard_start"))
+                    _std_e = _erp_parse_time(l.get("standard_end"))
+                    if _std_s and _std_e:
+                        _std_raw = max(0, (_std_e.hour * 60 + _std_e.minute)
+                                       - (_std_s.hour * 60 + _std_s.minute))
+                        _act = max(0, _std_raw - (_dm if wt in ("지각", "조퇴") else 0))
+                        rec = max(0, _act - _erp_break_min(_act))
+            elif wt == "연차":
+                rec = 480
+            elif wt == "반차":
+                rec = 240
+            elif wt in ("시차사용", "포상시간"):
+                rec = _dm
+            else:
+                note_parts.append(f"'{wt}' 로그는 카운터 미집계 유형")
+            _t = (f"{_ss.strftime('%H:%M')}~{_ee.strftime('%H:%M')}" if (_ss and _ee)
+                  else (f"{_dm}분" if _dm else ""))
+            _st_tag = "" if status == "approved" else f" [{status}]"
+            log_txts.append(f"{wt} {_t}".strip() + _st_tag)
+            if status == "approved":
+                has_approved_log = True
+                log_min += rec
+            else:
+                note_parts.append(f"미승인({status}) 로그는 카운터 미반영")
+        # ── 카운터 반영 (logs 우선 정책 그대로 재현) ────────────────
+        skipped_shift_min = 0
+        if d_obj > today_d:
+            counter_min = 0
+            src = "미래 (카운터 미집계)"
+        elif has_approved_log:
+            counter_min = log_min
+            if shift_min > 0:
+                src = "로그 (⚠️ 시프트 미반영)"
+                skipped_shift_min = shift_min
+            else:
+                src = "로그"
+        elif shift_min > 0:
+            counter_min = shift_min
+            src = "시프트"
+        else:
+            counter_min = 0
+            src = "-"
+        rows.append({
+            "날짜": d_iso,
+            "요일": _ERP_DOW_LABELS[d_obj.weekday()],
+            "정기시프트": " / ".join(shift_txts),
+            "시프트인정(h)": round(shift_min / 60, 2),
+            "근태로그": " / ".join(log_txts),
+            "로그인정(h)": round(log_min / 60, 2),
+            "카운터반영(h)": round(counter_min / 60, 2),
+            "반영출처": src,
+            "카운터누락시프트(h)": round(skipped_shift_min / 60, 2),
+            "비고": "; ".join(sorted(set(note_parts))),
+        })
+    return rows
+
+
+def _erp_render_attendance_excel_export(current_db: str, role: str, me_name: str,
+                                        all_dbs: list, year: int, month: int) -> None:
+    """근무시간 상세 엑셀 다운로드 (카운터 ↔ 캘린더 대사·검증용).
+
+    - 일반 직원: 본인 내역만 다운로드.
+    - 관리자(store_admin/superadmin): 직원 다중 선택 (비우면 전체 직원).
+    - 기간: 연도 + 월(또는 '전체 (연간)').
+    - 시트: '월별 요약'(목표/계획/카운터누적/잔여/누락시프트합), '일자별 상세'."""
+    _is_admin = role in ("store_admin", "superadmin")
+    with st.expander("📥 근무시간 상세 엑셀 다운로드 (카운터 검증용)", expanded=False):
+        st.caption(
+            "일자별로 정기 시프트·근태 로그와 카운터에 실제 반영된 시간을 나란히 보여줍니다. "
+            "**'카운터누락시프트(h)'가 0보다 큰 날짜**는 같은 날 근태 로그(추가근무·회의 등)가 있어 "
+            "정기 시프트가 카운터 집계에서 제외된 날입니다. 캘린더 표시와 상단 카운터가 다르게 "
+            "보이는 원인을 이 열로 확인할 수 있습니다."
+        )
+        emp_db_map: dict = {}
+        for _dbf in all_dbs:
+            for _e in _erp_get_employee_names_for_store(_dbf):
+                emp_db_map.setdefault(_e, _dbf)
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            _x_year = st.number_input("연도", min_value=2020, max_value=2100,
+                                      value=int(year), step=1, key="erp_att_xlsx_year")
+        with c2:
+            _x_month = st.selectbox("월", ["전체 (연간)"] + list(range(1, 13)),
+                                    index=int(month), key="erp_att_xlsx_month")
+        with c3:
+            if _is_admin:
+                _emp_opts = sorted(emp_db_map.keys())
+                _x_emps = st.multiselect("직원 선택 (비우면 전체 직원)", _emp_opts,
+                                         default=[], key="erp_att_xlsx_emps")
+                if not _x_emps:
+                    _x_emps = _emp_opts
+            else:
+                _x_emps = [me_name] if me_name else []
+                st.text_input("대상 직원 (본인)", value=me_name or "", disabled=True,
+                              key="erp_att_xlsx_me")
+        if st.button("📊 엑셀 생성", key="erp_att_xlsx_build", type="primary"):
+            if not _x_emps:
+                st.warning("대상 직원이 없습니다.")
+            else:
+                _months = list(range(1, 13)) if _x_month == "전체 (연간)" else [int(_x_month)]
+                detail_rows: list = []
+                summary_rows: list = []
+                _pg = st.progress(0.0, text="근무시간 집계 중…")
+                for _i, _emp in enumerate(_x_emps):
+                    _edb = emp_db_map.get(_emp, current_db)
+                    for _m in _months:
+                        _s = date(int(_x_year), _m, 1)
+                        _e = date(int(_x_year), _m, calendar.monthrange(int(_x_year), _m)[1])
+                        _rows = _erp_build_attendance_audit_rows(_emp, _edb, _s, _e)
+                        for _r in _rows:
+                            detail_rows.append({"직원": _emp, **_r})
+                        _ctr = _erp_compute_monthly_remaining(_edb, _emp, int(_x_year), _m)
+                        _pl = _erp_compute_monthly_planned_minutes(_emp, int(_x_year), _m,
+                                                                   fallback_db=_edb)
+                        _skip_sum = sum(float(_r.get("카운터누락시프트(h)") or 0) for _r in _rows)
+                        summary_rows.append({
+                            "직원": _emp,
+                            "연월": f"{int(_x_year)}-{_m:02d}",
+                            "목표(h)": round(_ctr["target_min"] / 60, 2),
+                            "계획(h)": round(_pl / 60, 2),
+                            "카운터누적(h)": round(_ctr["worked_min"] / 60, 2),
+                            "잔여(h)": round(_ctr["remaining_min"] / 60, 2),
+                            "카운터누락시프트합(h)": round(_skip_sum, 2),
+                        })
+                    _pg.progress((_i + 1) / len(_x_emps),
+                                 text=f"근무시간 집계 중… ({_i + 1}/{len(_x_emps)})")
+                _pg.empty()
+                if not detail_rows:
+                    st.info("선택한 기간에 근무 데이터가 없습니다.")
+                    st.session_state.pop("erp_att_xlsx_data", None)
+                else:
+                    _df_s = pd.DataFrame(summary_rows)
+                    _df_d = pd.DataFrame(detail_rows)
+                    _buf = io.BytesIO()
+                    with pd.ExcelWriter(_buf, engine="openpyxl") as _wr:
+                        _df_s.to_excel(_wr, sheet_name="월별 요약", index=False)
+                        _df_d.to_excel(_wr, sheet_name="일자별 상세", index=False)
+                    _m_tag = "연간" if _x_month == "전체 (연간)" else f"{int(_x_month):02d}월"
+                    _emp_tag = _x_emps[0] if len(_x_emps) == 1 else f"직원{len(_x_emps)}명"
+                    _fn = f"근무시간상세_{int(_x_year)}_{_m_tag}_{_emp_tag}.xlsx"
+                    st.session_state["erp_att_xlsx_data"] = (_buf.getvalue(), _fn)
+                    st.success(f"생성 완료 — 일자별 {len(detail_rows)}행 / 요약 {len(summary_rows)}행")
+        _cached = st.session_state.get("erp_att_xlsx_data")
+        if _cached:
+            st.download_button("📥 엑셀 다운로드", data=_cached[0], file_name=_cached[1],
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="erp_att_xlsx_dl")
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _erp_fetch_range_cached(table: str, db_col: str, db_filename: str, date_col: str,
                             start_iso: str, end_iso: str, extra_key: tuple) -> list:
@@ -14988,6 +15218,10 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 else:
                     st.info("이 Streamlit 버전은 팝업(st.dialog) 을 지원하지 않습니다. "
                             "'추가근무·휴무 신청' 탭에서 등록해 주세요.")
+
+    # ── 📥 근무시간 상세 엑셀 다운로드 (카운터 ↔ 캘린더 검증용) ──────
+    _erp_render_attendance_excel_export(current_db, role, me_name, all_dbs,
+                                        int(year), int(month))
 
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
     cal_obj = _cal.Calendar(firstweekday=6)
