@@ -17445,7 +17445,10 @@ def render_document_library():
 
     # ── Supabase Storage 업로드 헬퍼 ──────────────────────────────
     def _upload_file(doc_id, uploaded_file) -> tuple[str, str]:
-        """파일을 Supabase Storage 'documents' 버킷에 업로드. (url, filename) 반환."""
+        """파일을 Supabase Storage 'documents' 버킷에 업로드. (스토리지 경로, filename) 반환.
+
+        보안: 버킷을 Private 으로 운영하기 위해 public URL 대신 스토리지 경로를
+        file_url 컬럼에 저장하고, 표시 시점에 _doc_signed_url() 로 서명 URL 을 생성한다."""
         import mimetypes, re, unicodedata
         _fname_orig = uploaded_file.name
         _fbytes     = uploaded_file.read()
@@ -17466,9 +17469,35 @@ def render_document_library():
             _spath, _fbytes,
             file_options={"content-type": _mime, "upsert": "true"},
         )
-        _url = client.storage.from_("documents").get_public_url(_spath)
-        # DB에는 원본 파일명을 저장해 사용자에게 표시
-        return _url, _fname_orig
+        # DB에는 스토리지 경로 + 원본 파일명 저장 (URL 은 표시 시점에 서명 생성)
+        return _spath, _fname_orig
+
+    @st.cache_data(ttl=1800, show_spinner=False)
+    def _doc_signed_url(raw: str) -> str:
+        """file_url 값(신규: 스토리지 경로 / 구버전: public URL)을 서명 URL 로 변환.
+
+        documents 버킷을 Private 으로 전환해도 다운로드·미리보기가 계속 동작한다.
+        서명 유효 1시간, 캐시 30분 (만료 전 재발급). 실패 시 원본 값 반환."""
+        if not raw:
+            return ""
+        _path = raw
+        if raw.startswith("http"):
+            _marker = "/object/public/documents/"
+            if _marker in raw:
+                # 구버전 public URL → 경로 추출 (한글 파일명 percent-encoding 해제)
+                _path = _uparse.unquote(raw.split(_marker, 1)[1].split("?")[0])
+            else:
+                return raw  # documents 버킷 URL 이 아니면 그대로 사용
+        try:
+            _sb, _e = get_supabase_client()
+            if _e or not _sb:
+                return raw
+            _r = _sb.storage.from_("documents").create_signed_url(_path, 3600)
+            if isinstance(_r, dict):
+                return _r.get("signedURL") or _r.get("signed_url") or raw
+            return getattr(_r, "signedURL", None) or getattr(_r, "signed_url", None) or raw
+        except Exception:
+            return raw
 
     def _fmt_size(size: int | None) -> str:
         if not size:
@@ -17672,7 +17701,7 @@ def render_document_library():
             _doc_cat     = (_doc.get("category") or "미분류").strip()
             _doc_sub     = (_doc.get("subcategory") or "").strip()
             _doc_date    = str(_doc.get("created_at", ""))[:16].replace("T", " ")
-            _doc_furl    = _doc.get("file_url") or ""
+            _doc_furl    = _doc_signed_url(_doc.get("file_url") or "")
             _doc_fname   = _doc.get("file_name") or ""
             _doc_fsize   = _doc.get("file_size")
 
