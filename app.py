@@ -264,8 +264,9 @@ _SUPERADMIN_MENUS = [
     "⑥ 미수금(잔금) 레포트",
     "⑦ 결제수단별 집계표",
     "⑧ 💰 입금 관리",
-    "⑨ ⚠️ 데이터 초기화 (Danger Zone)",
-    "⑩ FAQ (도움말)",
+    "⑨ 🗺️ 상권 퍼포먼스 맵",
+    "⑩ ⚠️ 데이터 초기화 (Danger Zone)",
+    "⑪ FAQ (도움말)",
 ]
 
 
@@ -287,6 +288,7 @@ def _get_sales_tab_labels(role: str) -> list[str]:
             "12. 전시품 판매 검증",
             "13. FAQ (도움말)",
             "14. AI 세일즈 리포트",
+            "15. 🗺️ 상권 퍼포먼스 맵",
         ]
     return [
         "1. 대시보드",
@@ -24853,9 +24855,15 @@ def render_superadmin():
         render_monthly_payment_report(is_superadmin=True)
     elif menu_sel == "⑧ 💰 입금 관리":
         render_deposit_management()
-    elif menu_sel == "⑨ ⚠️ 데이터 초기화 (Danger Zone)":
+    elif menu_sel == "⑨ 🗺️ 상권 퍼포먼스 맵":
+        try:
+            from dong_commercial_map import render_dong_commercial_map  # noqa: WPS433
+            render_dong_commercial_map()
+        except Exception as _dme:
+            st.error(f"상권 퍼포먼스 맵 모듈 로드 실패: {_dme}")
+    elif menu_sel == "⑩ ⚠️ 데이터 초기화 (Danger Zone)":
         _superadmin_tab_danger_zone_data_reset()
-    elif menu_sel == "⑩ FAQ (도움말)":
+    elif menu_sel == "⑪ FAQ (도움말)":
         render_faq_page()
 
 
@@ -31442,6 +31450,12 @@ def main():
         render_faq_page()
     elif role == "store_admin" and idx == 13:
         render_ai_sales_reports()
+    elif role == "store_admin" and idx == 14:
+        try:
+            from dong_commercial_map import render_dong_commercial_map  # noqa: WPS433
+            render_dong_commercial_map()
+        except Exception as _dme:
+            st.error(f"상권 퍼포먼스 맵 모듈 로드 실패: {_dme}")
     elif role == "user" and idx == 9:
         render_faq_page()
 
