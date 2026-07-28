@@ -36,6 +36,22 @@ BEGIN
   END LOOP;
 END $$;
 
+-- 1-b) 기존 'Allow all' 등 허용 정책 전부 제거
+--      (과거 각 테이블 생성 SQL 이 만든 USING (true) 정책이 남아 있으면
+--       RLS 를 켜도 익명 접근이 계속 허용되고 Advisor 경고도 유지된다.
+--       service_role 은 RLS 를 우회하므로 정책이 없어도 앱은 정상 동작.)
+DO $$
+DECLARE tbl TEXT; pol TEXT;
+BEGIN
+  FOR tbl, pol IN
+    SELECT schemaname || '.' || tablename, policyname
+    FROM pg_policies
+    WHERE schemaname = 'public'
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS %I ON %s', pol, tbl);
+  END LOOP;
+END $$;
+
 -- 2) 이중 안전장치: anon/authenticated 의 테이블·시퀀스 권한 자체를 회수
 --    (RLS 와 별개로 GRANT 레벨에서도 차단 — 향후 새 테이블에도 기본 적용)
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
