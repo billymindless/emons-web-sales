@@ -11688,11 +11688,13 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
     """월 카운터 = 월 목표 - 누적 인정 시간. 반환: target_min, worked_min, remaining_min, percent.
     120s 캐시 (근태/근무일정 변경 시 _erp_invalidate_fetch_caches 로 무효화).
 
-    집계 정책 (yearly_breakdown과 동일):
+    집계 정책 (yearly_breakdown과 동일 · 캘린더 표시와 일치):
       - app_attendance_logs + app_shift_schedules 모두 포함
       - 전 매장 합산 (db_filename 필터 없음)
       - 오늘까지만 집계 (미래 날짜 제외)
-      - logs가 있는 날은 logs 우선, 없는 날만 shifts 사용 (중복 방지)
+      - 전일 대체 유형(정상·지각·조퇴·연차·반차) logs가 있는 날만 shifts 제외 (중복 방지).
+        보조 유형(추가근무·회의·행사·시차·포상시간)은 shifts 에 가산 — 캘린더에 둘 다
+        표시되는 것과 동일하게 집계.
       - 4시간 이상 근무 시 점심 60분 차감
     """
     target_h = _erp_get_employee_monthly_target(db_filename, employee_name)
@@ -11726,7 +11728,7 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                     _raw = max(0, (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute))
                     _actual = max(0, _raw - _erp_break_min(_raw))
                 # NULL 시각 보정: standard_start/end + diff_minutes 사용
-                if _actual == 0 and _wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+                if _actual == 0 and _wt in ("정상", "추가근무", "회의", "행사", "지각", "조퇴"):
                     _std_s_l = _erp_parse_time(_l.get("standard_start"))
                     _std_e_l = _erp_parse_time(_l.get("standard_end"))
                     if _std_s_l and _std_e_l:
@@ -11735,9 +11737,10 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
                         _diff_s = int(_l.get("diff_minutes") or 0)
                         _act_r = max(0, _log_std_r - (_diff_s if _wt in ("지각", "조퇴") else 0))
                         _actual = max(0, _act_r - _erp_break_min(_act_r))
-                if _ld:
+                # 전일 대체 유형만 시프트를 대체 (보조 유형은 시프트에 가산 — 캘린더와 일치)
+                if _ld and _wt in ("정상", "지각", "조퇴", "연차", "반차"):
                     log_dates.add(_ld)
-                if _wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+                if _wt in ("정상", "추가근무", "회의", "행사", "지각", "조퇴"):
                     worked_min += _actual
                 elif _wt == "연차":
                     worked_min += 480
@@ -11748,7 +11751,7 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
     except Exception:
         pass
 
-    # 2) shift_schedules (logs가 없는 날만, 전 매장, 오늘까지)
+    # 2) shift_schedules (전일 대체 logs가 없는 날만, 전 매장, 오늘까지)
     try:
         _cli2, _err2 = get_supabase_client()
         if not _err2 and _cli2:
@@ -11761,7 +11764,7 @@ def _erp_compute_monthly_remaining(db_filename: str, employee_name: str,
             for _sh in (_rs.data or []):
                 _sd = str(_sh.get("shift_date") or "")[:10]
                 if not _sd or _sd in log_dates:
-                    continue  # logs 우선 (중복 방지)
+                    continue  # 전일 대체 logs(정상·지각·조퇴·연차·반차) 우선 (중복 방지)
                 _ss = _erp_parse_time(_sh.get("shift_start"))
                 _ee = _erp_parse_time(_sh.get("shift_end"))
                 # NULL 시간 폴백: 매장 기본 출퇴근 시각 사용
@@ -11794,9 +11797,10 @@ def _erp_build_attendance_audit_rows(employee_name: str, fallback_db: str,
     """일자별 근무시간 상세 감사 행 (엑셀 다운로드용).
 
     카운터(_erp_compute_monthly_remaining)와 **완전히 동일한 수식**으로 일자별 인정 시간을
-    분해해, 캘린더에 표시되는 시프트·로그와 카운터에 실제 반영된 시간의 차이를
-    행 단위로 드러낸다. '카운터누락시프트(h)' > 0 인 날짜가 불일치의 원인 날짜다
-    (같은 날 승인 로그가 있으면 시프트를 무시하는 현행 정책 때문)."""
+    분해한다. 집계 정책: 전일 대체 유형(정상·지각·조퇴·연차·반차) 로그가 있는 날만
+    시프트를 로그로 대체하고, 보조 유형(추가근무·회의·행사·시차·포상시간)은 시프트에
+    가산한다 — 캘린더 표시와 동일. '시프트대체(h)' > 0 인 날짜는 전일 대체 로그가
+    시프트를 대신해 집계된 날짜다 (의도된 대체)."""
     client, err = get_supabase_client()
     if err or not client:
         return []
@@ -11857,7 +11861,7 @@ def _erp_build_attendance_audit_rows(employee_name: str, fallback_db: str,
         log_min = 0
         log_txts: list = []
         note_parts: list = []
-        has_approved_log = False
+        has_fullday_log = False  # 전일 대체 유형(정상·지각·조퇴·연차·반차) 승인 로그 존재
         for l in logs_by_date.get(d_iso, []):
             wt = l.get("work_type") or ""
             status = l.get("status") or "approved"
@@ -11865,7 +11869,7 @@ def _erp_build_attendance_audit_rows(employee_name: str, fallback_db: str,
             _ee = _erp_parse_time(l.get("end_time"))
             _dm = int(l.get("diff_minutes") or 0)
             rec = 0
-            if wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+            if wt in ("정상", "추가근무", "회의", "행사", "지각", "조퇴"):
                 if _ss and _ee:
                     _raw = max(0, (_ee.hour * 60 + _ee.minute) - (_ss.hour * 60 + _ss.minute))
                     rec = max(0, _raw - _erp_break_min(_raw))
@@ -11890,22 +11894,29 @@ def _erp_build_attendance_audit_rows(employee_name: str, fallback_db: str,
             _st_tag = "" if status == "approved" else f" [{status}]"
             log_txts.append(f"{wt} {_t}".strip() + _st_tag)
             if status == "approved":
-                has_approved_log = True
                 log_min += rec
+                if wt in ("정상", "지각", "조퇴", "연차", "반차"):
+                    has_fullday_log = True
             else:
                 note_parts.append(f"미승인({status}) 로그는 카운터 미반영")
-        # ── 카운터 반영 (logs 우선 정책 그대로 재현) ────────────────
-        skipped_shift_min = 0
+        # ── 카운터 반영 (전일 대체 유형만 시프트 대체, 보조 유형은 가산) ──
+        replaced_shift_min = 0
         if d_obj > today_d:
             counter_min = 0
             src = "미래 (카운터 미집계)"
-        elif has_approved_log:
+        elif has_fullday_log:
             counter_min = log_min
             if shift_min > 0:
-                src = "로그 (⚠️ 시프트 미반영)"
-                skipped_shift_min = shift_min
+                src = "로그 대체 (정상·연차 등)"
+                replaced_shift_min = shift_min
             else:
                 src = "로그"
+        elif log_min > 0 and shift_min > 0:
+            counter_min = shift_min + log_min
+            src = "시프트+로그 가산"
+        elif log_min > 0:
+            counter_min = log_min
+            src = "로그"
         elif shift_min > 0:
             counter_min = shift_min
             src = "시프트"
@@ -11921,7 +11932,7 @@ def _erp_build_attendance_audit_rows(employee_name: str, fallback_db: str,
             "로그인정(h)": round(log_min / 60, 2),
             "카운터반영(h)": round(counter_min / 60, 2),
             "반영출처": src,
-            "카운터누락시프트(h)": round(skipped_shift_min / 60, 2),
+            "시프트대체(h)": round(replaced_shift_min / 60, 2),
             "비고": "; ".join(sorted(set(note_parts))),
         })
     return rows
@@ -11939,9 +11950,9 @@ def _erp_render_attendance_excel_export(current_db: str, role: str, me_name: str
     with st.expander("📥 근무시간 상세 엑셀 다운로드 (카운터 검증용)", expanded=False):
         st.caption(
             "일자별로 정기 시프트·근태 로그와 카운터에 실제 반영된 시간을 나란히 보여줍니다. "
-            "**'카운터누락시프트(h)'가 0보다 큰 날짜**는 같은 날 근태 로그(추가근무·회의 등)가 있어 "
-            "정기 시프트가 카운터 집계에서 제외된 날입니다. 캘린더 표시와 상단 카운터가 다르게 "
-            "보이는 원인을 이 열로 확인할 수 있습니다."
+            "집계 정책: 정상·지각·조퇴·연차·반차 로그가 있는 날은 로그가 시프트를 대체하고 "
+            "('시프트대체(h)' 열), 추가근무·회의·행사·시차·포상시간 로그는 시프트에 가산됩니다 — "
+            "캘린더 표시와 동일합니다."
         )
         emp_db_map: dict = {}
         for _dbf in all_dbs:
@@ -11984,7 +11995,7 @@ def _erp_render_attendance_excel_export(current_db: str, role: str, me_name: str
                         _ctr = _erp_compute_monthly_remaining(_edb, _emp, int(_x_year), _m)
                         _pl = _erp_compute_monthly_planned_minutes(_emp, int(_x_year), _m,
                                                                    fallback_db=_edb)
-                        _skip_sum = sum(float(_r.get("카운터누락시프트(h)") or 0) for _r in _rows)
+                        _repl_sum = sum(float(_r.get("시프트대체(h)") or 0) for _r in _rows)
                         summary_rows.append({
                             "직원": _emp,
                             "연월": f"{int(_x_year)}-{_m:02d}",
@@ -11992,7 +12003,7 @@ def _erp_render_attendance_excel_export(current_db: str, role: str, me_name: str
                             "계획(h)": round(_pl / 60, 2),
                             "카운터누적(h)": round(_ctr["worked_min"] / 60, 2),
                             "잔여(h)": round(_ctr["remaining_min"] / 60, 2),
-                            "카운터누락시프트합(h)": round(_skip_sum, 2),
+                            "시프트대체합(h)": round(_repl_sum, 2),
                         })
                     _pg.progress((_i + 1) / len(_x_emps),
                                  text=f"근무시간 집계 중… ({_i + 1}/{len(_x_emps)})")
@@ -12760,7 +12771,9 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
     집계 정책: **캘린더에 표시된 시간 그대로, 전 매장 합산** (db_filename 무관)
       - attendance_logs / shift_schedules 모두 employee_name 기준
-      - 같은 날 attendance_logs가 있으면 logs 우선, 없으면 shift_schedules 가산 (중복 방지)
+      - 같은 날 전일 대체 유형(정상·지각·조퇴·연차·반차) logs가 있으면 logs 우선,
+        보조 유형(추가근무·회의·행사·시차·포상시간)만 있는 날은 shift 가산 + 보조 log 가산
+        (캘린더에 시프트·보조 배지가 함께 표시되는 것과 동일)
 
     반환 dict (단위: 분):
       - required_min      : 공통 필요근무시간
@@ -12857,7 +12870,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
         # ── NULL 시각 보정 ─────────────────────────────────────────────
         # start_time/end_time이 없으면 standard_start/end + diff_minutes로 추정
-        if actual_min == 0 and wt in ("정상", "추가근무", "행사", "지각", "조퇴"):
+        if actual_min == 0 and wt in ("정상", "추가근무", "회의", "행사", "지각", "조퇴"):
             _std_s_log = _erp_parse_time(l.get("standard_start"))
             _std_e_log = _erp_parse_time(l.get("standard_end"))
             if _std_s_log and _std_e_log:
@@ -12868,8 +12881,9 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                 _act_raw = max(0, _log_std_raw - (_diff_stored if wt in ("지각", "조퇴") else 0))
                 actual_min = max(0, _act_raw - _erp_break_min(_act_raw))
 
-        # ── log_dates 등록 (연차/반차/시차사용도 날짜 점유) ──────────
-        if _ld_str:
+        # ── log_dates 등록: 전일 대체 유형(정상·지각·조퇴·연차·반차)만 ──
+        # 보조 유형(추가근무·회의·행사·시차·포상시간)은 같은 날 시프트에 가산 (캘린더와 일치)
+        if _ld_str and wt in ("정상", "지각", "조퇴", "연차", "반차"):
             log_dates.add(_ld_str)
 
         if wt == "정상":
@@ -12878,7 +12892,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                 "date": _ld_str, "type": "log:정상", "h": round(actual_min / 60, 2),
                 "store": l.get("home_db_filename") or "",
             })
-        elif wt in ("추가근무", "행사"):
+        elif wt in ("추가근무", "회의", "행사"):
             overtime_min_logs += actual_min
         elif wt in ("지각", "조퇴"):
             # normal_min_logs: 실제 근무한 분(actual_min) 만 정상근무로 인정.
@@ -12911,7 +12925,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
     # ── 시프트 자동 가산 (app_shift_schedules, 오늘 포함 과거) ──
     # 복수 매장 지원: db_filename 필터 제거 → 모든 매장 시프트 합산
-    # logs에 이미 있는 날짜는 logs가 우선 (중복 방지)
+    # 전일 대체 logs(정상·지각·조퇴·연차·반차)가 있는 날짜만 logs 우선 (중복 방지)
     shift_normal_min = 0
     _debug_null_shifts: list[str] = []   # 시간 미입력 시프트 날짜 목록 (경고용)
     try:
