@@ -1,10 +1,17 @@
 -- =====================================================================
--- app_documents 403 오류 해결 — 둘 중 하나만 실행하세요
+-- ⚠️ 사용 금지 (DEPRECATED — 보안 취약)
 -- =====================================================================
+-- RLS 비활성화/anon 허용 정책은 프로젝트 URL + anon 키만으로 외부 접근을
+-- 허용한다. 403 오류는 배포 secrets 에 service_role_key 를 설정해 해결할 것.
+-- 보안 설정은 SUPABASE_SECURITY_ENABLE_RLS_ALL.sql 참고.
+-- =====================================================================
+-- (이하 원본 — 실행하지 마세요)
+
+-- app_documents 403 오류 해결 — 둘 중 하나만 실행하세요
 
 -- ▶ 방법 1 (권장, 가장 간단): RLS 완전 비활성화
 --   내부 ERP 앱이므로 RLS 불필요
-ALTER TABLE app_documents DISABLE ROW LEVEL SECURITY;
+-- ALTER TABLE app_documents DISABLE ROW LEVEL SECURITY;
 
 
 -- ▶ 방법 2: RLS 유지 + 모든 역할에 명시적 권한 부여 (방법 1 대신 사용)

@@ -43,19 +43,19 @@ CREATE INDEX IF NOT EXISTS idx_app_sales_reports_store
 CREATE INDEX IF NOT EXISTS idx_app_sales_reports_status
   ON app_sales_reports (status);
 
--- updated_at 자동 갱신 트리거
+-- updated_at 자동 갱신 트리거 (search_path 고정 — Advisor 경고 방지)
 CREATE OR REPLACE FUNCTION app_sales_reports_touch_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
   NEW.updated_at = now();
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SET search_path = '';
 
 DROP TRIGGER IF EXISTS trg_app_sales_reports_updated_at ON app_sales_reports;
 CREATE TRIGGER trg_app_sales_reports_updated_at
   BEFORE UPDATE ON app_sales_reports
   FOR EACH ROW EXECUTE FUNCTION app_sales_reports_touch_updated_at();
 
--- RLS 비활성화 (내부 ERP, service_role_key 사용)
-ALTER TABLE app_sales_reports DISABLE ROW LEVEL SECURITY;
+-- RLS 활성화 (정책 없음 = anon 기본 거부. service_role 은 RLS 우회 → 앱 정상 동작)
+ALTER TABLE app_sales_reports ENABLE ROW LEVEL SECURITY;

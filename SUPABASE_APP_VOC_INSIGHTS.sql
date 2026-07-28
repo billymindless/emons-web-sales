@@ -23,5 +23,5 @@ CREATE INDEX IF NOT EXISTS idx_voc_insights_analyzed_at ON app_voc_insights (ana
 CREATE INDEX IF NOT EXISTS idx_voc_insights_sentiment    ON app_voc_insights (sentiment);
 CREATE INDEX IF NOT EXISTS idx_voc_insights_is_claim     ON app_voc_insights (is_claim);
 
--- RLS 비활성화 (내부 ERP, service_role_key 사용)
-ALTER TABLE app_voc_insights DISABLE ROW LEVEL SECURITY;
+-- RLS 활성화 (정책 없음 = anon 기본 거부. service_role 은 RLS 우회 → 앱 정상 동작)
+ALTER TABLE app_voc_insights ENABLE ROW LEVEL SECURITY;

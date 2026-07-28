@@ -59,6 +59,10 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM anon, authenticated;
 
+-- 3) Advisor 'Function Search Path Mutable' 경고 해소
+--    updated_at 트리거 함수에 search_path 고정 (search_path 조작 공격 방지)
+ALTER FUNCTION public.app_sales_reports_touch_updated_at() SET search_path = '';
+
 -- =====================================================================
 -- 검증 쿼리 (실행 후 확인)
 -- =====================================================================

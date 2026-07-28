@@ -17,4 +17,5 @@ CREATE TABLE IF NOT EXISTS app_employee_salaries (
   UNIQUE (db_filename, employee_name)
 );
 
-ALTER TABLE app_employee_salaries DISABLE ROW LEVEL SECURITY;
+-- RLS 활성화 (정책 없음 = anon 기본 거부. service_role 은 RLS 우회 → 앱 정상 동작)
+ALTER TABLE app_employee_salaries ENABLE ROW LEVEL SECURITY;
