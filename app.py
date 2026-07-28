@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import textwrap
 import traceback
+import urllib.parse
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
@@ -643,20 +644,20 @@ def _render_left_dual_nav(user: dict, role: str) -> None:
         raw_logo_html = _common_logo_html(
             _resolve_logo_path(), fallback_id="emons-logo-fallback-sidebar",
         )
-        clickable_logo_html = f"""
-        <div style="cursor:pointer;"
-             onclick="(function(){{
-                 try {{
-                     var u = new URL(window.location.href);
-                     u.searchParams.set('home', '1');
-                     window.location.href = u.toString();
-                 }} catch(e2) {{
-                     window.location.href = window.location.pathname + '?home=1';
-                 }}
-             }})();">
-        {raw_logo_html}
-        </div>
-        """
+        # 로고 클릭 → ?home=1 로 이동해 세일즈 대시보드 홈 복귀.
+        # st.markdown 은 inline onclick(문자열 이벤트 핸들러)을 실행하지 않으므로
+        # 서버에서 기존 쿼리 파라미터(auth 세션 토큰 등)를 보존한 <a href> 링크로 렌더링.
+        try:
+            _home_qp = dict(st.query_params)
+        except Exception:
+            _home_qp = {}
+        _home_qp["home"] = "1"
+        _home_href = "?" + urllib.parse.urlencode(_home_qp, doseq=True)
+        clickable_logo_html = (
+            f'<a href="{html.escape(_home_href)}" target="_self" title="세일즈 대시보드 홈으로"'
+            f' style="text-decoration:none; display:block; cursor:pointer;">'
+            f'{raw_logo_html}</a>'
+        )
         st.markdown(clickable_logo_html, unsafe_allow_html=True)
         c_rail, c_nav = st.columns([1, 2.8], gap="small")  # CSS로 gap=0 처리됨
         with c_rail:
@@ -31269,9 +31270,13 @@ def main():
     except Exception:
         home_flag = None
     if home_flag:
-        # 관리자 전용 모니터링 등 별도 라우팅 상태를 초기화
-        if "active_admin_page" in st.session_state:
-            del st.session_state["active_admin_page"]
+        # 관리자 전용 모니터링 등 별도 라우팅 상태를 초기화하고
+        # 세일즈 메뉴를 대시보드(홈)로 리셋 (ERP 레일 🏠 버튼과 동일 동작)
+        st.session_state.pop("active_admin_page", None)
+        st.session_state["main_tab_idx"] = 0
+        st.session_state["superadmin_menu_idx"] = 0
+        for _k in ("nav_radio_main_tab_idx", "nav_radio_superadmin_menu_idx"):
+            st.session_state.pop(_k, None)
         # URL에서 home 파라미터 제거
         try:
             q = dict(st.query_params)
