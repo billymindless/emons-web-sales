@@ -20,8 +20,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -226,15 +228,53 @@ def _get_kakao_rest_key_local() -> str:
 # 카카오 API: 좌표 → 행정동
 # ══════════════════════════════════════════════════════════════════
 
-def _kakao_address_to_coord(address: str) -> tuple[float, float] | None:
-    """주소 → (lat, lon). app.py 의 geocode_address_kakao 와 동일 로직 (독립 구현)."""
+def _kakao_address_to_coord_ex(address: str) -> tuple[tuple[float, float] | None, bool]:
+    """주소 → (lat, lon). 반환의 2번째 값은 '일시 오류(HTTP 429/5xx 또는 요청 예외)' 여부.
+    2번째 값이 True 면 주소가 잘못된 게 아니라 API 쪽 일시 오류이므로 상위에서 재시도 대상으로
+    남겨야 한다 (0건 응답과 구분)."""
     key = _get_kakao_rest_key_local()
     if not key or not address:
-        return None
+        return None, False
     try:
         r = requests.get(
             "https://dapi.kakao.com/v2/local/search/address.json",
             params={"query": address.strip()},
+            headers={"Authorization": f"KakaoAK {key}"},
+            timeout=5.0,
+        )
+        if r.status_code == 429 or r.status_code >= 500:
+            return None, True
+        if r.status_code != 200:
+            return None, False
+        docs = (r.json() or {}).get("documents") or []
+        if not docs:
+            return None, False
+        d = docs[0]
+        x, y = d.get("x"), d.get("y")
+        if x is None or y is None:
+            return None, False
+        return (float(y), float(x)), False
+    except Exception:
+        return None, True
+
+
+def _kakao_address_to_coord(address: str) -> tuple[float, float] | None:
+    """하위호환 래퍼 (일시오류 구분 없이 좌표만 필요한 호출부용)."""
+    coord, _ = _kakao_address_to_coord_ex(address)
+    return coord
+
+
+def _kakao_keyword_search_to_coord(query: str) -> tuple[float, float] | None:
+    """카카오 키워드검색(POI/건물명 검색) → (lat, lon). 도로명주소 검색이 실패한 노이즈 섞인
+    주소(메모·태그·중복 텍스트 등)에 대한 최후 폴백. app.py 의 키워드검색 패턴과 동일한
+    엔드포인트를 독립 구현 (순환 import 방지)."""
+    key = _get_kakao_rest_key_local()
+    if not key or not query or not query.strip():
+        return None
+    try:
+        r = requests.get(
+            "https://dapi.kakao.com/v2/local/search/keyword.json",
+            params={"query": query.strip()},
             headers={"Authorization": f"KakaoAK {key}"},
             timeout=5.0,
         )
@@ -252,59 +292,134 @@ def _kakao_address_to_coord(address: str) -> tuple[float, float] | None:
         return None
 
 
+def _normalize_address_candidates(address: str) -> list[str]:
+    """도로명주소 검색이 실패하는 주된 원인(실측 확인)인 동/호수 뒤 메모·태그·중복표기를
+    제거한 재시도 후보 목록을 순서대로 반환 (원본과 동일하거나 너무 짧아진 후보는 제외).
+
+    실측 실패 사례:
+      "...래미안2차) 302-901  따님방"          → ')' 까지만 사용
+      "...서사 우미린 105-901 [84a] 미고지..."  → '[..]' 제거 + 숫자-숫자 이후 제거
+      "...양산삼성명가타운) 106-605"            → ')' 까지만 사용
+    """
+    addr = (address or "").strip()
+    if not addr:
+        return []
+    candidates: list[str] = []
+
+    # 1) 마지막 ')' 까지만 사용 — 법정동/건물명 이후의 동·호수·메모 제거
+    idx = addr.rfind(")")
+    if idx != -1 and idx < len(addr) - 1:
+        candidates.append(addr[: idx + 1].strip())
+
+    # 2) '[...]' 대괄호 메모 제거
+    no_bracket = re.sub(r"\[[^\]]*\]", "", addr).strip()
+    if no_bracket != addr:
+        candidates.append(no_bracket)
+
+    # 3) 끝부분 '숫자-숫자' (동-호 표기) 이후 전부 제거 (예: '106-605', '302-901  따님방')
+    stripped = re.sub(r"\s+\d{1,4}-\d{1,4}\b.*$", "", no_bracket).strip()
+    if stripped and stripped != no_bracket:
+        candidates.append(stripped)
+
+    # 4) 끝부분 '숫자동 숫자호' 표기 이후 전부 제거 (예: '102동 1504호 100A')
+    stripped2 = re.sub(r"\s+\d{1,4}\s*동\s*\d{0,4}\s*호?\b.*$", "", addr).strip()
+    if stripped2 and stripped2 != addr:
+        candidates.append(stripped2)
+
+    seen: set[str] = {addr}
+    out: list[str] = []
+    for c in candidates:
+        if c and len(c) >= 6 and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def geocode_to_admin_dong(
     address: str | None,
     lat: float | None = None,
     lon: float | None = None,
-) -> dict | None:
+) -> dict:
     """
-    주소 또는 좌표로 행정동명·행정동코드 조회.
+    주소 또는 좌표로 행정동명·행정동코드 조회. 주소검색 0건 시 정규화 재시도 →
+    키워드검색 순으로 폴백 체인을 적용한다 (다단계 재시도, 마스터 플랜 9.2-B).
 
-    로직:
-      1. lat/lon 이 없으면 카카오 주소검색으로 좌표 확보 (1회 호출)
-      2. 좌표로 카카오 coord2regioncode.json 호출 → region_type='H' (행정동) 문서 추출
-
-    반환:
-      {
-        "admin_dong_name": str,   # region_3depth_name
-        "admin_dong_code": str,   # code (10자리)
-        "sigungu": str,           # region_2depth_name
-        "sidonm": str,            # region_1depth_name
-      } 또는 None (실패 시).
+    반환 (항상 "ok" 키 포함):
+      성공: {"ok": True, "admin_dong_name", "admin_dong_code", "sigungu", "sidonm",
+             "lat", "lon", "matched_address"}
+      실패: {"ok": False, "fail_stage": str, "fail_detail": str}
+        fail_stage 종류:
+          - "no_kakao_key"   : 카카오 REST 키 미설정
+          - "rate_limited"   : HTTP 429/5xx 등 일시 오류 → 다음 배치에서 자동 재시도
+          - "no_h_region"    : 좌표는 확보했으나 행정동(H) 문서 없음
+          - "not_found"      : 주소검색·정규화 재시도·키워드검색 모두 실패 (영구 실패 후보)
     """
     key = _get_kakao_rest_key_local()
     if not key:
-        return None
+        return {"ok": False, "fail_stage": "no_kakao_key", "fail_detail": "카카오 REST 키가 설정되지 않음"}
 
-    if lat is None or lon is None:
-        if not address:
-            return None
-        coord = _kakao_address_to_coord(address)
-        if not coord:
-            return None
-        lat, lon = coord
+    _lat, _lon = lat, lon
+    matched_address: str | None = None
+
+    if _lat is None or _lon is None:
+        if not address or not address.strip():
+            return {"ok": False, "fail_stage": "not_found", "fail_detail": "주소 값이 비어 있음"}
+
+        coord, rate_limited = _kakao_address_to_coord_ex(address)
+        if coord:
+            _lat, _lon = coord
+            matched_address = address
+        elif rate_limited:
+            return {"ok": False, "fail_stage": "rate_limited", "fail_detail": "주소검색 HTTP 429/5xx 또는 요청 예외"}
+        else:
+            for cand in _normalize_address_candidates(address):
+                coord, rate_limited = _kakao_address_to_coord_ex(cand)
+                if coord:
+                    _lat, _lon = coord
+                    matched_address = cand
+                    break
+                if rate_limited:
+                    return {"ok": False, "fail_stage": "rate_limited", "fail_detail": f"정규화 재시도 중 HTTP 오류: {cand}"}
+
+            if _lat is None:
+                for cand in [address, *_normalize_address_candidates(address)]:
+                    coord = _kakao_keyword_search_to_coord(cand)
+                    if coord:
+                        _lat, _lon = coord
+                        matched_address = cand
+                        break
+                if _lat is None:
+                    return {
+                        "ok": False, "fail_stage": "not_found",
+                        "fail_detail": "주소검색·정규화 재시도·키워드검색 모두 0건",
+                    }
 
     try:
         r = requests.get(
             KAKAO_COORD2REGIONCODE_URL,
-            params={"x": lon, "y": lat},
+            params={"x": _lon, "y": _lat},
             headers={"Authorization": f"KakaoAK {key}"},
             timeout=5.0,
         )
+        if r.status_code == 429 or r.status_code >= 500:
+            return {"ok": False, "fail_stage": "rate_limited", "fail_detail": f"coord2region HTTP {r.status_code}"}
         if r.status_code != 200:
-            return None
+            return {"ok": False, "fail_stage": "not_found", "fail_detail": f"coord2region HTTP {r.status_code}"}
         docs = (r.json() or {}).get("documents") or []
         h = next((d for d in docs if str(d.get("region_type")) == "H"), None)
         if h is None:
-            return None
+            return {"ok": False, "fail_stage": "no_h_region", "fail_detail": "좌표는 확보했으나 행정동(H) 문서 없음"}
         return {
+            "ok": True,
             "admin_dong_name": (h.get("region_3depth_name") or "").strip(),
             "admin_dong_code": (h.get("code") or "").strip(),
             "sigungu": (h.get("region_2depth_name") or "").strip(),
             "sidonm": (h.get("region_1depth_name") or "").strip(),
+            "lat": _lat, "lon": _lon,
+            "matched_address": matched_address,
         }
-    except Exception:
-        return None
+    except Exception as e:
+        return {"ok": False, "fail_stage": "rate_limited", "fail_detail": f"coord2region 요청 예외: {type(e).__name__}: {e}"}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -708,9 +823,15 @@ def aggregate_purchase_count_by_dong(
     `_client` 는 언더스코어 접두사로 Streamlit 캐시 해싱에서 제외됨(공식 규칙).
     최신 데이터 강제 조회가 필요하면 `aggregate_purchase_count_by_dong.clear()` 호출.
     """
+    def _empty_with_coverage(total_orders: int, mapped_orders: int) -> pd.DataFrame:
+        _out = pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
+        _out.attrs["total_orders_in_period"] = total_orders
+        _out.attrs["mapped_orders_in_period"] = mapped_orders
+        return _out
+
     client = _client
     if not store_keys:
-        return pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
+        return _empty_with_coverage(0, 0)
     orders = _paginated_select(
         client, "app_orders", "id, customer_id, db_filename, order_date",
         filters=[
@@ -720,10 +841,10 @@ def aggregate_purchase_count_by_dong(
         ],
     )
     if not orders:
-        return pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
+        return _empty_with_coverage(0, 0)
     cust_ids = sorted({int(o["customer_id"]) for o in orders if o.get("customer_id") is not None})
     if not cust_ids:
-        return pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
+        return _empty_with_coverage(len(orders), 0)
     custs: list[dict] = []
     _CHUNK = 500
     for i in range(0, len(cust_ids), _CHUNK):
@@ -736,16 +857,20 @@ def aggregate_purchase_count_by_dong(
         except Exception as e:
             logger.warning("app_customers 배치 조회 실패 (%d ids): %s", len(_batch), e)
     if not custs:
-        return pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
+        return _empty_with_coverage(len(orders), 0)
     cdf = pd.DataFrame(custs).rename(columns={"id": "customer_id"})
     odf = pd.DataFrame(orders)
-    merged = odf.merge(cdf[["customer_id", "admin_dong_code", "admin_dong_name"]], on="customer_id", how="left")
-    merged = merged[merged["admin_dong_code"].notna() & (merged["admin_dong_code"] != "")]
+    merged_all = odf.merge(cdf[["customer_id", "admin_dong_code", "admin_dong_name"]], on="customer_id", how="left")
+    mapped_mask = merged_all["admin_dong_code"].notna() & (merged_all["admin_dong_code"] != "")
+    merged = merged_all[mapped_mask]
     if merged.empty:
-        return pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
+        return _empty_with_coverage(len(merged_all), 0)
     grp = merged.groupby(["admin_dong_code", "admin_dong_name"], as_index=False)["id"].count()
     grp = grp.rename(columns={"id": "purchase_count"})
-    return grp.sort_values("purchase_count", ascending=False)
+    grp = grp.sort_values("purchase_count", ascending=False)
+    grp.attrs["total_orders_in_period"] = len(merged_all)
+    grp.attrs["mapped_orders_in_period"] = int(mapped_mask.sum())
+    return grp
 
 
 def _attach_sigungu(df: pd.DataFrame) -> pd.DataFrame:
@@ -779,8 +904,25 @@ def _attach_sigungu(df: pd.DataFrame) -> pd.DataFrame:
 # 백필: 미변환 고객 → 행정동 매핑
 # ══════════════════════════════════════════════════════════════════
 
+_NOT_FOUND_RETRY_COOLDOWN_DAYS = 7
+_ADMIN_DONG_FAIL_REASONS = ("not_found", "no_h_region", "rate_limited", "no_kakao_key")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 def count_customers_needing_admin_dong(client, store_names: list[str] | None = None) -> int:
-    """admin_dong_code 가 없고 address 는 있는 고객 수."""
+    """admin_dong_code 가 없고 address 는 있는 고객 수 (실패사유 무관, 전체 미매핑)."""
     try:
         q = client.table("app_customers").select("id", count="exact").is_("admin_dong_code", "null").not_.is_("address", "null")
         if store_names:
@@ -792,17 +934,59 @@ def count_customers_needing_admin_dong(client, store_names: list[str] | None = N
         return 0
 
 
-def _fetch_customers_needing_admin_dong(client, store_names: list[str] | None, limit: int) -> list[dict]:
+def get_admin_dong_fail_breakdown(client, store_names: list[str] | None = None) -> dict[str, int]:
+    """실패 사유별 건수 + '미시도'(한 번도 시도한 적 없는 건) 건수. UI 브레이크다운 패널용."""
+    out: dict[str, int] = {}
+    try:
+        for reason in _ADMIN_DONG_FAIL_REASONS:
+            q = (
+                client.table("app_customers").select("id", count="exact")
+                .is_("admin_dong_code", "null").not_.is_("address", "null")
+                .eq("admin_dong_fail_reason", reason)
+            )
+            if store_names:
+                q = q.in_("store_name", store_names)
+            r = q.execute()
+            out[reason] = int(getattr(r, "count", 0) or 0)
+        total = count_customers_needing_admin_dong(client, store_names)
+        out["미시도"] = max(0, total - sum(out.values()))
+        out["_total"] = total
+    except Exception as e:
+        logger.warning("get_admin_dong_fail_breakdown 실패: %s", e)
+    return out
+
+
+def _fetch_customers_needing_admin_dong(
+    client, store_names: list[str] | None, limit: int, *, force_retry: bool = False,
+) -> list[dict]:
     """address 는 있고 admin_dong_code 는 비어있는 고객 최대 `limit` 명 조회.
-    latitude/longitude 가 이미 있으면 재활용해 카카오 주소검색 호출 절감."""
+    latitude/longitude 가 이미 있으면 재활용해 카카오 주소검색 호출 절감.
+
+    최근 `_NOT_FOUND_RETRY_COOLDOWN_DAYS`일 내 fail_reason='not_found' 로 기록된 건은
+    동일 주소 무한 재시도를 막기 위해 기본적으로 제외한다 (rate_limited 는 항상 재시도 대상).
+    force_retry=True 로 스킵 없이 강제 포함 가능."""
     try:
         q = client.table("app_customers").select(
-            "id, address, latitude, longitude, store_name"
-        ).is_("admin_dong_code", "null").not_.is_("address", "null").limit(limit)
+            "id, address, latitude, longitude, store_name, "
+            "admin_dong_fail_reason, admin_dong_fail_at, admin_dong_fail_count"
+        ).is_("admin_dong_code", "null").not_.is_("address", "null")
         if store_names:
             q = q.in_("store_name", store_names)
-        r = q.execute()
-        return (r.data or []) if hasattr(r, "data") else []
+        # not_found 쿨다운 스킵은 파이썬 필터로 처리하므로 여유있게 더 가져온다.
+        r = q.limit(limit if force_retry else limit * 3).execute()
+        rows = (r.data or []) if hasattr(r, "data") else []
+        if force_retry:
+            return rows[:limit]
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_NOT_FOUND_RETRY_COOLDOWN_DAYS)
+        eligible = []
+        for row in rows:
+            if row.get("admin_dong_fail_reason") == "not_found":
+                failed_at = _parse_iso_dt(row.get("admin_dong_fail_at"))
+                if failed_at is not None and failed_at >= cutoff:
+                    continue  # 최근 not_found → 이번 배치에서 스킵
+            eligible.append(row)
+        return eligible[:limit]
     except Exception as e:
         logger.warning("고객 조회 실패: %s", e)
         return []
@@ -814,13 +998,14 @@ def backfill_admin_dong_batch(
     max_records: int = 100,
     sleep_between_calls_sec: float = 0.05,
     progress_callback=None,
+    force_retry: bool = False,
 ) -> dict:
     """
     행정동 미매핑 고객을 최대 `max_records` 건 처리.
-    반환: {"processed": int, "updated": int, "failed": int, "errors": list[str]}
+    반환: {"processed", "updated", "failed", "fail_reasons": {stage: count}, "errors": [...]}
     """
-    result: dict = {"processed": 0, "updated": 0, "failed": 0, "errors": []}
-    rows = _fetch_customers_needing_admin_dong(client, store_names, max_records)
+    result: dict = {"processed": 0, "updated": 0, "failed": 0, "fail_reasons": {}, "errors": []}
+    rows = _fetch_customers_needing_admin_dong(client, store_names, max_records, force_retry=force_retry)
     if not rows:
         return result
 
@@ -839,21 +1024,34 @@ def backfill_admin_dong_batch(
         try:
             info = geocode_to_admin_dong(addr, lat=lat_f, lon=lon_f)
         except Exception as e:
-            info = None
-            result["errors"].append(f"id={cid}: geocode 예외 {e}")
+            info = {"ok": False, "fail_stage": "rate_limited", "fail_detail": f"예외: {e}"}
 
-        if not info or not info.get("admin_dong_code"):
-            result["failed"] += 1
-        else:
+        if info.get("ok") and info.get("admin_dong_code"):
             try:
                 client.table("app_customers").update({
                     "admin_dong_name": info.get("admin_dong_name"),
                     "admin_dong_code": info.get("admin_dong_code"),
+                    "admin_dong_fail_reason": None,
+                    "admin_dong_fail_at": None,
                 }).eq("id", cid).execute()
                 result["updated"] += 1
             except Exception as e:
                 result["failed"] += 1
                 result["errors"].append(f"id={cid}: update 실패 {e}")
+        else:
+            result["failed"] += 1
+            stage = info.get("fail_stage") or "not_found"
+            result["fail_reasons"][stage] = result["fail_reasons"].get(stage, 0) + 1
+            try:
+                client.table("app_customers").update({
+                    "admin_dong_fail_reason": stage,
+                    "admin_dong_fail_at": _now_iso(),
+                    "admin_dong_fail_count": int(row.get("admin_dong_fail_count") or 0) + 1,
+                }).eq("id", cid).execute()
+            except Exception as e:
+                result["errors"].append(f"id={cid}: 실패사유 저장 오류 {e}")
+            if info.get("fail_detail"):
+                result["errors"].append(f"id={cid}: [{stage}] {info['fail_detail']}")
 
         if progress_callback is not None:
             try:
@@ -1189,6 +1387,11 @@ def render_dong_commercial_map() -> None:
             aggregate_purchase_count_by_dong.clear()
         with st.spinner("행정동별 구매건수 집계 중…"):
             _raw_df = aggregate_purchase_count_by_dong(client, sel_dbfns, start_date_str, end_date_str)
+        # attrs 는 이후 merge/filter 과정에서 소실될 수 있어 원본에서 바로 캡처해 둔다.
+        st.session_state["dcm_mapping_coverage"] = {
+            "total_orders": _raw_df.attrs.get("total_orders_in_period", 0),
+            "mapped_orders": _raw_df.attrs.get("mapped_orders_in_period", 0),
+        }
         st.session_state["dcm_raw_crm_df"] = _attach_sigungu(_raw_df)
         st.session_state["dcm_raw_cache_key"] = _cache_key
         if st.session_state.get("dcm_sigungu_cache_key") != _cache_key:
@@ -1300,8 +1503,17 @@ def _render_diagnostic_panel() -> None:
             )
 
 
+_FAIL_REASON_LABELS: dict[str, str] = {
+    "not_found": "주소 못찾음 (정규화·키워드검색까지 실패)",
+    "no_h_region": "행정동 매칭 실패 (좌표는 확보)",
+    "rate_limited": "일시오류 (자동 재시도 대상)",
+    "no_kakao_key": "카카오 키 미설정",
+    "미시도": "미시도 (아직 배치 대상 안 됨)",
+}
+
+
 def _render_backfill_panel(client, store_names: list[str]) -> None:
-    """미변환 고객 백필 배치 실행 UI."""
+    """미변환 고객 백필 배치 실행 UI + 실패 사유 브레이크다운."""
     pending = count_customers_needing_admin_dong(client, store_names)
     st.metric("미변환 고객 수", f"{pending:,} 명",
               help="admin_dong_code 가 비어 있고 address 는 채워진 고객")
@@ -1309,6 +1521,14 @@ def _render_backfill_panel(client, store_names: list[str]) -> None:
     if pending == 0:
         st.success("모든 고객이 이미 행정동으로 매핑되어 있습니다.")
         return
+
+    breakdown = get_admin_dong_fail_breakdown(client, store_names)
+    if breakdown:
+        st.caption("실패 사유별 현황 (최근 배치 실행 결과 기준):")
+        _bc = st.columns(len(_ADMIN_DONG_FAIL_REASONS) + 1)
+        for _i, reason in enumerate((*_ADMIN_DONG_FAIL_REASONS, "미시도")):
+            with _bc[_i]:
+                st.metric(_FAIL_REASON_LABELS.get(reason, reason), f"{breakdown.get(reason, 0):,}")
 
     c1, c2 = st.columns([1, 3])
     with c1:
@@ -1319,8 +1539,15 @@ def _render_backfill_panel(client, store_names: list[str]) -> None:
     with c2:
         st.caption(
             "카카오 API Rate Limit 을 고려해 소량씩 반복 실행하는 걸 권장합니다. "
-            "위경도가 이미 있는 고객은 좌표를 재사용해 주소검색 호출을 절감합니다."
+            "위경도가 이미 있는 고객은 좌표를 재사용해 주소검색 호출을 절감합니다. "
+            f"최근 {_NOT_FOUND_RETRY_COOLDOWN_DAYS}일 내 '주소 못찾음'으로 확정된 건은 "
+            "기본적으로 재시도 대상에서 제외됩니다(무한 재시도 방지)."
         )
+    force_retry = st.checkbox(
+        "최근 실패건도 강제로 다시 시도",
+        key="dcm_backfill_force_retry",
+        help="쿨다운 기간과 무관하게 '주소 못찾음' 건도 이번 배치에 포함합니다 (주소를 수정한 뒤 재검증할 때 유용).",
+    )
     if st.button("▶️ 배치 실행", key="dcm_backfill_run"):
         _pbar = st.progress(0.0, text="지오코딩 중…")
 
@@ -1331,16 +1558,98 @@ def _render_backfill_panel(client, store_names: list[str]) -> None:
         with st.spinner("행정동 매핑 배치 실행 중…"):
             res = backfill_admin_dong_batch(
                 client, store_names or None, max_records=int(batch_size),
-                progress_callback=_cb,
+                progress_callback=_cb, force_retry=force_retry,
             )
         _pbar.progress(1.0, text="완료")
+        _reason_summary = " · ".join(
+            f"{_FAIL_REASON_LABELS.get(k, k)} {v}" for k, v in res.get("fail_reasons", {}).items()
+        )
         st.success(
             f"처리 {res['processed']} · 성공 {res['updated']} · 실패 {res['failed']}"
+            + (f" ({_reason_summary})" if _reason_summary else "")
         )
         if res["errors"]:
             with st.expander("오류 상세", expanded=False):
                 for e in res["errors"][:20]:
                     st.text(e)
+
+    _render_manual_correction_panel(client, store_names)
+
+
+def _render_manual_correction_panel(client, store_names: list[str]) -> None:
+    """'주소 못찾음(not_found)'으로 확정된 고객을 대상으로 주소 수정 후 재시도,
+    또는 행정동을 수동으로 직접 지정하는 최후 수단 UI."""
+    with st.expander("🛠️ 실패 고객 수동 교정 (not_found 대상)", expanded=False):
+        try:
+            q = (
+                client.table("app_customers").select(
+                    "id, address, store_name, admin_dong_fail_reason, admin_dong_fail_at, admin_dong_fail_count"
+                )
+                .is_("admin_dong_code", "null").not_.is_("address", "null")
+                .eq("admin_dong_fail_reason", "not_found")
+                .order("admin_dong_fail_count", desc=True)
+                .limit(30)
+            )
+            if store_names:
+                q = q.in_("store_name", store_names)
+            rows = (q.execute().data or [])
+        except Exception as e:
+            st.warning(f"실패 고객 목록 조회 실패: {e}")
+            return
+
+        if not rows:
+            st.caption("수동 교정이 필요한 not_found 건이 없습니다.")
+            return
+
+        idx = build_geojson_index(load_admdong_geojson())
+        # adm_nm 은 이미 "시도 시군구 행정동" 전체 경로 (예: '울산광역시 중구 학성동').
+        _dong_options = sorted(set(idx["adm_nm"].tolist())) if not idx.empty else []
+        _dong_code_by_label = (
+            dict(zip(idx["adm_nm"], idx["adm_cd2"])) if not idx.empty else {}
+        )
+
+        for row in rows:
+            cid = row.get("id")
+            with st.container(border=True):
+                st.caption(f"고객 #{cid} · {row.get('store_name') or ''} · 실패 {row.get('admin_dong_fail_count') or 0}회")
+                _c1, _c2 = st.columns([3, 1])
+                with _c1:
+                    new_addr = st.text_input(
+                        "주소 수정 후 재시도", value=row.get("address") or "",
+                        key=f"dcm_fix_addr_{cid}", label_visibility="collapsed",
+                    )
+                with _c2:
+                    if st.button("재시도", key=f"dcm_fix_retry_{cid}"):
+                        info = geocode_to_admin_dong(new_addr)
+                        if info.get("ok") and info.get("admin_dong_code"):
+                            client.table("app_customers").update({
+                                "address": new_addr,
+                                "admin_dong_name": info.get("admin_dong_name"),
+                                "admin_dong_code": info.get("admin_dong_code"),
+                                "admin_dong_fail_reason": None,
+                                "admin_dong_fail_at": None,
+                            }).eq("id", cid).execute()
+                            st.success(f"성공: {info.get('admin_dong_name')}")
+                            st.rerun()
+                        else:
+                            st.error(f"여전히 실패: {info.get('fail_stage')} · {info.get('fail_detail')}")
+
+                if _dong_options:
+                    _sel = st.selectbox(
+                        "또는 행정동 직접 지정 (최후 수단)", options=["(선택 안 함)"] + _dong_options,
+                        key=f"dcm_fix_manual_{cid}", label_visibility="collapsed",
+                    )
+                    if _sel != "(선택 안 함)" and st.button("이 행정동으로 지정", key=f"dcm_fix_manual_btn_{cid}"):
+                        _code = _dong_code_by_label.get(_sel, "")
+                        _name = _sel.split(" ")[-1]
+                        client.table("app_customers").update({
+                            "admin_dong_name": _name,
+                            "admin_dong_code": _code,
+                            "admin_dong_fail_reason": None,
+                            "admin_dong_fail_at": None,
+                        }).eq("id", cid).execute()
+                        st.success(f"'{_sel}' 로 수동 지정 완료")
+                        st.rerun()
 
 
 def _render_summary_metrics(df: pd.DataFrame) -> None:
@@ -1370,6 +1679,22 @@ def _render_summary_metrics(df: pd.DataFrame) -> None:
         f"D(저우선): {quad_counts.get('D', 0)} · "
         f"미분류: {quad_counts.get('-', 0)}"
     )
+
+    coverage = st.session_state.get("dcm_mapping_coverage") or {}
+    _total_o = int(coverage.get("total_orders") or 0)
+    _mapped_o = int(coverage.get("mapped_orders") or 0)
+    if _total_o > 0:
+        _unmapped_o = _total_o - _mapped_o
+        _unmapped_pct = _unmapped_o / _total_o * 100
+        _msg = (
+            f"⚠️ 선택 기간 내 구매건 중 행정동 미매핑 {_unmapped_o:,}건 "
+            f"(전체 {_total_o:,}건 대비 {_unmapped_pct:.1f}%) — 침투율 계산에서 제외됨. "
+            "위 '미변환 고객 백필' 패널에서 보완할 수 있습니다."
+        )
+        if _unmapped_pct >= 10:
+            st.warning(_msg)
+        elif _unmapped_o > 0:
+            st.caption(_msg)
 
 
 def _render_map(df: pd.DataFrame) -> None:
