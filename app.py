@@ -692,6 +692,23 @@ def _customers_tenant_column() -> str | None:
         return None
 
 
+def _reassert_supabase_client_key(client, key: str) -> None:
+    """
+    supabase-py 는 client.auth.sign_in_with_password() 가 성공하면 내부적으로
+    SIGNED_IN 이벤트를 발생시켜, 공유 클라이언트의 기본 Authorization 헤더를
+    (service_role/anon 키가 아니라) 방금 로그인한 사용자 자신의 access_token 으로
+    자동 교체해버린다 (supabase/_sync/client.py `_listen_to_auth_events`).
+    get_supabase_client() 은 이 클라이언트를 앱 전역에서 재사용하므로, 로그인 직후
+    이어지는 app_users 조회 등이 의도치 않게 낮은 권한(authenticated 롤)으로 나가
+    RLS/권한 오류가 발생할 수 있다. 매 호출 시 postgrest 요청 인증을 원래 키로
+    재적용해 이 오염을 원상복구한다.
+    """
+    try:
+        client.postgrest.auth(key)
+    except Exception:
+        pass
+
+
 def get_supabase_client():
     """
     Supabase 클라이언트 반환 (Singleton). 동일 URL/Key면 한 번만 생성 후 재사용.
@@ -717,6 +734,7 @@ def get_supabase_client():
         if _supabase_client_cache is not None:
             _client, _url, _key = _supabase_client_cache
             if _url == url and _key == key:
+                _reassert_supabase_client_key(_client, key)
                 return _client, None
         client = _create_supabase_client(url, key)
         _supabase_client_cache = (client, url, key)
