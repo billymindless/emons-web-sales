@@ -321,6 +321,18 @@ def _to_int_safe(v: Any) -> int:
         return 0
 
 
+def _clamp_population_yyyymm(yyyymm: str) -> str:
+    """행정안전부 인구·세대 API는 진행 중인 이번 달 통계를 아직 게시하지 않아,
+    이번 달(또는 미래월)로 조회하면 모든 행정동에서 INVALID_REQUEST_PARAMETER_ERROR
+    를 반환한다 (실측 확인됨). 분석 기간 종료월이 이번 달 이상이면 가장 최근
+    확정월(전월)로 낮춰서 요청한다."""
+    this_month = pd.Timestamp.now().strftime("%Y%m")
+    if not yyyymm or yyyymm >= this_month:
+        prev_month_last_day = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
+        return prev_month_last_day.strftime("%Y%m")
+    return yyyymm
+
+
 @st.cache_data(ttl=_THIRTY_DAYS_SEC, show_spinner=False)
 def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
     """
@@ -1119,7 +1131,9 @@ def render_dong_commercial_map() -> None:
         return
     start_date_str = start_date.isoformat()
     end_date_str = end_date.isoformat()
-    yyyymm = end_date.strftime("%Y%m")  # 인구·세대 데이터는 기간 종료월 스냅샷만 사용
+    # 인구·세대 데이터는 기간 종료월 스냅샷만 사용. 단, 이번 달 통계는 행안부가
+    # 아직 게시하지 않아 API가 거부하므로 최근 확정월(전월)로 자동 보정한다.
+    yyyymm = _clamp_population_yyyymm(end_date.strftime("%Y%m"))
 
     sel_dbfns = [dbf for dbf, name in store_options if name in sel_labels]
     sel_store_names = [name for _, name in store_options if name in sel_labels]
