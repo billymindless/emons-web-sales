@@ -603,8 +603,11 @@ def compute_dong_kpi(crm_counts: pd.DataFrame, population: pd.DataFrame) -> pd.D
     if crm_counts is None or crm_counts.empty:
         return crm_counts.copy() if crm_counts is not None else pd.DataFrame()
     df = crm_counts.merge(population, on="admin_dong_code", how="left")
-    df["total_households"] = pd.to_numeric(df.get("total_households"), errors="coerce").replace(0, pd.NA)
-    df["total_population"] = pd.to_numeric(df.get("total_population"), errors="coerce").replace(0, pd.NA)
+    # 0 을 NaN 으로 바꿔 분모 오류(ZeroDivisionError 대신 무한대) 를 방지.
+    # pd.NA 는 object dtype 승격을 유발해 이후 astype(float) 에서
+    # "float() argument ... not 'NAType'" 오류가 나므로 float 호환 NaN 사용.
+    df["total_households"] = pd.to_numeric(df.get("total_households"), errors="coerce").replace(0, float("nan"))
+    df["total_population"] = pd.to_numeric(df.get("total_population"), errors="coerce").replace(0, float("nan"))
     df["age_30_49_population"] = pd.to_numeric(df.get("age_30_49_population"), errors="coerce")
     df["purchase_count"] = pd.to_numeric(df.get("purchase_count"), errors="coerce").fillna(0)
     df["penetration_rate"] = (df["purchase_count"] / df["total_households"] * 100).astype(float).fillna(0.0)
