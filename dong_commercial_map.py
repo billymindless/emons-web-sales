@@ -1081,11 +1081,23 @@ def render_dong_commercial_map() -> None:
         st.info("매장 정보를 불러올 수 없습니다. 매장 계정 관리 화면에서 확인해 주세요.")
         return
 
-    role = st.session_state.get("user", {}).get("role", "user")
+    current_user = st.session_state.get("current_user", {}) or {}
+    role = current_user.get("role", "user")
     current_db = st.session_state.get("current_db")
+    # 다매장 배정 직원(app_user_stores)은 본인이 접근 가능한 매장 범위 내에서
+    # 여러 매장을 함께 선택해 집계할 수 있게 한다. (allowed_stores: (store_id, db_filename, store_name))
+    allowed_dbfns = {
+        s[1] for s in (current_user.get("allowed_stores") or []) if len(s) > 1 and s[1]
+    }
     if role == "superadmin":
         store_options: list[tuple[str, str]] = [
             (s["db_filename"], s["store_name"]) for s in stores if s.get("db_filename")
+        ]
+        default_indices = list(range(len(store_options)))
+    elif allowed_dbfns:
+        store_options = [
+            (s["db_filename"], s["store_name"])
+            for s in stores if s.get("db_filename") in allowed_dbfns
         ]
         default_indices = list(range(len(store_options)))
     else:
