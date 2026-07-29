@@ -1573,7 +1573,68 @@ def _render_backfill_panel(client, store_names: list[str]) -> None:
                 for e in res["errors"][:20]:
                     st.text(e)
 
+    st.divider()
+    if st.button(f"🚀 미변환 고객 전체 한번에 처리 ({pending:,}명)", key="dcm_backfill_run_all"):
+        _run_full_backfill(client, store_names, force_retry=force_retry, total_target=pending)
+
     _render_manual_correction_panel(client, store_names)
+
+
+_BACKFILL_ALL_CHUNK_SIZE = 200
+
+
+def _run_full_backfill(client, store_names: list[str], *, force_retry: bool, total_target: int) -> None:
+    """미변환 고객을 `_BACKFILL_ALL_CHUNK_SIZE` 단위로 자동 반복 호출해 배치 버튼을
+    여러 번 누를 필요 없이 한 번의 클릭으로 전체를 처리한다. Streamlit 은 스크립트
+    실행 중에도 progress bar 갱신을 즉시 화면에 반영하므로 실행 도중 진행 상황을
+    계속 확인할 수 있다 (브라우저 탭을 닫으면 중단되며, 이미 처리된 건은 DB에
+    저장돼 있어 다시 눌러 이어서 처리 가능)."""
+    agg = {"processed": 0, "updated": 0, "failed": 0, "fail_reasons": {}, "errors": []}
+    pbar = st.progress(0.0, text="전체 일괄 처리 준비 중…")
+    status = st.empty()
+
+    def _cb(done: int, _total_in_chunk: int) -> None:
+        running = agg["processed"] + done
+        frac = min(1.0, running / max(1, total_target))
+        pbar.progress(frac, text=f"전체 진행 {running:,}/{total_target:,}명")
+
+    max_iterations = max(5, (total_target // _BACKFILL_ALL_CHUNK_SIZE) + 5)
+    stagnant_chunks = 0
+    with st.spinner("전체 일괄 처리 중… 완료될 때까지 이 탭을 닫지 마세요."):
+        for _ in range(max_iterations):
+            chunk = backfill_admin_dong_batch(
+                client, store_names or None, max_records=_BACKFILL_ALL_CHUNK_SIZE,
+                progress_callback=_cb, force_retry=force_retry,
+            )
+            if chunk["processed"] == 0:
+                break
+            agg["processed"] += chunk["processed"]
+            agg["updated"] += chunk["updated"]
+            agg["failed"] += chunk["failed"]
+            for k, v in chunk.get("fail_reasons", {}).items():
+                agg["fail_reasons"][k] = agg["fail_reasons"].get(k, 0) + v
+            agg["errors"].extend(chunk.get("errors", []))
+            status.caption(f"누적 처리 {agg['processed']:,} · 성공 {agg['updated']:,} · 실패 {agg['failed']:,}")
+
+            stagnant_chunks = stagnant_chunks + 1 if chunk["updated"] == 0 else 0
+            if stagnant_chunks >= 2:
+                status.caption("⚠️ 연속 2개 청크에서 성공이 없어 중단합니다 (API 일시 오류 가능성, 잠시 후 다시 시도해 주세요).")
+                break
+            if chunk["processed"] < _BACKFILL_ALL_CHUNK_SIZE:
+                break  # 남은 대상이 소진됨
+
+    pbar.progress(1.0, text="전체 일괄 처리 완료")
+    reason_summary = " · ".join(
+        f"{_FAIL_REASON_LABELS.get(k, k)} {v}" for k, v in agg["fail_reasons"].items()
+    )
+    st.success(
+        f"전체 처리 완료 — 처리 {agg['processed']:,} · 성공 {agg['updated']:,} · 실패 {agg['failed']:,}"
+        + (f" ({reason_summary})" if reason_summary else "")
+    )
+    if agg["errors"]:
+        with st.expander("오류 상세 (최대 30건)", expanded=False):
+            for e in agg["errors"][:30]:
+                st.text(e)
 
 
 def _render_manual_correction_panel(client, store_names: list[str]) -> None:
