@@ -736,6 +736,33 @@ def aggregate_purchase_count_by_dong(
     return grp.sort_values("purchase_count", ascending=False)
 
 
+def _attach_sigungu(df: pd.DataFrame) -> pd.DataFrame:
+    """admin_dong_code 기준으로 GeoJSON 의 시도/시군구명을 조인해 `sigungu_label` 컬럼을 추가.
+
+    카카오 code(10자리)를 GeoJSON adm_cd2 로 우선 매칭하고, 실패 시 8자리 adm_cd 로 매칭한다
+    (_render_map 의 매칭 로직과 동일). GeoJSON 스코프 밖이라 매칭이 안 되는 행정동은
+    '기타(미분류)' 로 묶어 필터에서도 확인할 수 있게 한다.
+    """
+    if df is None or df.empty:
+        out = df.copy() if df is not None else pd.DataFrame()
+        out["sigungu_label"] = pd.Series(dtype=str)
+        return out
+    idx = build_geojson_index(load_admdong_geojson())
+    out = df.copy()
+    key10 = out["admin_dong_code"].astype(str)
+    key8 = key10.str[:8]
+    _label_by10 = {
+        c: f"{s} {g}".strip() for c, s, g in zip(idx["adm_cd2"], idx["sidonm"], idx["sggnm"])
+    }
+    _label_by8 = {
+        c: f"{s} {g}".strip() for c, s, g in zip(idx["adm_cd"], idx["sidonm"], idx["sggnm"])
+    }
+    out["sigungu_label"] = key10.map(_label_by10)
+    out["sigungu_label"] = out["sigungu_label"].fillna(key8.map(_label_by8))
+    out["sigungu_label"] = out["sigungu_label"].replace("", pd.NA).fillna("기타(미분류)")
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════
 # 백필: 미변환 고객 → 행정동 매핑
 # ══════════════════════════════════════════════════════════════════
@@ -1127,20 +1154,45 @@ def render_dong_commercial_map() -> None:
             help="캐시를 무시하고 Supabase 에서 구매건수를 다시 집계합니다 (당일 신규 주문 반영 등).",
         )
 
-    if not do_render:
+    # 매장·기간이 바뀌면 이전 결과는 무효화 (시군구 필터만 바꿀 때는 재클릭 없이도
+    # 아래 캐시된 원본으로 즉시 재필터링되도록 session_state 에 원본을 보관).
+    _cache_key = (tuple(sorted(sel_dbfns)), start_date_str, end_date_str)
+
+    if do_render:
+        if force_refresh:
+            aggregate_purchase_count_by_dong.clear()
+        with st.spinner("행정동별 구매건수 집계 중…"):
+            _raw_df = aggregate_purchase_count_by_dong(client, sel_dbfns, start_date_str, end_date_str)
+        st.session_state["dcm_raw_crm_df"] = _attach_sigungu(_raw_df)
+        st.session_state["dcm_raw_cache_key"] = _cache_key
+        if st.session_state.get("dcm_sigungu_cache_key") != _cache_key:
+            st.session_state.pop("dcm_sigungu_filter", None)
+            st.session_state["dcm_sigungu_cache_key"] = _cache_key
+
+    if st.session_state.get("dcm_raw_cache_key") != _cache_key:
         st.info("매장·분석기간 설정 후 '상권 맵 렌더링'을 눌러 주세요.")
         return
 
-    if force_refresh:
-        aggregate_purchase_count_by_dong.clear()
-
-    with st.spinner("행정동별 구매건수 집계 중…"):
-        crm_df = aggregate_purchase_count_by_dong(client, sel_dbfns, start_date_str, end_date_str)
-    if crm_df.empty:
+    crm_df_all = st.session_state.get("dcm_raw_crm_df")
+    if crm_df_all is None or crm_df_all.empty:
         st.warning(
             "선택한 매장·기간에 행정동 매핑이 된 구매 건이 없습니다. "
             "위 백필 패널로 행정동 변환을 먼저 실행하거나 분석 기간을 넓혀 보세요."
         )
+        return
+
+    # ── 시군구 필터 (변경 시 재클릭 없이 즉시 적용) ──────────
+    _sgg_options = sorted(x for x in crm_df_all["sigungu_label"].unique().tolist() if x)
+    sel_sgg = st.multiselect(
+        "시군구 필터 (미선택 시 전체)",
+        options=_sgg_options,
+        default=_sgg_options,
+        key="dcm_sigungu_filter",
+        help="구매건수가 집계된 행정동을 시군구 단위로 좁혀 봅니다. GeoJSON 범위 밖 행정동은 '기타(미분류)'로 표시됩니다.",
+    )
+    crm_df = crm_df_all[crm_df_all["sigungu_label"].isin(sel_sgg)] if sel_sgg else crm_df_all.iloc[0:0]
+    if crm_df.empty:
+        st.warning("선택한 시군구에 해당하는 행정동이 없습니다.")
         return
 
     st.caption(f"📅 분석 기간: {start_date} ~ {end_date} · 인구 기준월: {yyyymm}")
@@ -1440,11 +1492,14 @@ def _render_table(df: pd.DataFrame) -> None:
     """상세 표 (그룹별 정렬)."""
     if df is None or df.empty:
         return
-    show = df[[
+    _cols = [
         "quadrant", "admin_dong_name", "admin_dong_code", "purchase_count",
         "total_households", "total_population", "age_30_49_population",
         "penetration_rate", "target_density",
-    ]].copy()
+    ]
+    if "sigungu_label" in df.columns:
+        _cols.insert(2, "sigungu_label")
+    show = df[_cols].copy()
     show = show.sort_values(
         by=["quadrant", "penetration_rate", "target_density"],
         ascending=[True, False, False],
@@ -1452,6 +1507,7 @@ def _render_table(df: pd.DataFrame) -> None:
     show = show.rename(columns={
         "quadrant": "그룹",
         "admin_dong_name": "행정동",
+        "sigungu_label": "시군구",
         "admin_dong_code": "행정동코드",
         "purchase_count": "구매건수(기간내)",
         "total_households": "세대수",
