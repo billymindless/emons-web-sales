@@ -536,10 +536,11 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
 @st.cache_data(ttl=_THIRTY_DAYS_SEC, show_spinner=False)
 def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
     """
-    행정동코드+통계년월로 30~49세 인구수 조회 (타겟 밀집도 계산용).
+    행정동코드+통계년월로 30~59세 인구수 조회 (타겟 밀집도 계산용).
 
     반환: {"ok", "admin_dong_code", "yyyymm",
-           "age_30_49_population", "total_population", "error", "raw_url"}
+           "age_30_49_population"(30~59세 합산, 필드명은 하위호환 유지), "total_population",
+           "error", "raw_url"}
     """
     key = _get_population_service_key()
     if not key or not admin_dong_code or not yyyymm:
@@ -583,9 +584,9 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
         # 실 응답: 행별 컬럼형 age 필드.
         #   male{X}AgeNmprCnt: 만 X~X+9세 남자 (X ∈ {0,10,20,...,100})
         #   feml{X}AgeNmprCnt: 만 X~X+9세 여자
-        # 30~49세 대상: X ∈ {30, 40} 의 남녀 합산.
+        # 핵심 인구(30~59세) 대상: X ∈ {30, 40, 50} 의 남녀 합산.
         # 총인구는 totNmprCnt 필드에서 취득.
-        target_buckets = ("30", "40")
+        target_buckets = ("30", "40", "50")
         age_bucket = 0
         total = 0
         for it in items:
@@ -1136,7 +1137,7 @@ def fetch_population_bulk(
     client, admin_dong_codes: list[str], yyyymm: str, max_workers: int = 8,
 ) -> pd.DataFrame:
     """
-    행정동코드 리스트 → 인구·세대·3040 데이터 DataFrame.
+    행정동코드 리스트 → 인구·세대·핵심인구(30~59세) 데이터 DataFrame.
 
     1) app_dong_population_cache 에서 (code, yyyymm) 벌크 조회로 캐시 적중분 확보.
     2) 캐시 미스난 코드만 ThreadPoolExecutor 로 병렬 호출 (인구 API + 연령 API).
@@ -1890,7 +1891,7 @@ def _render_quadrant_scatter(df: pd.DataFrame) -> None:
         },
         labels={
             "penetration_rate": "시장 침투율 %",
-            "target_density": "타겟 밀집도 % (30~49세)",
+            "target_density": "타겟 밀집도 % (30~59세)",
             "quadrant": "그룹",
         },
         title="2x2 매트릭스 (중앙값 기준 4분면)",
@@ -1927,7 +1928,7 @@ def _render_table(df: pd.DataFrame) -> None:
         "purchase_count": "구매건수(기간내)",
         "total_households": "세대수",
         "total_population": "총인구",
-        "age_30_49_population": "3040 인구",
+        "age_30_49_population": "핵심인구(30~59세)",
         "penetration_rate": "침투율(%)",
         "target_density": "밀집도(%)",
     })
