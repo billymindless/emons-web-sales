@@ -40,11 +40,17 @@ GEOJSON_PATH_DEFAULT = str(Path(__file__).parent / "data" / "admdong_boundary.ge
 KAKAO_COORD2REGIONCODE_URL = "https://dapi.kakao.com/v2/local/geo/coord2regioncode.json"
 
 # 행정안전부 행정동별 주민등록 인구 및 세대현황 API (data.go.kr 15108065).
+# 서비스명(admmPpltnHhStus) 아래 operation(selectAdmmPpltnHhStus) 을 포함한 최종 경로.
 # endpoint 는 secrets.toml [population_api] endpoint 로 재정의 가능.
-POPULATION_API_BASE_DEFAULT = "https://apis.data.go.kr/1741000/admmPpltnHhStus"
+POPULATION_API_BASE_DEFAULT = (
+    "https://apis.data.go.kr/1741000/admmPpltnHhStus/selectAdmmPpltnHhStus"
+)
 # 행정동별 성/연령별 주민등록 인구수 API (data.go.kr 15108072).
+# 동일 기관(1741000) 명명 규칙에 따라 operation 은 selectAdmmSexdAgePpltn 로 추정.
 # endpoint 는 secrets.toml [population_api] age_endpoint 로 재정의 가능.
-POPULATION_AGE_API_BASE_DEFAULT = "https://apis.data.go.kr/1741000/admmSexdAgePpltn"
+POPULATION_AGE_API_BASE_DEFAULT = (
+    "https://apis.data.go.kr/1741000/admmSexdAgePpltn/selectAdmmSexdAgePpltn"
+)
 
 _POP_ENV_CANDIDATES: tuple[str, ...] = (
     "POPULATION_API_KEY",
@@ -298,16 +304,24 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
             "error": "service_key 또는 파라미터 누락", "raw_url": "",
         }
     url = _get_population_api_endpoint("population")
+    # data.go.kr 15108065 Swagger 필수 파라미터: serviceKey, admmCd, srchFrYm, srchToYm
+    # lv=7 → 단일 읍면동 단위 결과 1건. regSeCd=1 → 등록구분 전체 (기본값).
     params = {
         "serviceKey": key,
         "type": "json",
         "admmCd": admin_dong_code,
-        "stdgYm": yyyymm,
+        "srchFrYm": yyyymm,
+        "srchToYm": yyyymm,
+        "lv": "7",
+        "regSeCd": "1",
         "numOfRows": 100,
         "pageNo": 1,
     }
     try:
         r = requests.get(url, params=params, timeout=8.0)
+        # 1741000 API 는 Content-Type 이 UTF-8 을 명시하지 않아 requests 가
+        # ISO-8859-1 로 잘못 추측 → 한글 mojibake. 강제 UTF-8 로 재해석.
+        r.encoding = "utf-8"
         raw_url = str(r.url)
         if r.status_code != 200:
             return {
@@ -316,7 +330,6 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
                 "error": f"HTTP {r.status_code}: {r.text[:120]}", "raw_url": raw_url,
             }
         js = r.json() if r.content else {}
-        # 응답 구조는 API 마다 다르지만 통상 header/body/items 형태.
         items = _extract_items(js)
         if not items:
             return {
@@ -324,13 +337,21 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
                 "total_population": 0, "total_households": 0,
                 "error": "응답 items 비어 있음", "raw_url": raw_url,
             }
-        # 통·반 단위 응답을 행정동 총계로 합산 (같은 admmCd 필터가 안 될 경우 대비).
+        # lv=7 이면 단건이 정상이나, 안전하게 합산 (통·반 fallback 대비).
+        # 실 응답 필드: 총인구수=totNmprCnt, 세대수=hhCnt.
         total_pop = sum(
-            _to_int_safe(_pick(it, ["totPopltCnt", "tot_popltn_co", "totPopltnCnt", "totPopltnCo"]))
+            _to_int_safe(
+                _pick(it, [
+                    "totNmprCnt", "totPopltCnt", "totPopltnCnt",
+                    "tot_popltn_co", "totPopltnCo",
+                ])
+            )
             for it in items
         )
         total_hh = sum(
-            _to_int_safe(_pick(it, ["hshldCnt", "hshld_co", "totHshldCnt"]))
+            _to_int_safe(
+                _pick(it, ["hhCnt", "hshldCnt", "totHshldCnt", "hshld_co"])
+            )
             for it in items
         )
         return {
@@ -362,16 +383,21 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
             "error": "service_key 또는 파라미터 누락", "raw_url": "",
         }
     url = _get_population_api_endpoint("age")
+    # 자매 API(15108072) 는 동일 기관(1741000) 명명 규칙 → 파라미터 세트 동일 추정.
     params = {
         "serviceKey": key,
         "type": "json",
         "admmCd": admin_dong_code,
-        "stdgYm": yyyymm,
+        "srchFrYm": yyyymm,
+        "srchToYm": yyyymm,
+        "lv": "7",
+        "regSeCd": "1",
         "numOfRows": 200,
         "pageNo": 1,
     }
     try:
         r = requests.get(url, params=params, timeout=8.0)
+        r.encoding = "utf-8"
         raw_url = str(r.url)
         if r.status_code != 200:
             return {
@@ -387,21 +413,19 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
                 "age_30_49_population": 0, "total_population": 0,
                 "error": "응답 items 비어 있음", "raw_url": raw_url,
             }
-        # 연령별 응답 파싱: 필드명은 API 마다 다르므로 후보 목록을 순회.
+        # 실 응답: 행별 컬럼형 age 필드.
+        #   male{X}AgeNmprCnt: 만 X~X+9세 남자 (X ∈ {0,10,20,...,100})
+        #   feml{X}AgeNmprCnt: 만 X~X+9세 여자
+        # 30~49세 대상: X ∈ {30, 40} 의 남녀 합산.
+        # 총인구는 totNmprCnt 필드에서 취득.
+        target_buckets = ("30", "40")
         age_bucket = 0
         total = 0
         for it in items:
-            _age = _pick(it, ["age", "ageCd", "ageGrp", "ageBand"])
-            _pop = _to_int_safe(
-                _pick(it, ["popltCnt", "popltn_co", "tot_popltn_co", "totPopltCnt"])
-            )
-            total += _pop
-            try:
-                _age_i = int(str(_age).strip())
-            except Exception:
-                _age_i = -1
-            if 30 <= _age_i <= 49:
-                age_bucket += _pop
+            total += _to_int_safe(_pick(it, ["totNmprCnt", "totPopltCnt"]))
+            for _bkt in target_buckets:
+                age_bucket += _to_int_safe(it.get(f"male{_bkt}AgeNmprCnt"))
+                age_bucket += _to_int_safe(it.get(f"feml{_bkt}AgeNmprCnt"))
         return {
             "ok": True, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
             "age_30_49_population": age_bucket, "total_population": total,
@@ -416,23 +440,37 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
 
 
 def _extract_items(js: Any) -> list[dict]:
-    """공공데이터포털 표준 응답에서 items 리스트 추출 (dict/list 어느 쪽이든 대응)."""
-    try:
-        body = ((js.get("response") or {}).get("body")) or {}
-        items = body.get("items")
-        if isinstance(items, dict):
-            item = items.get("item")
-            if isinstance(item, list):
-                return item
-            if isinstance(item, dict):
-                return [item]
+    """공공데이터포털 응답에서 items 리스트 추출.
+
+    행안부 1741000 admmPpltnHhStus/admmSexdAgePpltn 실제 응답:
+      {"Response": {"head": {...}, "items": {"item": {...} | [{...}, ...]}}}
+    표준 data.go.kr 응답:
+      {"response": {"header": {...}, "body": {"items": {"item": ...}}}}
+    """
+    if not isinstance(js, dict):
+        return []
+    # 후보 최상위 래퍼 (대소문자 혼재 대응)
+    for _top in ("response", "Response"):
+        _wrap = js.get(_top)
+        if not isinstance(_wrap, dict):
+            continue
+        # body.items (표준) 또는 items 직접 (1741000)
+        _items = None
+        _body = _wrap.get("body")
+        if isinstance(_body, dict):
+            _items = _body.get("items")
+        if _items is None:
+            _items = _wrap.get("items")
+        if isinstance(_items, dict):
+            _item = _items.get("item")
+            if isinstance(_item, list):
+                return _item
+            if isinstance(_item, dict):
+                return [_item]
             return []
-        if isinstance(items, list):
-            return items
-    except Exception:
-        pass
-    # fallback: 최상위에 items 가 바로 오는 케이스
-    if isinstance(js, dict) and "items" in js and isinstance(js["items"], list):
+        if isinstance(_items, list):
+            return _items
+    if "items" in js and isinstance(js["items"], list):
         return js["items"]
     return []
 
