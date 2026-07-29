@@ -56,6 +56,8 @@ _POP_ENV_CANDIDATES: tuple[str, ...] = (
     "POPULATION_API_KEY",
     "DATA_GO_KR_SERVICE_KEY",
     "ADMIN_DONG_POPULATION_KEY",
+    "ELEVATOR_API_KEY",
+    "ELEVATOR_SERVICE_KEY",
 )
 
 _KAKAO_ENV_CANDIDATES: tuple[str, ...] = (
@@ -90,12 +92,15 @@ def _load_toml_dict() -> dict:
 
 def _get_population_service_key_diagnostic() -> tuple[str, dict[str, str]]:
     """
-    행정안전부 인구·세대 API 서비스 키를 3중 폴백으로 로드하고 진단 정보 반환.
-    로드 순서: secrets.toml [population_api] → st.secrets → 환경변수.
+    행정안전부 인구·세대 API 서비스 키를 다중 폴백으로 로드하고 진단 정보 반환.
+
+    data.go.kr 계정 1개의 일반 인증키는 승인받은 모든 API 에 공용 사용 가능.
+    [population_api] 가 없으면 [elevator_api] / ELEVATOR_API_KEY 로 폴백.
     """
     diag: dict[str, str] = {
         "secrets_toml_found": "no",
         "st_secrets_found": "no",
+        "elevator_fallback": "no",
         "env_var_found": "no",
         "env_var_name": "",
         "final_source": "none",
@@ -103,31 +108,52 @@ def _get_population_service_key_diagnostic() -> tuple[str, dict[str, str]]:
     }
     key = ""
 
+    def _set_key(value: str, source: str, *, elevator: bool = False) -> None:
+        nonlocal key
+        if not value:
+            return
+        key = value
+        diag["final_source"] = source
+        if elevator:
+            diag["elevator_fallback"] = "yes"
+
     _toml = _load_toml_dict()
     _v = str(((_toml.get("population_api") or {}).get("service_key", "")) or "").strip()
     if _v:
-        key = _v
+        _set_key(_v, "secrets.toml[population_api]")
         diag["secrets_toml_found"] = "yes"
-        diag["final_source"] = "secrets.toml"
+    else:
+        _v = str(((_toml.get("elevator_api") or {}).get("service_key", "")) or "").strip()
+        if _v:
+            _set_key(_v, "secrets.toml[elevator_api]", elevator=True)
+            diag["secrets_toml_found"] = "yes"
 
     try:
         if hasattr(st, "secrets"):
             _sec = st.secrets.get("population_api", {}) or {}
             _v = str(_sec.get("service_key", "") or "").strip()
             if _v:
-                key = _v
+                _set_key(_v, "st.secrets[population_api]")
                 diag["st_secrets_found"] = "yes"
-                diag["final_source"] = "st.secrets"
+            else:
+                _sec = st.secrets.get("elevator_api", {}) or {}
+                _v = str(_sec.get("service_key", "") or "").strip()
+                if _v:
+                    _set_key(_v, "st.secrets[elevator_api]", elevator=True)
+                    diag["st_secrets_found"] = "yes"
     except Exception:
         pass
 
     for _name in _POP_ENV_CANDIDATES:
         _v = (os.environ.get(_name, "") or "").strip()
         if _v:
-            key = _v
+            _set_key(
+                _v,
+                f"env:{_name}",
+                elevator=_name in ("ELEVATOR_API_KEY", "ELEVATOR_SERVICE_KEY"),
+            )
             diag["env_var_found"] = "yes"
             diag["env_var_name"] = _name
-            diag["final_source"] = f"env:{_name}"
             break
 
     diag["key_len"] = str(len(key))
@@ -139,16 +165,27 @@ def _get_population_service_key() -> str:
 
 
 def _get_population_api_endpoint(kind: str = "population") -> str:
-    """secrets.toml [population_api] endpoint / age_endpoint 값 우선, 없으면 기본값.
+    """[population_api] endpoint / age_endpoint 값 우선, 없으면 기본값.
     kind: 'population' (총인구/세대) 또는 'age' (성/연령별 인구).
     """
+    _field = "age_endpoint" if kind == "age" else "endpoint"
+    _default = POPULATION_AGE_API_BASE_DEFAULT if kind == "age" else POPULATION_API_BASE_DEFAULT
+
     _toml = _load_toml_dict()
-    _sec = (_toml.get("population_api") or {})
-    if kind == "age":
-        val = str(_sec.get("age_endpoint", "") or "").strip()
-        return val or POPULATION_AGE_API_BASE_DEFAULT
-    val = str(_sec.get("endpoint", "") or "").strip()
-    return val or POPULATION_API_BASE_DEFAULT
+    val = str(((_toml.get("population_api") or {}).get(_field, "")) or "").strip()
+    if val:
+        return val
+
+    try:
+        if hasattr(st, "secrets"):
+            _sec = st.secrets.get("population_api", {}) or {}
+            val = str(_sec.get(_field, "") or "").strip()
+            if val:
+                return val
+    except Exception:
+        pass
+
+    return _default
 
 
 def _get_kakao_rest_key_local() -> str:
@@ -955,13 +992,16 @@ def _render_diagnostic_panel() -> None:
         st.text(
             f"키 길이       : {pop_diag.get('key_len')}\n"
             f"소스          : {pop_diag.get('final_source')}\n"
+            f"elevator폴백  : {pop_diag.get('elevator_fallback')}\n"
             f"endpoint(pop) : {_get_population_api_endpoint('population')}\n"
             f"endpoint(age) : {_get_population_api_endpoint('age')}"
         )
         if not pop_key:
             st.warning(
                 "행안부 인구 API 키가 없습니다. `.streamlit/secrets.toml` 의 "
-                "[population_api] service_key 또는 환경변수 POPULATION_API_KEY 를 설정하세요."
+                "[population_api] service_key 를 설정하세요. "
+                "이미 [elevator_api] 가 있다면 동일한 data.go.kr 일반 인증키를 "
+                "[population_api] service_key 에 복사해도 됩니다."
             )
     with c2:
         st.markdown("**카카오 로컬 API**")
