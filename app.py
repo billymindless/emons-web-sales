@@ -728,6 +728,20 @@ def get_supabase_client():
         return None, f"Supabase 연결에 실패했습니다: {err_msg}"
 
 
+def _get_supabase_key_source_diag() -> str:
+    """현재 st.secrets 가 실제로 어떤 키(service_role_key 등)를 쓰고 있는지 진단 문자열.
+    로그인 실패 시 '배포 secrets 반영 여부'를 화면에서 바로 확인하기 위한 용도."""
+    try:
+        secrets = st.secrets.get("supabase") or {}
+    except Exception:
+        return "secrets 읽기 실패"
+    for _name in ("service_role_key", "service_role", "key", "anon_key"):
+        _v = (secrets.get(_name) or "").strip()
+        if _v:
+            return f"{_name}(len={len(_v)}, prefix={_v[:8]}...)"
+    return "키 없음(secrets [supabase] 섹션 비어있음)"
+
+
 def get_supabase_client_or_warn():
     """Supabase 클라이언트 반환 (내부적으로 Singleton 재사용). 실패 시 화면에 경고를 띄우고 None 반환."""
     client, err = get_supabase_client()
@@ -874,7 +888,10 @@ def _supabase_app_tables_available():
         return True
     except Exception as e:
         st.session_state[_cache_key] = False
-        st.session_state["_login_diag_error"] = f"app_users 테이블 접근 실패: {type(e).__name__}: {e}"
+        st.session_state["_login_diag_error"] = (
+            f"app_users 테이블 접근 실패: {type(e).__name__}: {e} "
+            f"[사용된 키: {_get_supabase_key_source_diag()}]"
+        )
         return False
 
 
@@ -1193,7 +1210,10 @@ def _get_supabase_app_user_by_email(email: str):
                 db_filename = s.data["db_filename"]
         return (uid, username, role, store_id, db_filename)
     except Exception as e:
-        st.session_state["_login_diag_error"] = f"app_users 조회 실패: {type(e).__name__}: {e}"
+        st.session_state["_login_diag_error"] = (
+            f"app_users 조회 실패: {type(e).__name__}: {e} "
+            f"[사용된 키: {_get_supabase_key_source_diag()}]"
+        )
         return None
 
 
