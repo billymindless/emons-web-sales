@@ -23,7 +23,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1322,13 +1322,34 @@ def render_dong_commercial_map() -> None:
     with c2:
         _today = pd.Timestamp.now().date()
         _default_start = (pd.Timestamp.now() - pd.DateOffset(years=1)).date()
-        period_range = st.date_input(
-            "분석 기간 (구매건수 집계 구간)",
-            value=(_default_start, _today),
-            help="이 기간의 구매건수를 행정동별로 합산해 침투율을 계산합니다. "
-                 "인구·세대 데이터는 기간 종료월 기준으로 1회만 조회합니다.",
-            key="dcm_period_range",
+        _preset = st.selectbox(
+            "기간 프리셋",
+            ["직접 입력", "연간", "상반기", "하반기"],
+            key="dcm_period_preset",
+            help="연간/상반기/하반기 선택 시 기준 연도로 분석 기간이 자동 설정됩니다. "
+                 "'직접 입력'은 기존처럼 날짜 범위를 자유롭게 지정합니다.",
         )
+        if _preset == "직접 입력":
+            period_range = st.date_input(
+                "분석 기간 (구매건수 집계 구간)",
+                value=(_default_start, _today),
+                help="이 기간의 구매건수를 행정동별로 합산해 침투율을 계산합니다. "
+                     "인구·세대 데이터는 기간 종료월 기준으로 1회만 조회합니다.",
+                key="dcm_period_range",
+            )
+        else:
+            _preset_year = st.number_input(
+                "기준 연도", min_value=2000, max_value=int(_today.year),
+                value=int(_today.year), step=1, key="dcm_preset_year",
+            )
+            _py = int(_preset_year)
+            if _preset == "연간":
+                period_range = (date(_py, 1, 1), date(_py, 12, 31))
+            elif _preset == "상반기":
+                period_range = (date(_py, 1, 1), date(_py, 6, 30))
+            else:  # 하반기
+                period_range = (date(_py, 7, 1), date(_py, 12, 31))
+            st.caption(f"📅 {period_range[0]} ~ {period_range[1]} (구매일 기준 집계)")
 
     if not sel_labels:
         st.info("최소 1개 이상의 매장을 선택해 주세요.")
