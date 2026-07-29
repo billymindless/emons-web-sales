@@ -1513,7 +1513,28 @@ _FAIL_REASON_LABELS: dict[str, str] = {
 
 
 def _render_backfill_panel(client, store_names: list[str]) -> None:
-    """미변환 고객 백필 배치 실행 UI + 실패 사유 브레이크다운."""
+    """미변환 고객 백필 배치 실행 UI + 실패 사유 브레이크다운.
+
+    배치 실행 직후에는 st.rerun() 으로 스크립트를 다시 돌려 아래 `pending` 카운트를
+    최신값으로 재조회한다. rerun 을 하지 않으면 이번 실행에서 이미 렌더링된 상단
+    지표(pending)가 배치 실행 '이전' 값을 그대로 보여줘, 실제로는 반영됐는데도
+    화면상 숫자가 안 바뀐 것처럼 보인다.
+    """
+    _last = st.session_state.pop("dcm_backfill_last_result", None)
+    if _last:
+        _reason_summary = " · ".join(
+            f"{_FAIL_REASON_LABELS.get(k, k)} {v}" for k, v in _last.get("fail_reasons", {}).items()
+        )
+        _label = "전체 처리 완료" if _last.get("is_full") else "처리 완료"
+        st.success(
+            f"{_label} — 처리 {_last['processed']} · 성공 {_last['updated']} · 실패 {_last['failed']}"
+            + (f" ({_reason_summary})" if _reason_summary else "")
+        )
+        if _last.get("errors"):
+            with st.expander("오류 상세", expanded=False):
+                for e in _last["errors"][:30]:
+                    st.text(e)
+
     pending = count_customers_needing_admin_dong(client, store_names)
     st.metric("미변환 고객 수", f"{pending:,} 명",
               help="admin_dong_code 가 비어 있고 address 는 채워진 고객")
@@ -1561,17 +1582,8 @@ def _render_backfill_panel(client, store_names: list[str]) -> None:
                 progress_callback=_cb, force_retry=force_retry,
             )
         _pbar.progress(1.0, text="완료")
-        _reason_summary = " · ".join(
-            f"{_FAIL_REASON_LABELS.get(k, k)} {v}" for k, v in res.get("fail_reasons", {}).items()
-        )
-        st.success(
-            f"처리 {res['processed']} · 성공 {res['updated']} · 실패 {res['failed']}"
-            + (f" ({_reason_summary})" if _reason_summary else "")
-        )
-        if res["errors"]:
-            with st.expander("오류 상세", expanded=False):
-                for e in res["errors"][:20]:
-                    st.text(e)
+        st.session_state["dcm_backfill_last_result"] = {**res, "is_full": False}
+        st.rerun()
 
     st.divider()
     if st.button(f"🚀 미변환 고객 전체 한번에 처리 ({pending:,}명)", key="dcm_backfill_run_all"):
@@ -1624,17 +1636,8 @@ def _run_full_backfill(client, store_names: list[str], *, force_retry: bool, tot
                 break  # 남은 대상이 소진됨
 
     pbar.progress(1.0, text="전체 일괄 처리 완료")
-    reason_summary = " · ".join(
-        f"{_FAIL_REASON_LABELS.get(k, k)} {v}" for k, v in agg["fail_reasons"].items()
-    )
-    st.success(
-        f"전체 처리 완료 — 처리 {agg['processed']:,} · 성공 {agg['updated']:,} · 실패 {agg['failed']:,}"
-        + (f" ({reason_summary})" if reason_summary else "")
-    )
-    if agg["errors"]:
-        with st.expander("오류 상세 (최대 30건)", expanded=False):
-            for e in agg["errors"][:30]:
-                st.text(e)
+    st.session_state["dcm_backfill_last_result"] = {**agg, "is_full": True}
+    st.rerun()
 
 
 def _render_manual_correction_panel(client, store_names: list[str]) -> None:
