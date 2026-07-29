@@ -42,9 +42,9 @@ KAKAO_COORD2REGIONCODE_URL = "https://dapi.kakao.com/v2/local/geo/coord2regionco
 # 행정안전부 행정동별 주민등록 인구 및 세대현황 API (data.go.kr 15108065).
 # endpoint 는 secrets.toml [population_api] endpoint 로 재정의 가능.
 POPULATION_API_BASE_DEFAULT = "https://apis.data.go.kr/1741000/admmPpltnHhStus"
-# 행정동별 성/연령별 주민등록 인구수 API (data.go.kr 15108072) — 별도 활용신청 후
-# secrets.toml [population_api] age_endpoint 에 값을 지정. 미지정 시 아래 기본값 시도.
-POPULATION_AGE_API_BASE_DEFAULT = "https://apis.data.go.kr/1741000/admmSexAgeStus"
+# 행정동별 성/연령별 주민등록 인구수 API (data.go.kr 15108072).
+# endpoint 는 secrets.toml [population_api] age_endpoint 로 재정의 가능.
+POPULATION_AGE_API_BASE_DEFAULT = "https://apis.data.go.kr/1741000/admmSexdAgePpltn"
 
 _POP_ENV_CANDIDATES: tuple[str, ...] = (
     "POPULATION_API_KEY",
