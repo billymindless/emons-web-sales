@@ -861,6 +861,32 @@ def suggest_dong_candidates(address: str, geo_idx: pd.DataFrame) -> list[dict]:
 # KPI 산출 · 2x2 클러스터링
 # ══════════════════════════════════════════════════════════════════
 
+# 매니저용 행동 전략 라벨 — 알파벳 quadrant 를 액션 의미로 매핑.
+# (기존 A=고침투·고밀도(핵심 VIP), B=저침투·고밀도(개척) 정의는 유지)
+STRATEGY_ATTACK   = "🚨 집중 공략 (마케팅 시급)"
+STRATEGY_DEFEND   = "👑 핵심 방어 (VIP 관리)"
+STRATEGY_LATENT   = "💡 잠재 상권 (특수 요인)"
+STRATEGY_HOLD     = "👻 마케팅 보류 (예산 절감)"
+STRATEGY_UNSET    = "(미분류)"
+
+STRATEGY_MAP = {
+    "A": STRATEGY_DEFEND,
+    "B": STRATEGY_ATTACK,
+    "C": STRATEGY_LATENT,
+    "D": STRATEGY_HOLD,
+}
+
+STRATEGY_COLOR = {
+    STRATEGY_ATTACK: "#E53935",
+    STRATEGY_DEFEND: "#1E88E5",
+    STRATEGY_LATENT: "#43A047",
+    STRATEGY_HOLD:   "#BDBDBD",
+    STRATEGY_UNSET:  "#EEEEEE",
+}
+
+STRATEGY_ORDER = [STRATEGY_ATTACK, STRATEGY_DEFEND, STRATEGY_LATENT, STRATEGY_HOLD, STRATEGY_UNSET]
+
+
 def compute_dong_kpi(crm_counts: pd.DataFrame, population: pd.DataFrame) -> pd.DataFrame:
     """
     crm_counts:  [admin_dong_code, admin_dong_name, purchase_count]
@@ -924,6 +950,14 @@ def assign_quadrant(df: pd.DataFrame) -> pd.DataFrame:
         return "D"
 
     out["quadrant"] = out.apply(_label, axis=1)
+    out["행동_전략"] = out["quadrant"].map(STRATEGY_MAP).fillna(STRATEGY_UNSET)
+
+    # 호버 문장용 파생 컬럼 (침투율 % → 1,000가구당 구매가구 환산)
+    _pen = pd.to_numeric(out.get("penetration_rate"), errors="coerce").fillna(0.0)
+    _tgt = pd.to_numeric(out.get("age_30_49_population"), errors="coerce").fillna(0)
+    out["hover_target"] = _tgt.astype(int).map(lambda n: f"{n:,}")
+    out["hover_perf"] = _pen.map(lambda p: f"1,000가구 중 약 {p * 10:.1f}가구 구매")
+
     out.attrs["median_penetration"] = med_pen
     out.attrs["median_target_density"] = med_den
     return out
@@ -1610,11 +1644,19 @@ def render_dong_commercial_map() -> None:
     # ── KPI 요약 ─────────────────────────────────────
     _render_summary_metrics(kpi_df)
 
-    # ── 지도 렌더 ────────────────────────────────────
-    _render_map(kpi_df)
+    # ── 좌: 지도 (범주형 행동_전략) / 우: 2x2 매트릭스 ──
+    _left, _right = st.columns([7, 3])
+    with _left:
+        _render_map(kpi_df)
+    with _right:
+        st.markdown("**2x2 매트릭스**")
+        st.caption("가로: 우리 매장 침투율 · 세로: 타겟 인구 비중")
+        _render_quadrant_scatter(kpi_df)
 
-    # ── 4분면 산점도 · 표 ────────────────────────────
-    _render_quadrant_scatter(kpi_df)
+    # ── 하단: 집중 공략 Top 5 (즉각 행동 지침) ──
+    _render_action_top5(kpi_df)
+
+    # ── 상세 표 ─────────────────────────────────────
     _render_table(kpi_df)
 
 
@@ -1937,14 +1979,14 @@ def _render_summary_metrics(df: pd.DataFrame) -> None:
     with m4:
         st.metric("밀집도 중앙값", f"{_med_d:.2f}%")
 
-    quad_counts = df["quadrant"].value_counts().to_dict() if "quadrant" in df.columns else {}
+    strat_counts = df["행동_전략"].value_counts().to_dict() if "행동_전략" in df.columns else {}
     st.caption(
-        "그룹 분포 — "
-        f"A(핵심): {quad_counts.get('A', 0)} · "
-        f"B(개척): {quad_counts.get('B', 0)} · "
-        f"C(포화): {quad_counts.get('C', 0)} · "
-        f"D(저우선): {quad_counts.get('D', 0)} · "
-        f"미분류: {quad_counts.get('-', 0)}"
+        "행동 전략 분포 — "
+        f"{STRATEGY_ATTACK}: {strat_counts.get(STRATEGY_ATTACK, 0)} · "
+        f"{STRATEGY_DEFEND}: {strat_counts.get(STRATEGY_DEFEND, 0)} · "
+        f"{STRATEGY_LATENT}: {strat_counts.get(STRATEGY_LATENT, 0)} · "
+        f"{STRATEGY_HOLD}: {strat_counts.get(STRATEGY_HOLD, 0)} · "
+        f"{STRATEGY_UNSET}: {strat_counts.get(STRATEGY_UNSET, 0)}"
     )
 
     coverage = st.session_state.get("dcm_mapping_coverage") or {}
@@ -1965,9 +2007,9 @@ def _render_summary_metrics(df: pd.DataFrame) -> None:
 
 
 def _render_map(df: pd.DataFrame) -> None:
-    """choropleth (침투율) + Scattermapbox (밀집도 버블) 오버레이."""
+    """행동_전략(A/B/C/D) 범주형 choropleth. 매니저가 색만 보고
+    '어디를 공략할지'를 즉시 판단할 수 있도록 4색 폴리곤만 표시한다."""
     import plotly.express as px
-    import plotly.graph_objects as go
 
     geojson = load_admdong_geojson()
     if not geojson.get("features"):
@@ -1999,14 +2041,12 @@ def _render_map(df: pd.DataFrame) -> None:
         )
         return
 
-    # centroid 조인 (버블 오버레이용)
     _cent_key = "adm_cd2" if featureidkey.endswith("adm_cd2") else "adm_cd"
     primary = primary.merge(
         idx[[_cent_key, "adm_nm", "centroid_lat", "centroid_lon"]],
         left_on="_join", right_on=_cent_key, how="left",
     )
 
-    # 지도 중심: centroid 평균
     _lat_c = float(primary["centroid_lat"].dropna().mean() or 35.5)
     _lon_c = float(primary["centroid_lon"].dropna().mean() or 129.3)
 
@@ -2015,115 +2055,156 @@ def _render_map(df: pd.DataFrame) -> None:
         geojson=geojson,
         locations="_join",
         featureidkey=featureidkey,
-        color="penetration_rate",
-        color_continuous_scale="YlOrRd",
-        range_color=(0, max(0.1, float(primary["penetration_rate"].quantile(0.95) or 1))),
+        color="행동_전략",
+        color_discrete_map=STRATEGY_COLOR,
+        category_orders={"행동_전략": STRATEGY_ORDER},
         mapbox_style="carto-positron",
         zoom=10,
         center={"lat": _lat_c, "lon": _lon_c},
-        opacity=0.55,
-        hover_name="admin_dong_name",
-        hover_data={
-            "_join": False,
-            "penetration_rate": ":.3f",
-            "target_density": ":.2f",
-            "purchase_count": True,
-            "total_households": True,
-            "quadrant": True,
-        },
-        labels={
-            "penetration_rate": "침투율 %", "target_density": "밀집도 %",
-            "purchase_count": "구매건수(기간내)", "total_households": "세대수",
-            "quadrant": "그룹",
-        },
+        opacity=0.72,
+        custom_data=["admin_dong_name", "행동_전략", "hover_target", "hover_perf"],
     )
 
-    # 버블 오버레이: quadrant 별 색상
-    _quad_color = {"A": "#d62728", "B": "#1f77b4", "C": "#2ca02c", "D": "#7f7f7f", "-": "#cccccc"}
-    _size_col = primary["target_density"].fillna(0).astype(float)
-    _size_max = float(_size_col.max() or 1)
-    _sizes = 6 + (_size_col / _size_max) * 24  # 6 ~ 30
-    _colors = primary["quadrant"].map(_quad_color).fillna("#cccccc")
-
-    fig.add_trace(go.Scattermapbox(
-        lat=primary["centroid_lat"],
-        lon=primary["centroid_lon"],
-        mode="markers",
-        marker=dict(size=_sizes, color=_colors, opacity=0.85),
-        text=primary["admin_dong_name"],
+    # 지침 3: 문장형 hover — "동이름: X | 전략: Y | 핵심타겟(30~59): N명 | 성과: 1,000가구 중 약 x가구 구매"
+    fig.update_traces(
         hovertemplate=(
-            "<b>%{text}</b><br>"
-            "침투율: %{customdata[0]:.3f}%<br>"
-            "밀집도: %{customdata[1]:.2f}%<br>"
-            "그룹: %{customdata[2]}<extra></extra>"
+            "<b>%{customdata[0]}</b><br>"
+            "전략: %{customdata[1]}<br>"
+            "핵심타겟(30~59): %{customdata[2]}명<br>"
+            "성과: %{customdata[3]}"
+            "<extra></extra>"
         ),
-        customdata=primary[["penetration_rate", "target_density", "quadrant"]].values,
-        name="타겟 밀집도",
-        showlegend=False,
-    ))
+        marker_line_width=0.3,
+        marker_line_color="#ffffff",
+    )
 
     fig.update_layout(
         margin={"r": 0, "t": 0, "l": 0, "b": 0},
-        height=560,
-        coloraxis_colorbar=dict(title="침투율 %"),
+        height=620,
+        legend=dict(
+            title=dict(text="행동 전략", font=dict(size=13)),
+            orientation="h",
+            yanchor="bottom", y=0.01,
+            xanchor="center", x=0.5,
+            bgcolor="rgba(255,255,255,0.85)",
+        ),
     )
     st.plotly_chart(fig, use_container_width=True)
 
 
 def _render_quadrant_scatter(df: pd.DataFrame) -> None:
-    """중앙값 기준 4분면 산점도 (지도 판독 보조)."""
+    """중앙값 기준 4분면 산점도 — 지도의 색상 범례와 동일한 행동_전략 색상을 사용."""
     import plotly.express as px
     if df is None or df.empty:
         return
     med_p = float(df.attrs.get("median_penetration", 0.0))
     med_d = float(df.attrs.get("median_target_density", 0.0))
-    _quad_color = {"A": "#d62728", "B": "#1f77b4", "C": "#2ca02c", "D": "#7f7f7f", "-": "#cccccc"}
 
     fig = px.scatter(
         df,
         x="penetration_rate",
         y="target_density",
-        color="quadrant",
-        color_discrete_map=_quad_color,
+        color="행동_전략",
+        color_discrete_map=STRATEGY_COLOR,
+        category_orders={"행동_전략": STRATEGY_ORDER},
         hover_name="admin_dong_name",
         hover_data={
-            "purchase_count": True, "total_households": True, "total_population": True,
-            "age_30_49_population": True,
             "penetration_rate": ":.3f", "target_density": ":.2f",
+            "purchase_count": True, "age_30_49_population": True,
+            "행동_전략": False,
         },
         labels={
-            "penetration_rate": "시장 침투율 %",
-            "target_density": "타겟 밀집도 % (30~59세)",
-            "quadrant": "그룹",
+            "penetration_rate": "우리 매장 침투율 %",
+            "target_density": "타겟 인구 비중 %",
+            "행동_전략": "행동 전략",
+            "purchase_count": "구매건수",
+            "age_30_49_population": "핵심타겟(30~59)",
         },
-        title="2x2 매트릭스 (중앙값 기준 4분면)",
     )
     fig.add_vline(x=med_p, line_dash="dash", line_color="grey",
                   annotation_text=f"침투율 중앙값 {med_p:.3f}%", annotation_position="top")
     fig.add_hline(y=med_d, line_dash="dash", line_color="grey",
-                  annotation_text=f"밀집도 중앙값 {med_d:.2f}%", annotation_position="right")
-    fig.update_layout(height=420, margin={"r": 20, "t": 60, "l": 40, "b": 40})
+                  annotation_text=f"타겟 비중 중앙값 {med_d:.2f}%", annotation_position="right")
+    fig.update_layout(
+        height=360,
+        margin={"r": 10, "t": 30, "l": 40, "b": 40},
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_action_top5(df: pd.DataFrame) -> None:
+    """🚨 집중 공략 그룹 중 핵심타겟(30~59세) 인구가 가장 많은 Top 5 를
+    가로 막대로 표시 — 매니저의 즉각적인 마케팅 실행 지침용."""
+    import plotly.express as px
+
+    if df is None or df.empty or "행동_전략" not in df.columns:
+        return
+
+    _attack = df[df["행동_전략"] == STRATEGY_ATTACK].copy()
+    _attack["age_30_49_population"] = pd.to_numeric(
+        _attack.get("age_30_49_population"), errors="coerce"
+    ).fillna(0).astype(int)
+    _attack = _attack[_attack["age_30_49_population"] > 0]
+
+    st.markdown("#### 당장 마케팅할 Top 5 행정동 · 집중 공략 · 타겟 인구 기준")
+
+    if _attack.empty:
+        st.caption("해당 기간에 '🚨 집중 공략' 지역이 없습니다. 다른 그룹은 매트릭스와 표를 참고하세요.")
+        return
+
+    top5 = _attack.nlargest(5, "age_30_49_population").iloc[::-1]  # 가로 막대는 아래→위로 커지도록 역순
+    top5["_label"] = top5["admin_dong_name"].fillna("").astype(str)
+    if "sigungu_label" in top5.columns:
+        top5["_label"] = top5["sigungu_label"].fillna("") + " " + top5["_label"]
+
+    top5["_perf"] = top5["hover_perf"] if "hover_perf" in top5.columns else ""
+
+    fig = px.bar(
+        top5,
+        x="age_30_49_population",
+        y="_label",
+        orientation="h",
+        text="age_30_49_population",
+        custom_data=["hover_perf"],
+        labels={"age_30_49_population": "핵심타겟(30~59) 인구", "_label": ""},
+    )
+    fig.update_traces(
+        marker_color=STRATEGY_COLOR[STRATEGY_ATTACK],
+        texttemplate="%{x:,}명",
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>핵심타겟: %{x:,}명<br>%{customdata[0]}<extra></extra>",
+        cliponaxis=False,
+    )
+    fig.update_layout(
+        height=max(220, 60 * len(top5) + 80),
+        margin={"r": 40, "t": 10, "l": 10, "b": 30},
+        xaxis=dict(showgrid=True, gridcolor="#eeeeee", zeroline=False),
+        yaxis=dict(showgrid=False),
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
 def _render_table(df: pd.DataFrame) -> None:
-    """상세 표 (그룹별 정렬)."""
+    """상세 표 — 행동 전략 순 정렬 (집중 공략 → 핵심 방어 → 잠재 → 보류)."""
     if df is None or df.empty:
         return
     _cols = [
-        "quadrant", "admin_dong_name", "admin_dong_code", "purchase_count",
+        "행동_전략", "admin_dong_name", "admin_dong_code", "purchase_count",
         "total_households", "total_population", "age_30_49_population",
         "penetration_rate", "target_density",
     ]
     if "sigungu_label" in df.columns:
         _cols.insert(2, "sigungu_label")
     show = df[_cols].copy()
+    _order_idx = {s: i for i, s in enumerate(STRATEGY_ORDER)}
+    show["_strategy_ord"] = show["행동_전략"].map(_order_idx).fillna(len(STRATEGY_ORDER))
     show = show.sort_values(
-        by=["quadrant", "penetration_rate", "target_density"],
+        by=["_strategy_ord", "penetration_rate", "target_density"],
         ascending=[True, False, False],
-    )
+    ).drop(columns=["_strategy_ord"])
     show = show.rename(columns={
-        "quadrant": "그룹",
+        "행동_전략": "행동 전략",
         "admin_dong_name": "행정동",
         "sigungu_label": "시군구",
         "admin_dong_code": "행정동코드",
