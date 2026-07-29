@@ -886,6 +886,67 @@ STRATEGY_COLOR = {
 
 STRATEGY_ORDER = [STRATEGY_ATTACK, STRATEGY_DEFEND, STRATEGY_LATENT, STRATEGY_HOLD, STRATEGY_UNSET]
 
+# Plotly 범례·안내 패널용 — 코드(A/B/C/D) + 지침 문구
+STRATEGY_CODE = {
+    STRATEGY_ATTACK: "B",
+    STRATEGY_DEFEND: "A",
+    STRATEGY_LATENT: "C",
+    STRATEGY_HOLD: "D",
+    STRATEGY_UNSET: "-",
+}
+
+STRATEGY_LEGEND_LABEL = {
+    STRATEGY_ATTACK: "B · 🚨 집중 공략 (마케팅 시급)",
+    STRATEGY_DEFEND: "A · 👑 핵심 방어 (VIP 관리)",
+    STRATEGY_LATENT: "C · 💡 잠재 상권 (특수 요인)",
+    STRATEGY_HOLD: "D · 👻 마케팅 보류 (예산 절감)",
+    STRATEGY_UNSET: "- · (미분류)",
+}
+
+STRATEGY_GUIDE = {
+    "B": "타겟(30~59세) 인구는 많지만 우리 매장 구매는 적음 → 전단·광고·체험 이벤트 등 마케팅을 **지금 우선** 투입",
+    "A": "구매도 많고 타겟 인구도 많음 → 기존 고객 **VIP 관리·재구매·소개 유도**에 집중",
+    "C": "구매는 많지만 타겟 인구 비중은 낮음 → 성숙·특수 요인 지역, **유지·케이스별** 대응",
+    "D": "구매·타겟 인구 모두 낮음 → **예산 절감·보류**, 다른 지역(B·A) 우선",
+    "-": "인구·구매 데이터 부족으로 분류 불가 — 백필·수동 교정 후 재분석",
+}
+
+STRATEGY_COLOR_BY_LEGEND = {
+    STRATEGY_LEGEND_LABEL[k]: v for k, v in STRATEGY_COLOR.items()
+}
+
+STRATEGY_LEGEND_ORDER = [STRATEGY_LEGEND_LABEL[s] for s in STRATEGY_ORDER]
+
+
+def _render_strategy_legend_guide() -> None:
+    """지도 하단·매니저용 상세 범례 — A/B/C/D 코드별 지침 문구."""
+    _items = [
+        ("B", STRATEGY_ATTACK),
+        ("A", STRATEGY_DEFEND),
+        ("C", STRATEGY_LATENT),
+        ("D", STRATEGY_HOLD),
+    ]
+    st.markdown("**행동 전략 범례** · 지도 색 = 아래 4가지 중 하나")
+    _cols = st.columns(4)
+    for _col, (_code, _label) in zip(_cols, _items):
+        _color = STRATEGY_COLOR[_label]
+        _guide = STRATEGY_GUIDE[_code]
+        _title = STRATEGY_LEGEND_LABEL[_label]
+        with _col:
+            st.markdown(
+                f'<div style="border-left:5px solid {_color};padding:8px 12px;'
+                f'background:#fafafa;border-radius:6px;font-size:0.82rem;line-height:1.45;">'
+                f'<span style="font-weight:700;color:{_color};">{_title}</span><br>'
+                f'<span style="color:#444;">{_guide.replace("**", "")}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    st.caption(
+        "분류 기준: 가로축 = 우리 매장 침투율(1,000가구당 구매), 세로축 = 타겟(30~59세) 인구 비중 — "
+        "각 축의 **중앙값**으로 2×2 매트릭스를 나눕니다. "
+        f"집중 공략(B) = {STRATEGY_GUIDE['B'].split('→')[0].strip()}."
+    )
+
 
 def compute_dong_kpi(crm_counts: pd.DataFrame, population: pd.DataFrame) -> pd.DataFrame:
     """
@@ -2050,14 +2111,20 @@ def _render_map(df: pd.DataFrame) -> None:
     _lat_c = float(primary["centroid_lat"].dropna().mean() or 35.5)
     _lon_c = float(primary["centroid_lon"].dropna().mean() or 129.3)
 
+    # Plotly 범례에 A/B/C/D 코드 포함
+    primary = primary.copy()
+    primary["행동_전략_범례"] = (
+        primary["행동_전략"].map(STRATEGY_LEGEND_LABEL).fillna(STRATEGY_LEGEND_LABEL[STRATEGY_UNSET])
+    )
+
     fig = px.choropleth_mapbox(
         primary,
         geojson=geojson,
         locations="_join",
         featureidkey=featureidkey,
-        color="행동_전략",
-        color_discrete_map=STRATEGY_COLOR,
-        category_orders={"행동_전략": STRATEGY_ORDER},
+        color="행동_전략_범례",
+        color_discrete_map=STRATEGY_COLOR_BY_LEGEND,
+        category_orders={"행동_전략_범례": STRATEGY_LEGEND_ORDER},
         mapbox_style="carto-positron",
         zoom=10,
         center={"lat": _lat_c, "lon": _lon_c},
@@ -2082,14 +2149,18 @@ def _render_map(df: pd.DataFrame) -> None:
         margin={"r": 0, "t": 0, "l": 0, "b": 0},
         height=620,
         legend=dict(
-            title=dict(text="행동 전략", font=dict(size=13)),
-            orientation="h",
-            yanchor="bottom", y=0.01,
-            xanchor="center", x=0.5,
-            bgcolor="rgba(255,255,255,0.85)",
+            title=dict(text="행동 전략 (코드 · 지침)", font=dict(size=12)),
+            orientation="v",
+            yanchor="top", y=0.98,
+            xanchor="left", x=1.01,
+            bgcolor="rgba(255,255,255,0.92)",
+            bordercolor="#dddddd",
+            borderwidth=1,
+            font=dict(size=11),
         ),
     )
     st.plotly_chart(fig, use_container_width=True)
+    _render_strategy_legend_guide()
 
 
 def _render_quadrant_scatter(df: pd.DataFrame) -> None:
