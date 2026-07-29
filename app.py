@@ -866,13 +866,15 @@ def _supabase_app_tables_available():
         return st.session_state[_cache_key]
     client, err = get_supabase_client()
     if err or not client:
+        st.session_state["_login_diag_error"] = f"Supabase 클라이언트 생성 실패: {err}"
         return False
     try:
         client.table("app_users").select("id").limit(1).execute()
         st.session_state[_cache_key] = True
         return True
-    except Exception:
+    except Exception as e:
         st.session_state[_cache_key] = False
+        st.session_state["_login_diag_error"] = f"app_users 테이블 접근 실패: {type(e).__name__}: {e}"
         return False
 
 
@@ -1168,8 +1170,10 @@ def _get_supabase_app_user_by_email(email: str):
         return None
     client, err = get_supabase_client()
     if err or not client:
+        st.session_state["_login_diag_error"] = f"Supabase 클라이언트 생성 실패: {err}"
         return None
     try:
+        st.session_state.pop("_login_diag_error", None)
         email_clean = str(email).strip().lower()
         r = client.table("app_users").select("id, username, role, store_id").eq("email", email_clean).execute()
         rows = (r.data or []) if hasattr(r, "data") else []
@@ -1188,7 +1192,8 @@ def _get_supabase_app_user_by_email(email: str):
             if s.data and s.data.get("db_filename"):
                 db_filename = s.data["db_filename"]
         return (uid, username, role, store_id, db_filename)
-    except Exception:
+    except Exception as e:
+        st.session_state["_login_diag_error"] = f"app_users 조회 실패: {type(e).__name__}: {e}"
         return None
 
 
@@ -6557,7 +6562,14 @@ def render_login():
                         else:
                             app_user = get_app_user_by_email(user.email)
                             if not app_user:
-                                st.error("이 이메일은 등록된 사용자가 아닙니다. 관리자에게 문의하세요.")
+                                _diag = st.session_state.pop("_login_diag_error", None)
+                                if _diag:
+                                    st.error(
+                                        "사용자 조회 중 오류가 발생했습니다. 관리자에게 문의하세요.\n\n"
+                                        f"진단 정보: {_diag}"
+                                    )
+                                else:
+                                    st.error("이 이메일은 등록된 사용자가 아닙니다. 관리자에게 문의하세요.")
                             else:
                                 user_id, uname, role, store_id, db_filename = app_user
                                 allowed_stores = get_user_allowed_stores(user_id) if role != "superadmin" else []
