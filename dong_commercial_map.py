@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -355,7 +356,8 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
         "pageNo": 1,
     }
     try:
-        r = requests.get(url, params=params, timeout=8.0)
+        # 실측상 5~7초가 걸리는 무거운 응답이라 병렬 호출 시 여유있게 20초로 설정.
+        r = requests.get(url, params=params, timeout=20.0)
         # 1741000 API 는 Content-Type 이 UTF-8 을 명시하지 않아 requests 가
         # ISO-8859-1 로 잘못 추측 → 한글 mojibake. 강제 UTF-8 로 재해석.
         r.encoding = "utf-8"
@@ -433,7 +435,8 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
         "pageNo": 1,
     }
     try:
-        r = requests.get(url, params=params, timeout=8.0)
+        # 실측상 5~7초가 걸리는 무거운 응답이라 병렬 호출 시 여유있게 20초로 설정.
+        r = requests.get(url, params=params, timeout=20.0)
         r.encoding = "utf-8"
         raw_url = str(r.url)
         if r.status_code != 200:
@@ -677,16 +680,29 @@ def _paginated_select(client, table: str, columns: str, filters: list[tuple] | N
     return all_rows
 
 
-def aggregate_purchase_count_by_dong(client, store_keys: list[str]) -> pd.DataFrame:
+@st.cache_data(ttl=600, show_spinner=False)
+def aggregate_purchase_count_by_dong(
+    _client, store_keys: list[str], start_date: str, end_date: str,
+) -> pd.DataFrame:
     """
     선택한 매장(들)의 app_orders + app_customers 조인 → admin_dong_code 별 구매건수 집계.
+    order_date 가 [start_date, end_date] (YYYY-MM-DD, 포함) 구간인 주문만 집계한다.
     반환: [admin_dong_code, admin_dong_name, purchase_count]
+
+    10분 캐싱(ttl=600) — 매장/기간이 동일하면 Supabase 재조회 없이 즉시 반환.
+    `_client` 는 언더스코어 접두사로 Streamlit 캐시 해싱에서 제외됨(공식 규칙).
+    최신 데이터 강제 조회가 필요하면 `aggregate_purchase_count_by_dong.clear()` 호출.
     """
+    client = _client
     if not store_keys:
         return pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
     orders = _paginated_select(
-        client, "app_orders", "id, customer_id, db_filename",
-        filters=[("in_", "db_filename", store_keys)],
+        client, "app_orders", "id, customer_id, db_filename, order_date",
+        filters=[
+            ("in_", "db_filename", store_keys),
+            ("gte", "order_date", start_date),
+            ("lte", "order_date", end_date),
+        ],
     )
     if not orders:
         return pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
@@ -808,31 +824,176 @@ def backfill_admin_dong_batch(
 
 
 # ══════════════════════════════════════════════════════════════════
-# 인구 데이터 배치 조회 (행정동 코드 리스트)
+# 인구 데이터 배치 조회 (행정동 코드 리스트) — 영구 캐시 + 병렬 조회
 # ══════════════════════════════════════════════════════════════════
 
-def fetch_population_bulk(admin_dong_codes: list[str], yyyymm: str) -> pd.DataFrame:
+_POP_CACHE_TABLE = "app_dong_population_cache"
+_POP_CACHE_COLUMNS = [
+    "admin_dong_code", "total_households", "total_population", "age_30_49_population",
+]
+
+
+def _load_population_cache_from_db(client, admin_dong_codes: list[str], yyyymm: str) -> dict[str, dict]:
+    """app_dong_population_cache 에서 (code, yyyymm) 일치 행을 벌크 조회 → {code: row} dict."""
+    if client is None or not admin_dong_codes:
+        return {}
+    hits: dict[str, dict] = {}
+    _CHUNK = 500
+    codes = [str(c) for c in admin_dong_codes if c]
+    try:
+        for i in range(0, len(codes), _CHUNK):
+            _batch = codes[i:i + _CHUNK]
+            r = (
+                client.table(_POP_CACHE_TABLE)
+                .select(",".join(_POP_CACHE_COLUMNS))
+                .eq("yyyymm", yyyymm)
+                .in_("admin_dong_code", _batch)
+                .execute()
+            )
+            for row in (r.data or []) if hasattr(r, "data") else []:
+                hits[str(row["admin_dong_code"])] = row
+    except Exception as e:
+        logger.warning("행정동 인구 캐시 조회 실패 (테이블 미생성 가능): %s", e)
+    return hits
+
+
+def _save_population_cache_to_db(client, rows: list[dict], yyyymm: str) -> None:
+    """새로 조회한 인구 데이터를 app_dong_population_cache 에 upsert (실패해도 렌더링은 계속)."""
+    if client is None or not rows:
+        return
+    payload = [
+        {
+            "admin_dong_code": r["admin_dong_code"],
+            "yyyymm": yyyymm,
+            "total_households": r["total_households"],
+            "total_population": r["total_population"],
+            "age_30_49_population": r["age_30_49_population"],
+        }
+        for r in rows
+    ]
+    try:
+        client.table(_POP_CACHE_TABLE).upsert(
+            payload, on_conflict="admin_dong_code,yyyymm"
+        ).execute()
+    except Exception as e:
+        logger.warning("행정동 인구 캐시 저장 실패 (테이블 미생성 가능): %s", e)
+
+
+def _fetch_one_dong_population(code: str, yyyymm: str) -> dict:
+    """행정동 1건의 인구+연령 API 를 호출해 캐시 저장용 row 로 변환 (스레드풀 워커)."""
+    pop = fetch_admin_dong_population(str(code), yyyymm)
+    age = fetch_admin_dong_age_population(str(code), yyyymm)
+    return {
+        "admin_dong_code": str(code),
+        "total_households": int(pop.get("total_households") or 0),
+        "total_population": int(pop.get("total_population") or 0),
+        "age_30_49_population": int(age.get("age_30_49_population") or 0),
+        "error": (pop.get("error") or "") + (" | " + age.get("error") if age.get("error") else ""),
+    }
+
+
+def fetch_population_bulk(
+    client, admin_dong_codes: list[str], yyyymm: str, max_workers: int = 8,
+) -> pd.DataFrame:
     """
     행정동코드 리스트 → 인구·세대·3040 데이터 DataFrame.
-    각 코드별로 인구 API + 성/연령별 API 를 개별 호출 (@st.cache_data 로 30일 캐싱).
+
+    1) app_dong_population_cache 에서 (code, yyyymm) 벌크 조회로 캐시 적중분 확보.
+    2) 캐시 미스난 코드만 ThreadPoolExecutor 로 병렬 호출 (인구 API + 연령 API).
+    3) 신규 조회분은 캐시 테이블에 upsert 해 다음 조회부터 즉시 재사용.
+
     반환: [admin_dong_code, total_households, total_population, age_30_49_population, error]
     """
+    codes = [str(c) for c in admin_dong_codes if c]
+    if not codes:
+        return pd.DataFrame(
+            columns=["admin_dong_code", "total_households", "total_population", "age_30_49_population", "error"]
+        )
+
+    cache_hits = _load_population_cache_from_db(client, codes, yyyymm)
+    missing = [c for c in codes if c not in cache_hits]
+
+    fetched_rows: list[dict] = []
+    if missing:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch_one_dong_population, c, yyyymm): c for c in missing}
+            for fut in as_completed(futures):
+                try:
+                    fetched_rows.append(fut.result())
+                except Exception as e:
+                    code = futures[fut]
+                    fetched_rows.append({
+                        "admin_dong_code": code, "total_households": 0,
+                        "total_population": 0, "age_30_49_population": 0,
+                        "error": f"병렬 조회 예외: {e}",
+                    })
+        # 정상 조회된(에러 없는) 행만 영구 캐시에 저장 — 오류 응답을 캐시해 재시도를 막지 않도록.
+        _ok_rows = [r for r in fetched_rows if not (r.get("error") or "").strip()]
+        _save_population_cache_to_db(client, _ok_rows, yyyymm)
+
     rows: list[dict] = []
-    for code in admin_dong_codes:
-        if not code:
-            continue
-        pop = fetch_admin_dong_population(str(code), yyyymm)
-        age = fetch_admin_dong_age_population(str(code), yyyymm)
-        rows.append({
-            "admin_dong_code": str(code),
-            "total_households": int(pop.get("total_households") or 0),
-            "total_population": int(pop.get("total_population") or 0),
-            "age_30_49_population": int(age.get("age_30_49_population") or 0),
-            "error": (pop.get("error") or "") + (" | " + age.get("error") if age.get("error") else ""),
-        })
+    for code in codes:
+        if code in cache_hits:
+            hit = cache_hits[code]
+            rows.append({
+                "admin_dong_code": code,
+                "total_households": int(hit.get("total_households") or 0),
+                "total_population": int(hit.get("total_population") or 0),
+                "age_30_49_population": int(hit.get("age_30_49_population") or 0),
+                "error": "",
+            })
+    rows.extend(fetched_rows)
+
     return pd.DataFrame(rows) if rows else pd.DataFrame(
         columns=["admin_dong_code", "total_households", "total_population", "age_30_49_population", "error"]
     )
+
+
+def prefetch_all_dong_population(client, yyyymm: str, max_workers: int = 8) -> dict:
+    """
+    관리자용: app_customers 전체의 distinct admin_dong_code 를 대상으로 인구 데이터를
+    미리 캐시 테이블에 채워 넣는다 (어떤 매장을 조회하든 즉시 캐시 히트하도록).
+
+    반환: {"total_codes": int, "cache_hits": int, "newly_fetched": int, "failed": int}
+    """
+    try:
+        r = client.table("app_customers").select("admin_dong_code").not_.is_("admin_dong_code", "null").execute()
+        codes = sorted({str(row["admin_dong_code"]) for row in (r.data or []) if row.get("admin_dong_code")})
+    except Exception as e:
+        logger.warning("prefetch_all_dong_population: 행정동코드 목록 조회 실패: %s", e)
+        return {"total_codes": 0, "cache_hits": 0, "newly_fetched": 0, "failed": 0}
+
+    if not codes:
+        return {"total_codes": 0, "cache_hits": 0, "newly_fetched": 0, "failed": 0}
+
+    cache_hits = _load_population_cache_from_db(client, codes, yyyymm)
+    missing = [c for c in codes if c not in cache_hits]
+
+    fetched_rows: list[dict] = []
+    if missing:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch_one_dong_population, c, yyyymm): c for c in missing}
+            for fut in as_completed(futures):
+                try:
+                    fetched_rows.append(fut.result())
+                except Exception as e:
+                    fetched_rows.append({
+                        "admin_dong_code": futures[fut], "total_households": 0,
+                        "total_population": 0, "age_30_49_population": 0,
+                        "error": f"병렬 조회 예외: {e}",
+                    })
+        _ok_rows = [r for r in fetched_rows if not (r.get("error") or "").strip()]
+        _save_population_cache_to_db(client, _ok_rows, yyyymm)
+        _failed = len(fetched_rows) - len(_ok_rows)
+    else:
+        _failed = 0
+
+    return {
+        "total_codes": len(codes),
+        "cache_hits": len(cache_hits),
+        "newly_fetched": len(missing) - _failed,
+        "failed": _failed,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -872,7 +1033,7 @@ def render_dong_commercial_map() -> None:
         st.error(f"Supabase 연결 실패: {err}")
         return
 
-    # ── 매장 · 기준월 선택 ─────────────────────────────────
+    # ── 매장 · 분석기간 선택 ───────────────────────────────
     stores = _get_stores_via_app()
     if not stores:
         st.info("매장 정보를 불러올 수 없습니다. 매장 계정 관리 화면에서 확인해 주세요.")
@@ -906,21 +1067,29 @@ def render_dong_commercial_map() -> None:
             key="dcm_stores",
         )
     with c2:
-        _default_ym = pd.Timestamp.now().strftime("%Y%m")
-        yyyymm = st.text_input(
-            "인구 통계 기준월 (YYYYMM)",
-            value=_default_ym,
-            max_chars=6,
-            help="행정안전부 인구·세대 데이터의 통계년월. 예: 202606",
-            key="dcm_yyyymm",
+        _today = pd.Timestamp.now().date()
+        _default_start = (pd.Timestamp.now() - pd.DateOffset(years=1)).date()
+        period_range = st.date_input(
+            "분석 기간 (구매건수 집계 구간)",
+            value=(_default_start, _today),
+            help="이 기간의 구매건수를 행정동별로 합산해 침투율을 계산합니다. "
+                 "인구·세대 데이터는 기간 종료월 기준으로 1회만 조회합니다.",
+            key="dcm_period_range",
         )
 
     if not sel_labels:
         st.info("최소 1개 이상의 매장을 선택해 주세요.")
         return
-    if not (yyyymm and len(yyyymm) == 6 and yyyymm.isdigit()):
-        st.warning("기준월은 YYYYMM 형식 6자리로 입력해 주세요.")
+    if not (isinstance(period_range, (tuple, list)) and len(period_range) == 2):
+        st.warning("분석 기간의 시작일과 종료일을 모두 선택해 주세요.")
         return
+    start_date, end_date = period_range
+    if start_date > end_date:
+        st.warning("시작일은 종료일보다 이전이어야 합니다.")
+        return
+    start_date_str = start_date.isoformat()
+    end_date_str = end_date.isoformat()
+    yyyymm = end_date.strftime("%Y%m")  # 인구·세대 데이터는 기간 종료월 스냅샷만 사용
 
     sel_dbfns = [dbf for dbf, name in store_options if name in sel_labels]
     sel_store_names = [name for _, name in store_options if name in sel_labels]
@@ -929,26 +1098,55 @@ def render_dong_commercial_map() -> None:
     with st.expander("🔄 미변환 고객 → 행정동 매핑 백필", expanded=False):
         _render_backfill_panel(client, sel_store_names)
 
+    # ── 관리자용 인구 데이터 사전 캐시 ─────────────────────
+    if role == "superadmin":
+        with st.expander("⚡ 인구 데이터 사전 캐시 (전체 매장 대상)", expanded=False):
+            st.caption(
+                f"인구 기준월({yyyymm}) 데이터를 전체 고객의 행정동 기준으로 미리 내려받아 "
+                "`app_dong_population_cache` 테이블에 저장합니다. "
+                "이후 어떤 매장·기간을 조회해도 (같은 종료월이면) 즉시 캐시 히트됩니다."
+            )
+            if st.button("🔄 전체 캐시 미리 채우기", key="dcm_prefetch_btn"):
+                with st.spinner("전체 행정동 인구 데이터 사전 캐시 중… (병렬 조회)"):
+                    _stat = prefetch_all_dong_population(client, yyyymm)
+                st.success(
+                    f"전체 {_stat['total_codes']}개 행정동 · 캐시 적중 {_stat['cache_hits']}건 · "
+                    f"신규 조회 {_stat['newly_fetched']}건 · 실패 {_stat['failed']}건"
+                )
+
     # ── 데이터 조회 · 렌더링 ─────────────────────────────
-    if not st.button("🗺️ 상권 맵 렌더링", type="primary", key="dcm_render_btn"):
-        st.info("매장·기준월 설정 후 '상권 맵 렌더링'을 눌러 주세요.")
+    _c_btn1, _c_btn2 = st.columns([2, 1])
+    with _c_btn1:
+        do_render = st.button("🗺️ 상권 맵 렌더링", type="primary", key="dcm_render_btn")
+    with _c_btn2:
+        force_refresh = st.checkbox(
+            "최신 데이터로 새로고침", key="dcm_force_refresh",
+            help="캐시를 무시하고 Supabase 에서 구매건수를 다시 집계합니다 (당일 신규 주문 반영 등).",
+        )
+
+    if not do_render:
+        st.info("매장·분석기간 설정 후 '상권 맵 렌더링'을 눌러 주세요.")
         return
 
+    if force_refresh:
+        aggregate_purchase_count_by_dong.clear()
+
     with st.spinner("행정동별 구매건수 집계 중…"):
-        crm_df = aggregate_purchase_count_by_dong(client, sel_dbfns)
+        crm_df = aggregate_purchase_count_by_dong(client, sel_dbfns, start_date_str, end_date_str)
     if crm_df.empty:
         st.warning(
-            "선택한 매장에서 행정동 매핑이 된 고객이 없습니다. "
-            "위 백필 패널로 행정동 변환을 먼저 실행해 주세요."
+            "선택한 매장·기간에 행정동 매핑이 된 구매 건이 없습니다. "
+            "위 백필 패널로 행정동 변환을 먼저 실행하거나 분석 기간을 넓혀 보세요."
         )
         return
 
+    st.caption(f"📅 분석 기간: {start_date} ~ {end_date} · 인구 기준월: {yyyymm}")
     st.success(
-        f"행정동 {len(crm_df)}개, 총 구매건수 {int(crm_df['purchase_count'].sum())} 건"
+        f"행정동 {len(crm_df)}개, 기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건"
     )
 
-    with st.spinner("행정안전부 인구·세대 데이터 조회 중… (30일 캐시)"):
-        pop_df = fetch_population_bulk(crm_df["admin_dong_code"].astype(str).tolist(), yyyymm)
+    with st.spinner("행정안전부 인구·세대 데이터 조회 중… (영구 캐시 + 병렬 조회)"):
+        pop_df = fetch_population_bulk(client, crm_df["admin_dong_code"].astype(str).tolist(), yyyymm)
 
     _err_msgs = [x for x in pop_df["error"].astype(str).tolist() if x.strip()]
     if pop_df.empty or all(pop_df["total_population"].fillna(0) == 0):
@@ -1162,7 +1360,7 @@ def _render_map(df: pd.DataFrame) -> None:
         },
         labels={
             "penetration_rate": "침투율 %", "target_density": "밀집도 %",
-            "purchase_count": "구매건수", "total_households": "세대수",
+            "purchase_count": "구매건수(기간내)", "total_households": "세대수",
             "quadrant": "그룹",
         },
     )
@@ -1252,7 +1450,7 @@ def _render_table(df: pd.DataFrame) -> None:
         "quadrant": "그룹",
         "admin_dong_name": "행정동",
         "admin_dong_code": "행정동코드",
-        "purchase_count": "구매건수",
+        "purchase_count": "구매건수(기간내)",
         "total_households": "세대수",
         "total_population": "총인구",
         "age_30_49_population": "3040 인구",
