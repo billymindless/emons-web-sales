@@ -42,6 +42,10 @@ GEOJSON_PATH_DEFAULT = str(Path(__file__).parent / "data" / "admdong_boundary.ge
 
 KAKAO_COORD2REGIONCODE_URL = "https://dapi.kakao.com/v2/local/geo/coord2regioncode.json"
 
+# 행안부 주소기반산업지원서비스 도로명주소 검색 API (business.juso.go.kr).
+# 카카오 주소검색 실패 시 2차 지오코더로 사용 — 노이즈 섞인 주소에 관대함.
+JUSO_ADDR_SEARCH_URL = "https://business.juso.go.kr/addrlink/addrLinkApi.do"
+
 # 행정안전부 행정동별 주민등록 인구 및 세대현황 API (data.go.kr 15108065).
 # 서비스명(admmPpltnHhStus) 아래 operation(selectAdmmPpltnHhStus) 을 포함한 최종 경로.
 # endpoint 는 secrets.toml [population_api] endpoint 로 재정의 가능.
@@ -292,6 +296,65 @@ def _kakao_keyword_search_to_coord(query: str) -> tuple[float, float] | None:
         return None
 
 
+def _get_juso_confm_key() -> str:
+    """행안부 주소검색 API 승인키 로더. [juso_api] confm_key → 환경변수 순."""
+    _toml = _load_toml_dict()
+    _v = str(((_toml.get("juso_api") or {}).get("confm_key", "")) or "").strip()
+    if _v:
+        return _v
+    try:
+        if hasattr(st, "secrets"):
+            _v = str((st.secrets.get("juso_api", {}) or {}).get("confm_key", "") or "").strip()
+            if _v:
+                return _v
+    except Exception:
+        pass
+    for _name in ("JUSO_CONFM_KEY", "JUSO_API_KEY"):
+        _v = (os.environ.get(_name, "") or "").strip()
+        if _v:
+            return _v
+    return ""
+
+
+def _juso_refine_road_address(address: str) -> str | None:
+    """행안부 juso.go.kr 검색 API 로 지저분한 주소를 정제된 도로명주소로 변환.
+
+    카카오 주소검색이 0건인 주소도 juso 는 부분 일치·옛 표기에 관대해 찾는 경우가 많다.
+    반환된 도로명주소를 카카오에 재투입하면 좌표 → 행정동으로 이어진다.
+    키 미설정·오류·0건이면 None (상위에서 다음 폴백으로 진행)."""
+    key = _get_juso_confm_key()
+    if not key or not address or not address.strip():
+        return None
+    # juso API 는 특수문자 포함 keyword 를 거부(E0012 등) → 사전 제거
+    kw = re.sub(r"[%=><\[\]{}|\\^~`!@#$&*()'\"]", " ", address)
+    kw = re.sub(r"\s+", " ", kw).strip()
+    if len(kw) < 4:
+        return None
+    try:
+        r = requests.get(
+            JUSO_ADDR_SEARCH_URL,
+            params={
+                "confmKey": key, "currentPage": 1, "countPerPage": 3,
+                "keyword": kw, "resultType": "json",
+            },
+            timeout=5.0,
+        )
+        if r.status_code != 200:
+            return None
+        results = (r.json() or {}).get("results") or {}
+        common = results.get("common") or {}
+        if str(common.get("errorCode", "")) != "0":
+            logger.info("juso API 오류 (%s): %s", common.get("errorCode"), common.get("errorMessage"))
+            return None
+        jusos = results.get("juso") or []
+        if not jusos:
+            return None
+        road = str(jusos[0].get("roadAddr") or jusos[0].get("roadAddrPart1") or "").strip()
+        return road or None
+    except Exception:
+        return None
+
+
 def _normalize_address_candidates(address: str) -> list[str]:
     """도로명주소 검색이 실패하는 주된 원인(실측 확인)인 동/호수 뒤 메모·태그·중복표기를
     제거한 재시도 후보 목록을 순서대로 반환 (원본과 동일하거나 너무 짧아진 후보는 제외).
@@ -326,6 +389,23 @@ def _normalize_address_candidates(address: str) -> list[str]:
     if stripped2 and stripped2 != addr:
         candidates.append(stripped2)
 
+    # 5) 전화번호 제거 (예: '... 010-1234-5678 배송전 연락')
+    no_phone = re.sub(r"\b\d{2,4}[- .]?\d{3,4}[- .]?\d{4}\b", "", addr).strip()
+    if no_phone != addr:
+        candidates.append(no_phone)
+
+    # 6) '도로명 + 건물번호' 까지만 절단 — 이후의 건물명·동호수·메모 전부 제거
+    #    (예: '울산 남구 삼산로 35, 무슨아파트 102동 301호 오후배송' → '울산 남구 삼산로 35')
+    m_road = re.match(r"^(.{4,}?(?:대로|로|길)\s*\d+(?:-\d+)?)", no_phone)
+    if m_road:
+        candidates.append(m_road.group(1).strip())
+
+    # 7) 지번주소 '동/리/가 + 번지' 까지만 절단
+    #    (예: '울산 중구 학성동 123-4 주택 파란대문' → '울산 중구 학성동 123-4')
+    m_jibun = re.match(r"^(.{4,}?[동리가]\s*\d+(?:-\d+)?)(?=\s|$)", no_phone)
+    if m_jibun:
+        candidates.append(m_jibun.group(1).strip())
+
     seen: set[str] = {addr}
     out: list[str] = []
     for c in candidates:
@@ -342,7 +422,7 @@ def geocode_to_admin_dong(
 ) -> dict:
     """
     주소 또는 좌표로 행정동명·행정동코드 조회. 주소검색 0건 시 정규화 재시도 →
-    키워드검색 순으로 폴백 체인을 적용한다 (다단계 재시도, 마스터 플랜 9.2-B).
+    juso.go.kr 2차 지오코더 → 키워드검색 순으로 폴백 체인을 적용한다.
 
     반환 (항상 "ok" 키 포함):
       성공: {"ok": True, "admin_dong_name", "admin_dong_code", "sigungu", "sidonm",
@@ -352,7 +432,7 @@ def geocode_to_admin_dong(
           - "no_kakao_key"   : 카카오 REST 키 미설정
           - "rate_limited"   : HTTP 429/5xx 등 일시 오류 → 다음 배치에서 자동 재시도
           - "no_h_region"    : 좌표는 확보했으나 행정동(H) 문서 없음
-          - "not_found"      : 주소검색·정규화 재시도·키워드검색 모두 실패 (영구 실패 후보)
+          - "not_found"      : 주소검색·정규화·juso·키워드검색 모두 실패 (영구 실패 후보)
     """
     key = _get_kakao_rest_key_local()
     if not key:
@@ -381,6 +461,23 @@ def geocode_to_admin_dong(
                 if rate_limited:
                     return {"ok": False, "fail_stage": "rate_limited", "fail_detail": f"정규화 재시도 중 HTTP 오류: {cand}"}
 
+            # 2차 지오코더: 행안부 juso 검색으로 주소 정제 → 카카오 재검색
+            if _lat is None:
+                _seen_road: set[str] = set()
+                for cand in [address, *_normalize_address_candidates(address)]:
+                    road = _juso_refine_road_address(cand)
+                    if not road or road in _seen_road:
+                        continue
+                    _seen_road.add(road)
+                    coord, rate_limited = _kakao_address_to_coord_ex(road)
+                    if coord:
+                        _lat, _lon = coord
+                        matched_address = road
+                        break
+                    if rate_limited:
+                        return {"ok": False, "fail_stage": "rate_limited",
+                                "fail_detail": f"juso 정제주소 재검색 중 HTTP 오류: {road}"}
+
             if _lat is None:
                 for cand in [address, *_normalize_address_candidates(address)]:
                     coord = _kakao_keyword_search_to_coord(cand)
@@ -391,7 +488,7 @@ def geocode_to_admin_dong(
                 if _lat is None:
                     return {
                         "ok": False, "fail_stage": "not_found",
-                        "fail_detail": "주소검색·정규화 재시도·키워드검색 모두 0건",
+                        "fail_detail": "주소검색·정규화·juso·키워드검색 모두 0건",
                     }
 
     try:
@@ -716,6 +813,48 @@ def build_geojson_index(geojson: dict) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame(
         columns=["adm_cd", "adm_cd2", "adm_nm", "sidonm", "sggnm", "centroid_lat", "centroid_lon"]
     )
+
+
+def suggest_dong_candidates(address: str, geo_idx: pd.DataFrame) -> list[dict]:
+    """실패 주소의 '같은 시군구 + 도로명 어간 ↔ 행정동명 어간' 매칭 후보를 점수순 반환.
+
+    예: '울산 남구 삼산로 12 ...' → 남구 내 '삼산동' (어간 '삼산' 완전일치, score 1.0).
+    도로명이 동명과 무관한 경우(중앙로 등)가 있으므로 자동 적용은
+    'score 1.0 후보가 시군구 내 정확히 1개'일 때만 권장 (그 외는 관리자 확인용 추천).
+
+    반환: [{"adm_nm", "adm_cd2", "score"}, ...] score 내림차순, 최대 3개.
+    """
+    addr = (address or "").strip()
+    if not addr or geo_idx is None or geo_idx.empty:
+        return []
+    # 1) 도로명 어간 추출: '삼산로'→'삼산', '화합로3길'→'화합', '테크노대로'→'테크노'
+    m_road = re.search(r"([가-힣]{2,})(?:대로|로|길)", addr)
+    if not m_road:
+        return []
+    road_stem = m_road.group(1)
+
+    # 2) 주소에 등장하는 시군구로 후보 범위 한정 (시군구 불명이면 추천하지 않음 — 안전)
+    sgg_rows = geo_idx[geo_idx["sggnm"].apply(lambda s: bool(s) and s in addr)]
+    if sgg_rows.empty:
+        return []
+
+    cands: dict[str, dict] = {}
+    for _, row in sgg_rows.iterrows():
+        # 행정동명 어간: '삼산동'→'삼산', '무거1동'→'무거', '범서읍'→'범서'
+        last = str(row["adm_nm"]).split()[-1]
+        dong_stem = re.sub(r"제?\d*[동읍면]$", "", last)
+        if not dong_stem:
+            continue
+        if dong_stem == road_stem:
+            score = 1.0
+        elif len(dong_stem) >= 2 and (road_stem.startswith(dong_stem) or dong_stem.startswith(road_stem)):
+            score = 0.6
+        else:
+            continue
+        code = str(row["adm_cd2"])
+        if code not in cands or cands[code]["score"] < score:
+            cands[code] = {"adm_nm": row["adm_nm"], "adm_cd2": code, "score": score}
+    return sorted(cands.values(), key=lambda x: -x["score"])[:3]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1694,6 +1833,34 @@ def _render_manual_correction_panel(client, store_names: list[str]) -> None:
             dict(zip(idx["adm_nm"], idx["adm_cd2"])) if not idx.empty else {}
         )
 
+        def _apply_dong(cid_: int, code_: str, name_: str) -> None:
+            client.table("app_customers").update({
+                "admin_dong_name": name_,
+                "admin_dong_code": code_,
+                "admin_dong_fail_reason": None,
+                "admin_dong_fail_at": None,
+            }).eq("id", cid_).execute()
+
+        # ── ⚡ 확실한 건 일괄 자동 적용 (도로명 어간 완전일치 후보가 시군구 내 1개뿐) ──
+        st.caption(
+            "⚡ **자동 적용**: 주소의 도로명 어간(예: '삼산로'→'삼산')과 완전히 일치하는 "
+            "행정동이 같은 시군구에 정확히 1개뿐인 건만 일괄 적용합니다. "
+            "그 외에는 아래 목록의 추천 버튼으로 개별 확인 후 적용하세요."
+        )
+        if st.button("⚡ 확실한 건 자동 적용 (현재 목록 대상)", key="dcm_fix_auto_apply"):
+            _applied = 0
+            for _r in rows:
+                _suggs_a = suggest_dong_candidates(_r.get("address") or "", idx)
+                _exact = [s for s in _suggs_a if s["score"] >= 1.0]
+                if len(_exact) == 1:
+                    _apply_dong(_r["id"], _exact[0]["adm_cd2"], _exact[0]["adm_nm"].split()[-1])
+                    _applied += 1
+            if _applied:
+                st.success(f"{_applied}건 자동 적용 완료.")
+                st.rerun()
+            else:
+                st.info("자동 적용 조건(어간 완전일치 단일 후보)에 맞는 건이 없습니다.")
+
         for row in rows:
             cid = row.get("id")
             with st.container(border=True):
@@ -1719,6 +1886,20 @@ def _render_manual_correction_panel(client, store_names: list[str]) -> None:
                             st.rerun()
                         else:
                             st.error(f"여전히 실패: {info.get('fail_stage')} · {info.get('fail_detail')}")
+
+                # ── 같은 시군구 유사명 추천 (⭐ 어간 완전일치 / ☆ 부분일치) ──
+                _suggs = suggest_dong_candidates(row.get("address") or "", idx)
+                if _suggs:
+                    _sc = st.columns(len(_suggs))
+                    for _si, _sg in enumerate(_suggs):
+                        with _sc[_si]:
+                            _star = "⭐" if _sg["score"] >= 1.0 else "☆"
+                            if st.button(f"{_star} {_sg['adm_nm']}",
+                                         key=f"dcm_fix_sugg_{cid}_{_sg['adm_cd2']}",
+                                         help="클릭 시 이 행정동으로 즉시 지정합니다."):
+                                _apply_dong(cid, _sg["adm_cd2"], _sg["adm_nm"].split()[-1])
+                                st.success(f"'{_sg['adm_nm']}' 지정 완료")
+                                st.rerun()
 
                 if _dong_options:
                     _sel = st.selectbox(
