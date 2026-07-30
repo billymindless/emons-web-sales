@@ -1,17 +1,15 @@
--- 행정동 인구 캐시에 연령대별(10세 단위) 버킷 컬럼 추가
+-- 행정동 인구 캐시에 연령대별(10세 단위) 버킷 컬럼 추가 (구버전 테이블 업그레이드용)
 -- 목적: 상권 퍼포먼스 맵의 '핵심 타겟 연령대' 멀티셀렉트(10대~70대 이상)에서
 --       API를 재호출하지 않고 UI 선택만으로 target_density 를 재계산할 수 있도록,
 --       행안부 성/연령 API 응답의 10세 단위 버킷을 캐시에 그대로 저장한다.
 --
--- 실행 순서: 1) SUPABASE_APP_DONG_POPULATION_CACHE.sql (테이블 미생성 환경) 먼저
---             2) 이 파일(SUPABASE_APP_DONG_POPULATION_CACHE_AGE_BUCKETS.sql)
+-- ⚠️ 테이블이 아직 없으면 이 파일을 실행하지 마세요 (42P01 오류 발생).
+--    대신 SUPABASE_APP_DONG_POPULATION_CACHE.sql 만 실행하세요 (연령 컬럼 포함 최신 버전).
 --
--- 주의: 기존 age_30_49_population 컬럼은 하위호환용으로 유지(신규 코드는 참조하지 않음).
---       배포 후 첫 조회 시 각 (admin_dong_code, yyyymm) 행의 신규 컬럼은 자동으로
---       upsert 되어 채워진다. 기존 캐시 행을 강제 재적재하려면 아래 주석의 DELETE 참고.
---       캐시 테이블이 아직 없어도 앱은 정상 동작하며(그저 매 조회마다 API 호출),
---       속도 향상을 원할 때 위 두 SQL 을 순서대로 실행하면 된다.
-
+-- 실행 순서:
+--   [최초 설치] SUPABASE_APP_DONG_POPULATION_CACHE.sql 만 실행
+--   [구버전 업그레이드] 이미 app_dong_population_cache 가 있고 age_10_population 등이
+--                       없을 때만 이 파일 실행
 ALTER TABLE app_dong_population_cache ADD COLUMN IF NOT EXISTS age_10_population INTEGER DEFAULT 0;
 ALTER TABLE app_dong_population_cache ADD COLUMN IF NOT EXISTS age_20_population INTEGER DEFAULT 0;
 ALTER TABLE app_dong_population_cache ADD COLUMN IF NOT EXISTS age_30_population INTEGER DEFAULT 0;
