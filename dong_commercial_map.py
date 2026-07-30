@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -1921,6 +1922,17 @@ def render_dong_commercial_map() -> None:
     # ── 상세 표 ─────────────────────────────────────
     _render_table(kpi_df)
 
+    # ── PDF 출력 ─────────────────────────────────────
+    _render_pdf_export_panel(
+        kpi_df,
+        store_names=sel_store_names,
+        start_date=str(start_date),
+        end_date=str(end_date),
+        yyyymm=yyyymm,
+        age_keys=sel_age_keys,
+        cache_key=_cache_key,
+    )
+
 
 # ══════════════════════════════════════════════════════════════════
 # 하위 렌더 함수
@@ -2494,3 +2506,543 @@ def _render_table(df: pd.DataFrame) -> None:
         "target_density": "밀집도(%)",
     })
     st.dataframe(show, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════
+# PDF 보고서 출력
+# ══════════════════════════════════════════════════════════════════
+
+# PDF 본문용 — 이모지 제거(CID 폰트 미지원)한 짧은 전략 라벨
+_STRATEGY_PDF_LABEL = {
+    STRATEGY_ATTACK: "B · 집중 공략",
+    STRATEGY_DEFEND: "A · 핵심 방어",
+    STRATEGY_LATENT: "C · 잠재 상권",
+    STRATEGY_HOLD: "D · 마케팅 보류",
+    STRATEGY_UNSET: "- · 미분류",
+}
+
+_MPL_KR_FONT_CONFIGURED = False
+
+
+def _configure_matplotlib_korean_font() -> None:
+    """matplotlib 차트/지도 라벨용 한글 폰트를 OS별로 설정 (1회)."""
+    global _MPL_KR_FONT_CONFIGURED
+    if _MPL_KR_FONT_CONFIGURED:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib import font_manager, rcParams
+    except Exception as exc:
+        logger.warning("matplotlib 폰트 설정 실패: %s", exc)
+        return
+
+    candidates = [
+        "Malgun Gothic",       # Windows
+        "AppleGothic",         # macOS
+        "NanumGothic",         # Linux / 나눔
+        "NanumBarunGothic",
+        "Noto Sans CJK KR",
+        "Noto Sans KR",
+        "UnDotum",
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    chosen = next((n for n in candidates if n in available), None)
+    if not chosen:
+        # 파일 경로로 직접 등록 (배포 환경·제한된 폰트 캐시 대비)
+        path_candidates = [
+            Path(__file__).parent / "data" / "fonts" / "NanumGothic.ttf",
+            Path("C:/Windows/Fonts/malgun.ttf"),
+            Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        ]
+        for fp in path_candidates:
+            if not fp.exists():
+                continue
+            try:
+                font_manager.fontManager.addfont(str(fp))
+                chosen = font_manager.FontProperties(fname=str(fp)).get_name()
+                break
+            except Exception as exc:
+                logger.warning("폰트 파일 등록 실패 %s: %s", fp, exc)
+    if chosen:
+        rcParams["font.family"] = chosen
+        rcParams["axes.unicode_minus"] = False
+        logger.info("matplotlib 한글 폰트: %s", chosen)
+    else:
+        logger.warning(
+            "한글 matplotlib 폰트를 찾지 못했습니다. 지도 라벨이 깨질 수 있습니다. "
+            "후보=%s", candidates,
+        )
+    _MPL_KR_FONT_CONFIGURED = True
+
+
+def _pdf_safe_text(s: Any) -> str:
+    """reportlab CID 폰트에서 문제 되는 이모지·제어문자를 제거."""
+    text = "" if s is None else str(s)
+    text = re.sub(r"[\U00010000-\U0010ffff]", "", text)
+    text = re.sub(r"[\u2600-\u27bf\u2300-\u23ff\u2b00-\u2bff\ufe0f]", "", text)
+    return text.strip()
+
+
+def _match_kpi_to_geojson(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """kpi_df 를 GeoJSON 키(adm_cd2 우선, adm_cd 폴백)로 조인할 준비.
+    반환: (조인키 컬럼 `_join` 이 붙은 df, featureidkey 접미 'adm_cd2'|'adm_cd')."""
+    geojson = load_admdong_geojson()
+    idx = build_geojson_index(geojson)
+    df_map = df.copy()
+    df_map["_key10"] = df_map["admin_dong_code"].astype(str)
+    df_map["_key8"] = df_map["_key10"].str[:8]
+    if df_map["_key10"].isin(set(idx["adm_cd2"])).any():
+        out = df_map[df_map["_key10"].isin(set(idx["adm_cd2"]))].copy()
+        out["_join"] = out["_key10"]
+        return out, "adm_cd2"
+    out = df_map[df_map["_key8"].isin(set(idx["adm_cd"]))].copy()
+    out["_join"] = out["_key8"]
+    return out, "adm_cd"
+
+
+def _build_strategy_map_png(df: pd.DataFrame) -> bytes | None:
+    """행동 전략 색으로 행정동 폴리곤을 채운 정적 지도 PNG."""
+    try:
+        _configure_matplotlib_korean_font()
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning("matplotlib 로드 실패 — PDF 지도 생략: %s", exc)
+        return None
+
+    geojson = load_admdong_geojson()
+    primary, join_key = _match_kpi_to_geojson(df)
+    if primary.empty or not geojson.get("features"):
+        return None
+
+    color_by_join = {
+        str(r["_join"]): STRATEGY_COLOR.get(r.get("행동_전략"), STRATEGY_COLOR[STRATEGY_UNSET])
+        for _, r in primary.iterrows()
+    }
+    name_by_join = {
+        str(r["_join"]): str(r.get("admin_dong_name") or "")
+        for _, r in primary.iterrows()
+    }
+
+    fig, ax = plt.subplots(figsize=(10.5, 8.2), dpi=140)
+    xs_all: list[float] = []
+    ys_all: list[float] = []
+    for feat in geojson.get("features") or []:
+        props = feat.get("properties") or {}
+        key = str(props.get(join_key) or "").strip()
+        if key not in color_by_join:
+            continue
+        geom = feat.get("geometry") or {}
+        gtype = geom.get("type")
+        coords = geom.get("coordinates") or []
+        polys = [coords] if gtype == "Polygon" else (coords if gtype == "MultiPolygon" else [])
+        for poly in polys:
+            if not poly:
+                continue
+            ring = poly[0]
+            xs = [float(p[0]) for p in ring]
+            ys = [float(p[1]) for p in ring]
+            xs_all.extend(xs)
+            ys_all.extend(ys)
+            ax.fill(xs, ys, facecolor=color_by_join[key], edgecolor="#ffffff",
+                    linewidth=0.35, alpha=0.82, zorder=2)
+            # 동 이름은 선택 동이 적을 때만 라벨 (가독성)
+            if len(color_by_join) <= 40 and key in name_by_join:
+                ax.text(
+                    sum(xs) / len(xs), sum(ys) / len(ys),
+                    name_by_join[key], fontsize=5.5, ha="center", va="center",
+                    color="#222222", zorder=3,
+                )
+
+    if not xs_all:
+        plt.close(fig)
+        return None
+
+    pad_x = (max(xs_all) - min(xs_all)) * 0.05 + 0.002
+    pad_y = (max(ys_all) - min(ys_all)) * 0.05 + 0.002
+    ax.set_xlim(min(xs_all) - pad_x, max(xs_all) + pad_x)
+    ax.set_ylim(min(ys_all) - pad_y, max(ys_all) + pad_y)
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    ax.set_title("상권 전략 지도", fontsize=12, pad=8)
+
+    from matplotlib.patches import Patch
+    legend_items = [
+        (STRATEGY_ATTACK, _STRATEGY_PDF_LABEL[STRATEGY_ATTACK]),
+        (STRATEGY_DEFEND, _STRATEGY_PDF_LABEL[STRATEGY_DEFEND]),
+        (STRATEGY_LATENT, _STRATEGY_PDF_LABEL[STRATEGY_LATENT]),
+        (STRATEGY_HOLD, _STRATEGY_PDF_LABEL[STRATEGY_HOLD]),
+    ]
+    handles = [
+        Patch(facecolor=STRATEGY_COLOR[s], edgecolor="#888", label=lab)
+        for s, lab in legend_items
+    ]
+    ax.legend(handles=handles, loc="lower left", framealpha=0.92, fontsize=8)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _build_quadrant_scatter_png(df: pd.DataFrame) -> bytes | None:
+    """2x2 매트릭스 산점도 PNG."""
+    try:
+        _configure_matplotlib_korean_font()
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning("matplotlib 로드 실패 — PDF 산점도 생략: %s", exc)
+        return None
+    if df is None or df.empty:
+        return None
+
+    med_p = float(df.attrs.get("median_penetration", 0.0) or 0.0)
+    med_d = float(df.attrs.get("median_target_density", 0.0) or 0.0)
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.2), dpi=140)
+    for strat in STRATEGY_ORDER:
+        sub = df[df["행동_전략"] == strat]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["penetration_rate"], sub["target_density"],
+            c=STRATEGY_COLOR.get(strat, "#999"),
+            s=42, alpha=0.85, edgecolors="#ffffff", linewidths=0.4,
+            label=_STRATEGY_PDF_LABEL.get(strat, strat),
+            zorder=3,
+        )
+    ax.axvline(med_p, color="#888888", linestyle="--", linewidth=1, zorder=2)
+    ax.axhline(med_d, color="#888888", linestyle="--", linewidth=1, zorder=2)
+    ax.set_xlabel("침투율 %")
+    ax.set_ylabel("타겟 밀집도 %")
+    ax.set_title("2×2 매트릭스")
+    ax.grid(True, color="#eeeeee", linewidth=0.6)
+    ax.legend(fontsize=7, loc="best", framealpha=0.9)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _build_top5_bar_png(df: pd.DataFrame) -> bytes | None:
+    """집중 공략 Top 5 가로 막대 PNG."""
+    try:
+        _configure_matplotlib_korean_font()
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning("matplotlib 로드 실패 — PDF Top5 생략: %s", exc)
+        return None
+    if df is None or df.empty or "행동_전략" not in df.columns:
+        return None
+
+    attack = df[df["행동_전략"] == STRATEGY_ATTACK].copy()
+    attack["target_population"] = pd.to_numeric(
+        attack.get("target_population"), errors="coerce"
+    ).fillna(0)
+    attack = attack[attack["target_population"] > 0]
+    if attack.empty:
+        return None
+    top5 = attack.nlargest(5, "target_population").iloc[::-1]
+    labels = top5["admin_dong_name"].fillna("").astype(str).tolist()
+    values = top5["target_population"].astype(float).tolist()
+
+    fig, ax = plt.subplots(figsize=(7.5, 3.6), dpi=140)
+    ax.barh(labels, values, color=STRATEGY_COLOR[STRATEGY_ATTACK], height=0.6)
+    for i, v in enumerate(values):
+        ax.text(v, i, f"  {int(v):,}", va="center", fontsize=8, color="#333")
+    ax.set_xlabel("핵심타겟 인구")
+    ax.set_title("집중 공략 Top 5 (B)")
+    ax.grid(True, axis="x", color="#eeeeee", linewidth=0.6)
+    ax.set_axisbelow(True)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_dong_commercial_pdf(
+    kpi_df: pd.DataFrame,
+    *,
+    store_names: list[str],
+    start_date: str,
+    end_date: str,
+    yyyymm: str,
+    age_label: str,
+) -> bytes:
+    """상권 퍼포먼스 맵 렌더 결과 PDF 바이트를 생성한다."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.platypus import (
+        Image,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    if "HYSMyeongJo-Medium" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
+    if "HYGothic-Medium" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+
+    page = landscape(A4)
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=page,
+        leftMargin=12 * mm, rightMargin=12 * mm,
+        topMargin=12 * mm, bottomMargin=12 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "DcmTitle", parent=styles["Title"],
+        fontName="HYGothic-Medium", fontSize=18, leading=24,
+        alignment=TA_CENTER, spaceAfter=6,
+    )
+    h_style = ParagraphStyle(
+        "DcmH", parent=styles["Heading2"],
+        fontName="HYGothic-Medium", fontSize=12, leading=16,
+        spaceBefore=8, spaceAfter=4,
+    )
+    body_style = ParagraphStyle(
+        "DcmBody", parent=styles["Normal"],
+        fontName="HYSMyeongJo-Medium", fontSize=9, leading=13,
+        alignment=TA_LEFT,
+    )
+    small_style = ParagraphStyle(
+        "DcmSmall", parent=styles["Normal"],
+        fontName="HYSMyeongJo-Medium", fontSize=8, leading=11,
+        textColor=colors.HexColor("#555555"),
+    )
+    cell_style = ParagraphStyle(
+        "DcmCell", parent=styles["Normal"],
+        fontName="HYSMyeongJo-Medium", fontSize=7.5, leading=9.5,
+    )
+
+    story: list[Any] = []
+    story.append(Paragraph(_pdf_safe_text("동 단위 상권 퍼포먼스 맵 보고서"), title_style))
+    story.append(Paragraph(
+        _pdf_safe_text(
+            f"매장: {', '.join(store_names) or '-'}  |  "
+            f"분석기간: {start_date} ~ {end_date}  |  "
+            f"인구기준월: {yyyymm}  |  "
+            f"핵심타겟: {age_label}"
+        ),
+        body_style,
+    ))
+    story.append(Spacer(1, 4 * mm))
+
+    # 요약 KPI
+    _total_dong = len(kpi_df) if kpi_df is not None else 0
+    _total_orders = int(kpi_df["purchase_count"].sum()) if _total_dong else 0
+    _med_p = float(kpi_df.attrs.get("median_penetration", 0.0) or 0.0) if _total_dong else 0.0
+    _med_d = float(kpi_df.attrs.get("median_target_density", 0.0) or 0.0) if _total_dong else 0.0
+    strat_counts = (
+        kpi_df["행동_전략"].value_counts().to_dict()
+        if _total_dong and "행동_전략" in kpi_df.columns else {}
+    )
+    summary_rows = [
+        ["대상 행정동", f"{_total_dong:,}", "총 구매건수", f"{_total_orders:,}"],
+        ["침투율 중앙값", f"{_med_p:.3f}%", "밀집도 중앙값", f"{_med_d:.2f}%"],
+        [
+            _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_ATTACK]),
+            str(strat_counts.get(STRATEGY_ATTACK, 0)),
+            _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_DEFEND]),
+            str(strat_counts.get(STRATEGY_DEFEND, 0)),
+        ],
+        [
+            _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_LATENT]),
+            str(strat_counts.get(STRATEGY_LATENT, 0)),
+            _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_HOLD]),
+            str(strat_counts.get(STRATEGY_HOLD, 0)),
+        ],
+    ]
+    summary_tbl = Table(summary_rows, colWidths=[45 * mm, 30 * mm, 45 * mm, 30 * mm])
+    summary_tbl.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "HYSMyeongJo-Medium"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F5F5F5")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#F5F5F5")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(summary_tbl)
+    story.append(Spacer(1, 3 * mm))
+    story.append(Paragraph(
+        _pdf_safe_text(
+            "행동 전략 — B 집중공략: 타겟 많음·구매 적음(마케팅 시급) / "
+            "A 핵심방어: 구매·타겟 모두 많음(VIP) / "
+            "C 잠재상권: 구매 많음·타겟 비중 낮음 / "
+            "D 보류: 구매·타겟 모두 낮음"
+        ),
+        small_style,
+    ))
+
+    # 지도
+    story.append(Paragraph(_pdf_safe_text("1. 상권 전략 지도"), h_style))
+    map_png = _build_strategy_map_png(kpi_df)
+    if map_png:
+        story.append(Image(io.BytesIO(map_png), width=250 * mm, height=155 * mm, kind="proportional"))
+    else:
+        story.append(Paragraph(_pdf_safe_text("(지도 이미지를 생성하지 못했습니다)"), body_style))
+
+    story.append(PageBreak())
+
+    # 2x2 + Top5
+    story.append(Paragraph(_pdf_safe_text("2. 2×2 매트릭스 · 집중 공략 Top 5"), h_style))
+    q_png = _build_quadrant_scatter_png(kpi_df)
+    t_png = _build_top5_bar_png(kpi_df)
+    chart_row: list[Any] = []
+    if q_png:
+        chart_row.append(Image(io.BytesIO(q_png), width=120 * mm, height=100 * mm, kind="proportional"))
+    if t_png:
+        chart_row.append(Image(io.BytesIO(t_png), width=130 * mm, height=70 * mm, kind="proportional"))
+    if chart_row:
+        if len(chart_row) == 2:
+            charts = Table([chart_row], colWidths=[125 * mm, 140 * mm])
+            charts.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            story.append(charts)
+        else:
+            story.append(chart_row[0])
+    else:
+        story.append(Paragraph(_pdf_safe_text("(차트 이미지를 생성하지 못했습니다)"), body_style))
+
+    story.append(PageBreak())
+
+    # 상세 표
+    story.append(Paragraph(_pdf_safe_text("3. 행정동별 상세 지표"), h_style))
+    if kpi_df is None or kpi_df.empty:
+        story.append(Paragraph(_pdf_safe_text("(데이터 없음)"), body_style))
+    else:
+        show = kpi_df.copy()
+        _order_idx = {s: i for i, s in enumerate(STRATEGY_ORDER)}
+        show["_ord"] = show["행동_전략"].map(_order_idx).fillna(len(STRATEGY_ORDER))
+        show = show.sort_values(
+            by=["_ord", "penetration_rate", "target_density"],
+            ascending=[True, False, False],
+        )
+        header = [
+            "전략", "시군구", "행정동", "구매", "세대", "총인구",
+            f"핵심({_pdf_safe_text(age_label)})", "침투%", "밀집%",
+        ]
+        rows: list[list[Any]] = [[Paragraph(_pdf_safe_text(h), cell_style) for h in header]]
+        for _, r in show.iterrows():
+            rows.append([
+                Paragraph(_pdf_safe_text(_STRATEGY_PDF_LABEL.get(r.get("행동_전략"), r.get("행동_전략"))), cell_style),
+                Paragraph(_pdf_safe_text(r.get("sigungu_label", "")), cell_style),
+                Paragraph(_pdf_safe_text(r.get("admin_dong_name", "")), cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('purchase_count'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('total_households'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('total_population'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('target_population'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{float(pd.to_numeric(r.get('penetration_rate'), errors='coerce') or 0):.3f}", cell_style),
+                Paragraph(f"{float(pd.to_numeric(r.get('target_density'), errors='coerce') or 0):.2f}", cell_style),
+            ])
+        col_w = [28 * mm, 32 * mm, 28 * mm, 18 * mm, 22 * mm, 22 * mm, 28 * mm, 18 * mm, 18 * mm]
+        detail = Table(rows, colWidths=col_w, repeatRows=1)
+        detail.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), "HYSMyeongJo-Medium"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#37474F")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0BEC5")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 2),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(detail)
+
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph(
+        _pdf_safe_text(
+            f"생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+            "본 보고서는 상권 퍼포먼스 맵 화면의 현재 선택(매장·기간·행정동·연령대) 기준입니다."
+        ),
+        small_style,
+    ))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _render_pdf_export_panel(
+    kpi_df: pd.DataFrame,
+    *,
+    store_names: list[str],
+    start_date: str,
+    end_date: str,
+    yyyymm: str,
+    age_keys: list[str],
+    cache_key: Any,
+) -> None:
+    """렌더 결과 하단 — PDF 생성·다운로드 패널."""
+    st.divider()
+    st.markdown("### 📄 PDF 보고서")
+    st.caption(
+        "현재 화면에 렌더된 상권 전략 지도 · 2×2 매트릭스 · 집중 공략 Top 5 · "
+        "행정동별 상세 표를 PDF로 저장합니다."
+    )
+    _pdf_state_key = (cache_key, tuple(age_keys), yyyymm)
+    if st.session_state.get("dcm_pdf_state_key") != _pdf_state_key:
+        st.session_state.pop("dcm_pdf_bytes", None)
+        st.session_state.pop("dcm_pdf_filename", None)
+        st.session_state["dcm_pdf_state_key"] = _pdf_state_key
+
+    _age_label = format_selected_age_label(age_keys)
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("📄 PDF 보고서 생성", type="secondary", key="dcm_pdf_gen_btn"):
+            try:
+                with st.spinner("PDF 생성 중… (지도·차트 렌더링)"):
+                    pdf_bytes = build_dong_commercial_pdf(
+                        kpi_df,
+                        store_names=list(store_names or []),
+                        start_date=start_date,
+                        end_date=end_date,
+                        yyyymm=yyyymm,
+                        age_label=_age_label,
+                    )
+                st.session_state["dcm_pdf_bytes"] = pdf_bytes
+                st.session_state["dcm_pdf_filename"] = (
+                    f"dong_commercial_map_{start_date}_{end_date}.pdf"
+                )
+                st.success(f"PDF 생성 완료 ({len(pdf_bytes):,} bytes)")
+            except Exception as exc:
+                logger.exception("상권 맵 PDF 생성 실패")
+                st.error(f"PDF 생성 실패: {exc}")
+
+    _pdf = st.session_state.get("dcm_pdf_bytes")
+    if _pdf:
+        with c2:
+            st.download_button(
+                "⬇️ PDF 다운로드",
+                data=_pdf,
+                file_name=st.session_state.get(
+                    "dcm_pdf_filename", "dong_commercial_map.pdf"
+                ),
+                mime="application/pdf",
+                key="dcm_pdf_download_btn",
+            )
