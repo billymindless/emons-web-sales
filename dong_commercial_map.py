@@ -1004,7 +1004,7 @@ def compute_dong_kpi(
     selected_age_keys: list[str] | tuple[str, ...] | None = None,
 ) -> pd.DataFrame:
     """
-    crm_counts:  [admin_dong_code, admin_dong_name, purchase_count]
+    crm_counts:  [admin_dong_code, admin_dong_name, purchase_count, purchase_amount?]
     population:  [admin_dong_code, total_households, total_population,
                   age_10_population ~ age_60_population, age_70plus_population]
     selected_age_keys: UI 에서 선택된 연령 버킷 키(예: ["30","40","50"]). None 이면 DEFAULT_TARGET_AGE_KEYS.
@@ -1029,6 +1029,9 @@ def compute_dong_kpi(
         df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0)
     df["target_population"] = sum(df[age_bucket_column(k)] for k in sel_keys).astype(float)
     df["purchase_count"] = pd.to_numeric(df.get("purchase_count"), errors="coerce").fillna(0)
+    df["purchase_amount"] = (
+        pd.to_numeric(df.get("purchase_amount"), errors="coerce").fillna(0).round(0).astype("int64")
+    )
     df["penetration_rate"] = (df["purchase_count"] / df["total_households"] * 100).astype(float).fillna(0.0)
     df["target_density"] = (df["target_population"] / df["total_population"] * 100).astype(float).fillna(0.0)
     df["penetration_rate"] = df["penetration_rate"].round(3)
@@ -1116,16 +1119,19 @@ def aggregate_purchase_count_by_dong(
     _client, store_keys: list[str], start_date: str, end_date: str,
 ) -> pd.DataFrame:
     """
-    선택한 매장(들)의 app_orders + app_customers 조인 → admin_dong_code 별 구매건수 집계.
+    선택한 매장(들)의 app_orders + app_customers 조인 → admin_dong_code 별 구매건수·금액 집계.
     order_date 가 [start_date, end_date] (YYYY-MM-DD, 포함) 구간인 주문만 집계한다.
-    반환: [admin_dong_code, admin_dong_name, purchase_count]
+    반환: [admin_dong_code, admin_dong_name, purchase_count, purchase_amount]
+    purchase_amount 는 app_orders.total_amount 합계.
 
     10분 캐싱(ttl=600) — 매장/기간이 동일하면 Supabase 재조회 없이 즉시 반환.
     `_client` 는 언더스코어 접두사로 Streamlit 캐시 해싱에서 제외됨(공식 규칙).
     최신 데이터 강제 조회가 필요하면 `aggregate_purchase_count_by_dong.clear()` 호출.
     """
     def _empty_with_coverage(total_orders: int, mapped_orders: int) -> pd.DataFrame:
-        _out = pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
+        _out = pd.DataFrame(columns=[
+            "admin_dong_code", "admin_dong_name", "purchase_count", "purchase_amount",
+        ])
         _out.attrs["total_orders_in_period"] = total_orders
         _out.attrs["mapped_orders_in_period"] = mapped_orders
         return _out
@@ -1134,7 +1140,7 @@ def aggregate_purchase_count_by_dong(
     if not store_keys:
         return _empty_with_coverage(0, 0)
     orders = _paginated_select(
-        client, "app_orders", "id, customer_id, db_filename, order_date",
+        client, "app_orders", "id, customer_id, db_filename, order_date, total_amount",
         filters=[
             ("in_", "db_filename", store_keys),
             ("gte", "order_date", start_date),
@@ -1161,13 +1167,17 @@ def aggregate_purchase_count_by_dong(
         return _empty_with_coverage(len(orders), 0)
     cdf = pd.DataFrame(custs).rename(columns={"id": "customer_id"})
     odf = pd.DataFrame(orders)
+    odf["total_amount"] = pd.to_numeric(odf.get("total_amount"), errors="coerce").fillna(0)
     merged_all = odf.merge(cdf[["customer_id", "admin_dong_code", "admin_dong_name"]], on="customer_id", how="left")
     mapped_mask = merged_all["admin_dong_code"].notna() & (merged_all["admin_dong_code"] != "")
     merged = merged_all[mapped_mask]
     if merged.empty:
         return _empty_with_coverage(len(merged_all), 0)
-    grp = merged.groupby(["admin_dong_code", "admin_dong_name"], as_index=False)["id"].count()
-    grp = grp.rename(columns={"id": "purchase_count"})
+    grp = merged.groupby(["admin_dong_code", "admin_dong_name"], as_index=False).agg(
+        purchase_count=("id", "count"),
+        purchase_amount=("total_amount", "sum"),
+    )
+    grp["purchase_amount"] = grp["purchase_amount"].fillna(0).round(0).astype("int64")
     grp = grp.sort_values("purchase_count", ascending=False)
     grp.attrs["total_orders_in_period"] = len(merged_all)
     grp.attrs["mapped_orders_in_period"] = int(mapped_mask.sum())
@@ -1844,11 +1854,20 @@ def render_dong_commercial_map() -> None:
         if _raw_df is None or _raw_df.empty:
             _merged = _skeleton.copy()
             _merged["purchase_count"] = 0
+            _merged["purchase_amount"] = 0
         else:
-            _crm_slim = _raw_df[["admin_dong_code", "purchase_count"]].copy()
+            _amt_cols = ["admin_dong_code", "purchase_count"]
+            if "purchase_amount" in _raw_df.columns:
+                _amt_cols.append("purchase_amount")
+            _crm_slim = _raw_df[_amt_cols].copy()
             _crm_slim["admin_dong_code"] = _crm_slim["admin_dong_code"].astype(str)
             _merged = _skeleton.merge(_crm_slim, on="admin_dong_code", how="left")
             _merged["purchase_count"] = _merged["purchase_count"].fillna(0).astype(int)
+            if "purchase_amount" not in _merged.columns:
+                _merged["purchase_amount"] = 0
+            _merged["purchase_amount"] = (
+                pd.to_numeric(_merged["purchase_amount"], errors="coerce").fillna(0).round(0).astype("int64")
+            )
         _merged = _attach_sigungu(_merged)
 
         # attrs 캡처 (요약 지표의 미매핑 커버리지에 사용). skeleton 은 attrs 를 가지지 않으므로
@@ -1875,9 +1894,11 @@ def render_dong_commercial_map() -> None:
 
     st.caption(f"📅 분석 기간: {start_date} ~ {end_date} · 인구 기준월: {yyyymm}")
     _n_purch = int((crm_df["purchase_count"] > 0).sum())
+    _amt_sum = int(pd.to_numeric(crm_df.get("purchase_amount"), errors="coerce").fillna(0).sum())
     st.success(
         f"선택 행정동 {len(crm_df)}개 (구매 발생 {_n_purch}개 · 잠재 {len(crm_df) - _n_purch}개), "
-        f"기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건"
+        f"기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건 · "
+        f"구매금액 합계 {_amt_sum:,} 원"
     )
 
     # 인구 데이터: 선택 행정동에 대해서만 조회 (불필요 API 호출 절감).
@@ -2240,17 +2261,20 @@ def _render_summary_metrics(df: pd.DataFrame) -> None:
         return
     _total_dong = len(df)
     _total_orders = int(df["purchase_count"].sum())
+    _total_amount = int(pd.to_numeric(df.get("purchase_amount"), errors="coerce").fillna(0).sum())
     _valid = df[(df["penetration_rate"] > 0) | (df["target_density"] > 0)]
     _med_p = float(df.attrs.get("median_penetration", _valid["penetration_rate"].median() if not _valid.empty else 0.0))
     _med_d = float(df.attrs.get("median_target_density", _valid["target_density"].median() if not _valid.empty else 0.0))
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
         st.metric("대상 행정동 수", f"{_total_dong:,}")
     with m2:
         st.metric("총 구매건수", f"{_total_orders:,}")
     with m3:
-        st.metric("침투율 중앙값", f"{_med_p:.3f}%")
+        st.metric("구매금액 합계", f"{_total_amount:,} 원")
     with m4:
+        st.metric("침투율 중앙값", f"{_med_p:.3f}%")
+    with m5:
         st.metric("밀집도 중앙값", f"{_med_d:.2f}%")
 
     strat_counts = df["행동_전략"].value_counts().to_dict() if "행동_전략" in df.columns else {}
@@ -2397,6 +2421,7 @@ def _render_quadrant_scatter(df: pd.DataFrame) -> None:
         hover_data={
             "penetration_rate": ":.3f", "target_density": ":.2f",
             "purchase_count": True,
+            "purchase_amount": True,
             "total_households": True, "total_population": True,
             "target_population": True,
             "행동_전략": False,
@@ -2406,6 +2431,7 @@ def _render_quadrant_scatter(df: pd.DataFrame) -> None:
             "target_density": f"타겟 인구 비중 % ({_age_label})",
             "행동_전략": "행동 전략",
             "purchase_count": "구매건수",
+            "purchase_amount": "구매금액 합계",
             "target_population": f"핵심타겟({_age_label})",
         },
     )
@@ -2480,13 +2506,19 @@ def _render_table(df: pd.DataFrame) -> None:
         return
     _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
     _cols = [
-        "행동_전략", "admin_dong_name", "admin_dong_code", "purchase_count",
+        "행동_전략", "admin_dong_name", "admin_dong_code", "purchase_count", "purchase_amount",
         "total_households", "total_population", "target_population",
         "penetration_rate", "target_density",
     ]
     if "sigungu_label" in df.columns:
         _cols.insert(2, "sigungu_label")
+    _cols = [c for c in _cols if c in df.columns]
     show = df[_cols].copy()
+    if "purchase_amount" not in show.columns:
+        show["purchase_amount"] = 0
+    show["purchase_amount"] = (
+        pd.to_numeric(show["purchase_amount"], errors="coerce").fillna(0).round(0).astype("int64")
+    )
     _order_idx = {s: i for i, s in enumerate(STRATEGY_ORDER)}
     show["_strategy_ord"] = show["행동_전략"].map(_order_idx).fillna(len(STRATEGY_ORDER))
     show = show.sort_values(
@@ -2499,6 +2531,7 @@ def _render_table(df: pd.DataFrame) -> None:
         "sigungu_label": "시군구",
         "admin_dong_code": "행정동코드",
         "purchase_count": "구매건수(기간내)",
+        "purchase_amount": "구매금액 합계",
         "total_households": "세대수",
         "total_population": "총인구",
         "target_population": f"핵심인구({_age_label})",
@@ -2848,6 +2881,10 @@ def build_dong_commercial_pdf(
     # 요약 KPI
     _total_dong = len(kpi_df) if kpi_df is not None else 0
     _total_orders = int(kpi_df["purchase_count"].sum()) if _total_dong else 0
+    _total_amount = (
+        int(pd.to_numeric(kpi_df.get("purchase_amount"), errors="coerce").fillna(0).sum())
+        if _total_dong else 0
+    )
     _med_p = float(kpi_df.attrs.get("median_penetration", 0.0) or 0.0) if _total_dong else 0.0
     _med_d = float(kpi_df.attrs.get("median_target_density", 0.0) or 0.0) if _total_dong else 0.0
     strat_counts = (
@@ -2856,6 +2893,7 @@ def build_dong_commercial_pdf(
     )
     summary_rows = [
         ["대상 행정동", f"{_total_dong:,}", "총 구매건수", f"{_total_orders:,}"],
+        ["구매금액 합계", f"{_total_amount:,} 원", "인구기준월", str(yyyymm)],
         ["침투율 중앙값", f"{_med_p:.3f}%", "밀집도 중앙값", f"{_med_d:.2f}%"],
         [
             _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_ATTACK]),
@@ -2943,7 +2981,7 @@ def build_dong_commercial_pdf(
             ascending=[True, False, False],
         )
         header = [
-            "전략", "시군구", "행정동", "구매", "세대", "총인구",
+            "전략", "시군구", "행정동", "구매건수", "구매금액", "세대", "총인구",
             f"핵심({_pdf_safe_text(age_label)})", "침투%", "밀집%",
         ]
         rows: list[list[Any]] = [[Paragraph(_pdf_safe_text(h), cell_style) for h in header]]
@@ -2953,13 +2991,14 @@ def build_dong_commercial_pdf(
                 Paragraph(_pdf_safe_text(r.get("sigungu_label", "")), cell_style),
                 Paragraph(_pdf_safe_text(r.get("admin_dong_name", "")), cell_style),
                 Paragraph(f"{int(pd.to_numeric(r.get('purchase_count'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('purchase_amount'), errors='coerce') or 0):,}", cell_style),
                 Paragraph(f"{int(pd.to_numeric(r.get('total_households'), errors='coerce') or 0):,}", cell_style),
                 Paragraph(f"{int(pd.to_numeric(r.get('total_population'), errors='coerce') or 0):,}", cell_style),
                 Paragraph(f"{int(pd.to_numeric(r.get('target_population'), errors='coerce') or 0):,}", cell_style),
                 Paragraph(f"{float(pd.to_numeric(r.get('penetration_rate'), errors='coerce') or 0):.3f}", cell_style),
                 Paragraph(f"{float(pd.to_numeric(r.get('target_density'), errors='coerce') or 0):.2f}", cell_style),
             ])
-        col_w = [28 * mm, 32 * mm, 28 * mm, 18 * mm, 22 * mm, 22 * mm, 28 * mm, 18 * mm, 18 * mm]
+        col_w = [24 * mm, 28 * mm, 24 * mm, 16 * mm, 24 * mm, 18 * mm, 18 * mm, 24 * mm, 16 * mm, 16 * mm]
         detail = Table(rows, colWidths=col_w, repeatRows=1)
         detail.setStyle(TableStyle([
             ("FONTNAME", (0, 0), (-1, -1), "HYSMyeongJo-Medium"),
