@@ -8290,10 +8290,41 @@ def render_marketing_insights_tenant():
         st.caption("비교 기간 B (예: 올해, 광고 후)")
         range_start_b = st.date_input("시작일", value=month_start, key="mi_tenant_period_b_start")
         range_end_b = st.date_input("종료일", value=today, key="mi_tenant_period_b_end")
+
+    _date_ok = True
     if range_start_a > range_end_a:
-        range_end_a = range_start_a
+        st.warning("비교 기간 A: 시작일은 종료일보다 이전이어야 합니다.")
+        _date_ok = False
     if range_start_b > range_end_b:
-        range_end_b = range_start_b
+        st.warning("비교 기간 B: 시작일은 종료일보다 이전이어야 합니다.")
+        _date_ok = False
+
+    if st.button(
+        "📊 마케팅 인사이트 분석 시작",
+        type="primary",
+        key="mi_tenant_run_btn",
+        disabled=not _date_ok,
+    ):
+        st.session_state["mi_tenant_applied"] = {
+            "a_start": range_start_a,
+            "a_end": range_end_a,
+            "b_start": range_start_b,
+            "b_end": range_end_b,
+        }
+
+    applied = st.session_state.get("mi_tenant_applied")
+    if not applied:
+        st.info("비교 기간 A·B의 시작일/종료일을 입력한 뒤 **마케팅 인사이트 분석 시작** 버튼을 눌러 주세요.")
+        return
+
+    range_start_a = applied["a_start"]
+    range_end_a = applied["a_end"]
+    range_start_b = applied["b_start"]
+    range_end_b = applied["b_end"]
+    st.caption(
+        f"분석 적용 기간 — A: {range_start_a} ~ {range_end_a} · "
+        f"B: {range_start_b} ~ {range_end_b}"
+    )
 
     merged = orders.merge(customers_sub, left_on="customer_id", right_on="id", how="left")
     if len(merged) == 0:
@@ -8424,10 +8455,41 @@ def render_marketing_insights_superadmin():
         st.caption("비교 기간 B (예: 올해, 광고 후)")
         range_start_b = st.date_input("시작일", value=month_start, key="mi_superadmin_period_b_start")
         range_end_b = st.date_input("종료일", value=today, key="mi_superadmin_period_b_end")
+
+    _date_ok = True
     if range_start_a > range_end_a:
-        range_end_a = range_start_a
+        st.warning("비교 기간 A: 시작일은 종료일보다 이전이어야 합니다.")
+        _date_ok = False
     if range_start_b > range_end_b:
-        range_end_b = range_start_b
+        st.warning("비교 기간 B: 시작일은 종료일보다 이전이어야 합니다.")
+        _date_ok = False
+
+    if st.button(
+        "📊 마케팅 인사이트 분석 시작",
+        type="primary",
+        key="mi_superadmin_run_btn",
+        disabled=not _date_ok,
+    ):
+        st.session_state["mi_superadmin_applied"] = {
+            "a_start": range_start_a,
+            "a_end": range_end_a,
+            "b_start": range_start_b,
+            "b_end": range_end_b,
+        }
+
+    applied = st.session_state.get("mi_superadmin_applied")
+    if not applied:
+        st.info("비교 기간 A·B의 시작일/종료일을 입력한 뒤 **마케팅 인사이트 분석 시작** 버튼을 눌러 주세요.")
+        return
+
+    range_start_a = applied["a_start"]
+    range_end_a = applied["a_end"]
+    range_start_b = applied["b_start"]
+    range_end_b = applied["b_end"]
+    st.caption(
+        f"분석 적용 기간 — A: {range_start_a} ~ {range_end_a} · "
+        f"B: {range_start_b} ~ {range_end_b}"
+    )
 
     _render_marketing_multi_period_comparison(
         merged_all,
