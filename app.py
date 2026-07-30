@@ -26746,173 +26746,319 @@ def _customer_balance_payment_ui(
     key_prefix: str = "pay",
     default_payment_date: date | None = None,
 ):
-    """잔금 완납 처리(결제 추가) 공통 UI. 직원도 사용 가능하되, 모든 변경은 PaymentHistory에 기록."""
+    """잔금 완납 처리(결제 추가) 공통 UI — 신규 매출 등록과 동일한 복수 결제 슬롯.
+
+    한 주문에 여러 결제 수단을 한 번에 등록할 수 있다 (예: 신용카드 + 현금).
+    금액이 0보다 큰 슬롯만 `app_payments` 에 INSERT 되고, 이후 잔금·마진을 1회 재계산한다.
+    모든 변경은 PaymentHistory에 합산(payments 배열 포함) 형태로 기록한다.
+    """
+    _BAL_MAX_SLOTS = 20
+    _BAL_DEFAULT_SLOTS = 1
+
     _pay_done_key = f"_pay_done_{key_prefix}"
     if _pay_done_key in st.session_state:
         _pd = st.session_state.pop(_pay_done_key)
         st.success(f"✅ 결제 입력 완료! {_pd['amount']:,}원이 등록되었습니다.")
-    amt_key = f"{key_prefix}_amt"
-    if amt_key not in st.session_state:
-        st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
+
     _pay_date_key = f"{key_prefix}_pay_date"
     if _pay_date_key not in st.session_state:
         st.session_state[_pay_date_key] = default_payment_date or _today_kst()
-    st.caption("잔금 완납 처리 (결제 추가)")
-    add_pay_date = st.date_input("결제 날짜 *", key=_pay_date_key)
-    add_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
-    if add_method in _CARD_WITH_COMPANY:
-        add_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
-    elif add_method == "메인페이":
-        add_card = st.text_input("메인페이 승인번호 4자리", key=f"{key_prefix}_card", max_chars=4)
-    elif add_method == "지역화폐":
-        add_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card")
-    else:
-        add_card = None
-    st.text_input("결제 금액", key=amt_key, on_change=lambda: st.session_state.__setitem__(amt_key, _format_number_comma(st.session_state.get(amt_key, ""))))
-    add_amt_int = _parse_comma_to_int(st.session_state.get(amt_key, "0"))
-    # 초과 결제 경고 (입력 차단 없음 — 결변·카드취소 처리 지원)
-    if add_amt_int > 0 and add_amt_int > balance:
-        _over = add_amt_int - max(balance, 0)
-        st.warning(f"⚠️ 입력 금액({add_amt_int:,}원)이 잔금({max(balance,0):,.0f}원)보다 **{_over:,}원 초과**합니다. 결변·카드취소 처리 목적이면 그대로 등록하세요. 초과 금액은 '초과결제 항목' 탭에 표시됩니다.")
-    # 온누리상품권일 때 승인번호/영수증 입력 (전자상품권만 해당, 지류는 승인번호 불필요)
-    is_onnuri = add_method and ("온누리" in str(add_method)) and ("지류" not in str(add_method))
-    stage_key = f"{key_prefix}_onnuri_stage"
-    last4_key = f"{key_prefix}_onnuri_last4"
-    full_key = f"{key_prefix}_onnuri_full"
-    receipt_key = f"{key_prefix}_onnuri_receipt"
-    if is_onnuri:
-        if stage_key not in st.session_state:
-            st.session_state[stage_key] = "last4"
-        stage = st.session_state.get(stage_key, "last4")
-        if stage == "last4":
-            st.text_input("온누리 승인번호 뒤 4자리", key=last4_key, max_chars=4)
+    _slot_count_key = f"{key_prefix}_slot_count"
+    if _slot_count_key not in st.session_state:
+        st.session_state[_slot_count_key] = _BAL_DEFAULT_SLOTS
+
+    def _slot_key(name: str, i: int) -> str:
+        return f"{key_prefix}_{name}_{i}"
+
+    # 슬롯 1 금액 기본값 = 잔금 (남은 슬롯은 0). 최초 진입 시 1회만 세팅.
+    _slot0_amt_key = _slot_key("amt", 0)
+    if _slot0_amt_key not in st.session_state:
+        st.session_state[_slot0_amt_key] = _format_number_comma(str(int(balance))) if balance and balance > 0 else "0"
+
+    st.caption("잔금 완납 처리 (결제 추가 · 복수 결제 가능)")
+    st.date_input("결제 날짜 *", key=_pay_date_key)
+
+    _add_col1, _add_col2 = st.columns([3, 1])
+    with _add_col2:
+        _disabled_add = st.session_state[_slot_count_key] >= _BAL_MAX_SLOTS
+        if st.button("➕ 결제 수단 추가", disabled=_disabled_add, key=f"{key_prefix}_add_slot"):
+            if st.session_state[_slot_count_key] < _BAL_MAX_SLOTS:
+                st.session_state[_slot_count_key] += 1
+
+    slot_count = int(st.session_state[_slot_count_key])
+    slot_infos: list[dict] = []
+    total_amt_int = 0
+    for i in range(slot_count):
+        m_key = _slot_key("method", i)
+        c_key = _slot_key("card", i)
+        a_key = _slot_key("amt", i)
+        if a_key not in st.session_state:
+            st.session_state[a_key] = "0"
+
+        _r1, _r2, _r3 = st.columns([2, 2, 2])
+        with _r1:
+            method = st.selectbox(
+                f"결제 수단 #{i+1}",
+                options=PAYMENT_METHOD_OPTIONS,
+                key=m_key,
+            )
+        with _r2:
+            if method in _CARD_WITH_COMPANY:
+                card_company = st.selectbox(f"카드사 #{i+1} *", options=CARD_COMPANY_OPTIONS, key=c_key)
+            elif method == "메인페이":
+                st.text_input(f"메인페이 승인번호 4자리 #{i+1} *", key=c_key, max_chars=4)
+                card_company = st.session_state.get(c_key)
+            elif method == "지역화폐":
+                st.text_input(f"지역화폐 승인번호 #{i+1} *", key=c_key)
+                card_company = st.session_state.get(c_key)
+            else:
+                card_company = None
+        with _r3:
+            st.text_input(
+                f"결제 금액 #{i+1} *",
+                key=a_key,
+                on_change=lambda _k=a_key: st.session_state.__setitem__(
+                    _k, _format_number_comma(st.session_state.get(_k, ""))
+                ),
+            )
+        amt_int = _parse_comma_to_int(st.session_state.get(a_key, "0"))
+        total_amt_int += amt_int
+
+        # 온누리 승인번호/영수증 (전자상품권만, '온누리지류'는 제외)
+        is_onnuri = method and ("온누리" in str(method)) and ("지류" not in str(method))
+        stage_key = _slot_key("onnuri_stage", i)
+        last4_key = _slot_key("onnuri_last4", i)
+        full_key = _slot_key("onnuri_full", i)
+        receipt_key = _slot_key("onnuri_receipt", i)
+        if is_onnuri:
+            if stage_key not in st.session_state:
+                st.session_state[stage_key] = "last4"
+            stage = st.session_state.get(stage_key, "last4")
+            if stage == "last4":
+                st.text_input(f"온누리 승인번호 뒤 4자리 #{i+1} *", key=last4_key, max_chars=4)
+            else:
+                st.text_input(f"온누리 승인번호 전체 (8자리 이상) #{i+1} *", key=full_key)
+            st.file_uploader(
+                f"온누리상품권 영수증 사진(선택) #{i+1}",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=receipt_key,
+            )
         else:
-            st.text_input("온누리 승인번호 전체 (8자리 이상)", key=full_key)
-        st.file_uploader(
-            "온누리상품권 영수증 사진(선택)",
-            type=["png", "jpg", "jpeg", "webp"],
-            key=receipt_key,
+            st.session_state.pop(stage_key, None)
+
+        slot_infos.append({
+            "index": i,
+            "method": method,
+            "card_company": card_company,
+            "amount": amt_int,
+            "is_onnuri": bool(is_onnuri),
+            "stage_key": stage_key,
+            "last4_key": last4_key,
+            "full_key": full_key,
+        })
+
+    _bal_after = float(balance) - float(total_amt_int)
+    _mc1, _mc2 = st.columns(2)
+    with _mc1:
+        st.metric("이번 결제 합계", f"{total_amt_int:,}원")
+    with _mc2:
+        st.metric("등록 후 예상 잔금", f"{_bal_after:,.0f}원",
+                  help="현재 잔금 - 이번 결제 합계. 음수면 초과결제로 등록됩니다.")
+
+    if total_amt_int > 0 and total_amt_int > balance:
+        _over = total_amt_int - max(balance, 0)
+        st.warning(
+            f"⚠️ 이번 결제 합계({total_amt_int:,}원)가 잔금({max(balance,0):,.0f}원)보다 "
+            f"**{_over:,}원 초과**합니다. 결변·카드취소 처리 목적이면 그대로 등록하세요. "
+            "초과 금액은 '초과결제 항목' 탭에 표시됩니다."
         )
-    else:
-        st.session_state.pop(stage_key, None)
+
     reason_key = f"{key_prefix}_reason"
     edit_reason = st.text_area("결제 메모(선택)", key=reason_key)
-    if st.button("결제 등록", key=f"{key_prefix}_btn"):
-        if add_amt_int > 0:
-            # 온누리상품권 중복 검증: 오늘 날짜 + 승인번호 4자리 조합 (금액 제외)
-            onnuri_code = None
-            pay_date_str = add_pay_date.isoformat() if hasattr(add_pay_date, "isoformat") else _today_kst().isoformat()
-            if is_onnuri:
-                stage = st.session_state.get(stage_key, "last4")
-                if stage == "last4":
-                    last4_raw = (st.session_state.get(last4_key, "") or "").strip()
-                    last4_digits = re.sub(r"\D", "", last4_raw)
-                    if len(last4_digits) != 4:
-                        st.error("온누리상품권 결제의 승인번호 뒤 4자리를 정확히 입력하세요.")
-                        return
-                    if _supabase_orders_payments_available():
-                        dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
-                    else:
-                        conn_chk = get_tenant_conn(db_filename)
-                        try:
-                            dup_cnt = conn_chk.execute(
-                                """
-                                SELECT COUNT(*) FROM Payments
-                                WHERE payment_method LIKE '%온누리%'
-                                  AND payment_date = ?
-                                  AND onnuri_approval_code IS NOT NULL
-                                  AND substr(onnuri_approval_code, -4) = ?
-                                """,
-                                (pay_date_str, last4_digits),
-                            ).fetchone()[0]
-                        finally:
-                            conn_chk.close()
-                    if dup_cnt > 0:
-                        st.session_state[stage_key] = "full"
-                        st.error("⚠️ 동일한 결제일, 금액, 승인번호 4자리를 가진 기록이 이미 존재합니다. 정상 중복 건일 경우 승인번호 '전체 8자리 이상'을 입력해 주세요.")
-                        return
-                    onnuri_code = last4_digits
-                else:
-                    full_raw = (st.session_state.get(full_key, "") or "").strip()
-                    full_digits = re.sub(r"\D", "", full_raw)
-                    if len(full_digits) < 8:
-                        st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
-                        return
-                    onnuri_code = full_digits
-            fee = _payment_fee_amount(add_method, add_amt_int)
-            use_supabase_op = _supabase_orders_payments_available()
-            if use_supabase_op:
-                paid_total, _ = _sum_payments_by_order_supabase(db_filename, order_id)
-                old_paid_total = paid_total
-                new_paid_total = old_paid_total + add_amt_int
-                old_balance = balance
-                new_balance = balance - add_amt_int
-                _insert_payment_supabase(db_filename, {
-                    "order_id": order_id,
-                    "payment_date": pay_date_str,
-                    "amount": add_amt_int,
-                    "payment_method": add_method or None,
-                    "card_company": add_card,
-                    "fee_amount": fee,
-                    "onnuri_approval_code": onnuri_code,
-                    "created_by": _current_username(),
-                })
-                _recalc_order_actual_margin_supabase(db_filename, order_id)
-                customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
-                customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
-                # Supabase 이력 저장 (conn 없이도 동작)
-                _ph_err = _insert_payment_history(
-                    None, order_id, customer_name, "잔금결제",
-                    {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
-                    {"order_id": order_id, "added_amount": add_amt_int, "method": add_method, "card_company": add_card, "balance_after": new_balance, "paid_total_after": new_paid_total},
-                    edit_reason, db_filename=db_filename,
-                )
-                if _ph_err:
-                    st.warning(f"⚠️ 이력 저장 오류 (기능은 정상): {_ph_err}")
-                # SQLite 감사 로그 (파일이 있을 때만)
-                conn = get_tenant_conn(db_filename)
-                if conn:
-                    try:
-                        _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
-                        _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
-                        conn.commit()
-                    finally:
-                        conn.close()
+
+    if not st.button("결제 등록", key=f"{key_prefix}_btn"):
+        return
+
+    add_pay_date = st.session_state.get(_pay_date_key) or _today_kst()
+    pay_date_str = add_pay_date.isoformat() if hasattr(add_pay_date, "isoformat") else _today_kst().isoformat()
+
+    # 결제 금액이 있는 슬롯만 대상
+    active = [s for s in slot_infos if int(s["amount"]) > 0]
+    if not active:
+        st.warning("금액을 입력하세요.")
+        return
+
+    # 슬롯별 필수값 검증 (매출 등록과 동일 수준)
+    for s in active:
+        method = s["method"] or ""
+        idx1 = s["index"] + 1
+        if method in _CARD_WITH_COMPANY:
+            if not (str(s["card_company"] or "").strip()):
+                st.error(f"결제 #{idx1} {method} 카드사를 선택하세요.")
+                return
+        elif method == "메인페이":
+            _digits = re.sub(r"\D", "", str(s["card_company"] or ""))
+            if len(_digits) != 4:
+                st.error(f"결제 #{idx1} 메인페이 승인번호 4자리를 정확히 입력하세요.")
+                return
+        elif method == "지역화폐":
+            _digits = re.sub(r"\D", "", str(s["card_company"] or ""))
+            if len(_digits) == 0:
+                st.error(f"결제 #{idx1} 지역화폐 승인번호를 입력하세요.")
+                return
+
+    # 온누리 승인번호 검증 + 중복 체크 (last4 → full 단계 전환)
+    onnuri_codes: dict[int, str | None] = {}
+    for s in active:
+        if not s["is_onnuri"]:
+            onnuri_codes[s["index"]] = None
+            continue
+        stage = st.session_state.get(s["stage_key"], "last4")
+        idx1 = s["index"] + 1
+        if stage == "last4":
+            last4_raw = (st.session_state.get(s["last4_key"], "") or "").strip()
+            last4_digits = re.sub(r"\D", "", last4_raw)
+            if len(last4_digits) != 4:
+                st.error(f"결제 #{idx1} 온누리상품권 승인번호 뒤 4자리를 정확히 입력하세요.")
+                return
+            if _supabase_orders_payments_available():
+                dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
             else:
-                conn = get_tenant_conn(db_filename)
-                cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (order_id,))
-                old_paid_total = cur.fetchone()[0] or 0
-                new_paid_total = old_paid_total + add_amt_int
-                old_balance = balance
-                new_balance = balance - add_amt_int
-                conn.execute("""
-                    INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
-                """, (order_id, pay_date_str, add_amt_int, add_method or None, add_card, fee, onnuri_code, _current_username()))
-                _recalc_order_actual_margin(conn, order_id, db_filename)
+                _conn_chk = get_tenant_conn(db_filename)
+                try:
+                    dup_cnt = _conn_chk.execute(
+                        """
+                        SELECT COUNT(*) FROM Payments
+                        WHERE payment_method LIKE '%온누리%'
+                          AND payment_date = ?
+                          AND onnuri_approval_code IS NOT NULL
+                          AND substr(onnuri_approval_code, -4) = ?
+                        """,
+                        (pay_date_str, last4_digits),
+                    ).fetchone()[0]
+                finally:
+                    _conn_chk.close()
+            if dup_cnt > 0:
+                st.session_state[s["stage_key"]] = "full"
+                st.error(
+                    f"⚠️ 결제 #{idx1}: 동일한 결제일·승인번호 뒤 4자리 조합이 이미 존재합니다. "
+                    "정상 중복 건일 경우 승인번호 '전체 8자리 이상'을 입력해 주세요."
+                )
+                return
+            onnuri_codes[s["index"]] = last4_digits
+        else:
+            full_raw = (st.session_state.get(s["full_key"], "") or "").strip()
+            full_digits = re.sub(r"\D", "", full_raw)
+            if len(full_digits) < 8:
+                st.error(f"결제 #{idx1} 온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
+                return
+            onnuri_codes[s["index"]] = full_digits
+
+    added_total = int(sum(int(s["amount"]) for s in active))
+    slot_snapshots = [
+        {"method": s["method"], "card_company": s["card_company"], "amount": int(s["amount"])}
+        for s in active
+    ]
+    use_supabase_op = _supabase_orders_payments_available()
+
+    if use_supabase_op:
+        paid_total, _ = _sum_payments_by_order_supabase(db_filename, order_id)
+        old_paid_total = paid_total
+        new_paid_total = old_paid_total + added_total
+        old_balance = balance
+        new_balance = balance - added_total
+        for s in active:
+            fee = _payment_fee_amount(s["method"], int(s["amount"]))
+            _insert_payment_supabase(db_filename, {
+                "order_id": order_id,
+                "payment_date": pay_date_str,
+                "amount": int(s["amount"]),
+                "payment_method": s["method"] or None,
+                "card_company": s["card_company"],
+                "fee_amount": fee,
+                "onnuri_approval_code": onnuri_codes.get(s["index"]),
+                "created_by": _current_username(),
+            })
+        _recalc_order_actual_margin_supabase(db_filename, order_id)
+        customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
+        customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
+        _ph_err = _insert_payment_history(
+            None, order_id, customer_name, "잔금결제",
+            {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
+            {
+                "order_id": order_id,
+                "added_amount": added_total,
+                "payments": slot_snapshots,
+                "balance_after": new_balance,
+                "paid_total_after": new_paid_total,
+            },
+            edit_reason, db_filename=db_filename,
+        )
+        if _ph_err:
+            st.warning(f"⚠️ 이력 저장 오류 (기능은 정상): {_ph_err}")
+        conn = get_tenant_conn(db_filename)
+        if conn:
+            try:
                 _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
                 _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
-                cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (order_id,)).fetchone()
-                customer_id_for_ph = cur_cid[0] if cur_cid else None
-                customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
-                old_payment_data = {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total}
-                new_payment_data = {
-                    "order_id": order_id,
-                    "added_amount": add_amt_int,
-                    "method": add_method,
-                    "card_company": add_card,
-                    "balance_after": new_balance,
-                    "paid_total_after": new_paid_total,
-                }
-                _insert_payment_history(conn, order_id, customer_name, "잔금결제", old_payment_data, new_payment_data, edit_reason, db_filename=db_filename)
                 conn.commit()
+            finally:
                 conn.close()
-            clear_data_cache()
-            st.toast("등록되었습니다. 잔금이 0원이면 리스트에서 사라집니다.", icon="✅")
-            st.session_state[f"_pay_done_{key_prefix}"] = {"amount": add_amt_int}
-            st.rerun()
-        else:
-            st.warning("금액을 입력하세요.")
+    else:
+        conn = get_tenant_conn(db_filename)
+        cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (order_id,))
+        old_paid_total = cur.fetchone()[0] or 0
+        new_paid_total = old_paid_total + added_total
+        old_balance = balance
+        new_balance = balance - added_total
+        for s in active:
+            fee = _payment_fee_amount(s["method"], int(s["amount"]))
+            conn.execute(
+                """
+                INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
+                """,
+                (
+                    order_id, pay_date_str, int(s["amount"]),
+                    s["method"] or None, s["card_company"], fee,
+                    onnuri_codes.get(s["index"]), _current_username(),
+                ),
+            )
+        _recalc_order_actual_margin(conn, order_id, db_filename)
+        _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
+        _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
+        cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (order_id,)).fetchone()
+        customer_id_for_ph = cur_cid[0] if cur_cid else None
+        customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
+        _insert_payment_history(
+            conn, order_id, customer_name, "잔금결제",
+            {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
+            {
+                "order_id": order_id,
+                "added_amount": added_total,
+                "payments": slot_snapshots,
+                "balance_after": new_balance,
+                "paid_total_after": new_paid_total,
+            },
+            edit_reason, db_filename=db_filename,
+        )
+        conn.commit()
+        conn.close()
+
+    clear_data_cache()
+    st.toast("등록되었습니다. 잔금이 0원이면 리스트에서 사라집니다.", icon="✅")
+    st.session_state[_pay_done_key] = {"amount": added_total}
+    # 다음 입력을 위해 이 프리픽스의 위젯 키를 정리
+    _prefix_ = f"{key_prefix}_"
+    for _k in list(st.session_state.keys()):
+        if not isinstance(_k, str):
+            continue
+        if _k.startswith(_prefix_) and _k != _pay_done_key:
+            try:
+                del st.session_state[_k]
+            except Exception:
+                pass
+    st.rerun()
 
 
 def render_sales_kpi_dashboard() -> None:
