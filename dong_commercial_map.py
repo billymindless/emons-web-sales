@@ -1703,96 +1703,162 @@ def render_dong_commercial_map() -> None:
                     f"신규 조회 {_stat['newly_fetched']}건 · 실패 {_stat['failed']}건"
                 )
 
-    # ── 데이터 조회 · 렌더링 ─────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # 2단계 — 핵심상권(시·군·동) 계층 선택
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### 2. 핵심상권 선정 (시·군·동)")
+    _geo_idx = build_geojson_index(load_admdong_geojson())
+    if _geo_idx.empty:
+        st.error("GeoJSON 이 로드되지 않아 행정동 선택을 표시할 수 없습니다. 위 '연동 진단' 패널을 확인해 주세요.")
+        return
+
+    _sido_options = sorted(x for x in _geo_idx["sidonm"].unique().tolist() if x)
+    _prev_sido = [s for s in st.session_state.get("dcm_sido", []) if s in _sido_options]
+    _sd_col, _sgg_col, _dong_col = st.columns([1, 1, 2])
+    with _sd_col:
+        sel_sido = st.multiselect(
+            "시도",
+            options=_sido_options,
+            default=_prev_sido or _sido_options[:1],
+            key="dcm_sido",
+            help="분석 대상 시도. 선택한 시도에 속한 시군구만 아래에서 표시됩니다.",
+        )
+    _sgg_pool = _geo_idx[_geo_idx["sidonm"].isin(sel_sido)] if sel_sido else _geo_idx.iloc[0:0]
+    _sgg_options = sorted(x for x in _sgg_pool["sggnm"].unique().tolist() if x)
+    _prev_sgg = [s for s in st.session_state.get("dcm_sgg", []) if s in _sgg_options]
+    with _sgg_col:
+        sel_sgg = st.multiselect(
+            "시군구",
+            options=_sgg_options,
+            default=_prev_sgg or _sgg_options,
+            key="dcm_sgg",
+            help="선택 시도 안에서 분석할 시군구. 선택 시군구에 속한 행정동만 아래에서 표시됩니다.",
+        )
+    _dong_pool = _sgg_pool[_sgg_pool["sggnm"].isin(sel_sgg)] if sel_sgg else _sgg_pool.iloc[0:0]
+    # adm_nm 은 "시도 시군구 행정동" 전체 경로 (라벨) / adm_cd2 는 10자리 코드 (값).
+    _dong_labels_all = sorted(x for x in _dong_pool["adm_nm"].unique().tolist() if x)
+    _dong_code_by_label = dict(zip(_dong_pool["adm_nm"], _dong_pool["adm_cd2"]))
+    _dong_name_by_code = {
+        str(row["adm_cd2"]): str(row["adm_nm"]).split()[-1]
+        for _, row in _dong_pool.iterrows() if row.get("adm_cd2")
+    }
+    _prev_dongs = [d for d in st.session_state.get("dcm_dongs", []) if d in _dong_labels_all]
+    with _dong_col:
+        sel_dong_labels = st.multiselect(
+            "행정동 (핵심상권)",
+            options=_dong_labels_all,
+            default=_prev_dongs or _dong_labels_all,
+            key="dcm_dongs",
+            help="분석 대상 행정동. 선택 후 4단계에서 렌더링 버튼을 누르면 구매 없는 동도 침투율 0으로 포함해 분석합니다.",
+        )
+    sel_adm_codes = [_dong_code_by_label[l] for l in sel_dong_labels if l in _dong_code_by_label]
+
+    # ══════════════════════════════════════════════════════════════
+    # 3단계 — 핵심 타겟 연령대
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### 3. 핵심 타겟 연령대")
+    _default_age_labels = [AGE_BUCKET_LABELS[k] for k in DEFAULT_TARGET_AGE_KEYS]
+    sel_age_labels = st.multiselect(
+        "핵심 타겟 연령대 (밀집도 계산 대상)",
+        options=[AGE_BUCKET_LABELS[k] for k in AGE_BUCKET_KEYS],
+        default=_default_age_labels,
+        key="dcm_target_ages",
+        help="선택한 연령대의 남녀 인구 합을 총인구로 나눠 타겟 밀집도를 계산합니다. "
+             "렌더링 후에도 변경 시 인구 API 재호출 없이 즉시 반영됩니다.",
+    )
+    _label_to_key = {v: k for k, v in AGE_BUCKET_LABELS.items()}
+    sel_age_keys = [_label_to_key[l] for l in sel_age_labels if l in _label_to_key]
+
+    # ══════════════════════════════════════════════════════════════
+    # 4단계 — 상권 맵 렌더링
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### 4. 상권 맵 렌더링")
+    _missing = []
+    if not sel_adm_codes:
+        _missing.append("2단계에서 행정동 1개 이상")
+    if not sel_age_keys:
+        _missing.append("3단계에서 연령대 1개 이상")
+    if _missing:
+        st.info("다음을 먼저 선택해 주세요 — " + " · ".join(_missing))
+
+    _can_render = bool(sel_labels and sel_adm_codes and sel_age_keys)
     _c_btn1, _c_btn2 = st.columns([2, 1])
     with _c_btn1:
-        do_render = st.button("🗺️ 상권 맵 렌더링", type="primary", key="dcm_render_btn")
+        do_render = st.button(
+            "🗺️ 상권 맵 렌더링", type="primary",
+            disabled=not _can_render, key="dcm_render_btn",
+        )
     with _c_btn2:
         force_refresh = st.checkbox(
             "최신 데이터로 새로고침", key="dcm_force_refresh",
             help="캐시를 무시하고 Supabase 에서 구매건수를 다시 집계합니다 (당일 신규 주문 반영 등).",
         )
 
-    # 매장·기간이 바뀌면 이전 결과는 무효화 (시군구 필터만 바꿀 때는 재클릭 없이도
-    # 아래 캐시된 원본으로 즉시 재필터링되도록 session_state 에 원본을 보관).
-    _cache_key = (tuple(sorted(sel_dbfns)), start_date_str, end_date_str)
+    if not _can_render:
+        return
 
+    # 캐시 키: 매장·기간·선택 행정동 집합. 연령은 사후 재계산 대상이라 키에서 제외.
+    _sel_adm_key = tuple(sorted(sel_adm_codes))
+    _cache_key = (tuple(sorted(sel_dbfns)), start_date_str, end_date_str, _sel_adm_key)
     _pop_cache_key = (_cache_key, yyyymm)
+
     if do_render:
         if force_refresh:
             aggregate_purchase_count_by_dong.clear()
         with st.spinner("행정동별 구매건수 집계 중…"):
             _raw_df = aggregate_purchase_count_by_dong(client, sel_dbfns, start_date_str, end_date_str)
-        # attrs 는 이후 merge/filter 과정에서 소실될 수 있어 원본에서 바로 캡처해 둔다.
+
+        # 선택 행정동 스켈레톤 — GeoJSON 기준으로 만든 뒤 CRM 을 left-join 하여
+        # 구매가 없는 동도 침투율 0 으로 포함(잠재 상권 분석).
+        _skeleton = pd.DataFrame({
+            "admin_dong_code": [str(c) for c in sel_adm_codes],
+            "admin_dong_name": [_dong_name_by_code.get(str(c), str(c)) for c in sel_adm_codes],
+        })
+        if _raw_df is None or _raw_df.empty:
+            _merged = _skeleton.copy()
+            _merged["purchase_count"] = 0
+        else:
+            _crm_slim = _raw_df[["admin_dong_code", "purchase_count"]].copy()
+            _crm_slim["admin_dong_code"] = _crm_slim["admin_dong_code"].astype(str)
+            _merged = _skeleton.merge(_crm_slim, on="admin_dong_code", how="left")
+            _merged["purchase_count"] = _merged["purchase_count"].fillna(0).astype(int)
+        _merged = _attach_sigungu(_merged)
+
+        # attrs 캡처 (요약 지표의 미매핑 커버리지에 사용). skeleton 은 attrs 를 가지지 않으므로
+        # 원본 CRM 결과의 attrs 를 사용한다.
+        _raw_attrs = _raw_df.attrs if (_raw_df is not None) else {}
         st.session_state["dcm_mapping_coverage"] = {
-            "total_orders": _raw_df.attrs.get("total_orders_in_period", 0),
-            "mapped_orders": _raw_df.attrs.get("mapped_orders_in_period", 0),
+            "total_orders": int(_raw_attrs.get("total_orders_in_period", 0) or 0),
+            "mapped_orders": int(_raw_attrs.get("mapped_orders_in_period", 0) or 0),
         }
-        st.session_state["dcm_raw_crm_df"] = _attach_sigungu(_raw_df)
+        st.session_state["dcm_raw_crm_df"] = _merged
         st.session_state["dcm_raw_cache_key"] = _cache_key
-        if st.session_state.get("dcm_sigungu_cache_key") != _cache_key:
-            st.session_state.pop("dcm_sigungu_filter", None)
-            st.session_state["dcm_sigungu_cache_key"] = _cache_key
-        # 새 렌더 요청이 오면 인구 데이터 캐시도 초기화 (아래에서 이번 매장·기간에 맞게 재적재).
+        # 새 렌더 요청이 오면 인구 데이터 캐시도 초기화 (아래에서 선택 동에 맞게 재적재).
         st.session_state.pop("dcm_pop_df", None)
         st.session_state.pop("dcm_pop_cache_key", None)
 
     if st.session_state.get("dcm_raw_cache_key") != _cache_key:
-        st.info("매장·분석기간 설정 후 '상권 맵 렌더링'을 눌러 주세요.")
+        st.info("현재 선택으로 '🗺️ 상권 맵 렌더링'을 눌러 주세요. (매장·기간·행정동을 바꿨다면 다시 눌러야 반영됩니다.)")
         return
 
-    crm_df_all = st.session_state.get("dcm_raw_crm_df")
-    if crm_df_all is None or crm_df_all.empty:
-        st.warning(
-            "선택한 매장·기간에 행정동 매핑이 된 구매 건이 없습니다. "
-            "위 백필 패널로 행정동 변환을 먼저 실행하거나 분석 기간을 넓혀 보세요."
-        )
-        return
-
-    # ── 필터 (시군구·핵심 타겟 연령) — 변경 시 재클릭 없이 즉시 적용 ──
-    _fc1, _fc2 = st.columns(2)
-    with _fc1:
-        _sgg_options = sorted(x for x in crm_df_all["sigungu_label"].unique().tolist() if x)
-        sel_sgg = st.multiselect(
-            "시군구 필터 (미선택 시 전체)",
-            options=_sgg_options,
-            default=_sgg_options,
-            key="dcm_sigungu_filter",
-            help="구매건수가 집계된 행정동을 시군구 단위로 좁혀 봅니다. GeoJSON 범위 밖 행정동은 '기타(미분류)'로 표시됩니다.",
-        )
-    with _fc2:
-        _default_age_labels = [AGE_BUCKET_LABELS[k] for k in DEFAULT_TARGET_AGE_KEYS]
-        sel_age_labels = st.multiselect(
-            "핵심 타겟 연령대 (밀집도 계산 대상)",
-            options=[AGE_BUCKET_LABELS[k] for k in AGE_BUCKET_KEYS],
-            default=_default_age_labels,
-            key="dcm_target_ages",
-            help="선택한 연령대의 남녀 인구 합을 총인구로 나눠 타겟 밀집도를 계산합니다. "
-                 "인구 API 재호출 없이 즉시 반영됩니다.",
-        )
-    _label_to_key = {v: k for k, v in AGE_BUCKET_LABELS.items()}
-    sel_age_keys = [_label_to_key[l] for l in sel_age_labels if l in _label_to_key]
-    if not sel_age_keys:
-        st.warning("핵심 타겟 연령대를 1개 이상 선택해 주세요.")
-        return
-
-    crm_df = crm_df_all[crm_df_all["sigungu_label"].isin(sel_sgg)] if sel_sgg else crm_df_all.iloc[0:0]
-    if crm_df.empty:
-        st.warning("선택한 시군구에 해당하는 행정동이 없습니다.")
+    crm_df = st.session_state.get("dcm_raw_crm_df")
+    if crm_df is None or crm_df.empty:
+        st.warning("선택한 행정동에 렌더링할 데이터가 없습니다.")
         return
 
     st.caption(f"📅 분석 기간: {start_date} ~ {end_date} · 인구 기준월: {yyyymm}")
+    _n_purch = int((crm_df["purchase_count"] > 0).sum())
     st.success(
-        f"행정동 {len(crm_df)}개, 기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건"
+        f"선택 행정동 {len(crm_df)}개 (구매 발생 {_n_purch}개 · 잠재 {len(crm_df) - _n_purch}개), "
+        f"기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건"
     )
 
-    # 인구 데이터: 필터가 바뀌어도 재조회하지 않도록, 이번 매장·기간에 대해 crm_df_all
-    # (사군구 필터 이전) 전체 행정동을 대상으로 한 번만 조회해 session_state 에 캐시.
+    # 인구 데이터: 선택 행정동에 대해서만 조회 (불필요 API 호출 절감).
     pop_df = st.session_state.get("dcm_pop_df")
     if pop_df is None or st.session_state.get("dcm_pop_cache_key") != _pop_cache_key:
         with st.spinner("행정안전부 인구·세대 데이터 조회 중… (영구 캐시 + 병렬 조회)"):
             pop_df = fetch_population_bulk(
-                client, crm_df_all["admin_dong_code"].astype(str).tolist(), yyyymm,
+                client, crm_df["admin_dong_code"].astype(str).tolist(), yyyymm,
             )
         st.session_state["dcm_pop_df"] = pop_df
         st.session_state["dcm_pop_cache_key"] = _pop_cache_key
