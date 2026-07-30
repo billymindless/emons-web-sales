@@ -273,6 +273,7 @@ _SUPERADMIN_MENUS = [
 def _get_sales_tab_labels(role: str) -> list[str]:
     """일반/매장관리자 세일즈 메뉴 라벨. main() 콘텐츠 디스패치 인덱스와 1:1 대응."""
     if role == "store_admin":
+        # 매장 관리자 메뉴(직원 마스터 등)는 ⚙️ 관리자 설정 최상단으로 이동됨.
         return [
             "1. 대시보드",
             "2. 마케팅 인사이트",
@@ -281,14 +282,13 @@ def _get_sales_tab_labels(role: str) -> list[str]:
             "5. 새로운 매출 등록",
             "6. 고객 및 잔금 관리",
             "7. 입금 관리",
-            "8. 매장 관리자 메뉴",
-            "9. 결제수단별 집계표",
-            "10. 고객 CRM 자동화",
-            "11. 세일즈 퍼포먼스",
-            "12. 전시품 판매 검증",
-            "13. FAQ (도움말)",
-            "14. AI 세일즈 리포트",
-            "15. 🗺️ 상권 퍼포먼스 맵",
+            "8. 결제수단별 집계표",
+            "9. 고객 CRM 자동화",
+            "10. 세일즈 퍼포먼스",
+            "11. 전시품 판매 검증",
+            "12. FAQ (도움말)",
+            "13. AI 세일즈 리포트",
+            "14. 🗺️ 상권 퍼포먼스 맵",
         ]
     return [
         "1. 대시보드",
@@ -22884,10 +22884,17 @@ def render_admin_settings():
     st.header("⚙️ 관리자 설정")
     st.caption("ERP 운영에 필요한 설정을 관리합니다. 항목은 추후 확장됩니다.")
 
-    # ── 매장별 근무 기준 설정 ──────────────────────────────────
+    # ── 1. 직원 마스터 (구 매장 관리자 메뉴) ─────────────────────
+    st.subheader("1. 직원 마스터 (Employees)")
+    st.caption("직원 등록·수정·삭제 및 매출 정합성 점검. 기존 「매장 관리자 메뉴」가 이곳으로 이동되었습니다.")
+    render_store_admin_employees()
+
+    st.divider()
+
+    # ── 2. 매장별 근무 기준 설정 ──────────────────────────────────
     current_db = st.session_state.get("current_db")
     if current_db:
-        with st.expander("🏪 매장별 근무 기준 설정", expanded=True):
+        with st.expander("2. 🏪 매장별 근무 기준 설정", expanded=False):
             _stores_list_sr = _get_supabase_stores_list()
             if _stores_list_sr:
                 _sr_tab_labels = [s["store_name"] for s in _stores_list_sr]
@@ -22909,14 +22916,14 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 공지사항 관리 (전체매장/매장별) ──────────────────────────
-    with st.expander("📢 공지사항 관리", expanded=False):
+    # ── 3. 공지사항 관리 (전체매장/매장별) ──────────────────────────
+    with st.expander("3. 📢 공지사항 관리", expanded=False):
         _render_notice_admin_section()
 
     st.divider()
 
-    # ── 카카오 채널 / 알림톡 ───────────────────────────────────
-    st.subheader("📲 카카오 채널 / 알림톡")
+    # ── 4. 카카오 채널 / 알림톡 ───────────────────────────────────
+    st.subheader("4. 📲 카카오 채널 / 알림톡")
 
     # 친구추가 미완료 직원 목록
     pending = _tb.load_friend_pending_users(store_id if role == "store_admin" else None)
@@ -22935,8 +22942,8 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 알림 문구 편집 ─────────────────────────────────────────
-    st.subheader("📝 알림 문구 편집")
+    # ── 5. 알림 문구 편집 ─────────────────────────────────────────
+    st.subheader("5. 📝 알림 문구 편집")
     tmpl_labels = {
         "task_assigned": "신규 업무 배정",
         "status_changed": "상태 변경",
@@ -22966,9 +22973,9 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 계좌-매장 매핑 (입금 SMS 자동 분류) ─────────────────────
+    # ── 6. 계좌-매장 매핑 (입금 SMS 자동 분류) ─────────────────────
     import deposit_board as _dep  # noqa: WPS433
-    st.subheader("🏦 계좌-매장 매핑 (입금 문자 자동 분류)")
+    st.subheader("6. 🏦 계좌-매장 매핑 (입금 문자 자동 분류)")
     st.caption(
         "기업은행 입금 문자의 계좌(예: 392***16401011)에서 **끝 8자리**(16401011)로 매장을 자동 분류합니다. "
         "각 매장 계좌의 끝 8자리를 등록해 주세요."
@@ -23035,14 +23042,14 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 추후 확장 플레이스홀더 ──────────────────────────────────
-    st.subheader("🔧 기타 설정")
+    # ── 7. 추후 확장 플레이스홀더 ──────────────────────────────────
+    st.subheader("7. 🔧 기타 설정")
     st.info("ERP 운영 설정 항목은 추후 이 곳에 추가됩니다.")
 
     st.divider()
 
-    # ── 🔐 비밀번호 변경 ──────────────────────────────────────
-    st.subheader("🔐 비밀번호 변경")
+    # ── 8. 🔐 비밀번호 변경 ──────────────────────────────────────
+    st.subheader("8. 🔐 비밀번호 변경")
     st.caption("현재 로그인 계정의 비밀번호를 변경합니다. 변경 후 다음 로그인부터 새 비밀번호를 사용하세요.")
     with st.form("admin_settings_change_pw_form", clear_on_submit=True):
         _cpw_new = st.text_input("새 비밀번호", type="password", key="as_new_pw")
@@ -24946,10 +24953,11 @@ def render_superadmin():
         render_faq_page()
 
 
-# ========== 탭 1: 매장 관리자 메뉴 (Store Admin 전용) — Employees ==========
+# ========== 직원 마스터 (⚙️ 관리자 설정 1번 항목) ==========
 
 def render_store_admin_employees():
-    """직원 마스터 및 수정 요청 UI. 100% Supabase app_users/app_user_stores 기반."""
+    """직원 마스터 및 수정 요청 UI. 100% Supabase app_users/app_user_stores 기반.
+    ⚙️ 관리자 설정의 1번 항목으로 렌더된다 (구 세일즈 메뉴 「매장 관리자 메뉴」)."""
     db_filename = st.session_state.get("current_db")
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
@@ -24970,7 +24978,7 @@ def render_store_admin_employees():
         return
 
     # ---------- 매출 정합성 점검 (sales 누락 자동 복구) ----------
-    with st.expander("🔧 매출 정합성 점검 (sales 누락 자동 복구)", expanded=False):
+    with st.expander("1-1. 🔧 매출 정합성 점검 (sales 누락 자동 복구)", expanded=False):
         st.caption(
             "주문(app_orders)은 저장됐지만 매출(sales)에 기록되지 않은 누락 건을 찾아 "
             "자동으로 복구합니다. KPI·월매출에 반영되지 않은 주문을 발견했을 때 사용하세요."
@@ -25000,7 +25008,6 @@ def render_store_admin_employees():
                             + "\n\n→ 관리자에게 수동 INSERT를 요청하세요."
                         )
 
-    st.header("직원 마스터 (Employees)")
     users = _get_supabase_users_list()
     emp_rows = []
     for u in users:
@@ -25021,7 +25028,7 @@ def render_store_admin_employees():
 
     # ---------- 신규 직원 등록 ----------
     with st.form("add_employee_form"):
-        st.subheader("신규 직원 등록")
+        st.markdown("**1-2. 신규 직원 등록**")
         new_username = st.text_input("사용자명(ID)", key="emp_new_username")
         new_password = st.text_input("비밀번호", type="password", key="emp_new_password")
         new_name = st.text_input("이름(표시명)", key="emp_new_name")
@@ -25070,7 +25077,7 @@ def render_store_admin_employees():
 
     # ---------- 직원 목록 (수정/삭제) ----------
     if len(df) > 0:
-        st.subheader("직원 목록 (수정/삭제)")
+        st.markdown("**1-3. 직원 목록 (수정/삭제)**")
         for _, row in df.iterrows():
             with st.expander(f"{row['name']} ({row.get('username', '')})"):
                 with st.form(f"emp_{row['id']}"):
@@ -25588,7 +25595,7 @@ def render_new_sales():
                 employees = pd.read_sql("SELECT id, name FROM Employees WHERE is_active = 1", conn)
             except Exception:
                 employees = pd.DataFrame(columns=["id", "name"])
-                st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
+                st.warning("직원 목록을 불러오지 못했습니다. ⚙️ 관리자 설정 → 1. 직원 마스터에서 직원을 먼저 등록해 주세요.")
             finally:
                 conn.close()
     # ── 특수 등록 (위약금 / 직원구매) ──
@@ -25803,7 +25810,7 @@ def render_new_sales():
     else:
         emp_names = employees["name"].tolist() if not employees.empty and "name" in employees.columns else []
     if not emp_names:
-        st.warning("이 매장에 배정된 직원이 없습니다. **직원 계정 관리**에서 해당 매장을 배정해 주세요. (또는 매장 관리자 메뉴 → 직원 마스터에서 등록)")
+        st.warning("이 매장에 배정된 직원이 없습니다. **직원 계정 관리**에서 해당 매장을 배정해 주세요. (또는 ⚙️ 관리자 설정 → 1. 직원 마스터에서 등록)")
     # key에 폼 리셋 카운터를 붙여 등록 완료 시 새 위젯으로 초기화
     _form_reset = st.session_state.get("_new_sales_form_reset", 0)
     selected_employees = st.multiselect(
@@ -31656,26 +31663,25 @@ def main():
         render_customer_balance()
     elif idx == 6:
         render_deposit_management()
+    # store_admin: 구 「8. 매장 관리자 메뉴」는 ⚙️ 관리자 설정 1번으로 이동 → 인덱스 한 칸씩 앞당김
     elif role == "store_admin" and idx == 7:
-        render_store_admin_employees()
-    elif role == "store_admin" and idx == 8:
         render_monthly_payment_report(is_superadmin=False)
     elif role == "user" and idx == 7:
         render_monthly_payment_report(is_superadmin=False)
-    elif role == "store_admin" and idx == 9:
+    elif role == "store_admin" and idx == 8:
         if CRM_MODULE_AVAILABLE:
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
-    elif role == "store_admin" and idx == 10:
+    elif role == "store_admin" and idx == 9:
         render_sales_kpi_dashboard()
-    elif (role == "store_admin" and idx == 11) or (role == "user" and idx == 8):
+    elif (role == "store_admin" and idx == 10) or (role == "user" and idx == 8):
         render_display_sales_audit()
-    elif role == "store_admin" and idx == 12:
+    elif role == "store_admin" and idx == 11:
         render_faq_page()
-    elif role == "store_admin" and idx == 13:
+    elif role == "store_admin" and idx == 12:
         render_ai_sales_reports()
-    elif role == "store_admin" and idx == 14:
+    elif role == "store_admin" and idx == 13:
         try:
             from dong_commercial_map import render_dong_commercial_map  # noqa: WPS433
             render_dong_commercial_map()
