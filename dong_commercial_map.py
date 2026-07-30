@@ -2555,59 +2555,98 @@ _STRATEGY_PDF_LABEL = {
 }
 
 _MPL_KR_FONT_CONFIGURED = False
+_MPL_KR_FONT_PROP = None  # matplotlib.font_manager.FontProperties | None
+_BUNDLED_KR_FONT_PATH = Path(__file__).parent / "data" / "fonts" / "NanumGothic.ttf"
 
 
-def _configure_matplotlib_korean_font() -> None:
-    """matplotlib 차트/지도 라벨용 한글 폰트를 OS별로 설정 (1회)."""
-    global _MPL_KR_FONT_CONFIGURED
+def _get_matplotlib_korean_font():
+    """PDF 차트용 한글 FontProperties. 번들 NanumGothic 을 최우선 사용."""
+    global _MPL_KR_FONT_CONFIGURED, _MPL_KR_FONT_PROP
     if _MPL_KR_FONT_CONFIGURED:
-        return
+        return _MPL_KR_FONT_PROP
+    _MPL_KR_FONT_CONFIGURED = True
     try:
         import matplotlib
         matplotlib.use("Agg")
         from matplotlib import font_manager, rcParams
     except Exception as exc:
         logger.warning("matplotlib 폰트 설정 실패: %s", exc)
-        return
+        return None
 
-    candidates = [
-        "Malgun Gothic",       # Windows
-        "AppleGothic",         # macOS
-        "NanumGothic",         # Linux / 나눔
-        "NanumBarunGothic",
-        "Noto Sans CJK KR",
-        "Noto Sans KR",
-        "UnDotum",
+    # 1) 리포지토리 번들 폰트 (Streamlit Cloud 등 OS 한글 폰트 없는 환경 대응)
+    path_candidates = [
+        _BUNDLED_KR_FONT_PATH,
+        Path("C:/Windows/Fonts/malgun.ttf"),
+        Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+        Path("/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
     ]
-    available = {f.name for f in font_manager.fontManager.ttflist}
-    chosen = next((n for n in candidates if n in available), None)
-    if not chosen:
-        # 파일 경로로 직접 등록 (배포 환경·제한된 폰트 캐시 대비)
-        path_candidates = [
-            Path(__file__).parent / "data" / "fonts" / "NanumGothic.ttf",
-            Path("C:/Windows/Fonts/malgun.ttf"),
-            Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
-            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    font_path: Path | None = None
+    for fp in path_candidates:
+        if fp.exists():
+            font_path = fp
+            break
+
+    chosen_name = None
+    if font_path is not None:
+        try:
+            font_manager.fontManager.addfont(str(font_path))
+            _MPL_KR_FONT_PROP = font_manager.FontProperties(fname=str(font_path))
+            chosen_name = _MPL_KR_FONT_PROP.get_name()
+        except Exception as exc:
+            logger.warning("폰트 파일 등록 실패 %s: %s", font_path, exc)
+            _MPL_KR_FONT_PROP = None
+
+    # 2) 시스템 설치 폰트 이름 폴백
+    if _MPL_KR_FONT_PROP is None:
+        name_candidates = [
+            "Malgun Gothic", "AppleGothic", "NanumGothic", "NanumBarunGothic",
+            "Noto Sans CJK KR", "Noto Sans KR", "UnDotum",
         ]
-        for fp in path_candidates:
-            if not fp.exists():
-                continue
-            try:
-                font_manager.fontManager.addfont(str(fp))
-                chosen = font_manager.FontProperties(fname=str(fp)).get_name()
-                break
-            except Exception as exc:
-                logger.warning("폰트 파일 등록 실패 %s: %s", fp, exc)
-    if chosen:
-        rcParams["font.family"] = chosen
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        chosen_name = next((n for n in name_candidates if n in available), None)
+        if chosen_name:
+            _MPL_KR_FONT_PROP = font_manager.FontProperties(family=chosen_name)
+
+    if chosen_name:
+        # sans-serif 최상단에 넣어 tick/legend 기본값에도 적용
+        rcParams["font.family"] = "sans-serif"
+        prev = list(rcParams.get("font.sans-serif") or [])
+        rcParams["font.sans-serif"] = [chosen_name] + [x for x in prev if x != chosen_name]
         rcParams["axes.unicode_minus"] = False
-        logger.info("matplotlib 한글 폰트: %s", chosen)
+        logger.info("matplotlib 한글 폰트: %s (path=%s)", chosen_name, font_path)
     else:
         logger.warning(
-            "한글 matplotlib 폰트를 찾지 못했습니다. 지도 라벨이 깨질 수 있습니다. "
-            "후보=%s", candidates,
+            "한글 matplotlib 폰트를 찾지 못했습니다. data/fonts/NanumGothic.ttf 번들을 확인하세요."
         )
-    _MPL_KR_FONT_CONFIGURED = True
+    return _MPL_KR_FONT_PROP
+
+
+def _configure_matplotlib_korean_font() -> None:
+    """하위 호환 — PDF PNG 빌더에서 호출."""
+    _get_matplotlib_korean_font()
+
+
+def _apply_korean_font_to_axes(ax, fp=None) -> None:
+    """축 제목·라벨·틱·범례에 한글 FontProperties 를 강제 적용."""
+    if fp is None:
+        fp = _get_matplotlib_korean_font()
+    if fp is None:
+        return
+    try:
+        ax.title.set_fontproperties(fp)
+        ax.xaxis.label.set_fontproperties(fp)
+        ax.yaxis.label.set_fontproperties(fp)
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontproperties(fp)
+        legend = ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_fontproperties(fp)
+            if legend.get_title() is not None:
+                legend.get_title().set_fontproperties(fp)
+    except Exception as exc:
+        logger.warning("축 한글 폰트 적용 실패: %s", exc)
 
 
 def _pdf_safe_text(s: Any) -> str:
@@ -2638,7 +2677,7 @@ def _match_kpi_to_geojson(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
 def _build_strategy_map_png(df: pd.DataFrame) -> bytes | None:
     """행동 전략 색으로 행정동 폴리곤을 채운 정적 지도 PNG."""
     try:
-        _configure_matplotlib_korean_font()
+        fp = _get_matplotlib_korean_font()
         import matplotlib.pyplot as plt
     except Exception as exc:
         logger.warning("matplotlib 로드 실패 — PDF 지도 생략: %s", exc)
@@ -2686,6 +2725,7 @@ def _build_strategy_map_png(df: pd.DataFrame) -> bytes | None:
                     sum(xs) / len(xs), sum(ys) / len(ys),
                     name_by_join[key], fontsize=5.5, ha="center", va="center",
                     color="#222222", zorder=3,
+                    fontproperties=fp,
                 )
 
     if not xs_all:
@@ -2698,7 +2738,7 @@ def _build_strategy_map_png(df: pd.DataFrame) -> bytes | None:
     ax.set_ylim(min(ys_all) - pad_y, max(ys_all) + pad_y)
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
-    ax.set_title("상권 전략 지도", fontsize=12, pad=8)
+    ax.set_title("상권 전략 지도", fontsize=12, pad=8, fontproperties=fp)
 
     from matplotlib.patches import Patch
     legend_items = [
@@ -2711,7 +2751,8 @@ def _build_strategy_map_png(df: pd.DataFrame) -> bytes | None:
         Patch(facecolor=STRATEGY_COLOR[s], edgecolor="#888", label=lab)
         for s, lab in legend_items
     ]
-    ax.legend(handles=handles, loc="lower left", framealpha=0.92, fontsize=8)
+    ax.legend(handles=handles, loc="lower left", framealpha=0.92, fontsize=8, prop=fp)
+    _apply_korean_font_to_axes(ax, fp)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
@@ -2723,7 +2764,7 @@ def _build_strategy_map_png(df: pd.DataFrame) -> bytes | None:
 def _build_quadrant_scatter_png(df: pd.DataFrame) -> bytes | None:
     """2x2 매트릭스 산점도 PNG."""
     try:
-        _configure_matplotlib_korean_font()
+        fp = _get_matplotlib_korean_font()
         import matplotlib.pyplot as plt
     except Exception as exc:
         logger.warning("matplotlib 로드 실패 — PDF 산점도 생략: %s", exc)
@@ -2748,11 +2789,12 @@ def _build_quadrant_scatter_png(df: pd.DataFrame) -> bytes | None:
         )
     ax.axvline(med_p, color="#888888", linestyle="--", linewidth=1, zorder=2)
     ax.axhline(med_d, color="#888888", linestyle="--", linewidth=1, zorder=2)
-    ax.set_xlabel("침투율 %")
-    ax.set_ylabel("타겟 밀집도 %")
-    ax.set_title("2×2 매트릭스")
+    ax.set_xlabel("침투율 %", fontproperties=fp)
+    ax.set_ylabel("타겟 밀집도 %", fontproperties=fp)
+    ax.set_title("2×2 매트릭스", fontproperties=fp)
     ax.grid(True, color="#eeeeee", linewidth=0.6)
-    ax.legend(fontsize=7, loc="best", framealpha=0.9)
+    ax.legend(fontsize=7, loc="best", framealpha=0.9, prop=fp)
+    _apply_korean_font_to_axes(ax, fp)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
@@ -2764,7 +2806,7 @@ def _build_quadrant_scatter_png(df: pd.DataFrame) -> bytes | None:
 def _build_top5_bar_png(df: pd.DataFrame) -> bytes | None:
     """집중 공략 Top 5 가로 막대 PNG."""
     try:
-        _configure_matplotlib_korean_font()
+        fp = _get_matplotlib_korean_font()
         import matplotlib.pyplot as plt
     except Exception as exc:
         logger.warning("matplotlib 로드 실패 — PDF Top5 생략: %s", exc)
@@ -2786,11 +2828,13 @@ def _build_top5_bar_png(df: pd.DataFrame) -> bytes | None:
     fig, ax = plt.subplots(figsize=(7.5, 3.6), dpi=140)
     ax.barh(labels, values, color=STRATEGY_COLOR[STRATEGY_ATTACK], height=0.6)
     for i, v in enumerate(values):
-        ax.text(v, i, f"  {int(v):,}", va="center", fontsize=8, color="#333")
-    ax.set_xlabel("핵심타겟 인구")
-    ax.set_title("집중 공략 Top 5 (B)")
+        ax.text(v, i, f"  {int(v):,}", va="center", fontsize=8, color="#333",
+                fontproperties=fp)
+    ax.set_xlabel("핵심타겟 인구", fontproperties=fp)
+    ax.set_title("집중 공략 Top 5 (B)", fontproperties=fp)
     ax.grid(True, axis="x", color="#eeeeee", linewidth=0.6)
     ax.set_axisbelow(True)
+    _apply_korean_font_to_axes(ax, fp)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
