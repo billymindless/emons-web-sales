@@ -73,6 +73,39 @@ _KAKAO_ENV_CANDIDATES: tuple[str, ...] = (
     "KAKAO_API_KEY",
 )
 
+# ── 핵심 타겟 연령대 (10세 단위 버킷) ─────────────────────────────
+# 행안부 성/연령 API 응답의 컬럼 접두어(만 X~X+9세) → 우리 시스템의 버킷 키.
+# 60대까지는 API 접두어와 동일하게 X(정수 문자열), 70대 이상은 "70plus" 로 축약해
+# API 버킷 70·80·90·100 을 모두 합산해 하나의 UI 라벨로 노출한다.
+AGE_BUCKET_KEYS: tuple[str, ...] = ("10", "20", "30", "40", "50", "60", "70plus")
+
+# 버킷 키 → 화면 라벨 (Streamlit multiselect 및 표/차트 라벨용).
+AGE_BUCKET_LABELS: dict[str, str] = {
+    "10": "10대", "20": "20대", "30": "30대", "40": "40대",
+    "50": "50대", "60": "60대", "70plus": "70대 이상",
+}
+
+# 버킷 키 → 실제 API 응답의 X 값 리스트 (male{X}AgeNmprCnt/feml{X}AgeNmprCnt 참조).
+_AGE_KEY_TO_API_BUCKETS: dict[str, tuple[str, ...]] = {
+    "10": ("10",), "20": ("20",), "30": ("30",), "40": ("40",),
+    "50": ("50",), "60": ("60",), "70plus": ("70", "80", "90", "100"),
+}
+
+# 기본 선택(=기존 30~59세 정의와 동일한 동작 유지).
+DEFAULT_TARGET_AGE_KEYS: tuple[str, ...] = ("30", "40", "50")
+
+
+def age_bucket_column(key: str) -> str:
+    """버킷 키 → app_dong_population_cache 컬럼명."""
+    return f"age_{key}_population"
+
+
+def format_selected_age_label(keys: list[str] | tuple[str, ...] | None) -> str:
+    """선택 연령대를 사람이 읽기 쉬운 문자열로 (예: '30·40·50대' / '20·70대 이상')."""
+    if not keys:
+        return "선택 없음"
+    return "·".join(AGE_BUCKET_LABELS.get(k, k) for k in keys)
+
 
 # ══════════════════════════════════════════════════════════════════
 # 인증키 로드 (elevator_inspection._get_service_key_diagnostic 패턴)
@@ -630,20 +663,29 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
         }
 
 
+def _empty_age_buckets() -> dict[str, int]:
+    """모든 UI 연령 버킷을 0 으로 초기화한 dict (누락 방지용 초기값)."""
+    return {k: 0 for k in AGE_BUCKET_KEYS}
+
+
 @st.cache_data(ttl=_THIRTY_DAYS_SEC, show_spinner=False)
 def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
     """
-    행정동코드+통계년월로 30~59세 인구수 조회 (타겟 밀집도 계산용).
+    행정동코드+통계년월로 10세 단위 연령 인구수 조회 (타겟 밀집도 계산용).
 
-    반환: {"ok", "admin_dong_code", "yyyymm",
-           "age_30_49_population"(30~59세 합산, 필드명은 하위호환 유지), "total_population",
-           "error", "raw_url"}
+    반환: {
+        "ok", "admin_dong_code", "yyyymm",
+        "age_buckets": {"10","20","30","40","50","60","70plus" → 남녀 합산 인구},
+        "total_population",
+        "error", "raw_url",
+    }
     """
+    empty_buckets = _empty_age_buckets()
     key = _get_population_service_key()
     if not key or not admin_dong_code or not yyyymm:
         return {
             "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-            "age_30_49_population": 0, "total_population": 0,
+            "age_buckets": empty_buckets, "total_population": 0,
             "error": "service_key 또는 파라미터 누락", "raw_url": "",
         }
     url = _get_population_api_endpoint("age")
@@ -667,7 +709,7 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
         if r.status_code != 200:
             return {
                 "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-                "age_30_49_population": 0, "total_population": 0,
+                "age_buckets": empty_buckets, "total_population": 0,
                 "error": f"HTTP {r.status_code}: {r.text[:120]}", "raw_url": raw_url,
             }
         js = r.json() if r.content else {}
@@ -675,31 +717,31 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
         if not items:
             return {
                 "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-                "age_30_49_population": 0, "total_population": 0,
+                "age_buckets": empty_buckets, "total_population": 0,
                 "error": "응답 items 비어 있음", "raw_url": raw_url,
             }
         # 실 응답: 행별 컬럼형 age 필드.
         #   male{X}AgeNmprCnt: 만 X~X+9세 남자 (X ∈ {0,10,20,...,100})
         #   feml{X}AgeNmprCnt: 만 X~X+9세 여자
-        # 핵심 인구(30~59세) 대상: X ∈ {30, 40, 50} 의 남녀 합산.
+        # UI 버킷 키(10~60, 70plus)별로 대응하는 API 버킷을 남녀 합산해 저장.
         # 총인구는 totNmprCnt 필드에서 취득.
-        target_buckets = ("30", "40", "50")
-        age_bucket = 0
+        buckets = _empty_age_buckets()
         total = 0
         for it in items:
             total += _to_int_safe(_pick(it, ["totNmprCnt", "totPopltCnt"]))
-            for _bkt in target_buckets:
-                age_bucket += _to_int_safe(it.get(f"male{_bkt}AgeNmprCnt"))
-                age_bucket += _to_int_safe(it.get(f"feml{_bkt}AgeNmprCnt"))
+            for ui_key, api_bkts in _AGE_KEY_TO_API_BUCKETS.items():
+                for api_bkt in api_bkts:
+                    buckets[ui_key] += _to_int_safe(it.get(f"male{api_bkt}AgeNmprCnt"))
+                    buckets[ui_key] += _to_int_safe(it.get(f"feml{api_bkt}AgeNmprCnt"))
         return {
             "ok": True, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-            "age_30_49_population": age_bucket, "total_population": total,
+            "age_buckets": buckets, "total_population": total,
             "error": "", "raw_url": raw_url,
         }
     except Exception as e:
         return {
             "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-            "age_30_49_population": 0, "total_population": 0,
+            "age_buckets": empty_buckets, "total_population": 0,
             "error": f"요청 실패: {type(e).__name__}: {e}", "raw_url": "",
         }
 
@@ -903,8 +945,10 @@ STRATEGY_LEGEND_LABEL = {
     STRATEGY_UNSET: "- · (미분류)",
 }
 
+# Phase 16: 핵심 타겟 연령대를 UI 에서 사용자가 지정하므로, 안내 문구는
+# 고정 "30~59세" 대신 "타겟" 으로 두고 실제 선택 라벨은 caption 에서 별도 노출한다.
 STRATEGY_GUIDE = {
-    "B": "타겟(30~59세) 인구는 많지만 우리 매장 구매는 적음 → 전단·광고·체험 이벤트 등 마케팅을 **지금 우선** 투입",
+    "B": "타겟 인구는 많지만 우리 매장 구매는 적음 → 전단·광고·체험 이벤트 등 마케팅을 **지금 우선** 투입",
     "A": "구매도 많고 타겟 인구도 많음 → 기존 고객 **VIP 관리·재구매·소개 유도**에 집중",
     "C": "구매는 많지만 타겟 인구 비중은 낮음 → 성숙·특수 요인 지역, **유지·케이스별** 대응",
     "D": "구매·타겟 인구 모두 낮음 → **예산 절감·보류**, 다른 지역(B·A) 우선",
@@ -918,8 +962,12 @@ STRATEGY_COLOR_BY_LEGEND = {
 STRATEGY_LEGEND_ORDER = [STRATEGY_LEGEND_LABEL[s] for s in STRATEGY_ORDER]
 
 
-def _render_strategy_legend_guide() -> None:
-    """지도 하단·매니저용 상세 범례 — A/B/C/D 코드별 지침 문구."""
+def _render_strategy_legend_guide(selected_age_label: str = "") -> None:
+    """지도 하단·매니저용 상세 범례 — A/B/C/D 코드별 지침 문구.
+
+    selected_age_label: 현재 선택된 핵심 타겟 연령대 라벨(예: '30대·40대·50대').
+    비어 있으면 세로축 안내에서 연령대 언급을 생략한다.
+    """
     _items = [
         ("B", STRATEGY_ATTACK),
         ("A", STRATEGY_DEFEND),
@@ -941,33 +989,50 @@ def _render_strategy_legend_guide() -> None:
                 f'</div>',
                 unsafe_allow_html=True,
             )
+    _age_suffix = f"(선택: {selected_age_label})" if selected_age_label else ""
     st.caption(
-        "분류 기준: 가로축 = 우리 매장 침투율(1,000가구당 구매), 세로축 = 타겟(30~59세) 인구 비중 — "
+        f"분류 기준: 가로축 = 우리 매장 침투율(1,000가구당 구매), 세로축 = 타겟 인구 비중{_age_suffix} — "
         "각 축의 **중앙값**으로 2×2 매트릭스를 나눕니다. "
         f"집중 공략(B) = {STRATEGY_GUIDE['B'].split('→')[0].strip()}."
     )
 
 
-def compute_dong_kpi(crm_counts: pd.DataFrame, population: pd.DataFrame) -> pd.DataFrame:
+def compute_dong_kpi(
+    crm_counts: pd.DataFrame,
+    population: pd.DataFrame,
+    selected_age_keys: list[str] | tuple[str, ...] | None = None,
+) -> pd.DataFrame:
     """
     crm_counts:  [admin_dong_code, admin_dong_name, purchase_count]
-    population:  [admin_dong_code, total_households, total_population, age_30_49_population]
-    반환: 위 컬럼 + penetration_rate(%), target_density(%)
+    population:  [admin_dong_code, total_households, total_population,
+                  age_10_population ~ age_60_population, age_70plus_population]
+    selected_age_keys: UI 에서 선택된 연령 버킷 키(예: ["30","40","50"]). None 이면 DEFAULT_TARGET_AGE_KEYS.
+
+    반환: 위 컬럼 + target_population, penetration_rate(%), target_density(%).
+    attrs["selected_age_keys"] 에 사용된 선택값을 담아 하위 UI 라벨에서 재사용한다.
     """
     if crm_counts is None or crm_counts.empty:
         return crm_counts.copy() if crm_counts is not None else pd.DataFrame()
+    sel_keys = [k for k in (selected_age_keys or DEFAULT_TARGET_AGE_KEYS) if k in AGE_BUCKET_KEYS]
+    if not sel_keys:
+        sel_keys = list(DEFAULT_TARGET_AGE_KEYS)
+
     df = crm_counts.merge(population, on="admin_dong_code", how="left")
     # 0 을 NaN 으로 바꿔 분모 오류(ZeroDivisionError 대신 무한대) 를 방지.
     # pd.NA 는 object dtype 승격을 유발해 이후 astype(float) 에서
     # "float() argument ... not 'NAType'" 오류가 나므로 float 호환 NaN 사용.
     df["total_households"] = pd.to_numeric(df.get("total_households"), errors="coerce").replace(0, float("nan"))
     df["total_population"] = pd.to_numeric(df.get("total_population"), errors="coerce").replace(0, float("nan"))
-    df["age_30_49_population"] = pd.to_numeric(df.get("age_30_49_population"), errors="coerce")
+    for k in AGE_BUCKET_KEYS:
+        col = age_bucket_column(k)
+        df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0)
+    df["target_population"] = sum(df[age_bucket_column(k)] for k in sel_keys).astype(float)
     df["purchase_count"] = pd.to_numeric(df.get("purchase_count"), errors="coerce").fillna(0)
     df["penetration_rate"] = (df["purchase_count"] / df["total_households"] * 100).astype(float).fillna(0.0)
-    df["target_density"] = (df["age_30_49_population"] / df["total_population"] * 100).astype(float).fillna(0.0)
+    df["target_density"] = (df["target_population"] / df["total_population"] * 100).astype(float).fillna(0.0)
     df["penetration_rate"] = df["penetration_rate"].round(3)
     df["target_density"] = df["target_density"].round(2)
+    df.attrs["selected_age_keys"] = list(sel_keys)
     return df
 
 
@@ -1015,7 +1080,7 @@ def assign_quadrant(df: pd.DataFrame) -> pd.DataFrame:
 
     # 호버 문장용 파생 컬럼 (침투율 % → 1,000가구당 구매가구 환산)
     _pen = pd.to_numeric(out.get("penetration_rate"), errors="coerce").fillna(0.0)
-    _tgt = pd.to_numeric(out.get("age_30_49_population"), errors="coerce").fillna(0)
+    _tgt = pd.to_numeric(out.get("target_population"), errors="coerce").fillna(0)
     out["hover_target"] = _tgt.astype(int).map(lambda n: f"{n:,}")
     out["hover_perf"] = _pen.map(lambda p: f"1,000가구 중 약 {p * 10:.1f}가구 구매")
 
@@ -1303,8 +1368,10 @@ def backfill_admin_dong_batch(
 # ══════════════════════════════════════════════════════════════════
 
 _POP_CACHE_TABLE = "app_dong_population_cache"
+_AGE_BUCKET_COLUMNS: list[str] = [age_bucket_column(k) for k in AGE_BUCKET_KEYS]
 _POP_CACHE_COLUMNS = [
-    "admin_dong_code", "total_households", "total_population", "age_30_49_population",
+    "admin_dong_code", "total_households", "total_population",
+    *_AGE_BUCKET_COLUMNS,
 ]
 
 
@@ -1336,16 +1403,17 @@ def _save_population_cache_to_db(client, rows: list[dict], yyyymm: str) -> None:
     """새로 조회한 인구 데이터를 app_dong_population_cache 에 upsert (실패해도 렌더링은 계속)."""
     if client is None or not rows:
         return
-    payload = [
-        {
+    payload = []
+    for r in rows:
+        entry = {
             "admin_dong_code": r["admin_dong_code"],
             "yyyymm": yyyymm,
             "total_households": r["total_households"],
             "total_population": r["total_population"],
-            "age_30_49_population": r["age_30_49_population"],
         }
-        for r in rows
-    ]
+        for k in AGE_BUCKET_KEYS:
+            entry[age_bucket_column(k)] = int(r.get(age_bucket_column(k)) or 0)
+        payload.append(entry)
     try:
         client.table(_POP_CACHE_TABLE).upsert(
             payload, on_conflict="admin_dong_code,yyyymm"
@@ -1358,32 +1426,51 @@ def _fetch_one_dong_population(code: str, yyyymm: str) -> dict:
     """행정동 1건의 인구+연령 API 를 호출해 캐시 저장용 row 로 변환 (스레드풀 워커)."""
     pop = fetch_admin_dong_population(str(code), yyyymm)
     age = fetch_admin_dong_age_population(str(code), yyyymm)
-    return {
+    buckets: dict[str, int] = age.get("age_buckets") or _empty_age_buckets()
+    row = {
         "admin_dong_code": str(code),
         "total_households": int(pop.get("total_households") or 0),
         "total_population": int(pop.get("total_population") or 0),
-        "age_30_49_population": int(age.get("age_30_49_population") or 0),
         "error": (pop.get("error") or "") + (" | " + age.get("error") if age.get("error") else ""),
     }
+    for k in AGE_BUCKET_KEYS:
+        row[age_bucket_column(k)] = int(buckets.get(k) or 0)
+    return row
+
+
+_POP_BULK_COLUMNS: list[str] = [
+    "admin_dong_code", "total_households", "total_population",
+    *_AGE_BUCKET_COLUMNS,
+    "error",
+]
+
+
+def _empty_pop_row(code: str, error: str = "") -> dict:
+    row = {
+        "admin_dong_code": code, "total_households": 0, "total_population": 0,
+        "error": error,
+    }
+    for k in AGE_BUCKET_KEYS:
+        row[age_bucket_column(k)] = 0
+    return row
 
 
 def fetch_population_bulk(
     client, admin_dong_codes: list[str], yyyymm: str, max_workers: int = 8,
 ) -> pd.DataFrame:
     """
-    행정동코드 리스트 → 인구·세대·핵심인구(30~59세) 데이터 DataFrame.
+    행정동코드 리스트 → 인구·세대·연령대별 인구 DataFrame.
 
     1) app_dong_population_cache 에서 (code, yyyymm) 벌크 조회로 캐시 적중분 확보.
     2) 캐시 미스난 코드만 ThreadPoolExecutor 로 병렬 호출 (인구 API + 연령 API).
     3) 신규 조회분은 캐시 테이블에 upsert 해 다음 조회부터 즉시 재사용.
 
-    반환: [admin_dong_code, total_households, total_population, age_30_49_population, error]
+    반환 컬럼: admin_dong_code, total_households, total_population,
+             age_10_population ~ age_60_population, age_70plus_population, error.
     """
     codes = [str(c) for c in admin_dong_codes if c]
     if not codes:
-        return pd.DataFrame(
-            columns=["admin_dong_code", "total_households", "total_population", "age_30_49_population", "error"]
-        )
+        return pd.DataFrame(columns=_POP_BULK_COLUMNS)
 
     cache_hits = _load_population_cache_from_db(client, codes, yyyymm)
     missing = [c for c in codes if c not in cache_hits]
@@ -1397,11 +1484,7 @@ def fetch_population_bulk(
                     fetched_rows.append(fut.result())
                 except Exception as e:
                     code = futures[fut]
-                    fetched_rows.append({
-                        "admin_dong_code": code, "total_households": 0,
-                        "total_population": 0, "age_30_49_population": 0,
-                        "error": f"병렬 조회 예외: {e}",
-                    })
+                    fetched_rows.append(_empty_pop_row(code, error=f"병렬 조회 예외: {e}"))
         # 정상 조회된(에러 없는) 행만 영구 캐시에 저장 — 오류 응답을 캐시해 재시도를 막지 않도록.
         _ok_rows = [r for r in fetched_rows if not (r.get("error") or "").strip()]
         _save_population_cache_to_db(client, _ok_rows, yyyymm)
@@ -1410,18 +1493,18 @@ def fetch_population_bulk(
     for code in codes:
         if code in cache_hits:
             hit = cache_hits[code]
-            rows.append({
+            row = {
                 "admin_dong_code": code,
                 "total_households": int(hit.get("total_households") or 0),
                 "total_population": int(hit.get("total_population") or 0),
-                "age_30_49_population": int(hit.get("age_30_49_population") or 0),
                 "error": "",
-            })
+            }
+            for k in AGE_BUCKET_KEYS:
+                row[age_bucket_column(k)] = int(hit.get(age_bucket_column(k)) or 0)
+            rows.append(row)
     rows.extend(fetched_rows)
 
-    return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=["admin_dong_code", "total_households", "total_population", "age_30_49_population", "error"]
-    )
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=_POP_BULK_COLUMNS)
 
 
 def prefetch_all_dong_population(client, yyyymm: str, max_workers: int = 8) -> dict:
@@ -1452,11 +1535,7 @@ def prefetch_all_dong_population(client, yyyymm: str, max_workers: int = 8) -> d
                 try:
                     fetched_rows.append(fut.result())
                 except Exception as e:
-                    fetched_rows.append({
-                        "admin_dong_code": futures[fut], "total_households": 0,
-                        "total_population": 0, "age_30_49_population": 0,
-                        "error": f"병렬 조회 예외: {e}",
-                    })
+                    fetched_rows.append(_empty_pop_row(futures[fut], error=f"병렬 조회 예외: {e}"))
         _ok_rows = [r for r in fetched_rows if not (r.get("error") or "").strip()]
         _save_population_cache_to_db(client, _ok_rows, yyyymm)
         _failed = len(fetched_rows) - len(_ok_rows)
@@ -1638,6 +1717,7 @@ def render_dong_commercial_map() -> None:
     # 아래 캐시된 원본으로 즉시 재필터링되도록 session_state 에 원본을 보관).
     _cache_key = (tuple(sorted(sel_dbfns)), start_date_str, end_date_str)
 
+    _pop_cache_key = (_cache_key, yyyymm)
     if do_render:
         if force_refresh:
             aggregate_purchase_count_by_dong.clear()
@@ -1653,6 +1733,9 @@ def render_dong_commercial_map() -> None:
         if st.session_state.get("dcm_sigungu_cache_key") != _cache_key:
             st.session_state.pop("dcm_sigungu_filter", None)
             st.session_state["dcm_sigungu_cache_key"] = _cache_key
+        # 새 렌더 요청이 오면 인구 데이터 캐시도 초기화 (아래에서 이번 매장·기간에 맞게 재적재).
+        st.session_state.pop("dcm_pop_df", None)
+        st.session_state.pop("dcm_pop_cache_key", None)
 
     if st.session_state.get("dcm_raw_cache_key") != _cache_key:
         st.info("매장·분석기간 설정 후 '상권 맵 렌더링'을 눌러 주세요.")
@@ -1666,15 +1749,33 @@ def render_dong_commercial_map() -> None:
         )
         return
 
-    # ── 시군구 필터 (변경 시 재클릭 없이 즉시 적용) ──────────
-    _sgg_options = sorted(x for x in crm_df_all["sigungu_label"].unique().tolist() if x)
-    sel_sgg = st.multiselect(
-        "시군구 필터 (미선택 시 전체)",
-        options=_sgg_options,
-        default=_sgg_options,
-        key="dcm_sigungu_filter",
-        help="구매건수가 집계된 행정동을 시군구 단위로 좁혀 봅니다. GeoJSON 범위 밖 행정동은 '기타(미분류)'로 표시됩니다.",
-    )
+    # ── 필터 (시군구·핵심 타겟 연령) — 변경 시 재클릭 없이 즉시 적용 ──
+    _fc1, _fc2 = st.columns(2)
+    with _fc1:
+        _sgg_options = sorted(x for x in crm_df_all["sigungu_label"].unique().tolist() if x)
+        sel_sgg = st.multiselect(
+            "시군구 필터 (미선택 시 전체)",
+            options=_sgg_options,
+            default=_sgg_options,
+            key="dcm_sigungu_filter",
+            help="구매건수가 집계된 행정동을 시군구 단위로 좁혀 봅니다. GeoJSON 범위 밖 행정동은 '기타(미분류)'로 표시됩니다.",
+        )
+    with _fc2:
+        _default_age_labels = [AGE_BUCKET_LABELS[k] for k in DEFAULT_TARGET_AGE_KEYS]
+        sel_age_labels = st.multiselect(
+            "핵심 타겟 연령대 (밀집도 계산 대상)",
+            options=[AGE_BUCKET_LABELS[k] for k in AGE_BUCKET_KEYS],
+            default=_default_age_labels,
+            key="dcm_target_ages",
+            help="선택한 연령대의 남녀 인구 합을 총인구로 나눠 타겟 밀집도를 계산합니다. "
+                 "인구 API 재호출 없이 즉시 반영됩니다.",
+        )
+    _label_to_key = {v: k for k, v in AGE_BUCKET_LABELS.items()}
+    sel_age_keys = [_label_to_key[l] for l in sel_age_labels if l in _label_to_key]
+    if not sel_age_keys:
+        st.warning("핵심 타겟 연령대를 1개 이상 선택해 주세요.")
+        return
+
     crm_df = crm_df_all[crm_df_all["sigungu_label"].isin(sel_sgg)] if sel_sgg else crm_df_all.iloc[0:0]
     if crm_df.empty:
         st.warning("선택한 시군구에 해당하는 행정동이 없습니다.")
@@ -1685,8 +1786,16 @@ def render_dong_commercial_map() -> None:
         f"행정동 {len(crm_df)}개, 기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건"
     )
 
-    with st.spinner("행정안전부 인구·세대 데이터 조회 중… (영구 캐시 + 병렬 조회)"):
-        pop_df = fetch_population_bulk(client, crm_df["admin_dong_code"].astype(str).tolist(), yyyymm)
+    # 인구 데이터: 필터가 바뀌어도 재조회하지 않도록, 이번 매장·기간에 대해 crm_df_all
+    # (사군구 필터 이전) 전체 행정동을 대상으로 한 번만 조회해 session_state 에 캐시.
+    pop_df = st.session_state.get("dcm_pop_df")
+    if pop_df is None or st.session_state.get("dcm_pop_cache_key") != _pop_cache_key:
+        with st.spinner("행정안전부 인구·세대 데이터 조회 중… (영구 캐시 + 병렬 조회)"):
+            pop_df = fetch_population_bulk(
+                client, crm_df_all["admin_dong_code"].astype(str).tolist(), yyyymm,
+            )
+        st.session_state["dcm_pop_df"] = pop_df
+        st.session_state["dcm_pop_cache_key"] = _pop_cache_key
 
     _err_msgs = [x for x in pop_df["error"].astype(str).tolist() if x.strip()]
     if pop_df.empty or all(pop_df["total_population"].fillna(0) == 0):
@@ -1699,7 +1808,7 @@ def render_dong_commercial_map() -> None:
                 for m in _err_msgs[:20]:
                     st.text(m)
 
-    kpi_df = compute_dong_kpi(crm_df, pop_df)
+    kpi_df = compute_dong_kpi(crm_df, pop_df, sel_age_keys)
     kpi_df = assign_quadrant(kpi_df)
 
     # ── KPI 요약 ─────────────────────────────────────
@@ -2132,12 +2241,13 @@ def _render_map(df: pd.DataFrame) -> None:
         custom_data=["admin_dong_name", "행동_전략", "hover_target", "hover_perf"],
     )
 
-    # 지침 3: 문장형 hover — "동이름: X | 전략: Y | 핵심타겟(30~59): N명 | 성과: 1,000가구 중 약 x가구 구매"
+    # 지침 3: 문장형 hover — 동이름·전략·핵심타겟(선택 연령대) 인구·성과 요약
+    _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
     fig.update_traces(
         hovertemplate=(
             "<b>%{customdata[0]}</b><br>"
             "전략: %{customdata[1]}<br>"
-            "핵심타겟(30~59): %{customdata[2]}명<br>"
+            f"핵심타겟({_age_label}): %{{customdata[2]}}명<br>"
             "성과: %{customdata[3]}"
             "<extra></extra>"
         ),
@@ -2160,7 +2270,7 @@ def _render_map(df: pd.DataFrame) -> None:
         ),
     )
     st.plotly_chart(fig, use_container_width=True)
-    _render_strategy_legend_guide()
+    _render_strategy_legend_guide(format_selected_age_label(df.attrs.get("selected_age_keys")))
 
 
 def _render_quadrant_scatter(df: pd.DataFrame) -> None:
@@ -2170,6 +2280,7 @@ def _render_quadrant_scatter(df: pd.DataFrame) -> None:
         return
     med_p = float(df.attrs.get("median_penetration", 0.0))
     med_d = float(df.attrs.get("median_target_density", 0.0))
+    _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
 
     fig = px.scatter(
         df,
@@ -2181,15 +2292,17 @@ def _render_quadrant_scatter(df: pd.DataFrame) -> None:
         hover_name="admin_dong_name",
         hover_data={
             "penetration_rate": ":.3f", "target_density": ":.2f",
-            "purchase_count": True, "age_30_49_population": True,
+            "purchase_count": True,
+            "total_households": True, "total_population": True,
+            "target_population": True,
             "행동_전략": False,
         },
         labels={
             "penetration_rate": "우리 매장 침투율 %",
-            "target_density": "타겟 인구 비중 %",
+            "target_density": f"타겟 인구 비중 % ({_age_label})",
             "행동_전략": "행동 전략",
             "purchase_count": "구매건수",
-            "age_30_49_population": "핵심타겟(30~59)",
+            "target_population": f"핵심타겟({_age_label})",
         },
     )
     fig.add_vline(x=med_p, line_dash="dash", line_color="grey",
@@ -2205,26 +2318,27 @@ def _render_quadrant_scatter(df: pd.DataFrame) -> None:
 
 
 def _render_action_top5(df: pd.DataFrame) -> None:
-    """🚨 집중 공략 그룹 중 핵심타겟(30~59세) 인구가 가장 많은 Top 5 를
+    """🚨 집중 공략 그룹 중 핵심 타겟(사용자가 선택한 연령대) 인구가 가장 많은 Top 5 를
     가로 막대로 표시 — 매니저의 즉각적인 마케팅 실행 지침용."""
     import plotly.express as px
 
     if df is None or df.empty or "행동_전략" not in df.columns:
         return
 
+    _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
     _attack = df[df["행동_전략"] == STRATEGY_ATTACK].copy()
-    _attack["age_30_49_population"] = pd.to_numeric(
-        _attack.get("age_30_49_population"), errors="coerce"
+    _attack["target_population"] = pd.to_numeric(
+        _attack.get("target_population"), errors="coerce"
     ).fillna(0).astype(int)
-    _attack = _attack[_attack["age_30_49_population"] > 0]
+    _attack = _attack[_attack["target_population"] > 0]
 
-    st.markdown("#### 당장 마케팅할 Top 5 행정동 · 집중 공략 · 타겟 인구 기준")
+    st.markdown(f"#### 당장 마케팅할 Top 5 행정동 · 집중 공략 · 핵심타겟({_age_label}) 인구 기준")
 
     if _attack.empty:
         st.caption("해당 기간에 '🚨 집중 공략' 지역이 없습니다. 다른 그룹은 매트릭스와 표를 참고하세요.")
         return
 
-    top5 = _attack.nlargest(5, "age_30_49_population").iloc[::-1]  # 가로 막대는 아래→위로 커지도록 역순
+    top5 = _attack.nlargest(5, "target_population").iloc[::-1]  # 가로 막대는 아래→위로 커지도록 역순
     top5["_label"] = top5["admin_dong_name"].fillna("").astype(str)
     if "sigungu_label" in top5.columns:
         top5["_label"] = top5["sigungu_label"].fillna("") + " " + top5["_label"]
@@ -2233,12 +2347,12 @@ def _render_action_top5(df: pd.DataFrame) -> None:
 
     fig = px.bar(
         top5,
-        x="age_30_49_population",
+        x="target_population",
         y="_label",
         orientation="h",
-        text="age_30_49_population",
+        text="target_population",
         custom_data=["hover_perf"],
-        labels={"age_30_49_population": "핵심타겟(30~59) 인구", "_label": ""},
+        labels={"target_population": f"핵심타겟({_age_label}) 인구", "_label": ""},
     )
     fig.update_traces(
         marker_color=STRATEGY_COLOR[STRATEGY_ATTACK],
@@ -2260,9 +2374,10 @@ def _render_table(df: pd.DataFrame) -> None:
     """상세 표 — 행동 전략 순 정렬 (집중 공략 → 핵심 방어 → 잠재 → 보류)."""
     if df is None or df.empty:
         return
+    _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
     _cols = [
         "행동_전략", "admin_dong_name", "admin_dong_code", "purchase_count",
-        "total_households", "total_population", "age_30_49_population",
+        "total_households", "total_population", "target_population",
         "penetration_rate", "target_density",
     ]
     if "sigungu_label" in df.columns:
@@ -2282,7 +2397,7 @@ def _render_table(df: pd.DataFrame) -> None:
         "purchase_count": "구매건수(기간내)",
         "total_households": "세대수",
         "total_population": "총인구",
-        "age_30_49_population": "핵심인구(30~59세)",
+        "target_population": f"핵심인구({_age_label})",
         "penetration_rate": "침투율(%)",
         "target_density": "밀집도(%)",
     })
