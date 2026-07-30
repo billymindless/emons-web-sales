@@ -7995,6 +7995,268 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
                         st.caption(f"방문·구매 조합 히트맵 생략: {_e}")
 
 
+def _mi_order_id_col(df: pd.DataFrame) -> str | None:
+    """orders↔customers merge 후 주문 id 컬럼명 해석 (id_x / id / order_id)."""
+    for c in ("id_x", "id", "order_id"):
+        if c in df.columns:
+            return c
+    return None
+
+
+def _mi_render_analysis_source_toggle(key_prefix: str) -> str:
+    """분석 소스 토글. 반환: 'header' | 'line'."""
+    _opts = {
+        "header": "현장 주문 헤더 (판매자 입력 category)",
+        "line": "원장 라인 + 대분류 (taxonomy)",
+    }
+    choice = st.radio(
+        "분석 소스",
+        options=list(_opts.keys()),
+        format_func=lambda k: _opts[k],
+        horizontal=True,
+        key=f"{key_prefix}_analysis_source",
+        help="카테고리 인기·다면분석 품목 차원에만 적용됩니다. 금액 KPI는 항상 헤더 total_amount입니다.",
+    )
+    if choice == "line":
+        st.info(
+            "카테고리 인기·다면분석 품목 차원: **라인 + taxonomy 대분류** 주문 수(distinct). "
+            "금액 KPI·방문/구매 이유·지도는 항상 헤더 `total_amount`. 라인 없는 주문은 카테고리에서 제외."
+        )
+    else:
+        st.info(
+            "카테고리 인기·다면분석 품목 차원: **주문 헤더 category** 건수. "
+            "금액 KPI·방문/구매 이유·지도는 항상 헤더 `total_amount`."
+        )
+    return choice if choice in ("header", "line") else "header"
+
+
+def _mi_line_category_order_counts(df_period: pd.DataFrame, tax_map: dict) -> pd.DataFrame:
+    """라인 아이템 → taxonomy 대분류별 distinct order_id 건수. 컬럼: 품목, 판매건수."""
+    empty = pd.DataFrame(columns=["품목", "판매건수"])
+    oid_col = _mi_order_id_col(df_period)
+    if oid_col is None or df_period is None or df_period.empty:
+        return empty
+    oids = [int(x) for x in df_period[oid_col].dropna().unique().tolist()]
+    if not oids:
+        return empty
+    try:
+        import product_taxonomy_service as _pts
+        client, _err = get_supabase_client()
+        if client is None:
+            return empty
+        items = _pts.load_order_items_batched(client, oids, columns="order_id, product_name")
+    except Exception as _e:
+        st.warning(f"라인 카테고리 집계 실패: {_e}")
+        return empty
+    if items is None or items.empty:
+        return empty
+    items = items.copy()
+    items["product_name"] = items["product_name"].fillna("").astype(str).str.strip()
+    items = items[items["product_name"] != ""]
+    if items.empty:
+        return empty
+    _tax = tax_map or {}
+    items["품목"] = items["product_name"].map(lambda n: _tax.get(n, "(미분류)"))
+    counts = (
+        items.groupby("품목", as_index=False)["order_id"]
+        .nunique()
+        .rename(columns={"order_id": "판매건수"})
+        .sort_values("판매건수", ascending=False)
+    )
+    return counts.reset_index(drop=True)
+
+
+def _mi_overlay_line_taxonomy_categories(merged: pd.DataFrame) -> pd.DataFrame:
+    """라인+taxonomy 대분류를 주문 단위 comma-join 해 category 컬럼에 덮어쓴다 (금액 컬럼 불변)."""
+    out = merged.copy() if merged is not None else pd.DataFrame()
+    oid_col = _mi_order_id_col(out)
+    if oid_col is None or out.empty:
+        return out
+    oids = [int(x) for x in out[oid_col].dropna().unique().tolist()]
+    if not oids:
+        out["category"] = ""
+        return out
+    try:
+        import product_taxonomy_service as _pts
+        client, _err = get_supabase_client()
+        if client is None:
+            return out
+        items = _pts.load_order_items_batched(client, oids, columns="order_id, product_name")
+    except Exception as _e:
+        st.warning(f"라인 대분류 오버레이 실패: {_e}")
+        return out
+    if items is None or items.empty:
+        out["category"] = ""
+        return out
+    items = items.copy()
+    items["product_name"] = items["product_name"].fillna("").astype(str).str.strip()
+    items = items[items["product_name"] != ""]
+    _tax = _cached_taxonomy_map()
+    items["_cat"] = items["product_name"].map(lambda n: _tax.get(n, "(미분류)"))
+    cat_by_oid = (
+        items.groupby("order_id")["_cat"]
+        .apply(lambda s: ",".join(sorted({str(x) for x in s if str(x).strip()})))
+        .to_dict()
+    )
+    out["category"] = out[oid_col].map(lambda x: cat_by_oid.get(int(x), "") if pd.notna(x) else "")
+    return out
+
+
+def _build_header_line_discrepancy_df(orders_df: pd.DataFrame) -> pd.DataFrame:
+    """헤더 total_amount/cost_price vs 라인 line_total/line_cost 차이 DataFrame."""
+    cols = [
+        "주문ID", "주문일", "import_source",
+        "헤더매출", "라인매출합", "매출차이",
+        "헤더원가", "라인원가합", "원가차이",
+        "라인수", "헤더카테고리",
+    ]
+    oid_col = _mi_order_id_col(orders_df)
+    if oid_col is None or orders_df is None or orders_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = orders_df.copy()
+    oids = [int(x) for x in df[oid_col].dropna().unique().tolist()]
+    items = pd.DataFrame()
+    if oids:
+        try:
+            import product_taxonomy_service as _pts
+            client, _err = get_supabase_client()
+            if client is not None:
+                items = _pts.load_order_items_batched(
+                    client, oids,
+                    columns="order_id, line_cost, line_total, product_name",
+                )
+        except Exception as _e:
+            st.warning(f"라인 아이템 조회 실패(정합성): {_e}")
+            items = pd.DataFrame()
+
+    if items is not None and not items.empty:
+        items = items.copy()
+        for _c in ("line_cost", "line_total"):
+            if _c in items.columns:
+                items[_c] = pd.to_numeric(items[_c], errors="coerce").fillna(0)
+            else:
+                items[_c] = 0
+        agg = (
+            items.groupby("order_id", as_index=False)
+            .agg(라인매출합=("line_total", "sum"), 라인원가합=("line_cost", "sum"), 라인수=("order_id", "count"))
+        )
+    else:
+        agg = pd.DataFrame(columns=["order_id", "라인매출합", "라인원가합", "라인수"])
+
+    out = pd.DataFrame()
+    out["주문ID"] = df[oid_col].map(lambda x: int(x) if pd.notna(x) else None)
+    out["주문일"] = df["order_date"] if "order_date" in df.columns else None
+    out["import_source"] = df["import_source"] if "import_source" in df.columns else None
+    out["헤더매출"] = pd.to_numeric(df["total_amount"], errors="coerce").fillna(0) if "total_amount" in df.columns else 0.0
+    out["헤더원가"] = pd.to_numeric(df["cost_price"], errors="coerce").fillna(0) if "cost_price" in df.columns else 0.0
+    out["헤더카테고리"] = df["category"].fillna("").astype(str) if "category" in df.columns else ""
+    out = out.merge(agg, left_on="주문ID", right_on="order_id", how="left")
+    if "order_id" in out.columns:
+        out = out.drop(columns=["order_id"])
+    out["라인매출합"] = pd.to_numeric(out.get("라인매출합"), errors="coerce").fillna(0)
+    out["라인원가합"] = pd.to_numeric(out.get("라인원가합"), errors="coerce").fillna(0)
+    out["라인수"] = pd.to_numeric(out.get("라인수"), errors="coerce").fillna(0).astype(int)
+    out["매출차이"] = out["헤더매출"] - out["라인매출합"]
+    out["원가차이"] = out["헤더원가"] - out["라인원가합"]
+    return out[cols]
+
+
+def _render_header_line_discrepancy_report(
+    merged: pd.DataFrame,
+    range_start_a: date,
+    range_end_a: date,
+    range_start_b: date,
+    range_end_b: date,
+    key_prefix: str,
+) -> None:
+    """다중기간 비교와 다면분석 사이 — 헤더↔라인 금액/원가 정합성 expander."""
+    with st.expander("헤더 ↔ 라인 정합성", expanded=False):
+        st.caption(
+            "주문 헤더(`total_amount`·`cost_price`)와 라인 합(`line_total`·`line_cost`)의 차이를 점검합니다. "
+            "자동 보정하지 않으며, 현장 판매 금액과 원장 라인은 별개 진실로 취급합니다. "
+            "비교 기간 A∪B 주문 기준입니다."
+        )
+        if merged is None or merged.empty:
+            st.info("분석할 주문이 없습니다.")
+            return
+        df = merged.copy()
+        df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+        df = df[df["order_date"].notna()]
+        if df.empty:
+            st.info("유효한 주문일이 없습니다.")
+            return
+        df["_dt"] = df["order_date"].dt.date
+        _mask = (
+            ((df["_dt"] >= range_start_a) & (df["_dt"] <= range_end_a))
+            | ((df["_dt"] >= range_start_b) & (df["_dt"] <= range_end_b))
+        )
+        scoped = df[_mask]
+        if scoped.empty:
+            st.info("분석 적용 기간(A∪B)에 주문이 없습니다.")
+            return
+
+        with st.spinner("헤더/라인 정합성 계산 중..."):
+            report = _build_header_line_discrepancy_df(scoped)
+
+        if report.empty:
+            st.info("정합성 리포트를 만들 수 없습니다.")
+            return
+
+        _has_line = report["라인수"] > 0
+        _amt_diff = report["매출차이"].abs() > 0.5
+        _cost_diff = report["원가차이"].abs() > 0.5
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("라인 있는 주문", f"{int(_has_line.sum()):,}건")
+        m2.metric("|매출차이|>0", f"{int((_has_line & _amt_diff).sum()):,}건")
+        m3.metric("|원가차이|>0", f"{int((_has_line & _cost_diff).sum()):,}건")
+        m4.metric(
+            "차이 합계(매출)",
+            f"{float(report.loc[_has_line, '매출차이'].sum()):,.0f}원",
+        )
+
+        show_all = st.checkbox(
+            "전체 표시 (라인 없는 주문 포함)",
+            value=False,
+            key=f"{key_prefix}_disc_show_all",
+        )
+        if show_all:
+            view = report
+        else:
+            view = report[_has_line & (_amt_diff | _cost_diff)].copy()
+            if view.empty:
+                st.success("라인 있는 주문 중 매출·원가 차이가 없습니다.")
+                view = report[_has_line].copy()
+
+        st.dataframe(
+            view,
+            width="stretch",
+            hide_index=True,
+            key=f"{key_prefix}_disc_df",
+            column_config={
+                "헤더매출": st.column_config.NumberColumn("헤더매출", format="%,.0f"),
+                "라인매출합": st.column_config.NumberColumn("라인매출합", format="%,.0f"),
+                "매출차이": st.column_config.NumberColumn("매출차이", format="%,.0f"),
+                "헤더원가": st.column_config.NumberColumn("헤더원가", format="%,.0f"),
+                "라인원가합": st.column_config.NumberColumn("라인원가합", format="%,.0f"),
+                "원가차이": st.column_config.NumberColumn("원가차이", format="%,.0f"),
+                "라인수": st.column_config.NumberColumn("라인수", format="%d"),
+            },
+            height=min(420, 80 + max(len(view), 1) * 28),
+        )
+        try:
+            _csv = view.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "CSV 다운로드",
+                data=_csv,
+                file_name=f"header_line_discrepancy_{key_prefix}.csv",
+                mime="text/csv",
+                key=f"{key_prefix}_disc_csv",
+            )
+        except Exception as _csv_e:
+            st.caption(f"CSV 생성 생략: {_csv_e}")
+
+
 def _render_marketing_multi_period_comparison(
     merged_all: pd.DataFrame,
     range_start_a: date,
@@ -8002,12 +8264,15 @@ def _render_marketing_multi_period_comparison(
     range_start_b: date,
     range_end_b: date,
     key_prefix: str,
+    analysis_source: str = "header",
 ):
     """
     다중 기간 교차 분석: 기간 A vs 기간 B로 4대 마케팅 지표를 좌우 비교.
     merged_all에는 order_date, total_amount, visit_reason, purchase_reason, category, name, address 필요.
+    analysis_source: 'header' | 'line' — ③ 카테고리 집계 소스 (금액 KPI는 항상 헤더).
     모든 st.plotly_chart / st.dataframe / st_folium에 key_prefix 기반 고유 key 부여.
     """
+    _src = analysis_source if analysis_source in ("header", "line") else "header"
     merged_all = merged_all.copy()
     merged_all["order_date"] = pd.to_datetime(merged_all["order_date"], errors="coerce")
     merged_all = merged_all[merged_all["order_date"].notna()]
@@ -8095,12 +8360,18 @@ def _render_marketing_multi_period_comparison(
 
     # ---------- ③ 카테고리별 인기 품목 Top 10: 가로형 막대 또는 DataFrame ----------
     st.subheader("③ 카테고리별 인기 품목 (Top 10)")
-    st.caption(
-        "app_orders.category 값이 매입 원장 임포트로 들어온 원본 품목명(예: '공용평상형침대깔판(QK)…')이면, "
-        "품목 분류 관리(taxonomy) 매핑으로 정규화된 대분류로 바꿔서 집계합니다. "
-        "모모 직접 등록 주문처럼 이미 카테고리로 깨끗하게 저장된 값은 그대로 사용합니다."
-    )
     _tax_map_c3 = _cached_taxonomy_map()
+    if _src == "line":
+        st.caption(
+            "분석 소스=원장 라인: `app_order_items` → taxonomy 대분류별 **주문 수(distinct order_id)**. "
+            "헤더 금액을 품목에 분배하지 않습니다. 라인 없는 주문은 제외됩니다."
+        )
+    else:
+        st.caption(
+            "분석 소스=현장 헤더: `app_orders.category` 건수. "
+            "매입 원장 임포트로 들어온 원본 품목명이면 taxonomy 매핑으로 정규화하고, "
+            "모모 직접 등록처럼 이미 카테고리로 저장된 값은 그대로 사용합니다."
+        )
 
     def _normalize_category_str(raw: str) -> str:
         raw = (raw or "").strip()
@@ -8108,37 +8379,47 @@ def _render_marketing_multi_period_comparison(
             return raw
         return _tax_map_c3.get(raw, raw)
 
+    def _header_category_top10(_df: pd.DataFrame) -> pd.DataFrame:
+        cats = _df["category"].fillna("").map(_normalize_category_str).str.split(",").explode().str.strip()
+        cats = cats[cats != ""]
+        top = cats.value_counts().reset_index().head(10)
+        top.columns = ["품목", "판매건수"]
+        top["순위"] = range(1, len(top) + 1)
+        return top
+
+    def _render_category_top10_panel(_df: pd.DataFrame, _label: str, _side_key: str, _side_label: str) -> None:
+        st.caption(f"기간 {_side_label}: {_label}")
+        if _src == "line":
+            cat = _mi_line_category_order_counts(_df, _tax_map_c3).head(10).copy()
+            if not cat.empty:
+                cat["순위"] = range(1, len(cat) + 1)
+            _title = "대분류별 주문 수 Top 10"
+            _hover = "%{y}<br>주문 수: %{x:,}건<extra></extra>"
+            _xaxis = "주문 수"
+        else:
+            cat = _header_category_top10(_df)
+            _title = "품목별 판매 횟수 Top 10"
+            _hover = "%{y}<br>판매 횟수: %{x:,}건<extra></extra>"
+            _xaxis = "판매 횟수"
+        if len(cat) == 0:
+            st.info("데이터 없음")
+            return
+        fig = px.bar(cat, x="판매건수", y="품목", orientation="h", title=_title)
+        fig.update_traces(hovertemplate=_hover)
+        fig.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title=_xaxis, yaxis_title="")
+        st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_category_top10_{_side_key}")
+        st.dataframe(
+            cat[["순위", "품목", "판매건수"]],
+            width="stretch",
+            key=f"{key_prefix}_category_df_{_side_key}",
+            height=min(280, 50 + len(cat) * 32),
+        )
+
     c1, c2 = st.columns(2)
     with c1:
-        st.caption(f"기간 A: {label_a}")
-        cats_a = df_period_a["category"].fillna("").map(_normalize_category_str).str.split(",").explode().str.strip()
-        cats_a = cats_a[cats_a != ""]
-        cat_a = cats_a.value_counts().reset_index().head(10)
-        cat_a.columns = ["품목", "판매건수"]
-        cat_a["순위"] = range(1, len(cat_a) + 1)
-        if len(cat_a) == 0:
-            st.info("데이터 없음")
-        else:
-            fig_a3 = px.bar(cat_a, x="판매건수", y="품목", orientation="h", title="품목별 판매 횟수 Top 10")
-            fig_a3.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
-            fig_a3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig_a3, width='stretch', key=f"{key_prefix}_category_top10_a")
-            st.dataframe(cat_a[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_a", height=min(280, 50 + len(cat_a) * 32))
+        _render_category_top10_panel(df_period_a, label_a, "a", "A")
     with c2:
-        st.caption(f"기간 B: {label_b}")
-        cats_b = df_period_b["category"].fillna("").map(_normalize_category_str).str.split(",").explode().str.strip()
-        cats_b = cats_b[cats_b != ""]
-        cat_b = cats_b.value_counts().reset_index().head(10)
-        cat_b.columns = ["품목", "판매건수"]
-        cat_b["순위"] = range(1, len(cat_b) + 1)
-        if len(cat_b) == 0:
-            st.info("데이터 없음")
-        else:
-            fig_b3 = px.bar(cat_b, x="판매건수", y="품목", orientation="h", title="품목별 판매 횟수 Top 10")
-            fig_b3.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
-            fig_b3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig_b3, width='stretch', key=f"{key_prefix}_category_top10_b")
-            st.dataframe(cat_b[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_b", height=min(280, 50 + len(cat_b) * 32))
+        _render_category_top10_panel(df_period_b, label_b, "b", "B")
 
     # ---------- ③-2 카테고리 대분류 × 라인 품목명 Top N (임포트 매입 원장 기반) ----------
     st.subheader("③-2 카테고리 대분류 × 인기 라인 품목명 (Top 5)")
@@ -8255,8 +8536,23 @@ def render_marketing_insights_tenant():
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
         return
-    order_cols_mi = "id, customer_id, order_date, delivery_date, total_amount, visit_reason, purchase_reason, category"
+    order_cols_mi = (
+        "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+        "visit_reason, purchase_reason, category, import_source"
+    )
     orders = load_orders_cached(db_filename, order_cols_mi, limit=None)
+    if orders.empty:
+        # import_source 미적용 DB 등 선택 컬럼 실패 시 폴백 (빈 주문과 구분 불가하나 안전)
+        orders = load_orders_cached(
+            db_filename,
+            "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+            "visit_reason, purchase_reason, category",
+            limit=None,
+        )
+    if not orders.empty and "import_source" not in orders.columns:
+        orders["import_source"] = None
+    if not orders.empty and "cost_price" not in orders.columns:
+        orders["cost_price"] = None
     customers = load_customers_cached(db_filename, limit=None)
 
     # 데이터 빈 값 체크
@@ -8326,6 +8622,8 @@ def render_marketing_insights_tenant():
         f"B: {range_start_b} ~ {range_end_b}"
     )
 
+    analysis_source = _mi_render_analysis_source_toggle("mi_tenant")
+
     merged = orders.merge(customers_sub, left_on="customer_id", right_on="id", how="left")
     if len(merged) == 0:
         st.info("등록된 매출 데이터가 없습니다. 기간을 선택해도 비교할 데이터가 없습니다.")
@@ -8336,10 +8634,21 @@ def render_marketing_insights_tenant():
         range_start_a, range_end_a,
         range_start_b, range_end_b,
         key_prefix="mi_tenant",
+        analysis_source=analysis_source,
+    )
+
+    _render_header_line_discrepancy_report(
+        merged,
+        range_start_a, range_end_a,
+        range_start_b, range_end_b,
+        key_prefix="mi_tenant",
     )
 
     # ── 다면 분석 섹션 (매장 단일: store_map=None) ─────────────────
-    _render_multi_dim_analysis(merged, key_prefix="mi_tenant", store_map=None)
+    _merged_for_mdim = (
+        _mi_overlay_line_taxonomy_categories(merged) if analysis_source == "line" else merged
+    )
+    _render_multi_dim_analysis(_merged_for_mdim, key_prefix="mi_tenant", store_map=None)
 
 
 def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str, key_prefix: str):
@@ -8404,10 +8713,23 @@ def render_marketing_insights_superadmin():
         st.info("등록된 매장이 없습니다.")
         return
     merged_list = []
-    order_cols_sa = "id, customer_id, order_date, delivery_date, total_amount, visit_reason, purchase_reason, category"
+    order_cols_sa = (
+        "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+        "visit_reason, purchase_reason, category, import_source"
+    )
+    order_cols_sa_fb = (
+        "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+        "visit_reason, purchase_reason, category"
+    )
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
         orders = load_orders_cached(db_fn, order_cols_sa, limit=None)
+        if orders.empty:
+            orders = load_orders_cached(db_fn, order_cols_sa_fb, limit=None)
+        if not orders.empty and "import_source" not in orders.columns:
+            orders["import_source"] = None
+        if not orders.empty and "cost_price" not in orders.columns:
+            orders["cost_price"] = None
         customers = load_customers_cached(db_fn, limit=None)
         if len(orders) == 0:
             continue
@@ -8491,7 +8813,17 @@ def render_marketing_insights_superadmin():
         f"B: {range_start_b} ~ {range_end_b}"
     )
 
+    analysis_source = _mi_render_analysis_source_toggle("mi_superadmin")
+
     _render_marketing_multi_period_comparison(
+        merged_all,
+        range_start_a, range_end_a,
+        range_start_b, range_end_b,
+        key_prefix="mi_superadmin",
+        analysis_source=analysis_source,
+    )
+
+    _render_header_line_discrepancy_report(
         merged_all,
         range_start_a, range_end_a,
         range_start_b, range_end_b,
@@ -8500,7 +8832,10 @@ def render_marketing_insights_superadmin():
 
     # ── 다면 분석 섹션 (전 매장: store_map = {db_fn: store_name}) ─────
     _sa_store_map = {row["db_filename"]: row["store_name"] for _, row in stores.iterrows()}
-    _render_multi_dim_analysis(merged_all, key_prefix="mi_superadmin", store_map=_sa_store_map)
+    _merged_for_mdim = (
+        _mi_overlay_line_taxonomy_categories(merged_all) if analysis_source == "line" else merged_all
+    )
+    _render_multi_dim_analysis(_merged_for_mdim, key_prefix="mi_superadmin", store_map=_sa_store_map)
 
 
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
