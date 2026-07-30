@@ -1742,16 +1742,42 @@ def render_dong_commercial_map() -> None:
         str(row["adm_cd2"]): str(row["adm_nm"]).split()[-1]
         for _, row in _dong_pool.iterrows() if row.get("adm_cd2")
     }
-    _prev_dongs = [d for d in st.session_state.get("dcm_dongs", []) if d in _dong_labels_all]
+    # 시군구별 "구전체" 가상 옵션 (예: 남구전체, 동구전체) — 선택 시 해당 시군구 전 행정동으로 펼침.
+    # 현재 선택된 시군구에 대해서만 표시한다.
+    _sgg_for_all = sorted(sel_sgg) if sel_sgg else []
+    _sgg_all_labels = [f"{sgg}전체" for sgg in _sgg_for_all]
+    _sgg_all_to_codes: dict[str, list[str]] = {
+        f"{sgg}전체": [
+            str(c) for c in _dong_pool.loc[_dong_pool["sggnm"] == sgg, "adm_cd2"].tolist() if c
+        ]
+        for sgg in _sgg_for_all
+    }
+    _dong_options = _sgg_all_labels + _dong_labels_all
+    _prev_dongs = [d for d in st.session_state.get("dcm_dongs", []) if d in _dong_options]
     with _dong_col:
         sel_dong_labels = st.multiselect(
             "행정동 (핵심상권)",
-            options=_dong_labels_all,
-            default=_prev_dongs or _dong_labels_all,
+            options=_dong_options,
+            default=_prev_dongs or _sgg_all_labels,
             key="dcm_dongs",
-            help="분석 대상 행정동. 선택 후 4단계에서 렌더링 버튼을 누르면 구매 없는 동도 침투율 0으로 포함해 분석합니다.",
+            help="시군구 '○○전체'(예: 남구전체)를 고르면 해당 구의 모든 행정동이 포함됩니다. "
+                 "개별 동도 함께 선택 가능합니다. 렌더링 시 구매 없는 동은 침투율 0으로 포함됩니다.",
         )
-    sel_adm_codes = [_dong_code_by_label[l] for l in sel_dong_labels if l in _dong_code_by_label]
+    # "남구전체" 등은 해당 시군구 코드 목록으로 펼치고, 개별 동 라벨은 직접 매핑. 중복 제거.
+    _sel_codes_ordered: list[str] = []
+    _seen_codes: set[str] = set()
+    for _lab in sel_dong_labels:
+        if _lab in _sgg_all_to_codes:
+            _codes_for = _sgg_all_to_codes[_lab]
+        elif _lab in _dong_code_by_label:
+            _codes_for = [str(_dong_code_by_label[_lab])]
+        else:
+            continue
+        for _c in _codes_for:
+            if _c and _c not in _seen_codes:
+                _seen_codes.add(_c)
+                _sel_codes_ordered.append(_c)
+    sel_adm_codes = _sel_codes_ordered
 
     # ══════════════════════════════════════════════════════════════
     # 3단계 — 핵심 타겟 연령대
