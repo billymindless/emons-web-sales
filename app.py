@@ -12887,6 +12887,7 @@ _ERP_CACHED_TABLES = {
     "app_overtime_claims", "app_leave_grants", "app_staffing_rules",
     "app_store_events", "app_store_hours", "app_employee_settings",
     "app_work_adjustments", "app_monthly_work_targets", "app_yearly_work_targets",
+    "app_period_work_targets",
 }
 
 
@@ -12916,7 +12917,8 @@ def _erp_invalidate_fetch_caches(table: str) -> None:
             pass
     # 근태 집계 함수 캐시도 관련 테이블 변경 시 무효화 (P0-3)
     if table in ("app_attendance_logs", "app_shift_schedules", "app_work_adjustments",
-                 "app_leave_grants", "app_employee_settings"):
+                 "app_leave_grants", "app_employee_settings",
+                 "app_period_work_targets", "app_yearly_work_targets"):
         for _fn in (_erp_compute_monthly_planned_minutes,
                     _erp_compute_monthly_remaining,
                     _erp_compute_yearly_breakdown):
@@ -12924,6 +12926,15 @@ def _erp_invalidate_fetch_caches(table: str) -> None:
                 _fn.clear()
             except Exception:
                 pass
+        try:
+            _erp_list_period_targets.clear()
+        except Exception:
+            pass
+        try:
+            _erp_get_yearly_target_row.clear()
+            _erp_list_yearly_targets.clear()
+        except Exception:
+            pass
 
 
 def _erp_insert_row(table: str, row: dict) -> tuple[bool, str]:
@@ -13206,6 +13217,34 @@ def _erp_find_active_period_target(db_filename: str, employee_name: str,
     return sorted(rows, key=lambda r: r.get("end_ym") or "")[-1]
 
 
+def _erp_resolve_period_target_for_year(
+    db_filename: str, employee_name: str, year: int, as_of: date
+) -> dict | None:
+    """조회 연도와 겹치는 기간 목표(근무시간 설정) 1건.
+    as_of 월을 덮는 행 우선, 없으면 겹치는 행 중 시작월이 빠른 것.
+    required_minutes > 0 인 행만 후보."""
+    rows = _erp_list_period_targets(db_filename, employee_name)
+    if not rows:
+        return None
+    year_start = f"{int(year):04d}-01"
+    year_end = f"{int(year):04d}-12"
+    overlapping = [
+        r for r in rows
+        if (r.get("start_ym") or "") <= year_end
+        and (r.get("end_ym") or "") >= year_start
+        and int(r.get("required_minutes") or 0) > 0
+    ]
+    if not overlapping:
+        return None
+    ref_ym = f"{as_of.year:04d}-{as_of.month:02d}"
+    covering = [
+        r for r in overlapping
+        if (r.get("start_ym") or "") <= ref_ym <= (r.get("end_ym") or "")
+    ]
+    pool = covering or overlapping
+    return sorted(pool, key=lambda r: r.get("start_ym") or "")[0]
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                                   year: int, as_of: date) -> dict:
@@ -13227,6 +13266,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
     반환 dict (단위: 분):
       - required_min      : 공통 필요근무시간
+      - required_source   : 'period' | 'yearly' | 'none' (기간 목표 1순위)
       - deductions / additions : 상세 분류 (kind_label → minutes) — UI 상세보기용 (합산 미포함)
       - normal_min        : 정상근무 (logs 정상/지각/조퇴 actual + shifts logs-없는-날짜)
       - overtime_min      : 연장근무 (logs 추가근무·회의·행사·시차사용·포상시간)
@@ -13239,14 +13279,32 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
     period_end = date(int(year), 12, 31)
 
     # ── 공통 필요근무시간 + 집계 시작일 ──────────────────────────
+    # 1순위: 근무시간 설정(기간 목표) / 2순위: app_yearly_work_targets
+    row_period = _erp_resolve_period_target_for_year(
+        db_filename, employee_name, int(year), as_of
+    )
     row_y = _erp_get_yearly_target_row(db_filename, employee_name, int(year))
-    required_min = int(row_y["required_minutes"]) if (row_y and row_y.get("required_minutes") is not None) else 0
+    if row_period is not None:
+        required_min = int(row_period.get("required_minutes") or 0)
+        required_source = "period"
+    elif row_y and row_y.get("required_minutes") is not None and int(row_y["required_minutes"]) > 0:
+        required_min = int(row_y["required_minutes"])
+        required_source = "yearly"
+    else:
+        required_min = 0
+        required_source = "none"
 
-    # period_start_date 가 있으면 그 날부터, 없으면 연도 1월 1일
+    # 집계 시작일: 연간 테이블 period_start_date → 기간 목표 start_ym 1일 → 연도 1/1
     _raw_psd = row_y.get("period_start_date") if row_y else None
     if _raw_psd:
         try:
             period_start = date.fromisoformat(str(_raw_psd)[:10])
+        except Exception:
+            period_start = date(int(year), 1, 1)
+    elif row_period and row_period.get("start_ym"):
+        try:
+            _sy, _sm = str(row_period["start_ym"]).split("-")[:2]
+            period_start = date(int(_sy), int(_sm), 1)
         except Exception:
             period_start = date(int(year), 1, 1)
     else:
@@ -13436,6 +13494,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
     return {
         "required_min": required_min,
+        "required_source": required_source,
         "deductions": deductions,
         "additions": additions,
         "normal_min": normal_min,
@@ -13990,6 +14049,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     bd = _erp_compute_yearly_breakdown(current_db, me_name, sel_year, _as_of)
 
     required_min = int(bd["required_min"])
+    required_source = bd.get("required_source") or ("none" if required_min <= 0 else "yearly")
     deductions = bd["deductions"] or {}
     additions  = bd["additions"] or {}
     total_short_adj_min = sum(int(v) for v in deductions.values())  # work_adjustments sign='-' 합
@@ -14003,6 +14063,12 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
 
     # 잔여 필요근무 = 공통 − 단축근무 누계 − 실제 근무시간 (캘린더·시프트 반영)
     remaining_required_min = required_min - total_short_adj_min - actual_total_min
+
+    _req_sub = {
+        "period": "(근무시간 설정 · 기간 목표)",
+        "yearly": "(연간 목표)",
+        "none": "⚠️ 미설정",
+    }.get(required_source, "⚠️ 미설정")
 
     # 잔여 연차 + 장기근속 정보
     _leave = _erp_compute_leave_status(current_db, me_name, _as_of)
@@ -14042,7 +14108,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
             f"<div style='background:#E3F2FD; {_card_css}'>"
             f"<div style='{_label_css}'>📌 공통 필요근무시간</div>"
             f"<div style='{_value_css} color:#0D47A1;'>{_erp_fmt_hm(required_min)}</div>"
-            f"<div style='{_sub_css}'>{'(연간 목표)' if required_min > 0 else '⚠️ 미설정'}</div>"
+            f"<div style='{_sub_css}'>{_req_sub}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -14140,7 +14206,10 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     r3c1, r3c2 = st.columns([3, 2])
     with r3c1:
         if required_min <= 0:
-            st.info("ℹ️ 공통 필요근무시간이 미설정입니다. 관리자에게 [근무시간 설정 → 연간 목표]를 등록하도록 요청해 주세요.")
+            st.info(
+                "ℹ️ 공통 필요근무시간이 미설정입니다. "
+                "관리자에게 [근무시간 설정]에서 기간 목표(예: 2026-06~2026-12)를 등록하도록 요청해 주세요."
+            )
         elif gap_min > 0:
             st.warning(f"⏰ 잔여 필요근무시간 달성까지 {_erp_fmt_hm(gap_min)} 부족 — 연말까지 {int(_leave['days_until_year_end'])}일 남음.")
         elif gap_min < 0:
@@ -19063,7 +19132,10 @@ def _erp_tab_period_targets(current_db: str, me_name: str):
         return
 
     st.subheader("⏰ 근무시간 설정")
-    st.caption("직원별로 임의 기간(예: 6~7월 200h)의 필수 근무시간 목표를 입력합니다.")
+    st.caption(
+        "직원별로 임의 기간(예: 2026-06~2026-12, 1275h)의 필수 근무시간 목표를 입력합니다. "
+        "대시보드 「공통 필요근무시간」에 1순위로 반영됩니다."
+    )
 
     today = _today_kst()
 
