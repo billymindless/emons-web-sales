@@ -14090,64 +14090,55 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         except Exception:
             pass
 
-    # ── 카드 공통 CSS ───────────────────────────────────────────
-    _card_css = (
-        "display:flex; flex-direction:column; align-items:center; justify-content:center; "
-        "border-radius:10px; padding:12px 8px; text-align:center; min-height:96px; "
-        "box-sizing:border-box;"
-    )
-    _label_css = "font-size:0.72rem; color:#555; margin-bottom:4px; line-height:1.2; font-weight:600;"
-    _value_css = "font-size:1.35rem; font-weight:700; line-height:1.15; margin:0;"
-    _sub_css   = "font-size:0.68rem; color:#777; margin-top:3px; line-height:1.25;"
-
-    # ── 한 줄 4지표: 전체필요 / 실제 / 잔여필요 / 단축누계 ─────
+    # ── 한 줄 요약: 필요 / 실제 / 잔여 / 단축 / 연차 ─────────────
     gap_min = remaining_required_min
-    _remain_color = "#C62828" if gap_min > 0 else ("#2E7D32" if gap_min < 0 else "#1565C0")
-    _remain_bg = "#FFEBEE" if gap_min > 0 else ("#E8F5E9" if gap_min < 0 else "#E3F2FD")
-    _remain_sub = (
-        "목표 미달" if gap_min > 0 else ("목표 초과" if gap_min < 0 else "목표 달성")
-    ) if required_min > 0 else "필요시간 미설정"
+    _days_left = int(_leave.get("days_until_year_end") or 0)
+    if required_min <= 0:
+        _status_txt = "필요근무 미설정"
+        _status_color = "#E65100"
+    elif gap_min > 0:
+        _status_txt = f"목표 미달 · 연말까지 {_days_left}일"
+        _status_color = "#C62828"
+    elif gap_min < 0:
+        _status_txt = f"목표 초과 {_erp_fmt_hm(-gap_min)}"
+        _status_color = "#2E7D32"
+    else:
+        _status_txt = "목표 달성"
+        _status_color = "#1565C0"
 
+    _leave_total = _leave["annual_total"]
+    _leave_used = _leave["annual_used"]
+    _summary_line = (
+        f"<div style='display:flex; flex-wrap:wrap; align-items:center; gap:10px 18px; "
+        f"background:#F7F9FC; border:1px solid #E0E6EF; border-radius:10px; "
+        f"padding:12px 16px; font-size:0.92rem; line-height:1.45;'>"
+        f"<span><b style='color:#555;'>필요</b> "
+        f"<b style='color:#0D47A1;'>{_erp_fmt_hm(required_min)}</b>"
+        f"<span style='color:#888; font-size:0.8rem;'> {_req_sub}</span></span>"
+        f"<span style='color:#BBB;'>|</span>"
+        f"<span><b style='color:#555;'>실제</b> "
+        f"<b style='color:#1B5E20;'>{_erp_fmt_hm(actual_total_min)}</b>"
+        f"<span style='color:#888; font-size:0.8rem;'> "
+        f"(정상 {_erp_fmt_hm(normal_min)} · 연장 {_erp_fmt_hm(overtime_min)})</span></span>"
+        f"<span style='color:#BBB;'>|</span>"
+        f"<span><b style='color:#555;'>잔여</b> "
+        f"<b style='color:{_status_color};'>{_erp_fmt_hm(gap_min)}</b>"
+        f"<span style='color:#888; font-size:0.8rem;'> {_status_txt}</span></span>"
+        f"<span style='color:#BBB;'>|</span>"
+        f"<span><b style='color:#555;'>단축</b> "
+        f"<b style='color:#E65100;'>{_erp_fmt_hm(total_short_adj_min)}</b></span>"
+        f"<span style='color:#BBB;'>|</span>"
+        f"<span><b style='color:#555;'>잔여연차</b> "
+        f"<b style='color:#C62828;'>{_annual_remain_days:g}일</b>"
+        f"<span style='color:#888; font-size:0.8rem;'> "
+        f"(총 {_leave_total:g} · 사용 {_leave_used:g})</span></span>"
+        f"</div>"
+    )
     st.markdown("##### 🎯 연간 근무시간 요약")
-    c_req, c_act, c_rem, c_short = st.columns(4)
-    with c_req:
-        st.markdown(
-            f"<div style='background:#E3F2FD; {_card_css}'>"
-            f"<div style='{_label_css}'>연간 전체 필요근무</div>"
-            f"<div style='{_value_css} color:#0D47A1;'>{_erp_fmt_hm(required_min)}</div>"
-            f"<div style='{_sub_css}'>{_req_sub}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with c_act:
-        st.markdown(
-            f"<div style='background:#E8F5E9; {_card_css}'>"
-            f"<div style='{_label_css}'>실제 근무시간</div>"
-            f"<div style='{_value_css} color:#1B5E20;'>{_erp_fmt_hm(actual_total_min)}</div>"
-            f"<div style='{_sub_css}'>"
-            f"정상 {_erp_fmt_hm(normal_min)} · 연장 {_erp_fmt_hm(overtime_min)}"
-            f"</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with c_rem:
-        st.markdown(
-            f"<div style='background:{_remain_bg}; {_card_css}'>"
-            f"<div style='{_label_css}'>연간 잔여 필요근무</div>"
-            f"<div style='{_value_css} color:{_remain_color};'>{_erp_fmt_hm(gap_min)}</div>"
-            f"<div style='{_sub_css}'>{_remain_sub}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with c_short:
-        st.markdown(
-            f"<div style='background:#FFF3E0; {_card_css}'>"
-            f"<div style='{_label_css}'>단축근무 누계</div>"
-            f"<div style='{_value_css} color:#E65100;'>{_erp_fmt_hm(total_short_adj_min)}</div>"
-            f"<div style='{_sub_css}'>포상·여름휴가 등 차감</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+    st.markdown(_summary_line, unsafe_allow_html=True)
+
+    if required_min <= 0:
+        st.caption("관리자 [근무시간 설정]에서 기간 목표를 등록해 주세요.")
 
     if deductions:
         with st.expander("ℹ️ 단축근무 누계 상세 (kind별 분류)", expanded=False):
@@ -14213,44 +14204,8 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         else:
             st.info("정상근무 내역이 없습니다.")
 
-    # ── 잔여 안내 + 잔여 연차 ───────────────────────────────────
-    st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-    r3c1, r3c2 = st.columns([3, 2])
-    with r3c1:
-        if required_min <= 0:
-            st.info(
-                "ℹ️ 공통 필요근무시간이 미설정입니다. "
-                "관리자에게 [근무시간 설정]에서 기간 목표(예: 2026-06~2026-12)를 등록하도록 요청해 주세요."
-            )
-        elif gap_min > 0:
-            st.warning(f"⏰ 잔여 필요근무시간 달성까지 {_erp_fmt_hm(gap_min)} 부족 — 연말까지 {int(_leave['days_until_year_end'])}일 남음.")
-        elif gap_min < 0:
-            st.success(f"🎉 목표 초과 달성 — {_erp_fmt_hm(-gap_min)} 초과 근무. 보상(시차·연차·급여) 신청을 검토해 주세요.")
-        else:
-            st.success("✅ 잔여 필요근무시간을 정확히 달성했습니다.")
-    with r3c2:
-        _leave_color = "#E53935" if _annual_remain_days == 0 else ("#FB8C00" if _leave["soak_risk"] else "#2E7D32")
-        _leave_bg = "#FFEBEE" if _annual_remain_days == 0 else ("#FFF8E1" if _leave["soak_risk"] else "#E8F5E9")
-        _leave_total = _leave["annual_total"]
-        _leave_used  = _leave["annual_used"]
-        _long_extra  = _legal_info.get("long_service_extra", 0)
-        _yos_str     = f"근속 {_legal_info['years_of_service']}년" if _legal_info else ""
-        _sub_leave   = (
-            f"총 {_leave_total:g}일 중 {_leave_used:g}일 사용"
-            + (f" | 장기근속 +{_long_extra}일 포함" if _long_extra > 0 else "")
-            + (f" | {_yos_str}" if _yos_str else "")
-        )
-        st.markdown(
-            f"<div style='background:{_leave_bg}; {_card_css}'>"
-            f"<div style='{_label_css}'>🎫 잔여 연차</div>"
-            f"<div style='{_value_css} color:{_leave_color};'>{_annual_remain_days:g}일</div>"
-            f"<div style='{_sub_css}'>{_sub_leave}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
     if _leave["soak_risk"]:
-        st.error(f"🔴 연차 소멸 위험 — 잔여 {_annual_remain_days:g}일 / 연말까지 {int(_leave['days_until_year_end'])}일 남음. 연차 사용을 서둘러 주세요.")
+        st.error(f"🔴 연차 소멸 위험 — 잔여 {_annual_remain_days:g}일 / 연말까지 {_days_left}일 남음. 연차 사용을 서둘러 주세요.")
 
     if role in ("store_admin", "superadmin"):
         # 관리자 설정(집계 시작일 · 월 목표 근무시간 · 직원 현황)은 상단 '관리자 메뉴' 탭으로 이동함.
