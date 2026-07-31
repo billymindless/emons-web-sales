@@ -14093,31 +14093,58 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     # ── 카드 공통 CSS ───────────────────────────────────────────
     _card_css = (
         "display:flex; flex-direction:column; align-items:center; justify-content:center; "
-        "border-radius:12px; padding:18px 12px; text-align:center; min-height:115px; "
+        "border-radius:10px; padding:12px 8px; text-align:center; min-height:96px; "
         "box-sizing:border-box;"
     )
-    _label_css = "font-size:0.78rem; color:#555; margin-bottom:6px; line-height:1.25; font-weight:600;"
-    _value_css = "font-size:1.7rem; font-weight:700; line-height:1.2; margin:0;"
-    _sub_css   = "font-size:0.72rem; color:#777; margin-top:4px; line-height:1.3;"
+    _label_css = "font-size:0.72rem; color:#555; margin-bottom:4px; line-height:1.2; font-weight:600;"
+    _value_css = "font-size:1.35rem; font-weight:700; line-height:1.15; margin:0;"
+    _sub_css   = "font-size:0.68rem; color:#777; margin-top:3px; line-height:1.25;"
 
-    # ── 상단 2카드: 공통 필요 / 단축근무 누계 ──────────────────
-    st.markdown("##### 🎯 연간 필요 근무시간")
-    r1c1, r1c2 = st.columns(2)
-    with r1c1:
+    # ── 한 줄 4지표: 전체필요 / 실제 / 잔여필요 / 단축누계 ─────
+    gap_min = remaining_required_min
+    _remain_color = "#C62828" if gap_min > 0 else ("#2E7D32" if gap_min < 0 else "#1565C0")
+    _remain_bg = "#FFEBEE" if gap_min > 0 else ("#E8F5E9" if gap_min < 0 else "#E3F2FD")
+    _remain_sub = (
+        "목표 미달" if gap_min > 0 else ("목표 초과" if gap_min < 0 else "목표 달성")
+    ) if required_min > 0 else "필요시간 미설정"
+
+    st.markdown("##### 🎯 연간 근무시간 요약")
+    c_req, c_act, c_rem, c_short = st.columns(4)
+    with c_req:
         st.markdown(
             f"<div style='background:#E3F2FD; {_card_css}'>"
-            f"<div style='{_label_css}'>📌 공통 필요근무시간</div>"
+            f"<div style='{_label_css}'>연간 전체 필요근무</div>"
             f"<div style='{_value_css} color:#0D47A1;'>{_erp_fmt_hm(required_min)}</div>"
             f"<div style='{_sub_css}'>{_req_sub}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
-    with r1c2:
+    with c_act:
+        st.markdown(
+            f"<div style='background:#E8F5E9; {_card_css}'>"
+            f"<div style='{_label_css}'>실제 근무시간</div>"
+            f"<div style='{_value_css} color:#1B5E20;'>{_erp_fmt_hm(actual_total_min)}</div>"
+            f"<div style='{_sub_css}'>"
+            f"정상 {_erp_fmt_hm(normal_min)} · 연장 {_erp_fmt_hm(overtime_min)}"
+            f"</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with c_rem:
+        st.markdown(
+            f"<div style='background:{_remain_bg}; {_card_css}'>"
+            f"<div style='{_label_css}'>연간 잔여 필요근무</div>"
+            f"<div style='{_value_css} color:{_remain_color};'>{_erp_fmt_hm(gap_min)}</div>"
+            f"<div style='{_sub_css}'>{_remain_sub}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with c_short:
         st.markdown(
             f"<div style='background:#FFF3E0; {_card_css}'>"
-            f"<div style='{_label_css}'>(−) 단축근무 누계 (통합)</div>"
+            f"<div style='{_label_css}'>단축근무 누계</div>"
             f"<div style='{_value_css} color:#E65100;'>{_erp_fmt_hm(total_short_adj_min)}</div>"
-            f"<div style='{_sub_css}'>포상·여름휴가·기타 차감 통합</div>"
+            f"<div style='{_sub_css}'>포상·여름휴가 등 차감</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -14186,23 +14213,8 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         else:
             st.info("정상근무 내역이 없습니다.")
 
-    # ── 하단: 정상근무 1카드 ─────────────────────────────────
+    # ── 잔여 안내 + 잔여 연차 ───────────────────────────────────
     st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-    st.markdown("##### ⏱️ 실제 근무시간 (캘린더 기준)")
-    with st.container():
-        _sub_normal = f"시프트 자동 {_erp_fmt_hm(shift_normal_min)} + 연차/반차 {_erp_fmt_hm(leave_min)}"
-        st.markdown(
-            f"<div style='background:#E8F5E9; {_card_css}'>"
-            f"<div style='{_label_css}'>(+) 정상근무</div>"
-            f"<div style='{_value_css} color:#1B5E20;'>{_erp_fmt_hm(normal_min)}</div>"
-            f"<div style='{_sub_css}'>{_sub_normal}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-    # ── 잔여 분석 + 잔여 연차 ───────────────────────────────────
-    st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-    gap_min = remaining_required_min  # actual_total_min 이미 차감된 값
     r3c1, r3c2 = st.columns([3, 2])
     with r3c1:
         if required_min <= 0:
