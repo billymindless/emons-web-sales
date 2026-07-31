@@ -14121,12 +14121,20 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         f"<span style='color:#888; font-size:0.8rem;'> "
         f"(정상 {_erp_fmt_hm(normal_min)} · 연장 {_erp_fmt_hm(overtime_min)})</span></span>"
         f"<span style='color:#BBB;'>|</span>"
+        f"<span style='display:inline-flex; flex-direction:column; gap:2px;'>"
         f"<span><b style='color:#555;'>잔여</b> "
         f"<b style='color:{_status_color};'>{_erp_fmt_hm(gap_min)}</b>"
         f"<span style='color:#888; font-size:0.8rem;'> {_status_txt}</span></span>"
+        f"<span style='color:#666; font-size:0.75rem; font-family:ui-monospace,monospace;'>"
+        f"＝ 필요 {_erp_fmt_hm(required_min)}"
+        f" − 차감 {_erp_fmt_hm(total_short_adj_min)}"
+        f" − 실제 {_erp_fmt_hm(actual_total_min)}"
+        f"</span>"
+        f"</span>"
         f"<span style='color:#BBB;'>|</span>"
-        f"<span><b style='color:#555;'>단축</b> "
-        f"<b style='color:#E65100;'>{_erp_fmt_hm(total_short_adj_min)}</b></span>"
+        f"<span><b style='color:#555;'>차감</b> "
+        f"<b style='color:#E65100;'>{_erp_fmt_hm(total_short_adj_min)}</b>"
+        f"<span style='color:#888; font-size:0.8rem;'> (포상·여름휴가 등)</span></span>"
         f"<span style='color:#BBB;'>|</span>"
         f"<span><b style='color:#555;'>잔여연차</b> "
         f"<b style='color:#C62828;'>{_annual_remain_days:g}일</b>"
@@ -14136,12 +14144,18 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     )
     st.markdown("##### 🎯 연간 근무시간 요약")
     st.markdown(_summary_line, unsafe_allow_html=True)
+    st.caption(
+        f"연간 잔여 필요근무 = **필요** {_erp_fmt_hm(required_min)} "
+        f"− **필요근무 차감** {_erp_fmt_hm(total_short_adj_min)} "
+        f"− **실제** {_erp_fmt_hm(actual_total_min)} "
+        f"= **{_erp_fmt_hm(gap_min)}**"
+    )
 
     if required_min <= 0:
         st.caption("관리자 [근무시간 설정]에서 기간 목표를 등록해 주세요.")
 
     if deductions:
-        with st.expander("ℹ️ 단축근무 누계 상세 (kind별 분류)", expanded=False):
+        with st.expander("ℹ️ 필요근무 차감 상세 (kind별 분류)", expanded=False):
             for k, v in sorted(deductions.items(), key=lambda x: -x[1]):
                 st.markdown(f"- **{k}**: {_erp_fmt_hm(v)}")
 
