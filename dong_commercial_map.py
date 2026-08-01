@@ -567,16 +567,64 @@ def _to_int_safe(v: Any) -> int:
         return 0
 
 
+def _yyyymm_add(yyyymm: str, months: int) -> str:
+    """'YYYYMM' 에 months(음수 가능)를 더한 'YYYYMM'."""
+    try:
+        y = int(str(yyyymm)[:4])
+        m = int(str(yyyymm)[4:6])
+    except Exception:
+        now = pd.Timestamp.now()
+        y, m = int(now.year), int(now.month)
+    total = y * 12 + (m - 1) + int(months)
+    return f"{total // 12:04d}{total % 12 + 1:02d}"
+
+
 def _clamp_population_yyyymm(yyyymm: str) -> str:
-    """행정안전부 인구·세대 API는 진행 중인 이번 달 통계를 아직 게시하지 않아,
-    이번 달(또는 미래월)로 조회하면 모든 행정동에서 INVALID_REQUEST_PARAMETER_ERROR
-    를 반환한다 (실측 확인됨). 분석 기간 종료월이 이번 달 이상이면 가장 최근
-    확정월(전월)로 낮춰서 요청한다."""
+    """이번 달/미래월 요청을 전월로 낮춘다.
+
+    행안부 주민등록 통계는 익월 중순 이후에야 게시되는 경우가 많아,
+    전월이라도 아직 NODATA 일 수 있다 → `_resolve_population_yyyymm` 이
+    실제 게시된 최근월까지 추가로 폴백한다.
+    """
     this_month = pd.Timestamp.now().strftime("%Y%m")
+    prev_month_last_day = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
+    prev = prev_month_last_day.strftime("%Y%m")
     if not yyyymm or yyyymm >= this_month:
-        prev_month_last_day = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
-        return prev_month_last_day.strftime("%Y%m")
+        return prev
     return yyyymm
+
+
+def _response_head(js: Any) -> dict:
+    """행안부 Response/response head|header 추출."""
+    if not isinstance(js, dict):
+        return {}
+    for top in ("Response", "response"):
+        wrap = js.get(top)
+        if isinstance(wrap, dict):
+            head = wrap.get("head") or wrap.get("header")
+            if isinstance(head, dict):
+                return head
+    return {}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _resolve_population_yyyymm(preferred: str) -> str:
+    """요청 통계월부터 최대 8개월 뒤로 걸어가며 실제 데이터가 있는 최근월을 고른다.
+
+    실측(2026-08-01): 분석 종료월 202607 → NODATA. 최근 게시월은 202606.
+    단순 '전월 클램프'만으로는 월초·게시 지연을 커버하지 못한다.
+    """
+    start = _clamp_population_yyyymm(preferred)
+    probe_code = "1111051500"  # 서울 종로구 청운효자동 (항상 존재)
+    for i in range(0, 8):
+        ym = _yyyymm_add(start, -i)
+        r = fetch_admin_dong_population(probe_code, ym)
+        if r.get("ok") and int(r.get("total_population") or 0) > 0:
+            return ym
+        err = str(r.get("error") or "")
+        if any(x in err for x in ("service_key", "파라미터 누락", "HTTP 401", "HTTP 403")):
+            break
+    return start
 
 
 @st.cache_data(ttl=_THIRTY_DAYS_SEC, show_spinner=False)
@@ -629,10 +677,17 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
         js = r.json() if r.content else {}
         items = _extract_items(js)
         if not items:
+            head = _response_head(js)
+            rc = str(head.get("resultCode") or "")
+            rm = str(head.get("resultMsg") or "")
+            if rc == "3" or "NODATA" in rm.upper():
+                err = f"통계월 {yyyymm} 데이터 없음 (NODATA)"
+            else:
+                err = f"응답 items 비어 있음 (resultCode={rc or '-'}, {rm or '-'})"
             return {
                 "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
                 "total_population": 0, "total_households": 0,
-                "error": "응답 items 비어 있음", "raw_url": raw_url,
+                "error": err, "raw_url": raw_url,
             }
         # lv=7 이면 단건이 정상이나, 안전하게 합산 (통·반 fallback 대비).
         # 실 응답 필드: 총인구수=totNmprCnt, 세대수=hhCnt.
@@ -716,10 +771,17 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
         js = r.json() if r.content else {}
         items = _extract_items(js)
         if not items:
+            head = _response_head(js)
+            rc = str(head.get("resultCode") or "")
+            rm = str(head.get("resultMsg") or "")
+            if rc == "3" or "NODATA" in rm.upper():
+                err = f"통계월 {yyyymm} 데이터 없음 (NODATA)"
+            else:
+                err = f"응답 items 비어 있음 (resultCode={rc or '-'}, {rm or '-'})"
             return {
                 "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
                 "age_buckets": empty_buckets, "total_population": 0,
-                "error": "응답 items 비어 있음", "raw_url": raw_url,
+                "error": err, "raw_url": raw_url,
             }
         # 실 응답: 행별 컬럼형 age 필드.
         #   male{X}AgeNmprCnt: 만 X~X+9세 남자 (X ∈ {0,10,20,...,100})
@@ -769,6 +831,11 @@ def _extract_items(js: Any) -> list[dict]:
             _items = _body.get("items")
         if _items is None:
             _items = _wrap.get("items")
+        # NODATA 시 items 가 빈 문자열("") 로 오는 경우 있음
+        if isinstance(_items, str):
+            if not _items.strip():
+                return []
+            continue
         if isinstance(_items, dict):
             _item = _items.get("item")
             if isinstance(_item, list):
@@ -1687,9 +1754,15 @@ def render_dong_commercial_map() -> None:
         return
     start_date_str = start_date.isoformat()
     end_date_str = end_date.isoformat()
-    # 인구·세대 데이터는 기간 종료월 스냅샷만 사용. 단, 이번 달 통계는 행안부가
-    # 아직 게시하지 않아 API가 거부하므로 최근 확정월(전월)로 자동 보정한다.
-    yyyymm = _clamp_population_yyyymm(end_date.strftime("%Y%m"))
+    # 인구·세대 데이터는 기간 종료월 스냅샷만 사용.
+    # 이번 달/미게시 월은 행안부가 NODATA 를 반환하므로 실제 게시된 최근월로 폴백.
+    _yyyymm_requested = end_date.strftime("%Y%m")
+    yyyymm = _resolve_population_yyyymm(_yyyymm_requested)
+    if yyyymm != _yyyymm_requested:
+        st.info(
+            f"ℹ️ 인구 기준월 자동 보정: 요청 `{_yyyymm_requested}` → 사용 `{yyyymm}` "
+            f"(행정안전부 해당 월 통계 미게시·NODATA)"
+        )
 
     sel_dbfns = [dbf for dbf, name in store_options if name in sel_labels]
     sel_store_names = [name for _, name in store_options if name in sel_labels]
@@ -1913,13 +1986,21 @@ def render_dong_commercial_map() -> None:
 
     _err_msgs = [x for x in pop_df["error"].astype(str).tolist() if x.strip()]
     if pop_df.empty or all(pop_df["total_population"].fillna(0) == 0):
-        st.error(
-            "행정안전부 API 응답에서 인구 데이터를 파싱하지 못했습니다. "
-            "위 '연동 진단' 패널에서 API 키·엔드포인트를 확인해 주세요."
-        )
+        _nodata = any(("NODATA" in m) or ("데이터 없음" in m) for m in _err_msgs)
+        if _nodata:
+            st.error(
+                f"행정안전부 통계월 `{yyyymm}` 인구 데이터가 없습니다 (NODATA). "
+                "분석 기간 종료월을 더 이르게 잡거나, 잠시 후 재시도해 주세요. "
+                "위 '연동 진단'에서 연결 테스트로 최근 게시월을 확인할 수 있습니다."
+            )
+        else:
+            st.error(
+                "행정안전부 API 응답에서 인구 데이터를 파싱하지 못했습니다. "
+                "위 '연동 진단' 패널에서 API 키·엔드포인트를 확인해 주세요."
+            )
         if _err_msgs:
             with st.expander("응답 오류 상세", expanded=False):
-                for m in _err_msgs[:20]:
+                for m in list(dict.fromkeys(_err_msgs))[:20]:
                     st.text(m)
 
     kpi_df = compute_dong_kpi(crm_df, pop_df, sel_age_keys)
@@ -1960,7 +2041,7 @@ def render_dong_commercial_map() -> None:
 # ══════════════════════════════════════════════════════════════════
 
 def _render_diagnostic_panel() -> None:
-    """API 키/엔드포인트/GeoJSON 상태 요약."""
+    """API 키/엔드포인트/GeoJSON 상태 요약 + 행안부 연결 테스트."""
     pop_key, pop_diag = _get_population_service_key_diagnostic()
     kakao_key = _get_kakao_rest_key_local()
     geojson_p = GEOJSON_PATH_DEFAULT
@@ -1983,6 +2064,30 @@ def _render_diagnostic_panel() -> None:
                 "이미 [elevator_api] 가 있다면 동일한 data.go.kr 일반 인증키를 "
                 "[population_api] service_key 에 복사해도 됩니다."
             )
+        if st.button("🔌 인구 API 연결 테스트", key="dcm_pop_api_test"):
+            _req_ym = pd.Timestamp.now().strftime("%Y%m")
+            with st.spinner("통계월 탐색 · 샘플 행정동 조회 중…"):
+                try:
+                    fetch_admin_dong_population.clear()
+                    fetch_admin_dong_age_population.clear()
+                    _resolve_population_yyyymm.clear()
+                except Exception:
+                    pass
+                _use_ym = _resolve_population_yyyymm(_req_ym)
+                _probe = fetch_admin_dong_population("1111051500", _use_ym)
+                _age = fetch_admin_dong_age_population("1111051500", _use_ym)
+            if _probe.get("ok") and int(_probe.get("total_population") or 0) > 0:
+                st.success(
+                    f"연결 성공 — 최근 게시월 `{_use_ym}` "
+                    f"(요청 `{_req_ym}`), 샘플 인구 {_probe['total_population']:,}명 / "
+                    f"세대 {_probe['total_households']:,} · "
+                    f"연령API {'OK' if _age.get('ok') else 'FAIL'}"
+                )
+            else:
+                st.error(
+                    f"연결 실패 — pop: {_probe.get('error') or 'unknown'} · "
+                    f"age: {_age.get('error') or 'unknown'}"
+                )
     with c2:
         st.markdown("**카카오 로컬 API**")
         st.text(f"키 길이 : {len(kakao_key)}\n키 감지 : {'yes' if kakao_key else 'no'}")
