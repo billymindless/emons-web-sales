@@ -21711,6 +21711,9 @@ def render_internal_work():
     if _expand_tid is not None:
         st.session_state.pop("board_expand_task_id", None)
 
+    # 첨부 크게 보기(회전 포함) — 업무 화면 rerun 시에도 다이얼로그 유지
+    _maybe_render_attachment_lightbox()
+
 
 def _render_task_gantt(tasks: list[dict], assignees_map: dict):
     """첨부 이미지 스타일의 간트차트.
@@ -21939,9 +21942,99 @@ def _fetch_attachment_bytes_cached(storage_path: str) -> bytes | None:
     return _tb.download_attachment_bytes(storage_path)
 
 
-def _open_attachment_lightbox(img_bytes: bytes, name: str | None = None):
-    """첨부 이미지를 다이얼로그(라이트박스)로 표시. dialog 미지원 환경은 expander로 fallback."""
-    title = name or "첨부 이미지"
+def _rotate_image_bytes(img_bytes: bytes, angle_cw: int) -> bytes:
+    """이미지를 시계 방향 angle_cw(0/90/180/270)도 회전한 PNG/JPEG 바이트 반환."""
+    angle_cw = int(angle_cw or 0) % 360
+    if angle_cw == 0:
+        return img_bytes
+    try:
+        from PIL import Image
+    except Exception:
+        return img_bytes
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        # PIL rotate 는 반시계 방향 → 시계 방향은 음수
+        out = im.rotate(-angle_cw, expand=True)
+        fmt = (im.format or "JPEG").upper()
+        if fmt not in ("JPEG", "JPG", "PNG", "WEBP"):
+            fmt = "PNG"
+        if fmt in ("JPEG", "JPG") and out.mode in ("RGBA", "P", "LA"):
+            out = out.convert("RGB")
+            fmt = "JPEG"
+        buf = io.BytesIO()
+        out.save(buf, format="JPEG" if fmt in ("JPEG", "JPG") else fmt, quality=92)
+        return buf.getvalue()
+    except Exception:
+        return img_bytes
+
+
+def _open_attachment_lightbox(
+    img_bytes: bytes | None = None,
+    name: str | None = None,
+    *,
+    storage_path: str | None = None,
+):
+    """첨부 이미지 라이트박스 열기 — session_state 에 상태를 남겨 회전 후에도 유지."""
+    st.session_state["att_lightbox"] = {
+        "bytes": img_bytes,
+        "storage_path": storage_path,
+        "name": name or "첨부 이미지",
+        "angle": 0,
+    }
+
+
+def _maybe_render_attachment_lightbox() -> None:
+    """열려 있는 첨부 라이트박스를 렌더. 좌/우 90° 회전·원본·닫기 지원."""
+    lb = st.session_state.get("att_lightbox")
+    if not isinstance(lb, dict):
+        return
+    img_bytes = lb.get("bytes")
+    if not img_bytes and lb.get("storage_path"):
+        img_bytes = _fetch_attachment_bytes_cached(str(lb["storage_path"]))
+        if img_bytes:
+            lb["bytes"] = img_bytes
+            st.session_state["att_lightbox"] = lb
+    if not img_bytes:
+        st.session_state.pop("att_lightbox", None)
+        return
+
+    title = str(lb.get("name") or "첨부 이미지")
+    angle = int(lb.get("angle") or 0) % 360
+    shown = _rotate_image_bytes(img_bytes, angle)
+
+    def _lightbox_body() -> None:
+        st.caption(f"현재 회전: {angle}° (시계 방향)")
+        st.image(shown, width="stretch")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            if st.button("↺ 왼쪽 90°", key="att_lb_rot_left", help="반시계 방향 90°"):
+                lb["angle"] = (angle - 90) % 360
+                st.session_state["att_lightbox"] = lb
+                st.rerun()
+        with c2:
+            if st.button("↻ 오른쪽 90°", key="att_lb_rot_right", help="시계 방향 90°", type="primary"):
+                lb["angle"] = (angle + 90) % 360
+                st.session_state["att_lightbox"] = lb
+                st.rerun()
+        with c3:
+            if st.button("⟲ 원본", key="att_lb_rot_reset"):
+                lb["angle"] = 0
+                st.session_state["att_lightbox"] = lb
+                st.rerun()
+        with c4:
+            if st.button("닫기", key="att_lb_close"):
+                st.session_state.pop("att_lightbox", None)
+                st.rerun()
+        _base, _ext = os.path.splitext(title)
+        _dl_name = f"{_base or 'image'}_rot{angle}{_ext or '.jpg'}"
+        st.download_button(
+            "⬇ 현재 화면 저장",
+            data=shown,
+            file_name=_dl_name,
+            mime="image/jpeg" if _dl_name.lower().endswith((".jpg", ".jpeg")) else "image/png",
+            key="att_lb_download",
+        )
+
     if hasattr(st, "dialog"):
         try:
             try:
@@ -21951,14 +22044,14 @@ def _open_attachment_lightbox(img_bytes: bytes, name: str | None = None):
 
             @dialog_dec
             def _dlg():
-                st.image(img_bytes, width="stretch")
+                _lightbox_body()
 
             _dlg()
             return
         except Exception:
             pass
     with st.expander(f"🔍 {title}", expanded=True):
-        st.image(img_bytes, width="stretch")
+        _lightbox_body()
 
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg")
@@ -22006,7 +22099,10 @@ def _render_attachment_inline(a: dict, key_suffix: str):
     if _is_image_attachment(a):
         st.image(data, caption=name, width="stretch")
         if st.button("🔍 크게 보기", key=f"open_img_{aid}_{key_suffix}"):
-            _open_attachment_lightbox(data, name)
+            _open_attachment_lightbox(
+                data, name, storage_path=a.get("storage_path"),
+            )
+            st.rerun()
     else:
         st.markdown(f"📄 **{name}**")
         st.caption(_humansize(a.get("byte_size")))
