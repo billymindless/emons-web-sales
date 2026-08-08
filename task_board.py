@@ -205,6 +205,33 @@ def load_my_confidential_tasks_cached(me_username: str, include_done: bool = Fal
         return []
 
 
+def load_task_by_id(task_id: int) -> dict | None:
+    """단일 업무 조회 (알림 딥링크·포커스용). 캐시 없음 — 최신 상태 필요."""
+    client, err = _client()
+    if err or not client or not task_id:
+        return None
+    _cols_full = (
+        "id, parent_task_id, title, description, status, priority, "
+        "start_date, due_date, created_by, store_name, db_filename, "
+        "scope, category, tags, is_pinned, task_type, verify_status, "
+        "created_at, updated_at, closed_at"
+    )
+    _cols_basic = (
+        "id, parent_task_id, title, description, status, priority, "
+        "start_date, due_date, created_by, store_name, db_filename, "
+        "created_at, updated_at, closed_at"
+    )
+    for cols in (_cols_full, _cols_basic):
+        try:
+            r = client.table("app_tasks").select(cols).eq("id", int(task_id)).maybe_single().execute()
+            return r.data if isinstance(r.data, dict) else None
+        except Exception as e:
+            if any(c in str(e) for c in ("task_type", "verify_status", "scope", "category", "tags", "is_pinned")):
+                continue
+            return None
+    return None
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_task_assignees_cached(task_ids: tuple[int, ...]) -> dict[int, list[dict]]:
     """task_id → assignees 리스트."""

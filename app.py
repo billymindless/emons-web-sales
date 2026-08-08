@@ -550,7 +550,7 @@ def _render_primary_nav(user: dict, role: str) -> None:
         unsafe_allow_html=True,
     )
 
-    # 🔔 인앱 알림 배지
+    # 🔔 인앱 알림 배지 — 클릭 시 해당 업무(결제변경 검증 등)로 이동
     try:
         import task_board as _tb_noti  # noqa: WPS433
         _noti_uname = user.get("username") or ""
@@ -562,14 +562,29 @@ def _render_primary_nav(user: dict, role: str) -> None:
                 f" text-align:center; margin-bottom:5px;'>🔔 미확인 알림 {_noti_cnt}건</div>",
                 unsafe_allow_html=True,
             )
+            st.caption("알림을 누르면 해당 업무 상세로 이동합니다.")
             _recent_notis = _tb_noti.load_my_notifications_cached(_noti_uname, unread_only=True, limit=3)
             for _noti in _recent_notis:
-                st.markdown(
-                    f"<div style='background:#fef2f2; border-left:3px solid #ef4444;"
-                    f" padding:4px 8px; border-radius:4px; margin-bottom:3px;"
-                    f" font-size:0.75rem;'>🔵 {_noti.get('message','')}</div>",
-                    unsafe_allow_html=True,
-                )
+                _nid = _noti.get("id")
+                _tid = _noti.get("task_id")
+                _msg = str(_noti.get("message") or "").strip() or "(내용 없음)"
+                _label = _msg if len(_msg) <= 72 else (_msg[:69] + "…")
+                if _tid:
+                    if st.button(
+                        f"🔵 {_label}",
+                        key=f"sidebar_noti_open_{_nid}",
+                        help="클릭하면 사내업무에서 해당 건을 엽니다.",
+                        width="stretch",
+                    ):
+                        _navigate_to_internal_task(int(_tid), noti_id=int(_nid) if _nid else None)
+                        st.rerun()
+                else:
+                    st.markdown(
+                        f"<div style='background:#fef2f2; border-left:3px solid #ef4444;"
+                        f" padding:4px 8px; border-radius:4px; margin-bottom:3px;"
+                        f" font-size:0.75rem;'>🔵 {html.escape(_msg)}</div>",
+                        unsafe_allow_html=True,
+                    )
             if st.button("✅ 모두 읽음 처리", key="sidebar_noti_read_all", width="stretch"):
                 _tb_noti.mark_all_read(_noti_uname)
                 st.rerun()
@@ -21389,6 +21404,37 @@ def render_employee_analytics():
 # 📋 사내 업무판 (사내결제시스템)
 # ─────────────────────────────────────────────────────────────────────
 
+def _navigate_to_internal_task(task_id: int | None, *, noti_id: int | None = None) -> None:
+    """알림/딥링크에서 사내업무 게시판의 특정 업무로 이동하도록 session_state 설정.
+
+    - active_admin_page=internal_board + board_goto_task → '✅ 업무' 섹션 진입
+    - board_focus_task_id / board_expand_task_id → 목록에서 해당 카드 상단 정렬·자세히 보기 자동 펼침
+    - noti_id 가 있으면 읽음 처리
+    """
+    import task_board as _tb  # noqa: WPS433
+
+    if noti_id is not None:
+        try:
+            _tb.mark_notification_read(int(noti_id))
+        except Exception:
+            pass
+        try:
+            _tb.clear_task_caches()
+        except Exception:
+            pass
+
+    st.session_state["active_admin_page"] = "internal_board"
+    st.session_state["board_goto_task"] = True
+    if task_id is not None:
+        try:
+            tid = int(task_id)
+        except Exception:
+            tid = None
+        if tid:
+            st.session_state["board_focus_task_id"] = tid
+            st.session_state["board_expand_task_id"] = tid
+
+
 def render_internal_work():
     """사내 업무판 — ERP 메뉴 하위. 업무 등록·할당·진행·댓글·첨부·알림."""
     import task_board as _tb  # noqa: WPS433
@@ -21490,20 +21536,28 @@ def render_internal_work():
         if not notis:
             st.caption("알림이 없습니다.")
         else:
-            cols = st.columns([1, 5, 2, 2, 1])
+            cols = st.columns([1, 4, 2, 2, 1, 1])
             cols[0].markdown("**상태**")
             cols[1].markdown("**내용**")
             cols[2].markdown("**유형**")
             cols[3].markdown("**시각**")
-            cols[4].markdown("")
+            cols[4].markdown("**업무**")
+            cols[5].markdown("")
             for n in notis:
-                c = st.columns([1, 5, 2, 2, 1])
+                c = st.columns([1, 4, 2, 2, 1, 1])
                 c[0].write("✅" if n.get("is_read") else "🔵")
                 c[1].write(n.get("message", ""))
                 c[2].write(n.get("type", ""))
                 c[3].caption(str(n.get("sent_at", ""))[:19])
+                _n_tid = n.get("task_id")
+                if _n_tid:
+                    if c[4].button("열기", key=f"noti_open_{n['id']}", help=f"업무 #{int(_n_tid)} 상세"):
+                        _navigate_to_internal_task(int(_n_tid), noti_id=int(n["id"]))
+                        st.rerun()
+                else:
+                    c[4].caption("-")
                 if not n.get("is_read"):
-                    if c[4].button("읽음", key=f"noti_read_{n['id']}"):
+                    if c[5].button("읽음", key=f"noti_read_{n['id']}"):
                         _tb.mark_notification_read(int(n["id"]))
                         st.rerun()
             if st.button("모두 읽음 처리", key="noti_mark_all"):
@@ -21546,6 +21600,25 @@ def render_internal_work():
             if int(_ct["id"]) not in _seen_ids:
                 tasks.append(_ct)
                 _seen_ids.add(int(_ct["id"]))
+
+    # 알림 딥링크 포커스: 필터에 가려져도 해당 업무를 강제로 포함·상단 정렬
+    _focus_tid = st.session_state.get("board_focus_task_id")
+    try:
+        _focus_tid = int(_focus_tid) if _focus_tid is not None else None
+    except Exception:
+        _focus_tid = None
+    if _focus_tid:
+        _seen_ids = {int(t["id"]) for t in tasks}
+        if _focus_tid not in _seen_ids:
+            _focused = _tb.load_task_by_id(_focus_tid)
+            if _focused:
+                tasks.append(_focused)
+                st.info(f"🔔 알림에서 연 업무 #{_focus_tid} 을(를) 표시합니다. (현재 필터 밖에 있어 강제 포함)")
+        # 상태 필터가 포커스 업무를 가리면 필터를 완화해 보이게 함
+        _focus_row = next((t for t in tasks if int(t["id"]) == _focus_tid), None)
+        if _focus_row and status_filter and _focus_row.get("status") not in status_filter:
+            status_filter = list(status_filter) + [_focus_row.get("status")]
+
     tasks = [t for t in tasks if (not status_filter) or t.get("status") in status_filter]
 
     # 키워드/태그 검색은 상단 통합 검색창에서 처리
@@ -21571,17 +21644,39 @@ def render_internal_work():
         if pid is not None and pid not in visible_ids:
             extra_roots.append(t)
     roots = list(by_parent.get(None, [])) + extra_roots
-    # 상단 고정(📌) 업무를 먼저 노출
-    roots.sort(key=lambda x: bool(x.get("is_pinned")), reverse=True)
+    # 알림 포커스 업무 → 상단 고정 → 나머지
+    def _root_sort_key(x: dict):
+        xid = int(x.get("id") or 0)
+        return (
+            0 if (_focus_tid and xid == _focus_tid) else 1,
+            0 if x.get("is_pinned") else 1,
+            -xid,
+        )
+    roots.sort(key=_root_sort_key)
+
+    _expand_tid = st.session_state.get("board_expand_task_id")
+    try:
+        _expand_tid = int(_expand_tid) if _expand_tid is not None else None
+    except Exception:
+        _expand_tid = None
 
     tab_list, tab_gantt = st.tabs(["📋 목록", "📊 간트차트"])
     with tab_list:
         if not roots:
             st.info("표시할 업무가 없습니다.")
         for root in roots:
-            _render_task_card(root, by_parent, assignees_map, me_uname, role, store_name, current_db, depth=0)
+            _render_task_card(
+                root, by_parent, assignees_map, me_uname, role, store_name, current_db,
+                depth=0, expand_task_id=_expand_tid,
+            )
     with tab_gantt:
         _render_task_gantt(tasks, assignees_map)
+
+    # 포커스/펼침은 1회성 — 다음 rerun 에서 일반 목록으로 복귀
+    if _focus_tid is not None:
+        st.session_state.pop("board_focus_task_id", None)
+    if _expand_tid is not None:
+        st.session_state.pop("board_expand_task_id", None)
 
 
 def _render_task_gantt(tasks: list[dict], assignees_map: dict):
@@ -22305,8 +22400,11 @@ def _internal_work_parent_options(store_name: str | None, role: str,
 
 def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                       me_uname: str, role: str, store_name: str | None,
-                      current_db: str | None, depth: int = 0):
-    """depth==0이면 큰 상위업무 카드, 그 외에는 컴팩트한 하위업무 행."""
+                      current_db: str | None, depth: int = 0,
+                      expand_task_id: int | None = None):
+    """depth==0이면 큰 상위업무 카드, 그 외에는 컴팩트한 하위업무 행.
+    expand_task_id 가 이 카드(또는 하위)와 일치하면 '자세히 보기' 를 자동으로 펼친다.
+    """
     import task_board as _tb  # noqa: WPS433
 
     tid = int(task["id"])
@@ -22321,6 +22419,10 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
     assignee_names = ", ".join(_uname_to_display(a.get("employee_username")) for a in assignees) or "(없음)"
     due = task.get("due_date") or "-"
     children = by_parent.get(tid, [])
+    _auto_expand = bool(expand_task_id and int(expand_task_id) == tid)
+    # 하위 중 포커스 대상이 있으면 상위 expander 도 함께 펼침
+    if not _auto_expand and expand_task_id:
+        _auto_expand = any(int(c.get("id") or 0) == int(expand_task_id) for c in children)
 
     if depth == 0:
         # ── 상위업무 카드 ─────────────────────────────────────
@@ -22387,14 +22489,26 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 preview = desc if len(desc) <= 140 else desc[:137] + "..."
                 st.caption(f"📝 {preview}")
 
-            with st.expander(f"📋 자세히 보기 / 수정 · 하위업무 {sub_count}개", expanded=False):
+            if _auto_expand:
+                st.success("🔔 알림에서 연 업무입니다 — 아래에서 증빙 확인 후 검증 완료/반려를 처리하세요.")
+            _exp_key = f"task_detail_exp_{tid}"
+            if _auto_expand:
+                st.session_state[_exp_key] = True
+            with st.expander(
+                f"📋 자세히 보기 / 수정 · 하위업무 {sub_count}개",
+                expanded=_auto_expand,
+                key=_exp_key,
+            ):
                 _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
                 if children:
                     st.markdown("---")
                     st.markdown(f"**↳ 하위업무 {len(children)}**")
                     for child in children:
-                        _render_task_card(child, by_parent, assignees_map,
-                                          me_uname, role, store_name, current_db, depth=depth + 1)
+                        _render_task_card(
+                            child, by_parent, assignees_map,
+                            me_uname, role, store_name, current_db,
+                            depth=depth + 1, expand_task_id=expand_task_id,
+                        )
     else:
         # ── 하위업무 행 (컴팩트) ─────────────────────────────
         indent = "&nbsp;" * (4 * (depth - 1))
@@ -22410,14 +22524,20 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
             c2.markdown(f"{indent}↳ **{_pin}{_lock}#{tid} {title}**", unsafe_allow_html=True)
             c3.caption(f"👤 {assignee_names}")
             c4.caption(f"📅 {due}")
-            with st.expander("자세히 보기 / 수정", expanded=False):
+            _exp_key = f"task_detail_exp_{tid}"
+            if _auto_expand:
+                st.session_state[_exp_key] = True
+            with st.expander("자세히 보기 / 수정", expanded=_auto_expand, key=_exp_key):
                 _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
                 if children:
                     st.markdown("---")
                     st.markdown(f"**↳ 하위업무 {len(children)}**")
                     for child in children:
-                        _render_task_card(child, by_parent, assignees_map,
-                                          me_uname, role, store_name, current_db, depth=depth + 1)
+                        _render_task_card(
+                            child, by_parent, assignees_map,
+                            me_uname, role, store_name, current_db,
+                            depth=depth + 1, expand_task_id=expand_task_id,
+                        )
 
 
 def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_creator: bool):
@@ -31966,6 +32086,27 @@ def main():
     # (Phase1 성능 개선 — 기존 5분 → 15분: 캐시 재검증·풀 rerun 빈도 감소.
     #  Streamlit Cloud 세션 만료(30분+)에도 충분한 간격)
     st_autorefresh(interval=900_000, limit=None, key="session_keepalive")
+
+    # 딥링크 ?task=123 → 사내업무 해당 업무 상세로 이동 (알림/친구톡 link_path 와 동일)
+    try:
+        _task_qp = st.query_params.get("task")
+    except Exception:
+        _task_qp = None
+    if _task_qp:
+        try:
+            _task_qp_id = int(str(_task_qp).strip())
+        except Exception:
+            _task_qp_id = None
+        if _task_qp_id:
+            _navigate_to_internal_task(_task_qp_id)
+            try:
+                q = dict(st.query_params)
+                q.pop("task", None)
+                st.query_params.from_dict(q)
+            except Exception:
+                pass
+            st.rerun()
+            return
 
     # 쿼리 파라미터를 이용한 홈 이동(?home=1) 처리:
     # 로고 클릭 시 언제든지 메인 대시보드/홈으로 돌아갈 수 있도록,
