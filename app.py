@@ -21591,6 +21591,7 @@ def render_internal_work():
     tasks = _tb.load_tasks_cached(
         store_name=None if role == "superadmin" else store_name,
         include_done=show_done,
+        db_filename=None if role == "superadmin" else (current_db or None),
     )
     # 보안(회사 경영) 업무: 작성자/담당자인 것만 별도로 합치고 id 기준 중복 제거
     _conf_tasks = _tb.load_my_confidential_tasks_cached(me_uname, include_done=show_done)
@@ -21601,30 +21602,68 @@ def render_internal_work():
                 tasks.append(_ct)
                 _seen_ids.add(int(_ct["id"]))
 
+    # 내가 담당자인 업무(결제변경 검증 등) — 매장명 불일치로 목록에서 빠지는 경우 보완
+    _assigned_tasks = _tb.load_my_assigned_tasks(me_uname, include_done=show_done)
+    if _assigned_tasks:
+        _seen_ids = {int(t["id"]) for t in tasks}
+        for _at in _assigned_tasks:
+            if int(_at["id"]) not in _seen_ids:
+                tasks.append(_at)
+                _seen_ids.add(int(_at["id"]))
+
+    # 결제변경 미결 검증도 강제 포함 (담당자 미지정·매장명 불일치 대비)
+    try:
+        for _pcr in _tb.load_pending_payment_verifications(store_name, role):
+            _pid = int(_pcr["id"])
+            if _pid not in {int(t["id"]) for t in tasks}:
+                _full = _tb.load_task_by_id(_pid)
+                if _full:
+                    tasks.append(_full)
+    except Exception:
+        pass
+
     # 알림 딥링크 포커스: 필터에 가려져도 해당 업무를 강제로 포함·상단 정렬
     _focus_tid = st.session_state.get("board_focus_task_id")
     try:
         _focus_tid = int(_focus_tid) if _focus_tid is not None else None
     except Exception:
         _focus_tid = None
+    _expand_tid = st.session_state.get("board_expand_task_id")
+    try:
+        _expand_tid = int(_expand_tid) if _expand_tid is not None else None
+    except Exception:
+        _expand_tid = None
+
+    _focused_task = None
     if _focus_tid:
-        _seen_ids = {int(t["id"]) for t in tasks}
-        if _focus_tid not in _seen_ids:
-            _focused = _tb.load_task_by_id(_focus_tid)
-            if _focused:
-                tasks.append(_focused)
-                st.info(f"🔔 알림에서 연 업무 #{_focus_tid} 을(를) 표시합니다. (현재 필터 밖에 있어 강제 포함)")
-        # 상태 필터가 포커스 업무를 가리면 필터를 완화해 보이게 함
-        _focus_row = next((t for t in tasks if int(t["id"]) == _focus_tid), None)
-        if _focus_row and status_filter and _focus_row.get("status") not in status_filter:
-            status_filter = list(status_filter) + [_focus_row.get("status")]
+        _focused_task = next((t for t in tasks if int(t["id"]) == _focus_tid), None)
+        if _focused_task is None:
+            _focused_task = _tb.load_task_by_id(_focus_tid)
+            if _focused_task:
+                tasks.append(_focused_task)
+        if _focused_task and status_filter and _focused_task.get("status") not in status_filter:
+            status_filter = list(status_filter) + [_focused_task.get("status")]
+        if _focused_task is None:
+            st.error(
+                f"🔔 알림 업무 #{_focus_tid} 을(를) 불러오지 못했습니다. "
+                "권한이 없거나 삭제된 업무일 수 있습니다."
+            )
+        else:
+            st.info(f"🔔 알림에서 연 업무 #{_focus_tid} — 아래에서 상세를 확인하세요.")
 
     tasks = [t for t in tasks if (not status_filter) or t.get("status") in status_filter]
 
     # 키워드/태그 검색은 상단 통합 검색창에서 처리
 
+    # 포커스 업무는 목록이 비어도 단독 카드로 반드시 표시
+    if _focused_task is not None and int(_focused_task["id"]) not in {int(t["id"]) for t in tasks}:
+        tasks.insert(0, _focused_task)
+
     if not tasks:
         st.info("표시할 업무가 없습니다. 위에서 새 업무를 등록해 주세요.")
+        # 포커스 키는 실패해도 1회성으로 소거 (무한 에러 배너 방지)
+        st.session_state.pop("board_focus_task_id", None)
+        st.session_state.pop("board_expand_task_id", None)
         return
 
     # 트리 구성
@@ -21654,12 +21693,6 @@ def render_internal_work():
         )
     roots.sort(key=_root_sort_key)
 
-    _expand_tid = st.session_state.get("board_expand_task_id")
-    try:
-        _expand_tid = int(_expand_tid) if _expand_tid is not None else None
-    except Exception:
-        _expand_tid = None
-
     tab_list, tab_gantt = st.tabs(["📋 목록", "📊 간트차트"])
     with tab_list:
         if not roots:
@@ -21667,7 +21700,7 @@ def render_internal_work():
         for root in roots:
             _render_task_card(
                 root, by_parent, assignees_map, me_uname, role, store_name, current_db,
-                depth=0, expand_task_id=_expand_tid,
+                depth=0, expand_task_id=_expand_tid or _focus_tid,
             )
     with tab_gantt:
         _render_task_gantt(tasks, assignees_map)

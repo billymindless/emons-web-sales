@@ -8,12 +8,15 @@ Supabase 클라이언트는 app.py의 get_supabase_client() / get_supabase_admin
 from __future__ import annotations
 
 import io
+import logging
 import mimetypes
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -104,11 +107,19 @@ TASK_SCOPE_LABELS = {"store": "🏪 내 매장 전용", "company": "🌐 전체 
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_tasks_cached(store_name: str | None = None, include_done: bool = False) -> list[dict]:
+def load_tasks_cached(
+    store_name: str | None = None,
+    include_done: bool = False,
+    db_filename: str | None = None,
+) -> list[dict]:
     """매장별 일반 업무 목록. None이면 전 매장 (superadmin용).
-    - scope='store': store_name 일치하는 매장만
+    - scope='store': store_name 또는 db_filename 일치하는 매장만
     - scope='company': 전체 공개 → 모든 매장에서 노출
-    보안(회사 경영) 업무는 여기서 제외."""
+    보안(회사 경영) 업무는 여기서 제외.
+
+    db_filename 폴백: 결제변경 검증 등 store_name 표기가 달라도
+    같은 매장 DB 파일이면 목록에 포함되도록 한다.
+    """
     client, err = _client()
     if err or not client:
         return []
@@ -148,12 +159,16 @@ def load_tasks_cached(store_name: str | None = None, include_done: bool = False)
     rows = [t for t in rows if t.get("category") != CONFIDENTIAL_CATEGORY]
 
     # scope 필터링 (superadmin / scope 미설정 시 전체 허용)
-    if store_name:
-        rows = [
-            t for t in rows
-            if t.get("scope", "store") == "company"
-            or t.get("store_name") == store_name
-        ]
+    if store_name or db_filename:
+        def _store_match(t: dict) -> bool:
+            if t.get("scope", "store") == "company":
+                return True
+            if store_name and t.get("store_name") == store_name:
+                return True
+            if db_filename and t.get("db_filename") == db_filename:
+                return True
+            return False
+        rows = [t for t in rows if _store_match(t)]
     return rows
 
 
@@ -206,30 +221,94 @@ def load_my_confidential_tasks_cached(me_username: str, include_done: bool = Fal
 
 
 def load_task_by_id(task_id: int) -> dict | None:
-    """단일 업무 조회 (알림 딥링크·포커스용). 캐시 없음 — 최신 상태 필요."""
+    """단일 업무 조회 (알림 딥링크·포커스용). 캐시 없음 — 최신 상태 필요.
+
+    maybe_single() 은 0건일 때 예외를 던지는 클라이언트가 있어 limit(1) 로 조회한다.
+    """
     client, err = _client()
     if err or not client or not task_id:
         return None
-    _cols_full = (
-        "id, parent_task_id, title, description, status, priority, "
-        "start_date, due_date, created_by, store_name, db_filename, "
-        "scope, category, tags, is_pinned, task_type, verify_status, "
-        "created_at, updated_at, closed_at"
+    _cols_candidates = (
+        (
+            "id, parent_task_id, title, description, status, priority, "
+            "start_date, due_date, created_by, store_name, db_filename, "
+            "scope, category, tags, is_pinned, task_type, verify_status, "
+            "created_at, updated_at, closed_at"
+        ),
+        (
+            "id, parent_task_id, title, description, status, priority, "
+            "start_date, due_date, created_by, store_name, db_filename, "
+            "scope, category, tags, is_pinned, created_at, updated_at, closed_at"
+        ),
+        (
+            "id, parent_task_id, title, description, status, priority, "
+            "start_date, due_date, created_by, store_name, db_filename, "
+            "created_at, updated_at, closed_at"
+        ),
     )
-    _cols_basic = (
-        "id, parent_task_id, title, description, status, priority, "
-        "start_date, due_date, created_by, store_name, db_filename, "
-        "created_at, updated_at, closed_at"
-    )
-    for cols in (_cols_full, _cols_basic):
+    for cols in _cols_candidates:
         try:
-            r = client.table("app_tasks").select(cols).eq("id", int(task_id)).maybe_single().execute()
-            return r.data if isinstance(r.data, dict) else None
+            r = client.table("app_tasks").select(cols).eq("id", int(task_id)).limit(1).execute()
+            rows = r.data or []
+            return rows[0] if rows else None
         except Exception as e:
             if any(c in str(e) for c in ("task_type", "verify_status", "scope", "category", "tags", "is_pinned")):
                 continue
+            logger.warning("load_task_by_id(%s) 실패: %s", task_id, e)
             return None
     return None
+
+
+def load_my_assigned_tasks(me_username: str, include_done: bool = False) -> list[dict]:
+    """내가 담당자로 지정된 업무 (결제변경 검증 등). 매장명 불일치여도 목록에 보이게 한다."""
+    if not me_username:
+        return []
+    client, err = _client()
+    if err or not client:
+        return []
+    try:
+        ar = client.table("app_task_assignees").select("task_id").eq(
+            "employee_username", me_username
+        ).execute()
+        ids = sorted({
+            int(row["task_id"]) for row in (ar.data or []) if row.get("task_id") is not None
+        })
+        if not ids:
+            return []
+        _cols = (
+            "id, parent_task_id, title, description, status, priority, "
+            "start_date, due_date, created_by, store_name, db_filename, "
+            "scope, category, tags, is_pinned, task_type, verify_status, "
+            "created_at, updated_at, closed_at"
+        )
+        _cols_basic = (
+            "id, parent_task_id, title, description, status, priority, "
+            "start_date, due_date, created_by, store_name, db_filename, "
+            "created_at, updated_at, closed_at"
+        )
+        rows: list[dict] = []
+        for cols in (_cols, _cols_basic):
+            try:
+                # PostgREST in_ 는 한 번에 많이내면 실패할 수 있어 청크
+                chunk: list[dict] = []
+                for i in range(0, len(ids), 200):
+                    batch = ids[i:i + 200]
+                    q = client.table("app_tasks").select(cols).in_("id", batch)
+                    if not include_done:
+                        q = q.not_.in_("status", ["done", "on_hold"])
+                    chunk.extend(q.execute().data or [])
+                rows = chunk
+                break
+            except Exception as e:
+                if any(c in str(e) for c in ("task_type", "verify_status", "scope", "category", "tags", "is_pinned")):
+                    continue
+                logger.warning("load_my_assigned_tasks 실패: %s", e)
+                return []
+        # 보안 업무는 기존 confidential 로더가 담당 — 여기서는 제외해 중복·권한 혼선 방지
+        return [t for t in rows if t.get("category") != CONFIDENTIAL_CATEGORY]
+    except Exception as e:
+        logger.warning("load_my_assigned_tasks 예외: %s", e)
+        return []
 
 
 @st.cache_data(ttl=60, show_spinner=False)
