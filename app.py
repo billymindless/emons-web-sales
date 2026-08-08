@@ -22491,13 +22491,10 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
 
             if _auto_expand:
                 st.success("🔔 알림에서 연 업무입니다 — 아래에서 증빙 확인 후 검증 완료/반려를 처리하세요.")
-            _exp_key = f"task_detail_exp_{tid}"
-            if _auto_expand:
-                st.session_state[_exp_key] = True
+            # Streamlit 1.54 expander 는 key 인자를 지원하지 않음 → expanded 만 사용
             with st.expander(
                 f"📋 자세히 보기 / 수정 · 하위업무 {sub_count}개",
                 expanded=_auto_expand,
-                key=_exp_key,
             ):
                 _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
                 if children:
@@ -22524,10 +22521,7 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
             c2.markdown(f"{indent}↳ **{_pin}{_lock}#{tid} {title}**", unsafe_allow_html=True)
             c3.caption(f"👤 {assignee_names}")
             c4.caption(f"📅 {due}")
-            _exp_key = f"task_detail_exp_{tid}"
-            if _auto_expand:
-                st.session_state[_exp_key] = True
-            with st.expander("자세히 보기 / 수정", expanded=_auto_expand, key=_exp_key):
+            with st.expander("자세히 보기 / 수정", expanded=_auto_expand):
                 _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
                 if children:
                     st.markdown("---")
