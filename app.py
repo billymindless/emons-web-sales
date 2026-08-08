@@ -2580,6 +2580,111 @@ def _ph_blob_amount(blob: dict) -> float:
     return 0.0
 
 
+def _ph_blob_to_pcr_fields(blob: dict) -> dict:
+    """app_payment_history old/new JSON → PCR용 {amount, method, onnuri, payment_id}."""
+    if not isinstance(blob, dict):
+        return {}
+    pay = blob.get("payment") if isinstance(blob.get("payment"), dict) else blob
+    if not isinstance(pay, dict) or not pay:
+        return {}
+    method = str(pay.get("method") or pay.get("payment_method") or "").strip()
+    cc = str(pay.get("card_company") or "").strip()
+    if cc in ("None", "nan", "none"):
+        cc = ""
+    onnuri = str(pay.get("onnuri") or pay.get("onnuri_approval_code") or "").strip()
+    if not onnuri and "온누리" in method and cc:
+        onnuri = cc
+    try:
+        amount = float(pay.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return {
+        "amount": amount,
+        "method": method,
+        "onnuri": onnuri,
+        "payment_id": pay.get("payment_id"),
+    }
+
+
+def _load_latest_payment_history_for_pcr(db_filename: str, sale_id: int) -> dict | None:
+    """주문별 최신 결제변경/취소 이력 1건. original/new는 PCR 필드 형태."""
+    if not db_filename or not sale_id:
+        return None
+    try:
+        if not _supabase_orders_payments_available():
+            return None
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return None
+        r = (
+            sc.table("app_payment_history")
+            .select("action_type, old_payment_data, new_payment_data, changed_at, reason")
+            .eq("db_filename", db_filename)
+            .eq("sale_id", int(sale_id))
+            .in_("action_type", ["결제변경", "결제취소"])
+            .order("changed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        old_blob = _dashboard_parse_ph_payload(row.get("old_payment_data"))
+        new_blob = _dashboard_parse_ph_payload(row.get("new_payment_data"))
+        return {
+            "action_type": row.get("action_type"),
+            "changed_at": row.get("changed_at"),
+            "reason": row.get("reason"),
+            "original": _ph_blob_to_pcr_fields(old_blob),
+            "new": _ph_blob_to_pcr_fields(new_blob),
+        }
+    except Exception:
+        return None
+
+
+def _pcr_display_meta_from_history(meta: dict) -> tuple[dict, str | None]:
+    """저장된 PCR 메타의 원본이 변경 후 결제행과 같으면 이력 기준으로 보정한 display meta 반환."""
+    if not isinstance(meta, dict):
+        return meta, None
+    db_filename = meta.get("db_filename")
+    sale_id = meta.get("sale_id")
+    if not db_filename or sale_id in (None, ""):
+        return meta, None
+    try:
+        sale_id_i = int(sale_id)
+    except (TypeError, ValueError):
+        return meta, None
+    hist = _load_latest_payment_history_for_pcr(str(db_filename), sale_id_i)
+    if not hist or not hist.get("original"):
+        return meta, None
+    ho = hist["original"]
+    hn = hist.get("new") or {}
+    hist_om = str(ho.get("method") or "").strip()
+    meta_om = str(meta.get("original_method") or "").strip()
+    meta_nm = str(meta.get("new_method") or "").strip()
+    # 원본이 이력과 다르거나, 원본==변경후(사후 조회 버그 패턴)이면 이력 우선
+    suspicious_same = bool(meta_om) and meta_om == meta_nm
+    if not hist_om:
+        return meta, None
+    if hist_om == meta_om and not suspicious_same:
+        return meta, None
+    display = dict(meta)
+    display["original_amount"] = ho.get("amount")
+    display["original_method"] = ho.get("method") or meta.get("original_method")
+    display["original_onnuri"] = ho.get("onnuri") or meta.get("original_onnuri")
+    if hn.get("method") or hn.get("amount") not in (None, "", 0, 0.0):
+        display["new_amount"] = hn.get("amount") if hn.get("amount") is not None else meta.get("new_amount")
+        display["new_method"] = hn.get("method") or meta.get("new_method")
+        if hn.get("onnuri"):
+            display["new_onnuri"] = hn.get("onnuri")
+    note = (
+        "저장된 검증 메타의 원본이 변경 후 결제행 기준으로 잘못 기록된 것으로 보여 "
+        "결제변경 이력 기준으로 표시합니다."
+    )
+    return display, note
+
+
 def _dashboard_cancel_reduce_totals_from_ph(
     ph_df: pd.DataFrame, today: date, month_start: date, month_end: date
 ) -> dict[str, float]:
@@ -22230,18 +22335,57 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
 
     with st.container(border=True):
         st.markdown("##### 💳 결제변경 검증 요청 작성")
-        st.caption("결제는 이미 매출관리에서 반영되었습니다. 아래 내용은 관리자 검증(완료/미결)을 위해 사내 업무로 등록됩니다.")
+        st.caption(
+            "결제는 이미 매출관리에서 반영되었습니다. "
+            "원본은 결제변경 이력(변경 전)을 우선 사용하고, 아래는 관리자 검증용으로 사내 업무에 등록됩니다."
+        )
+
+        # 원본은 현재 결제행이 아니라 최신 결제변경 이력에서 가져온다 (사후 검증 버그 방지)
+        _hist = _load_latest_payment_history_for_pcr(db_filename, int(order_id))
+        _hist_orig = (_hist or {}).get("original") or {}
+        _hist_new = (_hist or {}).get("new") or {}
 
         sel_pid = None
         if pay_options:
             sel_pid = st.selectbox(
-                "대상 결제",
+                "대상 결제(참조)",
                 options=list(pay_options.keys()),
                 format_func=lambda p: pay_options.get(p, str(p)),
                 key=f"pcr_pid_{order_id}",
+                help="현재 결제 목록은 변경 후 상태일 수 있습니다. 원본 수단/금액은 아래 이력을 우선합니다.",
             )
+
         orig = {}
-        if sel_pid is not None:
+        _orig_from_history = bool(_hist_orig.get("method") or _hist_orig.get("amount"))
+        if _orig_from_history:
+            orig = {
+                "amount": float(_hist_orig.get("amount") or 0),
+                "method": str(_hist_orig.get("method") or "").strip(),
+                "onnuri": str(_hist_orig.get("onnuri") or "").strip(),
+            }
+            _hp = _hist_orig.get("payment_id")
+            if sel_pid is None and _hp not in (None, "", "신규생성(상계처리)"):
+                try:
+                    sel_pid = int(_hp)
+                except (TypeError, ValueError):
+                    pass
+            try:
+                _oa = f"{int(float(orig.get('amount') or 0)):,}원"
+            except Exception:
+                _oa = "-"
+            _na = "-"
+            if _hist_new:
+                try:
+                    _na = f"{int(float(_hist_new.get('amount') or 0)):,}원"
+                except Exception:
+                    _na = "-"
+            st.info(
+                f"원본(이력): {_oa} / {orig.get('method') or '-'} "
+                f"{('· ' + orig['onnuri']) if orig.get('onnuri') else ''}  →  "
+                f"변경 후(이력): {_na} / {_hist_new.get('method') or '-'} "
+                f"{('· ' + str(_hist_new.get('onnuri'))) if _hist_new.get('onnuri') else ''}"
+            )
+        elif sel_pid is not None:
             try:
                 _r = pay_list[pay_list["id"] == sel_pid].iloc[0]
                 _cc = str(_r.get("card_company") or "").strip()
@@ -22253,6 +22397,43 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 }
             except Exception:
                 orig = {}
+            st.warning(
+                "이 주문의 결제변경 이력을 찾지 못했습니다. "
+                "현재 결제행을 원본으로 사용하므로, 이미 수단이 바뀐 행이면 원본이 잘못될 수 있습니다. "
+                "아래에서 원본을 직접 확인·수정하세요."
+            )
+
+        _manual_orig = st.checkbox("원본 수동 수정", key=f"pcr_manual_orig_{order_id}",
+                                   help="이력/현재행 원본이 틀리면 직접 수정합니다.")
+        if _manual_orig:
+            oc1, oc2, oc3 = st.columns(3)
+            with oc1:
+                orig["amount"] = st.number_input(
+                    "원본 금액(원)", min_value=0, step=1000,
+                    value=int(float(orig.get("amount") or 0)),
+                    key=f"pcr_orig_amt_{order_id}",
+                )
+            with oc2:
+                _om = str(orig.get("method") or "")
+                _om_idx = PAYMENT_METHOD_OPTIONS.index(_om) if _om in PAYMENT_METHOD_OPTIONS else 0
+                orig["method"] = st.selectbox(
+                    "원본 수단", options=PAYMENT_METHOD_OPTIONS,
+                    index=_om_idx, key=f"pcr_orig_meth_{order_id}",
+                )
+            with oc3:
+                orig["onnuri"] = st.text_input(
+                    "원본 온누리/승인번호", value=str(orig.get("onnuri") or ""),
+                    key=f"pcr_orig_onnuri_{order_id}",
+                )
+        elif orig:
+            try:
+                _oa2 = f"{int(float(orig.get('amount') or 0)):,}원"
+            except Exception:
+                _oa2 = "-"
+            st.caption(
+                f"등록될 원본: {_oa2} / {orig.get('method') or '-'} "
+                f"{('· ' + str(orig.get('onnuri'))) if orig.get('onnuri') else ''}"
+            )
 
         change_type = st.selectbox(
             "변경 유형",
@@ -22260,18 +22441,44 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             format_func=lambda c: _tb.PAYMENT_CHANGE_TYPE_LABELS.get(c, c),
             key=f"pcr_type_{order_id}",
         )
+
+        # 변경 후 기본값: 이력 new → 없으면 현재 선택 결제행
+        _default_new = _hist_new if (_hist_new.get("method") or _hist_new.get("amount") not in (None, "")) else {}
+        if not _default_new and sel_pid is not None:
+            try:
+                _nr = pay_list[pay_list["id"] == sel_pid].iloc[0]
+                _ncc = str(_nr.get("card_company") or "").strip()
+                _ncc = "" if _ncc in ("None", "nan", "none") else _ncc
+                _default_new = {
+                    "amount": float(_nr.get("amount") or 0),
+                    "method": _nr.get("payment_method") or "",
+                    "onnuri": _nr.get("onnuri_approval_code") or _ncc or "",
+                }
+            except Exception:
+                _default_new = {}
+
+        _amt_key = f"pcr_amt_{order_id}"
+        _meth_key = f"pcr_meth_{order_id}"
+        _onnuri_key = f"pcr_onnuri_{order_id}"
+        if _amt_key not in st.session_state:
+            st.session_state[_amt_key] = int(float(_default_new.get("amount") or orig.get("amount") or 0))
+        if _meth_key not in st.session_state:
+            _dm = str(_default_new.get("method") or "")
+            st.session_state[_meth_key] = _dm if _dm in PAYMENT_METHOD_OPTIONS else (
+                PAYMENT_METHOD_OPTIONS[0] if PAYMENT_METHOD_OPTIONS else ""
+            )
+        if _onnuri_key not in st.session_state:
+            st.session_state[_onnuri_key] = str(_default_new.get("onnuri") or "")
+
         cc1, cc2, cc3 = st.columns(3)
         with cc1:
             new_amount = st.number_input("변경 후 금액(원)", min_value=0, step=1000,
-                                         value=int(orig.get("amount") or 0), key=f"pcr_amt_{order_id}")
+                                         key=_amt_key)
         with cc2:
-            _orig_method = str(orig.get("method") or "")
-            _meth_idx = PAYMENT_METHOD_OPTIONS.index(_orig_method) if _orig_method in PAYMENT_METHOD_OPTIONS else 0
             new_method = st.selectbox("변경 후 수단", options=PAYMENT_METHOD_OPTIONS,
-                                      index=_meth_idx, key=f"pcr_meth_{order_id}")
+                                      key=_meth_key)
         with cc3:
-            new_onnuri = st.text_input("온누리/승인번호(선택)", value="",
-                                       key=f"pcr_onnuri_{order_id}")
+            new_onnuri = st.text_input("온누리/승인번호(선택)", key=_onnuri_key)
         reason = st.text_area("변경 사유 *", key=f"pcr_reason_{order_id}", height=70,
                               placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제")
 
@@ -22289,9 +22496,9 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             if float(orig.get("amount") or 0) > 0 and new_amount > float(orig.get("amount") or 0):
                 st.warning("⚠️ 변경 후 금액이 원본 결제 금액보다 큽니다. 환불/취소 금액을 다시 확인하세요.")
 
-        can_submit = bool((reason or "").strip()) and bool(files)
+        can_submit = bool((reason or "").strip()) and bool(files) and bool(orig.get("method") or orig.get("amount"))
         if not can_submit:
-            st.caption("사유 입력과 증빙 첨부가 모두 있어야 요청할 수 있습니다.")
+            st.caption("원본 확인, 사유 입력, 증빙 첨부가 모두 있어야 요청할 수 있습니다.")
         if st.button("📤 검증 요청 등록", key=f"pcr_submit_{order_id}",
                      type="primary", disabled=not can_submit):
             # 검증자(담당자): 같은 매장 관리자 + superadmin (요청자 본인 제외)
@@ -22698,11 +22905,16 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
             except Exception:
                 return "-"
 
+        # 사후 조회 버그로 원본==변경후인 기존 건은 결제변경 이력으로 보정 표시
+        display_meta, hist_note = _pcr_display_meta_from_history(meta)
+        if hist_note:
+            st.info(hist_note)
+
         # 원본 vs 변경 비교 표
         comp = pd.DataFrame([
-            {"항목": "금액", "원본": _fmt_amt(meta.get("original_amount")), "변경 후": _fmt_amt(meta.get("new_amount"))},
-            {"항목": "결제수단", "원본": meta.get("original_method") or "-", "변경 후": meta.get("new_method") or "-"},
-            {"항목": "온누리/승인번호", "원본": meta.get("original_onnuri") or "-", "변경 후": meta.get("new_onnuri") or "-"},
+            {"항목": "금액", "원본": _fmt_amt(display_meta.get("original_amount")), "변경 후": _fmt_amt(display_meta.get("new_amount"))},
+            {"항목": "결제수단", "원본": display_meta.get("original_method") or "-", "변경 후": display_meta.get("new_method") or "-"},
+            {"항목": "온누리/승인번호", "원본": display_meta.get("original_onnuri") or "-", "변경 후": display_meta.get("new_onnuri") or "-"},
         ])
         st.dataframe(comp, width='stretch', hide_index=True)
 
@@ -22713,9 +22925,9 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
 
         # 부정 방지 경고
         try:
-            oa = float(meta.get("original_amount") or 0)
-            na = float(meta.get("new_amount") or 0)
-            if meta.get("change_type") in ("refund", "cancel_card", "cancel_transfer") and na > oa > 0:
+            oa = float(display_meta.get("original_amount") or 0)
+            na = float(display_meta.get("new_amount") or 0)
+            if display_meta.get("change_type") in ("refund", "cancel_card", "cancel_transfer") and na > oa > 0:
                 st.warning("⚠️ 변경 후 금액이 원본 결제 금액을 초과합니다. 환불/취소 금액을 재확인하세요.")
         except Exception:
             pass
@@ -29977,6 +30189,7 @@ def render_customer_balance():
                                                                     "amount": float(prow["amount"] or 0),
                                                                     "method": prow["payment_method"],
                                                                     "card_company": prow["card_company"],
+                                                                    "onnuri_approval_code": prow.get("onnuri_approval_code"),
                                                                 }
                                                                 # 새 수수료 계산 (수단 변경 반영)
                                                                 new_fee = _payment_fee_amount(new_method, float(new_amount)) if new_amount > 0 else 0.0
@@ -30060,6 +30273,7 @@ def render_customer_balance():
                                                                                 "amount": float(new_amount),
                                                                                 "method": new_method,
                                                                                 "card_company": new_card_company,
+                                                                                "onnuri_approval_code": new_onnuri_code,
                                                                             }
                                                                             _pay_edit_committed = True
 
@@ -30113,6 +30327,7 @@ def render_customer_balance():
                                                                             "amount": float(new_amount),
                                                                             "method": new_method,
                                                                             "card_company": new_card_company,
+                                                                            "onnuri_approval_code": new_onnuri_code,
                                                                         }
                                                                     _recalc_order_actual_margin(conn, _order_id_pay, db_filename)
                                                                     cur2 = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
