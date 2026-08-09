@@ -1705,6 +1705,209 @@ def _kpi_sanitize_employee_label(raw: object) -> str:
     return ",".join(emps) if emps else ""
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 직원 KPI 가중치 (매장별/전체통합 × 연월 단위) — Supabase app_employee_kpi_weights
+# 설정이 없으면 기본값 70/15/5/10 사용. 과거 월은 그 월에 저장된 값을 그대로 사용.
+# ─────────────────────────────────────────────────────────────────────
+
+DEFAULT_KPI_WEIGHTS = {"revenue": 70.0, "margin": 15.0, "display": 5.0, "cash": 10.0}
+KPI_WEIGHTS_ALL_SCOPE = "__all__"
+
+
+def _kpi_weights_ym(year: int, month: int) -> str:
+    return f"{int(year):04d}-{int(month):02d}"
+
+
+def _kpi_weights_from_row(row: dict | None) -> dict:
+    """DB row → 가중치 dict. 결측 필드는 기본값으로 폴백."""
+    if not row:
+        return dict(DEFAULT_KPI_WEIGHTS)
+    def _f(k, dv):
+        v = row.get(k)
+        try:
+            return float(v) if v is not None else float(dv)
+        except (TypeError, ValueError):
+            return float(dv)
+    return {
+        "revenue": _f("w_revenue", DEFAULT_KPI_WEIGHTS["revenue"]),
+        "margin":  _f("w_margin",  DEFAULT_KPI_WEIGHTS["margin"]),
+        "display": _f("w_display", DEFAULT_KPI_WEIGHTS["display"]),
+        "cash":    _f("w_cash",    DEFAULT_KPI_WEIGHTS["cash"]),
+    }
+
+
+@st.cache_data(ttl=120)
+def _load_kpi_weights_cached(scope_key: str, year_month: str) -> dict:
+    """(scope, YYYY-MM) 가중치를 캐시로 조회. 없으면 기본값. 저장/삭제 후 clear() 필수."""
+    if not scope_key or not year_month:
+        return dict(DEFAULT_KPI_WEIGHTS)
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return dict(DEFAULT_KPI_WEIGHTS)
+        r = (
+            sc.table("app_employee_kpi_weights")
+            .select("w_revenue, w_margin, w_display, w_cash")
+            .eq("db_filename", scope_key)
+            .eq("year_month", year_month)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            return dict(DEFAULT_KPI_WEIGHTS)
+        return _kpi_weights_from_row(rows[0])
+    except Exception:
+        return dict(DEFAULT_KPI_WEIGHTS)
+
+
+def load_kpi_weights(db_filename: str | None, year: int, month: int, *, all_stores: bool = False) -> dict:
+    """앱 코드에서 호출하는 공개 헬퍼. all_stores=True면 __all__ 스코프.
+    개별 매장은 db_filename 필수. 잘못된 인자는 기본값 반환."""
+    ym = _kpi_weights_ym(year, month)
+    scope = KPI_WEIGHTS_ALL_SCOPE if all_stores else (db_filename or "")
+    if not scope:
+        return dict(DEFAULT_KPI_WEIGHTS)
+    return _load_kpi_weights_cached(scope, ym)
+
+
+def save_kpi_weights(
+    scope_key: str,
+    year: int,
+    month: int,
+    weights: dict,
+    updated_by: str | None,
+) -> tuple[bool, str | None]:
+    """(scope, YYYY-MM) upsert. 합=100 검증."""
+    if not scope_key:
+        return False, "스코프가 지정되지 않았습니다."
+    try:
+        w = {
+            "w_revenue": float(weights.get("revenue", 0)),
+            "w_margin":  float(weights.get("margin", 0)),
+            "w_display": float(weights.get("display", 0)),
+            "w_cash":    float(weights.get("cash", 0)),
+        }
+    except (TypeError, ValueError):
+        return False, "가중치는 숫자여야 합니다."
+    total = w["w_revenue"] + w["w_margin"] + w["w_display"] + w["w_cash"]
+    if abs(total - 100.0) > 0.01:
+        return False, f"가중치 합이 100이 아닙니다. (현재 합: {total:g})"
+    if any(v < 0 for v in w.values()):
+        return False, "가중치는 0 이상이어야 합니다."
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return False, err or "Supabase 연결 불가"
+        payload = {
+            "db_filename": scope_key,
+            "year_month": _kpi_weights_ym(year, month),
+            **w,
+            "updated_by": (updated_by or "").strip() or None,
+            "updated_at": datetime.now(tz=KST).isoformat(),
+        }
+        sc.table("app_employee_kpi_weights").upsert(
+            payload, on_conflict="db_filename,year_month"
+        ).execute()
+        _load_kpi_weights_cached.clear()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def delete_kpi_weights(scope_key: str, year: int, month: int) -> tuple[bool, str | None]:
+    """(scope, YYYY-MM) 삭제 → 기본값(70/15/5/10) 폴백."""
+    if not scope_key:
+        return False, "스코프가 지정되지 않았습니다."
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return False, err or "Supabase 연결 불가"
+        sc.table("app_employee_kpi_weights").delete()\
+            .eq("db_filename", scope_key)\
+            .eq("year_month", _kpi_weights_ym(year, month))\
+            .execute()
+        _load_kpi_weights_cached.clear()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def list_kpi_weights(scope_key: str, limit: int = 24) -> list[dict]:
+    """스코프의 최근 저장 목록(최신 연월 순). 관리자 설정 UI에서 표시용."""
+    if not scope_key:
+        return []
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return []
+        r = (
+            sc.table("app_employee_kpi_weights")
+            .select("year_month, w_revenue, w_margin, w_display, w_cash, updated_by, updated_at")
+            .eq("db_filename", scope_key)
+            .order("year_month", desc=True)
+            .limit(int(limit))
+            .execute()
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _kpi_score_col_names(w: dict) -> dict:
+    """가중치 dict → 표시용 점수 컬럼명. 소수는 첫자리, 정수는 정수로."""
+    def _fmt(v: float) -> str:
+        v = float(v or 0)
+        return f"{v:g}"
+    return {
+        "revenue": f"매출 점수({_fmt(w['revenue'])})",
+        "margin":  f"마진 점수({_fmt(w['margin'])})",
+        "display": f"전시품 점수({_fmt(w['display'])})",
+        "cash":    f"현금수금 점수({_fmt(w['cash'])})",
+    }
+
+
+def _apply_kpi_score_columns(emp_df: "pd.DataFrame", w: dict) -> tuple["pd.DataFrame", dict]:
+    """emp_df(revenue/margin/display_sales/kpi_receipt 합계 열 보유)에 점수·종합 열 추가.
+    반환: (emp_df, {'revenue': 컬럼명, 'margin': ..., 'display': ..., 'cash': ..., 'total': '종합 점수'})"""
+    if emp_df is None or emp_df.empty:
+        return emp_df, {**_kpi_score_col_names(w), "total": "종합 점수"}
+    total_revenue = float(emp_df["revenue"].sum() or 0)
+    total_margin = float(emp_df["margin"].sum() or 0)
+    total_display = float(emp_df["display_sales"].sum() or 0)
+    total_cash = float(emp_df["kpi_receipt"].sum() or 0)
+    cols = _kpi_score_col_names(w)
+    emp_df[cols["revenue"]] = (
+        (emp_df["revenue"] / total_revenue * float(w["revenue"])) if total_revenue else 0.0
+    )
+    emp_df[cols["margin"]] = (
+        (emp_df["margin"] / total_margin * float(w["margin"])) if total_margin else 0.0
+    )
+    emp_df[cols["display"]] = (
+        (emp_df["display_sales"] / total_display * float(w["display"])) if total_display else 0.0
+    )
+    emp_df[cols["cash"]] = (
+        (emp_df["kpi_receipt"] / total_cash * float(w["cash"])) if total_cash else 0.0
+    )
+    for _k in ("revenue", "margin", "display", "cash"):
+        emp_df[cols[_k]] = pd.to_numeric(emp_df[cols[_k]], errors="coerce").fillna(0.0).round(1)
+    emp_df["종합 점수"] = (
+        emp_df[cols["revenue"]] + emp_df[cols["margin"]]
+        + emp_df[cols["display"]] + emp_df[cols["cash"]]
+    ).round(1)
+    return emp_df, {**cols, "total": "종합 점수"}
+
+
+def _kpi_weights_caption(w: dict) -> str:
+    """캡션에 사용할 종합 점수 공식 문자열."""
+    def _fmt(v: float) -> str:
+        return f"{float(v or 0):g}"
+    return (
+        f"매출 {_fmt(w['revenue'])} + 마진 {_fmt(w['margin'])} "
+        f"+ 전시품 {_fmt(w['display'])} + 현금수금 {_fmt(w['cash'])}"
+    )
+
+
 def _fetch_order_employee_names_map_by_ids(db_filename: str, order_ids: list) -> dict[int, str]:
     """order_id → 주문 테이블의 최신 employee_names (Supabase app_orders 또는 SQLite Orders)."""
     out: dict[int, str] = {}
@@ -9897,11 +10100,25 @@ def _superadmin_tab2_hr_store_employees():
         range_end = date(ey, em, monthrange(ey, em)[1])
 
     st.caption(f"조회 기간: {range_start.isoformat()} ~ {range_end.isoformat()}")
+
+    # 가중치: 전체 매장 통합 → __all__ / 개별 매장 → 그 매장. 기간은 종료월 기준.
+    if selected_store == "전체 매장 통합":
+        _kpi_w = load_kpi_weights(None, int(ey), int(em), all_stores=True)
+        _kpi_w_scope_label = "전체 매장 통합"
+    else:
+        _kpi_w_db = next((r["db_filename"] for r in target_rows), None)
+        _kpi_w = load_kpi_weights(_kpi_w_db, int(ey), int(em), all_stores=False)
+        _kpi_w_scope_label = selected_store
+    _kpi_w_ym = f"{int(ey):04d}-{int(em):02d}"
     st.caption(
-        "※ **매출 점수(70)·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
-        "**현금수금 점수(10)·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-        "**마진 점수(15)**: 동 기간 sales를 주문 비율로 배분. "
-        "**전시품 점수(5)·전시품 판매액**: 옵션 A2 — **계약일(order_date)이 기간 내**인 주문의 **전시판매가 × 1/n** (주문당 1회). "
+        f"적용 가중치({_kpi_w_scope_label} · {_kpi_w_ym}): {_kpi_weights_caption(_kpi_w)}"
+        + ("  · 다월 조회 시 **종료월 가중치**를 사용합니다." if (sy, sm) != (ey, em) else "")
+    )
+    st.caption(
+        f"※ **매출 점수({float(_kpi_w['revenue']):g})·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
+        f"**현금수금 점수({float(_kpi_w['cash']):g})·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
+        f"**마진 점수({float(_kpi_w['margin']):g})**: 동 기간 sales를 주문 비율로 배분. "
+        f"**전시품 점수({float(_kpi_w['display']):g})·전시품 판매액**: 옵션 A2 — **계약일(order_date)이 기간 내**인 주문의 **전시판매가 × 1/n** (주문당 1회). "
         "다른 달 계약 + 단순 금액수정은 영향 없음. 다른 달 계약 + **이번 달에 총계약금액이 0원이 되면(전체 취소)** 전시판매가 차감. "
         "주문 수정으로 전시판매가만 변경된 경우 변경 시점 월에 **차액(__dm_d)만 분리 반영**."
     )
@@ -9974,17 +10191,7 @@ def _superadmin_tab2_hr_store_employees():
         "store": "nunique",
     }).rename(columns={"store": "참여 매장 수"})
 
-    total_revenue = emp_df["revenue"].sum() or 0
-    total_margin = emp_df["margin"].sum() or 0
-    total_display = emp_df["display_sales"].sum() or 0
-    total_kpi_receipt = emp_df["kpi_receipt"].sum() or 0
-    emp_df["매출 점수(70)"] = (emp_df["revenue"] / total_revenue * 70).round(1) if total_revenue else 0.0
-    emp_df["마진 점수(15)"] = (emp_df["margin"] / total_margin * 15).round(1) if total_margin else 0.0
-    emp_df["전시품 점수(5)"] = (emp_df["display_sales"] / total_display * 5).round(1) if total_display else 0.0
-    emp_df["현금수금 점수(10)"] = (emp_df["kpi_receipt"] / total_kpi_receipt * 10).round(1) if total_kpi_receipt else 0.0
-    emp_df["종합 점수"] = (
-        emp_df["매출 점수(70)"] + emp_df["마진 점수(15)"] + emp_df["전시품 점수(5)"] + emp_df["현금수금 점수(10)"]
-    ).round(1)
+    emp_df, _score_cols = _apply_kpi_score_columns(emp_df, _kpi_w)
     emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
     emp_df["매출집계(순액)"] = emp_df["revenue"].round(0).astype(int)
     emp_df["현금수금집계"] = emp_df["kpi_receipt"].round(0).astype(int)
@@ -9997,10 +10204,10 @@ def _superadmin_tab2_hr_store_employees():
         "현금수금집계",
         "마진액",
         "전시품 판매액",
-        "매출 점수(70)",
-        "마진 점수(15)",
-        "전시품 점수(5)",
-        "현금수금 점수(10)",
+        _score_cols["revenue"],
+        _score_cols["margin"],
+        _score_cols["display"],
+        _score_cols["cash"],
         "종합 점수",
     ]
     if selected_store == "전체 매장 통합":
@@ -10009,6 +10216,12 @@ def _superadmin_tab2_hr_store_employees():
     display_fmt = _format_df_display(
         display_df, ["매출집계(순액)", "현금수금집계", "마진액", "전시품 판매액"]
     )
+    _short_hdr = {
+        "revenue": f"매출({float(_kpi_w['revenue']):g})",
+        "margin":  f"마진({float(_kpi_w['margin']):g})",
+        "display": f"전시품({float(_kpi_w['display']):g})",
+        "cash":    f"현금수금({float(_kpi_w['cash']):g})",
+    }
     st.dataframe(
         display_fmt,
         width='stretch',
@@ -10018,10 +10231,10 @@ def _superadmin_tab2_hr_store_employees():
             "현금수금집계": st.column_config.TextColumn("현금수금집계", width="medium"),
             "마진액": st.column_config.TextColumn("마진액", width="medium"),
             "전시품 판매액": st.column_config.TextColumn("전시품 판매액", width="small"),
-            "매출 점수(70)": st.column_config.NumberColumn("매출(70)", format="%.1f", width="small"),
-            "마진 점수(15)": st.column_config.NumberColumn("마진(15)", format="%.1f", width="small"),
-            "전시품 점수(5)": st.column_config.NumberColumn("전시품(5)", format="%.1f", width="small"),
-            "현금수금 점수(10)": st.column_config.NumberColumn("현금수금(10)", format="%.1f", width="small"),
+            _score_cols["revenue"]: st.column_config.NumberColumn(_short_hdr["revenue"], format="%.1f", width="small"),
+            _score_cols["margin"]:  st.column_config.NumberColumn(_short_hdr["margin"],  format="%.1f", width="small"),
+            _score_cols["display"]: st.column_config.NumberColumn(_short_hdr["display"], format="%.1f", width="small"),
+            _score_cols["cash"]:    st.column_config.NumberColumn(_short_hdr["cash"],    format="%.1f", width="small"),
             "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
         },
     )
@@ -23787,6 +24000,174 @@ def render_deposit_management():
                     st.rerun()
 
 
+def _render_kpi_weights_admin_section(role: str, me_uname: str) -> None:
+    """관리자 설정 7번: 직원 평가 가중치 편집·목록.
+    - 스코프: 전체 매장 통합(__all__) + 매장별 (store_admin은 자기 매장만)
+    - 기간: 연월(YYYY-MM). 없으면 기본값(70/15/5/10) 사용
+    - 저장 조건: 합계 = 100
+    """
+    is_super = role == "superadmin"
+    current_db = st.session_state.get("current_db")
+
+    stores_rows = _get_supabase_stores_list()
+
+    scope_options: list[tuple[str, str]] = []
+    if is_super:
+        scope_options.append((KPI_WEIGHTS_ALL_SCOPE, "전체 매장 통합"))
+        for s in stores_rows:
+            _db = s.get("db_filename")
+            _nm = s.get("store_name") or _db
+            if _db:
+                scope_options.append((_db, _nm))
+    else:
+        if current_db:
+            _my_nm = next(
+                (s.get("store_name") for s in stores_rows if s.get("db_filename") == current_db),
+                current_db,
+            )
+            scope_options.append((current_db, _my_nm or current_db))
+        else:
+            st.info("현재 매장이 확인되지 않습니다. 매장에 로그인한 후 다시 시도해 주세요.")
+            return
+
+    if not scope_options:
+        st.info("설정 가능한 매장이 없습니다.")
+        return
+
+    scope_keys = [k for k, _ in scope_options]
+    scope_labels = {k: label for k, label in scope_options}
+
+    sel_scope = st.selectbox(
+        "대상",
+        options=scope_keys,
+        format_func=lambda k: scope_labels.get(k, k),
+        key="kpi_w_scope",
+    )
+
+    today_kst = _today_kst()
+    c1, c2 = st.columns(2)
+    with c1:
+        sel_year = st.number_input(
+            "적용 연도",
+            min_value=2020, max_value=2100, value=int(today_kst.year), step=1,
+            key="kpi_w_year",
+        )
+    with c2:
+        sel_month = st.number_input(
+            "적용 월",
+            min_value=1, max_value=12, value=int(today_kst.month), step=1,
+            key="kpi_w_month",
+        )
+
+    existing = load_kpi_weights(
+        sel_scope if sel_scope != KPI_WEIGHTS_ALL_SCOPE else None,
+        int(sel_year), int(sel_month),
+        all_stores=(sel_scope == KPI_WEIGHTS_ALL_SCOPE),
+    )
+
+    # 초기값을 세션에 담아 사용자 조작 우선
+    _wkey_prefix = f"kpi_w_v_{sel_scope}_{int(sel_year):04d}{int(sel_month):02d}"
+    for _k, _v in (
+        ("revenue", existing["revenue"]),
+        ("margin",  existing["margin"]),
+        ("display", existing["display"]),
+        ("cash",    existing["cash"]),
+    ):
+        _sk = f"{_wkey_prefix}_{_k}"
+        if _sk not in st.session_state:
+            st.session_state[_sk] = float(_v)
+
+    wc1, wc2, wc3, wc4 = st.columns(4)
+    with wc1:
+        w_revenue = st.number_input(
+            "매출 가중치", min_value=0.0, max_value=100.0, step=1.0,
+            key=f"{_wkey_prefix}_revenue",
+        )
+    with wc2:
+        w_margin = st.number_input(
+            "마진 가중치", min_value=0.0, max_value=100.0, step=1.0,
+            key=f"{_wkey_prefix}_margin",
+        )
+    with wc3:
+        w_display = st.number_input(
+            "전시품 가중치", min_value=0.0, max_value=100.0, step=1.0,
+            key=f"{_wkey_prefix}_display",
+        )
+    with wc4:
+        w_cash = st.number_input(
+            "현금수금 가중치", min_value=0.0, max_value=100.0, step=1.0,
+            key=f"{_wkey_prefix}_cash",
+        )
+
+    total_w = float(w_revenue) + float(w_margin) + float(w_display) + float(w_cash)
+    if abs(total_w - 100.0) < 0.01:
+        st.success(f"합계 {total_w:g} — 저장 가능")
+        _can_save = True
+    else:
+        st.error(f"합계가 100이 아닙니다. 현재 합: {total_w:g}")
+        _can_save = False
+
+    b1, b2, b3 = st.columns([1, 1, 3])
+    with b1:
+        if st.button("저장", type="primary", disabled=not _can_save, key=f"{_wkey_prefix}_save"):
+            ok, err = save_kpi_weights(
+                sel_scope,
+                int(sel_year), int(sel_month),
+                {
+                    "revenue": float(w_revenue),
+                    "margin":  float(w_margin),
+                    "display": float(w_display),
+                    "cash":    float(w_cash),
+                },
+                updated_by=me_uname,
+            )
+            if ok:
+                flash(f"가중치를 저장했습니다. ({scope_labels[sel_scope]} · {int(sel_year):04d}-{int(sel_month):02d})")
+                st.rerun()
+            else:
+                st.error(f"저장 실패: {err}")
+    with b2:
+        if st.button("이 달 삭제(기본값으로)", key=f"{_wkey_prefix}_del"):
+            ok, err = delete_kpi_weights(sel_scope, int(sel_year), int(sel_month))
+            if ok:
+                flash("해당 월 가중치를 삭제했습니다. 이후 기본값(70/15/5/10)이 적용됩니다.")
+                st.rerun()
+            else:
+                st.error(f"삭제 실패: {err}")
+    with b3:
+        if st.button("기본값 되돌리기", key=f"{_wkey_prefix}_reset"):
+            st.session_state[f"{_wkey_prefix}_revenue"] = float(DEFAULT_KPI_WEIGHTS["revenue"])
+            st.session_state[f"{_wkey_prefix}_margin"]  = float(DEFAULT_KPI_WEIGHTS["margin"])
+            st.session_state[f"{_wkey_prefix}_display"] = float(DEFAULT_KPI_WEIGHTS["display"])
+            st.session_state[f"{_wkey_prefix}_cash"]    = float(DEFAULT_KPI_WEIGHTS["cash"])
+            st.rerun()
+
+    st.markdown("##### 저장된 월별 가중치")
+    rows = list_kpi_weights(sel_scope, limit=24)
+    if not rows:
+        st.caption("저장된 가중치가 없습니다. (모든 달에 기본값 70/15/5/10 적용)")
+    else:
+        _tbl = pd.DataFrame([
+            {
+                "연월": r.get("year_month"),
+                "매출": float(r.get("w_revenue") or 0),
+                "마진": float(r.get("w_margin") or 0),
+                "전시품": float(r.get("w_display") or 0),
+                "현금수금": float(r.get("w_cash") or 0),
+                "합계": (
+                    float(r.get("w_revenue") or 0)
+                    + float(r.get("w_margin") or 0)
+                    + float(r.get("w_display") or 0)
+                    + float(r.get("w_cash") or 0)
+                ),
+                "수정자": r.get("updated_by") or "-",
+                "수정 시각": str(r.get("updated_at") or "")[:19],
+            }
+            for r in rows
+        ])
+        st.dataframe(_tbl, width="stretch", hide_index=True)
+
+
 def render_admin_settings():
     """⚙️ 관리자 설정 — ERP 운영 설정을 모아두는 허브.
     알림톡·카카오 채널 설정, 알림 문구 편집 등을 포함하며 항목이 늘어나면 여기에 추가."""
@@ -23962,9 +24343,15 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 7. 추후 확장 플레이스홀더 ──────────────────────────────────
-    st.subheader("7. 🔧 기타 설정")
-    st.info("ERP 운영 설정 항목은 추후 이 곳에 추가됩니다.")
+    # ── 7. 직원 평가 가중치 (월별/매장별 · 전체 통합) ─────────────────
+    st.subheader("7. 🎯 직원 평가 가중치 (월별)")
+    st.caption(
+        "매출 / 마진 / 전시품 / 현금수금 점수의 **가중치**를 매장별 또는 **전체 매장 통합**으로 "
+        "**연월(YYYY-MM) 단위**로 설정합니다. 저장이 없는 달은 기본값 **70 / 15 / 5 / 10**을 사용합니다. "
+        "과거 월 조회는 그 달에 저장된 값이 그대로 적용됩니다."
+    )
+    with st.expander("가중치 편집 / 목록", expanded=False):
+        _render_kpi_weights_admin_section(role, me_uname)
 
     st.divider()
 
@@ -25099,14 +25486,17 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "월별 판매 현황"
         ),
         "body": (
-            "종합 점수는 **네 가지 합**으로 **100점 만점**입니다.\n\n"
-            "- **매출 점수 70점**\n"
-            "- **마진 점수 15점**\n"
-            "- **전시품 판매 점수 5점**\n"
-            "- **현금수금 점수 10점** (결제일 기준, 수수료 없는 수납: 이체·온누리·지역화폐·현금)\n\n"
+            "종합 점수는 **네 가지 합**으로 **100점 만점**입니다. "
+            "기본값은 아래이며, ⚙️ **관리자 설정 → 7. 직원 평가 가중치(월별)** 에서 "
+            "**매장별 / 전체 매장 통합**으로 **연월 단위**로 변경할 수 있습니다. "
+            "저장 없는 달은 기본값이 그대로 쓰이고, 과거 월은 그 달에 저장된 값이 유지됩니다.\n\n"
+            "- **매출 점수 70점** (기본)\n"
+            "- **마진 점수 15점** (기본)\n"
+            "- **전시품 판매 점수 5점** (기본)\n"
+            "- **현금수금 점수 10점** (기본, 결제일 기준, 수수료 없는 수납: 이체·온누리·지역화폐·현금)\n\n"
             "**경영 대시보드**의 「3. 월별 직원 판매 현황 및 평가」와 "
             "**최고 관리자 → 매장별 직원 평가(HR)** 에서 같은 기준으로 집계합니다. "
-            "(HR은 선택한 **단일 월** 또는 **연월 범위** 기준입니다.)"
+            "(HR은 선택한 **단일 월** 또는 **연월 범위** 기준이며, 다월 조회 시 **종료월 가중치**를 적용합니다.)"
         ),
     },
     {
@@ -25139,7 +25529,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "**현금수금집계에 포함되지 않습니다.**\n"
             "- **수수료 0%** 인 **계좌이체(이체), 온누리·온누리지류, 지역화폐, 현금(수금)** 만 포함됩니다.\n"
             "- 결제 금액도 주문 담당 직원이 여러 명이면 **1/n**으로 나눈 뒤 직원별로 합산합니다.\n"
-            "- KPI 표의 **현금수금집계** 열은 위 기준의 **금액 참고**이며, **종합 점수(매출70+마진20+전시10)에는 넣지 않습니다.**"
+            "- **현금수금 점수(기본 10점)** 로 종합 점수에 포함되며, 가중치는 ⚙️ 관리자 설정에서 변경할 수 있습니다."
         ),
     },
     {
@@ -31105,17 +31495,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
 
             if not emp_merged.empty:
                 emp_df = emp_merged.copy()
-                total_revenue = emp_df["revenue"].sum() or 0
-                total_margin = emp_df["margin"].sum() or 0
-                total_display = emp_df["display_sales"].sum() or 0
-                total_kpi_receipt = emp_df["kpi_receipt"].sum() or 0
-                emp_df["매출 점수(70)"] = (emp_df["revenue"] / total_revenue * 70).round(1) if total_revenue else 0.0
-                emp_df["마진 점수(15)"] = (emp_df["margin"] / total_margin * 15).round(1) if total_margin else 0.0
-                emp_df["전시품 점수(5)"] = (emp_df["display_sales"] / total_display * 5).round(1) if total_display else 0.0
-                emp_df["현금수금 점수(10)"] = (emp_df["kpi_receipt"] / total_kpi_receipt * 10).round(1) if total_kpi_receipt else 0.0
-                emp_df["종합 점수"] = (
-                    emp_df["매출 점수(70)"] + emp_df["마진 점수(15)"] + emp_df["전시품 점수(5)"] + emp_df["현금수금 점수(10)"]
-                ).round(1)
+                _kpi_w_store = load_kpi_weights(db_filename, int(sel_y), int(sel_m), all_stores=False)
+                emp_df, _score_cols = _apply_kpi_score_columns(emp_df, _kpi_w_store)
                 emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
                 emp_df["매출집계(순액)"] = emp_df["revenue"].round(0).astype(int)
                 emp_df["현금수금집계"] = emp_df["kpi_receipt"].round(0).astype(int)
@@ -31128,16 +31509,22 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                         "현금수금집계",
                         "마진액",
                         "전시품 판매액",
-                        "매출 점수(70)",
-                        "마진 점수(15)",
-                        "전시품 점수(5)",
-                        "현금수금 점수(10)",
+                        _score_cols["revenue"],
+                        _score_cols["margin"],
+                        _score_cols["display"],
+                        _score_cols["cash"],
                         "종합 점수",
                     ]
                 ].rename(columns={"employee": "직원명"})
                 display_fmt = _format_df_display(
                     display_df, ["매출집계(순액)", "현금수금집계", "마진액", "전시품 판매액"]
                 )
+                _short_hdr = {
+                    "revenue": f"매출({float(_kpi_w_store['revenue']):g})",
+                    "margin":  f"마진({float(_kpi_w_store['margin']):g})",
+                    "display": f"전시품({float(_kpi_w_store['display']):g})",
+                    "cash":    f"현금수금({float(_kpi_w_store['cash']):g})",
+                }
                 st.dataframe(
                     display_fmt,
                     width='stretch',
@@ -31147,18 +31534,20 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                         "현금수금집계": st.column_config.TextColumn("현금수금집계", width="medium"),
                         "마진액": st.column_config.TextColumn("마진액", width="medium"),
                         "전시품 판매액": st.column_config.TextColumn("전시품 판매액", width="small"),
-                        "매출 점수(70)": st.column_config.NumberColumn("매출(70)", format="%.1f", width="small"),
-                        "마진 점수(15)": st.column_config.NumberColumn("마진(15)", format="%.1f", width="small"),
-                        "전시품 점수(5)": st.column_config.NumberColumn("전시품(5)", format="%.1f", width="small"),
-                        "현금수금 점수(10)": st.column_config.NumberColumn("현금수금(10)", format="%.1f", width="small"),
+                        _score_cols["revenue"]: st.column_config.NumberColumn(_short_hdr["revenue"], format="%.1f", width="small"),
+                        _score_cols["margin"]:  st.column_config.NumberColumn(_short_hdr["margin"],  format="%.1f", width="small"),
+                        _score_cols["display"]: st.column_config.NumberColumn(_short_hdr["display"], format="%.1f", width="small"),
+                        _score_cols["cash"]:    st.column_config.NumberColumn(_short_hdr["cash"],    format="%.1f", width="small"),
                         "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
                     },
                 )
                 st.caption(
-                    "※ **종합 점수** = 매출 70 + 마진 15 + 전시품 5 + 현금수금 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
-                    "**현금수금 점수(10)·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-                    "**마진 점수(15)**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영. "
-                    "**전시품 점수(5)·전시품 판매액**: 옵션 A2 — **계약일(order_date) in 해당 월** 주문의 **전시판매가 × 1/n**(주문당 1회). "
+                    f"※ **종합 점수** = {_kpi_weights_caption(_kpi_w_store)} "
+                    f"(⚙️ 관리자 설정 → 직원 평가 가중치, 적용 월 {int(sel_y):04d}-{int(sel_m):02d}). "
+                    f"**매출 점수({float(_kpi_w_store['revenue']):g})·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
+                    f"**현금수금 점수({float(_kpi_w_store['cash']):g})·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
+                    f"**마진 점수({float(_kpi_w_store['margin']):g})**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영. "
+                    f"**전시품 점수({float(_kpi_w_store['display']):g})·전시품 판매액**: 옵션 A2 — **계약일(order_date) in 해당 월** 주문의 **전시판매가 × 1/n**(주문당 1회). "
                     "다른 달 계약 + 단순 금액수정은 0 (영향 없음). 다른 달 계약 + 해당월 **총계약금액이 0원(전체 취소)**이 되면 전시판매가 차감. "
                     "주문 수정으로 전시판매가만 변경 시 변경 시점 월에 **차액(__dm_d)만 분리 반영**(KPI에서 마이너스 가능)."
                 )
