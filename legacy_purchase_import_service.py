@@ -101,6 +101,10 @@ def parse_date(raw: Any) -> Optional[str]:
 PURCHASE_IMPORT_SOURCE = "엑셀_매입원장"
 """app_orders.import_source / app_order_items.import_source / app_customers.source 태그."""
 
+# 이 날짜 미만(2026-04-01 미포함)의 매입원장 임포트 주문은 이미 정산된 과거 매출로 간주.
+# 미수금(잔금) 집계에서 제외하고, 누락된 결제는 전액 완납으로 보정한다.
+LEGACY_IMPORT_PAID_CUTOFF = date(2026, 4, 1)
+
 CHANNEL_TALK_DEFAULT_STORE = os.environ.get("CHANNEL_TALK_DEFAULT_STORE", "채널톡")
 """api.py 와 동일. 채널톡 자동가입 고객이 저장되는 스토어명."""
 
@@ -970,6 +974,170 @@ class PurchaseCommitResult:
     errors: list[str] = field(default_factory=list)
 
 
+def mask_legacy_import_force_paid(df: pd.DataFrame) -> pd.Series:
+    """2026-04-01 이전 매입원장 임포트 주문 → True (미수 집계에서 제외)."""
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    src = (
+        df["import_source"].fillna("").astype(str)
+        if "import_source" in df.columns
+        else pd.Series("", index=df.index)
+    )
+    od = (
+        pd.to_datetime(df["order_date"], errors="coerce")
+        if "order_date" in df.columns
+        else pd.Series(pd.NaT, index=df.index)
+    )
+    return (src == PURCHASE_IMPORT_SOURCE) & od.notna() & (od.dt.date < LEGACY_IMPORT_PAID_CUTOFF)
+
+
+def apply_legacy_import_paid_balance(df: pd.DataFrame, *, balance_col: str = "balance") -> pd.DataFrame:
+    """임포트 강제완납 대상 행의 잔금을 0으로 만든다 (조회 시점 방어)."""
+    if df is None or df.empty or balance_col not in df.columns:
+        return df
+    mask = mask_legacy_import_force_paid(df)
+    if not mask.any():
+        return df
+    out = df.copy()
+    out.loc[mask, balance_col] = 0
+    return out
+
+
+@dataclass
+class LegacyPaidBackfillResult:
+    scanned: int = 0
+    payments_inserted: int = 0
+    status_updated: int = 0
+    skipped_already_paid: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+def backfill_legacy_import_paid(
+    client,
+    *,
+    db_filename: str,
+    created_by: str = "legacy_import_paid_backfill",
+    progress_cb: Optional[Callable[[str, float], None]] = None,
+) -> LegacyPaidBackfillResult:
+    """2026-04-01 이전 매입원장 임포트 주문 중 결제가 부족한 건에 전액 완납 결제를 채운다.
+
+    - 대상: import_source='엑셀_매입원장' AND order_date < 2026-04-01
+    - 동작: (total_amount - 기존 결제합) 만큼 app_payments INSERT, balance_status='완납'
+    - 일반(모모) 주문은 건드리지 않음
+    """
+    res = LegacyPaidBackfillResult()
+    if client is None or not db_filename:
+        res.errors.append("client/db_filename 필수")
+        return res
+
+    cutoff = LEGACY_IMPORT_PAID_CUTOFF.isoformat()
+    page = 1000
+    offset = 0
+    orders: list[dict] = []
+    while True:
+        try:
+            q = (
+                client.table("app_orders")
+                .select("id, order_date, delivery_date, total_amount, balance_status, import_source")
+                .eq("db_filename", db_filename)
+                .eq("import_source", PURCHASE_IMPORT_SOURCE)
+                .lt("order_date", cutoff)
+                .range(offset, offset + page - 1)
+            )
+            data = q.execute().data or []
+        except Exception as e:
+            res.errors.append(f"임포트 주문 조회 실패: {e}")
+            return res
+        orders.extend(data)
+        if len(data) < page:
+            break
+        offset += page
+        if progress_cb:
+            progress_cb("임포트 주문 조회", min(0.4, offset / max(offset, 1)))
+
+    res.scanned = len(orders)
+    if not orders:
+        return res
+
+    order_ids = [int(r["id"]) for r in orders if r.get("id") is not None]
+    paid_by_oid: dict[int, int] = {}
+    _BATCH = 100
+    for _bi in range(0, len(order_ids), _BATCH):
+        chunk = order_ids[_bi:_bi + _BATCH]
+        try:
+            resp = (
+                client.table("app_payments")
+                .select("order_id, amount")
+                .eq("db_filename", db_filename)
+                .in_("order_id", chunk)
+                .execute()
+            )
+            rows = (resp.data or []) if hasattr(resp, "data") else []
+        except Exception as e:
+            res.errors.append(f"결제 조회 실패 ({len(chunk)}건): {e}")
+            continue
+        for row in rows:
+            try:
+                oid = int(row.get("order_id"))
+                amt = int(round(float(row.get("amount") or 0)))
+            except (TypeError, ValueError):
+                continue
+            paid_by_oid[oid] = paid_by_oid.get(oid, 0) + amt
+
+    pay_payloads: list[dict] = []
+    status_ids: list[int] = []
+    for row in orders:
+        try:
+            oid = int(row["id"])
+            total = int(round(float(row.get("total_amount") or 0)))
+        except (TypeError, ValueError, KeyError):
+            continue
+        paid = paid_by_oid.get(oid, 0)
+        short = total - paid
+        if short <= 0:
+            res.skipped_already_paid += 1
+            if str(row.get("balance_status") or "") != "완납":
+                status_ids.append(oid)
+            continue
+        _pay_date = str(row.get("order_date") or row.get("delivery_date") or "")[:10] or None
+        pay_payloads.append({
+            "db_filename": db_filename,
+            "order_id": oid,
+            "payment_date": _pay_date,
+            "amount": int(short),
+            "payment_method": "과거완납(임포트)",
+            "card_company": None,
+            "fee_amount": 0,
+            "onnuri_approval_code": None,
+            "created_by": created_by,
+        })
+        status_ids.append(oid)
+
+    for _bi in range(0, len(pay_payloads), _BATCH):
+        chunk = pay_payloads[_bi:_bi + _BATCH]
+        try:
+            client.table("app_payments").insert(chunk).execute()
+            res.payments_inserted += len(chunk)
+        except Exception as e:
+            res.errors.append(f"완납 결제 INSERT 실패 ({len(chunk)}건): {e}")
+        if progress_cb:
+            progress_cb("완납 결제 보정", 0.4 + 0.4 * min(1.0, (_bi + len(chunk)) / max(1, len(pay_payloads))))
+
+    # 잔금 상태를 완납으로 맞춤 (이미 완납이면 스킵)
+    _uniq_status = list(dict.fromkeys(status_ids))
+    for _bi in range(0, len(_uniq_status), _BATCH):
+        chunk = _uniq_status[_bi:_bi + _BATCH]
+        try:
+            client.table("app_orders").update({"balance_status": "완납"}).in_("id", chunk).eq("db_filename", db_filename).execute()
+            res.status_updated += len(chunk)
+        except Exception as e:
+            res.errors.append(f"완납 상태 UPDATE 실패 ({len(chunk)}건): {e}")
+        if progress_cb:
+            progress_cb("완납 상태 갱신", 0.8 + 0.2 * min(1.0, (_bi + len(chunk)) / max(1, len(_uniq_status))))
+
+    return res
+
+
 def _order_payload_from_group(g: OrderGroup, *, db_filename: str, customer_id: int) -> dict:
     """OrderGroup → app_orders INSERT payload."""
     _cats = [it.product_name for it in g.items if it.product_name]
@@ -1746,6 +1914,7 @@ def backfill_customer_addresses(
 
 __all__ = [
     "PURCHASE_IMPORT_SOURCE",
+    "LEGACY_IMPORT_PAID_CUTOFF",
     "PURCHASE_TARGET_FIELDS",
     "EXCLUDED_ORDER_KINDS",
     "LineItem",
@@ -1768,6 +1937,10 @@ __all__ = [
     "migrate_channeltalk_phones",
     "commit_import",
     "backfill_customer_addresses",
+    "backfill_legacy_import_paid",
+    "mask_legacy_import_force_paid",
+    "apply_legacy_import_paid_balance",
+    "LegacyPaidBackfillResult",
     "preview_rollback",
     "commit_rollback",
 ]

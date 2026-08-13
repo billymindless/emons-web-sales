@@ -3687,6 +3687,15 @@ def _sum_payments_by_order_supabase(db_filename: str, order_id: int) -> tuple[fl
     return paid, fees
 
 
+def _zero_pre_april_2026_import_balance(df: pd.DataFrame, balance_col: str = "balance") -> pd.DataFrame:
+    """2026-04-01 이전 매입원장 임포트 주문의 잔금을 0으로 본다 (미수 집계 방어)."""
+    try:
+        import legacy_purchase_import_service as lps
+        return lps.apply_legacy_import_paid_balance(df, balance_col=balance_col)
+    except Exception:
+        return df
+
+
 def _recalc_order_actual_margin_supabase(db_filename: str, order_id: int) -> bool:
     """주문의 actual_margin, balance_status를 결제 기준으로 재계산하여 app_orders에 반영."""
     order = _get_order_supabase(db_filename, order_id)
@@ -9795,7 +9804,7 @@ def _superadmin_tab1_integrated_dashboard():
     st.header(f"경영 대시보드 — {'전체 매장 통합' if is_all else sel_store}")
 
     # ── 데이터 로드 ─────────────────────────────────────
-    order_cols = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, display_sales_amount, display_cost_amount, balance_status"
+    order_cols = "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, display_sales_amount, display_cost_amount, balance_status, import_source"
     with st.spinner("데이터 불러오는 중..."):
         if is_all:
             _o_parts, _p_parts, _s_parts, _cu_parts = [], [], [], []
@@ -9836,6 +9845,7 @@ def _superadmin_tab1_integrated_dashboard():
                         _ps2 = _p.groupby("order_id")["amount"].sum() if not _p.empty and "order_id" in _p.columns else pd.Series(dtype=float)
                         _o2["_paid"] = _o2["id"].map(_ps2).fillna(0)
                         _o2["_bal"] = _o2["total_amount"].fillna(0) - _o2["_paid"]
+                        _o2 = _zero_pre_april_2026_import_balance(_o2, "_bal")
                         _store_rank_rows.append({
                             "매장명": _sn,
                             "이번 달 판매금액": int(_mo2["total_amount"].fillna(0).sum()),
@@ -9856,7 +9866,7 @@ def _superadmin_tab1_integrated_dashboard():
             _store_rank_rows = []
 
     # 공통 컬럼 보정
-    for _c in ["id","customer_id","order_date","delivery_date","total_amount","cost_price","actual_margin","employee_names","category","display_sales_amount","display_cost_amount","balance_status"]:
+    for _c in ["id","customer_id","order_date","delivery_date","total_amount","cost_price","actual_margin","employee_names","category","display_sales_amount","display_cost_amount","balance_status","import_source"]:
         if _c not in orders.columns:
             orders[_c] = None
     for _c in ("order_id","amount","payment_method","payment_date","onnuri_approval_code"):
@@ -9914,6 +9924,7 @@ def _superadmin_tab1_integrated_dashboard():
             _o2 = orders.copy()
             _o2["paid"] = _o2["id"].map(_dash_pay_sum).fillna(0)
             _o2["balance"] = _o2["total_amount"].fillna(0) - _o2["paid"]
+            _o2 = _zero_pre_april_2026_import_balance(_o2, "balance")
             _o2["delivery_date"] = pd.to_datetime(_o2["delivery_date"], errors="coerce")
             _cutoff = today + timedelta(days=10)
             _unpaid = _o2[(_o2["balance"] > 0) & (_o2["delivery_date"].notna())]
@@ -9993,6 +10004,7 @@ def _superadmin_tab1_integrated_dashboard():
                 _po = _period_orders.copy()
                 _po["_paid"] = _po["id"].map(_dash_pay_sum).fillna(0)
                 _po["_bal"] = _po["total_amount"].fillna(0) - _po["_paid"]
+                _po = _zero_pre_april_2026_import_balance(_po, "_bal")
                 _total_unpaid_period = float(_po["_bal"].clip(lower=0).sum())
             _sc1, _sc2 = st.columns(2)
             with _sc1:
@@ -10518,7 +10530,7 @@ def _superadmin_tab4_backup_csv():
         conn = get_tenant_conn(s["db_filename"])
         db_fn = s["db_filename"]
         if _supabase_orders_payments_available():
-            merged = _load_orders_supabase(db_fn, "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, visit_reason, purchase_reason, display_sales_amount, display_cost_amount, balance_status", limit=None)
+            merged = _load_orders_supabase(db_fn, "id, customer_id, order_date, delivery_date, total_amount, cost_price, actual_margin, employee_names, category, visit_reason, purchase_reason, display_sales_amount, display_cost_amount, balance_status, import_source", limit=None)
             payments = _load_payments_supabase(db_fn)
             if merged.empty:
                 continue
@@ -10566,6 +10578,7 @@ def _superadmin_tab4_backup_csv():
         merged = merged.merge(pay_agg, left_on="id", right_index=True, how="left")
         merged["paid"] = merged["paid"].fillna(0)
         merged["balance"] = merged["total_amount"] - merged["paid"]
+        merged = _zero_pre_april_2026_import_balance(merged, "balance")
         merged["methods"] = merged["methods"].fillna("")
         merged["onnuri_codes"] = merged["onnuri_codes"].fillna("")
         merged["특이사항"] = (merged["visit_reason"].fillna("") + " / " + merged["purchase_reason"].fillna("")).str.strip(" /")
@@ -10625,7 +10638,7 @@ def _superadmin_tab_unpaid_report():
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
         if _supabase_orders_payments_available():
-            merged = _load_orders_supabase(db_fn, "id, customer_id, order_date, delivery_date, total_amount, employee_names, display_sales_amount", limit=None)
+            merged = _load_orders_supabase(db_fn, "id, customer_id, order_date, delivery_date, total_amount, employee_names, display_sales_amount, import_source, balance_status", limit=None)
             if merged.empty:
                 continue
             if "display_sales_amount" not in merged.columns:
@@ -10660,6 +10673,7 @@ def _superadmin_tab_unpaid_report():
         merged = merged.merge(payments, left_on="id", right_on="order_id", how="left")
         merged["paid"] = merged["paid"].fillna(0)
         merged["balance"] = merged["total_amount"] - merged["paid"]
+        merged = _zero_pre_april_2026_import_balance(merged, "balance")
         merged["order_date"] = pd.to_datetime(merged["order_date"], errors="coerce")
         merged = merged[merged["order_date"].notna()]
         merged = merged[(merged["order_date"].dt.date >= report_start) & (merged["order_date"].dt.date <= report_end)]
@@ -26989,7 +27003,7 @@ def render_new_sales():
                 ]["id"].tolist() or [quick_cid]
 
                 if _supabase_orders_payments_available():
-                    all_orders_q = _load_orders_supabase(db_filename, "id, customer_id, order_date, total_amount", limit=None)
+                    all_orders_q = _load_orders_supabase(db_filename, "id, customer_id, order_date, total_amount, import_source", limit=None)
                     q_orders = all_orders_q[all_orders_q["customer_id"].isin(all_cids)].copy() if (not all_orders_q.empty and "customer_id" in all_orders_q.columns) else pd.DataFrame()
                     q_payments = _load_payments_supabase(db_filename)
                 else:
@@ -27013,6 +27027,7 @@ def render_new_sales():
                     pay_sum_q = q_payments.groupby("order_id")["amount"].sum() if (not q_payments.empty and "order_id" in q_payments.columns and "amount" in q_payments.columns) else pd.Series(dtype=float)
                     q_orders["paid"] = q_orders["id"].map(pay_sum_q).fillna(0)
                     q_orders["balance"] = q_orders["total_amount"].fillna(0) - q_orders["paid"]
+                    q_orders = _zero_pre_april_2026_import_balance(q_orders, "balance")
                     q_orders = q_orders[q_orders["balance"] > 0].copy()
                     q_orders["order_date"] = pd.to_datetime(q_orders["order_date"], errors="coerce")
                     q_orders = q_orders.sort_values(["order_date", "id"], ascending=[False, False]).reset_index(drop=True)
@@ -28672,6 +28687,7 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             "**1건이면 자동 매칭**, 2건 이상이면 아래에서 **수동 선택** 합니다. "
             "**회수** 주문구분 라인은 자동 스킵됩니다. "
             "\n\n**잔금 처리**: 신규 주문(모모에 없던 건)은 **판매가 전액 완납 결제**로 저장되어 미수 목록에 잡히지 않습니다. "
+            "**2026년 4월 이전** 매입원장 임포트 매출은 전부 **입금완료**로 간주하며 미수금에 포함하지 않습니다. "
             "이미 앱에 등록된 주문에 매칭될 때는 **판매금액·원가·잔금·기존 결제**를 절대 덮어쓰지 않고 **라인 아이템만 추가**합니다."
             "\n\n**사전 준비**: `app_order_items` 테이블이 필요합니다 — `SUPABASE_APP_ORDER_ITEMS.sql` 을 먼저 실행하세요."
         )
@@ -28680,6 +28696,37 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             st.error("현재 매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 먼저 선택해 주세요.")
             return
         st.info(f"저장 대상 매장: **{_store_name}** (`{db_filename}`)")
+
+        st.markdown("##### 2026년 4월 이전 임포트 매출 → 입금완료 보정")
+        st.caption(
+            "이미 임포트된 주문 중 `엑셀_매입원장` 이고 계약일이 **2026-04-01 이전**인 건은 "
+            "결제가 없어도 미수로 잡지 않습니다. 아래 버튼은 누락된 완납 결제를 채워 "
+            "미수금 레포트·대시보드 숫자가 일치하게 합니다. 일반(모모) 주문은 변경하지 않습니다."
+        )
+        if st.button("💳 2026년 4월 이전 임포트 매출 입금완료 처리", key=f"legacy_import_paid_backfill::{db_filename}"):
+            client, _err = get_supabase_client()
+            if not client:
+                st.error(f"Supabase 연결 실패: {_err}")
+            else:
+                _pbar = st.progress(0.0, text="보정 중…")
+                def _paid_cb(_label: str, _frac: float) -> None:
+                    _pbar.progress(min(1.0, float(_frac)), text=_label)
+                _created_by = (
+                    (st.session_state.get("current_user") or {}).get("name")
+                    or (st.session_state.get("current_user") or {}).get("username")
+                    or "legacy_import_paid_backfill"
+                )
+                _bres = lps.backfill_legacy_import_paid(
+                    client, db_filename=db_filename, created_by=_created_by, progress_cb=_paid_cb,
+                )
+                _pbar.progress(1.0, text="완료")
+                clear_data_cache()
+                st.success(
+                    f"대상 {_bres.scanned:,}건 조회 · 완납 결제 {_bres.payments_inserted:,}건 추가 · "
+                    f"완납 상태 {_bres.status_updated:,}건 갱신 · 이미 완납 {_bres.skipped_already_paid:,}건"
+                )
+                for _em in _bres.errors[:10]:
+                    st.warning(_em)
 
         excel_upload = st.file_uploader(
             "매입 원장 엑셀 (.xlsx)", type=["xlsx"], key="legacy_purchase_excel_upload",
@@ -29765,7 +29812,7 @@ def render_customer_balance():
                 if _supabase_orders_payments_available():
                     all_orders = _load_orders_supabase(
                         db_filename,
-                        "id, customer_id, order_date, delivery_date, category, cost_price, total_amount, actual_margin, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names",
+                        "id, customer_id, order_date, delivery_date, category, cost_price, total_amount, actual_margin, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names, import_source",
                         limit=None,
                     )
                     orders = all_orders[all_orders["customer_id"].isin(all_cids)].copy() if not all_orders.empty and "customer_id" in all_orders.columns else pd.DataFrame()
@@ -29788,6 +29835,7 @@ def render_customer_balance():
                     orders = orders.copy()
                     orders["paid"] = orders["id"].map(pay_sum).fillna(0)
                     orders["balance"] = orders["total_amount"] - orders["paid"]
+                    orders = _zero_pre_april_2026_import_balance(orders, "balance")
                     orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
                     # 일반판매가 = total_amount - display_sales_amount
                     if "display_sales_amount" in orders.columns:
@@ -30899,7 +30947,7 @@ def render_customer_balance():
 
     # ---------- 탭 2·3·4 공통 데이터: 1회만 로드 후 각 탭에서 재사용 ----------
     # balance_status: 완납·이상결제는 미수 대상에서 제외 (임포트 완납 주문 포함)
-    order_cols_d10 = "id, customer_id, order_date, delivery_date, total_amount, display_sales_amount, cost_price, category, employee_names, balance_status"
+    order_cols_d10 = "id, customer_id, order_date, delivery_date, total_amount, display_sales_amount, cost_price, category, employee_names, balance_status, import_source"
     _shared_orders_d10 = load_orders_cached(db_filename, order_cols_d10, limit=None)
     _shared_payments_d10 = load_payments_cached(db_filename)
     # 탭2·3·4는 id, name, phone1만 사용 → 불필요 컬럼 제외
@@ -30923,6 +30971,7 @@ def render_customer_balance():
             pay_sum = _shared_pay_sum_d10
             orders["paid"] = orders["id"].map(pay_sum).fillna(0)
             orders["balance"] = orders["total_amount"] - orders["paid"]
+            orders = _zero_pre_april_2026_import_balance(orders, "balance")
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
             orders = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
             d10_end = today + timedelta(days=10)
@@ -30957,6 +31006,7 @@ def render_customer_balance():
             pay_sum = _shared_pay_sum_d10  # 탭2에서 이미 계산된 pay_sum 재사용
             orders["paid"] = orders["id"].map(pay_sum).fillna(0)
             orders["balance"] = orders["total_amount"] - orders["paid"]
+            orders = _zero_pre_april_2026_import_balance(orders, "balance")
             orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
             orders = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
             mask_past = orders["delivery_date"].notna() & (orders["delivery_date"].dt.date < today)
@@ -32517,6 +32567,7 @@ def render_dashboard():
         orders = orders.copy()
         orders["paid"] = orders["id"].map(pay_sum).fillna(0)
         orders["balance"] = orders["total_amount"] - orders["paid"]
+        orders = _zero_pre_april_2026_import_balance(orders, "balance")
         orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
         orders_with_cust = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
         orders_with_cust = orders_with_cust.rename(columns={"name": "고객명", "phone1": "전화번호", "delivery_date": "배송일", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
@@ -32707,6 +32758,7 @@ def render_dashboard():
             period_orders = period_orders.copy()
             period_orders["_paid"] = period_orders["id"].map(paid_per).fillna(0)
             period_orders["_bal"] = period_orders["total_amount"] - period_orders["_paid"]
+            period_orders = _zero_pre_april_2026_import_balance(period_orders, "_bal")
             total_unpaid_period = float(period_orders["_bal"].clip(lower=0).sum())
         else:
             total_unpaid_period = 0.0

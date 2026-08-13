@@ -756,7 +756,7 @@ def collect_risks(store_keys: list[str], today: date) -> dict:
         return {"unpaid_d10": [], "total_unpaid": 0, "total_unpaid_all": 0}
     try:
         r = client.table("app_orders").select(
-            "id, db_filename, customer_id, delivery_date, total_amount, balance_status"
+            "id, db_filename, customer_id, order_date, delivery_date, total_amount, balance_status, import_source"
         ).in_("db_filename", store_keys).execute()
         orders = pd.DataFrame((r.data or []))
         if orders.empty:
@@ -780,6 +780,11 @@ def collect_risks(store_keys: list[str], today: date) -> dict:
     else:
         orders["paid"] = 0
     orders["balance"] = orders["_tot"] - orders["paid"]
+    try:
+        import legacy_purchase_import_service as lps
+        orders = lps.apply_legacy_import_paid_balance(orders, balance_col="balance")
+    except Exception:
+        pass
 
     # balance_status 로 완납·이상결제 제외 (app.py 관례: '미납' 이 회수 대상)
     if "balance_status" in orders.columns:
