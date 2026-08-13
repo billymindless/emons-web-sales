@@ -2336,7 +2336,12 @@ def get_tenant_conn(db_filename: str):
 def load_customers_cached(db_filename: str, limit: int | None = 50, col_list: str | None = None) -> pd.DataFrame:
     """고객 목록 캐시 로딩 (1시간 TTL). Supabase app_customers 테이블, store_name(매장) 기준 조회.
     col_list: 쉼표 구분 컬럼명 문자열. None이면 기본 전체 컬럼(latitude/longitude 포함 시도).
-    최소 컬럼만 필요한 경우 col_list='id, name, phone1' 등으로 전달해 네트워크 비용 절감."""
+    최소 컬럼만 필요한 경우 col_list='id, name, phone1' 등으로 전달해 네트워크 비용 절감.
+
+    PostgREST 기본 행 상한(1000) 초과 시 누락 방지를 위해 limit=None 이거나 limit>1000 이면
+    페이지네이션으로 전체 조회한다. (매입 원장 임포트 후 고객이 1000명을 넘으면
+    미수금 표의 고객명/전화번호가 None 으로 비는 문제를 방지.)
+    """
     client, err = get_supabase_client()
     if err:
         if "supabase_error" not in st.session_state:
@@ -2345,29 +2350,49 @@ def load_customers_cached(db_filename: str, limit: int | None = 50, col_list: st
     store_name = _get_current_store_name_for_customers(db_filename)
     if not store_name:
         return pd.DataFrame()
+
+    def _fetch(select_cols: str) -> list:
+        def _base():
+            return (
+                client.table("app_customers")
+                .select(select_cols)
+                .eq("store_name", store_name)
+                .order("id", desc=True)
+            )
+
+        if limit is not None and limit <= 1000:
+            return (_base().limit(limit).execute().data or [])
+
+        _PAGE = 1000
+        rows_all: list = []
+        offset = 0
+        while True:
+            r = _base().range(offset, offset + _PAGE - 1).execute()
+            page = r.data or []
+            rows_all.extend(page)
+            if len(page) < _PAGE:
+                break
+            offset += _PAGE
+            if limit is not None and len(rows_all) >= limit:
+                rows_all = rows_all[:limit]
+                break
+        return rows_all
+
     try:
-        r = None
+        rows: list = []
         if col_list:
-            # 지정 컬럼만 조회 (네트워크 절감)
-            q = client.table("app_customers").select(col_list).eq("store_name", store_name).order("id", desc=True)
-            if limit:
-                q = q.limit(limit)
-            r = q.execute()
+            rows = _fetch(col_list)
         else:
-            # latitude, longitude가 app_customers에 있으면 지도 렌더링 시 활용. 없으면 기본 컬럼만 사용.
             base_cols = "id, name, phone1, phone2, address"
             for select_cols in (f"{base_cols}, latitude, longitude", base_cols):
                 try:
-                    q = client.table("app_customers").select(select_cols).eq("store_name", store_name).order("id", desc=True)
-                    if limit:
-                        q = q.limit(limit)
-                    r = q.execute()
+                    rows = _fetch(select_cols)
                     break
                 except Exception:
                     continue
-        if r and r.data and len(r.data) > 0:
+        if rows:
             st.session_state.pop("supabase_error", None)
-            return pd.DataFrame(r.data)
+            return pd.DataFrame(rows)
         return pd.DataFrame()
     except Exception as e:
         detail = getattr(e, "details", None) or getattr(e, "message", None) or str(e)
@@ -9929,7 +9954,11 @@ def _superadmin_tab1_integrated_dashboard():
             _cutoff = today + timedelta(days=10)
             _unpaid = _o2[(_o2["balance"] > 0) & (_o2["delivery_date"].notna())]
             if not customers.empty and "id" in customers.columns:
-                _unpaid = _unpaid.merge(customers[["id","name","phone1"]], left_on="customer_id", right_on="id", how="left", suffixes=("","_c"))
+                _cust = customers[["id", "name", "phone1"]].copy()
+                _cust["id"] = pd.to_numeric(_cust["id"], errors="coerce")
+                _unpaid = _unpaid.copy()
+                _unpaid["customer_id"] = pd.to_numeric(_unpaid["customer_id"], errors="coerce")
+                _unpaid = _unpaid.merge(_cust, left_on="customer_id", right_on="id", how="left", suffixes=("", "_c"))
             _unpaid = _unpaid.rename(columns={"name":"고객명","phone1":"전화번호","delivery_date":"배송일","category":"품목","employee_names":"담당자","balance":"잔금"})
             _show_cols = [c for c in ["고객명","전화번호","배송일","품목","잔금","담당자"] if c in _unpaid.columns]
             if "_store" in orders.columns and is_all:
