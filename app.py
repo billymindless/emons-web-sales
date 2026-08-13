@@ -22517,6 +22517,154 @@ def _render_attachment_inline(a: dict, key_suffix: str):
         )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 클립보드 이미지 붙여넣기 (Ctrl+V) 컴포넌트 + Streamlit file_uploader 합치기
+# Streamlit 1.54 file_uploader는 paste 이벤트를 지원하지 않으므로, 커스텀
+# HTML 컴포넌트에서 클립보드 이미지를 base64로 받아 UploadedFile 호환 객체로 감싼다.
+# ─────────────────────────────────────────────────────────────────────
+
+_CLIPBOARD_PASTE_COMPONENT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "components", "clipboard_paste"
+)
+try:
+    _clipboard_paste_component = components.declare_component(
+        "emons_clipboard_paste",
+        path=_CLIPBOARD_PASTE_COMPONENT_DIR,
+    )
+except Exception:
+    _clipboard_paste_component = None
+
+
+class _PastedUpload:
+    """Streamlit UploadedFile 호환 인터페이스. task_board.attach_file / _is_image_upload / _render_upload_preview 에서 그대로 사용 가능."""
+
+    def __init__(self, name: str, mime: str, data: bytes, paste_id: str = ""):
+        self.name = name
+        self.type = mime or "image/png"
+        self.size = len(data or b"")
+        self._data = bytes(data or b"")
+        self._pos = 0
+        self._paste_id = paste_id or ""
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            out = self._data[self._pos:]
+            self._pos = len(self._data)
+            return out
+        out = self._data[self._pos : self._pos + n]
+        self._pos += len(out)
+        return out
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = max(0, min(int(pos), len(self._data)))
+        elif whence == 1:
+            self._pos = max(0, min(self._pos + int(pos), len(self._data)))
+        elif whence == 2:
+            self._pos = max(0, min(len(self._data) + int(pos), len(self._data)))
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def close(self) -> None:
+        return None
+
+
+def _paste_mime_ext_ok(mime: str, allow_types: list | None) -> bool:
+    """단일 이미지 업로더의 type= 필터를 붙여넣기에도 적용."""
+    if not allow_types:
+        return True
+    ext = (mime or "").split("/")[-1].lower()
+    allowed = {str(t).lower().lstrip(".") for t in allow_types}
+    if ext == "jpeg" and "jpg" in allowed:
+        return True
+    if ext == "jpg" and "jpeg" in allowed:
+        return True
+    return ext in allowed
+
+
+def _file_input_with_paste(
+    label: str,
+    *,
+    key: str,
+    accept_multiple_files: bool = True,
+    type: list | None = None,
+    help: str | None = None,
+    paste_hint: bool = True,
+):
+    """st.file_uploader 대체. 붙여넣기(Ctrl+V) 이미지 첨부 지원.
+
+    - accept_multiple_files=True: 업로더 파일 + 붙여넣기 이미지들의 합쳐진 리스트 반환.
+    - accept_multiple_files=False: 업로더 파일 우선, 없으면 마지막 붙여넣기 이미지 반환.
+    - 붙여넣기 이미지는 세션에 누적되며, 「붙여넣기 지우기」로 리셋.
+    - `key` 는 해당 폼/입력 인스턴스마다 고유해야 하며, 폼 버전키를 포함해 리셋되도록 한다.
+    """
+    upload_key = f"{key}__upload"
+    paste_key = f"{key}__paste"
+    state_key = f"{key}__pasted_list"
+
+    uploader_files = st.file_uploader(
+        label,
+        accept_multiple_files=accept_multiple_files,
+        type=type,
+        key=upload_key,
+        help=help,
+    )
+
+    paste_val = None
+    if _clipboard_paste_component is not None:
+        try:
+            paste_val = _clipboard_paste_component(default=None, key=paste_key)
+        except Exception:
+            paste_val = None
+
+    pasted_list: list = list(st.session_state.get(state_key, []))
+    if isinstance(paste_val, dict) and paste_val.get("b64"):
+        pid = str(paste_val.get("id") or "")
+        already = any(getattr(p, "_paste_id", "") == pid for p in pasted_list) if pid else False
+        if not already:
+            mime = str(paste_val.get("mime") or "image/png")
+            if _paste_mime_ext_ok(mime, type):
+                try:
+                    import base64 as _b64
+                    data = _b64.b64decode(paste_val.get("b64") or "")
+                except Exception:
+                    data = b""
+                if data:
+                    name = str(paste_val.get("name") or f"paste_{pid or 'x'}.png")
+                    new_upload = _PastedUpload(name=name, mime=mime, data=data, paste_id=pid)
+                    if accept_multiple_files:
+                        pasted_list.append(new_upload)
+                    else:
+                        pasted_list = [new_upload]
+                    st.session_state[state_key] = pasted_list
+
+    if pasted_list:
+        _c1, _c2 = st.columns([5, 1])
+        _c1.caption(f"📋 클립보드 붙여넣기 이미지 {len(pasted_list)}개")
+        if _c2.button("붙여넣기 지우기", key=f"{key}__clear_paste"):
+            st.session_state[state_key] = []
+            st.rerun()
+    elif paste_hint and _clipboard_paste_component is None:
+        st.caption("(클립보드 붙여넣기 컴포넌트를 불러오지 못했습니다. 파일 선택으로만 첨부 가능합니다.)")
+
+    if accept_multiple_files:
+        base = list(uploader_files or [])
+        return base + list(pasted_list)
+    if uploader_files is not None:
+        return uploader_files
+    return pasted_list[-1] if pasted_list else None
+
+
+def _clear_pasted_files(key: str) -> None:
+    """폼 리셋/버전 증가 시 붙여넣기 상태도 함께 비운다."""
+    st.session_state.pop(f"{key}__pasted_list", None)
+
+
 def _render_upload_preview(files: list, cols_per_row: int = 4):
     """업로드 직전 파일들의 썸네일/메타 표시. 이미지는 미리보기, 그 외는 아이콘."""
     if not files:
@@ -22550,7 +22698,7 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
     for _prev_err in st.session_state.pop(err_key, []):
         st.error(_prev_err)
 
-    files = st.file_uploader(
+    files = _file_input_with_paste(
         "📎 파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
         accept_multiple_files=True,
         key=files_key,
@@ -22781,7 +22929,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
 
         # 증빙 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
         ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0))
-        files = st.file_uploader(
+        files = _file_input_with_paste(
             "📎 증빙 사진/파일 첨부 * (과거 결제본·신규 오프라인 결제본 등)",
             accept_multiple_files=True,
             key=f"pcr_files_{order_id}_{ver}",
@@ -22897,7 +23045,7 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
 
         # 파일 첨부 — 설명 바로 아래, 즉시 미리보기
         nt_files_key = f"nt_files_{nt_ver}"
-        nt_files = st.file_uploader(
+        nt_files = _file_input_with_paste(
             "📎 파일 첨부 (선택, 이미지·문서 등 모든 종류 다중 가능)",
             accept_multiple_files=True,
             key=nt_files_key,
@@ -23411,7 +23559,7 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     st.markdown("**📎 업무 첨부**")
     _task_file_ver_key = f"task_files_ver_{tid}"
     _task_file_ver = int(st.session_state.get(_task_file_ver_key, 0))
-    _task_files = st.file_uploader(
+    _task_files = _file_input_with_paste(
         "파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
         accept_multiple_files=True,
         key=f"task_files_{tid}_{_task_file_ver}",
@@ -23593,7 +23741,7 @@ def _render_post_comment_input(post_id: int, me_uname: str, parent_cid: int | No
     for _prev_err in st.session_state.pop(err_key, []):
         st.error(_prev_err)
 
-    files = st.file_uploader(
+    files = _file_input_with_paste(
         "📎 파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
         accept_multiple_files=True,
         key=files_key,
@@ -23761,7 +23909,7 @@ def _render_post_card(post: dict, me_uname: str, role: str):
             # 게시물 본문에 파일 추가 첨부
             _post_file_ver_key = f"post_files_ver_{pid}"
             _post_file_ver = int(st.session_state.get(_post_file_ver_key, 0))
-            _post_files = st.file_uploader(
+            _post_files = _file_input_with_paste(
                 "📎 게시물에 파일 첨부 (다중 가능)",
                 accept_multiple_files=True,
                 key=f"post_files_{pid}_{_post_file_ver}",
@@ -24654,7 +24802,7 @@ def _render_new_post_form(me_uname: str, store_name: str | None, role: str, stor
 
     # 파일 첨부 — 내용 바로 아래, 즉시 미리보기
     np_files_key = f"np_files_{np_ver}"
-    np_files = st.file_uploader(
+    np_files = _file_input_with_paste(
         "📎 파일 첨부 (선택, 이미지·문서 등 모든 종류 다중 가능)",
         accept_multiple_files=True,
         key=np_files_key,
@@ -27388,9 +27536,10 @@ def render_new_sales():
                 st.text_input(f"온누리 승인번호 뒤 4자리 #{i+1} *", key=last4_key, max_chars=4)
             else:
                 st.text_input(f"온누리 승인번호 전체 (8자리 이상) #{i+1} *", key=full_key)
-            st.file_uploader(
+            _file_input_with_paste(
                 "온누리상품권 영수증 사진(선택)",
                 type=["png", "jpg", "jpeg", "webp"],
+                accept_multiple_files=False,
                 key=receipt_key,
             )
         else:
@@ -28240,9 +28389,10 @@ def _customer_balance_payment_ui(
                 st.text_input(f"온누리 승인번호 뒤 4자리 #{i+1} *", key=last4_key, max_chars=4)
             else:
                 st.text_input(f"온누리 승인번호 전체 (8자리 이상) #{i+1} *", key=full_key)
-            st.file_uploader(
+            _file_input_with_paste(
                 f"온누리상품권 영수증 사진(선택) #{i+1}",
                 type=["png", "jpg", "jpeg", "webp"],
+                accept_multiple_files=False,
                 key=receipt_key,
             )
         else:
@@ -30663,9 +30813,10 @@ def render_customer_balance():
                                                             new_amount = _parse_comma_to_int(st.session_state.get(_pay_amt_key, "0"))
                                                             st.caption(f"현재: **{_old_amt_for_mode:,}원** → 변경 후: **{new_amount:,}원**")
                                                         del_reason = st.text_input("결제 변경 사유 (필수, 5자 이상)", key=f"pay_del_reason_{prow['id']}", placeholder="예: 카드 취소 후 현금 결제")
-                                                        receipt_upload = st.file_uploader(
+                                                        receipt_upload = _file_input_with_paste(
                                                             "📷 취소/재결제 영수증 사진 업로드",
                                                             type=["png", "jpg", "jpeg"],
+                                                            accept_multiple_files=False,
                                                             key=f"pay_receipt_{prow['id']}",
                                                         )
                                                         if st.button("수정 완료", key=f"pay_edit_{prow['id']}"):

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>clipboard_paste</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", "맑은 고딕", sans-serif;
+  }
+  .cp-wrap { padding: 2px 0 0 0; }
+  .cp-bar {
+    padding: 10px 12px;
+    border: 1.5px dashed #93a3b6;
+    border-radius: 8px;
+    background: #f7fafd;
+    color: #37474f;
+    font-size: 13px;
+    line-height: 1.5;
+    cursor: text;
+    outline: none;
+    user-select: none;
+    white-space: normal;
+    min-height: 22px;
+  }
+  .cp-bar:focus, .cp-bar.focused {
+    border-color: #4a6cf7;
+    background: #eef4ff;
+    box-shadow: 0 0 0 2px rgba(74, 108, 247, 0.08);
+  }
+  .cp-status { color: #607d8b; font-size: 12px; margin-top: 5px; padding: 0 2px; }
+  .cp-status.ok { color: #1b7f4b; }
+  .cp-status.err { color: #b3261e; }
+</style>
+</head>
+<body>
+<div class="cp-wrap">
+  <div id="bar" class="cp-bar" tabindex="0" contenteditable="true" spellcheck="false"
+       role="textbox" aria-label="클립보드 이미지 붙여넣기">
+    📋 이미지를 복사한 뒤 이 칸을 클릭하고 <b>Ctrl+V</b> 를 누르세요.
+  </div>
+  <div id="status" class="cp-status">클립보드의 이미지만 첨부되며, 텍스트 붙여넣기는 무시됩니다.</div>
+</div>
+<script>
+(function () {
+  var PROMPT_HTML = "📋 이미지를 복사한 뒤 이 칸을 클릭하고 <b>Ctrl+V</b> 를 누르세요.";
+  var bar = document.getElementById("bar");
+  var status = document.getElementById("status");
+
+  function post(msg) {
+    try { window.parent.postMessage(msg, "*"); } catch (e) {}
+  }
+  function sendReady() { post({ type: "streamlit:componentReady", apiVersion: 1 }); }
+  function sendHeight() {
+    var h = Math.max(64, Math.ceil(document.body.scrollHeight) + 4);
+    post({ type: "streamlit:setFrameHeight", height: h });
+  }
+  function sendValue(v) {
+    post({ type: "streamlit:setComponentValue", value: v, dataType: "json" });
+  }
+
+  function blobToBase64(blob) {
+    return new Promise(function (resolve, reject) {
+      var r = new FileReader();
+      r.onload = function () {
+        var s = String(r.result || "");
+        var idx = s.indexOf(",");
+        resolve(idx >= 0 ? s.substring(idx + 1) : "");
+      };
+      r.onerror = function (e) { reject(e); };
+      r.readAsDataURL(blob);
+    });
+  }
+
+  function pad2(n) { return String(n).padStart(2, "0"); }
+  function tsStr() {
+    var d = new Date();
+    return "" + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate())
+      + "_" + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+  }
+  function rand(n) { return Math.random().toString(36).slice(2, 2 + (n || 6)); }
+
+  bar.addEventListener("focus", function () {
+    bar.classList.add("focused");
+    status.textContent = "이 칸이 활성화되었습니다. 이제 Ctrl+V 로 붙여넣어 주세요.";
+    status.className = "cp-status";
+  });
+  bar.addEventListener("blur", function () { bar.classList.remove("focused"); });
+
+  bar.addEventListener("paste", async function (e) {
+    e.preventDefault();
+    var items = (e.clipboardData || window.clipboardData || {}).items || [];
+    var found = null;
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it && it.kind === "file" && it.type && it.type.indexOf("image/") === 0) {
+        var blob = it.getAsFile();
+        if (!blob) continue;
+        try {
+          var b64 = await blobToBase64(blob);
+          var mime = it.type;
+          var ext = (mime.split("/")[1] || "png").split("+")[0].replace(/[^a-z0-9]/gi, "") || "png";
+          var name = "paste_" + tsStr() + "_" + rand(4) + "." + ext;
+          found = {
+            id: Date.now() + "_" + rand(8),
+            name: name,
+            mime: mime,
+            size: blob.size,
+            b64: b64
+          };
+        } catch (err) {}
+        break;
+      }
+    }
+    bar.innerHTML = PROMPT_HTML;
+    if (found) {
+      status.textContent = "✅ 이미지 붙여넣기 완료 · " + found.name
+        + " (" + Math.max(1, Math.round(found.size / 1024)) + " KB)";
+      status.className = "cp-status ok";
+      sendValue(found);
+    } else {
+      status.textContent = "⚠️ 클립보드에 이미지가 없습니다. 이미지를 먼저 복사해 주세요.";
+      status.className = "cp-status err";
+    }
+    setTimeout(sendHeight, 30);
+  });
+
+  bar.addEventListener("keydown", function (e) {
+    var isPaste = (e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V");
+    if (!isPaste) e.preventDefault();
+  });
+  bar.addEventListener("beforeinput", function (e) {
+    if (e.inputType && e.inputType !== "insertFromPaste") e.preventDefault();
+  });
+  bar.addEventListener("drop", function (e) { e.preventDefault(); });
+
+  window.addEventListener("load", function () {
+    sendReady();
+    setTimeout(sendHeight, 30);
+  });
+})();
+</script>
+</body>
+</html>
