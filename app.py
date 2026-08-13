@@ -273,6 +273,7 @@ _SUPERADMIN_MENUS = [
 def _get_sales_tab_labels(role: str) -> list[str]:
     """일반/매장관리자 세일즈 메뉴 라벨. main() 콘텐츠 디스패치 인덱스와 1:1 대응."""
     if role == "store_admin":
+        # 매장 관리자 메뉴(직원 마스터 등)는 ⚙️ 관리자 설정 최상단으로 이동됨.
         return [
             "1. 대시보드",
             "2. 마케팅 인사이트",
@@ -281,14 +282,13 @@ def _get_sales_tab_labels(role: str) -> list[str]:
             "5. 새로운 매출 등록",
             "6. 고객 및 잔금 관리",
             "7. 입금 관리",
-            "8. 매장 관리자 메뉴",
-            "9. 결제수단별 집계표",
-            "10. 고객 CRM 자동화",
-            "11. 세일즈 퍼포먼스",
-            "12. 전시품 판매 검증",
-            "13. FAQ (도움말)",
-            "14. AI 세일즈 리포트",
-            "15. 🗺️ 상권 퍼포먼스 맵",
+            "8. 결제수단별 집계표",
+            "9. 고객 CRM 자동화",
+            "10. 세일즈 퍼포먼스",
+            "11. 전시품 판매 검증",
+            "12. FAQ (도움말)",
+            "13. AI 세일즈 리포트",
+            "14. 🗺️ 상권 퍼포먼스 맵",
         ]
     return [
         "1. 대시보드",
@@ -557,7 +557,7 @@ def _render_primary_nav(user: dict, role: str) -> None:
         unsafe_allow_html=True,
     )
 
-    # 🔔 인앱 알림 배지
+    # 🔔 인앱 알림 배지 — 클릭 시 해당 업무(결제변경 검증 등)로 이동
     try:
         import task_board as _tb_noti  # noqa: WPS433
         _noti_uname = user.get("username") or ""
@@ -569,14 +569,29 @@ def _render_primary_nav(user: dict, role: str) -> None:
                 f" text-align:center; margin-bottom:5px;'>🔔 미확인 알림 {_noti_cnt}건</div>",
                 unsafe_allow_html=True,
             )
+            st.caption("알림을 누르면 해당 업무 상세로 이동합니다.")
             _recent_notis = _tb_noti.load_my_notifications_cached(_noti_uname, unread_only=True, limit=3)
             for _noti in _recent_notis:
-                st.markdown(
-                    f"<div style='background:#fef2f2; border-left:3px solid #ef4444;"
-                    f" padding:4px 8px; border-radius:4px; margin-bottom:3px;"
-                    f" font-size:0.75rem;'>🔵 {_noti.get('message','')}</div>",
-                    unsafe_allow_html=True,
-                )
+                _nid = _noti.get("id")
+                _tid = _noti.get("task_id")
+                _msg = str(_noti.get("message") or "").strip() or "(내용 없음)"
+                _label = _msg if len(_msg) <= 72 else (_msg[:69] + "…")
+                if _tid:
+                    if st.button(
+                        f"🔵 {_label}",
+                        key=f"sidebar_noti_open_{_nid}",
+                        help="클릭하면 사내업무에서 해당 건을 엽니다.",
+                        width="stretch",
+                    ):
+                        _navigate_to_internal_task(int(_tid), noti_id=int(_nid) if _nid else None)
+                        st.rerun()
+                else:
+                    st.markdown(
+                        f"<div style='background:#fef2f2; border-left:3px solid #ef4444;"
+                        f" padding:4px 8px; border-radius:4px; margin-bottom:3px;"
+                        f" font-size:0.75rem;'>🔵 {html.escape(_msg)}</div>",
+                        unsafe_allow_html=True,
+                    )
             if st.button("✅ 모두 읽음 처리", key="sidebar_noti_read_all", width="stretch"):
                 _tb_noti.mark_all_read(_noti_uname)
                 st.rerun()
@@ -1697,6 +1712,209 @@ def _kpi_sanitize_employee_label(raw: object) -> str:
     return ",".join(emps) if emps else ""
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 직원 KPI 가중치 (매장별/전체통합 × 연월 단위) — Supabase app_employee_kpi_weights
+# 설정이 없으면 기본값 70/15/5/10 사용. 과거 월은 그 월에 저장된 값을 그대로 사용.
+# ─────────────────────────────────────────────────────────────────────
+
+DEFAULT_KPI_WEIGHTS = {"revenue": 70.0, "margin": 15.0, "display": 5.0, "cash": 10.0}
+KPI_WEIGHTS_ALL_SCOPE = "__all__"
+
+
+def _kpi_weights_ym(year: int, month: int) -> str:
+    return f"{int(year):04d}-{int(month):02d}"
+
+
+def _kpi_weights_from_row(row: dict | None) -> dict:
+    """DB row → 가중치 dict. 결측 필드는 기본값으로 폴백."""
+    if not row:
+        return dict(DEFAULT_KPI_WEIGHTS)
+    def _f(k, dv):
+        v = row.get(k)
+        try:
+            return float(v) if v is not None else float(dv)
+        except (TypeError, ValueError):
+            return float(dv)
+    return {
+        "revenue": _f("w_revenue", DEFAULT_KPI_WEIGHTS["revenue"]),
+        "margin":  _f("w_margin",  DEFAULT_KPI_WEIGHTS["margin"]),
+        "display": _f("w_display", DEFAULT_KPI_WEIGHTS["display"]),
+        "cash":    _f("w_cash",    DEFAULT_KPI_WEIGHTS["cash"]),
+    }
+
+
+@st.cache_data(ttl=120)
+def _load_kpi_weights_cached(scope_key: str, year_month: str) -> dict:
+    """(scope, YYYY-MM) 가중치를 캐시로 조회. 없으면 기본값. 저장/삭제 후 clear() 필수."""
+    if not scope_key or not year_month:
+        return dict(DEFAULT_KPI_WEIGHTS)
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return dict(DEFAULT_KPI_WEIGHTS)
+        r = (
+            sc.table("app_employee_kpi_weights")
+            .select("w_revenue, w_margin, w_display, w_cash")
+            .eq("db_filename", scope_key)
+            .eq("year_month", year_month)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            return dict(DEFAULT_KPI_WEIGHTS)
+        return _kpi_weights_from_row(rows[0])
+    except Exception:
+        return dict(DEFAULT_KPI_WEIGHTS)
+
+
+def load_kpi_weights(db_filename: str | None, year: int, month: int, *, all_stores: bool = False) -> dict:
+    """앱 코드에서 호출하는 공개 헬퍼. all_stores=True면 __all__ 스코프.
+    개별 매장은 db_filename 필수. 잘못된 인자는 기본값 반환."""
+    ym = _kpi_weights_ym(year, month)
+    scope = KPI_WEIGHTS_ALL_SCOPE if all_stores else (db_filename or "")
+    if not scope:
+        return dict(DEFAULT_KPI_WEIGHTS)
+    return _load_kpi_weights_cached(scope, ym)
+
+
+def save_kpi_weights(
+    scope_key: str,
+    year: int,
+    month: int,
+    weights: dict,
+    updated_by: str | None,
+) -> tuple[bool, str | None]:
+    """(scope, YYYY-MM) upsert. 합=100 검증."""
+    if not scope_key:
+        return False, "스코프가 지정되지 않았습니다."
+    try:
+        w = {
+            "w_revenue": float(weights.get("revenue", 0)),
+            "w_margin":  float(weights.get("margin", 0)),
+            "w_display": float(weights.get("display", 0)),
+            "w_cash":    float(weights.get("cash", 0)),
+        }
+    except (TypeError, ValueError):
+        return False, "가중치는 숫자여야 합니다."
+    total = w["w_revenue"] + w["w_margin"] + w["w_display"] + w["w_cash"]
+    if abs(total - 100.0) > 0.01:
+        return False, f"가중치 합이 100이 아닙니다. (현재 합: {total:g})"
+    if any(v < 0 for v in w.values()):
+        return False, "가중치는 0 이상이어야 합니다."
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return False, err or "Supabase 연결 불가"
+        payload = {
+            "db_filename": scope_key,
+            "year_month": _kpi_weights_ym(year, month),
+            **w,
+            "updated_by": (updated_by or "").strip() or None,
+            "updated_at": datetime.now(tz=KST).isoformat(),
+        }
+        sc.table("app_employee_kpi_weights").upsert(
+            payload, on_conflict="db_filename,year_month"
+        ).execute()
+        _load_kpi_weights_cached.clear()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def delete_kpi_weights(scope_key: str, year: int, month: int) -> tuple[bool, str | None]:
+    """(scope, YYYY-MM) 삭제 → 기본값(70/15/5/10) 폴백."""
+    if not scope_key:
+        return False, "스코프가 지정되지 않았습니다."
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return False, err or "Supabase 연결 불가"
+        sc.table("app_employee_kpi_weights").delete()\
+            .eq("db_filename", scope_key)\
+            .eq("year_month", _kpi_weights_ym(year, month))\
+            .execute()
+        _load_kpi_weights_cached.clear()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def list_kpi_weights(scope_key: str, limit: int = 24) -> list[dict]:
+    """스코프의 최근 저장 목록(최신 연월 순). 관리자 설정 UI에서 표시용."""
+    if not scope_key:
+        return []
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return []
+        r = (
+            sc.table("app_employee_kpi_weights")
+            .select("year_month, w_revenue, w_margin, w_display, w_cash, updated_by, updated_at")
+            .eq("db_filename", scope_key)
+            .order("year_month", desc=True)
+            .limit(int(limit))
+            .execute()
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _kpi_score_col_names(w: dict) -> dict:
+    """가중치 dict → 표시용 점수 컬럼명. 소수는 첫자리, 정수는 정수로."""
+    def _fmt(v: float) -> str:
+        v = float(v or 0)
+        return f"{v:g}"
+    return {
+        "revenue": f"매출 점수({_fmt(w['revenue'])})",
+        "margin":  f"마진 점수({_fmt(w['margin'])})",
+        "display": f"전시품 점수({_fmt(w['display'])})",
+        "cash":    f"현금수금 점수({_fmt(w['cash'])})",
+    }
+
+
+def _apply_kpi_score_columns(emp_df: "pd.DataFrame", w: dict) -> tuple["pd.DataFrame", dict]:
+    """emp_df(revenue/margin/display_sales/kpi_receipt 합계 열 보유)에 점수·종합 열 추가.
+    반환: (emp_df, {'revenue': 컬럼명, 'margin': ..., 'display': ..., 'cash': ..., 'total': '종합 점수'})"""
+    if emp_df is None or emp_df.empty:
+        return emp_df, {**_kpi_score_col_names(w), "total": "종합 점수"}
+    total_revenue = float(emp_df["revenue"].sum() or 0)
+    total_margin = float(emp_df["margin"].sum() or 0)
+    total_display = float(emp_df["display_sales"].sum() or 0)
+    total_cash = float(emp_df["kpi_receipt"].sum() or 0)
+    cols = _kpi_score_col_names(w)
+    emp_df[cols["revenue"]] = (
+        (emp_df["revenue"] / total_revenue * float(w["revenue"])) if total_revenue else 0.0
+    )
+    emp_df[cols["margin"]] = (
+        (emp_df["margin"] / total_margin * float(w["margin"])) if total_margin else 0.0
+    )
+    emp_df[cols["display"]] = (
+        (emp_df["display_sales"] / total_display * float(w["display"])) if total_display else 0.0
+    )
+    emp_df[cols["cash"]] = (
+        (emp_df["kpi_receipt"] / total_cash * float(w["cash"])) if total_cash else 0.0
+    )
+    for _k in ("revenue", "margin", "display", "cash"):
+        emp_df[cols[_k]] = pd.to_numeric(emp_df[cols[_k]], errors="coerce").fillna(0.0).round(1)
+    emp_df["종합 점수"] = (
+        emp_df[cols["revenue"]] + emp_df[cols["margin"]]
+        + emp_df[cols["display"]] + emp_df[cols["cash"]]
+    ).round(1)
+    return emp_df, {**cols, "total": "종합 점수"}
+
+
+def _kpi_weights_caption(w: dict) -> str:
+    """캡션에 사용할 종합 점수 공식 문자열."""
+    def _fmt(v: float) -> str:
+        return f"{float(v or 0):g}"
+    return (
+        f"매출 {_fmt(w['revenue'])} + 마진 {_fmt(w['margin'])} "
+        f"+ 전시품 {_fmt(w['display'])} + 현금수금 {_fmt(w['cash'])}"
+    )
+
+
 def _fetch_order_employee_names_map_by_ids(db_filename: str, order_ids: list) -> dict[int, str]:
     """order_id → 주문 테이블의 최신 employee_names (Supabase app_orders 또는 SQLite Orders)."""
     out: dict[int, str] = {}
@@ -2570,6 +2788,111 @@ def _ph_blob_amount(blob: dict) -> float:
         except (TypeError, ValueError):
             pass
     return 0.0
+
+
+def _ph_blob_to_pcr_fields(blob: dict) -> dict:
+    """app_payment_history old/new JSON → PCR용 {amount, method, onnuri, payment_id}."""
+    if not isinstance(blob, dict):
+        return {}
+    pay = blob.get("payment") if isinstance(blob.get("payment"), dict) else blob
+    if not isinstance(pay, dict) or not pay:
+        return {}
+    method = str(pay.get("method") or pay.get("payment_method") or "").strip()
+    cc = str(pay.get("card_company") or "").strip()
+    if cc in ("None", "nan", "none"):
+        cc = ""
+    onnuri = str(pay.get("onnuri") or pay.get("onnuri_approval_code") or "").strip()
+    if not onnuri and "온누리" in method and cc:
+        onnuri = cc
+    try:
+        amount = float(pay.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return {
+        "amount": amount,
+        "method": method,
+        "onnuri": onnuri,
+        "payment_id": pay.get("payment_id"),
+    }
+
+
+def _load_latest_payment_history_for_pcr(db_filename: str, sale_id: int) -> dict | None:
+    """주문별 최신 결제변경/취소 이력 1건. original/new는 PCR 필드 형태."""
+    if not db_filename or not sale_id:
+        return None
+    try:
+        if not _supabase_orders_payments_available():
+            return None
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return None
+        r = (
+            sc.table("app_payment_history")
+            .select("action_type, old_payment_data, new_payment_data, changed_at, reason")
+            .eq("db_filename", db_filename)
+            .eq("sale_id", int(sale_id))
+            .in_("action_type", ["결제변경", "결제취소"])
+            .order("changed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        old_blob = _dashboard_parse_ph_payload(row.get("old_payment_data"))
+        new_blob = _dashboard_parse_ph_payload(row.get("new_payment_data"))
+        return {
+            "action_type": row.get("action_type"),
+            "changed_at": row.get("changed_at"),
+            "reason": row.get("reason"),
+            "original": _ph_blob_to_pcr_fields(old_blob),
+            "new": _ph_blob_to_pcr_fields(new_blob),
+        }
+    except Exception:
+        return None
+
+
+def _pcr_display_meta_from_history(meta: dict) -> tuple[dict, str | None]:
+    """저장된 PCR 메타의 원본이 변경 후 결제행과 같으면 이력 기준으로 보정한 display meta 반환."""
+    if not isinstance(meta, dict):
+        return meta, None
+    db_filename = meta.get("db_filename")
+    sale_id = meta.get("sale_id")
+    if not db_filename or sale_id in (None, ""):
+        return meta, None
+    try:
+        sale_id_i = int(sale_id)
+    except (TypeError, ValueError):
+        return meta, None
+    hist = _load_latest_payment_history_for_pcr(str(db_filename), sale_id_i)
+    if not hist or not hist.get("original"):
+        return meta, None
+    ho = hist["original"]
+    hn = hist.get("new") or {}
+    hist_om = str(ho.get("method") or "").strip()
+    meta_om = str(meta.get("original_method") or "").strip()
+    meta_nm = str(meta.get("new_method") or "").strip()
+    # 원본이 이력과 다르거나, 원본==변경후(사후 조회 버그 패턴)이면 이력 우선
+    suspicious_same = bool(meta_om) and meta_om == meta_nm
+    if not hist_om:
+        return meta, None
+    if hist_om == meta_om and not suspicious_same:
+        return meta, None
+    display = dict(meta)
+    display["original_amount"] = ho.get("amount")
+    display["original_method"] = ho.get("method") or meta.get("original_method")
+    display["original_onnuri"] = ho.get("onnuri") or meta.get("original_onnuri")
+    if hn.get("method") or hn.get("amount") not in (None, "", 0, 0.0):
+        display["new_amount"] = hn.get("amount") if hn.get("amount") is not None else meta.get("new_amount")
+        display["new_method"] = hn.get("method") or meta.get("new_method")
+        if hn.get("onnuri"):
+            display["new_onnuri"] = hn.get("onnuri")
+    note = (
+        "저장된 검증 메타의 원본이 변경 후 결제행 기준으로 잘못 기록된 것으로 보여 "
+        "결제변경 이력 기준으로 표시합니다."
+    )
+    return display, note
 
 
 def _dashboard_cancel_reduce_totals_from_ph(
@@ -8014,6 +8337,268 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
                         st.caption(f"방문·구매 조합 히트맵 생략: {_e}")
 
 
+def _mi_order_id_col(df: pd.DataFrame) -> str | None:
+    """orders↔customers merge 후 주문 id 컬럼명 해석 (id_x / id / order_id)."""
+    for c in ("id_x", "id", "order_id"):
+        if c in df.columns:
+            return c
+    return None
+
+
+def _mi_render_analysis_source_toggle(key_prefix: str) -> str:
+    """분석 소스 토글. 반환: 'header' | 'line'."""
+    _opts = {
+        "header": "현장 주문 헤더 (판매자 입력 category)",
+        "line": "원장 라인 + 대분류 (taxonomy)",
+    }
+    choice = st.radio(
+        "분석 소스",
+        options=list(_opts.keys()),
+        format_func=lambda k: _opts[k],
+        horizontal=True,
+        key=f"{key_prefix}_analysis_source",
+        help="카테고리 인기·다면분석 품목 차원에만 적용됩니다. 금액 KPI는 항상 헤더 total_amount입니다.",
+    )
+    if choice == "line":
+        st.info(
+            "카테고리 인기·다면분석 품목 차원: **라인 + taxonomy 대분류** 주문 수(distinct). "
+            "금액 KPI·방문/구매 이유·지도는 항상 헤더 `total_amount`. 라인 없는 주문은 카테고리에서 제외."
+        )
+    else:
+        st.info(
+            "카테고리 인기·다면분석 품목 차원: **주문 헤더 category** 건수. "
+            "금액 KPI·방문/구매 이유·지도는 항상 헤더 `total_amount`."
+        )
+    return choice if choice in ("header", "line") else "header"
+
+
+def _mi_line_category_order_counts(df_period: pd.DataFrame, tax_map: dict) -> pd.DataFrame:
+    """라인 아이템 → taxonomy 대분류별 distinct order_id 건수. 컬럼: 품목, 판매건수."""
+    empty = pd.DataFrame(columns=["품목", "판매건수"])
+    oid_col = _mi_order_id_col(df_period)
+    if oid_col is None or df_period is None or df_period.empty:
+        return empty
+    oids = [int(x) for x in df_period[oid_col].dropna().unique().tolist()]
+    if not oids:
+        return empty
+    try:
+        import product_taxonomy_service as _pts
+        client, _err = get_supabase_client()
+        if client is None:
+            return empty
+        items = _pts.load_order_items_batched(client, oids, columns="order_id, product_name")
+    except Exception as _e:
+        st.warning(f"라인 카테고리 집계 실패: {_e}")
+        return empty
+    if items is None or items.empty:
+        return empty
+    items = items.copy()
+    items["product_name"] = items["product_name"].fillna("").astype(str).str.strip()
+    items = items[items["product_name"] != ""]
+    if items.empty:
+        return empty
+    _tax = tax_map or {}
+    items["품목"] = items["product_name"].map(lambda n: _tax.get(n, "(미분류)"))
+    counts = (
+        items.groupby("품목", as_index=False)["order_id"]
+        .nunique()
+        .rename(columns={"order_id": "판매건수"})
+        .sort_values("판매건수", ascending=False)
+    )
+    return counts.reset_index(drop=True)
+
+
+def _mi_overlay_line_taxonomy_categories(merged: pd.DataFrame) -> pd.DataFrame:
+    """라인+taxonomy 대분류를 주문 단위 comma-join 해 category 컬럼에 덮어쓴다 (금액 컬럼 불변)."""
+    out = merged.copy() if merged is not None else pd.DataFrame()
+    oid_col = _mi_order_id_col(out)
+    if oid_col is None or out.empty:
+        return out
+    oids = [int(x) for x in out[oid_col].dropna().unique().tolist()]
+    if not oids:
+        out["category"] = ""
+        return out
+    try:
+        import product_taxonomy_service as _pts
+        client, _err = get_supabase_client()
+        if client is None:
+            return out
+        items = _pts.load_order_items_batched(client, oids, columns="order_id, product_name")
+    except Exception as _e:
+        st.warning(f"라인 대분류 오버레이 실패: {_e}")
+        return out
+    if items is None or items.empty:
+        out["category"] = ""
+        return out
+    items = items.copy()
+    items["product_name"] = items["product_name"].fillna("").astype(str).str.strip()
+    items = items[items["product_name"] != ""]
+    _tax = _cached_taxonomy_map()
+    items["_cat"] = items["product_name"].map(lambda n: _tax.get(n, "(미분류)"))
+    cat_by_oid = (
+        items.groupby("order_id")["_cat"]
+        .apply(lambda s: ",".join(sorted({str(x) for x in s if str(x).strip()})))
+        .to_dict()
+    )
+    out["category"] = out[oid_col].map(lambda x: cat_by_oid.get(int(x), "") if pd.notna(x) else "")
+    return out
+
+
+def _build_header_line_discrepancy_df(orders_df: pd.DataFrame) -> pd.DataFrame:
+    """헤더 total_amount/cost_price vs 라인 line_total/line_cost 차이 DataFrame."""
+    cols = [
+        "주문ID", "주문일", "import_source",
+        "헤더매출", "라인매출합", "매출차이",
+        "헤더원가", "라인원가합", "원가차이",
+        "라인수", "헤더카테고리",
+    ]
+    oid_col = _mi_order_id_col(orders_df)
+    if oid_col is None or orders_df is None or orders_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = orders_df.copy()
+    oids = [int(x) for x in df[oid_col].dropna().unique().tolist()]
+    items = pd.DataFrame()
+    if oids:
+        try:
+            import product_taxonomy_service as _pts
+            client, _err = get_supabase_client()
+            if client is not None:
+                items = _pts.load_order_items_batched(
+                    client, oids,
+                    columns="order_id, line_cost, line_total, product_name",
+                )
+        except Exception as _e:
+            st.warning(f"라인 아이템 조회 실패(정합성): {_e}")
+            items = pd.DataFrame()
+
+    if items is not None and not items.empty:
+        items = items.copy()
+        for _c in ("line_cost", "line_total"):
+            if _c in items.columns:
+                items[_c] = pd.to_numeric(items[_c], errors="coerce").fillna(0)
+            else:
+                items[_c] = 0
+        agg = (
+            items.groupby("order_id", as_index=False)
+            .agg(라인매출합=("line_total", "sum"), 라인원가합=("line_cost", "sum"), 라인수=("order_id", "count"))
+        )
+    else:
+        agg = pd.DataFrame(columns=["order_id", "라인매출합", "라인원가합", "라인수"])
+
+    out = pd.DataFrame()
+    out["주문ID"] = df[oid_col].map(lambda x: int(x) if pd.notna(x) else None)
+    out["주문일"] = df["order_date"] if "order_date" in df.columns else None
+    out["import_source"] = df["import_source"] if "import_source" in df.columns else None
+    out["헤더매출"] = pd.to_numeric(df["total_amount"], errors="coerce").fillna(0) if "total_amount" in df.columns else 0.0
+    out["헤더원가"] = pd.to_numeric(df["cost_price"], errors="coerce").fillna(0) if "cost_price" in df.columns else 0.0
+    out["헤더카테고리"] = df["category"].fillna("").astype(str) if "category" in df.columns else ""
+    out = out.merge(agg, left_on="주문ID", right_on="order_id", how="left")
+    if "order_id" in out.columns:
+        out = out.drop(columns=["order_id"])
+    out["라인매출합"] = pd.to_numeric(out.get("라인매출합"), errors="coerce").fillna(0)
+    out["라인원가합"] = pd.to_numeric(out.get("라인원가합"), errors="coerce").fillna(0)
+    out["라인수"] = pd.to_numeric(out.get("라인수"), errors="coerce").fillna(0).astype(int)
+    out["매출차이"] = out["헤더매출"] - out["라인매출합"]
+    out["원가차이"] = out["헤더원가"] - out["라인원가합"]
+    return out[cols]
+
+
+def _render_header_line_discrepancy_report(
+    merged: pd.DataFrame,
+    range_start_a: date,
+    range_end_a: date,
+    range_start_b: date,
+    range_end_b: date,
+    key_prefix: str,
+) -> None:
+    """다중기간 비교와 다면분석 사이 — 헤더↔라인 금액/원가 정합성 expander."""
+    with st.expander("헤더 ↔ 라인 정합성", expanded=False):
+        st.caption(
+            "주문 헤더(`total_amount`·`cost_price`)와 라인 합(`line_total`·`line_cost`)의 차이를 점검합니다. "
+            "자동 보정하지 않으며, 현장 판매 금액과 원장 라인은 별개 진실로 취급합니다. "
+            "비교 기간 A∪B 주문 기준입니다."
+        )
+        if merged is None or merged.empty:
+            st.info("분석할 주문이 없습니다.")
+            return
+        df = merged.copy()
+        df["order_date"] = pd.to_datetime(df["order_date"], errors="coerce")
+        df = df[df["order_date"].notna()]
+        if df.empty:
+            st.info("유효한 주문일이 없습니다.")
+            return
+        df["_dt"] = df["order_date"].dt.date
+        _mask = (
+            ((df["_dt"] >= range_start_a) & (df["_dt"] <= range_end_a))
+            | ((df["_dt"] >= range_start_b) & (df["_dt"] <= range_end_b))
+        )
+        scoped = df[_mask]
+        if scoped.empty:
+            st.info("분석 적용 기간(A∪B)에 주문이 없습니다.")
+            return
+
+        with st.spinner("헤더/라인 정합성 계산 중..."):
+            report = _build_header_line_discrepancy_df(scoped)
+
+        if report.empty:
+            st.info("정합성 리포트를 만들 수 없습니다.")
+            return
+
+        _has_line = report["라인수"] > 0
+        _amt_diff = report["매출차이"].abs() > 0.5
+        _cost_diff = report["원가차이"].abs() > 0.5
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("라인 있는 주문", f"{int(_has_line.sum()):,}건")
+        m2.metric("|매출차이|>0", f"{int((_has_line & _amt_diff).sum()):,}건")
+        m3.metric("|원가차이|>0", f"{int((_has_line & _cost_diff).sum()):,}건")
+        m4.metric(
+            "차이 합계(매출)",
+            f"{float(report.loc[_has_line, '매출차이'].sum()):,.0f}원",
+        )
+
+        show_all = st.checkbox(
+            "전체 표시 (라인 없는 주문 포함)",
+            value=False,
+            key=f"{key_prefix}_disc_show_all",
+        )
+        if show_all:
+            view = report
+        else:
+            view = report[_has_line & (_amt_diff | _cost_diff)].copy()
+            if view.empty:
+                st.success("라인 있는 주문 중 매출·원가 차이가 없습니다.")
+                view = report[_has_line].copy()
+
+        st.dataframe(
+            view,
+            width="stretch",
+            hide_index=True,
+            key=f"{key_prefix}_disc_df",
+            column_config={
+                "헤더매출": st.column_config.NumberColumn("헤더매출", format="%,.0f"),
+                "라인매출합": st.column_config.NumberColumn("라인매출합", format="%,.0f"),
+                "매출차이": st.column_config.NumberColumn("매출차이", format="%,.0f"),
+                "헤더원가": st.column_config.NumberColumn("헤더원가", format="%,.0f"),
+                "라인원가합": st.column_config.NumberColumn("라인원가합", format="%,.0f"),
+                "원가차이": st.column_config.NumberColumn("원가차이", format="%,.0f"),
+                "라인수": st.column_config.NumberColumn("라인수", format="%d"),
+            },
+            height=min(420, 80 + max(len(view), 1) * 28),
+        )
+        try:
+            _csv = view.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "CSV 다운로드",
+                data=_csv,
+                file_name=f"header_line_discrepancy_{key_prefix}.csv",
+                mime="text/csv",
+                key=f"{key_prefix}_disc_csv",
+            )
+        except Exception as _csv_e:
+            st.caption(f"CSV 생성 생략: {_csv_e}")
+
+
 def _render_marketing_multi_period_comparison(
     merged_all: pd.DataFrame,
     range_start_a: date,
@@ -8021,12 +8606,15 @@ def _render_marketing_multi_period_comparison(
     range_start_b: date,
     range_end_b: date,
     key_prefix: str,
+    analysis_source: str = "header",
 ):
     """
     다중 기간 교차 분석: 기간 A vs 기간 B로 4대 마케팅 지표를 좌우 비교.
     merged_all에는 order_date, total_amount, visit_reason, purchase_reason, category, name, address 필요.
+    analysis_source: 'header' | 'line' — ③ 카테고리 집계 소스 (금액 KPI는 항상 헤더).
     모든 st.plotly_chart / st.dataframe / st_folium에 key_prefix 기반 고유 key 부여.
     """
+    _src = analysis_source if analysis_source in ("header", "line") else "header"
     merged_all = merged_all.copy()
     merged_all["order_date"] = pd.to_datetime(merged_all["order_date"], errors="coerce")
     merged_all = merged_all[merged_all["order_date"].notna()]
@@ -8114,12 +8702,18 @@ def _render_marketing_multi_period_comparison(
 
     # ---------- ③ 카테고리별 인기 품목 Top 10: 가로형 막대 또는 DataFrame ----------
     st.subheader("③ 카테고리별 인기 품목 (Top 10)")
-    st.caption(
-        "app_orders.category 값이 매입 원장 임포트로 들어온 원본 품목명(예: '공용평상형침대깔판(QK)…')이면, "
-        "품목 분류 관리(taxonomy) 매핑으로 정규화된 대분류로 바꿔서 집계합니다. "
-        "모모 직접 등록 주문처럼 이미 카테고리로 깨끗하게 저장된 값은 그대로 사용합니다."
-    )
     _tax_map_c3 = _cached_taxonomy_map()
+    if _src == "line":
+        st.caption(
+            "분석 소스=원장 라인: `app_order_items` → taxonomy 대분류별 **주문 수(distinct order_id)**. "
+            "헤더 금액을 품목에 분배하지 않습니다. 라인 없는 주문은 제외됩니다."
+        )
+    else:
+        st.caption(
+            "분석 소스=현장 헤더: `app_orders.category` 건수. "
+            "매입 원장 임포트로 들어온 원본 품목명이면 taxonomy 매핑으로 정규화하고, "
+            "모모 직접 등록처럼 이미 카테고리로 저장된 값은 그대로 사용합니다."
+        )
 
     def _normalize_category_str(raw: str) -> str:
         raw = (raw or "").strip()
@@ -8127,37 +8721,47 @@ def _render_marketing_multi_period_comparison(
             return raw
         return _tax_map_c3.get(raw, raw)
 
+    def _header_category_top10(_df: pd.DataFrame) -> pd.DataFrame:
+        cats = _df["category"].fillna("").map(_normalize_category_str).str.split(",").explode().str.strip()
+        cats = cats[cats != ""]
+        top = cats.value_counts().reset_index().head(10)
+        top.columns = ["품목", "판매건수"]
+        top["순위"] = range(1, len(top) + 1)
+        return top
+
+    def _render_category_top10_panel(_df: pd.DataFrame, _label: str, _side_key: str, _side_label: str) -> None:
+        st.caption(f"기간 {_side_label}: {_label}")
+        if _src == "line":
+            cat = _mi_line_category_order_counts(_df, _tax_map_c3).head(10).copy()
+            if not cat.empty:
+                cat["순위"] = range(1, len(cat) + 1)
+            _title = "대분류별 주문 수 Top 10"
+            _hover = "%{y}<br>주문 수: %{x:,}건<extra></extra>"
+            _xaxis = "주문 수"
+        else:
+            cat = _header_category_top10(_df)
+            _title = "품목별 판매 횟수 Top 10"
+            _hover = "%{y}<br>판매 횟수: %{x:,}건<extra></extra>"
+            _xaxis = "판매 횟수"
+        if len(cat) == 0:
+            st.info("데이터 없음")
+            return
+        fig = px.bar(cat, x="판매건수", y="품목", orientation="h", title=_title)
+        fig.update_traces(hovertemplate=_hover)
+        fig.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title=_xaxis, yaxis_title="")
+        st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_category_top10_{_side_key}")
+        st.dataframe(
+            cat[["순위", "품목", "판매건수"]],
+            width="stretch",
+            key=f"{key_prefix}_category_df_{_side_key}",
+            height=min(280, 50 + len(cat) * 32),
+        )
+
     c1, c2 = st.columns(2)
     with c1:
-        st.caption(f"기간 A: {label_a}")
-        cats_a = df_period_a["category"].fillna("").map(_normalize_category_str).str.split(",").explode().str.strip()
-        cats_a = cats_a[cats_a != ""]
-        cat_a = cats_a.value_counts().reset_index().head(10)
-        cat_a.columns = ["품목", "판매건수"]
-        cat_a["순위"] = range(1, len(cat_a) + 1)
-        if len(cat_a) == 0:
-            st.info("데이터 없음")
-        else:
-            fig_a3 = px.bar(cat_a, x="판매건수", y="품목", orientation="h", title="품목별 판매 횟수 Top 10")
-            fig_a3.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
-            fig_a3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig_a3, width='stretch', key=f"{key_prefix}_category_top10_a")
-            st.dataframe(cat_a[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_a", height=min(280, 50 + len(cat_a) * 32))
+        _render_category_top10_panel(df_period_a, label_a, "a", "A")
     with c2:
-        st.caption(f"기간 B: {label_b}")
-        cats_b = df_period_b["category"].fillna("").map(_normalize_category_str).str.split(",").explode().str.strip()
-        cats_b = cats_b[cats_b != ""]
-        cat_b = cats_b.value_counts().reset_index().head(10)
-        cat_b.columns = ["품목", "판매건수"]
-        cat_b["순위"] = range(1, len(cat_b) + 1)
-        if len(cat_b) == 0:
-            st.info("데이터 없음")
-        else:
-            fig_b3 = px.bar(cat_b, x="판매건수", y="품목", orientation="h", title="품목별 판매 횟수 Top 10")
-            fig_b3.update_traces(hovertemplate="%{y}<br>판매 횟수: %{x:,}건<extra></extra>")
-            fig_b3.update_layout(margin=dict(t=30, b=20, l=20, r=20), height=320, xaxis_title="판매 횟수", yaxis_title="")
-            st.plotly_chart(fig_b3, width='stretch', key=f"{key_prefix}_category_top10_b")
-            st.dataframe(cat_b[["순위", "품목", "판매건수"]], width='stretch', key=f"{key_prefix}_category_df_b", height=min(280, 50 + len(cat_b) * 32))
+        _render_category_top10_panel(df_period_b, label_b, "b", "B")
 
     # ---------- ③-2 카테고리 대분류 × 라인 품목명 Top N (임포트 매입 원장 기반) ----------
     st.subheader("③-2 카테고리 대분류 × 인기 라인 품목명 (Top 5)")
@@ -8274,8 +8878,23 @@ def render_marketing_insights_tenant():
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
         return
-    order_cols_mi = "id, customer_id, order_date, delivery_date, total_amount, visit_reason, purchase_reason, category"
+    order_cols_mi = (
+        "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+        "visit_reason, purchase_reason, category, import_source"
+    )
     orders = load_orders_cached(db_filename, order_cols_mi, limit=None)
+    if orders.empty:
+        # import_source 미적용 DB 등 선택 컬럼 실패 시 폴백 (빈 주문과 구분 불가하나 안전)
+        orders = load_orders_cached(
+            db_filename,
+            "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+            "visit_reason, purchase_reason, category",
+            limit=None,
+        )
+    if not orders.empty and "import_source" not in orders.columns:
+        orders["import_source"] = None
+    if not orders.empty and "cost_price" not in orders.columns:
+        orders["cost_price"] = None
     customers = load_customers_cached(db_filename, limit=None)
 
     # 데이터 빈 값 체크
@@ -8309,10 +8928,43 @@ def render_marketing_insights_tenant():
         st.caption("비교 기간 B (예: 올해, 광고 후)")
         range_start_b = st.date_input("시작일", value=month_start, key="mi_tenant_period_b_start")
         range_end_b = st.date_input("종료일", value=today, key="mi_tenant_period_b_end")
+
+    _date_ok = True
     if range_start_a > range_end_a:
-        range_end_a = range_start_a
+        st.warning("비교 기간 A: 시작일은 종료일보다 이전이어야 합니다.")
+        _date_ok = False
     if range_start_b > range_end_b:
-        range_end_b = range_start_b
+        st.warning("비교 기간 B: 시작일은 종료일보다 이전이어야 합니다.")
+        _date_ok = False
+
+    if st.button(
+        "📊 마케팅 인사이트 분석 시작",
+        type="primary",
+        key="mi_tenant_run_btn",
+        disabled=not _date_ok,
+    ):
+        st.session_state["mi_tenant_applied"] = {
+            "a_start": range_start_a,
+            "a_end": range_end_a,
+            "b_start": range_start_b,
+            "b_end": range_end_b,
+        }
+
+    applied = st.session_state.get("mi_tenant_applied")
+    if not applied:
+        st.info("비교 기간 A·B의 시작일/종료일을 입력한 뒤 **마케팅 인사이트 분석 시작** 버튼을 눌러 주세요.")
+        return
+
+    range_start_a = applied["a_start"]
+    range_end_a = applied["a_end"]
+    range_start_b = applied["b_start"]
+    range_end_b = applied["b_end"]
+    st.caption(
+        f"분석 적용 기간 — A: {range_start_a} ~ {range_end_a} · "
+        f"B: {range_start_b} ~ {range_end_b}"
+    )
+
+    analysis_source = _mi_render_analysis_source_toggle("mi_tenant")
 
     merged = orders.merge(customers_sub, left_on="customer_id", right_on="id", how="left")
     if len(merged) == 0:
@@ -8324,10 +8976,21 @@ def render_marketing_insights_tenant():
         range_start_a, range_end_a,
         range_start_b, range_end_b,
         key_prefix="mi_tenant",
+        analysis_source=analysis_source,
+    )
+
+    _render_header_line_discrepancy_report(
+        merged,
+        range_start_a, range_end_a,
+        range_start_b, range_end_b,
+        key_prefix="mi_tenant",
     )
 
     # ── 다면 분석 섹션 (매장 단일: store_map=None) ─────────────────
-    _render_multi_dim_analysis(merged, key_prefix="mi_tenant", store_map=None)
+    _merged_for_mdim = (
+        _mi_overlay_line_taxonomy_categories(merged) if analysis_source == "line" else merged
+    )
+    _render_multi_dim_analysis(_merged_for_mdim, key_prefix="mi_tenant", store_map=None)
 
 
 def _render_single_period_folium_map(merged_df: pd.DataFrame, period_label: str, key_prefix: str):
@@ -8392,10 +9055,23 @@ def render_marketing_insights_superadmin():
         st.info("등록된 매장이 없습니다.")
         return
     merged_list = []
-    order_cols_sa = "id, customer_id, order_date, delivery_date, total_amount, visit_reason, purchase_reason, category"
+    order_cols_sa = (
+        "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+        "visit_reason, purchase_reason, category, import_source"
+    )
+    order_cols_sa_fb = (
+        "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+        "visit_reason, purchase_reason, category"
+    )
     for _, s in stores.iterrows():
         db_fn = s["db_filename"]
         orders = load_orders_cached(db_fn, order_cols_sa, limit=None)
+        if orders.empty:
+            orders = load_orders_cached(db_fn, order_cols_sa_fb, limit=None)
+        if not orders.empty and "import_source" not in orders.columns:
+            orders["import_source"] = None
+        if not orders.empty and "cost_price" not in orders.columns:
+            orders["cost_price"] = None
         customers = load_customers_cached(db_fn, limit=None)
         if len(orders) == 0:
             continue
@@ -8443,12 +9119,53 @@ def render_marketing_insights_superadmin():
         st.caption("비교 기간 B (예: 올해, 광고 후)")
         range_start_b = st.date_input("시작일", value=month_start, key="mi_superadmin_period_b_start")
         range_end_b = st.date_input("종료일", value=today, key="mi_superadmin_period_b_end")
+
+    _date_ok = True
     if range_start_a > range_end_a:
-        range_end_a = range_start_a
+        st.warning("비교 기간 A: 시작일은 종료일보다 이전이어야 합니다.")
+        _date_ok = False
     if range_start_b > range_end_b:
-        range_end_b = range_start_b
+        st.warning("비교 기간 B: 시작일은 종료일보다 이전이어야 합니다.")
+        _date_ok = False
+
+    if st.button(
+        "📊 마케팅 인사이트 분석 시작",
+        type="primary",
+        key="mi_superadmin_run_btn",
+        disabled=not _date_ok,
+    ):
+        st.session_state["mi_superadmin_applied"] = {
+            "a_start": range_start_a,
+            "a_end": range_end_a,
+            "b_start": range_start_b,
+            "b_end": range_end_b,
+        }
+
+    applied = st.session_state.get("mi_superadmin_applied")
+    if not applied:
+        st.info("비교 기간 A·B의 시작일/종료일을 입력한 뒤 **마케팅 인사이트 분석 시작** 버튼을 눌러 주세요.")
+        return
+
+    range_start_a = applied["a_start"]
+    range_end_a = applied["a_end"]
+    range_start_b = applied["b_start"]
+    range_end_b = applied["b_end"]
+    st.caption(
+        f"분석 적용 기간 — A: {range_start_a} ~ {range_end_a} · "
+        f"B: {range_start_b} ~ {range_end_b}"
+    )
+
+    analysis_source = _mi_render_analysis_source_toggle("mi_superadmin")
 
     _render_marketing_multi_period_comparison(
+        merged_all,
+        range_start_a, range_end_a,
+        range_start_b, range_end_b,
+        key_prefix="mi_superadmin",
+        analysis_source=analysis_source,
+    )
+
+    _render_header_line_discrepancy_report(
         merged_all,
         range_start_a, range_end_a,
         range_start_b, range_end_b,
@@ -8457,7 +9174,10 @@ def render_marketing_insights_superadmin():
 
     # ── 다면 분석 섹션 (전 매장: store_map = {db_fn: store_name}) ─────
     _sa_store_map = {row["db_filename"]: row["store_name"] for _, row in stores.iterrows()}
-    _render_multi_dim_analysis(merged_all, key_prefix="mi_superadmin", store_map=_sa_store_map)
+    _merged_for_mdim = (
+        _mi_overlay_line_taxonomy_categories(merged_all) if analysis_source == "line" else merged_all
+    )
+    _render_multi_dim_analysis(_merged_for_mdim, key_prefix="mi_superadmin", store_map=_sa_store_map)
 
 
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
@@ -9399,11 +10119,25 @@ def _superadmin_tab2_hr_store_employees():
         range_end = date(ey, em, monthrange(ey, em)[1])
 
     st.caption(f"조회 기간: {range_start.isoformat()} ~ {range_end.isoformat()}")
+
+    # 가중치: 전체 매장 통합 → __all__ / 개별 매장 → 그 매장. 기간은 종료월 기준.
+    if selected_store == "전체 매장 통합":
+        _kpi_w = load_kpi_weights(None, int(ey), int(em), all_stores=True)
+        _kpi_w_scope_label = "전체 매장 통합"
+    else:
+        _kpi_w_db = next((r["db_filename"] for r in target_rows), None)
+        _kpi_w = load_kpi_weights(_kpi_w_db, int(ey), int(em), all_stores=False)
+        _kpi_w_scope_label = selected_store
+    _kpi_w_ym = f"{int(ey):04d}-{int(em):02d}"
     st.caption(
-        "※ **매출 점수(70)·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
-        "**현금수금 점수(10)·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-        "**마진 점수(15)**: 동 기간 sales를 주문 비율로 배분. "
-        "**전시품 점수(5)·전시품 판매액**: 옵션 A2 — **계약일(order_date)이 기간 내**인 주문의 **전시판매가 × 1/n** (주문당 1회). "
+        f"적용 가중치({_kpi_w_scope_label} · {_kpi_w_ym}): {_kpi_weights_caption(_kpi_w)}"
+        + ("  · 다월 조회 시 **종료월 가중치**를 사용합니다." if (sy, sm) != (ey, em) else "")
+    )
+    st.caption(
+        f"※ **매출 점수({float(_kpi_w['revenue']):g})·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
+        f"**현금수금 점수({float(_kpi_w['cash']):g})·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
+        f"**마진 점수({float(_kpi_w['margin']):g})**: 동 기간 sales를 주문 비율로 배분. "
+        f"**전시품 점수({float(_kpi_w['display']):g})·전시품 판매액**: 옵션 A2 — **계약일(order_date)이 기간 내**인 주문의 **전시판매가 × 1/n** (주문당 1회). "
         "다른 달 계약 + 단순 금액수정은 영향 없음. 다른 달 계약 + **이번 달에 총계약금액이 0원이 되면(전체 취소)** 전시판매가 차감. "
         "주문 수정으로 전시판매가만 변경된 경우 변경 시점 월에 **차액(__dm_d)만 분리 반영**."
     )
@@ -9476,17 +10210,7 @@ def _superadmin_tab2_hr_store_employees():
         "store": "nunique",
     }).rename(columns={"store": "참여 매장 수"})
 
-    total_revenue = emp_df["revenue"].sum() or 0
-    total_margin = emp_df["margin"].sum() or 0
-    total_display = emp_df["display_sales"].sum() or 0
-    total_kpi_receipt = emp_df["kpi_receipt"].sum() or 0
-    emp_df["매출 점수(70)"] = (emp_df["revenue"] / total_revenue * 70).round(1) if total_revenue else 0.0
-    emp_df["마진 점수(15)"] = (emp_df["margin"] / total_margin * 15).round(1) if total_margin else 0.0
-    emp_df["전시품 점수(5)"] = (emp_df["display_sales"] / total_display * 5).round(1) if total_display else 0.0
-    emp_df["현금수금 점수(10)"] = (emp_df["kpi_receipt"] / total_kpi_receipt * 10).round(1) if total_kpi_receipt else 0.0
-    emp_df["종합 점수"] = (
-        emp_df["매출 점수(70)"] + emp_df["마진 점수(15)"] + emp_df["전시품 점수(5)"] + emp_df["현금수금 점수(10)"]
-    ).round(1)
+    emp_df, _score_cols = _apply_kpi_score_columns(emp_df, _kpi_w)
     emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
     emp_df["매출집계(순액)"] = emp_df["revenue"].round(0).astype(int)
     emp_df["현금수금집계"] = emp_df["kpi_receipt"].round(0).astype(int)
@@ -9499,10 +10223,10 @@ def _superadmin_tab2_hr_store_employees():
         "현금수금집계",
         "마진액",
         "전시품 판매액",
-        "매출 점수(70)",
-        "마진 점수(15)",
-        "전시품 점수(5)",
-        "현금수금 점수(10)",
+        _score_cols["revenue"],
+        _score_cols["margin"],
+        _score_cols["display"],
+        _score_cols["cash"],
         "종합 점수",
     ]
     if selected_store == "전체 매장 통합":
@@ -9511,6 +10235,12 @@ def _superadmin_tab2_hr_store_employees():
     display_fmt = _format_df_display(
         display_df, ["매출집계(순액)", "현금수금집계", "마진액", "전시품 판매액"]
     )
+    _short_hdr = {
+        "revenue": f"매출({float(_kpi_w['revenue']):g})",
+        "margin":  f"마진({float(_kpi_w['margin']):g})",
+        "display": f"전시품({float(_kpi_w['display']):g})",
+        "cash":    f"현금수금({float(_kpi_w['cash']):g})",
+    }
     st.dataframe(
         display_fmt,
         width='stretch',
@@ -9520,10 +10250,10 @@ def _superadmin_tab2_hr_store_employees():
             "현금수금집계": st.column_config.TextColumn("현금수금집계", width="medium"),
             "마진액": st.column_config.TextColumn("마진액", width="medium"),
             "전시품 판매액": st.column_config.TextColumn("전시품 판매액", width="small"),
-            "매출 점수(70)": st.column_config.NumberColumn("매출(70)", format="%.1f", width="small"),
-            "마진 점수(15)": st.column_config.NumberColumn("마진(15)", format="%.1f", width="small"),
-            "전시품 점수(5)": st.column_config.NumberColumn("전시품(5)", format="%.1f", width="small"),
-            "현금수금 점수(10)": st.column_config.NumberColumn("현금수금(10)", format="%.1f", width="small"),
+            _score_cols["revenue"]: st.column_config.NumberColumn(_short_hdr["revenue"], format="%.1f", width="small"),
+            _score_cols["margin"]:  st.column_config.NumberColumn(_short_hdr["margin"],  format="%.1f", width="small"),
+            _score_cols["display"]: st.column_config.NumberColumn(_short_hdr["display"], format="%.1f", width="small"),
+            _score_cols["cash"]:    st.column_config.NumberColumn(_short_hdr["cash"],    format="%.1f", width="small"),
             "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
         },
     )
@@ -12509,6 +13239,7 @@ _ERP_CACHED_TABLES = {
     "app_overtime_claims", "app_leave_grants", "app_staffing_rules",
     "app_store_events", "app_store_hours", "app_employee_settings",
     "app_work_adjustments", "app_monthly_work_targets", "app_yearly_work_targets",
+    "app_period_work_targets",
 }
 
 
@@ -12538,7 +13269,8 @@ def _erp_invalidate_fetch_caches(table: str) -> None:
             pass
     # 근태 집계 함수 캐시도 관련 테이블 변경 시 무효화 (P0-3)
     if table in ("app_attendance_logs", "app_shift_schedules", "app_work_adjustments",
-                 "app_leave_grants", "app_employee_settings"):
+                 "app_leave_grants", "app_employee_settings",
+                 "app_period_work_targets", "app_yearly_work_targets"):
         for _fn in (_erp_compute_monthly_planned_minutes,
                     _erp_compute_monthly_remaining,
                     _erp_compute_yearly_breakdown):
@@ -12546,6 +13278,15 @@ def _erp_invalidate_fetch_caches(table: str) -> None:
                 _fn.clear()
             except Exception:
                 pass
+        try:
+            _erp_list_period_targets.clear()
+        except Exception:
+            pass
+        try:
+            _erp_get_yearly_target_row.clear()
+            _erp_list_yearly_targets.clear()
+        except Exception:
+            pass
 
 
 def _erp_insert_row(table: str, row: dict) -> tuple[bool, str]:
@@ -12828,6 +13569,34 @@ def _erp_find_active_period_target(db_filename: str, employee_name: str,
     return sorted(rows, key=lambda r: r.get("end_ym") or "")[-1]
 
 
+def _erp_resolve_period_target_for_year(
+    db_filename: str, employee_name: str, year: int, as_of: date
+) -> dict | None:
+    """조회 연도와 겹치는 기간 목표(근무시간 설정) 1건.
+    as_of 월을 덮는 행 우선, 없으면 겹치는 행 중 시작월이 빠른 것.
+    required_minutes > 0 인 행만 후보."""
+    rows = _erp_list_period_targets(db_filename, employee_name)
+    if not rows:
+        return None
+    year_start = f"{int(year):04d}-01"
+    year_end = f"{int(year):04d}-12"
+    overlapping = [
+        r for r in rows
+        if (r.get("start_ym") or "") <= year_end
+        and (r.get("end_ym") or "") >= year_start
+        and int(r.get("required_minutes") or 0) > 0
+    ]
+    if not overlapping:
+        return None
+    ref_ym = f"{as_of.year:04d}-{as_of.month:02d}"
+    covering = [
+        r for r in overlapping
+        if (r.get("start_ym") or "") <= ref_ym <= (r.get("end_ym") or "")
+    ]
+    pool = covering or overlapping
+    return sorted(pool, key=lambda r: r.get("start_ym") or "")[0]
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
                                   year: int, as_of: date) -> dict:
@@ -12849,6 +13618,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
     반환 dict (단위: 분):
       - required_min      : 공통 필요근무시간
+      - required_source   : 'period' | 'yearly' | 'none' (기간 목표 1순위)
       - deductions / additions : 상세 분류 (kind_label → minutes) — UI 상세보기용 (합산 미포함)
       - normal_min        : 정상근무 (logs 정상/지각/조퇴 actual + shifts logs-없는-날짜)
       - overtime_min      : 연장근무 (logs 추가근무·회의·행사·시차사용·포상시간)
@@ -12861,14 +13631,32 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
     period_end = date(int(year), 12, 31)
 
     # ── 공통 필요근무시간 + 집계 시작일 ──────────────────────────
+    # 1순위: 근무시간 설정(기간 목표) / 2순위: app_yearly_work_targets
+    row_period = _erp_resolve_period_target_for_year(
+        db_filename, employee_name, int(year), as_of
+    )
     row_y = _erp_get_yearly_target_row(db_filename, employee_name, int(year))
-    required_min = int(row_y["required_minutes"]) if (row_y and row_y.get("required_minutes") is not None) else 0
+    if row_period is not None:
+        required_min = int(row_period.get("required_minutes") or 0)
+        required_source = "period"
+    elif row_y and row_y.get("required_minutes") is not None and int(row_y["required_minutes"]) > 0:
+        required_min = int(row_y["required_minutes"])
+        required_source = "yearly"
+    else:
+        required_min = 0
+        required_source = "none"
 
-    # period_start_date 가 있으면 그 날부터, 없으면 연도 1월 1일
+    # 집계 시작일: 연간 테이블 period_start_date → 기간 목표 start_ym 1일 → 연도 1/1
     _raw_psd = row_y.get("period_start_date") if row_y else None
     if _raw_psd:
         try:
             period_start = date.fromisoformat(str(_raw_psd)[:10])
+        except Exception:
+            period_start = date(int(year), 1, 1)
+    elif row_period and row_period.get("start_ym"):
+        try:
+            _sy, _sm = str(row_period["start_ym"]).split("-")[:2]
+            period_start = date(int(_sy), int(_sm), 1)
         except Exception:
             period_start = date(int(year), 1, 1)
     else:
@@ -13058,6 +13846,7 @@ def _erp_compute_yearly_breakdown(db_filename: str, employee_name: str,
 
     return {
         "required_min": required_min,
+        "required_source": required_source,
         "deductions": deductions,
         "additions": additions,
         "normal_min": normal_min,
@@ -13612,6 +14401,7 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
     bd = _erp_compute_yearly_breakdown(current_db, me_name, sel_year, _as_of)
 
     required_min = int(bd["required_min"])
+    required_source = bd.get("required_source") or ("none" if required_min <= 0 else "yearly")
     deductions = bd["deductions"] or {}
     additions  = bd["additions"] or {}
     total_short_adj_min = sum(int(v) for v in deductions.values())  # work_adjustments sign='-' 합
@@ -13625,6 +14415,12 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
 
     # 잔여 필요근무 = 공통 − 단축근무 누계 − 실제 근무시간 (캘린더·시프트 반영)
     remaining_required_min = required_min - total_short_adj_min - actual_total_min
+
+    _req_sub = {
+        "period": "(근무시간 설정 · 기간 목표)",
+        "yearly": "(연간 목표)",
+        "none": "⚠️ 미설정",
+    }.get(required_source, "⚠️ 미설정")
 
     # 잔여 연차 + 장기근속 정보
     _leave = _erp_compute_leave_status(current_db, me_name, _as_of)
@@ -13646,40 +14442,87 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         except Exception:
             pass
 
-    # ── 카드 공통 CSS ───────────────────────────────────────────
-    _card_css = (
-        "display:flex; flex-direction:column; align-items:center; justify-content:center; "
-        "border-radius:12px; padding:18px 12px; text-align:center; min-height:115px; "
-        "box-sizing:border-box;"
-    )
-    _label_css = "font-size:0.78rem; color:#555; margin-bottom:6px; line-height:1.25; font-weight:600;"
-    _value_css = "font-size:1.7rem; font-weight:700; line-height:1.2; margin:0;"
-    _sub_css   = "font-size:0.72rem; color:#777; margin-top:4px; line-height:1.3;"
+    # ── 컬럼 요약: 필요 / 실제 / 잔여 / 차감 / 연차 (파스텔) ───
+    gap_min = remaining_required_min
+    _days_left = int(_leave.get("days_until_year_end") or 0)
+    if required_min <= 0:
+        _status_txt = "필요근무 미설정"
+    elif gap_min > 0:
+        _status_txt = f"목표 미달 · 연말 {_days_left}일"
+    elif gap_min < 0:
+        _status_txt = f"목표 초과 {_erp_fmt_hm(-gap_min)}"
+    else:
+        _status_txt = "목표 달성"
 
-    # ── 상단 2카드: 공통 필요 / 단축근무 누계 ──────────────────
-    st.markdown("##### 🎯 연간 필요 근무시간")
-    r1c1, r1c2 = st.columns(2)
-    with r1c1:
+    _leave_total = _leave["annual_total"]
+    _leave_used = _leave["annual_used"]
+
+    def _kpi_card(bg: str, border: str, label: str, value: str, value_color: str) -> str:
+        return (
+            f"<div style='background:{bg}; border:1px solid {border}; border-radius:14px; "
+            f"padding:16px 10px; text-align:center; min-height:108px; "
+            f"display:flex; flex-direction:column; align-items:center; justify-content:center;'>"
+            f"<div style='font-size:0.78rem; color:#6B7280; font-weight:600; margin-bottom:8px;'>"
+            f"{label}</div>"
+            f"<div style='font-size:1.85rem; font-weight:800; color:{value_color}; "
+            f"line-height:1.1; letter-spacing:-0.02em;'>{value}</div>"
+            f"</div>"
+        )
+
+    st.markdown("##### 🎯 연간 근무시간 요약")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
         st.markdown(
-            f"<div style='background:#E3F2FD; {_card_css}'>"
-            f"<div style='{_label_css}'>📌 공통 필요근무시간</div>"
-            f"<div style='{_value_css} color:#0D47A1;'>{_erp_fmt_hm(required_min)}</div>"
-            f"<div style='{_sub_css}'>{'(연간 목표)' if required_min > 0 else '⚠️ 미설정'}</div>"
-            f"</div>",
+            _kpi_card("#EAF3FB", "#D0E4F5", "연간 전체 필요근무",
+                      _erp_fmt_hm(required_min), "#3B6FA0"),
             unsafe_allow_html=True,
         )
-    with r1c2:
+    with c2:
         st.markdown(
-            f"<div style='background:#FFF3E0; {_card_css}'>"
-            f"<div style='{_label_css}'>(−) 단축근무 누계 (통합)</div>"
-            f"<div style='{_value_css} color:#E65100;'>{_erp_fmt_hm(total_short_adj_min)}</div>"
-            f"<div style='{_sub_css}'>포상·여름휴가·기타 차감 통합</div>"
-            f"</div>",
+            _kpi_card("#EAF7EF", "#C9E8D4", "실제 근무시간",
+                      _erp_fmt_hm(actual_total_min), "#3D8B5E"),
             unsafe_allow_html=True,
         )
+    with c3:
+        st.markdown(
+            _kpi_card("#FDECEC", "#F5D0D0", "연간 잔여 필요근무",
+                      _erp_fmt_hm(gap_min), "#C45C5C"),
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            _kpi_card("#FFF4E8", "#F0DCC0", "필요근무 차감",
+                      _erp_fmt_hm(total_short_adj_min), "#C4843A"),
+            unsafe_allow_html=True,
+        )
+    with c5:
+        st.markdown(
+            _kpi_card("#F3EEF8", "#DDD0EC", "잔여 연차",
+                      f"{_annual_remain_days:g}일", "#8B6BAE"),
+            unsafe_allow_html=True,
+        )
+
+    # 수식·설명은 박스 밖 작은 글씨
+    st.markdown(
+        f"<div style='margin:6px 2px 0; color:#8A93A0; font-size:0.78rem; line-height:1.55;'>"
+        f"<div>잔여 수식: 필요 {_erp_fmt_hm(required_min)}"
+        f" − 차감 {_erp_fmt_hm(total_short_adj_min)}"
+        f" − 실제 {_erp_fmt_hm(actual_total_min)}"
+        f" = {_erp_fmt_hm(gap_min)}"
+        f"{' · ' + _status_txt if _status_txt else ''}</div>"
+        f"<div>실제 내역: 정상 {_erp_fmt_hm(normal_min)} · 연장 {_erp_fmt_hm(overtime_min)}"
+        f" &nbsp;|&nbsp; 필요 출처: {_req_sub.strip('() ')}"
+        f" &nbsp;|&nbsp; 차감: 포상·여름휴가 등"
+        f" &nbsp;|&nbsp; 연차: 총 {_leave_total:g}일 중 {_leave_used:g}일 사용</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    if required_min <= 0:
+        st.caption("관리자 [근무시간 설정]에서 기간 목표를 등록해 주세요.")
 
     if deductions:
-        with st.expander("ℹ️ 단축근무 누계 상세 (kind별 분류)", expanded=False):
+        with st.expander("ℹ️ 필요근무 차감 상세 (kind별 분류)", expanded=False):
             for k, v in sorted(deductions.items(), key=lambda x: -x[1]):
                 st.markdown(f"- **{k}**: {_erp_fmt_hm(v)}")
 
@@ -13742,56 +14585,8 @@ def _erp_tab_dashboard(current_db: str, role: str, me_name: str, today: date):
         else:
             st.info("정상근무 내역이 없습니다.")
 
-    # ── 하단: 정상근무 1카드 ─────────────────────────────────
-    st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-    st.markdown("##### ⏱️ 실제 근무시간 (캘린더 기준)")
-    with st.container():
-        _sub_normal = f"시프트 자동 {_erp_fmt_hm(shift_normal_min)} + 연차/반차 {_erp_fmt_hm(leave_min)}"
-        st.markdown(
-            f"<div style='background:#E8F5E9; {_card_css}'>"
-            f"<div style='{_label_css}'>(+) 정상근무</div>"
-            f"<div style='{_value_css} color:#1B5E20;'>{_erp_fmt_hm(normal_min)}</div>"
-            f"<div style='{_sub_css}'>{_sub_normal}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-    # ── 잔여 분석 + 잔여 연차 ───────────────────────────────────
-    st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-    gap_min = remaining_required_min  # actual_total_min 이미 차감된 값
-    r3c1, r3c2 = st.columns([3, 2])
-    with r3c1:
-        if required_min <= 0:
-            st.info("ℹ️ 공통 필요근무시간이 미설정입니다. 관리자에게 [근무시간 설정 → 연간 목표]를 등록하도록 요청해 주세요.")
-        elif gap_min > 0:
-            st.warning(f"⏰ 잔여 필요근무시간 달성까지 {_erp_fmt_hm(gap_min)} 부족 — 연말까지 {int(_leave['days_until_year_end'])}일 남음.")
-        elif gap_min < 0:
-            st.success(f"🎉 목표 초과 달성 — {_erp_fmt_hm(-gap_min)} 초과 근무. 보상(시차·연차·급여) 신청을 검토해 주세요.")
-        else:
-            st.success("✅ 잔여 필요근무시간을 정확히 달성했습니다.")
-    with r3c2:
-        _leave_color = "#E53935" if _annual_remain_days == 0 else ("#FB8C00" if _leave["soak_risk"] else "#2E7D32")
-        _leave_bg = "#FFEBEE" if _annual_remain_days == 0 else ("#FFF8E1" if _leave["soak_risk"] else "#E8F5E9")
-        _leave_total = _leave["annual_total"]
-        _leave_used  = _leave["annual_used"]
-        _long_extra  = _legal_info.get("long_service_extra", 0)
-        _yos_str     = f"근속 {_legal_info['years_of_service']}년" if _legal_info else ""
-        _sub_leave   = (
-            f"총 {_leave_total:g}일 중 {_leave_used:g}일 사용"
-            + (f" | 장기근속 +{_long_extra}일 포함" if _long_extra > 0 else "")
-            + (f" | {_yos_str}" if _yos_str else "")
-        )
-        st.markdown(
-            f"<div style='background:{_leave_bg}; {_card_css}'>"
-            f"<div style='{_label_css}'>🎫 잔여 연차</div>"
-            f"<div style='{_value_css} color:{_leave_color};'>{_annual_remain_days:g}일</div>"
-            f"<div style='{_sub_css}'>{_sub_leave}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
     if _leave["soak_risk"]:
-        st.error(f"🔴 연차 소멸 위험 — 잔여 {_annual_remain_days:g}일 / 연말까지 {int(_leave['days_until_year_end'])}일 남음. 연차 사용을 서둘러 주세요.")
+        st.error(f"🔴 연차 소멸 위험 — 잔여 {_annual_remain_days:g}일 / 연말까지 {_days_left}일 남음. 연차 사용을 서둘러 주세요.")
 
     if role in ("store_admin", "superadmin"):
         # 관리자 설정(집계 시작일 · 월 목표 근무시간 · 직원 현황)은 상단 '관리자 메뉴' 탭으로 이동함.
@@ -18685,7 +19480,10 @@ def _erp_tab_period_targets(current_db: str, me_name: str):
         return
 
     st.subheader("⏰ 근무시간 설정")
-    st.caption("직원별로 임의 기간(예: 6~7월 200h)의 필수 근무시간 목표를 입력합니다.")
+    st.caption(
+        "직원별로 임의 기간(예: 2026-06~2026-12, 1275h)의 필수 근무시간 목표를 입력합니다. "
+        "대시보드 「공통 필요근무시간」에 1순위로 반영됩니다."
+    )
 
     today = _today_kst()
 
@@ -20943,6 +21741,37 @@ def render_employee_analytics():
 # 📋 사내 업무판 (사내결제시스템)
 # ─────────────────────────────────────────────────────────────────────
 
+def _navigate_to_internal_task(task_id: int | None, *, noti_id: int | None = None) -> None:
+    """알림/딥링크에서 사내업무 게시판의 특정 업무로 이동하도록 session_state 설정.
+
+    - active_admin_page=internal_board + board_goto_task → '✅ 업무' 섹션 진입
+    - board_focus_task_id / board_expand_task_id → 목록에서 해당 카드 상단 정렬·자세히 보기 자동 펼침
+    - noti_id 가 있으면 읽음 처리
+    """
+    import task_board as _tb  # noqa: WPS433
+
+    if noti_id is not None:
+        try:
+            _tb.mark_notification_read(int(noti_id))
+        except Exception:
+            pass
+        try:
+            _tb.clear_task_caches()
+        except Exception:
+            pass
+
+    st.session_state["active_admin_page"] = "internal_board"
+    st.session_state["board_goto_task"] = True
+    if task_id is not None:
+        try:
+            tid = int(task_id)
+        except Exception:
+            tid = None
+        if tid:
+            st.session_state["board_focus_task_id"] = tid
+            st.session_state["board_expand_task_id"] = tid
+
+
 def render_internal_work():
     """사내 업무판 — ERP 메뉴 하위. 업무 등록·할당·진행·댓글·첨부·알림."""
     import task_board as _tb  # noqa: WPS433
@@ -21044,20 +21873,28 @@ def render_internal_work():
         if not notis:
             st.caption("알림이 없습니다.")
         else:
-            cols = st.columns([1, 5, 2, 2, 1])
+            cols = st.columns([1, 4, 2, 2, 1, 1])
             cols[0].markdown("**상태**")
             cols[1].markdown("**내용**")
             cols[2].markdown("**유형**")
             cols[3].markdown("**시각**")
-            cols[4].markdown("")
+            cols[4].markdown("**업무**")
+            cols[5].markdown("")
             for n in notis:
-                c = st.columns([1, 5, 2, 2, 1])
+                c = st.columns([1, 4, 2, 2, 1, 1])
                 c[0].write("✅" if n.get("is_read") else "🔵")
                 c[1].write(n.get("message", ""))
                 c[2].write(n.get("type", ""))
                 c[3].caption(str(n.get("sent_at", ""))[:19])
+                _n_tid = n.get("task_id")
+                if _n_tid:
+                    if c[4].button("열기", key=f"noti_open_{n['id']}", help=f"업무 #{int(_n_tid)} 상세"):
+                        _navigate_to_internal_task(int(_n_tid), noti_id=int(n["id"]))
+                        st.rerun()
+                else:
+                    c[4].caption("-")
                 if not n.get("is_read"):
-                    if c[4].button("읽음", key=f"noti_read_{n['id']}"):
+                    if c[5].button("읽음", key=f"noti_read_{n['id']}"):
                         _tb.mark_notification_read(int(n["id"]))
                         st.rerun()
             if st.button("모두 읽음 처리", key="noti_mark_all"):
@@ -21091,6 +21928,7 @@ def render_internal_work():
     tasks = _tb.load_tasks_cached(
         store_name=None if role == "superadmin" else store_name,
         include_done=show_done,
+        db_filename=None if role == "superadmin" else (current_db or None),
     )
     # 보안(회사 경영) 업무: 작성자/담당자인 것만 별도로 합치고 id 기준 중복 제거
     _conf_tasks = _tb.load_my_confidential_tasks_cached(me_uname, include_done=show_done)
@@ -21100,12 +21938,69 @@ def render_internal_work():
             if int(_ct["id"]) not in _seen_ids:
                 tasks.append(_ct)
                 _seen_ids.add(int(_ct["id"]))
+
+    # 내가 담당자인 업무(결제변경 검증 등) — 매장명 불일치로 목록에서 빠지는 경우 보완
+    _assigned_tasks = _tb.load_my_assigned_tasks(me_uname, include_done=show_done)
+    if _assigned_tasks:
+        _seen_ids = {int(t["id"]) for t in tasks}
+        for _at in _assigned_tasks:
+            if int(_at["id"]) not in _seen_ids:
+                tasks.append(_at)
+                _seen_ids.add(int(_at["id"]))
+
+    # 결제변경 미결 검증도 강제 포함 (담당자 미지정·매장명 불일치 대비)
+    try:
+        for _pcr in _tb.load_pending_payment_verifications(store_name, role):
+            _pid = int(_pcr["id"])
+            if _pid not in {int(t["id"]) for t in tasks}:
+                _full = _tb.load_task_by_id(_pid)
+                if _full:
+                    tasks.append(_full)
+    except Exception:
+        pass
+
+    # 알림 딥링크 포커스: 필터에 가려져도 해당 업무를 강제로 포함·상단 정렬
+    _focus_tid = st.session_state.get("board_focus_task_id")
+    try:
+        _focus_tid = int(_focus_tid) if _focus_tid is not None else None
+    except Exception:
+        _focus_tid = None
+    _expand_tid = st.session_state.get("board_expand_task_id")
+    try:
+        _expand_tid = int(_expand_tid) if _expand_tid is not None else None
+    except Exception:
+        _expand_tid = None
+
+    _focused_task = None
+    if _focus_tid:
+        _focused_task = next((t for t in tasks if int(t["id"]) == _focus_tid), None)
+        if _focused_task is None:
+            _focused_task = _tb.load_task_by_id(_focus_tid)
+            if _focused_task:
+                tasks.append(_focused_task)
+        if _focused_task and status_filter and _focused_task.get("status") not in status_filter:
+            status_filter = list(status_filter) + [_focused_task.get("status")]
+        if _focused_task is None:
+            st.error(
+                f"🔔 알림 업무 #{_focus_tid} 을(를) 불러오지 못했습니다. "
+                "권한이 없거나 삭제된 업무일 수 있습니다."
+            )
+        else:
+            st.info(f"🔔 알림에서 연 업무 #{_focus_tid} — 아래에서 상세를 확인하세요.")
+
     tasks = [t for t in tasks if (not status_filter) or t.get("status") in status_filter]
 
     # 키워드/태그 검색은 상단 통합 검색창에서 처리
 
+    # 포커스 업무는 목록이 비어도 단독 카드로 반드시 표시
+    if _focused_task is not None and int(_focused_task["id"]) not in {int(t["id"]) for t in tasks}:
+        tasks.insert(0, _focused_task)
+
     if not tasks:
         st.info("표시할 업무가 없습니다. 위에서 새 업무를 등록해 주세요.")
+        # 포커스 키는 실패해도 1회성으로 소거 (무한 에러 배너 방지)
+        st.session_state.pop("board_focus_task_id", None)
+        st.session_state.pop("board_expand_task_id", None)
         return
 
     # 트리 구성
@@ -21125,17 +22020,36 @@ def render_internal_work():
         if pid is not None and pid not in visible_ids:
             extra_roots.append(t)
     roots = list(by_parent.get(None, [])) + extra_roots
-    # 상단 고정(📌) 업무를 먼저 노출
-    roots.sort(key=lambda x: bool(x.get("is_pinned")), reverse=True)
+    # 알림 포커스 업무 → 상단 고정 → 나머지
+    def _root_sort_key(x: dict):
+        xid = int(x.get("id") or 0)
+        return (
+            0 if (_focus_tid and xid == _focus_tid) else 1,
+            0 if x.get("is_pinned") else 1,
+            -xid,
+        )
+    roots.sort(key=_root_sort_key)
 
     tab_list, tab_gantt = st.tabs(["📋 목록", "📊 간트차트"])
     with tab_list:
         if not roots:
             st.info("표시할 업무가 없습니다.")
         for root in roots:
-            _render_task_card(root, by_parent, assignees_map, me_uname, role, store_name, current_db, depth=0)
+            _render_task_card(
+                root, by_parent, assignees_map, me_uname, role, store_name, current_db,
+                depth=0, expand_task_id=_expand_tid or _focus_tid,
+            )
     with tab_gantt:
         _render_task_gantt(tasks, assignees_map)
+
+    # 포커스/펼침은 1회성 — 다음 rerun 에서 일반 목록으로 복귀
+    if _focus_tid is not None:
+        st.session_state.pop("board_focus_task_id", None)
+    if _expand_tid is not None:
+        st.session_state.pop("board_expand_task_id", None)
+
+    # 첨부 크게 보기(회전 포함) — 업무 화면 rerun 시에도 다이얼로그 유지
+    _maybe_render_attachment_lightbox()
 
 
 def _render_task_gantt(tasks: list[dict], assignees_map: dict):
@@ -21365,9 +22279,99 @@ def _fetch_attachment_bytes_cached(storage_path: str) -> bytes | None:
     return _tb.download_attachment_bytes(storage_path)
 
 
-def _open_attachment_lightbox(img_bytes: bytes, name: str | None = None):
-    """첨부 이미지를 다이얼로그(라이트박스)로 표시. dialog 미지원 환경은 expander로 fallback."""
-    title = name or "첨부 이미지"
+def _rotate_image_bytes(img_bytes: bytes, angle_cw: int) -> bytes:
+    """이미지를 시계 방향 angle_cw(0/90/180/270)도 회전한 PNG/JPEG 바이트 반환."""
+    angle_cw = int(angle_cw or 0) % 360
+    if angle_cw == 0:
+        return img_bytes
+    try:
+        from PIL import Image
+    except Exception:
+        return img_bytes
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        # PIL rotate 는 반시계 방향 → 시계 방향은 음수
+        out = im.rotate(-angle_cw, expand=True)
+        fmt = (im.format or "JPEG").upper()
+        if fmt not in ("JPEG", "JPG", "PNG", "WEBP"):
+            fmt = "PNG"
+        if fmt in ("JPEG", "JPG") and out.mode in ("RGBA", "P", "LA"):
+            out = out.convert("RGB")
+            fmt = "JPEG"
+        buf = io.BytesIO()
+        out.save(buf, format="JPEG" if fmt in ("JPEG", "JPG") else fmt, quality=92)
+        return buf.getvalue()
+    except Exception:
+        return img_bytes
+
+
+def _open_attachment_lightbox(
+    img_bytes: bytes | None = None,
+    name: str | None = None,
+    *,
+    storage_path: str | None = None,
+):
+    """첨부 이미지 라이트박스 열기 — session_state 에 상태를 남겨 회전 후에도 유지."""
+    st.session_state["att_lightbox"] = {
+        "bytes": img_bytes,
+        "storage_path": storage_path,
+        "name": name or "첨부 이미지",
+        "angle": 0,
+    }
+
+
+def _maybe_render_attachment_lightbox() -> None:
+    """열려 있는 첨부 라이트박스를 렌더. 좌/우 90° 회전·원본·닫기 지원."""
+    lb = st.session_state.get("att_lightbox")
+    if not isinstance(lb, dict):
+        return
+    img_bytes = lb.get("bytes")
+    if not img_bytes and lb.get("storage_path"):
+        img_bytes = _fetch_attachment_bytes_cached(str(lb["storage_path"]))
+        if img_bytes:
+            lb["bytes"] = img_bytes
+            st.session_state["att_lightbox"] = lb
+    if not img_bytes:
+        st.session_state.pop("att_lightbox", None)
+        return
+
+    title = str(lb.get("name") or "첨부 이미지")
+    angle = int(lb.get("angle") or 0) % 360
+    shown = _rotate_image_bytes(img_bytes, angle)
+
+    def _lightbox_body() -> None:
+        st.caption(f"현재 회전: {angle}° (시계 방향)")
+        st.image(shown, width="stretch")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            if st.button("↺ 왼쪽 90°", key="att_lb_rot_left", help="반시계 방향 90°"):
+                lb["angle"] = (angle - 90) % 360
+                st.session_state["att_lightbox"] = lb
+                st.rerun()
+        with c2:
+            if st.button("↻ 오른쪽 90°", key="att_lb_rot_right", help="시계 방향 90°", type="primary"):
+                lb["angle"] = (angle + 90) % 360
+                st.session_state["att_lightbox"] = lb
+                st.rerun()
+        with c3:
+            if st.button("⟲ 원본", key="att_lb_rot_reset"):
+                lb["angle"] = 0
+                st.session_state["att_lightbox"] = lb
+                st.rerun()
+        with c4:
+            if st.button("닫기", key="att_lb_close"):
+                st.session_state.pop("att_lightbox", None)
+                st.rerun()
+        _base, _ext = os.path.splitext(title)
+        _dl_name = f"{_base or 'image'}_rot{angle}{_ext or '.jpg'}"
+        st.download_button(
+            "⬇ 현재 화면 저장",
+            data=shown,
+            file_name=_dl_name,
+            mime="image/jpeg" if _dl_name.lower().endswith((".jpg", ".jpeg")) else "image/png",
+            key="att_lb_download",
+        )
+
     if hasattr(st, "dialog"):
         try:
             try:
@@ -21377,14 +22381,14 @@ def _open_attachment_lightbox(img_bytes: bytes, name: str | None = None):
 
             @dialog_dec
             def _dlg():
-                st.image(img_bytes, width="stretch")
+                _lightbox_body()
 
             _dlg()
             return
         except Exception:
             pass
     with st.expander(f"🔍 {title}", expanded=True):
-        st.image(img_bytes, width="stretch")
+        _lightbox_body()
 
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg")
@@ -21432,7 +22436,10 @@ def _render_attachment_inline(a: dict, key_suffix: str):
     if _is_image_attachment(a):
         st.image(data, caption=name, width="stretch")
         if st.button("🔍 크게 보기", key=f"open_img_{aid}_{key_suffix}"):
-            _open_attachment_lightbox(data, name)
+            _open_attachment_lightbox(
+                data, name, storage_path=a.get("storage_path"),
+            )
+            st.rerun()
     else:
         st.markdown(f"📄 **{name}**")
         st.caption(_humansize(a.get("byte_size")))
@@ -21560,18 +22567,57 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
 
     with st.container(border=True):
         st.markdown("##### 💳 결제변경 검증 요청 작성")
-        st.caption("결제는 이미 매출관리에서 반영되었습니다. 아래 내용은 관리자 검증(완료/미결)을 위해 사내 업무로 등록됩니다.")
+        st.caption(
+            "결제는 이미 매출관리에서 반영되었습니다. "
+            "원본은 결제변경 이력(변경 전)을 우선 사용하고, 아래는 관리자 검증용으로 사내 업무에 등록됩니다."
+        )
+
+        # 원본은 현재 결제행이 아니라 최신 결제변경 이력에서 가져온다 (사후 검증 버그 방지)
+        _hist = _load_latest_payment_history_for_pcr(db_filename, int(order_id))
+        _hist_orig = (_hist or {}).get("original") or {}
+        _hist_new = (_hist or {}).get("new") or {}
 
         sel_pid = None
         if pay_options:
             sel_pid = st.selectbox(
-                "대상 결제",
+                "대상 결제(참조)",
                 options=list(pay_options.keys()),
                 format_func=lambda p: pay_options.get(p, str(p)),
                 key=f"pcr_pid_{order_id}",
+                help="현재 결제 목록은 변경 후 상태일 수 있습니다. 원본 수단/금액은 아래 이력을 우선합니다.",
             )
+
         orig = {}
-        if sel_pid is not None:
+        _orig_from_history = bool(_hist_orig.get("method") or _hist_orig.get("amount"))
+        if _orig_from_history:
+            orig = {
+                "amount": float(_hist_orig.get("amount") or 0),
+                "method": str(_hist_orig.get("method") or "").strip(),
+                "onnuri": str(_hist_orig.get("onnuri") or "").strip(),
+            }
+            _hp = _hist_orig.get("payment_id")
+            if sel_pid is None and _hp not in (None, "", "신규생성(상계처리)"):
+                try:
+                    sel_pid = int(_hp)
+                except (TypeError, ValueError):
+                    pass
+            try:
+                _oa = f"{int(float(orig.get('amount') or 0)):,}원"
+            except Exception:
+                _oa = "-"
+            _na = "-"
+            if _hist_new:
+                try:
+                    _na = f"{int(float(_hist_new.get('amount') or 0)):,}원"
+                except Exception:
+                    _na = "-"
+            st.info(
+                f"원본(이력): {_oa} / {orig.get('method') or '-'} "
+                f"{('· ' + orig['onnuri']) if orig.get('onnuri') else ''}  →  "
+                f"변경 후(이력): {_na} / {_hist_new.get('method') or '-'} "
+                f"{('· ' + str(_hist_new.get('onnuri'))) if _hist_new.get('onnuri') else ''}"
+            )
+        elif sel_pid is not None:
             try:
                 _r = pay_list[pay_list["id"] == sel_pid].iloc[0]
                 _cc = str(_r.get("card_company") or "").strip()
@@ -21583,6 +22629,43 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 }
             except Exception:
                 orig = {}
+            st.warning(
+                "이 주문의 결제변경 이력을 찾지 못했습니다. "
+                "현재 결제행을 원본으로 사용하므로, 이미 수단이 바뀐 행이면 원본이 잘못될 수 있습니다. "
+                "아래에서 원본을 직접 확인·수정하세요."
+            )
+
+        _manual_orig = st.checkbox("원본 수동 수정", key=f"pcr_manual_orig_{order_id}",
+                                   help="이력/현재행 원본이 틀리면 직접 수정합니다.")
+        if _manual_orig:
+            oc1, oc2, oc3 = st.columns(3)
+            with oc1:
+                orig["amount"] = st.number_input(
+                    "원본 금액(원)", min_value=0, step=1000,
+                    value=int(float(orig.get("amount") or 0)),
+                    key=f"pcr_orig_amt_{order_id}",
+                )
+            with oc2:
+                _om = str(orig.get("method") or "")
+                _om_idx = PAYMENT_METHOD_OPTIONS.index(_om) if _om in PAYMENT_METHOD_OPTIONS else 0
+                orig["method"] = st.selectbox(
+                    "원본 수단", options=PAYMENT_METHOD_OPTIONS,
+                    index=_om_idx, key=f"pcr_orig_meth_{order_id}",
+                )
+            with oc3:
+                orig["onnuri"] = st.text_input(
+                    "원본 온누리/승인번호", value=str(orig.get("onnuri") or ""),
+                    key=f"pcr_orig_onnuri_{order_id}",
+                )
+        elif orig:
+            try:
+                _oa2 = f"{int(float(orig.get('amount') or 0)):,}원"
+            except Exception:
+                _oa2 = "-"
+            st.caption(
+                f"등록될 원본: {_oa2} / {orig.get('method') or '-'} "
+                f"{('· ' + str(orig.get('onnuri'))) if orig.get('onnuri') else ''}"
+            )
 
         change_type = st.selectbox(
             "변경 유형",
@@ -21590,18 +22673,44 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             format_func=lambda c: _tb.PAYMENT_CHANGE_TYPE_LABELS.get(c, c),
             key=f"pcr_type_{order_id}",
         )
+
+        # 변경 후 기본값: 이력 new → 없으면 현재 선택 결제행
+        _default_new = _hist_new if (_hist_new.get("method") or _hist_new.get("amount") not in (None, "")) else {}
+        if not _default_new and sel_pid is not None:
+            try:
+                _nr = pay_list[pay_list["id"] == sel_pid].iloc[0]
+                _ncc = str(_nr.get("card_company") or "").strip()
+                _ncc = "" if _ncc in ("None", "nan", "none") else _ncc
+                _default_new = {
+                    "amount": float(_nr.get("amount") or 0),
+                    "method": _nr.get("payment_method") or "",
+                    "onnuri": _nr.get("onnuri_approval_code") or _ncc or "",
+                }
+            except Exception:
+                _default_new = {}
+
+        _amt_key = f"pcr_amt_{order_id}"
+        _meth_key = f"pcr_meth_{order_id}"
+        _onnuri_key = f"pcr_onnuri_{order_id}"
+        if _amt_key not in st.session_state:
+            st.session_state[_amt_key] = int(float(_default_new.get("amount") or orig.get("amount") or 0))
+        if _meth_key not in st.session_state:
+            _dm = str(_default_new.get("method") or "")
+            st.session_state[_meth_key] = _dm if _dm in PAYMENT_METHOD_OPTIONS else (
+                PAYMENT_METHOD_OPTIONS[0] if PAYMENT_METHOD_OPTIONS else ""
+            )
+        if _onnuri_key not in st.session_state:
+            st.session_state[_onnuri_key] = str(_default_new.get("onnuri") or "")
+
         cc1, cc2, cc3 = st.columns(3)
         with cc1:
             new_amount = st.number_input("변경 후 금액(원)", min_value=0, step=1000,
-                                         value=int(orig.get("amount") or 0), key=f"pcr_amt_{order_id}")
+                                         key=_amt_key)
         with cc2:
-            _orig_method = str(orig.get("method") or "")
-            _meth_idx = PAYMENT_METHOD_OPTIONS.index(_orig_method) if _orig_method in PAYMENT_METHOD_OPTIONS else 0
             new_method = st.selectbox("변경 후 수단", options=PAYMENT_METHOD_OPTIONS,
-                                      index=_meth_idx, key=f"pcr_meth_{order_id}")
+                                      key=_meth_key)
         with cc3:
-            new_onnuri = st.text_input("온누리/승인번호(선택)", value="",
-                                       key=f"pcr_onnuri_{order_id}")
+            new_onnuri = st.text_input("온누리/승인번호(선택)", key=_onnuri_key)
         reason = st.text_area("변경 사유 *", key=f"pcr_reason_{order_id}", height=70,
                               placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제")
 
@@ -21619,9 +22728,9 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             if float(orig.get("amount") or 0) > 0 and new_amount > float(orig.get("amount") or 0):
                 st.warning("⚠️ 변경 후 금액이 원본 결제 금액보다 큽니다. 환불/취소 금액을 다시 확인하세요.")
 
-        can_submit = bool((reason or "").strip()) and bool(files)
+        can_submit = bool((reason or "").strip()) and bool(files) and bool(orig.get("method") or orig.get("amount"))
         if not can_submit:
-            st.caption("사유 입력과 증빙 첨부가 모두 있어야 요청할 수 있습니다.")
+            st.caption("원본 확인, 사유 입력, 증빙 첨부가 모두 있어야 요청할 수 있습니다.")
         if st.button("📤 검증 요청 등록", key=f"pcr_submit_{order_id}",
                      type="primary", disabled=not can_submit):
             # 검증자(담당자): 같은 매장 관리자 + superadmin (요청자 본인 제외)
@@ -21859,8 +22968,11 @@ def _internal_work_parent_options(store_name: str | None, role: str,
 
 def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                       me_uname: str, role: str, store_name: str | None,
-                      current_db: str | None, depth: int = 0):
-    """depth==0이면 큰 상위업무 카드, 그 외에는 컴팩트한 하위업무 행."""
+                      current_db: str | None, depth: int = 0,
+                      expand_task_id: int | None = None):
+    """depth==0이면 큰 상위업무 카드, 그 외에는 컴팩트한 하위업무 행.
+    expand_task_id 가 이 카드(또는 하위)와 일치하면 '자세히 보기' 를 자동으로 펼친다.
+    """
     import task_board as _tb  # noqa: WPS433
 
     tid = int(task["id"])
@@ -21875,6 +22987,10 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
     assignee_names = ", ".join(_uname_to_display(a.get("employee_username")) for a in assignees) or "(없음)"
     due = task.get("due_date") or "-"
     children = by_parent.get(tid, [])
+    _auto_expand = bool(expand_task_id and int(expand_task_id) == tid)
+    # 하위 중 포커스 대상이 있으면 상위 expander 도 함께 펼침
+    if not _auto_expand and expand_task_id:
+        _auto_expand = any(int(c.get("id") or 0) == int(expand_task_id) for c in children)
 
     if depth == 0:
         # ── 상위업무 카드 ─────────────────────────────────────
@@ -21941,14 +23057,23 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 preview = desc if len(desc) <= 140 else desc[:137] + "..."
                 st.caption(f"📝 {preview}")
 
-            with st.expander(f"📋 자세히 보기 / 수정 · 하위업무 {sub_count}개", expanded=False):
+            if _auto_expand:
+                st.success("🔔 알림에서 연 업무입니다 — 아래에서 증빙 확인 후 검증 완료/반려를 처리하세요.")
+            # Streamlit 1.54 expander 는 key 인자를 지원하지 않음 → expanded 만 사용
+            with st.expander(
+                f"📋 자세히 보기 / 수정 · 하위업무 {sub_count}개",
+                expanded=_auto_expand,
+            ):
                 _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
                 if children:
                     st.markdown("---")
                     st.markdown(f"**↳ 하위업무 {len(children)}**")
                     for child in children:
-                        _render_task_card(child, by_parent, assignees_map,
-                                          me_uname, role, store_name, current_db, depth=depth + 1)
+                        _render_task_card(
+                            child, by_parent, assignees_map,
+                            me_uname, role, store_name, current_db,
+                            depth=depth + 1, expand_task_id=expand_task_id,
+                        )
     else:
         # ── 하위업무 행 (컴팩트) ─────────────────────────────
         indent = "&nbsp;" * (4 * (depth - 1))
@@ -21964,14 +23089,17 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
             c2.markdown(f"{indent}↳ **{_pin}{_lock}#{tid} {title}**", unsafe_allow_html=True)
             c3.caption(f"👤 {assignee_names}")
             c4.caption(f"📅 {due}")
-            with st.expander("자세히 보기 / 수정", expanded=False):
+            with st.expander("자세히 보기 / 수정", expanded=_auto_expand):
                 _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
                 if children:
                     st.markdown("---")
                     st.markdown(f"**↳ 하위업무 {len(children)}**")
                     for child in children:
-                        _render_task_card(child, by_parent, assignees_map,
-                                          me_uname, role, store_name, current_db, depth=depth + 1)
+                        _render_task_card(
+                            child, by_parent, assignees_map,
+                            me_uname, role, store_name, current_db,
+                            depth=depth + 1, expand_task_id=expand_task_id,
+                        )
 
 
 def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_creator: bool):
@@ -22009,11 +23137,16 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
             except Exception:
                 return "-"
 
+        # 사후 조회 버그로 원본==변경후인 기존 건은 결제변경 이력으로 보정 표시
+        display_meta, hist_note = _pcr_display_meta_from_history(meta)
+        if hist_note:
+            st.info(hist_note)
+
         # 원본 vs 변경 비교 표
         comp = pd.DataFrame([
-            {"항목": "금액", "원본": _fmt_amt(meta.get("original_amount")), "변경 후": _fmt_amt(meta.get("new_amount"))},
-            {"항목": "결제수단", "원본": meta.get("original_method") or "-", "변경 후": meta.get("new_method") or "-"},
-            {"항목": "온누리/승인번호", "원본": meta.get("original_onnuri") or "-", "변경 후": meta.get("new_onnuri") or "-"},
+            {"항목": "금액", "원본": _fmt_amt(display_meta.get("original_amount")), "변경 후": _fmt_amt(display_meta.get("new_amount"))},
+            {"항목": "결제수단", "원본": display_meta.get("original_method") or "-", "변경 후": display_meta.get("new_method") or "-"},
+            {"항목": "온누리/승인번호", "원본": display_meta.get("original_onnuri") or "-", "변경 후": display_meta.get("new_onnuri") or "-"},
         ])
         st.dataframe(comp, width='stretch', hide_index=True)
 
@@ -22024,9 +23157,9 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
 
         # 부정 방지 경고
         try:
-            oa = float(meta.get("original_amount") or 0)
-            na = float(meta.get("new_amount") or 0)
-            if meta.get("change_type") in ("refund", "cancel_card", "cancel_transfer") and na > oa > 0:
+            oa = float(display_meta.get("original_amount") or 0)
+            na = float(display_meta.get("new_amount") or 0)
+            if display_meta.get("change_type") in ("refund", "cancel_card", "cancel_transfer") and na > oa > 0:
                 st.warning("⚠️ 변경 후 금액이 원본 결제 금액을 초과합니다. 환불/취소 금액을 재확인하세요.")
         except Exception:
             pass
@@ -22886,6 +24019,174 @@ def render_deposit_management():
                     st.rerun()
 
 
+def _render_kpi_weights_admin_section(role: str, me_uname: str) -> None:
+    """관리자 설정 7번: 직원 평가 가중치 편집·목록.
+    - 스코프: 전체 매장 통합(__all__) + 매장별 (store_admin은 자기 매장만)
+    - 기간: 연월(YYYY-MM). 없으면 기본값(70/15/5/10) 사용
+    - 저장 조건: 합계 = 100
+    """
+    is_super = role == "superadmin"
+    current_db = st.session_state.get("current_db")
+
+    stores_rows = _get_supabase_stores_list()
+
+    scope_options: list[tuple[str, str]] = []
+    if is_super:
+        scope_options.append((KPI_WEIGHTS_ALL_SCOPE, "전체 매장 통합"))
+        for s in stores_rows:
+            _db = s.get("db_filename")
+            _nm = s.get("store_name") or _db
+            if _db:
+                scope_options.append((_db, _nm))
+    else:
+        if current_db:
+            _my_nm = next(
+                (s.get("store_name") for s in stores_rows if s.get("db_filename") == current_db),
+                current_db,
+            )
+            scope_options.append((current_db, _my_nm or current_db))
+        else:
+            st.info("현재 매장이 확인되지 않습니다. 매장에 로그인한 후 다시 시도해 주세요.")
+            return
+
+    if not scope_options:
+        st.info("설정 가능한 매장이 없습니다.")
+        return
+
+    scope_keys = [k for k, _ in scope_options]
+    scope_labels = {k: label for k, label in scope_options}
+
+    sel_scope = st.selectbox(
+        "대상",
+        options=scope_keys,
+        format_func=lambda k: scope_labels.get(k, k),
+        key="kpi_w_scope",
+    )
+
+    today_kst = _today_kst()
+    c1, c2 = st.columns(2)
+    with c1:
+        sel_year = st.number_input(
+            "적용 연도",
+            min_value=2020, max_value=2100, value=int(today_kst.year), step=1,
+            key="kpi_w_year",
+        )
+    with c2:
+        sel_month = st.number_input(
+            "적용 월",
+            min_value=1, max_value=12, value=int(today_kst.month), step=1,
+            key="kpi_w_month",
+        )
+
+    existing = load_kpi_weights(
+        sel_scope if sel_scope != KPI_WEIGHTS_ALL_SCOPE else None,
+        int(sel_year), int(sel_month),
+        all_stores=(sel_scope == KPI_WEIGHTS_ALL_SCOPE),
+    )
+
+    # 초기값을 세션에 담아 사용자 조작 우선
+    _wkey_prefix = f"kpi_w_v_{sel_scope}_{int(sel_year):04d}{int(sel_month):02d}"
+    for _k, _v in (
+        ("revenue", existing["revenue"]),
+        ("margin",  existing["margin"]),
+        ("display", existing["display"]),
+        ("cash",    existing["cash"]),
+    ):
+        _sk = f"{_wkey_prefix}_{_k}"
+        if _sk not in st.session_state:
+            st.session_state[_sk] = float(_v)
+
+    wc1, wc2, wc3, wc4 = st.columns(4)
+    with wc1:
+        w_revenue = st.number_input(
+            "매출 가중치", min_value=0.0, max_value=100.0, step=1.0,
+            key=f"{_wkey_prefix}_revenue",
+        )
+    with wc2:
+        w_margin = st.number_input(
+            "마진 가중치", min_value=0.0, max_value=100.0, step=1.0,
+            key=f"{_wkey_prefix}_margin",
+        )
+    with wc3:
+        w_display = st.number_input(
+            "전시품 가중치", min_value=0.0, max_value=100.0, step=1.0,
+            key=f"{_wkey_prefix}_display",
+        )
+    with wc4:
+        w_cash = st.number_input(
+            "현금수금 가중치", min_value=0.0, max_value=100.0, step=1.0,
+            key=f"{_wkey_prefix}_cash",
+        )
+
+    total_w = float(w_revenue) + float(w_margin) + float(w_display) + float(w_cash)
+    if abs(total_w - 100.0) < 0.01:
+        st.success(f"합계 {total_w:g} — 저장 가능")
+        _can_save = True
+    else:
+        st.error(f"합계가 100이 아닙니다. 현재 합: {total_w:g}")
+        _can_save = False
+
+    b1, b2, b3 = st.columns([1, 1, 3])
+    with b1:
+        if st.button("저장", type="primary", disabled=not _can_save, key=f"{_wkey_prefix}_save"):
+            ok, err = save_kpi_weights(
+                sel_scope,
+                int(sel_year), int(sel_month),
+                {
+                    "revenue": float(w_revenue),
+                    "margin":  float(w_margin),
+                    "display": float(w_display),
+                    "cash":    float(w_cash),
+                },
+                updated_by=me_uname,
+            )
+            if ok:
+                flash(f"가중치를 저장했습니다. ({scope_labels[sel_scope]} · {int(sel_year):04d}-{int(sel_month):02d})")
+                st.rerun()
+            else:
+                st.error(f"저장 실패: {err}")
+    with b2:
+        if st.button("이 달 삭제(기본값으로)", key=f"{_wkey_prefix}_del"):
+            ok, err = delete_kpi_weights(sel_scope, int(sel_year), int(sel_month))
+            if ok:
+                flash("해당 월 가중치를 삭제했습니다. 이후 기본값(70/15/5/10)이 적용됩니다.")
+                st.rerun()
+            else:
+                st.error(f"삭제 실패: {err}")
+    with b3:
+        if st.button("기본값 되돌리기", key=f"{_wkey_prefix}_reset"):
+            st.session_state[f"{_wkey_prefix}_revenue"] = float(DEFAULT_KPI_WEIGHTS["revenue"])
+            st.session_state[f"{_wkey_prefix}_margin"]  = float(DEFAULT_KPI_WEIGHTS["margin"])
+            st.session_state[f"{_wkey_prefix}_display"] = float(DEFAULT_KPI_WEIGHTS["display"])
+            st.session_state[f"{_wkey_prefix}_cash"]    = float(DEFAULT_KPI_WEIGHTS["cash"])
+            st.rerun()
+
+    st.markdown("##### 저장된 월별 가중치")
+    rows = list_kpi_weights(sel_scope, limit=24)
+    if not rows:
+        st.caption("저장된 가중치가 없습니다. (모든 달에 기본값 70/15/5/10 적용)")
+    else:
+        _tbl = pd.DataFrame([
+            {
+                "연월": r.get("year_month"),
+                "매출": float(r.get("w_revenue") or 0),
+                "마진": float(r.get("w_margin") or 0),
+                "전시품": float(r.get("w_display") or 0),
+                "현금수금": float(r.get("w_cash") or 0),
+                "합계": (
+                    float(r.get("w_revenue") or 0)
+                    + float(r.get("w_margin") or 0)
+                    + float(r.get("w_display") or 0)
+                    + float(r.get("w_cash") or 0)
+                ),
+                "수정자": r.get("updated_by") or "-",
+                "수정 시각": str(r.get("updated_at") or "")[:19],
+            }
+            for r in rows
+        ])
+        st.dataframe(_tbl, width="stretch", hide_index=True)
+
+
 def render_admin_settings():
     """⚙️ 관리자 설정 — ERP 운영 설정을 모아두는 허브.
     알림톡·카카오 채널 설정, 알림 문구 편집 등을 포함하며 항목이 늘어나면 여기에 추가."""
@@ -22903,10 +24204,17 @@ def render_admin_settings():
     st.header("⚙️ 관리자 설정")
     st.caption("ERP 운영에 필요한 설정을 관리합니다. 항목은 추후 확장됩니다.")
 
-    # ── 매장별 근무 기준 설정 ──────────────────────────────────
+    # ── 1. 직원 마스터 (구 매장 관리자 메뉴) ─────────────────────
+    st.subheader("1. 직원 마스터 (Employees)")
+    st.caption("직원 등록·수정·삭제 및 매출 정합성 점검. 기존 「매장 관리자 메뉴」가 이곳으로 이동되었습니다.")
+    render_store_admin_employees()
+
+    st.divider()
+
+    # ── 2. 매장별 근무 기준 설정 ──────────────────────────────────
     current_db = st.session_state.get("current_db")
     if current_db:
-        with st.expander("🏪 매장별 근무 기준 설정", expanded=True):
+        with st.expander("2. 🏪 매장별 근무 기준 설정", expanded=False):
             _stores_list_sr = _get_supabase_stores_list()
             if _stores_list_sr:
                 _sr_tab_labels = [s["store_name"] for s in _stores_list_sr]
@@ -22928,14 +24236,14 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 공지사항 관리 (전체매장/매장별) ──────────────────────────
-    with st.expander("📢 공지사항 관리", expanded=False):
+    # ── 3. 공지사항 관리 (전체매장/매장별) ──────────────────────────
+    with st.expander("3. 📢 공지사항 관리", expanded=False):
         _render_notice_admin_section()
 
     st.divider()
 
-    # ── 카카오 채널 / 알림톡 ───────────────────────────────────
-    st.subheader("📲 카카오 채널 / 알림톡")
+    # ── 4. 카카오 채널 / 알림톡 ───────────────────────────────────
+    st.subheader("4. 📲 카카오 채널 / 알림톡")
 
     # 친구추가 미완료 직원 목록
     pending = _tb.load_friend_pending_users(store_id if role == "store_admin" else None)
@@ -22954,8 +24262,8 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 알림 문구 편집 ─────────────────────────────────────────
-    st.subheader("📝 알림 문구 편집")
+    # ── 5. 알림 문구 편집 ─────────────────────────────────────────
+    st.subheader("5. 📝 알림 문구 편집")
     tmpl_labels = {
         "task_assigned": "신규 업무 배정",
         "status_changed": "상태 변경",
@@ -22985,9 +24293,9 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 계좌-매장 매핑 (입금 SMS 자동 분류) ─────────────────────
+    # ── 6. 계좌-매장 매핑 (입금 SMS 자동 분류) ─────────────────────
     import deposit_board as _dep  # noqa: WPS433
-    st.subheader("🏦 계좌-매장 매핑 (입금 문자 자동 분류)")
+    st.subheader("6. 🏦 계좌-매장 매핑 (입금 문자 자동 분류)")
     st.caption(
         "기업은행 입금 문자의 계좌(예: 392***16401011)에서 **끝 8자리**(16401011)로 매장을 자동 분류합니다. "
         "각 매장 계좌의 끝 8자리를 등록해 주세요."
@@ -23054,14 +24362,20 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 추후 확장 플레이스홀더 ──────────────────────────────────
-    st.subheader("🔧 기타 설정")
-    st.info("ERP 운영 설정 항목은 추후 이 곳에 추가됩니다.")
+    # ── 7. 직원 평가 가중치 (월별/매장별 · 전체 통합) ─────────────────
+    st.subheader("7. 🎯 직원 평가 가중치 (월별)")
+    st.caption(
+        "매출 / 마진 / 전시품 / 현금수금 점수의 **가중치**를 매장별 또는 **전체 매장 통합**으로 "
+        "**연월(YYYY-MM) 단위**로 설정합니다. 저장이 없는 달은 기본값 **70 / 15 / 5 / 10**을 사용합니다. "
+        "과거 월 조회는 그 달에 저장된 값이 그대로 적용됩니다."
+    )
+    with st.expander("가중치 편집 / 목록", expanded=False):
+        _render_kpi_weights_admin_section(role, me_uname)
 
     st.divider()
 
-    # ── 🔐 비밀번호 변경 ──────────────────────────────────────
-    st.subheader("🔐 비밀번호 변경")
+    # ── 8. 🔐 비밀번호 변경 ──────────────────────────────────────
+    st.subheader("8. 🔐 비밀번호 변경")
     st.caption("현재 로그인 계정의 비밀번호를 변경합니다. 변경 후 다음 로그인부터 새 비밀번호를 사용하세요.")
     with st.form("admin_settings_change_pw_form", clear_on_submit=True):
         _cpw_new = st.text_input("새 비밀번호", type="password", key="as_new_pw")
@@ -24191,14 +25505,17 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "월별 판매 현황"
         ),
         "body": (
-            "종합 점수는 **네 가지 합**으로 **100점 만점**입니다.\n\n"
-            "- **매출 점수 70점**\n"
-            "- **마진 점수 15점**\n"
-            "- **전시품 판매 점수 5점**\n"
-            "- **현금수금 점수 10점** (결제일 기준, 수수료 없는 수납: 이체·온누리·지역화폐·현금)\n\n"
+            "종합 점수는 **네 가지 합**으로 **100점 만점**입니다. "
+            "기본값은 아래이며, ⚙️ **관리자 설정 → 7. 직원 평가 가중치(월별)** 에서 "
+            "**매장별 / 전체 매장 통합**으로 **연월 단위**로 변경할 수 있습니다. "
+            "저장 없는 달은 기본값이 그대로 쓰이고, 과거 월은 그 달에 저장된 값이 유지됩니다.\n\n"
+            "- **매출 점수 70점** (기본)\n"
+            "- **마진 점수 15점** (기본)\n"
+            "- **전시품 판매 점수 5점** (기본)\n"
+            "- **현금수금 점수 10점** (기본, 결제일 기준, 수수료 없는 수납: 이체·온누리·지역화폐·현금)\n\n"
             "**경영 대시보드**의 「3. 월별 직원 판매 현황 및 평가」와 "
             "**최고 관리자 → 매장별 직원 평가(HR)** 에서 같은 기준으로 집계합니다. "
-            "(HR은 선택한 **단일 월** 또는 **연월 범위** 기준입니다.)"
+            "(HR은 선택한 **단일 월** 또는 **연월 범위** 기준이며, 다월 조회 시 **종료월 가중치**를 적용합니다.)"
         ),
     },
     {
@@ -24231,7 +25548,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "**현금수금집계에 포함되지 않습니다.**\n"
             "- **수수료 0%** 인 **계좌이체(이체), 온누리·온누리지류, 지역화폐, 현금(수금)** 만 포함됩니다.\n"
             "- 결제 금액도 주문 담당 직원이 여러 명이면 **1/n**으로 나눈 뒤 직원별로 합산합니다.\n"
-            "- KPI 표의 **현금수금집계** 열은 위 기준의 **금액 참고**이며, **종합 점수(매출70+마진20+전시10)에는 넣지 않습니다.**"
+            "- **현금수금 점수(기본 10점)** 로 종합 점수에 포함되며, 가중치는 ⚙️ 관리자 설정에서 변경할 수 있습니다."
         ),
     },
     {
@@ -24965,10 +26282,11 @@ def render_superadmin():
         render_faq_page()
 
 
-# ========== 탭 1: 매장 관리자 메뉴 (Store Admin 전용) — Employees ==========
+# ========== 직원 마스터 (⚙️ 관리자 설정 1번 항목) ==========
 
 def render_store_admin_employees():
-    """직원 마스터 및 수정 요청 UI. 100% Supabase app_users/app_user_stores 기반."""
+    """직원 마스터 및 수정 요청 UI. 100% Supabase app_users/app_user_stores 기반.
+    ⚙️ 관리자 설정의 1번 항목으로 렌더된다 (구 세일즈 메뉴 「매장 관리자 메뉴」)."""
     db_filename = st.session_state.get("current_db")
     if not db_filename:
         st.warning("매장에 로그인한 후 이용하세요.")
@@ -24989,7 +26307,7 @@ def render_store_admin_employees():
         return
 
     # ---------- 매출 정합성 점검 (sales 누락 자동 복구) ----------
-    with st.expander("🔧 매출 정합성 점검 (sales 누락 자동 복구)", expanded=False):
+    with st.expander("1-1. 🔧 매출 정합성 점검 (sales 누락 자동 복구)", expanded=False):
         st.caption(
             "주문(app_orders)은 저장됐지만 매출(sales)에 기록되지 않은 누락 건을 찾아 "
             "자동으로 복구합니다. KPI·월매출에 반영되지 않은 주문을 발견했을 때 사용하세요."
@@ -25019,7 +26337,6 @@ def render_store_admin_employees():
                             + "\n\n→ 관리자에게 수동 INSERT를 요청하세요."
                         )
 
-    st.header("직원 마스터 (Employees)")
     users = _get_supabase_users_list()
     emp_rows = []
     for u in users:
@@ -25040,7 +26357,7 @@ def render_store_admin_employees():
 
     # ---------- 신규 직원 등록 ----------
     with st.form("add_employee_form"):
-        st.subheader("신규 직원 등록")
+        st.markdown("**1-2. 신규 직원 등록**")
         new_username = st.text_input("사용자명(ID)", key="emp_new_username")
         new_password = st.text_input("비밀번호", type="password", key="emp_new_password")
         new_name = st.text_input("이름(표시명)", key="emp_new_name")
@@ -25089,7 +26406,7 @@ def render_store_admin_employees():
 
     # ---------- 직원 목록 (수정/삭제) ----------
     if len(df) > 0:
-        st.subheader("직원 목록 (수정/삭제)")
+        st.markdown("**1-3. 직원 목록 (수정/삭제)**")
         for _, row in df.iterrows():
             with st.expander(f"{row['name']} ({row.get('username', '')})"):
                 with st.form(f"emp_{row['id']}"):
@@ -25607,7 +26924,7 @@ def render_new_sales():
                 employees = pd.read_sql("SELECT id, name FROM Employees WHERE is_active = 1", conn)
             except Exception:
                 employees = pd.DataFrame(columns=["id", "name"])
-                st.warning("직원 목록을 불러오지 못했습니다. 매장 관리자 메뉴에서 직원을 먼저 등록해 주세요.")
+                st.warning("직원 목록을 불러오지 못했습니다. ⚙️ 관리자 설정 → 1. 직원 마스터에서 직원을 먼저 등록해 주세요.")
             finally:
                 conn.close()
     # ── 특수 등록 (위약금 / 직원구매) ──
@@ -25822,7 +27139,7 @@ def render_new_sales():
     else:
         emp_names = employees["name"].tolist() if not employees.empty and "name" in employees.columns else []
     if not emp_names:
-        st.warning("이 매장에 배정된 직원이 없습니다. **직원 계정 관리**에서 해당 매장을 배정해 주세요. (또는 매장 관리자 메뉴 → 직원 마스터에서 등록)")
+        st.warning("이 매장에 배정된 직원이 없습니다. **직원 계정 관리**에서 해당 매장을 배정해 주세요. (또는 ⚙️ 관리자 설정 → 1. 직원 마스터에서 등록)")
     # key에 폼 리셋 카운터를 붙여 등록 완료 시 새 위젯으로 초기화
     _form_reset = st.session_state.get("_new_sales_form_reset", 0)
     selected_employees = st.multiselect(
@@ -26765,173 +28082,319 @@ def _customer_balance_payment_ui(
     key_prefix: str = "pay",
     default_payment_date: date | None = None,
 ):
-    """잔금 완납 처리(결제 추가) 공통 UI. 직원도 사용 가능하되, 모든 변경은 PaymentHistory에 기록."""
+    """잔금 완납 처리(결제 추가) 공통 UI — 신규 매출 등록과 동일한 복수 결제 슬롯.
+
+    한 주문에 여러 결제 수단을 한 번에 등록할 수 있다 (예: 신용카드 + 현금).
+    금액이 0보다 큰 슬롯만 `app_payments` 에 INSERT 되고, 이후 잔금·마진을 1회 재계산한다.
+    모든 변경은 PaymentHistory에 합산(payments 배열 포함) 형태로 기록한다.
+    """
+    _BAL_MAX_SLOTS = 20
+    _BAL_DEFAULT_SLOTS = 1
+
     _pay_done_key = f"_pay_done_{key_prefix}"
     if _pay_done_key in st.session_state:
         _pd = st.session_state.pop(_pay_done_key)
         st.success(f"✅ 결제 입력 완료! {_pd['amount']:,}원이 등록되었습니다.")
-    amt_key = f"{key_prefix}_amt"
-    if amt_key not in st.session_state:
-        st.session_state[amt_key] = _format_number_comma(str(int(balance))) if balance > 0 else "0"
+
     _pay_date_key = f"{key_prefix}_pay_date"
     if _pay_date_key not in st.session_state:
         st.session_state[_pay_date_key] = default_payment_date or _today_kst()
-    st.caption("잔금 완납 처리 (결제 추가)")
-    add_pay_date = st.date_input("결제 날짜 *", key=_pay_date_key)
-    add_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
-    if add_method in _CARD_WITH_COMPANY:
-        add_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
-    elif add_method == "메인페이":
-        add_card = st.text_input("메인페이 승인번호 4자리", key=f"{key_prefix}_card", max_chars=4)
-    elif add_method == "지역화폐":
-        add_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card")
-    else:
-        add_card = None
-    st.text_input("결제 금액", key=amt_key, on_change=lambda: st.session_state.__setitem__(amt_key, _format_number_comma(st.session_state.get(amt_key, ""))))
-    add_amt_int = _parse_comma_to_int(st.session_state.get(amt_key, "0"))
-    # 초과 결제 경고 (입력 차단 없음 — 결변·카드취소 처리 지원)
-    if add_amt_int > 0 and add_amt_int > balance:
-        _over = add_amt_int - max(balance, 0)
-        st.warning(f"⚠️ 입력 금액({add_amt_int:,}원)이 잔금({max(balance,0):,.0f}원)보다 **{_over:,}원 초과**합니다. 결변·카드취소 처리 목적이면 그대로 등록하세요. 초과 금액은 '초과결제 항목' 탭에 표시됩니다.")
-    # 온누리상품권일 때 승인번호/영수증 입력 (전자상품권만 해당, 지류는 승인번호 불필요)
-    is_onnuri = add_method and ("온누리" in str(add_method)) and ("지류" not in str(add_method))
-    stage_key = f"{key_prefix}_onnuri_stage"
-    last4_key = f"{key_prefix}_onnuri_last4"
-    full_key = f"{key_prefix}_onnuri_full"
-    receipt_key = f"{key_prefix}_onnuri_receipt"
-    if is_onnuri:
-        if stage_key not in st.session_state:
-            st.session_state[stage_key] = "last4"
-        stage = st.session_state.get(stage_key, "last4")
-        if stage == "last4":
-            st.text_input("온누리 승인번호 뒤 4자리", key=last4_key, max_chars=4)
+    _slot_count_key = f"{key_prefix}_slot_count"
+    if _slot_count_key not in st.session_state:
+        st.session_state[_slot_count_key] = _BAL_DEFAULT_SLOTS
+
+    def _slot_key(name: str, i: int) -> str:
+        return f"{key_prefix}_{name}_{i}"
+
+    # 슬롯 1 금액 기본값 = 잔금 (남은 슬롯은 0). 최초 진입 시 1회만 세팅.
+    _slot0_amt_key = _slot_key("amt", 0)
+    if _slot0_amt_key not in st.session_state:
+        st.session_state[_slot0_amt_key] = _format_number_comma(str(int(balance))) if balance and balance > 0 else "0"
+
+    st.caption("잔금 완납 처리 (결제 추가 · 복수 결제 가능)")
+    st.date_input("결제 날짜 *", key=_pay_date_key)
+
+    _add_col1, _add_col2 = st.columns([3, 1])
+    with _add_col2:
+        _disabled_add = st.session_state[_slot_count_key] >= _BAL_MAX_SLOTS
+        if st.button("➕ 결제 수단 추가", disabled=_disabled_add, key=f"{key_prefix}_add_slot"):
+            if st.session_state[_slot_count_key] < _BAL_MAX_SLOTS:
+                st.session_state[_slot_count_key] += 1
+
+    slot_count = int(st.session_state[_slot_count_key])
+    slot_infos: list[dict] = []
+    total_amt_int = 0
+    for i in range(slot_count):
+        m_key = _slot_key("method", i)
+        c_key = _slot_key("card", i)
+        a_key = _slot_key("amt", i)
+        if a_key not in st.session_state:
+            st.session_state[a_key] = "0"
+
+        _r1, _r2, _r3 = st.columns([2, 2, 2])
+        with _r1:
+            method = st.selectbox(
+                f"결제 수단 #{i+1}",
+                options=PAYMENT_METHOD_OPTIONS,
+                key=m_key,
+            )
+        with _r2:
+            if method in _CARD_WITH_COMPANY:
+                card_company = st.selectbox(f"카드사 #{i+1} *", options=CARD_COMPANY_OPTIONS, key=c_key)
+            elif method == "메인페이":
+                st.text_input(f"메인페이 승인번호 4자리 #{i+1} *", key=c_key, max_chars=4)
+                card_company = st.session_state.get(c_key)
+            elif method == "지역화폐":
+                st.text_input(f"지역화폐 승인번호 #{i+1} *", key=c_key)
+                card_company = st.session_state.get(c_key)
+            else:
+                card_company = None
+        with _r3:
+            st.text_input(
+                f"결제 금액 #{i+1} *",
+                key=a_key,
+                on_change=lambda _k=a_key: st.session_state.__setitem__(
+                    _k, _format_number_comma(st.session_state.get(_k, ""))
+                ),
+            )
+        amt_int = _parse_comma_to_int(st.session_state.get(a_key, "0"))
+        total_amt_int += amt_int
+
+        # 온누리 승인번호/영수증 (전자상품권만, '온누리지류'는 제외)
+        is_onnuri = method and ("온누리" in str(method)) and ("지류" not in str(method))
+        stage_key = _slot_key("onnuri_stage", i)
+        last4_key = _slot_key("onnuri_last4", i)
+        full_key = _slot_key("onnuri_full", i)
+        receipt_key = _slot_key("onnuri_receipt", i)
+        if is_onnuri:
+            if stage_key not in st.session_state:
+                st.session_state[stage_key] = "last4"
+            stage = st.session_state.get(stage_key, "last4")
+            if stage == "last4":
+                st.text_input(f"온누리 승인번호 뒤 4자리 #{i+1} *", key=last4_key, max_chars=4)
+            else:
+                st.text_input(f"온누리 승인번호 전체 (8자리 이상) #{i+1} *", key=full_key)
+            st.file_uploader(
+                f"온누리상품권 영수증 사진(선택) #{i+1}",
+                type=["png", "jpg", "jpeg", "webp"],
+                key=receipt_key,
+            )
         else:
-            st.text_input("온누리 승인번호 전체 (8자리 이상)", key=full_key)
-        st.file_uploader(
-            "온누리상품권 영수증 사진(선택)",
-            type=["png", "jpg", "jpeg", "webp"],
-            key=receipt_key,
+            st.session_state.pop(stage_key, None)
+
+        slot_infos.append({
+            "index": i,
+            "method": method,
+            "card_company": card_company,
+            "amount": amt_int,
+            "is_onnuri": bool(is_onnuri),
+            "stage_key": stage_key,
+            "last4_key": last4_key,
+            "full_key": full_key,
+        })
+
+    _bal_after = float(balance) - float(total_amt_int)
+    _mc1, _mc2 = st.columns(2)
+    with _mc1:
+        st.metric("이번 결제 합계", f"{total_amt_int:,}원")
+    with _mc2:
+        st.metric("등록 후 예상 잔금", f"{_bal_after:,.0f}원",
+                  help="현재 잔금 - 이번 결제 합계. 음수면 초과결제로 등록됩니다.")
+
+    if total_amt_int > 0 and total_amt_int > balance:
+        _over = total_amt_int - max(balance, 0)
+        st.warning(
+            f"⚠️ 이번 결제 합계({total_amt_int:,}원)가 잔금({max(balance,0):,.0f}원)보다 "
+            f"**{_over:,}원 초과**합니다. 결변·카드취소 처리 목적이면 그대로 등록하세요. "
+            "초과 금액은 '초과결제 항목' 탭에 표시됩니다."
         )
-    else:
-        st.session_state.pop(stage_key, None)
+
     reason_key = f"{key_prefix}_reason"
     edit_reason = st.text_area("결제 메모(선택)", key=reason_key)
-    if st.button("결제 등록", key=f"{key_prefix}_btn"):
-        if add_amt_int > 0:
-            # 온누리상품권 중복 검증: 오늘 날짜 + 승인번호 4자리 조합 (금액 제외)
-            onnuri_code = None
-            pay_date_str = add_pay_date.isoformat() if hasattr(add_pay_date, "isoformat") else _today_kst().isoformat()
-            if is_onnuri:
-                stage = st.session_state.get(stage_key, "last4")
-                if stage == "last4":
-                    last4_raw = (st.session_state.get(last4_key, "") or "").strip()
-                    last4_digits = re.sub(r"\D", "", last4_raw)
-                    if len(last4_digits) != 4:
-                        st.error("온누리상품권 결제의 승인번호 뒤 4자리를 정확히 입력하세요.")
-                        return
-                    if _supabase_orders_payments_available():
-                        dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
-                    else:
-                        conn_chk = get_tenant_conn(db_filename)
-                        try:
-                            dup_cnt = conn_chk.execute(
-                                """
-                                SELECT COUNT(*) FROM Payments
-                                WHERE payment_method LIKE '%온누리%'
-                                  AND payment_date = ?
-                                  AND onnuri_approval_code IS NOT NULL
-                                  AND substr(onnuri_approval_code, -4) = ?
-                                """,
-                                (pay_date_str, last4_digits),
-                            ).fetchone()[0]
-                        finally:
-                            conn_chk.close()
-                    if dup_cnt > 0:
-                        st.session_state[stage_key] = "full"
-                        st.error("⚠️ 동일한 결제일, 금액, 승인번호 4자리를 가진 기록이 이미 존재합니다. 정상 중복 건일 경우 승인번호 '전체 8자리 이상'을 입력해 주세요.")
-                        return
-                    onnuri_code = last4_digits
-                else:
-                    full_raw = (st.session_state.get(full_key, "") or "").strip()
-                    full_digits = re.sub(r"\D", "", full_raw)
-                    if len(full_digits) < 8:
-                        st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
-                        return
-                    onnuri_code = full_digits
-            fee = _payment_fee_amount(add_method, add_amt_int)
-            use_supabase_op = _supabase_orders_payments_available()
-            if use_supabase_op:
-                paid_total, _ = _sum_payments_by_order_supabase(db_filename, order_id)
-                old_paid_total = paid_total
-                new_paid_total = old_paid_total + add_amt_int
-                old_balance = balance
-                new_balance = balance - add_amt_int
-                _insert_payment_supabase(db_filename, {
-                    "order_id": order_id,
-                    "payment_date": pay_date_str,
-                    "amount": add_amt_int,
-                    "payment_method": add_method or None,
-                    "card_company": add_card,
-                    "fee_amount": fee,
-                    "onnuri_approval_code": onnuri_code,
-                    "created_by": _current_username(),
-                })
-                _recalc_order_actual_margin_supabase(db_filename, order_id)
-                customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
-                customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
-                # Supabase 이력 저장 (conn 없이도 동작)
-                _ph_err = _insert_payment_history(
-                    None, order_id, customer_name, "잔금결제",
-                    {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
-                    {"order_id": order_id, "added_amount": add_amt_int, "method": add_method, "card_company": add_card, "balance_after": new_balance, "paid_total_after": new_paid_total},
-                    edit_reason, db_filename=db_filename,
-                )
-                if _ph_err:
-                    st.warning(f"⚠️ 이력 저장 오류 (기능은 정상): {_ph_err}")
-                # SQLite 감사 로그 (파일이 있을 때만)
-                conn = get_tenant_conn(db_filename)
-                if conn:
-                    try:
-                        _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
-                        _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
-                        conn.commit()
-                    finally:
-                        conn.close()
+
+    if not st.button("결제 등록", key=f"{key_prefix}_btn"):
+        return
+
+    add_pay_date = st.session_state.get(_pay_date_key) or _today_kst()
+    pay_date_str = add_pay_date.isoformat() if hasattr(add_pay_date, "isoformat") else _today_kst().isoformat()
+
+    # 결제 금액이 있는 슬롯만 대상
+    active = [s for s in slot_infos if int(s["amount"]) > 0]
+    if not active:
+        st.warning("금액을 입력하세요.")
+        return
+
+    # 슬롯별 필수값 검증 (매출 등록과 동일 수준)
+    for s in active:
+        method = s["method"] or ""
+        idx1 = s["index"] + 1
+        if method in _CARD_WITH_COMPANY:
+            if not (str(s["card_company"] or "").strip()):
+                st.error(f"결제 #{idx1} {method} 카드사를 선택하세요.")
+                return
+        elif method == "메인페이":
+            _digits = re.sub(r"\D", "", str(s["card_company"] or ""))
+            if len(_digits) != 4:
+                st.error(f"결제 #{idx1} 메인페이 승인번호 4자리를 정확히 입력하세요.")
+                return
+        elif method == "지역화폐":
+            _digits = re.sub(r"\D", "", str(s["card_company"] or ""))
+            if len(_digits) == 0:
+                st.error(f"결제 #{idx1} 지역화폐 승인번호를 입력하세요.")
+                return
+
+    # 온누리 승인번호 검증 + 중복 체크 (last4 → full 단계 전환)
+    onnuri_codes: dict[int, str | None] = {}
+    for s in active:
+        if not s["is_onnuri"]:
+            onnuri_codes[s["index"]] = None
+            continue
+        stage = st.session_state.get(s["stage_key"], "last4")
+        idx1 = s["index"] + 1
+        if stage == "last4":
+            last4_raw = (st.session_state.get(s["last4_key"], "") or "").strip()
+            last4_digits = re.sub(r"\D", "", last4_raw)
+            if len(last4_digits) != 4:
+                st.error(f"결제 #{idx1} 온누리상품권 승인번호 뒤 4자리를 정확히 입력하세요.")
+                return
+            if _supabase_orders_payments_available():
+                dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
             else:
-                conn = get_tenant_conn(db_filename)
-                cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (order_id,))
-                old_paid_total = cur.fetchone()[0] or 0
-                new_paid_total = old_paid_total + add_amt_int
-                old_balance = balance
-                new_balance = balance - add_amt_int
-                conn.execute("""
-                    INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
-                """, (order_id, pay_date_str, add_amt_int, add_method or None, add_card, fee, onnuri_code, _current_username()))
-                _recalc_order_actual_margin(conn, order_id, db_filename)
+                _conn_chk = get_tenant_conn(db_filename)
+                try:
+                    dup_cnt = _conn_chk.execute(
+                        """
+                        SELECT COUNT(*) FROM Payments
+                        WHERE payment_method LIKE '%온누리%'
+                          AND payment_date = ?
+                          AND onnuri_approval_code IS NOT NULL
+                          AND substr(onnuri_approval_code, -4) = ?
+                        """,
+                        (pay_date_str, last4_digits),
+                    ).fetchone()[0]
+                finally:
+                    _conn_chk.close()
+            if dup_cnt > 0:
+                st.session_state[s["stage_key"]] = "full"
+                st.error(
+                    f"⚠️ 결제 #{idx1}: 동일한 결제일·승인번호 뒤 4자리 조합이 이미 존재합니다. "
+                    "정상 중복 건일 경우 승인번호 '전체 8자리 이상'을 입력해 주세요."
+                )
+                return
+            onnuri_codes[s["index"]] = last4_digits
+        else:
+            full_raw = (st.session_state.get(s["full_key"], "") or "").strip()
+            full_digits = re.sub(r"\D", "", full_raw)
+            if len(full_digits) < 8:
+                st.error(f"결제 #{idx1} 온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
+                return
+            onnuri_codes[s["index"]] = full_digits
+
+    added_total = int(sum(int(s["amount"]) for s in active))
+    slot_snapshots = [
+        {"method": s["method"], "card_company": s["card_company"], "amount": int(s["amount"])}
+        for s in active
+    ]
+    use_supabase_op = _supabase_orders_payments_available()
+
+    if use_supabase_op:
+        paid_total, _ = _sum_payments_by_order_supabase(db_filename, order_id)
+        old_paid_total = paid_total
+        new_paid_total = old_paid_total + added_total
+        old_balance = balance
+        new_balance = balance - added_total
+        for s in active:
+            fee = _payment_fee_amount(s["method"], int(s["amount"]))
+            _insert_payment_supabase(db_filename, {
+                "order_id": order_id,
+                "payment_date": pay_date_str,
+                "amount": int(s["amount"]),
+                "payment_method": s["method"] or None,
+                "card_company": s["card_company"],
+                "fee_amount": fee,
+                "onnuri_approval_code": onnuri_codes.get(s["index"]),
+                "created_by": _current_username(),
+            })
+        _recalc_order_actual_margin_supabase(db_filename, order_id)
+        customer_id_for_ph = _get_order_customer_id_supabase(db_filename, order_id)
+        customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
+        _ph_err = _insert_payment_history(
+            None, order_id, customer_name, "잔금결제",
+            {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
+            {
+                "order_id": order_id,
+                "added_amount": added_total,
+                "payments": slot_snapshots,
+                "balance_after": new_balance,
+                "paid_total_after": new_paid_total,
+            },
+            edit_reason, db_filename=db_filename,
+        )
+        if _ph_err:
+            st.warning(f"⚠️ 이력 저장 오류 (기능은 정상): {_ph_err}")
+        conn = get_tenant_conn(db_filename)
+        if conn:
+            try:
                 _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
                 _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
-                cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (order_id,)).fetchone()
-                customer_id_for_ph = cur_cid[0] if cur_cid else None
-                customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
-                old_payment_data = {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total}
-                new_payment_data = {
-                    "order_id": order_id,
-                    "added_amount": add_amt_int,
-                    "method": add_method,
-                    "card_company": add_card,
-                    "balance_after": new_balance,
-                    "paid_total_after": new_paid_total,
-                }
-                _insert_payment_history(conn, order_id, customer_name, "잔금결제", old_payment_data, new_payment_data, edit_reason, db_filename=db_filename)
                 conn.commit()
+            finally:
                 conn.close()
-            clear_data_cache()
-            st.toast("등록되었습니다. 잔금이 0원이면 리스트에서 사라집니다.", icon="✅")
-            st.session_state[f"_pay_done_{key_prefix}"] = {"amount": add_amt_int}
-            st.rerun()
-        else:
-            st.warning("금액을 입력하세요.")
+    else:
+        conn = get_tenant_conn(db_filename)
+        cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (order_id,))
+        old_paid_total = cur.fetchone()[0] or 0
+        new_paid_total = old_paid_total + added_total
+        old_balance = balance
+        new_balance = balance - added_total
+        for s in active:
+            fee = _payment_fee_amount(s["method"], int(s["amount"]))
+            conn.execute(
+                """
+                INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
+                """,
+                (
+                    order_id, pay_date_str, int(s["amount"]),
+                    s["method"] or None, s["card_company"], fee,
+                    onnuri_codes.get(s["index"]), _current_username(),
+                ),
+            )
+        _recalc_order_actual_margin(conn, order_id, db_filename)
+        _insert_audit_log(conn, "Order", order_id, "payment_total", old_paid_total, new_paid_total, edit_reason)
+        _insert_audit_log(conn, "Order", order_id, "balance_amount", old_balance, new_balance, edit_reason)
+        cur_cid = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (order_id,)).fetchone()
+        customer_id_for_ph = cur_cid[0] if cur_cid else None
+        customer_name = _get_customer_name_supabase(db_filename, customer_id_for_ph) if customer_id_for_ph else ""
+        _insert_payment_history(
+            conn, order_id, customer_name, "잔금결제",
+            {"order_id": order_id, "balance_before": old_balance, "paid_total_before": old_paid_total},
+            {
+                "order_id": order_id,
+                "added_amount": added_total,
+                "payments": slot_snapshots,
+                "balance_after": new_balance,
+                "paid_total_after": new_paid_total,
+            },
+            edit_reason, db_filename=db_filename,
+        )
+        conn.commit()
+        conn.close()
+
+    clear_data_cache()
+    st.toast("등록되었습니다. 잔금이 0원이면 리스트에서 사라집니다.", icon="✅")
+    st.session_state[_pay_done_key] = {"amount": added_total}
+    # 다음 입력을 위해 이 프리픽스의 위젯 키를 정리
+    _prefix_ = f"{key_prefix}_"
+    for _k in list(st.session_state.keys()):
+        if not isinstance(_k, str):
+            continue
+        if _k.startswith(_prefix_) and _k != _pay_done_key:
+            try:
+                del st.session_state[_k]
+            except Exception:
+                pass
+    st.rerun()
 
 
 def render_sales_kpi_dashboard() -> None:
@@ -29135,6 +30598,7 @@ def render_customer_balance():
                                                                     "amount": float(prow["amount"] or 0),
                                                                     "method": prow["payment_method"],
                                                                     "card_company": prow["card_company"],
+                                                                    "onnuri_approval_code": prow.get("onnuri_approval_code"),
                                                                 }
                                                                 # 새 수수료 계산 (수단 변경 반영)
                                                                 new_fee = _payment_fee_amount(new_method, float(new_amount)) if new_amount > 0 else 0.0
@@ -29218,6 +30682,7 @@ def render_customer_balance():
                                                                                 "amount": float(new_amount),
                                                                                 "method": new_method,
                                                                                 "card_company": new_card_company,
+                                                                                "onnuri_approval_code": new_onnuri_code,
                                                                             }
                                                                             _pay_edit_committed = True
 
@@ -29271,6 +30736,7 @@ def render_customer_balance():
                                                                             "amount": float(new_amount),
                                                                             "method": new_method,
                                                                             "card_company": new_card_company,
+                                                                            "onnuri_approval_code": new_onnuri_code,
                                                                         }
                                                                     _recalc_order_actual_margin(conn, _order_id_pay, db_filename)
                                                                     cur2 = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
@@ -30048,17 +31514,8 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
 
             if not emp_merged.empty:
                 emp_df = emp_merged.copy()
-                total_revenue = emp_df["revenue"].sum() or 0
-                total_margin = emp_df["margin"].sum() or 0
-                total_display = emp_df["display_sales"].sum() or 0
-                total_kpi_receipt = emp_df["kpi_receipt"].sum() or 0
-                emp_df["매출 점수(70)"] = (emp_df["revenue"] / total_revenue * 70).round(1) if total_revenue else 0.0
-                emp_df["마진 점수(15)"] = (emp_df["margin"] / total_margin * 15).round(1) if total_margin else 0.0
-                emp_df["전시품 점수(5)"] = (emp_df["display_sales"] / total_display * 5).round(1) if total_display else 0.0
-                emp_df["현금수금 점수(10)"] = (emp_df["kpi_receipt"] / total_kpi_receipt * 10).round(1) if total_kpi_receipt else 0.0
-                emp_df["종합 점수"] = (
-                    emp_df["매출 점수(70)"] + emp_df["마진 점수(15)"] + emp_df["전시품 점수(5)"] + emp_df["현금수금 점수(10)"]
-                ).round(1)
+                _kpi_w_store = load_kpi_weights(db_filename, int(sel_y), int(sel_m), all_stores=False)
+                emp_df, _score_cols = _apply_kpi_score_columns(emp_df, _kpi_w_store)
                 emp_df = emp_df.sort_values("종합 점수", ascending=False).reset_index(drop=True)
                 emp_df["매출집계(순액)"] = emp_df["revenue"].round(0).astype(int)
                 emp_df["현금수금집계"] = emp_df["kpi_receipt"].round(0).astype(int)
@@ -30071,16 +31528,22 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                         "현금수금집계",
                         "마진액",
                         "전시품 판매액",
-                        "매출 점수(70)",
-                        "마진 점수(15)",
-                        "전시품 점수(5)",
-                        "현금수금 점수(10)",
+                        _score_cols["revenue"],
+                        _score_cols["margin"],
+                        _score_cols["display"],
+                        _score_cols["cash"],
                         "종합 점수",
                     ]
                 ].rename(columns={"employee": "직원명"})
                 display_fmt = _format_df_display(
                     display_df, ["매출집계(순액)", "현금수금집계", "마진액", "전시품 판매액"]
                 )
+                _short_hdr = {
+                    "revenue": f"매출({float(_kpi_w_store['revenue']):g})",
+                    "margin":  f"마진({float(_kpi_w_store['margin']):g})",
+                    "display": f"전시품({float(_kpi_w_store['display']):g})",
+                    "cash":    f"현금수금({float(_kpi_w_store['cash']):g})",
+                }
                 st.dataframe(
                     display_fmt,
                     width='stretch',
@@ -30090,18 +31553,20 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                         "현금수금집계": st.column_config.TextColumn("현금수금집계", width="medium"),
                         "마진액": st.column_config.TextColumn("마진액", width="medium"),
                         "전시품 판매액": st.column_config.TextColumn("전시품 판매액", width="small"),
-                        "매출 점수(70)": st.column_config.NumberColumn("매출(70)", format="%.1f", width="small"),
-                        "마진 점수(15)": st.column_config.NumberColumn("마진(15)", format="%.1f", width="small"),
-                        "전시품 점수(5)": st.column_config.NumberColumn("전시품(5)", format="%.1f", width="small"),
-                        "현금수금 점수(10)": st.column_config.NumberColumn("현금수금(10)", format="%.1f", width="small"),
+                        _score_cols["revenue"]: st.column_config.NumberColumn(_short_hdr["revenue"], format="%.1f", width="small"),
+                        _score_cols["margin"]:  st.column_config.NumberColumn(_short_hdr["margin"],  format="%.1f", width="small"),
+                        _score_cols["display"]: st.column_config.NumberColumn(_short_hdr["display"], format="%.1f", width="small"),
+                        _score_cols["cash"]:    st.column_config.NumberColumn(_short_hdr["cash"],    format="%.1f", width="small"),
                         "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
                     },
                 )
                 st.caption(
-                    "※ **종합 점수** = 매출 70 + 마진 15 + 전시품 5 + 현금수금 10. **매출 점수(70)·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
-                    "**현금수금 점수(10)·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-                    "**마진 점수(15)**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영. "
-                    "**전시품 점수(5)·전시품 판매액**: 옵션 A2 — **계약일(order_date) in 해당 월** 주문의 **전시판매가 × 1/n**(주문당 1회). "
+                    f"※ **종합 점수** = {_kpi_weights_caption(_kpi_w_store)} "
+                    f"(⚙️ 관리자 설정 → 직원 평가 가중치, 적용 월 {int(sel_y):04d}-{int(sel_m):02d}). "
+                    f"**매출 점수({float(_kpi_w_store['revenue']):g})·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
+                    f"**현금수금 점수({float(_kpi_w_store['cash']):g})·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
+                    f"**마진 점수({float(_kpi_w_store['margin']):g})**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영. "
+                    f"**전시품 점수({float(_kpi_w_store['display']):g})·전시품 판매액**: 옵션 A2 — **계약일(order_date) in 해당 월** 주문의 **전시판매가 × 1/n**(주문당 1회). "
                     "다른 달 계약 + 단순 금액수정은 0 (영향 없음). 다른 달 계약 + 해당월 **총계약금액이 0원(전체 취소)**이 되면 전시판매가 차감. "
                     "주문 수정으로 전시판매가만 변경 시 변경 시점 월에 **차액(__dm_d)만 분리 반영**(KPI에서 마이너스 가능)."
                 )
@@ -31373,6 +32838,27 @@ def main():
     #  Streamlit Cloud 세션 만료(30분+)에도 충분한 간격)
     st_autorefresh(interval=900_000, limit=None, key="session_keepalive")
 
+    # 딥링크 ?task=123 → 사내업무 해당 업무 상세로 이동 (알림/친구톡 link_path 와 동일)
+    try:
+        _task_qp = st.query_params.get("task")
+    except Exception:
+        _task_qp = None
+    if _task_qp:
+        try:
+            _task_qp_id = int(str(_task_qp).strip())
+        except Exception:
+            _task_qp_id = None
+        if _task_qp_id:
+            _navigate_to_internal_task(_task_qp_id)
+            try:
+                q = dict(st.query_params)
+                q.pop("task", None)
+                st.query_params.from_dict(q)
+            except Exception:
+                pass
+            st.rerun()
+            return
+
     # 쿼리 파라미터를 이용한 홈 이동(?home=1) 처리:
     # 로고 클릭 시 언제든지 메인 대시보드/홈으로 돌아갈 수 있도록,
     # payment_monitor 등 별도 관리자 화면 진입 상태를 초기화한다.
@@ -31534,26 +33020,25 @@ def main():
         render_customer_balance()
     elif idx == 6:
         render_deposit_management()
+    # store_admin: 구 「8. 매장 관리자 메뉴」는 ⚙️ 관리자 설정 1번으로 이동 → 인덱스 한 칸씩 앞당김
     elif role == "store_admin" and idx == 7:
-        render_store_admin_employees()
-    elif role == "store_admin" and idx == 8:
         render_monthly_payment_report(is_superadmin=False)
     elif role == "user" and idx == 7:
         render_monthly_payment_report(is_superadmin=False)
-    elif role == "store_admin" and idx == 9:
+    elif role == "store_admin" and idx == 8:
         if CRM_MODULE_AVAILABLE:
             render_crm_menu()
         else:
             st.error("CRM 모듈(crm_automation.py)을 불러올 수 없습니다. 파일이 존재하는지 확인해 주세요.")
-    elif role == "store_admin" and idx == 10:
+    elif role == "store_admin" and idx == 9:
         render_sales_kpi_dashboard()
-    elif (role == "store_admin" and idx == 11) or (role == "user" and idx == 8):
+    elif (role == "store_admin" and idx == 10) or (role == "user" and idx == 8):
         render_display_sales_audit()
-    elif role == "store_admin" and idx == 12:
+    elif role == "store_admin" and idx == 11:
         render_faq_page()
-    elif role == "store_admin" and idx == 13:
+    elif role == "store_admin" and idx == 12:
         render_ai_sales_reports()
-    elif role == "store_admin" and idx == 14:
+    elif role == "store_admin" and idx == 13:
         try:
             from dong_commercial_map import render_dong_commercial_map  # noqa: WPS433
             render_dong_commercial_map()

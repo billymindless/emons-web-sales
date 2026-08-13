@@ -1375,7 +1375,7 @@ def _render_register_form() -> None:
     if not _emp_name_list:
         st.warning(
             "담당 직원 목록을 불러오지 못했습니다. "
-            "매장 관리자 메뉴에서 직원이 등록되어 있는지 확인해 주세요."
+            "⚙️ 관리자 설정 → 1. 직원 마스터에서 직원이 등록되어 있는지 확인해 주세요."
         )
     with st.form("lead_register_form_v2", clear_on_submit=True):
         c1, c2 = st.columns(2)

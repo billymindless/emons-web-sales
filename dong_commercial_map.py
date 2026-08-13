@@ -17,11 +17,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -67,11 +69,61 @@ _POP_ENV_CANDIDATES: tuple[str, ...] = (
     "ELEVATOR_SERVICE_KEY",
 )
 
+# 국토교통부 아파트 매매 실거래가 상세 자료 API (data.go.kr 15126468).
+# 서비스명 RTMSDataSvcAptTradeDev / operation getRTMSDataSvcAptTradeDev.
+# 응답은 기본 XML (JSON 지원 안 함) → xml.etree 로 파싱.
+APT_TRADE_API_BASE_DEFAULT = (
+    "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
+)
+
+# data.go.kr 일반 인증키는 계정 1개에 여러 API 활용신청이 승인되면 모두 공용 사용 가능.
+# [apt_trade_api] 가 없으면 [population_api] / [elevator_api] 키로 폴백 (인구 API 와 동일 패턴).
+_APT_ENV_CANDIDATES: tuple[str, ...] = (
+    "APT_TRADE_API_KEY",
+    "MOLIT_APT_TRADE_KEY",
+    "DATA_GO_KR_SERVICE_KEY",
+    "POPULATION_API_KEY",
+    "ELEVATOR_API_KEY",
+)
+
 _KAKAO_ENV_CANDIDATES: tuple[str, ...] = (
     "KAKAO_REST_API_KEY",
     "KAKAO_REST_KEY",
     "KAKAO_API_KEY",
 )
+
+# ── 핵심 타겟 연령대 (10세 단위 버킷) ─────────────────────────────
+# 행안부 성/연령 API 응답의 컬럼 접두어(만 X~X+9세) → 우리 시스템의 버킷 키.
+# 60대까지는 API 접두어와 동일하게 X(정수 문자열), 70대 이상은 "70plus" 로 축약해
+# API 버킷 70·80·90·100 을 모두 합산해 하나의 UI 라벨로 노출한다.
+AGE_BUCKET_KEYS: tuple[str, ...] = ("10", "20", "30", "40", "50", "60", "70plus")
+
+# 버킷 키 → 화면 라벨 (Streamlit multiselect 및 표/차트 라벨용).
+AGE_BUCKET_LABELS: dict[str, str] = {
+    "10": "10대", "20": "20대", "30": "30대", "40": "40대",
+    "50": "50대", "60": "60대", "70plus": "70대 이상",
+}
+
+# 버킷 키 → 실제 API 응답의 X 값 리스트 (male{X}AgeNmprCnt/feml{X}AgeNmprCnt 참조).
+_AGE_KEY_TO_API_BUCKETS: dict[str, tuple[str, ...]] = {
+    "10": ("10",), "20": ("20",), "30": ("30",), "40": ("40",),
+    "50": ("50",), "60": ("60",), "70plus": ("70", "80", "90", "100"),
+}
+
+# 기본 선택(=기존 30~59세 정의와 동일한 동작 유지).
+DEFAULT_TARGET_AGE_KEYS: tuple[str, ...] = ("30", "40", "50")
+
+
+def age_bucket_column(key: str) -> str:
+    """버킷 키 → app_dong_population_cache 컬럼명."""
+    return f"age_{key}_population"
+
+
+def format_selected_age_label(keys: list[str] | tuple[str, ...] | None) -> str:
+    """선택 연령대를 사람이 읽기 쉬운 문자열로 (예: '30·40·50대' / '20·70대 이상')."""
+    if not keys:
+        return "선택 없음"
+    return "·".join(AGE_BUCKET_LABELS.get(k, k) for k in keys)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -193,6 +245,93 @@ def _get_population_api_endpoint(kind: str = "population") -> str:
         pass
 
     return _default
+
+
+def _get_apt_trade_service_key_diagnostic() -> tuple[str, dict[str, str]]:
+    """
+    국토부 아파트 실거래가 API 서비스 키를 다중 폴백으로 로드하고 진단 정보 반환.
+
+    우선순위: [apt_trade_api] → [population_api] → [elevator_api] → 환경변수.
+    data.go.kr 계정 1개의 일반 인증키는 승인받은 모든 API 에서 공용 사용 가능.
+    """
+    diag: dict[str, str] = {
+        "secrets_toml_found": "no",
+        "st_secrets_found": "no",
+        "fallback_source": "",
+        "env_var_found": "no",
+        "env_var_name": "",
+        "final_source": "none",
+        "key_len": "0",
+    }
+    key = ""
+
+    def _set_key(value: str, source: str, *, fallback: str = "") -> None:
+        nonlocal key
+        if not value:
+            return
+        key = value
+        diag["final_source"] = source
+        if fallback:
+            diag["fallback_source"] = fallback
+
+    _toml = _load_toml_dict()
+    for _sect, _fallback_label in (
+        ("apt_trade_api", ""), ("population_api", "population_api"), ("elevator_api", "elevator_api"),
+    ):
+        _v = str(((_toml.get(_sect) or {}).get("service_key", "")) or "").strip()
+        if _v:
+            _set_key(_v, f"secrets.toml[{_sect}]", fallback=_fallback_label)
+            diag["secrets_toml_found"] = "yes"
+            break
+
+    if not key:
+        try:
+            if hasattr(st, "secrets"):
+                for _sect, _fallback_label in (
+                    ("apt_trade_api", ""), ("population_api", "population_api"),
+                    ("elevator_api", "elevator_api"),
+                ):
+                    _sec = st.secrets.get(_sect, {}) or {}
+                    _v = str(_sec.get("service_key", "") or "").strip()
+                    if _v:
+                        _set_key(_v, f"st.secrets[{_sect}]", fallback=_fallback_label)
+                        diag["st_secrets_found"] = "yes"
+                        break
+        except Exception:
+            pass
+
+    if not key:
+        for _name in _APT_ENV_CANDIDATES:
+            _v = (os.environ.get(_name, "") or "").strip()
+            if _v:
+                _set_key(_v, f"env:{_name}")
+                diag["env_var_found"] = "yes"
+                diag["env_var_name"] = _name
+                break
+
+    diag["key_len"] = str(len(key))
+    return key, diag
+
+
+def _get_apt_trade_service_key() -> str:
+    return _get_apt_trade_service_key_diagnostic()[0]
+
+
+def _get_apt_trade_endpoint() -> str:
+    """[apt_trade_api] endpoint 값 우선, 없으면 기본값."""
+    _toml = _load_toml_dict()
+    val = str(((_toml.get("apt_trade_api") or {}).get("endpoint", "")) or "").strip()
+    if val:
+        return val
+    try:
+        if hasattr(st, "secrets"):
+            _sec = st.secrets.get("apt_trade_api", {}) or {}
+            val = str(_sec.get("endpoint", "") or "").strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return APT_TRADE_API_BASE_DEFAULT
 
 
 def _get_kakao_rest_key_local() -> str:
@@ -533,16 +672,64 @@ def _to_int_safe(v: Any) -> int:
         return 0
 
 
+def _yyyymm_add(yyyymm: str, months: int) -> str:
+    """'YYYYMM' 에 months(음수 가능)를 더한 'YYYYMM'."""
+    try:
+        y = int(str(yyyymm)[:4])
+        m = int(str(yyyymm)[4:6])
+    except Exception:
+        now = pd.Timestamp.now()
+        y, m = int(now.year), int(now.month)
+    total = y * 12 + (m - 1) + int(months)
+    return f"{total // 12:04d}{total % 12 + 1:02d}"
+
+
 def _clamp_population_yyyymm(yyyymm: str) -> str:
-    """행정안전부 인구·세대 API는 진행 중인 이번 달 통계를 아직 게시하지 않아,
-    이번 달(또는 미래월)로 조회하면 모든 행정동에서 INVALID_REQUEST_PARAMETER_ERROR
-    를 반환한다 (실측 확인됨). 분석 기간 종료월이 이번 달 이상이면 가장 최근
-    확정월(전월)로 낮춰서 요청한다."""
+    """이번 달/미래월 요청을 전월로 낮춘다.
+
+    행안부 주민등록 통계는 익월 중순 이후에야 게시되는 경우가 많아,
+    전월이라도 아직 NODATA 일 수 있다 → `_resolve_population_yyyymm` 이
+    실제 게시된 최근월까지 추가로 폴백한다.
+    """
     this_month = pd.Timestamp.now().strftime("%Y%m")
+    prev_month_last_day = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
+    prev = prev_month_last_day.strftime("%Y%m")
     if not yyyymm or yyyymm >= this_month:
-        prev_month_last_day = pd.Timestamp.now().replace(day=1) - pd.Timedelta(days=1)
-        return prev_month_last_day.strftime("%Y%m")
+        return prev
     return yyyymm
+
+
+def _response_head(js: Any) -> dict:
+    """행안부 Response/response head|header 추출."""
+    if not isinstance(js, dict):
+        return {}
+    for top in ("Response", "response"):
+        wrap = js.get(top)
+        if isinstance(wrap, dict):
+            head = wrap.get("head") or wrap.get("header")
+            if isinstance(head, dict):
+                return head
+    return {}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _resolve_population_yyyymm(preferred: str) -> str:
+    """요청 통계월부터 최대 8개월 뒤로 걸어가며 실제 데이터가 있는 최근월을 고른다.
+
+    실측(2026-08-01): 분석 종료월 202607 → NODATA. 최근 게시월은 202606.
+    단순 '전월 클램프'만으로는 월초·게시 지연을 커버하지 못한다.
+    """
+    start = _clamp_population_yyyymm(preferred)
+    probe_code = "1111051500"  # 서울 종로구 청운효자동 (항상 존재)
+    for i in range(0, 8):
+        ym = _yyyymm_add(start, -i)
+        r = fetch_admin_dong_population(probe_code, ym)
+        if r.get("ok") and int(r.get("total_population") or 0) > 0:
+            return ym
+        err = str(r.get("error") or "")
+        if any(x in err for x in ("service_key", "파라미터 누락", "HTTP 401", "HTTP 403")):
+            break
+    return start
 
 
 @st.cache_data(ttl=_THIRTY_DAYS_SEC, show_spinner=False)
@@ -595,10 +782,17 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
         js = r.json() if r.content else {}
         items = _extract_items(js)
         if not items:
+            head = _response_head(js)
+            rc = str(head.get("resultCode") or "")
+            rm = str(head.get("resultMsg") or "")
+            if rc == "3" or "NODATA" in rm.upper():
+                err = f"통계월 {yyyymm} 데이터 없음 (NODATA)"
+            else:
+                err = f"응답 items 비어 있음 (resultCode={rc or '-'}, {rm or '-'})"
             return {
                 "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
                 "total_population": 0, "total_households": 0,
-                "error": "응답 items 비어 있음", "raw_url": raw_url,
+                "error": err, "raw_url": raw_url,
             }
         # lv=7 이면 단건이 정상이나, 안전하게 합산 (통·반 fallback 대비).
         # 실 응답 필드: 총인구수=totNmprCnt, 세대수=hhCnt.
@@ -630,20 +824,29 @@ def fetch_admin_dong_population(admin_dong_code: str, yyyymm: str) -> dict:
         }
 
 
+def _empty_age_buckets() -> dict[str, int]:
+    """모든 UI 연령 버킷을 0 으로 초기화한 dict (누락 방지용 초기값)."""
+    return {k: 0 for k in AGE_BUCKET_KEYS}
+
+
 @st.cache_data(ttl=_THIRTY_DAYS_SEC, show_spinner=False)
 def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
     """
-    행정동코드+통계년월로 30~59세 인구수 조회 (타겟 밀집도 계산용).
+    행정동코드+통계년월로 10세 단위 연령 인구수 조회 (타겟 밀집도 계산용).
 
-    반환: {"ok", "admin_dong_code", "yyyymm",
-           "age_30_49_population"(30~59세 합산, 필드명은 하위호환 유지), "total_population",
-           "error", "raw_url"}
+    반환: {
+        "ok", "admin_dong_code", "yyyymm",
+        "age_buckets": {"10","20","30","40","50","60","70plus" → 남녀 합산 인구},
+        "total_population",
+        "error", "raw_url",
+    }
     """
+    empty_buckets = _empty_age_buckets()
     key = _get_population_service_key()
     if not key or not admin_dong_code or not yyyymm:
         return {
             "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-            "age_30_49_population": 0, "total_population": 0,
+            "age_buckets": empty_buckets, "total_population": 0,
             "error": "service_key 또는 파라미터 누락", "raw_url": "",
         }
     url = _get_population_api_endpoint("age")
@@ -667,39 +870,46 @@ def fetch_admin_dong_age_population(admin_dong_code: str, yyyymm: str) -> dict:
         if r.status_code != 200:
             return {
                 "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-                "age_30_49_population": 0, "total_population": 0,
+                "age_buckets": empty_buckets, "total_population": 0,
                 "error": f"HTTP {r.status_code}: {r.text[:120]}", "raw_url": raw_url,
             }
         js = r.json() if r.content else {}
         items = _extract_items(js)
         if not items:
+            head = _response_head(js)
+            rc = str(head.get("resultCode") or "")
+            rm = str(head.get("resultMsg") or "")
+            if rc == "3" or "NODATA" in rm.upper():
+                err = f"통계월 {yyyymm} 데이터 없음 (NODATA)"
+            else:
+                err = f"응답 items 비어 있음 (resultCode={rc or '-'}, {rm or '-'})"
             return {
                 "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-                "age_30_49_population": 0, "total_population": 0,
-                "error": "응답 items 비어 있음", "raw_url": raw_url,
+                "age_buckets": empty_buckets, "total_population": 0,
+                "error": err, "raw_url": raw_url,
             }
         # 실 응답: 행별 컬럼형 age 필드.
         #   male{X}AgeNmprCnt: 만 X~X+9세 남자 (X ∈ {0,10,20,...,100})
         #   feml{X}AgeNmprCnt: 만 X~X+9세 여자
-        # 핵심 인구(30~59세) 대상: X ∈ {30, 40, 50} 의 남녀 합산.
+        # UI 버킷 키(10~60, 70plus)별로 대응하는 API 버킷을 남녀 합산해 저장.
         # 총인구는 totNmprCnt 필드에서 취득.
-        target_buckets = ("30", "40", "50")
-        age_bucket = 0
+        buckets = _empty_age_buckets()
         total = 0
         for it in items:
             total += _to_int_safe(_pick(it, ["totNmprCnt", "totPopltCnt"]))
-            for _bkt in target_buckets:
-                age_bucket += _to_int_safe(it.get(f"male{_bkt}AgeNmprCnt"))
-                age_bucket += _to_int_safe(it.get(f"feml{_bkt}AgeNmprCnt"))
+            for ui_key, api_bkts in _AGE_KEY_TO_API_BUCKETS.items():
+                for api_bkt in api_bkts:
+                    buckets[ui_key] += _to_int_safe(it.get(f"male{api_bkt}AgeNmprCnt"))
+                    buckets[ui_key] += _to_int_safe(it.get(f"feml{api_bkt}AgeNmprCnt"))
         return {
             "ok": True, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-            "age_30_49_population": age_bucket, "total_population": total,
+            "age_buckets": buckets, "total_population": total,
             "error": "", "raw_url": raw_url,
         }
     except Exception as e:
         return {
             "ok": False, "admin_dong_code": admin_dong_code, "yyyymm": yyyymm,
-            "age_30_49_population": 0, "total_population": 0,
+            "age_buckets": empty_buckets, "total_population": 0,
             "error": f"요청 실패: {type(e).__name__}: {e}", "raw_url": "",
         }
 
@@ -726,6 +936,11 @@ def _extract_items(js: Any) -> list[dict]:
             _items = _body.get("items")
         if _items is None:
             _items = _wrap.get("items")
+        # NODATA 시 items 가 빈 문자열("") 로 오는 경우 있음
+        if isinstance(_items, str):
+            if not _items.strip():
+                return []
+            continue
         if isinstance(_items, dict):
             _item = _items.get("item")
             if isinstance(_item, list):
@@ -903,8 +1118,10 @@ STRATEGY_LEGEND_LABEL = {
     STRATEGY_UNSET: "- · (미분류)",
 }
 
+# Phase 16: 핵심 타겟 연령대를 UI 에서 사용자가 지정하므로, 안내 문구는
+# 고정 "30~59세" 대신 "타겟" 으로 두고 실제 선택 라벨은 caption 에서 별도 노출한다.
 STRATEGY_GUIDE = {
-    "B": "타겟(30~59세) 인구는 많지만 우리 매장 구매는 적음 → 전단·광고·체험 이벤트 등 마케팅을 **지금 우선** 투입",
+    "B": "타겟 인구는 많지만 우리 매장 구매는 적음 → 전단·광고·체험 이벤트 등 마케팅을 **지금 우선** 투입",
     "A": "구매도 많고 타겟 인구도 많음 → 기존 고객 **VIP 관리·재구매·소개 유도**에 집중",
     "C": "구매는 많지만 타겟 인구 비중은 낮음 → 성숙·특수 요인 지역, **유지·케이스별** 대응",
     "D": "구매·타겟 인구 모두 낮음 → **예산 절감·보류**, 다른 지역(B·A) 우선",
@@ -918,8 +1135,12 @@ STRATEGY_COLOR_BY_LEGEND = {
 STRATEGY_LEGEND_ORDER = [STRATEGY_LEGEND_LABEL[s] for s in STRATEGY_ORDER]
 
 
-def _render_strategy_legend_guide() -> None:
-    """지도 하단·매니저용 상세 범례 — A/B/C/D 코드별 지침 문구."""
+def _render_strategy_legend_guide(selected_age_label: str = "", *, y_axis: str = "target_density") -> None:
+    """지도 하단·매니저용 상세 범례 — A/B/C/D 코드별 지침 문구.
+
+    selected_age_label: 현재 선택된 핵심 타겟 연령대 라벨(예: '30대·40대·50대').
+    비어 있으면 세로축 안내에서 연령대 언급을 생략한다.
+    """
     _items = [
         ("B", STRATEGY_ATTACK),
         ("A", STRATEGY_DEFEND),
@@ -941,72 +1162,183 @@ def _render_strategy_legend_guide() -> None:
                 f'</div>',
                 unsafe_allow_html=True,
             )
+    _age_suffix = f"(선택: {selected_age_label})" if selected_age_label else ""
+    _y_desc = (
+        f"세로축 = 가중 매력도 (타겟 밀집도 × wT + 아파트 ㎡단가 × wA){_age_suffix}"
+        if y_axis == "attractiveness"
+        else f"세로축 = 타겟 인구 비중{_age_suffix}"
+    )
     st.caption(
-        "분류 기준: 가로축 = 우리 매장 침투율(1,000가구당 구매), 세로축 = 타겟(30~59세) 인구 비중 — "
+        f"분류 기준: 가로축 = 우리 매장 침투율(1,000가구당 구매), {_y_desc} — "
         "각 축의 **중앙값**으로 2×2 매트릭스를 나눕니다. "
         f"집중 공략(B) = {STRATEGY_GUIDE['B'].split('→')[0].strip()}."
     )
 
 
-def compute_dong_kpi(crm_counts: pd.DataFrame, population: pd.DataFrame) -> pd.DataFrame:
+def compute_dong_kpi(
+    crm_counts: pd.DataFrame,
+    population: pd.DataFrame,
+    selected_age_keys: list[str] | tuple[str, ...] | None = None,
+    apt_trades: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
-    crm_counts:  [admin_dong_code, admin_dong_name, purchase_count]
-    population:  [admin_dong_code, total_households, total_population, age_30_49_population]
-    반환: 위 컬럼 + penetration_rate(%), target_density(%)
+    crm_counts:  [admin_dong_code, admin_dong_name, purchase_count, purchase_amount?]
+    population:  [admin_dong_code, total_households, total_population,
+                  age_10_population ~ age_60_population, age_70plus_population]
+    selected_age_keys: UI 에서 선택된 연령 버킷 키(예: ["30","40","50"]). None 이면 DEFAULT_TARGET_AGE_KEYS.
+    apt_trades: `fetch_apt_price_bulk` 반환 형식 (선택). 있으면 apt_price_per_m2·apt_deal_count·apt_match_level 컬럼 조인.
+
+    반환: 위 컬럼 + target_population, penetration_rate(%), target_density(%),
+          apt_price_per_m2(원/㎡), apt_deal_count, apt_match_level.
+    attrs["selected_age_keys"] 에 사용된 선택값을 담아 하위 UI 라벨에서 재사용한다.
     """
     if crm_counts is None or crm_counts.empty:
         return crm_counts.copy() if crm_counts is not None else pd.DataFrame()
+    sel_keys = [k for k in (selected_age_keys or DEFAULT_TARGET_AGE_KEYS) if k in AGE_BUCKET_KEYS]
+    if not sel_keys:
+        sel_keys = list(DEFAULT_TARGET_AGE_KEYS)
+
     df = crm_counts.merge(population, on="admin_dong_code", how="left")
     # 0 을 NaN 으로 바꿔 분모 오류(ZeroDivisionError 대신 무한대) 를 방지.
     # pd.NA 는 object dtype 승격을 유발해 이후 astype(float) 에서
     # "float() argument ... not 'NAType'" 오류가 나므로 float 호환 NaN 사용.
     df["total_households"] = pd.to_numeric(df.get("total_households"), errors="coerce").replace(0, float("nan"))
     df["total_population"] = pd.to_numeric(df.get("total_population"), errors="coerce").replace(0, float("nan"))
-    df["age_30_49_population"] = pd.to_numeric(df.get("age_30_49_population"), errors="coerce")
+    for k in AGE_BUCKET_KEYS:
+        col = age_bucket_column(k)
+        df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0)
+    df["target_population"] = sum(df[age_bucket_column(k)] for k in sel_keys).astype(float)
     df["purchase_count"] = pd.to_numeric(df.get("purchase_count"), errors="coerce").fillna(0)
+    df["purchase_amount"] = (
+        pd.to_numeric(df.get("purchase_amount"), errors="coerce").fillna(0).round(0).astype("int64")
+    )
     df["penetration_rate"] = (df["purchase_count"] / df["total_households"] * 100).astype(float).fillna(0.0)
-    df["target_density"] = (df["age_30_49_population"] / df["total_population"] * 100).astype(float).fillna(0.0)
+    df["target_density"] = (df["target_population"] / df["total_population"] * 100).astype(float).fillna(0.0)
     df["penetration_rate"] = df["penetration_rate"].round(3)
     df["target_density"] = df["target_density"].round(2)
+
+    if apt_trades is not None and not apt_trades.empty and "admin_dong_code" in apt_trades.columns:
+        _apt_slim = apt_trades[[
+            c for c in ("admin_dong_code", "median_price_per_m2", "deal_count", "match_level")
+            if c in apt_trades.columns
+        ]].copy()
+        _apt_slim["admin_dong_code"] = _apt_slim["admin_dong_code"].astype(str)
+        _apt_slim = _apt_slim.rename(columns={
+            "median_price_per_m2": "apt_price_per_m2",
+            "deal_count": "apt_deal_count",
+            "match_level": "apt_match_level",
+        })
+        df["admin_dong_code"] = df["admin_dong_code"].astype(str)
+        df = df.merge(_apt_slim, on="admin_dong_code", how="left")
+    else:
+        df["apt_price_per_m2"] = 0.0
+        df["apt_deal_count"] = 0
+        df["apt_match_level"] = ""
+
+    df["apt_price_per_m2"] = pd.to_numeric(df.get("apt_price_per_m2"), errors="coerce").fillna(0.0).round(0)
+    df["apt_deal_count"] = pd.to_numeric(df.get("apt_deal_count"), errors="coerce").fillna(0).astype("int64")
+    df["apt_match_level"] = df.get("apt_match_level").fillna("").astype(str)
+
+    df.attrs["selected_age_keys"] = list(sel_keys)
     return df
+
+
+def compute_attractiveness(
+    df: pd.DataFrame, *, w_target: float = 70.0, w_apt: float = 30.0,
+) -> pd.DataFrame:
+    """
+    선택 행정동 집합 내에서 target_density / apt_price_per_m2 를 각각 min-max 정규화하고
+    가중합으로 attractiveness (0~1) 를 계산한다.
+
+    수식:  attractiveness = (w_target/100)*dens_n + (w_apt/100)*price_n
+      - dens_n  = (target_density - min) / (max - min)   (분모 0 이면 0.5)
+      - price_n = (apt_price_per_m2 - min) / (max - min) (분모 0 이면 0.5, 전체 0 이면 0)
+
+    attrs["w_target"], attrs["w_apt"], attrs["price_available"] 를 df.attrs 에 저장.
+    """
+    if df is None or df.empty:
+        return df.copy() if df is not None else pd.DataFrame()
+
+    w_t = max(0.0, min(100.0, float(w_target or 0)))
+    w_a = max(0.0, min(100.0, float(w_apt or 0)))
+    _sum = w_t + w_a
+    if _sum <= 0:
+        w_t, w_a = 100.0, 0.0
+    else:
+        w_t = w_t / _sum * 100.0
+        w_a = w_a / _sum * 100.0
+
+    out = df.copy()
+    dens = pd.to_numeric(out.get("target_density"), errors="coerce").fillna(0.0).astype(float)
+    price = pd.to_numeric(out.get("apt_price_per_m2"), errors="coerce").fillna(0.0).astype(float)
+
+    def _minmax(series: pd.Series, *, all_zero_to_zero: bool = False) -> pd.Series:
+        _min = float(series.min())
+        _max = float(series.max())
+        if _max <= _min:
+            if all_zero_to_zero and _max <= 0:
+                return pd.Series([0.0] * len(series), index=series.index)
+            return pd.Series([0.5] * len(series), index=series.index)
+        return (series - _min) / (_max - _min)
+
+    dens_n = _minmax(dens)
+    price_available = bool((price > 0).any())
+    price_n = _minmax(price, all_zero_to_zero=True) if price_available else pd.Series([0.0] * len(price), index=price.index)
+
+    out["dens_n"] = dens_n.round(4)
+    out["price_n"] = price_n.round(4)
+    out["attractiveness"] = ((w_t / 100.0) * dens_n + (w_a / 100.0) * price_n).round(4)
+
+    out.attrs["w_target"] = float(w_t)
+    out.attrs["w_apt"] = float(w_a)
+    out.attrs["price_available"] = price_available
+    if "selected_age_keys" in df.attrs:
+        out.attrs["selected_age_keys"] = df.attrs["selected_age_keys"]
+    return out
 
 
 def assign_quadrant(df: pd.DataFrame) -> pd.DataFrame:
     """
-    침투율·밀집도 각각의 중앙값으로 4분면 분류.
-      A: 고침투·고밀집  (핵심 상권, 방어)
-      B: 저침투·고밀집  (잠재/개척 상권, 마케팅 우선 투입)
-      C: 고침투·저밀집  (성숙/포화 상권, 유지 관리)
-      D: 저침투·저밀집  (저우선 상권)
+    침투율(X) × 가중 매력도(Y, `attractiveness` 있으면 사용) 각각의 중앙값으로 4분면 분류.
 
-    유효 데이터가 없으면 quadrant='-' 반환.
+      A: 고침투·고매력  (핵심 상권, 방어)
+      B: 저침투·고매력  (잠재/개척 상권, 마케팅 우선 투입)
+      C: 고침투·저매력  (성숙/포화 상권, 유지 관리)
+      D: 저침투·저매력  (저우선 상권)
+
+    `attractiveness` 컬럼이 없으면(가중 계산 이전 호출) `target_density` 를 Y 축으로 사용해
+    기존 동작을 유지한다. 유효 데이터가 없으면 quadrant='-' 반환.
     """
     if df is None or df.empty:
         return df
     out = df.copy()
-    if "penetration_rate" not in out.columns or "target_density" not in out.columns:
+    if "penetration_rate" not in out.columns:
         out["quadrant"] = "-"
         return out
-    # 침투율/밀집도가 모두 0 인 행 (구매도 없고 인구 데이터도 없는 경우)은 median 계산에서 제외
-    _valid = out[(out["penetration_rate"] > 0) | (out["target_density"] > 0)]
+    _y_col = "attractiveness" if "attractiveness" in out.columns else "target_density"
+    if _y_col not in out.columns:
+        out["quadrant"] = "-"
+        return out
+    # 침투율/Y 축이 모두 0 인 행 (구매도 없고 인구 데이터도 없는 경우)은 median 계산에서 제외
+    _valid = out[(out["penetration_rate"] > 0) | (out[_y_col] > 0)]
     if _valid.empty:
         out["quadrant"] = "-"
         return out
     med_pen = float(_valid["penetration_rate"].median())
-    med_den = float(_valid["target_density"].median())
+    med_y = float(_valid[_y_col].median())
 
     def _label(row: pd.Series) -> str:
         p = float(row.get("penetration_rate") or 0)
-        d = float(row.get("target_density") or 0)
-        if p <= 0 and d <= 0:
+        y = float(row.get(_y_col) or 0)
+        if p <= 0 and y <= 0:
             return "-"
         high_p = p >= med_pen
-        high_d = d >= med_den
-        if high_p and high_d:
+        high_y = y >= med_y
+        if high_p and high_y:
             return "A"
-        if (not high_p) and high_d:
+        if (not high_p) and high_y:
             return "B"
-        if high_p and (not high_d):
+        if high_p and (not high_y):
             return "C"
         return "D"
 
@@ -1015,12 +1347,16 @@ def assign_quadrant(df: pd.DataFrame) -> pd.DataFrame:
 
     # 호버 문장용 파생 컬럼 (침투율 % → 1,000가구당 구매가구 환산)
     _pen = pd.to_numeric(out.get("penetration_rate"), errors="coerce").fillna(0.0)
-    _tgt = pd.to_numeric(out.get("age_30_49_population"), errors="coerce").fillna(0)
+    _tgt = pd.to_numeric(out.get("target_population"), errors="coerce").fillna(0)
     out["hover_target"] = _tgt.astype(int).map(lambda n: f"{n:,}")
     out["hover_perf"] = _pen.map(lambda p: f"1,000가구 중 약 {p * 10:.1f}가구 구매")
 
     out.attrs["median_penetration"] = med_pen
-    out.attrs["median_target_density"] = med_den
+    out.attrs["median_y_axis"] = med_y
+    out.attrs["quadrant_y_col"] = _y_col
+    # 하위 호환: 기존 코드가 median_target_density 를 참조 가능하도록 유지 (Y=target_density 인 경우와 일치)
+    if _y_col == "target_density":
+        out.attrs["median_target_density"] = med_y
     return out
 
 
@@ -1050,16 +1386,19 @@ def aggregate_purchase_count_by_dong(
     _client, store_keys: list[str], start_date: str, end_date: str,
 ) -> pd.DataFrame:
     """
-    선택한 매장(들)의 app_orders + app_customers 조인 → admin_dong_code 별 구매건수 집계.
+    선택한 매장(들)의 app_orders + app_customers 조인 → admin_dong_code 별 구매건수·금액 집계.
     order_date 가 [start_date, end_date] (YYYY-MM-DD, 포함) 구간인 주문만 집계한다.
-    반환: [admin_dong_code, admin_dong_name, purchase_count]
+    반환: [admin_dong_code, admin_dong_name, purchase_count, purchase_amount]
+    purchase_amount 는 app_orders.total_amount 합계.
 
     10분 캐싱(ttl=600) — 매장/기간이 동일하면 Supabase 재조회 없이 즉시 반환.
     `_client` 는 언더스코어 접두사로 Streamlit 캐시 해싱에서 제외됨(공식 규칙).
     최신 데이터 강제 조회가 필요하면 `aggregate_purchase_count_by_dong.clear()` 호출.
     """
     def _empty_with_coverage(total_orders: int, mapped_orders: int) -> pd.DataFrame:
-        _out = pd.DataFrame(columns=["admin_dong_code", "admin_dong_name", "purchase_count"])
+        _out = pd.DataFrame(columns=[
+            "admin_dong_code", "admin_dong_name", "purchase_count", "purchase_amount",
+        ])
         _out.attrs["total_orders_in_period"] = total_orders
         _out.attrs["mapped_orders_in_period"] = mapped_orders
         return _out
@@ -1068,7 +1407,7 @@ def aggregate_purchase_count_by_dong(
     if not store_keys:
         return _empty_with_coverage(0, 0)
     orders = _paginated_select(
-        client, "app_orders", "id, customer_id, db_filename, order_date",
+        client, "app_orders", "id, customer_id, db_filename, order_date, total_amount",
         filters=[
             ("in_", "db_filename", store_keys),
             ("gte", "order_date", start_date),
@@ -1095,13 +1434,17 @@ def aggregate_purchase_count_by_dong(
         return _empty_with_coverage(len(orders), 0)
     cdf = pd.DataFrame(custs).rename(columns={"id": "customer_id"})
     odf = pd.DataFrame(orders)
+    odf["total_amount"] = pd.to_numeric(odf.get("total_amount"), errors="coerce").fillna(0)
     merged_all = odf.merge(cdf[["customer_id", "admin_dong_code", "admin_dong_name"]], on="customer_id", how="left")
     mapped_mask = merged_all["admin_dong_code"].notna() & (merged_all["admin_dong_code"] != "")
     merged = merged_all[mapped_mask]
     if merged.empty:
         return _empty_with_coverage(len(merged_all), 0)
-    grp = merged.groupby(["admin_dong_code", "admin_dong_name"], as_index=False)["id"].count()
-    grp = grp.rename(columns={"id": "purchase_count"})
+    grp = merged.groupby(["admin_dong_code", "admin_dong_name"], as_index=False).agg(
+        purchase_count=("id", "count"),
+        purchase_amount=("total_amount", "sum"),
+    )
+    grp["purchase_amount"] = grp["purchase_amount"].fillna(0).round(0).astype("int64")
     grp = grp.sort_values("purchase_count", ascending=False)
     grp.attrs["total_orders_in_period"] = len(merged_all)
     grp.attrs["mapped_orders_in_period"] = int(mapped_mask.sum())
@@ -1303,8 +1646,10 @@ def backfill_admin_dong_batch(
 # ══════════════════════════════════════════════════════════════════
 
 _POP_CACHE_TABLE = "app_dong_population_cache"
+_AGE_BUCKET_COLUMNS: list[str] = [age_bucket_column(k) for k in AGE_BUCKET_KEYS]
 _POP_CACHE_COLUMNS = [
-    "admin_dong_code", "total_households", "total_population", "age_30_49_population",
+    "admin_dong_code", "total_households", "total_population",
+    *_AGE_BUCKET_COLUMNS,
 ]
 
 
@@ -1336,16 +1681,17 @@ def _save_population_cache_to_db(client, rows: list[dict], yyyymm: str) -> None:
     """새로 조회한 인구 데이터를 app_dong_population_cache 에 upsert (실패해도 렌더링은 계속)."""
     if client is None or not rows:
         return
-    payload = [
-        {
+    payload = []
+    for r in rows:
+        entry = {
             "admin_dong_code": r["admin_dong_code"],
             "yyyymm": yyyymm,
             "total_households": r["total_households"],
             "total_population": r["total_population"],
-            "age_30_49_population": r["age_30_49_population"],
         }
-        for r in rows
-    ]
+        for k in AGE_BUCKET_KEYS:
+            entry[age_bucket_column(k)] = int(r.get(age_bucket_column(k)) or 0)
+        payload.append(entry)
     try:
         client.table(_POP_CACHE_TABLE).upsert(
             payload, on_conflict="admin_dong_code,yyyymm"
@@ -1358,32 +1704,51 @@ def _fetch_one_dong_population(code: str, yyyymm: str) -> dict:
     """행정동 1건의 인구+연령 API 를 호출해 캐시 저장용 row 로 변환 (스레드풀 워커)."""
     pop = fetch_admin_dong_population(str(code), yyyymm)
     age = fetch_admin_dong_age_population(str(code), yyyymm)
-    return {
+    buckets: dict[str, int] = age.get("age_buckets") or _empty_age_buckets()
+    row = {
         "admin_dong_code": str(code),
         "total_households": int(pop.get("total_households") or 0),
         "total_population": int(pop.get("total_population") or 0),
-        "age_30_49_population": int(age.get("age_30_49_population") or 0),
         "error": (pop.get("error") or "") + (" | " + age.get("error") if age.get("error") else ""),
     }
+    for k in AGE_BUCKET_KEYS:
+        row[age_bucket_column(k)] = int(buckets.get(k) or 0)
+    return row
+
+
+_POP_BULK_COLUMNS: list[str] = [
+    "admin_dong_code", "total_households", "total_population",
+    *_AGE_BUCKET_COLUMNS,
+    "error",
+]
+
+
+def _empty_pop_row(code: str, error: str = "") -> dict:
+    row = {
+        "admin_dong_code": code, "total_households": 0, "total_population": 0,
+        "error": error,
+    }
+    for k in AGE_BUCKET_KEYS:
+        row[age_bucket_column(k)] = 0
+    return row
 
 
 def fetch_population_bulk(
     client, admin_dong_codes: list[str], yyyymm: str, max_workers: int = 8,
 ) -> pd.DataFrame:
     """
-    행정동코드 리스트 → 인구·세대·핵심인구(30~59세) 데이터 DataFrame.
+    행정동코드 리스트 → 인구·세대·연령대별 인구 DataFrame.
 
     1) app_dong_population_cache 에서 (code, yyyymm) 벌크 조회로 캐시 적중분 확보.
     2) 캐시 미스난 코드만 ThreadPoolExecutor 로 병렬 호출 (인구 API + 연령 API).
     3) 신규 조회분은 캐시 테이블에 upsert 해 다음 조회부터 즉시 재사용.
 
-    반환: [admin_dong_code, total_households, total_population, age_30_49_population, error]
+    반환 컬럼: admin_dong_code, total_households, total_population,
+             age_10_population ~ age_60_population, age_70plus_population, error.
     """
     codes = [str(c) for c in admin_dong_codes if c]
     if not codes:
-        return pd.DataFrame(
-            columns=["admin_dong_code", "total_households", "total_population", "age_30_49_population", "error"]
-        )
+        return pd.DataFrame(columns=_POP_BULK_COLUMNS)
 
     cache_hits = _load_population_cache_from_db(client, codes, yyyymm)
     missing = [c for c in codes if c not in cache_hits]
@@ -1397,11 +1762,7 @@ def fetch_population_bulk(
                     fetched_rows.append(fut.result())
                 except Exception as e:
                     code = futures[fut]
-                    fetched_rows.append({
-                        "admin_dong_code": code, "total_households": 0,
-                        "total_population": 0, "age_30_49_population": 0,
-                        "error": f"병렬 조회 예외: {e}",
-                    })
+                    fetched_rows.append(_empty_pop_row(code, error=f"병렬 조회 예외: {e}"))
         # 정상 조회된(에러 없는) 행만 영구 캐시에 저장 — 오류 응답을 캐시해 재시도를 막지 않도록.
         _ok_rows = [r for r in fetched_rows if not (r.get("error") or "").strip()]
         _save_population_cache_to_db(client, _ok_rows, yyyymm)
@@ -1410,18 +1771,18 @@ def fetch_population_bulk(
     for code in codes:
         if code in cache_hits:
             hit = cache_hits[code]
-            rows.append({
+            row = {
                 "admin_dong_code": code,
                 "total_households": int(hit.get("total_households") or 0),
                 "total_population": int(hit.get("total_population") or 0),
-                "age_30_49_population": int(hit.get("age_30_49_population") or 0),
                 "error": "",
-            })
+            }
+            for k in AGE_BUCKET_KEYS:
+                row[age_bucket_column(k)] = int(hit.get(age_bucket_column(k)) or 0)
+            rows.append(row)
     rows.extend(fetched_rows)
 
-    return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=["admin_dong_code", "total_households", "total_population", "age_30_49_population", "error"]
-    )
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=_POP_BULK_COLUMNS)
 
 
 def prefetch_all_dong_population(client, yyyymm: str, max_workers: int = 8) -> dict:
@@ -1452,11 +1813,7 @@ def prefetch_all_dong_population(client, yyyymm: str, max_workers: int = 8) -> d
                 try:
                     fetched_rows.append(fut.result())
                 except Exception as e:
-                    fetched_rows.append({
-                        "admin_dong_code": futures[fut], "total_households": 0,
-                        "total_population": 0, "age_30_49_population": 0,
-                        "error": f"병렬 조회 예외: {e}",
-                    })
+                    fetched_rows.append(_empty_pop_row(futures[fut], error=f"병렬 조회 예외: {e}"))
         _ok_rows = [r for r in fetched_rows if not (r.get("error") or "").strip()]
         _save_population_cache_to_db(client, _ok_rows, yyyymm)
         _failed = len(fetched_rows) - len(_ok_rows)
@@ -1469,6 +1826,384 @@ def prefetch_all_dong_population(client, yyyymm: str, max_workers: int = 8) -> d
         "newly_fetched": len(missing) - _failed,
         "failed": _failed,
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# 국토교통부 아파트 매매 실거래가 (RTMSDataSvcAptTradeDev)
+# ══════════════════════════════════════════════════════════════════
+#
+# 구조 요약:
+#   1) `fetch_apt_trades_sgg(lawd_cd, deal_ymd)` — 시군구·월 단위 페이지네이션 XML 조회
+#   2) `aggregate_apt_price_by_umd(trades)`     — 법정동(umdNm)별 ㎡단가 중앙값 집계
+#   3) `fetch_apt_price_bulk(client, codes, yyyymm_end, window_months)`
+#         — 행정동코드 리스트를 시군구(LAWD_CD)로 묶어 (a) DB 캐시 조회 (b) API 호출
+#           (c) 법정동↔행정동 매칭, 실패 시 시군구 전체 중앙값 폴백(sgg_fallback)
+#
+# 조인 제약: MOLIT 는 법정동(umdNm), 카카오 좌표는 행정동(admin_dong_name).
+# 이름 매칭이 실패하는 지역(대표적으로 행정동 통폐합 지역: '청운효자동' vs '청운동')은
+# 플랜의 지침대로 시군구 전체 중앙값을 폴백값으로 사용하고 `match_level='sgg_fallback'` 로
+# 표기해 UI 에서 폴백 여부를 드러낸다.
+
+_APT_TRADE_ITEM_FIELDS: tuple[str, ...] = (
+    "dealAmount",       # 거래금액 (만원, 쉼표 포함 문자열)
+    "excluUseAr",       # 전용면적 (㎡, 실수)
+    "umdNm",            # 법정동명
+    "aptNm",            # 아파트명 (샘플 확인용)
+    "dealYear", "dealMonth", "dealDay",
+    "floor", "buildYear",
+)
+
+_APT_PAGE_SIZE = 1000
+_APT_MAX_PAGES = 10  # 안전장치: 시군구·월당 최대 1만건까지 조회
+
+
+def _apt_trade_error_from_body(text: str) -> str:
+    """공공데이터포털 공통 오류(SERVICE ERROR / SERVICE_KEY_IS_NOT_REGISTERED 등)를 추출."""
+    _t = (text or "").strip()
+    if not _t:
+        return "빈 응답"
+    for tag in ("resultMsg", "returnAuthMsg", "errMsg"):
+        m = re.search(rf"<{tag}>([^<]+)</{tag}>", _t, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return _t[:160]
+
+
+@st.cache_data(ttl=_THIRTY_DAYS_SEC, show_spinner=False)
+def fetch_apt_trades_sgg(lawd_cd: str, deal_ymd: str) -> dict:
+    """
+    시군구코드(LAWD_CD 5자리) + 계약년월(YYYYMM) 로 아파트 매매 실거래가 목록을 페이지네이션 조회.
+
+    반환: {
+      "ok": bool, "lawd_cd": str, "deal_ymd": str,
+      "trades": list[dict]  # 각 dict 는 _APT_TRADE_ITEM_FIELDS 컬럼 + price_per_m2 float,
+      "total_count": int,   # header totalCount
+      "error": str, "raw_url": str,
+    }
+    """
+    empty = {"ok": False, "lawd_cd": lawd_cd, "deal_ymd": deal_ymd,
+             "trades": [], "total_count": 0, "error": "", "raw_url": ""}
+    key = _get_apt_trade_service_key()
+    if not key:
+        return {**empty, "error": "service_key 미설정 ([apt_trade_api] service_key 필요)"}
+    if not lawd_cd or len(str(lawd_cd)) < 5 or not deal_ymd:
+        return {**empty, "error": "파라미터 누락 (lawd_cd/deal_ymd)"}
+
+    url = _get_apt_trade_endpoint()
+    lawd = str(lawd_cd)[:5]
+    ymd = str(deal_ymd)[:6]
+
+    trades: list[dict] = []
+    total_count = 0
+    raw_url = ""
+    for page in range(1, _APT_MAX_PAGES + 1):
+        params = {
+            "serviceKey": key,
+            "LAWD_CD": lawd,
+            "DEAL_YMD": ymd,
+            "pageNo": page,
+            "numOfRows": _APT_PAGE_SIZE,
+        }
+        try:
+            r = requests.get(url, params=params, timeout=20.0)
+            if page == 1:
+                raw_url = str(r.url)
+            if r.status_code != 200:
+                return {**empty, "trades": trades, "total_count": total_count,
+                        "error": f"HTTP {r.status_code}: {_apt_trade_error_from_body(r.text)}",
+                        "raw_url": raw_url or str(r.url)}
+            root = ET.fromstring(r.content)
+        except ET.ParseError as e:
+            return {**empty, "trades": trades, "total_count": total_count,
+                    "error": f"XML 파싱 실패: {e}: {_apt_trade_error_from_body(r.text if 'r' in locals() else '')}",
+                    "raw_url": raw_url}
+        except Exception as e:
+            return {**empty, "trades": trades, "total_count": total_count,
+                    "error": f"요청 실패: {type(e).__name__}: {e}", "raw_url": raw_url}
+
+        # header 오류 감지 (HTTP 200 이더라도 resultCode!=00 인 경우 다수)
+        result_code = (root.findtext(".//resultCode") or root.findtext(".//header/resultCode") or "").strip()
+        result_msg = (root.findtext(".//resultMsg") or root.findtext(".//header/resultMsg") or "").strip()
+        if result_code and result_code not in ("0", "00", "000"):
+            if "NODATA" in result_msg.upper() or result_code in ("3", "03"):
+                return {"ok": True, "lawd_cd": lawd, "deal_ymd": ymd,
+                        "trades": trades, "total_count": total_count,
+                        "error": f"계약월 {ymd} 거래 없음 (NODATA)", "raw_url": raw_url}
+            return {**empty, "trades": trades, "total_count": total_count,
+                    "error": f"resultCode={result_code}, {result_msg}", "raw_url": raw_url}
+
+        try:
+            total_count = int((root.findtext(".//totalCount") or "0").strip() or 0)
+        except Exception:
+            total_count = 0
+
+        items = root.findall(".//items/item")
+        if not items:
+            break
+
+        for it in items:
+            row = {f: (it.findtext(f) or "").strip() for f in _APT_TRADE_ITEM_FIELDS}
+            deal_amt = _to_int_safe(row.get("dealAmount", ""))
+            try:
+                area = float((row.get("excluUseAr") or "0").replace(",", "") or 0)
+            except Exception:
+                area = 0.0
+            if deal_amt > 0 and area > 0:
+                row["price_per_m2"] = round(deal_amt * 10000.0 / area, 2)  # 원/㎡
+            else:
+                row["price_per_m2"] = 0.0
+            trades.append(row)
+
+        if len(items) < _APT_PAGE_SIZE:
+            break
+
+    return {"ok": True, "lawd_cd": lawd, "deal_ymd": ymd,
+            "trades": trades, "total_count": total_count,
+            "error": "", "raw_url": raw_url}
+
+
+def _normalize_umd_name(name: str) -> str:
+    """법정동/행정동 매칭용 정규화 — 공백 제거, 소괄호 안 부기명 제거."""
+    if not name:
+        return ""
+    s = re.sub(r"\s+", "", str(name))
+    s = re.sub(r"\(.*?\)$", "", s)
+    return s
+
+
+def aggregate_apt_price_by_umd(trades: list[dict]) -> dict[str, dict]:
+    """
+    거래 리스트 → {umd_normalized: {"median_price_per_m2": float, "deal_count": int, "sample_names": set}}.
+
+    price_per_m2 == 0 인 결측 행은 집계에서 제외.
+    """
+    buckets: dict[str, list[float]] = {}
+    names: dict[str, set[str]] = {}
+    for t in trades or []:
+        raw = t.get("umdNm") or ""
+        key = _normalize_umd_name(raw)
+        p = float(t.get("price_per_m2") or 0)
+        if not key or p <= 0:
+            continue
+        buckets.setdefault(key, []).append(p)
+        names.setdefault(key, set()).add(raw.strip())
+
+    out: dict[str, dict] = {}
+    for key, prices in buckets.items():
+        s = pd.Series(prices)
+        out[key] = {
+            "median_price_per_m2": float(s.median()),
+            "deal_count": int(len(prices)),
+            "sample_names": names.get(key) or set(),
+        }
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────
+# 캐시 테이블 (app_dong_apt_trade_cache) 조회·저장
+# ──────────────────────────────────────────────────────────────────
+
+_APT_CACHE_TABLE = "app_dong_apt_trade_cache"
+_APT_CACHE_COLUMNS = [
+    "admin_dong_code", "yyyymm_end", "window_months",
+    "median_price_per_m2", "deal_count", "match_level",
+]
+
+
+def _load_apt_cache_from_db(
+    client, admin_dong_codes: list[str], yyyymm_end: str, window_months: int,
+) -> dict[str, dict]:
+    """app_dong_apt_trade_cache 에서 (code, yyyymm_end, window_months) 일치 행 벌크 조회."""
+    if client is None or not admin_dong_codes:
+        return {}
+    hits: dict[str, dict] = {}
+    codes = [str(c) for c in admin_dong_codes if c]
+    _CHUNK = 500
+    try:
+        for i in range(0, len(codes), _CHUNK):
+            batch = codes[i:i + _CHUNK]
+            r = (
+                client.table(_APT_CACHE_TABLE)
+                .select(",".join(_APT_CACHE_COLUMNS))
+                .eq("yyyymm_end", yyyymm_end)
+                .eq("window_months", int(window_months))
+                .in_("admin_dong_code", batch)
+                .execute()
+            )
+            for row in (r.data or []) if hasattr(r, "data") else []:
+                hits[str(row["admin_dong_code"])] = row
+    except Exception as e:
+        logger.warning("아파트 실거래 캐시 조회 실패 (테이블 미생성 가능): %s", e)
+    return hits
+
+
+def _save_apt_cache_to_db(client, rows: list[dict], yyyymm_end: str, window_months: int) -> None:
+    """새 실거래 지표를 app_dong_apt_trade_cache 에 upsert (실패해도 렌더링은 계속)."""
+    if client is None or not rows:
+        return
+    payload = []
+    for r in rows:
+        payload.append({
+            "admin_dong_code": str(r["admin_dong_code"]),
+            "yyyymm_end": yyyymm_end,
+            "window_months": int(window_months),
+            "median_price_per_m2": float(r.get("median_price_per_m2") or 0),
+            "deal_count": int(r.get("deal_count") or 0),
+            "match_level": str(r.get("match_level") or ""),
+        })
+    try:
+        client.table(_APT_CACHE_TABLE).upsert(
+            payload, on_conflict="admin_dong_code,yyyymm_end,window_months",
+        ).execute()
+    except Exception as e:
+        logger.warning("아파트 실거래 캐시 저장 실패 (테이블 미생성 가능): %s", e)
+
+
+def _fetch_apt_agg_for_sgg(lawd_cd: str, yyyymm_end: str, window_months: int) -> dict:
+    """
+    시군구 하나에 대해 (yyyymm_end 포함) 직전 window_months 개월치 실거래를 합쳐,
+    법정동별 중앙값·건수 + 시군구 전체 폴백 중앙값·건수를 반환.
+
+    반환: {"ok", "umd_map": {umd_norm: {...}}, "sgg_median": float, "sgg_count": int,
+           "errors": list[str], "months": list[str]}
+    """
+    yyyymm_end = str(yyyymm_end)[:6]
+    months: list[str] = [_yyyymm_add(yyyymm_end, -i) for i in range(int(window_months))]
+    all_trades: list[dict] = []
+    errors: list[str] = []
+    for ym in months:
+        res = fetch_apt_trades_sgg(lawd_cd, ym)
+        if not res.get("ok"):
+            errors.append(f"{ym}: {res.get('error') or 'unknown'}")
+            continue
+        if res.get("error"):  # ok=True 지만 NODATA 표기
+            errors.append(f"{ym}: {res.get('error')}")
+        all_trades.extend(res.get("trades") or [])
+
+    umd_map = aggregate_apt_price_by_umd(all_trades)
+    _all_prices = [float(t.get("price_per_m2") or 0) for t in all_trades if float(t.get("price_per_m2") or 0) > 0]
+    sgg_median = float(pd.Series(_all_prices).median()) if _all_prices else 0.0
+    sgg_count = len(_all_prices)
+
+    return {
+        "ok": True,
+        "umd_map": umd_map,
+        "sgg_median": sgg_median,
+        "sgg_count": sgg_count,
+        "errors": errors,
+        "months": months,
+    }
+
+
+def _apt_bulk_empty_row(code: str, error: str = "") -> dict:
+    return {
+        "admin_dong_code": str(code),
+        "median_price_per_m2": 0.0,
+        "deal_count": 0,
+        "match_level": "",
+        "error": error,
+    }
+
+
+_APT_BULK_COLUMNS = [
+    "admin_dong_code", "median_price_per_m2", "deal_count", "match_level", "error",
+]
+
+
+def fetch_apt_price_bulk(
+    client, admin_dong_codes: list[str], yyyymm_end: str, *,
+    window_months: int = 3, max_workers: int = 4,
+    dong_name_by_code: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """
+    행정동코드 리스트 → 최근 window_months 개월치 실거래 중앙값(㎡단가) DataFrame.
+
+    1) app_dong_apt_trade_cache 에서 (code, yyyymm_end, window_months) 캐시 적중분 확보
+    2) 캐시 미스난 코드를 LAWD_CD(앞 5자리) 로 묶어 시군구 단위 병렬 조회 (동마다 API 를 치지 않음)
+    3) umd(법정동)↔admin_dong_name(행정동) 정규화 매칭. 실패 시 시군구 중앙값을 폴백값으로 사용
+       (match_level='sgg_fallback'). 매칭 성공 시 match_level='umd'.
+    4) 신규 조회분은 캐시 테이블에 upsert.
+
+    반환 컬럼: admin_dong_code, median_price_per_m2, deal_count, match_level, error.
+    """
+    yyyymm_end = str(yyyymm_end)[:6]
+    codes = [str(c) for c in admin_dong_codes if c]
+    if not codes:
+        return pd.DataFrame(columns=_APT_BULK_COLUMNS)
+
+    # 1) 캐시 조회
+    cache_hits = _load_apt_cache_from_db(client, codes, yyyymm_end, window_months)
+    missing = [c for c in codes if c not in cache_hits]
+
+    # 2) 행정동명 매핑: 호출자가 주지 않으면 GeoJSON 인덱스에서 만들어 사용
+    if dong_name_by_code is None:
+        try:
+            _idx = build_geojson_index(load_admdong_geojson())
+            dong_name_by_code = {
+                str(row["adm_cd2"]): str(row["adm_nm"]).split()[-1]
+                for _, row in _idx.iterrows() if row.get("adm_cd2")
+            }
+        except Exception:
+            dong_name_by_code = {}
+    dong_name_by_code = dong_name_by_code or {}
+
+    # 3) 시군구별 그룹핑 후 병렬 조회
+    fetched_rows: list[dict] = []
+    if missing:
+        sgg_groups: dict[str, list[str]] = {}
+        for c in missing:
+            sgg_groups.setdefault(c[:5], []).append(c)
+
+        def _work(lawd_cd: str) -> tuple[str, dict]:
+            return lawd_cd, _fetch_apt_agg_for_sgg(lawd_cd, yyyymm_end, window_months)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_work, lawd): lawd for lawd in sgg_groups}
+            for fut in as_completed(futures):
+                lawd, agg = fut.result()
+                group_codes = sgg_groups.get(lawd, [])
+                _err_join = " · ".join(agg.get("errors") or []) if not agg.get("umd_map") else ""
+                for code in group_codes:
+                    dong_name = dong_name_by_code.get(code) or ""
+                    umd_key = _normalize_umd_name(dong_name)
+                    hit = (agg.get("umd_map") or {}).get(umd_key)
+                    if hit and hit.get("median_price_per_m2"):
+                        fetched_rows.append({
+                            "admin_dong_code": code,
+                            "median_price_per_m2": float(hit["median_price_per_m2"]),
+                            "deal_count": int(hit["deal_count"]),
+                            "match_level": "umd",
+                            "error": "",
+                        })
+                    elif agg.get("sgg_median"):
+                        fetched_rows.append({
+                            "admin_dong_code": code,
+                            "median_price_per_m2": float(agg["sgg_median"]),
+                            "deal_count": int(agg["sgg_count"]),
+                            "match_level": "sgg_fallback",
+                            "error": "",
+                        })
+                    else:
+                        fetched_rows.append(_apt_bulk_empty_row(code, error=_err_join or "거래 0건"))
+
+        # 정상 조회된(match_level 이 있는) 행만 캐시에 저장 — 오류/무데이터는 재시도 대상.
+        _ok_rows = [r for r in fetched_rows if r.get("match_level")]
+        _save_apt_cache_to_db(client, _ok_rows, yyyymm_end, window_months)
+
+    # 4) 최종 병합
+    rows: list[dict] = []
+    for code in codes:
+        if code in cache_hits:
+            hit = cache_hits[code]
+            rows.append({
+                "admin_dong_code": code,
+                "median_price_per_m2": float(hit.get("median_price_per_m2") or 0),
+                "deal_count": int(hit.get("deal_count") or 0),
+                "match_level": str(hit.get("match_level") or ""),
+                "error": "",
+            })
+    rows.extend(fetched_rows)
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=_APT_BULK_COLUMNS)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1597,9 +2332,15 @@ def render_dong_commercial_map() -> None:
         return
     start_date_str = start_date.isoformat()
     end_date_str = end_date.isoformat()
-    # 인구·세대 데이터는 기간 종료월 스냅샷만 사용. 단, 이번 달 통계는 행안부가
-    # 아직 게시하지 않아 API가 거부하므로 최근 확정월(전월)로 자동 보정한다.
-    yyyymm = _clamp_population_yyyymm(end_date.strftime("%Y%m"))
+    # 인구·세대 데이터는 기간 종료월 스냅샷만 사용.
+    # 이번 달/미게시 월은 행안부가 NODATA 를 반환하므로 실제 게시된 최근월로 폴백.
+    _yyyymm_requested = end_date.strftime("%Y%m")
+    yyyymm = _resolve_population_yyyymm(_yyyymm_requested)
+    if yyyymm != _yyyymm_requested:
+        st.info(
+            f"ℹ️ 인구 기준월 자동 보정: 요청 `{_yyyymm_requested}` → 사용 `{yyyymm}` "
+            f"(행정안전부 해당 월 통계 미게시·NODATA)"
+        )
 
     sel_dbfns = [dbf for dbf, name in store_options if name in sel_labels]
     sel_store_names = [name for _, name in store_options if name in sel_labels]
@@ -1624,82 +2365,314 @@ def render_dong_commercial_map() -> None:
                     f"신규 조회 {_stat['newly_fetched']}건 · 실패 {_stat['failed']}건"
                 )
 
-    # ── 데이터 조회 · 렌더링 ─────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # 2단계 — 핵심상권(시·군·동) 계층 선택
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### 2. 핵심상권 선정 (시·군·동)")
+    _geo_idx = build_geojson_index(load_admdong_geojson())
+    if _geo_idx.empty:
+        st.error("GeoJSON 이 로드되지 않아 행정동 선택을 표시할 수 없습니다. 위 '연동 진단' 패널을 확인해 주세요.")
+        return
+
+    _sido_options = sorted(x for x in _geo_idx["sidonm"].unique().tolist() if x)
+    _prev_sido = [s for s in st.session_state.get("dcm_sido", []) if s in _sido_options]
+    _sd_col, _sgg_col, _dong_col = st.columns([1, 1, 2])
+    with _sd_col:
+        sel_sido = st.multiselect(
+            "시도",
+            options=_sido_options,
+            default=_prev_sido or _sido_options[:1],
+            key="dcm_sido",
+            help="분석 대상 시도. 선택한 시도에 속한 시군구만 아래에서 표시됩니다.",
+        )
+    _sgg_pool = _geo_idx[_geo_idx["sidonm"].isin(sel_sido)] if sel_sido else _geo_idx.iloc[0:0]
+    _sgg_options = sorted(x for x in _sgg_pool["sggnm"].unique().tolist() if x)
+    _prev_sgg = [s for s in st.session_state.get("dcm_sgg", []) if s in _sgg_options]
+    with _sgg_col:
+        sel_sgg = st.multiselect(
+            "시군구",
+            options=_sgg_options,
+            default=_prev_sgg or _sgg_options,
+            key="dcm_sgg",
+            help="선택 시도 안에서 분석할 시군구. 선택 시군구에 속한 행정동만 아래에서 표시됩니다.",
+        )
+    _dong_pool = _sgg_pool[_sgg_pool["sggnm"].isin(sel_sgg)] if sel_sgg else _sgg_pool.iloc[0:0]
+    # adm_nm 은 "시도 시군구 행정동" 전체 경로 (라벨) / adm_cd2 는 10자리 코드 (값).
+    _dong_labels_all = sorted(x for x in _dong_pool["adm_nm"].unique().tolist() if x)
+    _dong_code_by_label = dict(zip(_dong_pool["adm_nm"], _dong_pool["adm_cd2"]))
+    _dong_name_by_code = {
+        str(row["adm_cd2"]): str(row["adm_nm"]).split()[-1]
+        for _, row in _dong_pool.iterrows() if row.get("adm_cd2")
+    }
+    # 시군구별 "구전체" 가상 옵션 (예: 남구전체, 동구전체) — 선택 시 해당 시군구 전 행정동으로 펼침.
+    # 현재 선택된 시군구에 대해서만 표시한다.
+    _sgg_for_all = sorted(sel_sgg) if sel_sgg else []
+    _sgg_all_labels = [f"{sgg}전체" for sgg in _sgg_for_all]
+    _sgg_all_to_codes: dict[str, list[str]] = {
+        f"{sgg}전체": [
+            str(c) for c in _dong_pool.loc[_dong_pool["sggnm"] == sgg, "adm_cd2"].tolist() if c
+        ]
+        for sgg in _sgg_for_all
+    }
+    _dong_options = _sgg_all_labels + _dong_labels_all
+    _prev_dongs = [d for d in st.session_state.get("dcm_dongs", []) if d in _dong_options]
+    with _dong_col:
+        sel_dong_labels = st.multiselect(
+            "행정동 (핵심상권)",
+            options=_dong_options,
+            default=_prev_dongs or _sgg_all_labels,
+            key="dcm_dongs",
+            help="시군구 '○○전체'(예: 남구전체)를 고르면 해당 구의 모든 행정동이 포함됩니다. "
+                 "개별 동도 함께 선택 가능합니다. 렌더링 시 구매 없는 동은 침투율 0으로 포함됩니다.",
+        )
+    # "남구전체" 등은 해당 시군구 코드 목록으로 펼치고, 개별 동 라벨은 직접 매핑. 중복 제거.
+    _sel_codes_ordered: list[str] = []
+    _seen_codes: set[str] = set()
+    for _lab in sel_dong_labels:
+        if _lab in _sgg_all_to_codes:
+            _codes_for = _sgg_all_to_codes[_lab]
+        elif _lab in _dong_code_by_label:
+            _codes_for = [str(_dong_code_by_label[_lab])]
+        else:
+            continue
+        for _c in _codes_for:
+            if _c and _c not in _seen_codes:
+                _seen_codes.add(_c)
+                _sel_codes_ordered.append(_c)
+    sel_adm_codes = _sel_codes_ordered
+
+    # ══════════════════════════════════════════════════════════════
+    # 3단계 — 핵심 타겟 연령대
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### 3. 핵심 타겟 연령대")
+    _default_age_labels = [AGE_BUCKET_LABELS[k] for k in DEFAULT_TARGET_AGE_KEYS]
+    sel_age_labels = st.multiselect(
+        "핵심 타겟 연령대 (밀집도 계산 대상)",
+        options=[AGE_BUCKET_LABELS[k] for k in AGE_BUCKET_KEYS],
+        default=_default_age_labels,
+        key="dcm_target_ages",
+        help="선택한 연령대의 남녀 인구 합을 총인구로 나눠 타겟 밀집도를 계산합니다. "
+             "렌더링 후에도 변경 시 인구 API 재호출 없이 즉시 반영됩니다.",
+    )
+    _label_to_key = {v: k for k, v in AGE_BUCKET_LABELS.items()}
+    sel_age_keys = [_label_to_key[l] for l in sel_age_labels if l in _label_to_key]
+
+    # ══════════════════════════════════════════════════════════════
+    # 4단계 — 평가 가중치 (핵심타겟 vs 아파트 실거래가)
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### 4. 평가 가중치")
+    st.caption(
+        "매력도 = **wT × 정규화(타겟 밀집도) + wA × 정규화(아파트 ㎡단가)**. "
+        "두 축 각각 선택 행정동 집합 안에서 min-max 정규화(0~1)한 뒤 가중합. "
+        "가중치만 바꾸면 API 재호출 없이 즉시 4분면(A/B/C/D)이 재계산됩니다."
+    )
+    # 두 슬라이더가 합=100 을 유지하도록 콜백에서 상대편을 자동 보정.
+    def _sync_w_apt() -> None:
+        st.session_state["dcm_w_apt"] = int(max(0, min(100, 100 - int(st.session_state.get("dcm_w_target", 70)))))
+
+    def _sync_w_target() -> None:
+        st.session_state["dcm_w_target"] = int(max(0, min(100, 100 - int(st.session_state.get("dcm_w_apt", 30)))))
+
+    if "dcm_w_target" not in st.session_state:
+        st.session_state["dcm_w_target"] = 70
+    if "dcm_w_apt" not in st.session_state:
+        st.session_state["dcm_w_apt"] = 100 - int(st.session_state["dcm_w_target"])
+
+    _wc1, _wc2 = st.columns(2)
+    with _wc1:
+        w_target = st.slider(
+            "핵심타겟 weight (wT)",
+            min_value=0, max_value=100, step=5,
+            key="dcm_w_target", on_change=_sync_w_apt,
+            help="타겟 밀집도(선택 연령대 인구 비중)에 부여할 가중치. 슬라이더를 조절하면 반대편 weight가 자동으로 100-값으로 맞춰집니다.",
+        )
+    with _wc2:
+        w_apt = st.slider(
+            "아파트 실거래가 weight (wA)",
+            min_value=0, max_value=100, step=5,
+            key="dcm_w_apt", on_change=_sync_w_target,
+            help="아파트 매매 ㎡단가에 부여할 가중치. 100-wT 로 자동 보정됩니다.",
+        )
+    st.caption(f"현재 가중치: 핵심타겟 **{w_target}** / 아파트 실거래 **{w_apt}** (합계 {w_target + w_apt})")
+
+    # ══════════════════════════════════════════════════════════════
+    # 5단계 — 상권 맵 렌더링
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### 5. 상권 맵 렌더링")
+    _missing = []
+    if not sel_adm_codes:
+        _missing.append("2단계에서 행정동 1개 이상")
+    if not sel_age_keys:
+        _missing.append("3단계에서 연령대 1개 이상")
+    if _missing:
+        st.info("다음을 먼저 선택해 주세요 — " + " · ".join(_missing))
+
+    _can_render = bool(sel_labels and sel_adm_codes and sel_age_keys)
     _c_btn1, _c_btn2 = st.columns([2, 1])
     with _c_btn1:
-        do_render = st.button("🗺️ 상권 맵 렌더링", type="primary", key="dcm_render_btn")
+        do_render = st.button(
+            "🗺️ 상권 맵 렌더링", type="primary",
+            disabled=not _can_render, key="dcm_render_btn",
+        )
     with _c_btn2:
         force_refresh = st.checkbox(
             "최신 데이터로 새로고침", key="dcm_force_refresh",
             help="캐시를 무시하고 Supabase 에서 구매건수를 다시 집계합니다 (당일 신규 주문 반영 등).",
         )
 
-    # 매장·기간이 바뀌면 이전 결과는 무효화 (시군구 필터만 바꿀 때는 재클릭 없이도
-    # 아래 캐시된 원본으로 즉시 재필터링되도록 session_state 에 원본을 보관).
-    _cache_key = (tuple(sorted(sel_dbfns)), start_date_str, end_date_str)
+    if not _can_render:
+        return
+
+    # 캐시 키: 매장·기간·선택 행정동 집합. 연령·가중치는 사후 재계산 대상이라 키에서 제외.
+    _sel_adm_key = tuple(sorted(sel_adm_codes))
+    _cache_key = (tuple(sorted(sel_dbfns)), start_date_str, end_date_str, _sel_adm_key)
+    _pop_cache_key = (_cache_key, yyyymm)
+    _APT_WINDOW_MONTHS = 3
+    _apt_cache_key = (_cache_key, yyyymm, _APT_WINDOW_MONTHS)
 
     if do_render:
         if force_refresh:
             aggregate_purchase_count_by_dong.clear()
         with st.spinner("행정동별 구매건수 집계 중…"):
             _raw_df = aggregate_purchase_count_by_dong(client, sel_dbfns, start_date_str, end_date_str)
-        # attrs 는 이후 merge/filter 과정에서 소실될 수 있어 원본에서 바로 캡처해 둔다.
+
+        # 선택 행정동 스켈레톤 — GeoJSON 기준으로 만든 뒤 CRM 을 left-join 하여
+        # 구매가 없는 동도 침투율 0 으로 포함(잠재 상권 분석).
+        _skeleton = pd.DataFrame({
+            "admin_dong_code": [str(c) for c in sel_adm_codes],
+            "admin_dong_name": [_dong_name_by_code.get(str(c), str(c)) for c in sel_adm_codes],
+        })
+        if _raw_df is None or _raw_df.empty:
+            _merged = _skeleton.copy()
+            _merged["purchase_count"] = 0
+            _merged["purchase_amount"] = 0
+        else:
+            _amt_cols = ["admin_dong_code", "purchase_count"]
+            if "purchase_amount" in _raw_df.columns:
+                _amt_cols.append("purchase_amount")
+            _crm_slim = _raw_df[_amt_cols].copy()
+            _crm_slim["admin_dong_code"] = _crm_slim["admin_dong_code"].astype(str)
+            _merged = _skeleton.merge(_crm_slim, on="admin_dong_code", how="left")
+            _merged["purchase_count"] = _merged["purchase_count"].fillna(0).astype(int)
+            if "purchase_amount" not in _merged.columns:
+                _merged["purchase_amount"] = 0
+            _merged["purchase_amount"] = (
+                pd.to_numeric(_merged["purchase_amount"], errors="coerce").fillna(0).round(0).astype("int64")
+            )
+        _merged = _attach_sigungu(_merged)
+
+        # attrs 캡처 (요약 지표의 미매핑 커버리지에 사용). skeleton 은 attrs 를 가지지 않으므로
+        # 원본 CRM 결과의 attrs 를 사용한다.
+        _raw_attrs = _raw_df.attrs if (_raw_df is not None) else {}
         st.session_state["dcm_mapping_coverage"] = {
-            "total_orders": _raw_df.attrs.get("total_orders_in_period", 0),
-            "mapped_orders": _raw_df.attrs.get("mapped_orders_in_period", 0),
+            "total_orders": int(_raw_attrs.get("total_orders_in_period", 0) or 0),
+            "mapped_orders": int(_raw_attrs.get("mapped_orders_in_period", 0) or 0),
         }
-        st.session_state["dcm_raw_crm_df"] = _attach_sigungu(_raw_df)
+        st.session_state["dcm_raw_crm_df"] = _merged
         st.session_state["dcm_raw_cache_key"] = _cache_key
-        if st.session_state.get("dcm_sigungu_cache_key") != _cache_key:
-            st.session_state.pop("dcm_sigungu_filter", None)
-            st.session_state["dcm_sigungu_cache_key"] = _cache_key
+        # 새 렌더 요청이 오면 인구/실거래 캐시도 초기화 (아래에서 선택 동에 맞게 재적재).
+        st.session_state.pop("dcm_pop_df", None)
+        st.session_state.pop("dcm_pop_cache_key", None)
+        st.session_state.pop("dcm_apt_df", None)
+        st.session_state.pop("dcm_apt_cache_key", None)
 
     if st.session_state.get("dcm_raw_cache_key") != _cache_key:
-        st.info("매장·분석기간 설정 후 '상권 맵 렌더링'을 눌러 주세요.")
+        st.info("현재 선택으로 '🗺️ 상권 맵 렌더링'을 눌러 주세요. (매장·기간·행정동을 바꿨다면 다시 눌러야 반영됩니다.)")
         return
 
-    crm_df_all = st.session_state.get("dcm_raw_crm_df")
-    if crm_df_all is None or crm_df_all.empty:
-        st.warning(
-            "선택한 매장·기간에 행정동 매핑이 된 구매 건이 없습니다. "
-            "위 백필 패널로 행정동 변환을 먼저 실행하거나 분석 기간을 넓혀 보세요."
-        )
-        return
-
-    # ── 시군구 필터 (변경 시 재클릭 없이 즉시 적용) ──────────
-    _sgg_options = sorted(x for x in crm_df_all["sigungu_label"].unique().tolist() if x)
-    sel_sgg = st.multiselect(
-        "시군구 필터 (미선택 시 전체)",
-        options=_sgg_options,
-        default=_sgg_options,
-        key="dcm_sigungu_filter",
-        help="구매건수가 집계된 행정동을 시군구 단위로 좁혀 봅니다. GeoJSON 범위 밖 행정동은 '기타(미분류)'로 표시됩니다.",
-    )
-    crm_df = crm_df_all[crm_df_all["sigungu_label"].isin(sel_sgg)] if sel_sgg else crm_df_all.iloc[0:0]
-    if crm_df.empty:
-        st.warning("선택한 시군구에 해당하는 행정동이 없습니다.")
+    crm_df = st.session_state.get("dcm_raw_crm_df")
+    if crm_df is None or crm_df.empty:
+        st.warning("선택한 행정동에 렌더링할 데이터가 없습니다.")
         return
 
     st.caption(f"📅 분석 기간: {start_date} ~ {end_date} · 인구 기준월: {yyyymm}")
+    _n_purch = int((crm_df["purchase_count"] > 0).sum())
+    _amt_sum = int(pd.to_numeric(crm_df.get("purchase_amount"), errors="coerce").fillna(0).sum())
     st.success(
-        f"행정동 {len(crm_df)}개, 기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건"
+        f"선택 행정동 {len(crm_df)}개 (구매 발생 {_n_purch}개 · 잠재 {len(crm_df) - _n_purch}개), "
+        f"기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건 · "
+        f"구매금액 합계 {_amt_sum:,} 원"
     )
 
-    with st.spinner("행정안전부 인구·세대 데이터 조회 중… (영구 캐시 + 병렬 조회)"):
-        pop_df = fetch_population_bulk(client, crm_df["admin_dong_code"].astype(str).tolist(), yyyymm)
+    # 인구 데이터: 선택 행정동에 대해서만 조회 (불필요 API 호출 절감).
+    pop_df = st.session_state.get("dcm_pop_df")
+    if pop_df is None or st.session_state.get("dcm_pop_cache_key") != _pop_cache_key:
+        with st.spinner("행정안전부 인구·세대 데이터 조회 중… (영구 캐시 + 병렬 조회)"):
+            pop_df = fetch_population_bulk(
+                client, crm_df["admin_dong_code"].astype(str).tolist(), yyyymm,
+            )
+        st.session_state["dcm_pop_df"] = pop_df
+        st.session_state["dcm_pop_cache_key"] = _pop_cache_key
 
     _err_msgs = [x for x in pop_df["error"].astype(str).tolist() if x.strip()]
     if pop_df.empty or all(pop_df["total_population"].fillna(0) == 0):
-        st.error(
-            "행정안전부 API 응답에서 인구 데이터를 파싱하지 못했습니다. "
-            "위 '연동 진단' 패널에서 API 키·엔드포인트를 확인해 주세요."
-        )
+        _nodata = any(("NODATA" in m) or ("데이터 없음" in m) for m in _err_msgs)
+        if _nodata:
+            st.error(
+                f"행정안전부 통계월 `{yyyymm}` 인구 데이터가 없습니다 (NODATA). "
+                "분석 기간 종료월을 더 이르게 잡거나, 잠시 후 재시도해 주세요. "
+                "위 '연동 진단'에서 연결 테스트로 최근 게시월을 확인할 수 있습니다."
+            )
+        else:
+            st.error(
+                "행정안전부 API 응답에서 인구 데이터를 파싱하지 못했습니다. "
+                "위 '연동 진단' 패널에서 API 키·엔드포인트를 확인해 주세요."
+            )
         if _err_msgs:
             with st.expander("응답 오류 상세", expanded=False):
-                for m in _err_msgs[:20]:
+                for m in list(dict.fromkeys(_err_msgs))[:20]:
                     st.text(m)
 
-    kpi_df = compute_dong_kpi(crm_df, pop_df)
+    # 아파트 실거래가: 선택 행정동에 대해 시군구 단위로 3개월 창 조회.
+    # 가중치 변경 시 API 재호출 없이 session_state 재사용.
+    apt_df = st.session_state.get("dcm_apt_df")
+    if apt_df is None or st.session_state.get("dcm_apt_cache_key") != _apt_cache_key:
+        _dong_name_map = {
+            str(r["admin_dong_code"]): str(r["admin_dong_name"])
+            for _, r in crm_df.iterrows() if r.get("admin_dong_code")
+        }
+        with st.spinner(f"국토부 아파트 실거래가 조회 중… (기준월 `{yyyymm}` 직전 {_APT_WINDOW_MONTHS}개월 · 시군구 단위 병렬)"):
+            try:
+                apt_df = fetch_apt_price_bulk(
+                    client, crm_df["admin_dong_code"].astype(str).tolist(),
+                    yyyymm, window_months=_APT_WINDOW_MONTHS,
+                    dong_name_by_code=_dong_name_map,
+                )
+            except Exception as exc:
+                logger.exception("아파트 실거래 조회 실패")
+                st.warning(f"아파트 실거래가 조회에 실패했습니다: {exc}. 매력도는 타겟 밀집도만 반영합니다.")
+                apt_df = pd.DataFrame(columns=_APT_BULK_COLUMNS)
+        st.session_state["dcm_apt_df"] = apt_df
+        st.session_state["dcm_apt_cache_key"] = _apt_cache_key
+
+    _apt_err_msgs = [
+        x for x in (apt_df["error"].astype(str).tolist() if "error" in apt_df.columns else [])
+        if x.strip()
+    ]
+    _n_priced = int((apt_df["median_price_per_m2"] > 0).sum()) if not apt_df.empty else 0
+    if apt_df is not None and not apt_df.empty and _n_priced == 0:
+        _apt_key, _apt_diag = _get_apt_trade_service_key_diagnostic()
+        _hint = (
+            "국토부 실거래가 API 활용신청이 승인되지 않았거나 시군구 코드가 매칭되지 않았습니다. "
+            "data.go.kr 15126468 에서 인증키를 승인받고 `.streamlit/secrets.toml` 의 "
+            "`[apt_trade_api] service_key` 를 설정하세요. "
+            "실거래 데이터가 없어도 침투율과 타겟 밀집도만으로 A/B/C/D 분류는 정상 동작합니다."
+        )
+        st.info(f"ℹ️ 아파트 실거래 매칭 0건 — {_hint}")
+        if _apt_err_msgs:
+            with st.expander("실거래 API 응답 오류 상세", expanded=False):
+                for m in list(dict.fromkeys(_apt_err_msgs))[:20]:
+                    st.text(m)
+    elif _n_priced > 0:
+        _n_umd = int((apt_df["match_level"] == "umd").sum())
+        _n_sgg = int((apt_df["match_level"] == "sgg_fallback").sum())
+        st.caption(
+            f"🏢 아파트 실거래 매칭: 법정동 정확 매칭 {_n_umd}건 · "
+            f"시군구 폴백 {_n_sgg}건 (기준월 `{yyyymm}` 직전 {_APT_WINDOW_MONTHS}개월)"
+        )
+
+    kpi_df = compute_dong_kpi(crm_df, pop_df, sel_age_keys, apt_trades=apt_df)
+    kpi_df = compute_attractiveness(kpi_df, w_target=w_target, w_apt=w_apt)
     kpi_df = assign_quadrant(kpi_df)
 
     # ── KPI 요약 ─────────────────────────────────────
@@ -1711,7 +2684,7 @@ def render_dong_commercial_map() -> None:
         _render_map(kpi_df)
     with _right:
         st.markdown("**2x2 매트릭스**")
-        st.caption("가로: 우리 매장 침투율 · 세로: 타겟 인구 비중")
+        st.caption(f"가로: 우리 매장 침투율 · 세로: 가중 매력도 (wT={w_target}/wA={w_apt})")
         _render_quadrant_scatter(kpi_df)
 
     # ── 하단: 집중 공략 Top 5 (즉각 행동 지침) ──
@@ -1720,19 +2693,32 @@ def render_dong_commercial_map() -> None:
     # ── 상세 표 ─────────────────────────────────────
     _render_table(kpi_df)
 
+    # ── PDF 출력 ─────────────────────────────────────
+    _render_pdf_export_panel(
+        kpi_df,
+        store_names=sel_store_names,
+        start_date=str(start_date),
+        end_date=str(end_date),
+        yyyymm=yyyymm,
+        age_keys=sel_age_keys,
+        cache_key=_cache_key,
+        weights=(int(w_target), int(w_apt)),
+    )
+
 
 # ══════════════════════════════════════════════════════════════════
 # 하위 렌더 함수
 # ══════════════════════════════════════════════════════════════════
 
 def _render_diagnostic_panel() -> None:
-    """API 키/엔드포인트/GeoJSON 상태 요약."""
+    """API 키/엔드포인트/GeoJSON 상태 요약 + 행안부·국토부 연결 테스트."""
     pop_key, pop_diag = _get_population_service_key_diagnostic()
+    apt_key, apt_diag = _get_apt_trade_service_key_diagnostic()
     kakao_key = _get_kakao_rest_key_local()
     geojson_p = GEOJSON_PATH_DEFAULT
     _exists = Path(geojson_p).exists()
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown("**행안부 인구 API**")
         st.text(
@@ -1749,12 +2735,82 @@ def _render_diagnostic_panel() -> None:
                 "이미 [elevator_api] 가 있다면 동일한 data.go.kr 일반 인증키를 "
                 "[population_api] service_key 에 복사해도 됩니다."
             )
+        if st.button("🔌 인구 API 연결 테스트", key="dcm_pop_api_test"):
+            _req_ym = pd.Timestamp.now().strftime("%Y%m")
+            with st.spinner("통계월 탐색 · 샘플 행정동 조회 중…"):
+                try:
+                    fetch_admin_dong_population.clear()
+                    fetch_admin_dong_age_population.clear()
+                    _resolve_population_yyyymm.clear()
+                except Exception:
+                    pass
+                _use_ym = _resolve_population_yyyymm(_req_ym)
+                _probe = fetch_admin_dong_population("1111051500", _use_ym)
+                _age = fetch_admin_dong_age_population("1111051500", _use_ym)
+            if _probe.get("ok") and int(_probe.get("total_population") or 0) > 0:
+                st.success(
+                    f"연결 성공 — 최근 게시월 `{_use_ym}` "
+                    f"(요청 `{_req_ym}`), 샘플 인구 {_probe['total_population']:,}명 / "
+                    f"세대 {_probe['total_households']:,} · "
+                    f"연령API {'OK' if _age.get('ok') else 'FAIL'}"
+                )
+            else:
+                st.error(
+                    f"연결 실패 — pop: {_probe.get('error') or 'unknown'} · "
+                    f"age: {_age.get('error') or 'unknown'}"
+                )
     with c2:
+        st.markdown("**국토부 실거래 API**")
+        st.text(
+            f"키 길이   : {apt_diag.get('key_len')}\n"
+            f"소스      : {apt_diag.get('final_source')}\n"
+            f"폴백소스  : {apt_diag.get('fallback_source') or '-'}\n"
+            f"endpoint  : {_get_apt_trade_endpoint()}"
+        )
+        if not apt_key:
+            st.warning(
+                "국토부 실거래 API 키가 없습니다. `.streamlit/secrets.toml` 의 "
+                "[apt_trade_api] service_key 를 설정하거나 기존 [population_api] "
+                "키에 15126468 활용신청을 추가하세요."
+            )
+        if st.button("🔌 실거래 API 연결 테스트", key="dcm_apt_api_test"):
+            _req_ym = pd.Timestamp.now().strftime("%Y%m")
+            with st.spinner("샘플 시군구(11110 종로구) · 확정월 조회 중…"):
+                try:
+                    fetch_apt_trades_sgg.clear()
+                except Exception:
+                    pass
+                # 최근 확정월은 계약월 익월 이후 확정. 요청월 → -1 → -2 순으로 탐색.
+                _res: dict = {}
+                _use_ym = ""
+                for _off in range(0, 5):
+                    _try = _yyyymm_add(_req_ym, -_off)
+                    _res = fetch_apt_trades_sgg("11110", _try)
+                    if _res.get("ok") and (_res.get("trades") or []):
+                        _use_ym = _try
+                        break
+                    if _res.get("error") and (
+                        "service_key" in str(_res.get("error")).lower()
+                        or "SERVICE_KEY" in str(_res.get("error"))
+                        or "HTTP 40" in str(_res.get("error"))
+                    ):
+                        break
+            if _use_ym and _res.get("trades"):
+                _n = len(_res["trades"])
+                _prices = [t.get("price_per_m2", 0) for t in _res["trades"] if t.get("price_per_m2")]
+                _med = float(pd.Series(_prices).median()) if _prices else 0.0
+                st.success(
+                    f"연결 성공 — 종로구(`11110`) 계약월 `{_use_ym}` · 거래 {_n}건 · "
+                    f"㎡단가 중앙값 {_med/10000:,.1f} 만원/㎡"
+                )
+            else:
+                st.error(f"연결 실패 — {_res.get('error') or '거래 없음'}")
+    with c3:
         st.markdown("**카카오 로컬 API**")
         st.text(f"키 길이 : {len(kakao_key)}\n키 감지 : {'yes' if kakao_key else 'no'}")
         if not kakao_key:
             st.warning("카카오 REST 키가 없습니다. 백필/신규 고객 지오코딩이 불가합니다.")
-    with c3:
+    with c4:
         st.markdown("**행정동 GeoJSON**")
         st.text(f"경로     : {geojson_p}\n존재여부 : {'yes' if _exists else 'no'}")
         if _exists:
@@ -2027,18 +3083,36 @@ def _render_summary_metrics(df: pd.DataFrame) -> None:
         return
     _total_dong = len(df)
     _total_orders = int(df["purchase_count"].sum())
-    _valid = df[(df["penetration_rate"] > 0) | (df["target_density"] > 0)]
+    _total_amount = int(pd.to_numeric(df.get("purchase_amount"), errors="coerce").fillna(0).sum())
+    _y_col = df.attrs.get("quadrant_y_col") or ("attractiveness" if "attractiveness" in df.columns else "target_density")
+    _valid = df[(df["penetration_rate"] > 0) | (df[_y_col] > 0)] if _y_col in df.columns else df
     _med_p = float(df.attrs.get("median_penetration", _valid["penetration_rate"].median() if not _valid.empty else 0.0))
-    _med_d = float(df.attrs.get("median_target_density", _valid["target_density"].median() if not _valid.empty else 0.0))
-    m1, m2, m3, m4 = st.columns(4)
+    _med_y = float(df.attrs.get("median_y_axis", _valid[_y_col].median() if _y_col in df.columns and not _valid.empty else 0.0))
+
+    _w_t = float(df.attrs.get("w_target", 100.0))
+    _w_a = float(df.attrs.get("w_apt", 0.0))
+    _apt_med = float(pd.to_numeric(df.get("apt_price_per_m2"), errors="coerce").fillna(0).median()) if "apt_price_per_m2" in df.columns else 0.0
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     with m1:
         st.metric("대상 행정동 수", f"{_total_dong:,}")
     with m2:
         st.metric("총 구매건수", f"{_total_orders:,}")
     with m3:
-        st.metric("침투율 중앙값", f"{_med_p:.3f}%")
+        st.metric("구매금액 합계", f"{_total_amount:,} 원")
     with m4:
-        st.metric("밀집도 중앙값", f"{_med_d:.2f}%")
+        st.metric("침투율 중앙값", f"{_med_p:.3f}%")
+    with m5:
+        if _y_col == "attractiveness":
+            st.metric("매력도 중앙값", f"{_med_y:.3f}", help=f"weight = 타겟 {_w_t:.0f} / 실거래 {_w_a:.0f}")
+        else:
+            st.metric("밀집도 중앙값", f"{_med_y:.2f}%")
+    with m6:
+        st.metric(
+            "아파트 ㎡단가 중앙값",
+            f"{_apt_med/10000:,.1f} 만원/㎡" if _apt_med > 0 else "실거래 없음",
+            help="선택 행정동 apt_price_per_m2 의 중앙값 (원/㎡ → 만원/㎡ 환산 표기)",
+        )
 
     strat_counts = df["행동_전략"].value_counts().to_dict() if "행동_전략" in df.columns else {}
     st.caption(
@@ -2117,6 +3191,22 @@ def _render_map(df: pd.DataFrame) -> None:
         primary["행동_전략"].map(STRATEGY_LEGEND_LABEL).fillna(STRATEGY_LEGEND_LABEL[STRATEGY_UNSET])
     )
 
+    # 실거래·매력도 hover 표기용 파생 컬럼 (지도 렌더 직전 만들어 안전 보장)
+    if "apt_price_per_m2" in primary.columns:
+        _p_arr = pd.to_numeric(primary["apt_price_per_m2"], errors="coerce").fillna(0)
+        _lvl_arr = primary["apt_match_level"].astype(str) if "apt_match_level" in primary.columns else pd.Series([""] * len(primary), index=primary.index)
+        _lvl_kor = _lvl_arr.map({"umd": "법정동 매칭", "sgg_fallback": "시군구 폴백"}).fillna("-")
+        primary["hover_apt"] = [
+            (f"{p/10000:.1f} 만원/㎡ · {lvl}" if p > 0 else "실거래 없음")
+            for p, lvl in zip(_p_arr, _lvl_kor)
+        ]
+    else:
+        primary["hover_apt"] = "실거래 없음"
+    if "attractiveness" in primary.columns:
+        primary["hover_attr"] = pd.to_numeric(primary["attractiveness"], errors="coerce").fillna(0.0).map(lambda a: f"{a:.3f}")
+    else:
+        primary["hover_attr"] = "-"
+
     fig = px.choropleth_mapbox(
         primary,
         geojson=geojson,
@@ -2129,16 +3219,24 @@ def _render_map(df: pd.DataFrame) -> None:
         zoom=10,
         center={"lat": _lat_c, "lon": _lon_c},
         opacity=0.72,
-        custom_data=["admin_dong_name", "행동_전략", "hover_target", "hover_perf"],
+        custom_data=[
+            "admin_dong_name", "행동_전략", "hover_target", "hover_perf",
+            "hover_apt", "hover_attr",
+        ],
     )
 
-    # 지침 3: 문장형 hover — "동이름: X | 전략: Y | 핵심타겟(30~59): N명 | 성과: 1,000가구 중 약 x가구 구매"
+    # 지침 3: 문장형 hover — 동이름·전략·핵심타겟(선택 연령대) 인구·성과·실거래·매력도 요약
+    _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
+    _w_t = int(round(float(df.attrs.get("w_target", 100.0))))
+    _w_a = int(round(float(df.attrs.get("w_apt", 0.0))))
     fig.update_traces(
         hovertemplate=(
             "<b>%{customdata[0]}</b><br>"
             "전략: %{customdata[1]}<br>"
-            "핵심타겟(30~59): %{customdata[2]}명<br>"
-            "성과: %{customdata[3]}"
+            f"핵심타겟({_age_label}): %{{customdata[2]}}명<br>"
+            "성과: %{customdata[3]}<br>"
+            "실거래: %{customdata[4]}<br>"
+            f"매력도(wT{_w_t}/wA{_w_a}): %{{customdata[5]}}"
             "<extra></extra>"
         ),
         marker_line_width=0.3,
@@ -2160,42 +3258,74 @@ def _render_map(df: pd.DataFrame) -> None:
         ),
     )
     st.plotly_chart(fig, use_container_width=True)
-    _render_strategy_legend_guide()
+    _render_strategy_legend_guide(
+        format_selected_age_label(df.attrs.get("selected_age_keys")),
+        y_axis=df.attrs.get("quadrant_y_col") or "target_density",
+    )
 
 
 def _render_quadrant_scatter(df: pd.DataFrame) -> None:
-    """중앙값 기준 4분면 산점도 — 지도의 색상 범례와 동일한 행동_전략 색상을 사용."""
+    """중앙값 기준 4분면 산점도. Y 축은 `attractiveness`(가중 매력도) 있으면 그것을,
+    없으면 하위호환용 `target_density` 를 사용."""
     import plotly.express as px
     if df is None or df.empty:
         return
     med_p = float(df.attrs.get("median_penetration", 0.0))
-    med_d = float(df.attrs.get("median_target_density", 0.0))
+    _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
+    _y_col = df.attrs.get("quadrant_y_col") or ("attractiveness" if "attractiveness" in df.columns else "target_density")
+    med_y = float(df.attrs.get("median_y_axis", df.attrs.get("median_target_density", 0.0)))
+    _w_t = float(df.attrs.get("w_target", 100.0))
+    _w_a = float(df.attrs.get("w_apt", 0.0))
+
+    if _y_col == "attractiveness":
+        _y_label = f"가중 매력도 ({_w_t:.0f}/{_w_a:.0f})"
+        _y_fmt = ":.3f"
+        _median_ann = f"매력도 중앙값 {med_y:.3f}"
+    else:
+        _y_label = f"타겟 인구 비중 % ({_age_label})"
+        _y_fmt = ":.2f"
+        _median_ann = f"타겟 비중 중앙값 {med_y:.2f}%"
+
+    _hover_data: dict[str, Any] = {
+        "penetration_rate": ":.3f",
+        _y_col: _y_fmt,
+        "purchase_count": True,
+        "purchase_amount": True,
+        "total_households": True, "total_population": True,
+        "target_population": True,
+        "행동_전략": False,
+    }
+    if "target_density" in df.columns and _y_col != "target_density":
+        _hover_data["target_density"] = ":.2f"
+    if "apt_price_per_m2" in df.columns:
+        _hover_data["apt_price_per_m2"] = ":,.0f"
+        _hover_data["apt_deal_count"] = True
 
     fig = px.scatter(
         df,
         x="penetration_rate",
-        y="target_density",
+        y=_y_col,
         color="행동_전략",
         color_discrete_map=STRATEGY_COLOR,
         category_orders={"행동_전략": STRATEGY_ORDER},
         hover_name="admin_dong_name",
-        hover_data={
-            "penetration_rate": ":.3f", "target_density": ":.2f",
-            "purchase_count": True, "age_30_49_population": True,
-            "행동_전략": False,
-        },
+        hover_data=_hover_data,
         labels={
             "penetration_rate": "우리 매장 침투율 %",
-            "target_density": "타겟 인구 비중 %",
+            _y_col: _y_label,
+            "target_density": f"타겟 인구 비중 % ({_age_label})",
             "행동_전략": "행동 전략",
             "purchase_count": "구매건수",
-            "age_30_49_population": "핵심타겟(30~59)",
+            "purchase_amount": "구매금액 합계",
+            "target_population": f"핵심타겟({_age_label})",
+            "apt_price_per_m2": "아파트 ㎡단가(원)",
+            "apt_deal_count": "실거래 건수",
         },
     )
     fig.add_vline(x=med_p, line_dash="dash", line_color="grey",
                   annotation_text=f"침투율 중앙값 {med_p:.3f}%", annotation_position="top")
-    fig.add_hline(y=med_d, line_dash="dash", line_color="grey",
-                  annotation_text=f"타겟 비중 중앙값 {med_d:.2f}%", annotation_position="right")
+    fig.add_hline(y=med_y, line_dash="dash", line_color="grey",
+                  annotation_text=_median_ann, annotation_position="right")
     fig.update_layout(
         height=360,
         margin={"r": 10, "t": 30, "l": 40, "b": 40},
@@ -2205,26 +3335,27 @@ def _render_quadrant_scatter(df: pd.DataFrame) -> None:
 
 
 def _render_action_top5(df: pd.DataFrame) -> None:
-    """🚨 집중 공략 그룹 중 핵심타겟(30~59세) 인구가 가장 많은 Top 5 를
+    """🚨 집중 공략 그룹 중 핵심 타겟(사용자가 선택한 연령대) 인구가 가장 많은 Top 5 를
     가로 막대로 표시 — 매니저의 즉각적인 마케팅 실행 지침용."""
     import plotly.express as px
 
     if df is None or df.empty or "행동_전략" not in df.columns:
         return
 
+    _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
     _attack = df[df["행동_전략"] == STRATEGY_ATTACK].copy()
-    _attack["age_30_49_population"] = pd.to_numeric(
-        _attack.get("age_30_49_population"), errors="coerce"
+    _attack["target_population"] = pd.to_numeric(
+        _attack.get("target_population"), errors="coerce"
     ).fillna(0).astype(int)
-    _attack = _attack[_attack["age_30_49_population"] > 0]
+    _attack = _attack[_attack["target_population"] > 0]
 
-    st.markdown("#### 당장 마케팅할 Top 5 행정동 · 집중 공략 · 타겟 인구 기준")
+    st.markdown(f"#### 당장 마케팅할 Top 5 행정동 · 집중 공략 · 핵심타겟({_age_label}) 인구 기준")
 
     if _attack.empty:
         st.caption("해당 기간에 '🚨 집중 공략' 지역이 없습니다. 다른 그룹은 매트릭스와 표를 참고하세요.")
         return
 
-    top5 = _attack.nlargest(5, "age_30_49_population").iloc[::-1]  # 가로 막대는 아래→위로 커지도록 역순
+    top5 = _attack.nlargest(5, "target_population").iloc[::-1]  # 가로 막대는 아래→위로 커지도록 역순
     top5["_label"] = top5["admin_dong_name"].fillna("").astype(str)
     if "sigungu_label" in top5.columns:
         top5["_label"] = top5["sigungu_label"].fillna("") + " " + top5["_label"]
@@ -2233,12 +3364,12 @@ def _render_action_top5(df: pd.DataFrame) -> None:
 
     fig = px.bar(
         top5,
-        x="age_30_49_population",
+        x="target_population",
         y="_label",
         orientation="h",
-        text="age_30_49_population",
+        text="target_population",
         custom_data=["hover_perf"],
-        labels={"age_30_49_population": "핵심타겟(30~59) 인구", "_label": ""},
+        labels={"target_population": f"핵심타겟({_age_label}) 인구", "_label": ""},
     )
     fig.update_traces(
         marker_color=STRATEGY_COLOR[STRATEGY_ATTACK],
@@ -2260,18 +3391,39 @@ def _render_table(df: pd.DataFrame) -> None:
     """상세 표 — 행동 전략 순 정렬 (집중 공략 → 핵심 방어 → 잠재 → 보류)."""
     if df is None or df.empty:
         return
+    _age_label = format_selected_age_label(df.attrs.get("selected_age_keys"))
+    _w_t = int(round(float(df.attrs.get("w_target", 100.0))))
+    _w_a = int(round(float(df.attrs.get("w_apt", 0.0))))
     _cols = [
-        "행동_전략", "admin_dong_name", "admin_dong_code", "purchase_count",
-        "total_households", "total_population", "age_30_49_population",
+        "행동_전략", "admin_dong_name", "admin_dong_code", "purchase_count", "purchase_amount",
+        "total_households", "total_population", "target_population",
         "penetration_rate", "target_density",
+        "apt_price_per_m2", "apt_deal_count", "apt_match_level",
+        "attractiveness",
     ]
     if "sigungu_label" in df.columns:
         _cols.insert(2, "sigungu_label")
+    _cols = [c for c in _cols if c in df.columns]
     show = df[_cols].copy()
+    if "purchase_amount" not in show.columns:
+        show["purchase_amount"] = 0
+    show["purchase_amount"] = (
+        pd.to_numeric(show["purchase_amount"], errors="coerce").fillna(0).round(0).astype("int64")
+    )
+    if "apt_price_per_m2" in show.columns:
+        # 원/㎡ → 만원/㎡ 로 환산해 가독성 향상 (테이블 표시용).
+        show["apt_price_per_m2"] = (
+            pd.to_numeric(show["apt_price_per_m2"], errors="coerce").fillna(0) / 10000.0
+        ).round(1)
+    if "apt_match_level" in show.columns:
+        show["apt_match_level"] = show["apt_match_level"].map(
+            {"umd": "법정동 매칭", "sgg_fallback": "시군구 폴백", "": "-"}
+        ).fillna("-")
     _order_idx = {s: i for i, s in enumerate(STRATEGY_ORDER)}
     show["_strategy_ord"] = show["행동_전략"].map(_order_idx).fillna(len(STRATEGY_ORDER))
+    _sort_y = "attractiveness" if "attractiveness" in show.columns else "target_density"
     show = show.sort_values(
-        by=["_strategy_ord", "penetration_rate", "target_density"],
+        by=["_strategy_ord", "penetration_rate", _sort_y],
         ascending=[True, False, False],
     ).drop(columns=["_strategy_ord"])
     show = show.rename(columns={
@@ -2280,10 +3432,644 @@ def _render_table(df: pd.DataFrame) -> None:
         "sigungu_label": "시군구",
         "admin_dong_code": "행정동코드",
         "purchase_count": "구매건수(기간내)",
+        "purchase_amount": "구매금액 합계",
         "total_households": "세대수",
         "total_population": "총인구",
-        "age_30_49_population": "핵심인구(30~59세)",
+        "target_population": f"핵심인구({_age_label})",
         "penetration_rate": "침투율(%)",
         "target_density": "밀집도(%)",
+        "apt_price_per_m2": "아파트 ㎡단가(만원)",
+        "apt_deal_count": "실거래 건수",
+        "apt_match_level": "실거래 매칭",
+        "attractiveness": f"매력도(wT{_w_t}/wA{_w_a})",
     })
     st.dataframe(show, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════
+# PDF 보고서 출력
+# ══════════════════════════════════════════════════════════════════
+
+# PDF 본문용 — 이모지 제거(CID 폰트 미지원)한 짧은 전략 라벨
+_STRATEGY_PDF_LABEL = {
+    STRATEGY_ATTACK: "B · 집중 공략",
+    STRATEGY_DEFEND: "A · 핵심 방어",
+    STRATEGY_LATENT: "C · 잠재 상권",
+    STRATEGY_HOLD: "D · 마케팅 보류",
+    STRATEGY_UNSET: "- · 미분류",
+}
+
+_MPL_KR_FONT_CONFIGURED = False
+_MPL_KR_FONT_PROP = None  # matplotlib.font_manager.FontProperties | None
+_BUNDLED_KR_FONT_PATH = Path(__file__).parent / "data" / "fonts" / "NanumGothic.ttf"
+
+
+def _get_matplotlib_korean_font():
+    """PDF 차트용 한글 FontProperties. 번들 NanumGothic 을 최우선 사용."""
+    global _MPL_KR_FONT_CONFIGURED, _MPL_KR_FONT_PROP
+    if _MPL_KR_FONT_CONFIGURED:
+        return _MPL_KR_FONT_PROP
+    _MPL_KR_FONT_CONFIGURED = True
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib import font_manager, rcParams
+    except Exception as exc:
+        logger.warning("matplotlib 폰트 설정 실패: %s", exc)
+        return None
+
+    # 1) 리포지토리 번들 폰트 (Streamlit Cloud 등 OS 한글 폰트 없는 환경 대응)
+    path_candidates = [
+        _BUNDLED_KR_FONT_PATH,
+        Path("C:/Windows/Fonts/malgun.ttf"),
+        Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+        Path("/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    ]
+    font_path: Path | None = None
+    for fp in path_candidates:
+        if fp.exists():
+            font_path = fp
+            break
+
+    chosen_name = None
+    if font_path is not None:
+        try:
+            font_manager.fontManager.addfont(str(font_path))
+            _MPL_KR_FONT_PROP = font_manager.FontProperties(fname=str(font_path))
+            chosen_name = _MPL_KR_FONT_PROP.get_name()
+        except Exception as exc:
+            logger.warning("폰트 파일 등록 실패 %s: %s", font_path, exc)
+            _MPL_KR_FONT_PROP = None
+
+    # 2) 시스템 설치 폰트 이름 폴백
+    if _MPL_KR_FONT_PROP is None:
+        name_candidates = [
+            "Malgun Gothic", "AppleGothic", "NanumGothic", "NanumBarunGothic",
+            "Noto Sans CJK KR", "Noto Sans KR", "UnDotum",
+        ]
+        available = {f.name for f in font_manager.fontManager.ttflist}
+        chosen_name = next((n for n in name_candidates if n in available), None)
+        if chosen_name:
+            _MPL_KR_FONT_PROP = font_manager.FontProperties(family=chosen_name)
+
+    if chosen_name:
+        # sans-serif 최상단에 넣어 tick/legend 기본값에도 적용
+        rcParams["font.family"] = "sans-serif"
+        prev = list(rcParams.get("font.sans-serif") or [])
+        rcParams["font.sans-serif"] = [chosen_name] + [x for x in prev if x != chosen_name]
+        rcParams["axes.unicode_minus"] = False
+        logger.info("matplotlib 한글 폰트: %s (path=%s)", chosen_name, font_path)
+    else:
+        logger.warning(
+            "한글 matplotlib 폰트를 찾지 못했습니다. data/fonts/NanumGothic.ttf 번들을 확인하세요."
+        )
+    return _MPL_KR_FONT_PROP
+
+
+def _configure_matplotlib_korean_font() -> None:
+    """하위 호환 — PDF PNG 빌더에서 호출."""
+    _get_matplotlib_korean_font()
+
+
+def _apply_korean_font_to_axes(ax, fp=None) -> None:
+    """축 제목·라벨·틱·범례에 한글 FontProperties 를 강제 적용."""
+    if fp is None:
+        fp = _get_matplotlib_korean_font()
+    if fp is None:
+        return
+    try:
+        ax.title.set_fontproperties(fp)
+        ax.xaxis.label.set_fontproperties(fp)
+        ax.yaxis.label.set_fontproperties(fp)
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontproperties(fp)
+        legend = ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_fontproperties(fp)
+            if legend.get_title() is not None:
+                legend.get_title().set_fontproperties(fp)
+    except Exception as exc:
+        logger.warning("축 한글 폰트 적용 실패: %s", exc)
+
+
+def _pdf_safe_text(s: Any) -> str:
+    """reportlab CID 폰트에서 문제 되는 이모지·제어문자를 제거."""
+    text = "" if s is None else str(s)
+    text = re.sub(r"[\U00010000-\U0010ffff]", "", text)
+    text = re.sub(r"[\u2600-\u27bf\u2300-\u23ff\u2b00-\u2bff\ufe0f]", "", text)
+    return text.strip()
+
+
+def _match_kpi_to_geojson(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """kpi_df 를 GeoJSON 키(adm_cd2 우선, adm_cd 폴백)로 조인할 준비.
+    반환: (조인키 컬럼 `_join` 이 붙은 df, featureidkey 접미 'adm_cd2'|'adm_cd')."""
+    geojson = load_admdong_geojson()
+    idx = build_geojson_index(geojson)
+    df_map = df.copy()
+    df_map["_key10"] = df_map["admin_dong_code"].astype(str)
+    df_map["_key8"] = df_map["_key10"].str[:8]
+    if df_map["_key10"].isin(set(idx["adm_cd2"])).any():
+        out = df_map[df_map["_key10"].isin(set(idx["adm_cd2"]))].copy()
+        out["_join"] = out["_key10"]
+        return out, "adm_cd2"
+    out = df_map[df_map["_key8"].isin(set(idx["adm_cd"]))].copy()
+    out["_join"] = out["_key8"]
+    return out, "adm_cd"
+
+
+def _build_strategy_map_png(df: pd.DataFrame) -> bytes | None:
+    """행동 전략 색으로 행정동 폴리곤을 채운 정적 지도 PNG."""
+    try:
+        fp = _get_matplotlib_korean_font()
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning("matplotlib 로드 실패 — PDF 지도 생략: %s", exc)
+        return None
+
+    geojson = load_admdong_geojson()
+    primary, join_key = _match_kpi_to_geojson(df)
+    if primary.empty or not geojson.get("features"):
+        return None
+
+    color_by_join = {
+        str(r["_join"]): STRATEGY_COLOR.get(r.get("행동_전략"), STRATEGY_COLOR[STRATEGY_UNSET])
+        for _, r in primary.iterrows()
+    }
+    name_by_join = {
+        str(r["_join"]): str(r.get("admin_dong_name") or "")
+        for _, r in primary.iterrows()
+    }
+
+    fig, ax = plt.subplots(figsize=(10.5, 8.2), dpi=140)
+    xs_all: list[float] = []
+    ys_all: list[float] = []
+    for feat in geojson.get("features") or []:
+        props = feat.get("properties") or {}
+        key = str(props.get(join_key) or "").strip()
+        if key not in color_by_join:
+            continue
+        geom = feat.get("geometry") or {}
+        gtype = geom.get("type")
+        coords = geom.get("coordinates") or []
+        polys = [coords] if gtype == "Polygon" else (coords if gtype == "MultiPolygon" else [])
+        for poly in polys:
+            if not poly:
+                continue
+            ring = poly[0]
+            xs = [float(p[0]) for p in ring]
+            ys = [float(p[1]) for p in ring]
+            xs_all.extend(xs)
+            ys_all.extend(ys)
+            ax.fill(xs, ys, facecolor=color_by_join[key], edgecolor="#ffffff",
+                    linewidth=0.35, alpha=0.82, zorder=2)
+            # 동 이름은 선택 동이 적을 때만 라벨 (가독성)
+            if len(color_by_join) <= 40 and key in name_by_join:
+                ax.text(
+                    sum(xs) / len(xs), sum(ys) / len(ys),
+                    name_by_join[key], fontsize=5.5, ha="center", va="center",
+                    color="#222222", zorder=3,
+                    fontproperties=fp,
+                )
+
+    if not xs_all:
+        plt.close(fig)
+        return None
+
+    pad_x = (max(xs_all) - min(xs_all)) * 0.05 + 0.002
+    pad_y = (max(ys_all) - min(ys_all)) * 0.05 + 0.002
+    ax.set_xlim(min(xs_all) - pad_x, max(xs_all) + pad_x)
+    ax.set_ylim(min(ys_all) - pad_y, max(ys_all) + pad_y)
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    ax.set_title("상권 전략 지도", fontsize=12, pad=8, fontproperties=fp)
+
+    from matplotlib.patches import Patch
+    legend_items = [
+        (STRATEGY_ATTACK, _STRATEGY_PDF_LABEL[STRATEGY_ATTACK]),
+        (STRATEGY_DEFEND, _STRATEGY_PDF_LABEL[STRATEGY_DEFEND]),
+        (STRATEGY_LATENT, _STRATEGY_PDF_LABEL[STRATEGY_LATENT]),
+        (STRATEGY_HOLD, _STRATEGY_PDF_LABEL[STRATEGY_HOLD]),
+    ]
+    handles = [
+        Patch(facecolor=STRATEGY_COLOR[s], edgecolor="#888", label=lab)
+        for s, lab in legend_items
+    ]
+    ax.legend(handles=handles, loc="lower left", framealpha=0.92, fontsize=8, prop=fp)
+    _apply_korean_font_to_axes(ax, fp)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _build_quadrant_scatter_png(df: pd.DataFrame) -> bytes | None:
+    """2x2 매트릭스 산점도 PNG."""
+    try:
+        fp = _get_matplotlib_korean_font()
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning("matplotlib 로드 실패 — PDF 산점도 생략: %s", exc)
+        return None
+    if df is None or df.empty:
+        return None
+
+    med_p = float(df.attrs.get("median_penetration", 0.0) or 0.0)
+    med_d = float(df.attrs.get("median_target_density", 0.0) or 0.0)
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.2), dpi=140)
+    for strat in STRATEGY_ORDER:
+        sub = df[df["행동_전략"] == strat]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["penetration_rate"], sub["target_density"],
+            c=STRATEGY_COLOR.get(strat, "#999"),
+            s=42, alpha=0.85, edgecolors="#ffffff", linewidths=0.4,
+            label=_STRATEGY_PDF_LABEL.get(strat, strat),
+            zorder=3,
+        )
+    ax.axvline(med_p, color="#888888", linestyle="--", linewidth=1, zorder=2)
+    ax.axhline(med_d, color="#888888", linestyle="--", linewidth=1, zorder=2)
+    ax.set_xlabel("침투율 %", fontproperties=fp)
+    ax.set_ylabel("타겟 밀집도 %", fontproperties=fp)
+    ax.set_title("2×2 매트릭스", fontproperties=fp)
+    ax.grid(True, color="#eeeeee", linewidth=0.6)
+    ax.legend(fontsize=7, loc="best", framealpha=0.9, prop=fp)
+    _apply_korean_font_to_axes(ax, fp)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _build_top5_bar_png(df: pd.DataFrame) -> bytes | None:
+    """집중 공략 Top 5 가로 막대 PNG."""
+    try:
+        fp = _get_matplotlib_korean_font()
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        logger.warning("matplotlib 로드 실패 — PDF Top5 생략: %s", exc)
+        return None
+    if df is None or df.empty or "행동_전략" not in df.columns:
+        return None
+
+    attack = df[df["행동_전략"] == STRATEGY_ATTACK].copy()
+    attack["target_population"] = pd.to_numeric(
+        attack.get("target_population"), errors="coerce"
+    ).fillna(0)
+    attack = attack[attack["target_population"] > 0]
+    if attack.empty:
+        return None
+    top5 = attack.nlargest(5, "target_population").iloc[::-1]
+    labels = top5["admin_dong_name"].fillna("").astype(str).tolist()
+    values = top5["target_population"].astype(float).tolist()
+
+    fig, ax = plt.subplots(figsize=(7.5, 3.6), dpi=140)
+    ax.barh(labels, values, color=STRATEGY_COLOR[STRATEGY_ATTACK], height=0.6)
+    for i, v in enumerate(values):
+        ax.text(v, i, f"  {int(v):,}", va="center", fontsize=8, color="#333",
+                fontproperties=fp)
+    ax.set_xlabel("핵심타겟 인구", fontproperties=fp)
+    ax.set_title("집중 공략 Top 5 (B)", fontproperties=fp)
+    ax.grid(True, axis="x", color="#eeeeee", linewidth=0.6)
+    ax.set_axisbelow(True)
+    _apply_korean_font_to_axes(ax, fp)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_dong_commercial_pdf(
+    kpi_df: pd.DataFrame,
+    *,
+    store_names: list[str],
+    start_date: str,
+    end_date: str,
+    yyyymm: str,
+    age_label: str,
+    weights: tuple[int, int] | None = None,
+) -> bytes:
+    """상권 퍼포먼스 맵 렌더 결과 PDF 바이트를 생성한다."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.platypus import (
+        Image,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    if "HYSMyeongJo-Medium" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
+    if "HYGothic-Medium" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+
+    page = landscape(A4)
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=page,
+        leftMargin=12 * mm, rightMargin=12 * mm,
+        topMargin=12 * mm, bottomMargin=12 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "DcmTitle", parent=styles["Title"],
+        fontName="HYGothic-Medium", fontSize=18, leading=24,
+        alignment=TA_CENTER, spaceAfter=6,
+    )
+    h_style = ParagraphStyle(
+        "DcmH", parent=styles["Heading2"],
+        fontName="HYGothic-Medium", fontSize=12, leading=16,
+        spaceBefore=8, spaceAfter=4,
+    )
+    body_style = ParagraphStyle(
+        "DcmBody", parent=styles["Normal"],
+        fontName="HYSMyeongJo-Medium", fontSize=9, leading=13,
+        alignment=TA_LEFT,
+    )
+    small_style = ParagraphStyle(
+        "DcmSmall", parent=styles["Normal"],
+        fontName="HYSMyeongJo-Medium", fontSize=8, leading=11,
+        textColor=colors.HexColor("#555555"),
+    )
+    cell_style = ParagraphStyle(
+        "DcmCell", parent=styles["Normal"],
+        fontName="HYSMyeongJo-Medium", fontSize=7.5, leading=9.5,
+    )
+
+    story: list[Any] = []
+    story.append(Paragraph(_pdf_safe_text("동 단위 상권 퍼포먼스 맵 보고서"), title_style))
+    _wt = int(weights[0]) if weights else int(round(float(kpi_df.attrs.get("w_target", 100.0)) if kpi_df is not None else 100))
+    _wa = int(weights[1]) if weights else int(round(float(kpi_df.attrs.get("w_apt", 0.0)) if kpi_df is not None else 0))
+    story.append(Paragraph(
+        _pdf_safe_text(
+            f"매장: {', '.join(store_names) or '-'}  |  "
+            f"분석기간: {start_date} ~ {end_date}  |  "
+            f"인구기준월: {yyyymm}  |  "
+            f"핵심타겟: {age_label}  |  "
+            f"가중치 wT/wA: {_wt}/{_wa}"
+        ),
+        body_style,
+    ))
+    story.append(Spacer(1, 4 * mm))
+
+    # 요약 KPI
+    _total_dong = len(kpi_df) if kpi_df is not None else 0
+    _total_orders = int(kpi_df["purchase_count"].sum()) if _total_dong else 0
+    _total_amount = (
+        int(pd.to_numeric(kpi_df.get("purchase_amount"), errors="coerce").fillna(0).sum())
+        if _total_dong else 0
+    )
+    _med_p = float(kpi_df.attrs.get("median_penetration", 0.0) or 0.0) if _total_dong else 0.0
+    _med_y = float(kpi_df.attrs.get("median_y_axis", kpi_df.attrs.get("median_target_density", 0.0)) or 0.0) if _total_dong else 0.0
+    _y_is_attr = (kpi_df.attrs.get("quadrant_y_col") == "attractiveness") if _total_dong else False
+    _apt_med = float(
+        pd.to_numeric(kpi_df.get("apt_price_per_m2"), errors="coerce").fillna(0).median()
+    ) if _total_dong and "apt_price_per_m2" in kpi_df.columns else 0.0
+    strat_counts = (
+        kpi_df["행동_전략"].value_counts().to_dict()
+        if _total_dong and "행동_전략" in kpi_df.columns else {}
+    )
+    _y_label = "매력도 중앙값" if _y_is_attr else "밀집도 중앙값"
+    _y_val = f"{_med_y:.3f}" if _y_is_attr else f"{_med_y:.2f}%"
+    _apt_val = f"{_apt_med/10000:,.1f} 만원/㎡" if _apt_med > 0 else "실거래 없음"
+    summary_rows = [
+        ["대상 행정동", f"{_total_dong:,}", "총 구매건수", f"{_total_orders:,}"],
+        ["구매금액 합계", f"{_total_amount:,} 원", "인구기준월", str(yyyymm)],
+        ["침투율 중앙값", f"{_med_p:.3f}%", _y_label, _y_val],
+        ["아파트 ㎡단가 중앙값", _apt_val, "가중치 (wT/wA)", f"{_wt}/{_wa}"],
+        [
+            _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_ATTACK]),
+            str(strat_counts.get(STRATEGY_ATTACK, 0)),
+            _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_DEFEND]),
+            str(strat_counts.get(STRATEGY_DEFEND, 0)),
+        ],
+        [
+            _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_LATENT]),
+            str(strat_counts.get(STRATEGY_LATENT, 0)),
+            _pdf_safe_text(_STRATEGY_PDF_LABEL[STRATEGY_HOLD]),
+            str(strat_counts.get(STRATEGY_HOLD, 0)),
+        ],
+    ]
+    summary_tbl = Table(summary_rows, colWidths=[45 * mm, 30 * mm, 45 * mm, 30 * mm])
+    summary_tbl.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "HYSMyeongJo-Medium"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F5F5F5")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#F5F5F5")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CCCCCC")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(summary_tbl)
+    story.append(Spacer(1, 3 * mm))
+    story.append(Paragraph(
+        _pdf_safe_text(
+            "행동 전략 — B 집중공략: 타겟 많음·구매 적음(마케팅 시급) / "
+            "A 핵심방어: 구매·타겟 모두 많음(VIP) / "
+            "C 잠재상권: 구매 많음·타겟 비중 낮음 / "
+            "D 보류: 구매·타겟 모두 낮음"
+        ),
+        small_style,
+    ))
+
+    # 지도
+    story.append(Paragraph(_pdf_safe_text("1. 상권 전략 지도"), h_style))
+    map_png = _build_strategy_map_png(kpi_df)
+    if map_png:
+        story.append(Image(io.BytesIO(map_png), width=250 * mm, height=155 * mm, kind="proportional"))
+    else:
+        story.append(Paragraph(_pdf_safe_text("(지도 이미지를 생성하지 못했습니다)"), body_style))
+
+    story.append(PageBreak())
+
+    # 2x2 + Top5
+    story.append(Paragraph(_pdf_safe_text("2. 2×2 매트릭스 · 집중 공략 Top 5"), h_style))
+    q_png = _build_quadrant_scatter_png(kpi_df)
+    t_png = _build_top5_bar_png(kpi_df)
+    chart_row: list[Any] = []
+    if q_png:
+        chart_row.append(Image(io.BytesIO(q_png), width=120 * mm, height=100 * mm, kind="proportional"))
+    if t_png:
+        chart_row.append(Image(io.BytesIO(t_png), width=130 * mm, height=70 * mm, kind="proportional"))
+    if chart_row:
+        if len(chart_row) == 2:
+            charts = Table([chart_row], colWidths=[125 * mm, 140 * mm])
+            charts.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            story.append(charts)
+        else:
+            story.append(chart_row[0])
+    else:
+        story.append(Paragraph(_pdf_safe_text("(차트 이미지를 생성하지 못했습니다)"), body_style))
+
+    story.append(PageBreak())
+
+    # 상세 표
+    story.append(Paragraph(_pdf_safe_text("3. 행정동별 상세 지표"), h_style))
+    if kpi_df is None or kpi_df.empty:
+        story.append(Paragraph(_pdf_safe_text("(데이터 없음)"), body_style))
+    else:
+        show = kpi_df.copy()
+        _order_idx = {s: i for i, s in enumerate(STRATEGY_ORDER)}
+        show["_ord"] = show["행동_전략"].map(_order_idx).fillna(len(STRATEGY_ORDER))
+        _sort_y = "attractiveness" if "attractiveness" in show.columns else "target_density"
+        show = show.sort_values(
+            by=["_ord", "penetration_rate", _sort_y],
+            ascending=[True, False, False],
+        )
+        _has_apt = "apt_price_per_m2" in show.columns
+        _has_attr = "attractiveness" in show.columns
+        header = [
+            "전략", "시군구", "행정동", "구매건수", "구매금액", "세대", "총인구",
+            f"핵심({_pdf_safe_text(age_label)})", "침투%", "밀집%",
+        ]
+        if _has_apt:
+            header.append("실거래㎡(만원)")
+        if _has_attr:
+            header.append(f"매력도(wT{_wt}/wA{_wa})")
+        rows: list[list[Any]] = [[Paragraph(_pdf_safe_text(h), cell_style) for h in header]]
+        for _, r in show.iterrows():
+            row_cells = [
+                Paragraph(_pdf_safe_text(_STRATEGY_PDF_LABEL.get(r.get("행동_전략"), r.get("행동_전략"))), cell_style),
+                Paragraph(_pdf_safe_text(r.get("sigungu_label", "")), cell_style),
+                Paragraph(_pdf_safe_text(r.get("admin_dong_name", "")), cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('purchase_count'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('purchase_amount'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('total_households'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('total_population'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{int(pd.to_numeric(r.get('target_population'), errors='coerce') or 0):,}", cell_style),
+                Paragraph(f"{float(pd.to_numeric(r.get('penetration_rate'), errors='coerce') or 0):.3f}", cell_style),
+                Paragraph(f"{float(pd.to_numeric(r.get('target_density'), errors='coerce') or 0):.2f}", cell_style),
+            ]
+            if _has_apt:
+                _p = float(pd.to_numeric(r.get("apt_price_per_m2"), errors="coerce") or 0)
+                _mlvl = str(r.get("apt_match_level") or "")
+                _lvl_kor = {"umd": "동", "sgg_fallback": "구"}.get(_mlvl, "-")
+                row_cells.append(Paragraph(
+                    _pdf_safe_text(f"{_p/10000:.1f} ({_lvl_kor})" if _p > 0 else "-"),
+                    cell_style,
+                ))
+            if _has_attr:
+                row_cells.append(Paragraph(
+                    f"{float(pd.to_numeric(r.get('attractiveness'), errors='coerce') or 0):.3f}",
+                    cell_style,
+                ))
+            rows.append(row_cells)
+        col_w = [22 * mm, 26 * mm, 22 * mm, 14 * mm, 20 * mm, 16 * mm, 16 * mm, 20 * mm, 14 * mm, 14 * mm]
+        if _has_apt:
+            col_w.append(22 * mm)
+        if _has_attr:
+            col_w.append(18 * mm)
+        detail = Table(rows, colWidths=col_w, repeatRows=1)
+        detail.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), "HYSMyeongJo-Medium"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#37474F")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0BEC5")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FAFAFA")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 2),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(detail)
+
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph(
+        _pdf_safe_text(
+            f"생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+            "본 보고서는 상권 퍼포먼스 맵 화면의 현재 선택(매장·기간·행정동·연령대) 기준입니다."
+        ),
+        small_style,
+    ))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _render_pdf_export_panel(
+    kpi_df: pd.DataFrame,
+    *,
+    store_names: list[str],
+    start_date: str,
+    end_date: str,
+    yyyymm: str,
+    age_keys: list[str],
+    cache_key: Any,
+    weights: tuple[int, int] | None = None,
+) -> None:
+    """렌더 결과 하단 — PDF 생성·다운로드 패널."""
+    st.divider()
+    st.markdown("### 📄 PDF 보고서")
+    st.caption(
+        "현재 화면에 렌더된 상권 전략 지도 · 2×2 매트릭스 · 집중 공략 Top 5 · "
+        "행정동별 상세 표(실거래 ㎡단가·가중 매력도 포함)를 PDF로 저장합니다."
+    )
+    _pdf_state_key = (cache_key, tuple(age_keys), yyyymm, tuple(weights or ()))
+    if st.session_state.get("dcm_pdf_state_key") != _pdf_state_key:
+        st.session_state.pop("dcm_pdf_bytes", None)
+        st.session_state.pop("dcm_pdf_filename", None)
+        st.session_state["dcm_pdf_state_key"] = _pdf_state_key
+
+    _age_label = format_selected_age_label(age_keys)
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("📄 PDF 보고서 생성", type="secondary", key="dcm_pdf_gen_btn"):
+            try:
+                with st.spinner("PDF 생성 중… (지도·차트 렌더링)"):
+                    pdf_bytes = build_dong_commercial_pdf(
+                        kpi_df,
+                        store_names=list(store_names or []),
+                        start_date=start_date,
+                        end_date=end_date,
+                        yyyymm=yyyymm,
+                        age_label=_age_label,
+                        weights=weights,
+                    )
+                st.session_state["dcm_pdf_bytes"] = pdf_bytes
+                st.session_state["dcm_pdf_filename"] = (
+                    f"dong_commercial_map_{start_date}_{end_date}.pdf"
+                )
+                st.success(f"PDF 생성 완료 ({len(pdf_bytes):,} bytes)")
+            except Exception as exc:
+                logger.exception("상권 맵 PDF 생성 실패")
+                st.error(f"PDF 생성 실패: {exc}")
+
+    _pdf = st.session_state.get("dcm_pdf_bytes")
+    if _pdf:
+        with c2:
+            st.download_button(
+                "⬇️ PDF 다운로드",
+                data=_pdf,
+                file_name=st.session_state.get(
+                    "dcm_pdf_filename", "dong_commercial_map.pdf"
+                ),
+                mime="application/pdf",
+                key="dcm_pdf_download_btn",
+            )
