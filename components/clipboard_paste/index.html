@@ -7,48 +7,24 @@
   html, body {
     margin: 0;
     padding: 0;
-    background: #ffffff;
+    background: transparent;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", "맑은 고딕", sans-serif;
-    min-height: 88px;
   }
-  .cp-wrap { padding: 0; }
-  .cp-bar {
-    padding: 14px 14px;
-    border: 2px dashed #4a6cf7;
-    border-radius: 8px;
-    background: #eef4ff;
-    color: #1a237e;
-    font-size: 14px;
-    line-height: 1.45;
-    cursor: pointer;
-    outline: none;
-    user-select: none;
-    white-space: normal;
-    min-height: 24px;
-    font-weight: 600;
+  #status {
+    color: #546e7a;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 2px 0;
+    min-height: 16px;
   }
-  .cp-bar:focus, .cp-bar.focused {
-    border-color: #1a237e;
-    background: #dce7ff;
-    box-shadow: 0 0 0 3px rgba(74, 108, 247, 0.18);
-  }
-  .cp-status { color: #546e7a; font-size: 12px; margin-top: 6px; padding: 0 2px; font-weight: 400; }
-  .cp-status.ok { color: #1b7f4b; }
-  .cp-status.err { color: #b3261e; }
+  #status.ok { color: #1b7f4b; }
+  #status.err { color: #b3261e; }
 </style>
 </head>
 <body>
-<div class="cp-wrap">
-  <div id="bar" class="cp-bar" tabindex="0" contenteditable="true" spellcheck="false"
-       role="textbox" aria-label="클립보드 이미지 붙여넣기">
-    이미지를 복사한 뒤 이 칸을 클릭하고 Ctrl+V
-  </div>
-  <div id="status" class="cp-status">클립보드의 이미지만 첨부됩니다. 텍스트 붙여넣기는 그대로 입력됩니다.</div>
-</div>
+<div id="status">이 화면에서 Ctrl+V 하면 이미지가 바로 첨부됩니다.</div>
 <script>
 (function () {
-  var PROMPT_HTML = "이미지를 복사한 뒤 이 칸을 클릭하고 Ctrl+V";
-  var bar = document.getElementById("bar");
   var status = document.getElementById("status");
   var myKey = "";
   var lastSentId = "";
@@ -59,8 +35,7 @@
   }
   function sendReady() { post("streamlit:componentReady", { apiVersion: 1 }); }
   function sendHeight(h) {
-    var height = h || Math.max(88, Math.ceil(document.body.scrollHeight) + 8);
-    post("streamlit:setFrameHeight", { height: height });
+    post("streamlit:setFrameHeight", { height: h || 28 });
   }
   function sendValue(v) {
     post("streamlit:setComponentValue", { value: v, dataType: "json" });
@@ -87,122 +62,101 @@
   }
   function rand(n) { return Math.random().toString(36).slice(2, 2 + (n || 6)); }
 
-  function armThis() {
-    try {
-      if (myKey) window.parent.__emonsPasteActive = myKey;
-    } catch (e) {}
-    bar.classList.add("focused");
-    status.textContent = "이 칸이 활성화되었습니다. 이제 Ctrl+V 로 붙여넣어 주세요.";
-    status.className = "cp-status";
-  }
-
-  function disarmBar() {
-    bar.classList.remove("focused");
-  }
-
-  async function handleClipboard(e, fromParent) {
-    var cd = e.clipboardData || (window.clipboardData) || null;
-    var items = (cd && cd.items) ? cd.items : [];
-    var found = null;
-    for (var i = 0; i < items.length; i++) {
-      var it = items[i];
-      if (it && it.kind === "file" && it.type && it.type.indexOf("image/") === 0) {
-        var blob = it.getAsFile();
-        if (!blob) continue;
-        try {
-          var b64 = await blobToBase64(blob);
-          var mime = it.type;
-          var ext = (mime.split("/")[1] || "png").split("+")[0].replace(/[^a-z0-9]/gi, "") || "png";
-          var name = "paste_" + tsStr() + "_" + rand(4) + "." + ext;
-          found = {
-            id: Date.now() + "_" + rand(8),
-            name: name,
-            mime: mime,
-            size: blob.size,
-            b64: b64
-          };
-        } catch (err) {}
-        break;
+  function pickImageBlob(cd) {
+    if (!cd) return null;
+    var items = cd.items;
+    if (items) {
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (it && it.kind === "file" && it.type && it.type.indexOf("image/") === 0) {
+          var blob = it.getAsFile();
+          if (blob) return blob;
+        }
       }
     }
-    if (!found) {
-      if (!fromParent) {
-        status.textContent = "클립보드에 이미지가 없습니다. 이미지를 먼저 복사해 주세요.";
-        status.className = "cp-status err";
-        if (e && e.preventDefault) e.preventDefault();
-        bar.innerHTML = PROMPT_HTML;
-        sendHeight();
+    var files = cd.files;
+    if (files) {
+      for (var j = 0; j < files.length; j++) {
+        if (files[j] && files[j].type && files[j].type.indexOf("image/") === 0) {
+          return files[j];
+        }
       }
+    }
+    return null;
+  }
+
+  async function ingestBlob(blob, ev) {
+    if (!blob) return false;
+    if (ev && ev.preventDefault) ev.preventDefault();
+    if (ev && ev.stopPropagation) ev.stopPropagation();
+    try {
+      var b64 = await blobToBase64(blob);
+      if (!b64) return false;
+      var mime = blob.type || "image/png";
+      var ext = (mime.split("/")[1] || "png").split("+")[0].replace(/[^a-z0-9]/gi, "") || "png";
+      var found = {
+        id: Date.now() + "_" + rand(8),
+        name: "paste_" + tsStr() + "_" + rand(4) + "." + ext,
+        mime: mime,
+        size: blob.size,
+        b64: b64
+      };
+      if (found.id === lastSentId) return true;
+      lastSentId = found.id;
+      status.textContent = "이미지 붙여넣기 완료 · " + found.name;
+      status.className = "ok";
+      sendValue(found);
+      sendHeight(28);
+      return true;
+    } catch (err) {
+      status.textContent = "이미지 붙여넣기에 실패했습니다.";
+      status.className = "err";
       return false;
     }
-    if (e && e.preventDefault) e.preventDefault();
-    if (found.id === lastSentId) return true;
-    lastSentId = found.id;
-    bar.innerHTML = PROMPT_HTML;
-    status.textContent = "이미지 붙여넣기 완료 · " + found.name
-      + " (" + Math.max(1, Math.round(found.size / 1024)) + " KB)";
-    status.className = "cp-status ok";
-    sendValue(found);
-    setTimeout(sendHeight, 30);
-    return true;
   }
 
-  bar.addEventListener("click", function () { bar.focus(); armThis(); });
-  bar.addEventListener("focus", armThis);
-  bar.addEventListener("blur", disarmBar);
-
-  bar.addEventListener("paste", function (e) {
-    handleClipboard(e, false);
-  });
-
-  bar.addEventListener("keydown", function (e) {
-    var isPaste = (e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V");
-    if (!isPaste) e.preventDefault();
-  });
-  bar.addEventListener("beforeinput", function (e) {
-    if (e.inputType && e.inputType !== "insertFromPaste") e.preventDefault();
-  });
-  bar.addEventListener("drop", function (e) { e.preventDefault(); });
-
-  function onParentPaste(e) {
+  function onPaste(ev) {
     try {
       if (window.parent.__emonsPasteActive !== myKey) return;
-    } catch (err) { return; }
-    handleClipboard(e, true);
+    } catch (e) { return; }
+    var blob = pickImageBlob(ev.clipboardData || window.clipboardData);
+    if (!blob) return;
+    ingestBlob(blob, ev);
   }
 
   function attachParentPaste() {
     try {
-      var doc = window.parent.document;
-      if (doc && !doc.__emonsPasteBound) {
+      var w = window.parent;
+      var doc = w.document;
+      w.__emonsPasteActive = myKey;
+      doc.__emonsPasteHandlers = doc.__emonsPasteHandlers || {};
+      if (myKey) doc.__emonsPasteHandlers[myKey] = onPaste;
+      if (!doc.__emonsPasteBound) {
         doc.addEventListener("paste", function (ev) {
-          var active = window.parent.__emonsPasteActive;
-          if (!active) return;
-          var items = (ev.clipboardData && ev.clipboardData.items) ? ev.clipboardData.items : [];
-          var hasImg = false;
-          for (var i = 0; i < items.length; i++) {
-            if (items[i] && items[i].kind === "file" && items[i].type && items[i].type.indexOf("image/") === 0) {
-              hasImg = true;
-              break;
-            }
-          }
-          if (!hasImg) return;
-          if (typeof doc.__emonsPasteDispatch === "function") {
-            doc.__emonsPasteDispatch(ev);
-          }
-        });
+          var blob = pickImageBlob(ev.clipboardData || w.clipboardData);
+          if (!blob) return;
+          var k = w.__emonsPasteActive;
+          var h = (doc.__emonsPasteHandlers || {})[k];
+          if (typeof h === "function") h(ev);
+        }, true);
         doc.__emonsPasteBound = true;
       }
-      doc.__emonsPasteHandlers = doc.__emonsPasteHandlers || {};
-      if (myKey) doc.__emonsPasteHandlers[myKey] = onParentPaste;
-      doc.__emonsPasteDispatch = function (ev) {
-        var k = window.parent.__emonsPasteActive;
-        var h = (doc.__emonsPasteHandlers || {})[k];
-        if (typeof h === "function") h(ev);
-      };
-      if (myKey && !window.parent.__emonsPasteActive) {
-        window.parent.__emonsPasteActive = myKey;
-      }
+    } catch (e) {
+      status.textContent = "창 붙여넣기를 연결하지 못했습니다. 새로고침 후 다시 시도해 주세요.";
+      status.className = "err";
+    }
+  }
+
+  function pollParentPaste() {
+    try {
+      var p = window.parent.__emonsLastPaste;
+      if (!p || !p.b64 || !p.id) return;
+      if (p.id === lastSentId) return;
+      if (p.key && myKey && p.key !== myKey) return;
+      lastSentId = p.id;
+      status.textContent = "이미지 붙여넣기 완료 · " + p.name;
+      status.className = "ok";
+      sendValue(p);
     } catch (e) {}
   }
 
@@ -212,13 +166,14 @@
     var args = data.args || {};
     myKey = String(args.paste_key || args.key || myKey || "");
     attachParentPaste();
-    sendHeight(88);
+    sendHeight(28);
   });
 
   sendReady();
-  sendHeight(88);
-  setTimeout(function () { sendHeight(88); }, 50);
-  setTimeout(function () { sendHeight(88); }, 300);
+  sendHeight(28);
+  setInterval(pollParentPaste, 250);
+  setTimeout(function () { sendHeight(28); attachParentPaste(); }, 50);
+  setTimeout(function () { sendHeight(28); }, 300);
 })();
 </script>
 </body>

@@ -22587,6 +22587,81 @@ def _paste_mime_ext_ok(mime: str, allow_types: list | None) -> bool:
     return ext in allowed
 
 
+def _inject_window_paste_listener(paste_key: str) -> None:
+    """부모 창(document)에 이미지 Ctrl+V 리스너를 1회 설치.
+    커스텀 컴포넌트 iframe이 부모에 접근하지 못하는 환경에서도 동작하도록
+    기존 auth 주입과 같은 components.html(window.parent) 경로를 사용한다.
+    """
+    safe_key = json.dumps(str(paste_key))
+    components.html(
+        f"""
+        <script>
+        (function(){{
+            var PASTE_KEY = {safe_key};
+            function pickImage(cd) {{
+                if (!cd) return null;
+                if (cd.items) {{
+                    for (var i = 0; i < cd.items.length; i++) {{
+                        var it = cd.items[i];
+                        if (it && it.kind === "file" && it.type && it.type.indexOf("image/") === 0) {{
+                            var b = it.getAsFile();
+                            if (b) return b;
+                        }}
+                    }}
+                }}
+                if (cd.files) {{
+                    for (var j = 0; j < cd.files.length; j++) {{
+                        if (cd.files[j] && cd.files[j].type && cd.files[j].type.indexOf("image/") === 0) {{
+                            return cd.files[j];
+                        }}
+                    }}
+                }}
+                return null;
+            }}
+            function pad2(n) {{ return String(n).padStart(2, "0"); }}
+            function tsStr() {{
+                var d = new Date();
+                return "" + d.getFullYear() + pad2(d.getMonth()+1) + pad2(d.getDate())
+                    + "_" + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+            }}
+            function rand(n) {{ return Math.random().toString(36).slice(2, 2+(n||6)); }}
+            try {{
+                var w = window.parent;
+                var doc = w.document;
+                w.__emonsPasteActive = PASTE_KEY;
+                if (doc.__emonsWindowPasteBound) return;
+                doc.addEventListener("paste", function(ev) {{
+                    var blob = pickImage(ev.clipboardData || w.clipboardData);
+                    if (!blob) return;
+                    ev.preventDefault();
+                    var r = new FileReader();
+                    r.onload = function() {{
+                        var s = String(r.result || "");
+                        var idx = s.indexOf(",");
+                        var b64 = idx >= 0 ? s.substring(idx+1) : "";
+                        if (!b64) return;
+                        var mime = blob.type || "image/png";
+                        var ext = (mime.split("/")[1] || "png").split("+")[0].replace(/[^a-z0-9]/gi, "") || "png";
+                        w.__emonsLastPaste = {{
+                            id: Date.now() + "_" + rand(8),
+                            name: "paste_" + tsStr() + "_" + rand(4) + "." + ext,
+                            mime: mime,
+                            size: blob.size,
+                            b64: b64,
+                            key: w.__emonsPasteActive || PASTE_KEY
+                        }};
+                    }};
+                    r.readAsDataURL(blob);
+                }}, true);
+                doc.__emonsWindowPasteBound = true;
+            }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def _file_input_with_paste(
     label: str,
     *,
@@ -22615,13 +22690,8 @@ def _file_input_with_paste(
         help=help,
     )
 
-    st.markdown(
-        '<div style="margin:4px 0 6px 0;padding:10px 12px;border:2px dashed #4a6cf7;'
-        'border-radius:8px;background:#eef4ff;color:#1a237e;font-size:0.95rem;font-weight:600;">'
-        "이미지를 복사한 뒤 아래 칸을 클릭하고 Ctrl+V"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    st.caption("이미지는 이 화면에서 **Ctrl+V**로 바로 첨부됩니다. 제목·내용에 텍스트를 붙여넣는 것은 그대로입니다.")
+    _inject_window_paste_listener(paste_key)
 
     paste_val = None
     if _clipboard_paste_component is not None:
