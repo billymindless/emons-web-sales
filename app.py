@@ -22755,10 +22755,21 @@ def _render_upload_preview(files: list, cols_per_row: int = 4):
     cols = st.columns(min(len(files), cols_per_row) or 1)
     for i, f in enumerate(files):
         with cols[i % len(cols)]:
+            name = getattr(f, "name", "file")
             if _is_image_upload(f):
-                st.image(f, caption=f.name, width="stretch")
+                try:
+                    data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
+                    # bytes로 넘겨 _PastedUpload 등 커스텀 파일 객체를 PIL로 오인하지 않게 함
+                    st.image(data, caption=name, width="stretch")
+                except Exception:
+                    st.markdown(f"🖼️ **{name}**")
+                    st.caption("미리보기를 표시할 수 없습니다.")
             else:
-                st.markdown(f"📄 **{f.name}**")
+                st.markdown(f"📄 **{name}**")
                 size = getattr(f, "size", None)
                 st.caption(_humansize(size))
             try:
