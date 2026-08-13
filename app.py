@@ -508,10 +508,17 @@ def _render_erp_icon_rail(role: str) -> None:
             pass
         for key in list(st.session_state.keys()):
             del st.session_state[key]
+        # 세션만 지우면 로그인 화면 JS가 localStorage 의 emons_auth 로
+        # ?auth= 를 다시 붙여 즉시 재로그인한다. logout=1 을 남겨
+        # localStorage 삭제 + 자동복구 차단이 다음 렌더에서 실행되게 한다.
         try:
-            st.query_params.clear()
+            st.query_params.from_dict({"logout": "1"})
         except Exception:
-            pass
+            try:
+                st.query_params.clear()
+                st.query_params["logout"] = "1"
+            except Exception:
+                pass
         st.rerun()
 
 
@@ -6106,6 +6113,7 @@ def _inject_js_clear_auth_on_logout():
                 console.log("[momo-auth] 토큰 삭제됨: 원인=로그아웃 버튼 클릭");
                 var u = new URL(w.location.href);
                 u.searchParams.delete("logout");
+                u.searchParams.delete("auth");
                 w.history.replaceState({}, "", u.toString());
             } catch(e) { console.warn("[momo-auth] logout 실패:", e); }
         })();
@@ -6681,6 +6689,17 @@ def render_login():
             try {
                 var w = window.parent;
                 var u = new URL(w.location.href);
+
+                // 로그아웃 직후: 저장된 토큰으로 재로그인하지 않고 삭제만 한다.
+                if (u.searchParams.get('logout') === '1') {
+                    w.localStorage.removeItem(AUTH_KEY);
+                    w.sessionStorage.removeItem(AUTH_KEY);
+                    u.searchParams.delete('logout');
+                    u.searchParams.delete('auth');
+                    w.history.replaceState({}, '', u.toString());
+                    console.log('[momo-auth] 토큰 삭제됨: 원인=로그아웃 (로그인화면)');
+                    return;
+                }
 
                 // 1) 자동 로그인 토큰 복구: localStorage 토큰 → URL ?auth=
                 if (!u.searchParams.get('auth')) {
@@ -31270,7 +31289,12 @@ def main():
     #  2) URL에 ?auth=토큰 + 미로그인 → 검증 후 세션 복구 + localStorage 동기화
     #  3) 로그인 성공 직후 _pending_auth_token이 있으면 → localStorage 저장
     _maybe_clear_localStorage_on_logout()
-    if not st.session_state.logged_in:
+    _is_logout = False
+    try:
+        _is_logout = st.query_params.get("logout") == "1"
+    except Exception:
+        pass
+    if not st.session_state.logged_in and not _is_logout:
         if _try_restore_from_query_params():
             # 복구 성공: URL의 ?auth=를 localStorage에 저장하고 URL 깨끗하게 정리
             _inject_js_url_auth_save_and_replace_state()
