@@ -22615,12 +22615,26 @@ def _file_input_with_paste(
         help=help,
     )
 
+    st.markdown(
+        '<div style="margin:4px 0 6px 0;padding:10px 12px;border:2px dashed #4a6cf7;'
+        'border-radius:8px;background:#eef4ff;color:#1a237e;font-size:0.95rem;font-weight:600;">'
+        "이미지를 복사한 뒤 아래 칸을 클릭하고 Ctrl+V"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
     paste_val = None
     if _clipboard_paste_component is not None:
         try:
-            paste_val = _clipboard_paste_component(default=None, key=paste_key)
+            paste_val = _clipboard_paste_component(
+                paste_key=paste_key,
+                default=None,
+                key=paste_key,
+            )
         except Exception:
             paste_val = None
+    elif paste_hint:
+        st.caption("클립보드 붙여넣기 칸을 불러오지 못했습니다. 파일 선택으로만 첨부할 수 있습니다.")
 
     pasted_list: list = list(st.session_state.get(state_key, []))
     if isinstance(paste_val, dict) and paste_val.get("b64"):
@@ -22645,12 +22659,10 @@ def _file_input_with_paste(
 
     if pasted_list:
         _c1, _c2 = st.columns([5, 1])
-        _c1.caption(f"📋 클립보드 붙여넣기 이미지 {len(pasted_list)}개")
+        _c1.caption(f"클립보드 붙여넣기 이미지 {len(pasted_list)}개")
         if _c2.button("붙여넣기 지우기", key=f"{key}__clear_paste"):
             st.session_state[state_key] = []
             st.rerun()
-    elif paste_hint and _clipboard_paste_component is None:
-        st.caption("(클립보드 붙여넣기 컴포넌트를 불러오지 못했습니다. 파일 선택으로만 첨부 가능합니다.)")
 
     if accept_multiple_files:
         base = list(uploader_files or [])
