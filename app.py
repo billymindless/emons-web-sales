@@ -1634,6 +1634,21 @@ def _format_df_display(df, num_columns):
     return out
 
 
+def _style_overdue_unpaid_rows(df: pd.DataFrame, overdue_mask):
+    """배송일이 지났고 잔금이 남은 행을 빨간 경고 배경으로 표시."""
+    if overdue_mask is None or not isinstance(overdue_mask, pd.Series):
+        overdue_mask = pd.Series(False, index=df.index)
+    else:
+        overdue_mask = overdue_mask.reindex(df.index).fillna(False).astype(bool)
+
+    def _hl(row):
+        if bool(overdue_mask.loc[row.name]):
+            return ["background-color: #ffe6e6; color: #b30000; font-weight: 600;"] * len(row)
+        return [""] * len(row)
+
+    return df.style.apply(_hl, axis=1)
+
+
 def _format_phone_hyphen(s):
     """숫자만 입력된 전화번호를 010-1234-5678 형식으로 포맷."""
     if s is None or s == "":
@@ -9965,15 +9980,22 @@ def _superadmin_tab1_integrated_dashboard():
                 _unpaid["매장"] = orders.loc[_unpaid.index, "_store"] if "_store" in orders.columns else ""
                 _show_cols = ["매장"] + _show_cols
             _unpaid_disp = _unpaid[_show_cols].copy()
+            _overdue_mask = pd.Series(False, index=_unpaid_disp.index)
             if "잔금" in _unpaid_disp.columns:
                 _unpaid_disp["잔금"] = _unpaid_disp["잔금"].apply(lambda v: f"{v:,.0f}원" if pd.notna(v) else "-")
             if "배송일" in _unpaid_disp.columns:
-                _unpaid_disp["배송일"] = pd.to_datetime(_unpaid_disp["배송일"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-")
+                _dd = pd.to_datetime(_unpaid_disp["배송일"], errors="coerce")
+                _overdue_mask = _dd.dt.date < today
+                _unpaid_disp["배송일"] = _dd.dt.strftime("%Y-%m-%d").fillna("-")
             if len(_unpaid_disp) == 0:
                 st.success("미수금 고객이 없습니다.")
             else:
-                st.dataframe(_unpaid_disp, width="stretch")
-                st.caption(f"총 {len(_unpaid_disp)}건의 미수금 고객 (잔금 > 0)")
+                _n_overdue = int(_overdue_mask.fillna(False).sum())
+                st.dataframe(_style_overdue_unpaid_rows(_unpaid_disp, _overdue_mask), width="stretch")
+                st.caption(
+                    f"총 {len(_unpaid_disp)}건의 미수금 고객 (잔금 > 0)"
+                    + (f" · 🚨 배송일 경과 {_n_overdue}건은 빨간 행(우선 회수)" if _n_overdue else "")
+                )
         else:
             st.info("주문 데이터가 없습니다.")
     except Exception as _e2:
@@ -32611,12 +32633,17 @@ def render_dashboard():
             unpaid_list = unpaid_list[unpaid_list["배송일"].dt.date <= cutoff]
         display_cols = ["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]
         unpaid_list = unpaid_list[["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]].copy()
+        _overdue_mask = pd.Series(False, index=unpaid_list.index)
         if len(unpaid_list) > 0 and pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
             unpaid_list = unpaid_list.sort_values("배송일", ascending=True)
+            _overdue_mask = unpaid_list["배송일"].dt.date < today
             unpaid_list["배송일"] = unpaid_list["배송일"].dt.strftime("%Y-%m-%d")
         if len(unpaid_list) > 0:
             unpaid_display = _format_df_display(unpaid_list, ["잔금"])
-            st.dataframe(unpaid_display, width='stretch')
+            _n_overdue = int(_overdue_mask.fillna(False).sum())
+            st.dataframe(_style_overdue_unpaid_rows(unpaid_display, _overdue_mask), width='stretch')
+            if _n_overdue:
+                st.caption(f"🚨 배송일이 지났는데 잔금이 남은 {_n_overdue}건은 빨간 행입니다. 우선 회수해 주세요.")
         else:
             st.info("해당 조건의 미수금 고객이 없습니다. (배송일 10일 이내·잔금 있음)")
     else:
