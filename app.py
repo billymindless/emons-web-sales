@@ -3061,10 +3061,10 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
             ap = ap[-6:]
         erp_pairs = pays_by_approval.get(ap) if (m.get("result_code") == "ambiguous" and ap) else None
         if erp_pairs:
-            erp_amt_disp = " / ".join(str(a) for a, _ in erp_pairs)
+            erp_amt_disp = " / ".join(f"{a:,}" for a, _ in erp_pairs)
             erp_date_disp = " / ".join(d for _, d in erp_pairs if d)
         elif pid_int is not None:
-            erp_amt_disp = str(pay_amt_by_id[pid_int]) if pid_int in pay_amt_by_id else ""
+            erp_amt_disp = f"{pay_amt_by_id[pid_int]:,}" if pid_int in pay_amt_by_id else ""
             erp_date_disp = pay_date_by_id.get(pid_int) or ""
         else:
             erp_amt_disp = ""
@@ -3074,7 +3074,7 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
             "ERP일자": erp_date_disp,
             "뒤4": r.get("phone_last4") or "",
             "승인번호": r.get("approval_code") or "",
-            "공식금액": official_amt,
+            "공식금액": f"{official_amt:,}",
             "ERP금액": erp_amt_disp,
             "공식상태": r.get("tx_status") or "",
             "정산": r.get("settle_status") or "",
