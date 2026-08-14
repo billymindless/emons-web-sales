@@ -2912,9 +2912,166 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
     return counts, None
 
 
-def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | None) -> "pd.DataFrame":
-    """관리자 UI 표시용: 공식 행 + 매칭 결과 조인 DataFrame.
-    verify_from 이 None 이면 날짜 필터 없이 해당 매장·출처 전체."""
+def _ext_pay_new_customer_order_ids(sc, db_filename: str, order_rows: list[dict]) -> set[int]:
+    """entry_source=new_customer_sale 이거나 해당 고객의 첫 주문이면 신규고객 매출."""
+    out: set[int] = set()
+    need: list[dict] = []
+    for o in order_rows:
+        try:
+            oid = int(o["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if (o.get("entry_source") or "").strip() == "new_customer_sale":
+            out.add(oid)
+        else:
+            need.append(o)
+    cust_ids = []
+    for o in need:
+        if o.get("customer_id") is None:
+            continue
+        try:
+            cust_ids.append(int(o["customer_id"]))
+        except (TypeError, ValueError):
+            continue
+    first_by_cust: dict[int, int] = {}
+    uniq = sorted(set(cust_ids))
+    for chunk in (uniq[i : i + 100] for i in range(0, len(uniq), 100)):
+        try:
+            def _filt(q, _chunk=chunk):
+                return q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).in_("customer_id", _chunk)
+            all_o = _ext_pay_select_paged(
+                sc, "app_orders", "id, customer_id, order_date", _filt, order_col="id",
+            )
+        except Exception:
+            all_o = []
+        for row in all_o:
+            try:
+                cid = int(row["customer_id"])
+                oid = int(row["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            key = (str(row.get("order_date") or ""), oid)
+            prev = first_by_cust.get(cid)
+            if prev is None or key < (str(prev[1]), prev[0]):
+                first_by_cust[cid] = (oid, str(row.get("order_date") or ""))
+    first_by_cust = {cid: pair[0] for cid, pair in first_by_cust.items()}
+    for o in need:
+        try:
+            cid = int(o["customer_id"])
+            oid = int(o["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if first_by_cust.get(cid) == oid:
+            out.add(oid)
+    return out
+
+
+def _ext_pay_unmatched_erp_pays(
+    sc, db_filename: str, source: str, erp_from: date, used_payment_ids: set[int],
+) -> list[dict]:
+    """공식 파일에 매칭되지 않은 신규고객 ERP 결제 (erp_only)."""
+    try:
+        def _filt(q):
+            q = q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).gt("amount", 0)
+            if erp_from is not None:
+                q = q.gte("payment_date", erp_from.isoformat())
+            return q
+        pays = _ext_pay_select_paged(
+            sc, "app_payments",
+            "id, order_id, payment_date, amount, payment_method, card_company, onnuri_approval_code",
+            _filt, order_col="id",
+        )
+    except Exception:
+        return []
+
+    def _keep(p: dict) -> bool:
+        meth = str(p.get("payment_method") or "")
+        if source == "ulsanpay":
+            return "지역화폐" in meth
+        return ("온누리" in meth) and ("지류" not in meth)
+
+    leftover = []
+    for p in pays:
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError):
+            continue
+        if pid in used_payment_ids:
+            continue
+        if not _keep(p):
+            continue
+        leftover.append(p)
+    if not leftover:
+        return []
+
+    order_ids = []
+    for p in leftover:
+        if p.get("order_id") is None:
+            continue
+        try:
+            order_ids.append(int(p["order_id"]))
+        except (TypeError, ValueError):
+            continue
+    orders_map: dict[int, dict] = {}
+    uniq_oids = sorted(set(order_ids))
+    for chunk in (uniq_oids[i : i + 200] for i in range(0, len(uniq_oids), 200)):
+        try:
+            r = (
+                sc.table("app_orders")
+                .select("id, customer_id, order_date, entry_source")
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .in_("id", chunk)
+                .execute()
+            )
+            for row in r.data or []:
+                orders_map[int(row["id"])] = row
+        except Exception:
+            continue
+    new_oids = _ext_pay_new_customer_order_ids(sc, db_filename, list(orders_map.values()))
+
+    out: list[dict] = []
+    for p in leftover:
+        try:
+            oid = int(p["order_id"]) if p.get("order_id") is not None else None
+        except (TypeError, ValueError):
+            oid = None
+        if oid is None or oid not in new_oids:
+            continue
+        o = orders_map.get(oid) or {}
+        try:
+            cid = int(o["customer_id"]) if o.get("customer_id") is not None else None
+        except (TypeError, ValueError):
+            cid = None
+        try:
+            amt = int(p.get("amount") or 0)
+        except (TypeError, ValueError):
+            amt = 0
+        if source == "ulsanpay":
+            ap = _ext_pay_digits_only(p.get("card_company"))
+            approval = ap[-6:] if len(ap) >= 6 else ap
+            phone4 = ""
+        else:
+            approval = ""
+            stored = _ext_pay_digits_only(p.get("onnuri_approval_code"))
+            phone4 = stored[-4:] if len(stored) >= 4 else ""
+        out.append({
+            "payment_id": int(p["id"]),
+            "order_id": oid,
+            "customer_id": cid,
+            "payment_date": str(p.get("payment_date") or "")[:10],
+            "amount": amt,
+            "approval_code": approval,
+            "phone_last4": phone4,
+        })
+    return out
+
+
+def _ext_pay_list_matches_df(
+    db_filename: str, source: str, verify_from: date | None, erp_from: date | None = None,
+) -> "pd.DataFrame":
+    """관리자 UI 표시용: 공식 행 + 매칭 결과 + ERP-only 행 DataFrame.
+    verify_from 이 None 이면 공식 행은 날짜 필터 없이 해당 매장·출처 전체.
+    erp_from 은 ERP-only 조회 시작일(미지정 시 verify_from 또는 기본 시작일)."""
     sc, err = get_supabase_client()
     if err or not sc:
         return pd.DataFrame()
@@ -2966,6 +3123,25 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
                 payment_ids.append(int(pid))
             except (TypeError, ValueError):
                 pass
+
+    erp_only_from = erp_from or verify_from or EXT_PAY_DEFAULT_VERIFY_FROM
+    erp_only_pays = _ext_pay_unmatched_erp_pays(
+        sc, db_filename, source, erp_only_from, set(payment_ids),
+    )
+    for p in erp_only_pays:
+        cid = p.get("customer_id")
+        if cid is not None:
+            try:
+                cust_ids.append(int(cid))
+            except (TypeError, ValueError):
+                pass
+        oid = p.get("order_id")
+        if oid is not None:
+            try:
+                order_ids.append(int(oid))
+            except (TypeError, ValueError):
+                pass
+
     cust_map: dict = {}
     uniq_cids = sorted(set(cust_ids))
     for i in range(0, len(uniq_cids), 100):
@@ -3084,6 +3260,33 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
             "메모": m.get("note") or "",
+        })
+    for p in erp_only_pays:
+        try:
+            cid_int = int(p["customer_id"]) if p.get("customer_id") is not None else None
+        except (TypeError, ValueError):
+            cid_int = None
+        try:
+            oid_int = int(p["order_id"]) if p.get("order_id") is not None else None
+        except (TypeError, ValueError):
+            oid_int = None
+        cust = cust_map.get(cid_int) or {}
+        amt = int(p.get("amount") or 0)
+        data.append({
+            "공식일자": "",
+            "ERP일자": p.get("payment_date") or "",
+            "뒤4": p.get("phone_last4") or "",
+            "승인번호": p.get("approval_code") or "",
+            "공식금액": "",
+            "ERP금액": f"{amt:,}",
+            "공식상태": "",
+            "정산": "",
+            "구매자": "",
+            "결과": "erp_only",
+            "고객명": cust.get("name") or "",
+            "고객전화": cust.get("phone1") or "",
+            "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
+            "메모": "공식 파일에 없음",
         })
     return pd.DataFrame(data)
 
@@ -25935,7 +26138,9 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             help="다른 관리자가 올린 건을 시작일 필터에 가리지 않고 봅니다.",
         )
     saved_n = _ext_pay_count_rows(sel_db, sel_src)
-    df = _ext_pay_list_matches_df(sel_db, sel_src, None if show_all_saved else new_from)
+    df = _ext_pay_list_matches_df(
+        sel_db, sel_src, None if show_all_saved else new_from, erp_from=new_from,
+    )
     if df.empty:
         if saved_n > 0:
             st.warning(
@@ -25958,7 +26163,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     if only_alerts:
         _alert_codes = {
             "official_only", "official_canceled",
-            "erp_canceled_official_paid", "ambiguous", "미매칭",
+            "erp_canceled_official_paid", "ambiguous", "erp_only", "미매칭",
         }
         df = df[df["결과"].isin(_alert_codes)]
         if df.empty:
@@ -25966,7 +26171,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             return
     st.dataframe(df, width="stretch", hide_index=True)
     st.caption(
-        "결과 코드: matched_ok=정상 · official_only=미입력 · official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
+        "결과 코드: matched_ok=정상 · official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
+        "official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
         "erp_canceled_official_paid=ERP 취소인데 공식 결제완료 · ambiguous=시간까지 봐도 특정 불가 · 미매칭=아직 매칭 미실행"
     )
 
