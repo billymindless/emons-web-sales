@@ -2944,9 +2944,29 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
     except Exception:
         m_by_row = {}
 
+    cust_ids: list[int] = []
+    for m in m_by_row.values():
+        cid = m.get("customer_id")
+        if cid is None:
+            continue
+        try:
+            cust_ids.append(int(cid))
+        except (TypeError, ValueError):
+            continue
+    cust_map: dict = {}
+    uniq_cids = sorted(set(cust_ids))
+    for i in range(0, len(uniq_cids), 100):
+        cust_map.update(_get_customers_by_ids_supabase(db_filename, uniq_cids[i : i + 100]))
+
     data: list[dict] = []
     for r in rows:
         m = m_by_row.get(int(r["id"])) or {}
+        cid = m.get("customer_id")
+        try:
+            cid_int = int(cid) if cid is not None else None
+        except (TypeError, ValueError):
+            cid_int = None
+        cust = cust_map.get(cid_int) or {}
         data.append({
             "일자": r.get("tx_date"),
             "시간": r.get("tx_time") or "",
@@ -2959,7 +2979,8 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
             "결과": m.get("result_code") or "미매칭",
             "결제ID": m.get("payment_id"),
             "주문ID": m.get("order_id"),
-            "고객ID": m.get("customer_id"),
+            "고객명": cust.get("name") or "",
+            "고객전화": cust.get("phone1") or "",
             "메모": m.get("note") or "",
         })
     return pd.DataFrame(data)
