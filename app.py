@@ -2350,6 +2350,159 @@ def _ext_pay_is_cancel_status(status: str | None) -> bool:
     return "취소" in str(status)
 
 
+def _ext_pay_norm_approval6(v) -> str:
+    digits = _ext_pay_digits_only(v)
+    return digits[-6:] if len(digits) >= 6 else digits
+
+
+def _ext_pay_pair_cancel_offsets(items: list[dict]) -> list[tuple[dict, dict]]:
+    """동일 승인번호·동일 절대금액의 (ERP취소된 공식결제, 공식취소) 쌍.
+    items 키: approval, abs_amount, result_code, is_official_cancel, order_has_neg.
+    """
+    groups: dict[tuple[str, int], dict[str, list]] = {}
+    for it in items:
+        ap = str(it.get("approval") or "").strip()
+        if not ap:
+            continue
+        try:
+            abs_amt = int(it.get("abs_amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs_amt <= 0:
+            continue
+        g = groups.setdefault((ap, abs_amt), {"paid": [], "cancel": []})
+        code = it.get("result_code") or ""
+        if it.get("is_official_cancel") and code in ("official_canceled", "official_only", "미매칭"):
+            g["cancel"].append(it)
+        elif not it.get("is_official_cancel"):
+            if code == "erp_canceled_official_paid" or (
+                code == "matched_ok" and it.get("order_has_neg")
+            ):
+                g["paid"].append(it)
+    pairs: list[tuple[dict, dict]] = []
+    for g in groups.values():
+        n = min(len(g["paid"]), len(g["cancel"]))
+        for i in range(n):
+            pairs.append((g["paid"][i], g["cancel"][i]))
+    return pairs
+
+
+def _ext_pay_offset_ulsan_cancels(sc, db_filename: str) -> int:
+    """저장된 울산페이 매칭에서 동일 승인번호 취소 상계. 갱신 행 수 반환."""
+    if not sc or not db_filename:
+        return 0
+    try:
+        def _filt_rows(q):
+            return q.eq("db_filename", db_filename).eq("source", "ulsanpay")
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            "id, tx_date, amount, tx_status, approval_code",
+            _filt_rows, order_col="id",
+        )
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename).eq("source", "ulsanpay")
+        matches = _ext_pay_select_paged(
+            sc, "app_external_pay_matches",
+            "id, row_id, payment_id, order_id, customer_id, result_code, note",
+            _filt_m, order_col="id",
+        )
+    except Exception:
+        return 0
+    m_by_row = {int(m["row_id"]): m for m in matches if m.get("row_id") is not None}
+    items: list[dict] = []
+    order_ids: list[int] = []
+    for r in rows:
+        try:
+            rid = int(r["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        m = m_by_row.get(rid)
+        if not m:
+            continue
+        try:
+            amt = int(r.get("amount") or 0)
+        except (TypeError, ValueError):
+            amt = 0
+        oid = m.get("order_id")
+        try:
+            oid_int = int(oid) if oid is not None else None
+        except (TypeError, ValueError):
+            oid_int = None
+        items.append({
+            "row_id": rid,
+            "approval": _ext_pay_norm_approval6(r.get("approval_code")),
+            "abs_amount": abs(amt),
+            "result_code": m.get("result_code") or "",
+            "is_official_cancel": _ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0,
+            "order_id": oid_int,
+            "payment_id": m.get("payment_id"),
+            "customer_id": m.get("customer_id"),
+            "tx_date": str(r.get("tx_date") or "")[:10],
+            "order_has_neg": False,
+        })
+        if oid_int is not None:
+            order_ids.append(oid_int)
+    neg_by_order: dict[int, dict] = {}
+    uniq_oids = sorted(set(order_ids))
+    for chunk in (uniq_oids[i : i + 200] for i in range(0, len(uniq_oids), 200)):
+        try:
+            pr = (
+                sc.table("app_payments")
+                .select("id, order_id, amount, payment_date, payment_method, card_company")
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .in_("order_id", chunk)
+                .lt("amount", 0)
+                .execute()
+            )
+            for p in pr.data or []:
+                if "지역화폐" not in str(p.get("payment_method") or ""):
+                    continue
+                try:
+                    oid = int(p["order_id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if oid not in neg_by_order:
+                    neg_by_order[oid] = p
+        except Exception:
+            continue
+    for it in items:
+        if it["order_id"] is not None and it["order_id"] in neg_by_order:
+            it["order_has_neg"] = True
+    pairs = _ext_pay_pair_cancel_offsets(items)
+    updated = 0
+    for paid, cancel in pairs:
+        note = f"동일 승인번호 취소 상계 (공식취소일 {cancel.get('tx_date') or ''})"
+        try:
+            sc.table("app_external_pay_matches").update({
+                "result_code": "matched_ok",
+                "note": note,
+            }).eq("db_filename", db_filename).eq("row_id", int(paid["row_id"])).execute()
+            updated += 1
+        except Exception:
+            continue
+        cancel_payload = {"result_code": "matched_ok", "note": note}
+        if paid.get("order_id") is not None:
+            cancel_payload["order_id"] = paid["order_id"]
+            if paid.get("customer_id") is not None:
+                cancel_payload["customer_id"] = paid["customer_id"]
+        neg = neg_by_order.get(paid["order_id"]) if paid.get("order_id") is not None else None
+        if neg and neg.get("id") is not None:
+            try:
+                cancel_payload["payment_id"] = int(neg["id"])
+            except (TypeError, ValueError):
+                pass
+        elif paid.get("payment_id") is not None:
+            cancel_payload["payment_id"] = paid["payment_id"]
+        try:
+            sc.table("app_external_pay_matches").update(cancel_payload).eq(
+                "db_filename", db_filename
+            ).eq("row_id", int(cancel["row_id"])).execute()
+            updated += 1
+        except Exception:
+            continue
+    return updated
+
+
 def _ext_pay_insert_batch_and_rows(
     db_filename: str, source: str, file_name: str, rows: list[dict],
     verify_from: date, uploaded_by: str | None,
@@ -2909,6 +3062,7 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
                 except Exception:
                     continue
 
+    _ext_pay_offset_ulsan_cancels(sc, db_filename)
     return counts, None
 
 
@@ -3075,6 +3229,8 @@ def _ext_pay_list_matches_df(
     sc, err = get_supabase_client()
     if err or not sc:
         return pd.DataFrame()
+    if source == "ulsanpay":
+        _ext_pay_offset_ulsan_cancels(sc, db_filename)
     try:
         def _filt_rows(q):
             q = q.eq("db_filename", db_filename).eq("source", source)
@@ -26239,6 +26395,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     )
     st.caption(
         "빨간 행: 공식 파일에 승인번호가 없고 ERP에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
+        "동일 승인번호의 공식 취소와 ERP 취소는 날짜가 달라도 상계되어 matched_ok 로 표시됩니다. "
         "결과 코드: matched_ok=정상 · official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
         "official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
         "erp_canceled_official_paid=ERP 취소인데 공식 결제완료 · ambiguous=시간까지 봐도 특정 불가 · 미매칭=아직 매칭 미실행"
