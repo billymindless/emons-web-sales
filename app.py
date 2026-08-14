@@ -26462,10 +26462,31 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             return ["background-color: #ffe6e6; color: #b30000; font-weight: 600;"] * len(row)
         return [""] * len(row)
 
+    _col_w = {
+        "공식일자": 110,
+        "ERP일자": 110,
+        "승인번호": 90,
+        "뒤4": 70,
+        "공식금액": 100,
+        "ERP금액": 110,
+        "공식상태": 90,
+        "정산": 80,
+        "구매자": 90,
+        "결과": 180,
+        "고객명": 100,
+        "고객전화": 140,
+        "담당매니저": 100,
+        "메모": 280,
+    }
+    _cfg = {
+        c: st.column_config.Column(c, width=_col_w.get(c, 120))
+        for c in _all_cols
+    }
     st.dataframe(
         _show.style.apply(_hl_fabricated, axis=1),
-        width="content",
+        width="stretch",
         hide_index=True,
+        column_config=_cfg,
     )
     _dl = df[_all_cols].copy()
     if _flag_col in df.columns:
