@@ -2324,10 +2324,9 @@ def _ext_pay_parse_ulsanpay_file(uploaded_file) -> tuple[list[dict], str | None]
         amt = _ext_pay_parse_amount(row.get(colmap["amount"]))
         if amt is None:
             continue
-        appr_digits = _ext_pay_digits_only(row.get(colmap["approval_code"]))
-        if len(appr_digits) < 6:
+        appr = _ext_pay_norm_approval6(row.get(colmap["approval_code"]))
+        if not appr:
             continue
-        appr = appr_digits[-6:]
         tx_status = str(row.get(colmap["tx_status"]) or "").strip() if "tx_status" in colmap else ""
         raw = {k: (None if pd.isna(v) else str(v)) for k, v in row.items() if v is not None}
         out.append({
@@ -2351,8 +2350,26 @@ def _ext_pay_is_cancel_status(status: str | None) -> bool:
 
 
 def _ext_pay_norm_approval6(v) -> str:
-    digits = _ext_pay_digits_only(v)
-    return digits[-6:] if len(digits) >= 6 else digits
+    """울산페이 승인번호 6자리. 앞자리 0 유지. 5자리 이하는 왼쪽에 0을 채움.
+    float 43927.0 이 '439270'으로 깨지지 않게 정수부만 사용."""
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        if v != v:
+            return ""
+        digits = re.sub(r"\D", "", str(int(round(v))))
+    elif isinstance(v, int):
+        digits = re.sub(r"\D", "", str(v))
+    else:
+        s = str(v).strip()
+        if re.fullmatch(r"\d+\.0+", s):
+            s = s.split(".", 1)[0]
+        digits = re.sub(r"\D", "", s)
+    if not digits:
+        return ""
+    if len(digits) > 6:
+        return digits[-6:]
+    return digits.zfill(6)
 
 
 def _ext_pay_pair_cancel_offsets(items: list[dict]) -> list[tuple[dict, dict]]:
@@ -2498,6 +2515,115 @@ def _ext_pay_offset_ulsan_cancels(sc, db_filename: str) -> int:
                 "db_filename", db_filename
             ).eq("row_id", int(cancel["row_id"])).execute()
             updated += 1
+        except Exception:
+            continue
+    return updated
+
+
+def _ext_pay_rematch_ulsan_zeropad(sc, db_filename: str) -> int:
+    """앞자리 0 정규화 후 official_only를 ERP와 다시 매칭. 갱신 행 수 반환."""
+    if not sc or not db_filename:
+        return 0
+    try:
+        def _filt_rows(q):
+            return q.eq("db_filename", db_filename).eq("source", "ulsanpay")
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            "id, amount, tx_status, approval_code",
+            _filt_rows, order_col="id",
+        )
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename).eq("source", "ulsanpay")
+        matches = _ext_pay_select_paged(
+            sc, "app_external_pay_matches",
+            "row_id, payment_id, result_code",
+            _filt_m, order_col="id",
+        )
+        def _filt_p(q):
+            return q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+        pays_all = _ext_pay_select_paged(
+            sc, "app_payments",
+            "id, order_id, amount, payment_method, card_company",
+            _filt_p, order_col="id",
+        )
+        pays = [p for p in pays_all if "지역화폐" in str(p.get("payment_method") or "")]
+    except Exception:
+        return 0
+    m_by_row = {int(m["row_id"]): m for m in matches if m.get("row_id") is not None}
+    used = {int(m["payment_id"]) for m in matches if m.get("payment_id") is not None}
+    retry_rows = []
+    for r in rows:
+        m = m_by_row.get(int(r["id"]))
+        if not m:
+            continue
+        if (m.get("result_code") or "") not in ("official_only", "미매칭"):
+            continue
+        retry_rows.append(r)
+    if not retry_rows:
+        return 0
+    idx: dict[tuple[str, int], list[dict]] = {}
+    for p in pays:
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if pid in used:
+            continue
+        ap = _ext_pay_norm_approval6(p.get("card_company"))
+        if not ap:
+            continue
+        try:
+            amt = abs(int(p.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        if amt <= 0:
+            continue
+        idx.setdefault((ap, amt), []).append(p)
+    updated = 0
+    for r in retry_rows:
+        ap = _ext_pay_norm_approval6(r.get("approval_code"))
+        try:
+            amt = abs(int(r.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        if not ap or amt <= 0:
+            continue
+        cands = list(idx.get((ap, amt), []))
+        if len(cands) != 1:
+            continue
+        pay = cands[0]
+        try:
+            pid = int(pay["id"])
+            oid = int(pay["order_id"]) if pay.get("order_id") is not None else None
+        except (TypeError, ValueError, KeyError):
+            continue
+        payload = {
+            "result_code": "matched_ok",
+            "note": "승인번호 앞자리 0 정규화 재매칭",
+            "payment_id": pid,
+        }
+        if oid is not None:
+            payload["order_id"] = oid
+            try:
+                _or = (
+                    sc.table("app_orders")
+                    .select("customer_id")
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                    .eq("id", oid)
+                    .limit(1)
+                    .execute()
+                )
+                if _or.data and _or.data[0].get("customer_id") is not None:
+                    payload["customer_id"] = _or.data[0]["customer_id"]
+            except Exception:
+                pass
+        try:
+            sc.table("app_external_pay_matches").update(payload).eq(
+                "db_filename", db_filename
+            ).eq("row_id", int(r["id"])).execute()
+            updated += 1
+            used.add(pid)
+            idx[(ap, amt)] = [x for x in cands if int(x["id"]) != pid]
         except Exception:
             continue
     return updated
@@ -2964,8 +3090,7 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
     neg_orders = {int(p["order_id"]) for p in pays if p.get("order_id") is not None and (p.get("amount") or 0) < 0}
 
     def _erp_approval(pay: dict) -> str:
-        digits = _ext_pay_digits_only(pay.get("card_company"))
-        return digits[-6:] if len(digits) >= 6 else digits
+        return _ext_pay_norm_approval6(pay.get("card_company"))
 
     # 키: (승인번호6, 금액)
     idx: dict[tuple, list[dict]] = {}
@@ -2980,9 +3105,7 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
 
     for r in todo:
         row_id = int(r["id"])
-        appr = _ext_pay_digits_only(r.get("approval_code"))
-        if len(appr) >= 6:
-            appr = appr[-6:]
+        appr = _ext_pay_norm_approval6(r.get("approval_code"))
         amt = int(r.get("amount") or 0)
         is_cancel = _ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0
         match_amt = abs(amt)
@@ -3063,6 +3186,7 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
                     continue
 
     _ext_pay_offset_ulsan_cancels(sc, db_filename)
+    _ext_pay_rematch_ulsan_zeropad(sc, db_filename)
     return counts, None
 
 
@@ -3201,8 +3325,7 @@ def _ext_pay_unmatched_erp_pays(
         except (TypeError, ValueError):
             amt = 0
         if source == "ulsanpay":
-            ap = _ext_pay_digits_only(p.get("card_company"))
-            approval = ap[-6:] if len(ap) >= 6 else ap
+            approval = _ext_pay_norm_approval6(p.get("card_company"))
             phone4 = ""
         else:
             approval = ""
@@ -3231,6 +3354,7 @@ def _ext_pay_list_matches_df(
         return pd.DataFrame()
     if source == "ulsanpay":
         _ext_pay_offset_ulsan_cancels(sc, db_filename)
+        _ext_pay_rematch_ulsan_zeropad(sc, db_filename)
     try:
         def _filt_rows(q):
             q = q.eq("db_filename", db_filename).eq("source", source)
@@ -3329,8 +3453,7 @@ def _ext_pay_list_matches_df(
                     except (TypeError, ValueError):
                         pay_amt_by_id[pid] = 0
                     pay_date_by_id[pid] = str(p.get("payment_date") or "")[:10]
-                    _ap = _ext_pay_digits_only(p.get("card_company"))
-                    pay_ap_by_id[pid] = _ap[-6:] if len(_ap) >= 6 else _ap
+                    pay_ap_by_id[pid] = _ext_pay_norm_approval6(p.get("card_company"))
         except Exception:
             pay_amt_by_id = {}
             pay_date_by_id = {}
@@ -3343,9 +3466,9 @@ def _ext_pay_list_matches_df(
             m = m_by_row.get(int(r["id"])) or {}
             if (m.get("result_code") or "") != "ambiguous":
                 continue
-            ap = _ext_pay_digits_only(r.get("approval_code"))
-            if len(ap) >= 6:
-                amb_approvals.append(ap[-6:])
+            ap = _ext_pay_norm_approval6(r.get("approval_code"))
+            if ap:
+                amb_approvals.append(ap)
     amb_approvals = sorted(set(amb_approvals))
     if amb_approvals:
         try:
@@ -3360,9 +3483,7 @@ def _ext_pay_list_matches_df(
                 for p in pr.data or []:
                     if "지역화폐" not in str(p.get("payment_method") or ""):
                         continue
-                    ap = _ext_pay_digits_only(p.get("card_company"))
-                    if len(ap) >= 6:
-                        ap = ap[-6:]
+                    ap = _ext_pay_norm_approval6(p.get("card_company"))
                     if not ap:
                         continue
                     try:
@@ -3392,9 +3513,7 @@ def _ext_pay_list_matches_df(
             pid_int = None
         cust = cust_map.get(cid_int) or {}
         official_amt = int(r.get("amount") or 0)
-        ap = _ext_pay_digits_only(r.get("approval_code"))
-        if len(ap) >= 6:
-            ap = ap[-6:]
+        ap = _ext_pay_norm_approval6(r.get("approval_code"))
         erp_pairs = pays_by_approval.get(ap) if (m.get("result_code") == "ambiguous" and ap) else None
         if erp_pairs:
             erp_amt_disp = " / ".join(f"{a:,}" for a, _ in erp_pairs)
@@ -3410,7 +3529,7 @@ def _ext_pay_list_matches_df(
             "공식일자": str(r.get("tx_date") or "")[:10],
             "ERP일자": erp_date_disp,
             "뒤4": r.get("phone_last4") or "",
-            "승인번호": r.get("approval_code") or "",
+            "승인번호": ap or (r.get("approval_code") or ""),
             "공식금액": f"{official_amt:,}",
             "ERP금액": erp_amt_disp,
             "공식상태": r.get("tx_status") or "",
@@ -3439,7 +3558,7 @@ def _ext_pay_list_matches_df(
             "공식일자": "",
             "ERP일자": p.get("payment_date") or "",
             "뒤4": p.get("phone_last4") or "",
-            "승인번호": p.get("approval_code") or "",
+            "승인번호": _ext_pay_norm_approval6(p.get("approval_code")) or (p.get("approval_code") or ""),
             "공식금액": "",
             "ERP금액": f"{amt:,}",
             "공식상태": "",
@@ -5296,8 +5415,8 @@ def _ulsan_approval_already_used(
     db_filename: str, approval: str, *, exclude_payment_id: int | None = None,
 ) -> bool:
     """같은 매장에 동일 지역화폐 승인번호(양수 결제)가 이미 있으면 True."""
-    code = re.sub(r"\D", "", str(approval or ""))
-    if not db_filename or len(code) < 5:
+    code = _ext_pay_norm_approval6(approval)
+    if not db_filename or not code:
         return False
     if _supabase_orders_payments_available():
         sc, err = get_supabase_client()
@@ -5324,12 +5443,8 @@ def _ulsan_approval_already_used(
                         rid = 0
                     if exclude_payment_id is not None and rid == int(exclude_payment_id):
                         continue
-                    existing = re.sub(r"\D", "", str(row.get("card_company") or ""))
-                    if not existing:
-                        continue
-                    if existing == code:
-                        return True
-                    if len(existing) >= 6 and len(code) >= 6 and existing[-6:] == code[-6:]:
+                    existing = _ext_pay_norm_approval6(row.get("card_company"))
+                    if existing and existing == code:
                         return True
                 if len(rows) < page:
                     break
@@ -5347,8 +5462,8 @@ def _ulsan_approval_already_used(
         for rid, cc in rows:
             if exclude_payment_id is not None and int(rid) == int(exclude_payment_id):
                 continue
-            existing = re.sub(r"\D", "", str(cc or ""))
-            if existing == code or (len(existing) >= 6 and len(code) >= 6 and existing[-6:] == code[-6:]):
+            existing = _ext_pay_norm_approval6(cc)
+            if existing and existing == code:
                 return True
         return False
     finally:
@@ -26382,9 +26497,24 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     _dl = df[_all_cols].copy()
     if _flag_col in df.columns:
         _dl["가공번호의심"] = df[_flag_col].map(lambda v: "Y" if bool(v) else "")
+    if "승인번호" in _dl.columns:
+        _dl["승인번호"] = _dl["승인번호"].map(
+            lambda v: _ext_pay_norm_approval6(v) if str(v or "").strip() else ""
+        )
     _buf = io.BytesIO()
     with pd.ExcelWriter(_buf, engine="openpyxl") as _ew:
         _dl.to_excel(_ew, index=False, sheet_name="검증결과")
+        _ws = _ew.book["검증결과"]
+        _headers = [c.value for c in _ws[1]]
+        if "승인번호" in _headers:
+            from openpyxl.utils import get_column_letter
+            _col = get_column_letter(_headers.index("승인번호") + 1)
+            for _cell in _ws[_col]:
+                if _cell.row == 1:
+                    continue
+                if _cell.value is not None and str(_cell.value).strip() != "":
+                    _cell.value = str(_cell.value)
+                    _cell.number_format = "@"
     _src_fn = "ulsanpay" if sel_src == "ulsanpay" else "onnuri"
     st.download_button(
         "📥 엑셀 다운로드",
