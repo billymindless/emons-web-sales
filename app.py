@@ -4925,6 +4925,130 @@ def _count_payments_onnuri_dup_supabase(db_filename: str, payment_date: str, onn
         return 0
 
 
+def _ulsan_approval_already_used(
+    db_filename: str, approval: str, *, exclude_payment_id: int | None = None,
+) -> bool:
+    """같은 매장에 동일 지역화폐 승인번호(양수 결제)가 이미 있으면 True."""
+    code = re.sub(r"\D", "", str(approval or ""))
+    if not db_filename or len(code) < 5:
+        return False
+    if _supabase_orders_payments_available():
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return False
+        try:
+            offset = 0
+            page = 1000
+            while True:
+                r = (
+                    sc.table("app_payments")
+                    .select("id, card_company, amount")
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                    .eq("payment_method", "지역화폐")
+                    .gt("amount", 0)
+                    .range(offset, offset + page - 1)
+                    .execute()
+                )
+                rows = r.data or []
+                for row in rows:
+                    try:
+                        rid = int(row.get("id") or 0)
+                    except (TypeError, ValueError):
+                        rid = 0
+                    if exclude_payment_id is not None and rid == int(exclude_payment_id):
+                        continue
+                    existing = re.sub(r"\D", "", str(row.get("card_company") or ""))
+                    if not existing:
+                        continue
+                    if existing == code:
+                        return True
+                    if len(existing) >= 6 and len(code) >= 6 and existing[-6:] == code[-6:]:
+                        return True
+                if len(rows) < page:
+                    break
+                offset += page
+            return False
+        except Exception:
+            return False
+    conn = get_tenant_conn(db_filename)
+    if not conn:
+        return False
+    try:
+        rows = conn.execute(
+            "SELECT id, card_company FROM Payments WHERE payment_method LIKE '%지역화폐%' AND amount > 0"
+        ).fetchall()
+        for rid, cc in rows:
+            if exclude_payment_id is not None and int(rid) == int(exclude_payment_id):
+                continue
+            existing = re.sub(r"\D", "", str(cc or ""))
+            if existing == code or (len(existing) >= 6 and len(code) >= 6 and existing[-6:] == code[-6:]):
+                return True
+        return False
+    finally:
+        conn.close()
+
+
+def _onnuri_ident_already_used(
+    db_filename: str, last4: str, amount: int, payment_date: str,
+    *, exclude_payment_id: int | None = None,
+) -> bool:
+    """같은 매장·같은 날·같은 금액·같은 온누리 식별자(전화 뒤4)의 양수 결제가 있으면 True."""
+    last4 = re.sub(r"\D", "", str(last4 or ""))
+    if not db_filename or len(last4) != 4 or int(amount or 0) <= 0 or not payment_date:
+        return False
+    if _supabase_orders_payments_available():
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return False
+        try:
+            r = (
+                sc.table("app_payments")
+                .select("id, onnuri_approval_code, payment_method, amount")
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .eq("payment_date", payment_date)
+                .eq("amount", int(amount))
+                .execute()
+            )
+            for row in r.data or []:
+                try:
+                    rid = int(row.get("id") or 0)
+                except (TypeError, ValueError):
+                    rid = 0
+                if exclude_payment_id is not None and rid == int(exclude_payment_id):
+                    continue
+                meth = str(row.get("payment_method") or "")
+                if "온누리" not in meth or "지류" in meth:
+                    continue
+                existing = re.sub(r"\D", "", str(row.get("onnuri_approval_code") or ""))
+                if existing[-4:] == last4:
+                    return True
+            return False
+        except Exception:
+            return False
+    conn = get_tenant_conn(db_filename)
+    if not conn:
+        return False
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, onnuri_approval_code, payment_method FROM Payments
+            WHERE payment_date = ? AND amount = ?
+            """,
+            (payment_date, int(amount)),
+        ).fetchall()
+        for rid, code, meth in rows:
+            if exclude_payment_id is not None and int(rid) == int(exclude_payment_id):
+                continue
+            if "온누리" not in str(meth or "") or "지류" in str(meth or ""):
+                continue
+            existing = re.sub(r"\D", "", str(code or ""))
+            if existing[-4:] == last4:
+                return True
+        return False
+    finally:
+        conn.close()
+
+
 def _insert_sales_transaction(db_filename: str, order_id: int, transaction_date: str, amount: float, note: str = "", unpaid_balance: float | None = None, employee_names: str | None = None):
     """Sales 테이블에 매출 트랜잭션 1건 INSERT (Supabase). order_id, amount, transaction_date, note, employee_names, created_at 저장.
     employee_names: 쉼표 구분 직원명 (1/n 분배 기준). unpaid_balance(미수금)는 sales.unpaid_balance 컬럼에 저장(없으면 제외 후 재시도).
@@ -29158,6 +29282,37 @@ def render_new_sales():
             if len(last4_digits) != 4:
                 st.error(f"결제 #{i+1} 온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
                 st.stop()
+        # 같은 폼·기존 DB 의 지역화폐 승인번호 / 온누리 식별자 중복 차단
+        _seen_ulsan: set[str] = set()
+        _seen_onnuri: set[tuple[str, int]] = set()
+        _pay_date_dup = order_date.isoformat() if hasattr(order_date, "isoformat") else str(order_date)
+        for i in range(slot_count):
+            method = st.session_state.get(f"pay_method_{i}", "")
+            amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
+            if amt <= 0 or not method:
+                continue
+            if method == "지역화폐":
+                _appr = re.sub(r"\D", "", (st.session_state.get(f"pay_card_{i}", "") or "").strip())
+                if _appr in _seen_ulsan:
+                    st.error(f"결제 #{i+1}: 같은 등록 화면에 지역화폐 승인번호 {_appr} 가 중복됩니다.")
+                    st.stop()
+                if _ulsan_approval_already_used(db_filename, _appr):
+                    st.error(f"결제 #{i+1}: 지역화폐 승인번호 {_appr} 는 이미 등록된 결제입니다. 같은 승인번호로 다시 입력할 수 없습니다.")
+                    st.stop()
+                _seen_ulsan.add(_appr)
+            elif "온누리" in str(method) and "지류" not in str(method):
+                _last4 = re.sub(r"\D", "", (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip())
+                _okey = (_last4, int(amt))
+                if _okey in _seen_onnuri:
+                    st.error(f"결제 #{i+1}: 같은 등록 화면에 온누리 전화번호 뒤 4자리 {_last4} / 금액 {amt:,}원이 중복됩니다.")
+                    st.stop()
+                if _onnuri_ident_already_used(db_filename, _last4, amt, _pay_date_dup):
+                    st.error(
+                        f"결제 #{i+1}: 온누리 전화번호 뒤 4자리 {_last4} · {amt:,}원 · {_pay_date_dup} 결제가 이미 있습니다. "
+                        "같은 건을 다시 입력할 수 없습니다."
+                    )
+                    st.stop()
+                _seen_onnuri.add(_okey)
         use_supabase_op = _supabase_orders_payments_available()
         # 성과 축하는 신규 INSERT 시에만 1회 트리거 (UPDATE/수정 시 미설정). INSERT 전 메타데이터 수집.
         today_iso = order_date.isoformat() if hasattr(order_date, "isoformat") else str(_today_kst())
@@ -29592,6 +29747,14 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                 st.error("온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
                 return
             onnuri_code = last4_digits
+            if _onnuri_ident_already_used(db_filename, last4_digits, actual_paid_int, pay_date_str):
+                st.error(f"온누리 {last4_digits} · {actual_paid_int:,}원 · {pay_date_str} 결제가 이미 있습니다.")
+                return
+        if split_method == "지역화폐":
+            _appr = re.sub(r"\D", "", str(split_card or ""))
+            if _ulsan_approval_already_used(db_filename, _appr):
+                st.error(f"지역화폐 승인번호 {_appr} 는 이미 등록된 결제입니다.")
+                return
 
         errors = []
         success_count = 0
@@ -29826,6 +29989,32 @@ def _customer_balance_payment_ui(
             st.error(f"결제 #{idx1} 온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
             return
         onnuri_codes[s["index"]] = last4_digits
+
+    _seen_ulsan_add: set[str] = set()
+    _seen_onnuri_add: set[tuple[str, int]] = set()
+    for s in active:
+        idx1 = s["index"] + 1
+        method = s["method"] or ""
+        amt = int(s["amount"])
+        if method == "지역화폐":
+            _appr = re.sub(r"\D", "", str(s.get("card_company") or ""))
+            if _appr in _seen_ulsan_add:
+                st.error(f"결제 #{idx1}: 같은 화면에 지역화폐 승인번호 {_appr} 가 중복됩니다.")
+                return
+            if _ulsan_approval_already_used(db_filename, _appr):
+                st.error(f"결제 #{idx1}: 지역화폐 승인번호 {_appr} 는 이미 등록된 결제입니다.")
+                return
+            _seen_ulsan_add.add(_appr)
+        elif s.get("is_onnuri"):
+            _last4 = onnuri_codes.get(s["index"]) or ""
+            _okey = (_last4, amt)
+            if _okey in _seen_onnuri_add:
+                st.error(f"결제 #{idx1}: 같은 화면에 온누리 식별자 {_last4} / {amt:,}원이 중복됩니다.")
+                return
+            if _onnuri_ident_already_used(db_filename, _last4, amt, pay_date_str):
+                st.error(f"결제 #{idx1}: 온누리 {_last4} · {amt:,}원 · {pay_date_str} 결제가 이미 있습니다.")
+                return
+            _seen_onnuri_add.add(_okey)
 
     added_total = int(sum(int(s["amount"]) for s in active))
     slot_snapshots = [
@@ -32150,6 +32339,10 @@ def render_customer_balance():
                                                                 st.warning("메인페이 승인번호 4자리를 정확히 입력하세요.")
                                                             elif new_method == "지역화폐" and len(re.sub(r"\D", "", (new_card_company or "").strip())) != 6:
                                                                 st.warning("지역화폐 승인번호 6자리를 정확히 입력하세요.")
+                                                            elif new_method == "지역화폐" and new_amount > 0 and _ulsan_approval_already_used(
+                                                                db_filename, new_card_company, exclude_payment_id=int(prow["id"]),
+                                                            ):
+                                                                st.warning("지역화폐 승인번호가 이미 다른 결제에 등록되어 있습니다.")
                                                             elif "온누리" in str(new_method) and "지류" not in str(new_method) and len(re.sub(r"\D", "", (new_onnuri_code or "").strip())) != 4:
                                                                 st.warning("온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
                                                             else:
