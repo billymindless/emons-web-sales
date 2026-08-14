@@ -26223,6 +26223,20 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         ):
             st.session_state[_off_key] = min(_max_off, _off + _step)
             st.rerun()
+    _dl = df[_all_cols].copy()
+    if _flag_col in df.columns:
+        _dl["가공번호의심"] = df[_flag_col].map(lambda v: "Y" if bool(v) else "")
+    _buf = io.BytesIO()
+    with pd.ExcelWriter(_buf, engine="openpyxl") as _ew:
+        _dl.to_excel(_ew, index=False, sheet_name="검증결과")
+    _src_fn = "ulsanpay" if sel_src == "ulsanpay" else "onnuri"
+    st.download_button(
+        "📥 엑셀 다운로드",
+        data=_buf.getvalue(),
+        file_name=f"외부결제대사_{_src_fn}_{sel_db}_{datetime.now(tz=KST).strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"extpay_xlsx_{sel_db}_{sel_src}",
+    )
     st.caption(
         "빨간 행: 공식 파일에 승인번호가 없고 ERP에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
         "결과 코드: matched_ok=정상 · official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
