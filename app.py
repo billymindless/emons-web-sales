@@ -26169,7 +26169,39 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         if df.empty:
             st.success("표시할 알림이 없습니다. (모두 정상 매칭)")
             return
-    st.dataframe(df, width="stretch", hide_index=True)
+    _all_cols = list(df.columns)
+    _visible_n = 8
+    _step = 3
+    _off_key = f"extpay_col_off_{sel_db}_{sel_src}"
+    _max_off = max(0, len(_all_cols) - _visible_n)
+    _off = int(st.session_state.get(_off_key, 0) or 0)
+    _off = min(max(0, _off), _max_off)
+    st.session_state[_off_key] = _off
+    _show_cols = _all_cols[_off:_off + _visible_n]
+    st.dataframe(df[_show_cols], width="stretch", hide_index=True)
+    _nav_l, _nav_m, _nav_r = st.columns([1, 4, 1])
+    with _nav_l:
+        if st.button(
+            "◀",
+            key=f"extpay_col_left_{sel_db}_{sel_src}",
+            disabled=_off <= 0,
+            help="왼쪽 열로 이동",
+            width="stretch",
+        ):
+            st.session_state[_off_key] = max(0, _off - _step)
+            st.rerun()
+    with _nav_m:
+        st.caption(f"{_show_cols[0]}  ~  {_show_cols[-1]}" if _show_cols else "")
+    with _nav_r:
+        if st.button(
+            "▶",
+            key=f"extpay_col_right_{sel_db}_{sel_src}",
+            disabled=_off >= _max_off,
+            help="오른쪽 열로 이동",
+            width="stretch",
+        ):
+            st.session_state[_off_key] = min(_max_off, _off + _step)
+            st.rerun()
     st.caption(
         "결과 코드: matched_ok=정상 · official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
         "official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
