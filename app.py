@@ -26450,15 +26450,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             return
     _flag_col = "_fabricated"
     _all_cols = [c for c in df.columns if c != _flag_col]
-    _visible_n = 8
-    _step = 3
-    _off_key = f"extpay_col_off_{sel_db}_{sel_src}"
-    _max_off = max(0, len(_all_cols) - _visible_n)
-    _off = int(st.session_state.get(_off_key, 0) or 0)
-    _off = min(max(0, _off), _max_off)
-    st.session_state[_off_key] = _off
-    _show_cols = _all_cols[_off:_off + _visible_n]
-    _show = df[_show_cols]
+    _show = df[_all_cols]
     _red = (
         df[_flag_col].reindex(_show.index).fillna(False).astype(bool)
         if _flag_col in df.columns
@@ -26470,30 +26462,11 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             return ["background-color: #ffe6e6; color: #b30000; font-weight: 600;"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(_show.style.apply(_hl_fabricated, axis=1), width="stretch", hide_index=True)
-    _nav_l, _nav_m, _nav_r = st.columns([1, 4, 1])
-    with _nav_l:
-        if st.button(
-            "◀",
-            key=f"extpay_col_left_{sel_db}_{sel_src}",
-            disabled=_off <= 0,
-            help="왼쪽 열로 이동",
-            width="stretch",
-        ):
-            st.session_state[_off_key] = max(0, _off - _step)
-            st.rerun()
-    with _nav_m:
-        st.caption(f"{_show_cols[0]}  ~  {_show_cols[-1]}" if _show_cols else "")
-    with _nav_r:
-        if st.button(
-            "▶",
-            key=f"extpay_col_right_{sel_db}_{sel_src}",
-            disabled=_off >= _max_off,
-            help="오른쪽 열로 이동",
-            width="stretch",
-        ):
-            st.session_state[_off_key] = min(_max_off, _off + _step)
-            st.rerun()
+    st.dataframe(
+        _show.style.apply(_hl_fabricated, axis=1),
+        width="content",
+        hide_index=True,
+    )
     _dl = df[_all_cols].copy()
     if _flag_col in df.columns:
         _dl["가공번호의심"] = df[_flag_col].map(lambda v: "Y" if bool(v) else "")
