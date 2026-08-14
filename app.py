@@ -2973,14 +2973,15 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
     emp_map = _fetch_order_employee_names_map_by_ids(db_filename, order_ids)
 
     pay_amt_by_id: dict[int, int] = {}
-    pays_by_approval: dict[str, list[int]] = {}
+    pay_date_by_id: dict[int, str] = {}
+    pays_by_approval: dict[str, list[tuple[int, str]]] = {}
     uniq_pids = sorted(set(payment_ids))
     if uniq_pids:
         try:
             for chunk in (uniq_pids[i : i + 200] for i in range(0, len(uniq_pids), 200)):
                 pr = (
                     sc.table("app_payments")
-                    .select("id, amount, card_company, payment_method")
+                    .select("id, amount, payment_date, card_company, payment_method")
                     .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
                     .in_("id", chunk)
                     .execute()
@@ -2994,10 +2995,12 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
                         pay_amt_by_id[pid] = int(p.get("amount") or 0)
                     except (TypeError, ValueError):
                         pay_amt_by_id[pid] = 0
+                    pay_date_by_id[pid] = str(p.get("payment_date") or "")[:10]
         except Exception:
             pay_amt_by_id = {}
+            pay_date_by_id = {}
 
-    # 동일 승인번호 후보(ambiguous) — 해당 승인번호의 ERP 금액을 모두 모아 표시
+    # 동일 승인번호 후보(ambiguous) — 해당 승인번호의 ERP 금액·일자를 모두 모아 표시
     amb_approvals = []
     if source == "ulsanpay":
         for r in rows:
@@ -3013,7 +3016,7 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
             for chunk in (amb_approvals[i : i + 100] for i in range(0, len(amb_approvals), 100)):
                 pr = (
                     sc.table("app_payments")
-                    .select("id, amount, card_company, payment_method")
+                    .select("id, amount, payment_date, card_company, payment_method")
                     .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
                     .in_("card_company", chunk)
                     .execute()
@@ -3030,7 +3033,8 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
                         amt = int(p.get("amount") or 0)
                     except (TypeError, ValueError):
                         amt = 0
-                    pays_by_approval.setdefault(ap, []).append(amt)
+                    pdt = str(p.get("payment_date") or "")[:10]
+                    pays_by_approval.setdefault(ap, []).append((amt, pdt))
         except Exception:
             pays_by_approval = {}
 
@@ -3055,16 +3059,19 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
         ap = _ext_pay_digits_only(r.get("approval_code"))
         if len(ap) >= 6:
             ap = ap[-6:]
-        erp_amts = pays_by_approval.get(ap) if (m.get("result_code") == "ambiguous" and ap) else None
-        if erp_amts:
-            erp_amt_disp = " / ".join(str(a) for a in erp_amts)
-        elif pid_int is not None and pid_int in pay_amt_by_id:
-            erp_amt_disp = str(pay_amt_by_id[pid_int])
+        erp_pairs = pays_by_approval.get(ap) if (m.get("result_code") == "ambiguous" and ap) else None
+        if erp_pairs:
+            erp_amt_disp = " / ".join(str(a) for a, _ in erp_pairs)
+            erp_date_disp = " / ".join(d for _, d in erp_pairs if d)
+        elif pid_int is not None:
+            erp_amt_disp = str(pay_amt_by_id[pid_int]) if pid_int in pay_amt_by_id else ""
+            erp_date_disp = pay_date_by_id.get(pid_int) or ""
         else:
             erp_amt_disp = ""
+            erp_date_disp = ""
         data.append({
-            "일자": r.get("tx_date"),
-            "시간": r.get("tx_time") or "",
+            "공식일자": str(r.get("tx_date") or "")[:10],
+            "ERP일자": erp_date_disp,
             "뒤4": r.get("phone_last4") or "",
             "승인번호": r.get("approval_code") or "",
             "공식금액": official_amt,
