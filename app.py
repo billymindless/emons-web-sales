@@ -3150,6 +3150,7 @@ def _ext_pay_list_matches_df(
 
     pay_amt_by_id: dict[int, int] = {}
     pay_date_by_id: dict[int, str] = {}
+    pay_ap_by_id: dict[int, str] = {}
     pays_by_approval: dict[str, list[tuple[int, str]]] = {}
     uniq_pids = sorted(set(payment_ids))
     if uniq_pids:
@@ -3172,9 +3173,12 @@ def _ext_pay_list_matches_df(
                     except (TypeError, ValueError):
                         pay_amt_by_id[pid] = 0
                     pay_date_by_id[pid] = str(p.get("payment_date") or "")[:10]
+                    _ap = _ext_pay_digits_only(p.get("card_company"))
+                    pay_ap_by_id[pid] = _ap[-6:] if len(_ap) >= 6 else _ap
         except Exception:
             pay_amt_by_id = {}
             pay_date_by_id = {}
+            pay_ap_by_id = {}
 
     # 동일 승인번호 후보(ambiguous) — 해당 승인번호의 ERP 금액·일자를 모두 모아 표시
     amb_approvals = []
@@ -3245,6 +3249,7 @@ def _ext_pay_list_matches_df(
         else:
             erp_amt_disp = ""
             erp_date_disp = ""
+        erp_ap = pay_ap_by_id.get(pid_int, "") if pid_int is not None else ""
         data.append({
             "공식일자": str(r.get("tx_date") or "")[:10],
             "ERP일자": erp_date_disp,
@@ -3260,6 +3265,7 @@ def _ext_pay_list_matches_df(
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
             "메모": m.get("note") or "",
+            "_fabricated": (not ap) and bool(erp_ap),
         })
     for p in erp_only_pays:
         try:
@@ -3272,6 +3278,7 @@ def _ext_pay_list_matches_df(
             oid_int = None
         cust = cust_map.get(cid_int) or {}
         amt = int(p.get("amount") or 0)
+        erp_ap = _ext_pay_digits_only(p.get("approval_code") or p.get("phone_last4"))
         data.append({
             "공식일자": "",
             "ERP일자": p.get("payment_date") or "",
@@ -3286,7 +3293,8 @@ def _ext_pay_list_matches_df(
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
-            "메모": "공식 파일에 없음",
+            "메모": "공식 파일에 없음 · 가공 번호 의심",
+            "_fabricated": bool(erp_ap),
         })
     return pd.DataFrame(data)
 
@@ -26169,7 +26177,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         if df.empty:
             st.success("표시할 알림이 없습니다. (모두 정상 매칭)")
             return
-    _all_cols = list(df.columns)
+    _flag_col = "_fabricated"
+    _all_cols = [c for c in df.columns if c != _flag_col]
     _visible_n = 8
     _step = 3
     _off_key = f"extpay_col_off_{sel_db}_{sel_src}"
@@ -26178,7 +26187,19 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     _off = min(max(0, _off), _max_off)
     st.session_state[_off_key] = _off
     _show_cols = _all_cols[_off:_off + _visible_n]
-    st.dataframe(df[_show_cols], width="stretch", hide_index=True)
+    _show = df[_show_cols]
+    _red = (
+        df[_flag_col].reindex(_show.index).fillna(False).astype(bool)
+        if _flag_col in df.columns
+        else pd.Series(False, index=_show.index)
+    )
+
+    def _hl_fabricated(row):
+        if bool(_red.loc[row.name]):
+            return ["background-color: #ffe6e6; color: #b30000; font-weight: 600;"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(_show.style.apply(_hl_fabricated, axis=1), width="stretch", hide_index=True)
     _nav_l, _nav_m, _nav_r = st.columns([1, 4, 1])
     with _nav_l:
         if st.button(
@@ -26203,6 +26224,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             st.session_state[_off_key] = min(_max_off, _off + _step)
             st.rerun()
     st.caption(
+        "빨간 행: 공식 파일에 승인번호가 없고 ERP에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
         "결과 코드: matched_ok=정상 · official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
         "official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
         "erp_canceled_official_paid=ERP 취소인데 공식 결제완료 · ambiguous=시간까지 봐도 특정 불가 · 미매칭=아직 매칭 미실행"
