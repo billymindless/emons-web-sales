@@ -2143,20 +2143,16 @@ def _ext_pay_parse_onnuri_file(uploaded_file) -> tuple[list[dict], str | None]:
     if df is None or df.empty:
         return [], "파일에 데이터가 없습니다."
 
-    # 상단에 매장정보/필터 헤더가 있는 경우: '거래일자' 등 실제 헤더가 나올 때까지 스킵
-    if not any(str(c).replace(" ", "").strip() in {"거래일자", "결제일자", "거래일"} for c in df.columns):
-        for i in range(min(len(df), 10)):
-            row_vals = [str(v).replace(" ", "").strip() for v in df.iloc[i].tolist()]
-            if any(v in {"거래일자", "결제일자", "거래일"} for v in row_vals):
-                new_cols = df.iloc[i].tolist()
-                df = df.iloc[i + 1:].reset_index(drop=True)
-                df.columns = new_cols
-                break
+    # 상단 가맹점명/사업자번호 행 스킵 → 거래일자·구매자전화번호 헤더 승격
+    df = _ext_pay_promote_header_row(df, {"거래일자", "결제일자", "거래일", "구매자전화번호", "결제금액(원)", "결제금액"})
 
     colmap = _ext_pay_map_columns(df.columns)
-    required = ("tx_date", "amount")
+    required = ("tx_date", "amount", "phone")
     if not all(k in colmap for k in required):
-        return [], f"필수 컬럼(거래일자, 결제금액)을 찾을 수 없습니다. 감지된 컬럼: {list(df.columns)}"
+        return [], (
+            "필수 컬럼(거래일자, 구매자전화번호, 결제금액)을 찾을 수 없습니다. "
+            f"감지된 컬럼: {list(df.columns)}"
+        )
 
     out: list[dict] = []
     for _, row in df.iterrows():
@@ -2508,6 +2504,11 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
     neg_orders = {int(p["order_id"]) for p in pays if p.get("order_id") is not None and (p.get("amount") or 0) < 0}
 
     def _phone_last4_for(pay: dict) -> str | None:
+        # 1) 신규매출 입력 시 저장한 전화번호 뒤 4자리 (onnuri_approval_code 재사용)
+        stored = _ext_pay_digits_only(pay.get("onnuri_approval_code"))
+        if len(stored) >= 4:
+            return stored[-4:]
+        # 2) 스탬프 이전 건: 고객 phone1 폴백
         oid = pay["_order"].get("customer_id")
         if oid is None:
             return None
@@ -27071,30 +27072,17 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
         ),
     },
     {
-        "title": "온누리상품권 승인번호를 8자리 이상 전체로 입력해야 하는 경우는 언제인가요?",
+        "title": "온누리 결제 시 전화번호 뒤 4자리는 어디에 있는 숫자인가요?",
         "keywords": (
-            "온누리 승인번호 8자리 전체 4자리 중복 전자상품권 중복 검증 dup "
-            "온누리 중복 동일 결제일 분배 결제 잔금"
+            "온누리 전화번호 4자리 승인번호 구매자전화번호 검증파일 "
+            "디지털 온누리 매출내역 식별자"
         ),
         "body": (
-            "온누리(전자)상품권 결제 시 승인번호는 **두 단계**로 입력받습니다.\n\n"
-            "**1단계 — 뒤 4자리 입력 (기본)**\n\n"
-            "일반적인 경우 승인번호 **뒤 4자리**만 입력합니다. "
-            "입력 후 등록 버튼을 누르면 시스템이 **동일 결제일 + 동일 뒤 4자리** 조합이 이미 등록된 건이 있는지 자동으로 확인합니다.\n\n"
-            "**2단계 — 전체 8자리 이상 입력 (중복 의심 시)**\n\n"
-            "아래 오류 메시지가 뜨면 2단계로 진행해야 합니다.\n\n"
-            "> ⚠️ 동일한 결제일, 승인번호 4자리를 가진 온누리 기록이 이미 존재합니다. "
-            "정상 중복 건일 경우 승인번호 전체(8자리 이상)를 입력하세요.\n\n"
-            "이 경우 승인번호 **전체(8자리 이상)** 를 입력하면 중복 여부를 다시 판단하지 않고 등록할 수 있습니다. "
-            "승인번호 전체가 다르면 별개의 정상 결제이므로 등록해도 됩니다.\n\n"
-            "**언제 2단계가 필요한가요?**\n\n"
-            "- 같은 날 동일한 뒤 4자리를 가진 온누리상품권을 **두 건 이상** 처리하는 경우 "
-            "(서로 다른 고객, 또는 실제 다른 상품권인 경우)\n"
-            "- **온누리 중복 입력 오류**가 아니라 **실제 다른 건**임을 확인한 경우\n\n"
-            "**주의**\n\n"
-            "2단계(전체 8자리) 입력은 중복 차단을 우회하는 수단이므로, "
-            "실제 동일한 상품권이 아닌지 반드시 **영수증·승인번호를 육안으로 확인**한 후 입력하세요. "
-            "이 과정은 **잔금 결제**와 **복수 주문 분배 결제** 양쪽 모두 동일하게 적용됩니다."
+            "온누리(전자) 결제 식별자는 **승인번호가 아니라 구매자 전화번호 뒤 4자리**입니다.\n\n"
+            "가맹점 포털의 **디지털 온누리 매출내역** 파일 `구매자전화번호` 열 "
+            "(예: `010****2414`)의 **2414** 를 그대로 입력하세요.\n\n"
+            "외부파일 대사는 **결제일 + 전화번호 뒤 4자리 + 결제금액** 으로 매칭합니다. "
+            "영수증의 승인번호를 넣으면 검증파일과 맞지 않습니다."
         ),
     },
 ]
@@ -28744,29 +28732,23 @@ def render_new_sales():
             _ak = amt_key
             st.text_input(f"금액 #{i+1} *", key=_ak, on_change=lambda k=_ak: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))))
         total_payment_int += _parse_comma_to_int(st.session_state.get(amt_key, "0"))
-        # 온누리상품권 전용 승인번호/영수증 입력 UI (전자상품권 '온누리'만 해당, '온누리지류'는 승인번호 불필요)
+        # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리. 온누리지류는 불필요.
         is_onnuri = method and ("온누리" in str(method)) and ("지류" not in str(method))
-        onnuri_stage_key = f"pay_onnuri_stage_{i}"
         last4_key = f"pay_onnuri_last4_{i}"
-        full_key = f"pay_onnuri_full_{i}"
         receipt_key = f"pay_onnuri_receipt_{i}"
         if is_onnuri:
-            if onnuri_stage_key not in st.session_state:
-                st.session_state[onnuri_stage_key] = "last4"
-            stage = st.session_state.get(onnuri_stage_key, "last4")
-            if stage == "last4":
-                st.text_input(f"온누리 승인번호 뒤 4자리 #{i+1} *", key=last4_key, max_chars=4)
-            else:
-                st.text_input(f"온누리 승인번호 전체 (8자리 이상) #{i+1} *", key=full_key)
+            st.text_input(
+                f"온누리 전화번호 뒤 4자리 #{i+1} *",
+                key=last4_key,
+                max_chars=4,
+                help="검증파일의 구매자전화번호(예: 010****2414) 뒤 4자리와 동일하게 입력하세요.",
+            )
             _file_input_with_paste(
                 "온누리상품권 영수증 사진(선택)",
                 type=["png", "jpg", "jpeg", "webp"],
                 accept_multiple_files=False,
                 key=receipt_key,
             )
-        else:
-            # 다른 결제 수단으로 변경되면 단계 상태는 초기화
-            st.session_state.pop(onnuri_stage_key, None)
     balance = final_sales - total_payment_int
     st.metric("잔금 (미수금)", f"{balance:,}원", help="최종 총 판매금액 - 누적 결제금액")
 
@@ -28926,9 +28908,7 @@ def render_new_sales():
                 if len(_appr) != 6:
                     st.error(f"결제 #{i+1} 지역화폐 승인번호 6자리를 정확히 입력하세요.")
                     st.stop()
-        # 온누리상품권 결제에 대한 부정 사용 방지 검증
-        # 1차: 승인번호 뒤 4자리 + 결제일 기준 중복 여부 확인 (금액 제외)
-        # 중복 발견 시 해당 슬롯은 전체 승인번호(8자리 이상) 입력 단계로 전환
+        # 온누리(전자): 검증파일 구매자전화번호 뒤 4자리 필수
         for i in range(slot_count):
             method = st.session_state.get(f"pay_method_{i}", "")
             amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
@@ -28936,46 +28916,11 @@ def render_new_sales():
                 continue
             if not method or "온누리" not in str(method) or "지류" in str(method):
                 continue
-            stage_key = f"pay_onnuri_stage_{i}"
-            last4_key = f"pay_onnuri_last4_{i}"
-            full_key = f"pay_onnuri_full_{i}"
-            stage = st.session_state.get(stage_key, "last4")
-            pay_date_str = order_date.isoformat()
-            if stage == "last4":
-                last4_raw = (st.session_state.get(last4_key, "") or "").strip()
-                last4_digits = re.sub(r"\D", "", last4_raw)
-                if len(last4_digits) != 4:
-                    st.error("온누리상품권 결제의 승인번호 뒤 4자리를 정확히 입력하세요.")
-                    st.stop()
-                # 동일 결제일+승인번호 4자리 조합이 이미 존재하는지 교차 검증 (금액 제외)
-                if _supabase_orders_payments_available():
-                    dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
-                else:
-                    conn_chk = get_tenant_conn(db_filename)
-                    try:
-                        dup_cnt = conn_chk.execute(
-                            """
-                            SELECT COUNT(*) FROM Payments
-                            WHERE payment_method LIKE '%온누리%'
-                              AND payment_date = ?
-                              AND onnuri_approval_code IS NOT NULL
-                              AND substr(onnuri_approval_code, -4) = ?
-                            """,
-                            (pay_date_str, last4_digits),
-                        ).fetchone()[0]
-                    finally:
-                        conn_chk.close()
-                if dup_cnt > 0:
-                    # 전체 승인번호(8자리 이상) 입력 단계로 전환
-                    st.session_state[stage_key] = "full"
-                    st.error("⚠️ 동일한 결제일, 금액, 승인번호 4자리를 가진 기록이 이미 존재합니다. 정상 중복 건일 경우 승인번호 '전체 8자리 이상'을 입력해 주세요.")
-                    st.stop()
-            else:
-                full_code_raw = (st.session_state.get(full_key, "") or "").strip()
-                full_digits = re.sub(r"\D", "", full_code_raw)
-                if len(full_digits) < 8:
-                    st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
-                    st.stop()
+            last4_raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
+            last4_digits = re.sub(r"\D", "", last4_raw)
+            if len(last4_digits) != 4:
+                st.error(f"결제 #{i+1} 온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
+                st.stop()
         use_supabase_op = _supabase_orders_payments_available()
         # 성과 축하는 신규 INSERT 시에만 1회 트리거 (UPDATE/수정 시 미설정). INSERT 전 메타데이터 수집.
         today_iso = order_date.isoformat() if hasattr(order_date, "isoformat") else str(_today_kst())
@@ -29029,11 +28974,7 @@ def render_new_sales():
                 total_paid_initial += amt
                 onnuri_code = None
                 if method and "온누리" in str(method) and "지류" not in str(method):
-                    stage = st.session_state.get(f"pay_onnuri_stage_{i}", "last4")
-                    if stage == "last4":
-                        raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
-                    else:
-                        raw = (st.session_state.get(f"pay_onnuri_full_{i}", "") or "").strip()
+                    raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
                     onnuri_code = re.sub(r"\D", "", raw) or None
                 _insert_payment_supabase(db_filename, {
                     "order_id": order_id,
@@ -29171,11 +29112,7 @@ def render_new_sales():
                     total_paid_initial += amt
                     onnuri_code = None
                     if method and "온누리" in str(method) and "지류" not in str(method):
-                        stage = st.session_state.get(f"pay_onnuri_stage_{i}", "last4")
-                        if stage == "last4":
-                            raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
-                        else:
-                            raw = (st.session_state.get(f"pay_onnuri_full_{i}", "") or "").strip()
+                        raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
                         onnuri_code = re.sub(r"\D", "", raw) or None
                     conn.execute("""
                         INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
@@ -29327,23 +29264,18 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         split_card = None
         st.session_state.pop(f"{key_prefix}_card", None)
 
-    # 온누리상품권 승인번호 (2단계 중복 검증)
-    is_onnuri_split = split_method and "온누리" in str(split_method)
-    _onnuri_stage_key = f"{key_prefix}_onnuri_stage"
+    # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리
+    is_onnuri_split = split_method and "온누리" in str(split_method) and "지류" not in str(split_method)
     _onnuri_last4_key = f"{key_prefix}_onnuri_last4"
-    _onnuri_full_key = f"{key_prefix}_onnuri_full"
     if is_onnuri_split:
-        if _onnuri_stage_key not in st.session_state:
-            st.session_state[_onnuri_stage_key] = "last4"
-        _onnuri_stage = st.session_state.get(_onnuri_stage_key, "last4")
-        if _onnuri_stage == "last4":
-            st.text_input("온누리 승인번호 뒤 4자리", key=_onnuri_last4_key, max_chars=4)
-        else:
-            st.text_input("온누리 승인번호 전체 (8자리 이상)", key=_onnuri_full_key)
+        st.text_input(
+            "온누리 전화번호 뒤 4자리",
+            key=_onnuri_last4_key,
+            max_chars=4,
+            help="검증파일의 구매자전화번호 뒤 4자리",
+        )
     else:
-        st.session_state.pop(_onnuri_stage_key, None)
         st.session_state.pop(_onnuri_last4_key, None)
-        st.session_state.pop(_onnuri_full_key, None)
         st.session_state.pop(f"{key_prefix}_onnuri", None)
 
     st.markdown("**주문별 배분 금액 입력**")
@@ -29414,46 +29346,15 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
             st.error(f"배분 합계({alloc_total:,}원)와 실제 입금액({actual_paid_int:,}원)이 일치하지 않습니다. 각 주문 배분 금액 또는 실제 입금액을 수정하세요.")
             return
 
-        # 온누리 중복 검증
         onnuri_code = None
         pay_date_str = split_date.isoformat() if hasattr(split_date, "isoformat") else _today_kst().isoformat()
         if is_onnuri_split:
-            _onnuri_stage = st.session_state.get(_onnuri_stage_key, "last4")
-            if _onnuri_stage == "last4":
-                last4_raw = (st.session_state.get(_onnuri_last4_key, "") or "").strip()
-                last4_digits = re.sub(r"\D", "", last4_raw)
-                if len(last4_digits) != 4:
-                    st.error("온누리상품권 승인번호 뒤 4자리를 정확히 입력하세요.")
-                    return
-                if _supabase_orders_payments_available():
-                    dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
-                else:
-                    conn_chk = get_tenant_conn(db_filename)
-                    try:
-                        dup_cnt = conn_chk.execute(
-                            """
-                            SELECT COUNT(*) FROM Payments
-                            WHERE payment_method LIKE '%온누리%'
-                              AND payment_date = ?
-                              AND onnuri_approval_code IS NOT NULL
-                              AND substr(onnuri_approval_code, -4) = ?
-                            """,
-                            (pay_date_str, last4_digits),
-                        ).fetchone()[0]
-                    finally:
-                        conn_chk.close()
-                if dup_cnt > 0:
-                    st.session_state[_onnuri_stage_key] = "full"
-                    st.error("⚠️ 동일한 결제일, 승인번호 4자리를 가진 온누리 기록이 이미 존재합니다. 정상 중복 건일 경우 승인번호 전체(8자리 이상)를 입력하세요.")
-                    return
-                onnuri_code = last4_digits
-            else:
-                full_raw = (st.session_state.get(_onnuri_full_key, "") or "").strip()
-                full_digits = re.sub(r"\D", "", full_raw)
-                if len(full_digits) < 8:
-                    st.error("온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
-                    return
-                onnuri_code = full_digits
+            last4_raw = (st.session_state.get(_onnuri_last4_key, "") or "").strip()
+            last4_digits = re.sub(r"\D", "", last4_raw)
+            if len(last4_digits) != 4:
+                st.error("온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
+                return
+            onnuri_code = last4_digits
 
         errors = []
         success_count = 0
@@ -29599,28 +29500,23 @@ def _customer_balance_payment_ui(
         amt_int = _parse_comma_to_int(st.session_state.get(a_key, "0"))
         total_amt_int += amt_int
 
-        # 온누리 승인번호/영수증 (전자상품권만, '온누리지류'는 제외)
+        # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리
         is_onnuri = method and ("온누리" in str(method)) and ("지류" not in str(method))
-        stage_key = _slot_key("onnuri_stage", i)
         last4_key = _slot_key("onnuri_last4", i)
-        full_key = _slot_key("onnuri_full", i)
         receipt_key = _slot_key("onnuri_receipt", i)
         if is_onnuri:
-            if stage_key not in st.session_state:
-                st.session_state[stage_key] = "last4"
-            stage = st.session_state.get(stage_key, "last4")
-            if stage == "last4":
-                st.text_input(f"온누리 승인번호 뒤 4자리 #{i+1} *", key=last4_key, max_chars=4)
-            else:
-                st.text_input(f"온누리 승인번호 전체 (8자리 이상) #{i+1} *", key=full_key)
+            st.text_input(
+                f"온누리 전화번호 뒤 4자리 #{i+1} *",
+                key=last4_key,
+                max_chars=4,
+                help="검증파일의 구매자전화번호 뒤 4자리",
+            )
             _file_input_with_paste(
                 f"온누리상품권 영수증 사진(선택) #{i+1}",
                 type=["png", "jpg", "jpeg", "webp"],
                 accept_multiple_files=False,
                 key=receipt_key,
             )
-        else:
-            st.session_state.pop(stage_key, None)
 
         slot_infos.append({
             "index": i,
@@ -29628,9 +29524,7 @@ def _customer_balance_payment_ui(
             "card_company": card_company,
             "amount": amt_int,
             "is_onnuri": bool(is_onnuri),
-            "stage_key": stage_key,
             "last4_key": last4_key,
-            "full_key": full_key,
         })
 
     _bal_after = float(balance) - float(total_amt_int)
@@ -29683,52 +29577,18 @@ def _customer_balance_payment_ui(
                 st.error(f"결제 #{idx1} 지역화폐 승인번호를 입력하세요.")
                 return
 
-    # 온누리 승인번호 검증 + 중복 체크 (last4 → full 단계 전환)
     onnuri_codes: dict[int, str | None] = {}
     for s in active:
         if not s["is_onnuri"]:
             onnuri_codes[s["index"]] = None
             continue
-        stage = st.session_state.get(s["stage_key"], "last4")
         idx1 = s["index"] + 1
-        if stage == "last4":
-            last4_raw = (st.session_state.get(s["last4_key"], "") or "").strip()
-            last4_digits = re.sub(r"\D", "", last4_raw)
-            if len(last4_digits) != 4:
-                st.error(f"결제 #{idx1} 온누리상품권 승인번호 뒤 4자리를 정확히 입력하세요.")
-                return
-            if _supabase_orders_payments_available():
-                dup_cnt = _count_payments_onnuri_dup_supabase(db_filename, pay_date_str, last4_digits)
-            else:
-                _conn_chk = get_tenant_conn(db_filename)
-                try:
-                    dup_cnt = _conn_chk.execute(
-                        """
-                        SELECT COUNT(*) FROM Payments
-                        WHERE payment_method LIKE '%온누리%'
-                          AND payment_date = ?
-                          AND onnuri_approval_code IS NOT NULL
-                          AND substr(onnuri_approval_code, -4) = ?
-                        """,
-                        (pay_date_str, last4_digits),
-                    ).fetchone()[0]
-                finally:
-                    _conn_chk.close()
-            if dup_cnt > 0:
-                st.session_state[s["stage_key"]] = "full"
-                st.error(
-                    f"⚠️ 결제 #{idx1}: 동일한 결제일·승인번호 뒤 4자리 조합이 이미 존재합니다. "
-                    "정상 중복 건일 경우 승인번호 '전체 8자리 이상'을 입력해 주세요."
-                )
-                return
-            onnuri_codes[s["index"]] = last4_digits
-        else:
-            full_raw = (st.session_state.get(s["full_key"], "") or "").strip()
-            full_digits = re.sub(r"\D", "", full_raw)
-            if len(full_digits) < 8:
-                st.error(f"결제 #{idx1} 온누리상품권 승인번호 전체(8자리 이상)를 정확히 입력하세요.")
-                return
-            onnuri_codes[s["index"]] = full_digits
+        last4_raw = (st.session_state.get(s["last4_key"], "") or "").strip()
+        last4_digits = re.sub(r"\D", "", last4_raw)
+        if len(last4_digits) != 4:
+            st.error(f"결제 #{idx1} 온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
+            return
+        onnuri_codes[s["index"]] = last4_digits
 
     added_total = int(sum(int(s["amount"]) for s in active))
     slot_snapshots = [
@@ -31974,8 +31834,9 @@ def render_customer_balance():
                                                             _cur_onnuri = prow.get("onnuri_approval_code") or ""
                                                             new_card_company = None
                                                             new_onnuri_code = st.text_input(
-                                                                "온누리 승인번호 *",
+                                                                "온누리 전화번호 뒤 4자리 *",
                                                                 value=_cur_onnuri,
+                                                                max_chars=4,
                                                                 key=f"pay_edit_card_{prow['id']}",
                                                             )
                                                         else:
@@ -32052,8 +31913,8 @@ def render_customer_balance():
                                                                 st.warning("메인페이 승인번호 4자리를 정확히 입력하세요.")
                                                             elif new_method == "지역화폐" and len(re.sub(r"\D", "", (new_card_company or "").strip())) != 6:
                                                                 st.warning("지역화폐 승인번호 6자리를 정확히 입력하세요.")
-                                                            elif "온누리" in str(new_method) and "지류" not in str(new_method) and not (new_onnuri_code or "").strip():
-                                                                st.warning("온누리 승인번호를 입력하세요.")
+                                                            elif "온누리" in str(new_method) and "지류" not in str(new_method) and len(re.sub(r"\D", "", (new_onnuri_code or "").strip())) != 4:
+                                                                st.warning("온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
                                                             else:
                                                                 receipt_path_saved = None
                                                                 if receipt_upload:
