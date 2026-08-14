@@ -2977,8 +2977,6 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
             "정산": r.get("settle_status") or "",
             "구매자": r.get("buyer_name_masked") or "",
             "결과": m.get("result_code") or "미매칭",
-            "결제ID": m.get("payment_id"),
-            "주문ID": m.get("order_id"),
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
             "메모": m.get("note") or "",
