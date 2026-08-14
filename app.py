@@ -1987,6 +1987,74 @@ def _ext_pay_save_settings(db_filename: str, verify_from: date, updated_by: str 
         return False, str(e)
 
 
+def _ext_pay_safe_raw(raw) -> dict | None:
+    """raw_json 을 JSON 직렬화 가능한 dict 로 정규화. 실패 시 None."""
+    if not raw:
+        return None
+    try:
+        import json as _json
+        return _json.loads(_json.dumps(raw, default=str, ensure_ascii=False))
+    except Exception:
+        return None
+
+
+def _ext_pay_select_paged(sc, table: str, columns: str, apply_filters, order_col: str = "id") -> list:
+    """PostgREST 1000행 상한을 넘어 페이지네이션으로 전체 조회."""
+    page = 1000
+    all_rows: list = []
+    offset = 0
+    while True:
+        q = apply_filters(sc.table(table).select(columns))
+        q = q.order(order_col).range(offset, offset + page - 1)
+        r = q.execute()
+        rows = r.data or []
+        all_rows.extend(rows)
+        if len(rows) < page:
+            break
+        offset += page
+    return all_rows
+
+
+def _ext_pay_list_batches(db_filename: str, limit: int = 20) -> list[dict]:
+    """매장 업로드 이력. 출처·업로더 무관 — 다른 관리자도 동일하게 조회."""
+    if not db_filename:
+        return []
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return []
+        r = (
+            sc.table("app_external_pay_batches")
+            .select("id, source, file_name, parsed_count, inserted_count, skipped_count, uploaded_by, uploaded_at")
+            .eq("db_filename", db_filename)
+            .order("uploaded_at", desc=True)
+            .limit(int(limit))
+            .execute()
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _ext_pay_count_rows(db_filename: str, source: str | None = None) -> int:
+    """저장된 공식 행 수. 날짜 필터 없이 저장 여부 확인용."""
+    if not db_filename:
+        return 0
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return 0
+        q = sc.table("app_external_pay_rows").select("id", count="exact").eq("db_filename", db_filename)
+        if source:
+            q = q.eq("source", source)
+        r = q.limit(1).execute()
+        if getattr(r, "count", None) is not None:
+            return int(r.count)
+        return len(r.data or [])
+    except Exception:
+        return 0
+
+
 _ONNURI_HEADER_ALIASES = {
     "tx_date":       ("거래일자", "거래일", "결제일자", "결제일", "일자"),
     "tx_time":       ("거래시간", "결제시간", "시간"),
@@ -2305,6 +2373,7 @@ def _ext_pay_insert_batch_and_rows(
 
     inserted = 0
     duplicates = 0
+    first_row_err: str | None = None
     batch_id: int | None = None
     try:
         br = sc.table("app_external_pay_batches").insert({
@@ -2337,20 +2406,19 @@ def _ext_pay_insert_batch_and_rows(
             "settle_status": r.get("settle_status"),
             "buyer_name_masked": r.get("buyer_name_masked"),
             "approval_code": r.get("approval_code"),
-            "raw_json": r.get("raw"),
+            "raw_json": _ext_pay_safe_raw(r.get("raw")),
             "fingerprint": fp,
         }
         try:
             sc.table("app_external_pay_rows").insert(payload).execute()
             inserted += 1
         except Exception as e:
-            # UNIQUE(fingerprint) 위반이면 중복 skip. 그 외는 오류로 표시.
             msg = str(e).lower()
             if "duplicate" in msg or "unique" in msg or "23505" in msg or "conflict" in msg:
                 duplicates += 1
                 continue
-            # 정합성 실패 1건은 무시하고 계속 (파싱 문제 등)
-            duplicates += 0
+            if first_row_err is None:
+                first_row_err = str(e)
             continue
 
     try:
@@ -2361,6 +2429,8 @@ def _ext_pay_insert_batch_and_rows(
             }).eq("id", batch_id).execute()
     except Exception:
         pass
+    if inserted == 0 and filtered and first_row_err:
+        return inserted, before_date, duplicates, f"행 저장 실패: {first_row_err}"
     return inserted, before_date, duplicates, None
 
 
@@ -2842,34 +2912,35 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
     return counts, None
 
 
-def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date) -> "pd.DataFrame":
+def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | None) -> "pd.DataFrame":
     """관리자 UI 표시용: 공식 행 + 매칭 결과 조인 DataFrame.
-    ERP-only는 별도 조회 후 추가."""
+    verify_from 이 None 이면 날짜 필터 없이 해당 매장·출처 전체."""
     sc, err = get_supabase_client()
     if err or not sc:
         return pd.DataFrame()
     try:
-        rr = (
-            sc.table("app_external_pay_rows")
-            .select("id, tx_date, tx_time, phone_last4, amount, tx_status, settle_status, buyer_name_masked, approval_code")
-            .eq("db_filename", db_filename)
-            .eq("source", source)
-            .gte("tx_date", verify_from.isoformat())
-            .order("tx_date")
-            .execute()
+        def _filt_rows(q):
+            q = q.eq("db_filename", db_filename).eq("source", source)
+            if verify_from is not None:
+                q = q.gte("tx_date", verify_from.isoformat())
+            return q
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            "id, tx_date, tx_time, phone_last4, amount, tx_status, settle_status, buyer_name_masked, approval_code",
+            _filt_rows, order_col="id",
         )
-        rows = rr.data or []
+        rows.sort(key=lambda r: (str(r.get("tx_date") or ""), str(r.get("tx_time") or ""), int(r.get("id") or 0)))
     except Exception:
         rows = []
     try:
-        mr = (
-            sc.table("app_external_pay_matches")
-            .select("row_id, payment_id, order_id, customer_id, result_code, note")
-            .eq("db_filename", db_filename)
-            .eq("source", source)
-            .execute()
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename).eq("source", source)
+        matches = _ext_pay_select_paged(
+            sc, "app_external_pay_matches",
+            "row_id, payment_id, order_id, customer_id, result_code, note",
+            _filt_m, order_col="id",
         )
-        m_by_row = {int(m["row_id"]): m for m in (mr.data or []) if m.get("row_id") is not None}
+        m_by_row = {int(m["row_id"]): m for m in matches if m.get("row_id") is not None}
     except Exception:
         m_by_row = {}
 
@@ -25495,6 +25566,27 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         key="extpay_scope_db",
     )
 
+    _src_label = {"onnuri": "온누리", "ulsanpay": "울산페이"}
+    batches = _ext_pay_list_batches(sel_db, limit=20)
+    if batches:
+        st.markdown("##### 업로드 이력 (모든 관리자 공통)")
+        st.caption("한 명이 올린 파일은 같은 매장을 보면 다른 관리자에게도 동일하게 보입니다.")
+        st.dataframe(
+            pd.DataFrame([{
+                "시각": str(b.get("uploaded_at") or "")[:19],
+                "출처": _src_label.get(b.get("source"), b.get("source")),
+                "파일": b.get("file_name") or "-",
+                "파싱": int(b.get("parsed_count") or 0),
+                "신규적재": int(b.get("inserted_count") or 0),
+                "skip": int(b.get("skipped_count") or 0),
+                "업로더": b.get("uploaded_by") or "-",
+            } for b in batches]),
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.caption("이 매장에 저장된 업로드 이력이 없습니다. (테이블 미생성 또는 아직 업로드 없음)")
+
     cur_from = _ext_pay_load_settings(sel_db)
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -25581,15 +25673,37 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
                         st.rerun()
 
     st.markdown("##### 검증 결과")
-    only_alerts = st.checkbox(
-        "미결·취소 의심만 보기",
-        value=False,
-        key=f"extpay_only_alerts_{sel_db}_{sel_src}",
-    )
-    df = _ext_pay_list_matches_df(sel_db, sel_src, new_from)
+    f1, f2 = st.columns(2)
+    with f1:
+        only_alerts = st.checkbox(
+            "미결·취소 의심만 보기",
+            value=False,
+            key=f"extpay_only_alerts_{sel_db}_{sel_src}",
+        )
+    with f2:
+        show_all_saved = st.checkbox(
+            "검증 시작일 이전 저장분도 보기",
+            value=True,
+            key=f"extpay_show_all_{sel_db}_{sel_src}",
+            help="다른 관리자가 올린 건을 시작일 필터에 가리지 않고 봅니다.",
+        )
+    saved_n = _ext_pay_count_rows(sel_db, sel_src)
+    df = _ext_pay_list_matches_df(sel_db, sel_src, None if show_all_saved else new_from)
     if df.empty:
-        st.caption("아직 매칭 결과가 없습니다. 파일을 업로드하면 여기에 표시됩니다.")
+        if saved_n > 0:
+            st.warning(
+                f"이 출처로 **{saved_n}건이 저장**되어 있습니다. "
+                "검증 시작일을 더 이르게 하거나 '시작일 이전 저장분도 보기'를 켜 주세요."
+            )
+        elif batches:
+            st.warning(
+                "업로드 이력은 있으나 이 출처(온누리/울산페이)의 저장 행이 없습니다. "
+                "라디오에서 올린 출처를 선택해 주세요."
+            )
+        else:
+            st.caption("아직 매칭 결과가 없습니다. 파일을 업로드하면 여기에 표시됩니다.")
         return
+    st.caption(f"표시 {len(df)}건 · DB 저장 {saved_n}건 ({src_labels.get(sel_src, sel_src)})")
     if sel_src == "ulsanpay" and "뒤4" in df.columns:
         df = df.drop(columns=["뒤4", "구매자", "정산"], errors="ignore")
     elif sel_src == "onnuri" and "승인번호" in df.columns:
