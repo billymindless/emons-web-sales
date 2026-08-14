@@ -2945,18 +2945,25 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
         m_by_row = {}
 
     cust_ids: list[int] = []
+    order_ids: list[int] = []
     for m in m_by_row.values():
         cid = m.get("customer_id")
-        if cid is None:
-            continue
-        try:
-            cust_ids.append(int(cid))
-        except (TypeError, ValueError):
-            continue
+        if cid is not None:
+            try:
+                cust_ids.append(int(cid))
+            except (TypeError, ValueError):
+                pass
+        oid = m.get("order_id")
+        if oid is not None:
+            try:
+                order_ids.append(int(oid))
+            except (TypeError, ValueError):
+                pass
     cust_map: dict = {}
     uniq_cids = sorted(set(cust_ids))
     for i in range(0, len(uniq_cids), 100):
         cust_map.update(_get_customers_by_ids_supabase(db_filename, uniq_cids[i : i + 100]))
+    emp_map = _fetch_order_employee_names_map_by_ids(db_filename, order_ids)
 
     data: list[dict] = []
     for r in rows:
@@ -2966,6 +2973,10 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
             cid_int = int(cid) if cid is not None else None
         except (TypeError, ValueError):
             cid_int = None
+        try:
+            oid_int = int(m["order_id"]) if m.get("order_id") is not None else None
+        except (TypeError, ValueError):
+            oid_int = None
         cust = cust_map.get(cid_int) or {}
         data.append({
             "일자": r.get("tx_date"),
@@ -2979,6 +2990,7 @@ def _ext_pay_list_matches_df(db_filename: str, source: str, verify_from: date | 
             "결과": m.get("result_code") or "미매칭",
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
+            "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
             "메모": m.get("note") or "",
         })
     return pd.DataFrame(data)
