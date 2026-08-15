@@ -2629,6 +2629,134 @@ def _ext_pay_rematch_ulsan_zeropad(sc, db_filename: str) -> int:
     return updated
 
 
+def _ext_pay_relink_amount_and_near_date(sc, db_filename: str, source: str) -> int:
+    """기존 official_only를 금액상이·결제일 ±1~2일로 재연결."""
+    if not sc or not db_filename or source not in ("ulsanpay", "onnuri"):
+        return 0
+    try:
+        def _filt_rows(q):
+            return q.eq("db_filename", db_filename).eq("source", source)
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            "id, tx_date, amount, tx_status, approval_code, phone_last4",
+            _filt_rows, order_col="id",
+        )
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename).eq("source", source)
+        matches = _ext_pay_select_paged(
+            sc, "app_external_pay_matches",
+            "row_id, payment_id, result_code, note",
+            _filt_m, order_col="id",
+        )
+    except Exception:
+        return 0
+    m_by_row = {int(m["row_id"]): m for m in matches if m.get("row_id") is not None}
+    used = {int(m["payment_id"]) for m in matches if m.get("payment_id") is not None}
+    leftover = _ext_pay_unmatched_erp_pays(
+        sc, db_filename, source, _ext_pay_load_settings(db_filename), used,
+    )
+    updated = 0
+    for r in rows:
+        try:
+            rid = int(r["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        m = m_by_row.get(rid)
+        if not m or (m.get("result_code") or "") not in ("official_only", "미매칭"):
+            continue
+        if _ext_pay_is_cancel_status(r.get("tx_status")):
+            continue
+        try:
+            oamt = abs(int(r.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        file_date = str(r.get("tx_date") or "")[:10]
+        hit = None
+        code = None
+        notes: list[str] = []
+        if source == "ulsanpay":
+            ap = _ext_pay_norm_approval6(r.get("approval_code"))
+            if not ap:
+                continue
+            alts = [p for p in leftover if p.get("approval_code") == ap]
+            same_amt = [p for p in alts if abs(int(p.get("amount") or 0)) == oamt]
+            diff_amt = [p for p in alts if abs(int(p.get("amount") or 0)) != oamt]
+            if len(same_amt) == 1:
+                hit = same_amt[0]
+                _dn = _ext_pay_date_gap_note(file_date, hit.get("payment_date"))
+                gap_d = _ext_pay_as_date(file_date)
+                gap_e = _ext_pay_as_date(hit.get("payment_date"))
+                gap = abs((gap_d - gap_e).days) if gap_d and gap_e else 0
+                if gap <= 2:
+                    code = "matched_ok"
+                    if _dn:
+                        notes.append(_dn)
+                else:
+                    code = "matched_ok"
+                    if _dn:
+                        notes.append(_dn)
+            elif len(diff_amt) == 1:
+                hit = diff_amt[0]
+                code = "amount_mismatch"
+                notes.append("공식파일에 있으나 금액 다름")
+                _dn = _ext_pay_date_gap_note(file_date, hit.get("payment_date"))
+                if _dn:
+                    notes.append(_dn)
+        else:
+            last4 = str(r.get("phone_last4") or "")
+            if not last4:
+                continue
+            near = []
+            for p in leftover:
+                if (p.get("phone_last4") or "") != last4:
+                    continue
+                if abs(int(p.get("amount") or 0)) != oamt:
+                    continue
+                _dn = _ext_pay_date_gap_note(file_date, p.get("payment_date"))
+                gap_d = _ext_pay_as_date(file_date)
+                gap_e = _ext_pay_as_date(p.get("payment_date"))
+                if gap_d is None or gap_e is None:
+                    continue
+                gap = abs((gap_d - gap_e).days)
+                if 1 <= gap <= 2:
+                    near.append((p, _dn))
+            diff_amt = [
+                p for p in leftover
+                if (p.get("phone_last4") or "") == last4
+                and str(p.get("payment_date") or "")[:10] == file_date
+                and abs(int(p.get("amount") or 0)) != oamt
+            ]
+            if len(near) == 1:
+                hit, _dn = near[0]
+                code = "matched_ok"
+                if _dn:
+                    notes.append(_dn)
+            elif len(diff_amt) == 1:
+                hit = diff_amt[0]
+                code = "amount_mismatch"
+                notes.append("공식파일에 있으나 금액 다름")
+        if hit is None or code is None:
+            continue
+        payload = {
+            "result_code": code,
+            "note": " · ".join(notes) or None,
+            "payment_id": hit.get("payment_id"),
+            "order_id": hit.get("order_id"),
+            "customer_id": hit.get("customer_id"),
+        }
+        try:
+            sc.table("app_external_pay_matches").update(payload).eq(
+                "db_filename", db_filename
+            ).eq("row_id", rid).execute()
+            updated += 1
+            if hit.get("payment_id") is not None:
+                used.add(int(hit["payment_id"]))
+                leftover = [p for p in leftover if p.get("payment_id") != hit.get("payment_id")]
+        except Exception:
+            continue
+    return updated
+
+
 def _ext_pay_source_from_method(method: str | None) -> str | None:
     m = str(method or "")
     if "지역화폐" in m:
@@ -2652,6 +2780,18 @@ def _ext_pay_as_date(v) -> date | None:
         return date.fromisoformat(s)
     except ValueError:
         return None
+
+
+def _ext_pay_date_gap_note(file_date, erp_date) -> str | None:
+    """결제일 차이 메모. 1~2일은 근사 매칭, 그 이상은 일자 불일치."""
+    d1 = _ext_pay_as_date(file_date)
+    d2 = _ext_pay_as_date(erp_date)
+    if d1 is None or d2 is None or d1 == d2:
+        return None
+    gap = abs((d1 - d2).days)
+    if 1 <= gap <= 2:
+        return f"결제일 {gap}일 차이 공식 {d1.isoformat()} / ERP {d2.isoformat()}"
+    return f"일자 불일치 공식 {d1.isoformat()} / ERP {d2.isoformat()}"
 
 
 def _ext_pay_match_fields_changed(old_pay: dict | None, updates: dict) -> bool:
@@ -3092,17 +3232,65 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
         # 온누리는 취소도 양수 금액으로 오는 경우가 많음 → 절대값 기준 매칭 후 취소 여부로 분기
         pos_key = (tx_date, last4, amt)
         candidates = list(idx.get(pos_key, []))
+        date_note = None
+        if not candidates and last4 and not _ext_pay_is_cancel_status(r.get("tx_status")):
+            _fd = _ext_pay_as_date(tx_date)
+            near: list[dict] = []
+            if _fd is not None:
+                for _delta in (1, -1, 2, -2):
+                    _nd = (_fd + timedelta(days=_delta)).isoformat()
+                    near.extend(idx.get((_nd, last4, amt), []))
+            _seen_n: set[int] = set()
+            _uniq_n: list[dict] = []
+            for _p in near:
+                try:
+                    _pid = int(_p["id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if _pid in _seen_n:
+                    continue
+                _seen_n.add(_pid)
+                _uniq_n.append(_p)
+            if len(_uniq_n) == 1:
+                candidates = _uniq_n
+                date_note = _ext_pay_date_gap_note(tx_date, _uniq_n[0].get("payment_date"))
 
         result_code = None
         matched_pay: dict | None = None
         note_parts: list[str] = []
+        if date_note:
+            note_parts.append(date_note)
 
         if len(candidates) == 0:
             if is_cancel:
                 result_code = "official_canceled"
                 note_parts.append("공식 취소·ERP에 대응 결제 없음")
             else:
-                result_code = "official_only"
+                amt_alts: list[dict] = []
+                if last4:
+                    for _p in candidate_pays:
+                        try:
+                            _pid = int(_p["id"])
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                        if _pid in used_payment_ids:
+                            continue
+                        if _phone_last4_for(_p) != last4:
+                            continue
+                        if str(_p.get("payment_date") or "")[:10] != tx_date:
+                            continue
+                        try:
+                            _pa = int(_p.get("amount") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if abs(_pa) != abs(amt):
+                            amt_alts.append(_p)
+                if len(amt_alts) == 1:
+                    matched_pay = amt_alts[0]
+                    result_code = "amount_mismatch"
+                    note_parts.append("공식파일에 있으나 금액 다름")
+                else:
+                    result_code = "official_only"
         elif len(candidates) == 1:
             matched_pay = candidates[0]
             if is_cancel:
@@ -3171,6 +3359,7 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
                 except Exception:
                     continue
 
+    _ext_pay_relink_amount_and_near_date(sc, db_filename, "onnuri")
     return counts, None
 
 
@@ -3330,13 +3519,39 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
                 result_code = "official_canceled"
                 note_parts.append("공식 취소·ERP에 대응 결제 없음")
             else:
-                result_code = "official_only"
+                amt_alts = []
+                if appr:
+                    for _p in candidate_pays:
+                        try:
+                            _pid = int(_p["id"])
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                        if _pid in used_payment_ids:
+                            continue
+                        if _erp_approval(_p) != appr:
+                            continue
+                        try:
+                            _pa = abs(int(_p.get("amount") or 0))
+                        except (TypeError, ValueError):
+                            continue
+                        if _pa != match_amt and _pa > 0:
+                            amt_alts.append(_p)
+                if len(amt_alts) == 1:
+                    matched_pay = amt_alts[0]
+                    result_code = "amount_mismatch"
+                    note_parts.append("공식파일에 있으나 금액 다름")
+                    _dn = _ext_pay_date_gap_note(r.get("tx_date"), matched_pay.get("payment_date"))
+                    if _dn:
+                        note_parts.append(_dn)
+                else:
+                    result_code = "official_only"
         elif len(candidates) == 1:
             matched_pay = candidates[0]
             erp_date = str(matched_pay.get("payment_date") or "")[:10]
             file_date = str(r.get("tx_date") or "")[:10]
-            if erp_date and file_date and erp_date != file_date:
-                note_parts.append(f"일자 불일치 공식 {file_date} / ERP {erp_date}")
+            _dn = _ext_pay_date_gap_note(file_date, erp_date)
+            if _dn:
+                note_parts.append(_dn)
             if is_cancel:
                 if int(matched_pay["order_id"]) in neg_orders:
                     result_code = "matched_ok"
@@ -3394,6 +3609,7 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
 
     _ext_pay_offset_ulsan_cancels(sc, db_filename)
     _ext_pay_rematch_ulsan_zeropad(sc, db_filename)
+    _ext_pay_relink_amount_and_near_date(sc, db_filename, "ulsanpay")
     return counts, None
 
 
@@ -3562,6 +3778,7 @@ def _ext_pay_list_matches_df(
     if source == "ulsanpay":
         _ext_pay_offset_ulsan_cancels(sc, db_filename)
         _ext_pay_rematch_ulsan_zeropad(sc, db_filename)
+    _ext_pay_relink_amount_and_near_date(sc, db_filename, source)
     try:
         def _filt_rows(q):
             q = q.eq("db_filename", db_filename).eq("source", source)
@@ -26702,7 +26919,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     if only_alerts:
         _alert_codes = {
             "official_only", "official_canceled",
-            "erp_canceled_official_paid", "ambiguous", "erp_only", "미매칭",
+            "erp_canceled_official_paid", "ambiguous", "erp_only",
+            "amount_mismatch", "미매칭",
         }
         df = df[df["결과"].isin(_alert_codes)]
         if df.empty:
@@ -26782,6 +27000,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         "동일 승인번호의 공식 취소와 ERP 취소는 날짜가 달라도 상계되어 matched_ok 로 표시됩니다. "
         "결제 금액·수단·승인번호를 바꾸면 해당 건은 자동 재매칭됩니다. "
         "결과 코드: matched_ok=정상 · official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
+        "amount_mismatch=공식파일에 있으나 금액 다름(오입력 의심) · "
         "official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
         "erp_canceled_official_paid=ERP 취소인데 공식 결제완료 · ambiguous=시간까지 봐도 특정 불가 · 미매칭=아직 매칭 미실행"
     )
