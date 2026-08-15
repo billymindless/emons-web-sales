@@ -4051,21 +4051,8 @@ def _ext_pay_list_matches_df(
             "_fabricated": (not ap) and bool(erp_ap),
         })
     official_aps: set[str] = set()
-    unmatched_official_keys: set[tuple[str, int]] = set()
     for r in rows:
-        alts = _ext_pay_approval_alts(r.get("approval_code"))
-        official_aps.update(alts)
-        try:
-            _oa = abs(int(r.get("amount") or 0))
-        except (TypeError, ValueError):
-            continue
-        if not alts or not _oa:
-            continue
-        m = m_by_row.get(int(r["id"])) or {}
-        code = m.get("result_code") or "미매칭"
-        if code in ("official_only", "미매칭") or m.get("payment_id") is None:
-            for alt in alts:
-                unmatched_official_keys.add((alt, _oa))
+        official_aps.update(_ext_pay_approval_alts(r.get("approval_code")))
     for p in erp_only_pays:
         try:
             cid_int = int(p["customer_id"]) if p.get("customer_id") is not None else None
@@ -4079,9 +4066,8 @@ def _ext_pay_list_matches_df(
         amt = int(p.get("amount") or 0)
         erp_ap = _ext_pay_norm_approval6(p.get("approval_code") or p.get("phone_last4"))
         erp_alts = set(_ext_pay_approval_alts(erp_ap))
-        if source == "ulsanpay" and erp_ap and (erp_ap, abs(amt)) in unmatched_official_keys:
+        if source == "ulsanpay" and erp_alts and (erp_alts & official_aps):
             continue
-        in_official = bool(erp_alts and official_aps and (erp_alts & official_aps))
         data.append({
             "공식일자": "",
             "ERP일자": p.get("payment_date") or "",
@@ -4096,12 +4082,8 @@ def _ext_pay_list_matches_df(
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
-            "메모": (
-                "공식 행과 미연결"
-                if in_official
-                else "공식 파일에 없음 · 가공 번호 의심"
-            ),
-            "_fabricated": bool(erp_ap) and not in_official,
+            "메모": "공식 파일에 없음 · 가공 번호 의심",
+            "_fabricated": bool(erp_ap),
         })
     return pd.DataFrame(data)
 
