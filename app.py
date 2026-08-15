@@ -2076,7 +2076,10 @@ _ULSANPAY_HEADER_ALIASES = {
     "tx_time":       ("거래일시", "거래시간", "결제시간", "시간"),
     # 금액은 반드시 '결제금액'(오타 '결재금액' 허용). '거래금액'은 쓰지 않음.
     "amount":        ("결제금액", "결재금액"),
-    "approval_code": ("승인번호",),
+    "approval_code": (
+        "승인번호", "승인 번호", "승인번호(6자리)", "승인코드",
+        "승인no", "승인No", "Approval",
+    ),
     "tx_status":     ("거래상태", "결제상태", "상태", "구분"),
 }
 
@@ -2183,7 +2186,7 @@ def _ext_pay_fingerprint(source: str, db_filename: str, tx_date: str, tx_time: s
         (tx_status or "").strip(),
     ]
     if (source or "").strip() == "ulsanpay":
-        parts.append((approval_code or "").strip())
+        parts.append(_ext_pay_norm_approval6(approval_code))
     return "|".join(parts)
 
 
@@ -2282,14 +2285,16 @@ def _ext_pay_read_uploaded_df(uploaded_file) -> tuple["pd.DataFrame | None", str
 
 def _ext_pay_promote_header_row(df: "pd.DataFrame", header_tokens: set[str]) -> "pd.DataFrame":
     """상단 매장정보 행을 건너뛰고, header_tokens 가 있는 행을 컬럼으로 승격."""
+    tokens = {_ext_pay_norm_header(t) for t in header_tokens}
+
     def _norm_list(vals) -> list[str]:
         return [_ext_pay_norm_header(v) for v in vals]
 
-    if any(_ext_pay_norm_header(c) in header_tokens for c in df.columns):
+    if any(_ext_pay_norm_header(c) in tokens for c in df.columns):
         return df
     for i in range(min(len(df), 20)):
         row_vals = _norm_list(df.iloc[i].tolist())
-        if any(v in header_tokens for v in row_vals):
+        if any(v in tokens for v in row_vals):
             new_cols = df.iloc[i].tolist()
             df = df.iloc[i + 1:].reset_index(drop=True)
             df.columns = new_cols
@@ -2361,7 +2366,9 @@ def _ext_pay_norm_approval6(v) -> str:
     elif isinstance(v, int):
         digits = re.sub(r"\D", "", str(v))
     else:
-        s = str(v).strip()
+        s = str(v).replace("\u00a0", " ").replace("\u3000", " ")
+        s = s.strip().strip("'\"`")
+        s = re.sub(r"\s+", "", s)
         if re.fullmatch(r"\d+\.0+", s):
             s = s.split(".", 1)[0]
         digits = re.sub(r"\D", "", s)
@@ -2370,6 +2377,28 @@ def _ext_pay_norm_approval6(v) -> str:
     if len(digits) > 6:
         return digits[-6:]
     return digits.zfill(6)
+
+
+def _ext_pay_approval_alts(v) -> list[str]:
+    """승인번호 비교 후보. Excel 숫자 43927.0 → 자릿수 '439270' 오인을 포함."""
+    ap = _ext_pay_norm_approval6(v)
+    if not ap:
+        return []
+    out = [ap]
+    if len(ap) == 6 and ap.endswith("0") and not ap.startswith("0"):
+        alt = ap[:5].zfill(6)
+        if alt not in out:
+            out.append(alt)
+    if len(ap) == 6 and ap.startswith("0") and not ap.endswith("0"):
+        alt = ap[1:] + "0"
+        if alt not in out:
+            out.append(alt)
+    return out
+
+
+def _ext_pay_approvals_equal(a, b) -> bool:
+    sa, sb = set(_ext_pay_approval_alts(a)), set(_ext_pay_approval_alts(b))
+    return bool(sa and sb and (sa & sb))
 
 
 def _ext_pay_pair_cancel_offsets(items: list[dict]) -> list[tuple[dict, dict]]:
@@ -2554,9 +2583,7 @@ def _ext_pay_rematch_ulsan_zeropad(sc, db_filename: str) -> int:
     retry_rows = []
     for r in rows:
         m = m_by_row.get(int(r["id"]))
-        if not m:
-            continue
-        if (m.get("result_code") or "") not in ("official_only", "미매칭"):
+        if m and (m.get("result_code") or "") not in ("official_only", "미매칭"):
             continue
         retry_rows.append(r)
     if not retry_rows:
@@ -2569,26 +2596,34 @@ def _ext_pay_rematch_ulsan_zeropad(sc, db_filename: str) -> int:
             continue
         if pid in used:
             continue
-        ap = _ext_pay_norm_approval6(p.get("card_company"))
-        if not ap:
-            continue
         try:
             amt = abs(int(p.get("amount") or 0))
         except (TypeError, ValueError):
             continue
         if amt <= 0:
             continue
-        idx.setdefault((ap, amt), []).append(p)
+        for alt in _ext_pay_approval_alts(p.get("card_company")):
+            idx.setdefault((alt, amt), []).append(p)
     updated = 0
     for r in retry_rows:
-        ap = _ext_pay_norm_approval6(r.get("approval_code"))
         try:
             amt = abs(int(r.get("amount") or 0))
         except (TypeError, ValueError):
             continue
-        if not ap or amt <= 0:
+        if amt <= 0:
             continue
-        cands = list(idx.get((ap, amt), []))
+        seen_c: set[int] = set()
+        cands: list[dict] = []
+        for alt in _ext_pay_approval_alts(r.get("approval_code")):
+            for p in idx.get((alt, amt), []):
+                try:
+                    _pid = int(p["id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if _pid in seen_c:
+                    continue
+                seen_c.add(_pid)
+                cands.append(p)
         if len(cands) != 1:
             continue
         pay = cands[0]
@@ -2618,19 +2653,42 @@ def _ext_pay_rematch_ulsan_zeropad(sc, db_filename: str) -> int:
             except Exception:
                 pass
         try:
-            sc.table("app_external_pay_matches").update(payload).eq(
-                "db_filename", db_filename
-            ).eq("row_id", int(r["id"])).execute()
+            rid = int(r["id"])
+            m = m_by_row.get(rid)
+            if m:
+                sc.table("app_external_pay_matches").update(payload).eq(
+                    "db_filename", db_filename
+                ).eq("row_id", rid).execute()
+            else:
+                sc.table("app_external_pay_matches").insert({
+                    "db_filename": db_filename,
+                    "source": "ulsanpay",
+                    "row_id": rid,
+                    **payload,
+                    "matched_by": "zeropad",
+                }).execute()
+            canon = _ext_pay_norm_approval6(pay.get("card_company"))
+            stored = _ext_pay_norm_approval6(r.get("approval_code"))
+            if canon and stored and canon != stored and _ext_pay_approvals_equal(canon, stored):
+                try:
+                    sc.table("app_external_pay_rows").update({
+                        "approval_code": canon,
+                    }).eq("id", rid).eq("db_filename", db_filename).execute()
+                except Exception:
+                    pass
             updated += 1
             used.add(pid)
-            idx[(ap, amt)] = [x for x in cands if int(x["id"]) != pid]
+            for k, lst in list(idx.items()):
+                idx[k] = [x for x in lst if int(x["id"]) != pid]
         except Exception:
             continue
     return updated
 
 
-def _ext_pay_relink_amount_and_near_date(sc, db_filename: str, source: str) -> int:
-    """기존 official_only를 금액상이·결제일 ±1~2일로 재연결."""
+def _ext_pay_relink_amount_and_near_date(
+    sc, db_filename: str, source: str, erp_from: date | None = None,
+) -> int:
+    """기존 official_only·미매칭 공식 행을 금액·근사일자로 재연결."""
     if not sc or not db_filename or source not in ("ulsanpay", "onnuri"):
         return 0
     try:
@@ -2652,8 +2710,11 @@ def _ext_pay_relink_amount_and_near_date(sc, db_filename: str, source: str) -> i
         return 0
     m_by_row = {int(m["row_id"]): m for m in matches if m.get("row_id") is not None}
     used = {int(m["payment_id"]) for m in matches if m.get("payment_id") is not None}
+    from_candidates = [_ext_pay_load_settings(db_filename), EXT_PAY_DEFAULT_VERIFY_FROM]
+    if erp_from is not None:
+        from_candidates.append(erp_from)
     leftover = _ext_pay_unmatched_erp_pays(
-        sc, db_filename, source, _ext_pay_load_settings(db_filename), used,
+        sc, db_filename, source, min(from_candidates), used,
     )
     updated = 0
     for r in rows:
@@ -2662,7 +2723,7 @@ def _ext_pay_relink_amount_and_near_date(sc, db_filename: str, source: str) -> i
         except (TypeError, ValueError, KeyError):
             continue
         m = m_by_row.get(rid)
-        if not m or (m.get("result_code") or "") not in ("official_only", "미매칭"):
+        if m and (m.get("result_code") or "") not in ("official_only", "미매칭"):
             continue
         if _ext_pay_is_cancel_status(r.get("tx_status")):
             continue
@@ -2678,23 +2739,26 @@ def _ext_pay_relink_amount_and_near_date(sc, db_filename: str, source: str) -> i
             ap = _ext_pay_norm_approval6(r.get("approval_code"))
             if not ap:
                 continue
-            alts = [p for p in leftover if p.get("approval_code") == ap]
+            alts = [
+                p for p in leftover
+                if _ext_pay_approvals_equal(p.get("approval_code"), ap)
+            ]
             same_amt = [p for p in alts if abs(int(p.get("amount") or 0)) == oamt]
             diff_amt = [p for p in alts if abs(int(p.get("amount") or 0)) != oamt]
-            if len(same_amt) == 1:
-                hit = same_amt[0]
+            if same_amt:
+                fd = _ext_pay_as_date(file_date)
+
+                def _gap(p):
+                    ed = _ext_pay_as_date(p.get("payment_date"))
+                    if fd is None or ed is None:
+                        return 99
+                    return abs((fd - ed).days)
+
+                hit = sorted(same_amt, key=lambda p: (_gap(p), int(p.get("payment_id") or 0)))[0]
+                code = "matched_ok"
                 _dn = _ext_pay_date_gap_note(file_date, hit.get("payment_date"))
-                gap_d = _ext_pay_as_date(file_date)
-                gap_e = _ext_pay_as_date(hit.get("payment_date"))
-                gap = abs((gap_d - gap_e).days) if gap_d and gap_e else 0
-                if gap <= 2:
-                    code = "matched_ok"
-                    if _dn:
-                        notes.append(_dn)
-                else:
-                    code = "matched_ok"
-                    if _dn:
-                        notes.append(_dn)
+                if _dn:
+                    notes.append(_dn)
             elif len(diff_amt) == 1:
                 hit = diff_amt[0]
                 code = "amount_mismatch"
@@ -2745,9 +2809,18 @@ def _ext_pay_relink_amount_and_near_date(sc, db_filename: str, source: str) -> i
             "customer_id": hit.get("customer_id"),
         }
         try:
-            sc.table("app_external_pay_matches").update(payload).eq(
-                "db_filename", db_filename
-            ).eq("row_id", rid).execute()
+            if m:
+                sc.table("app_external_pay_matches").update(payload).eq(
+                    "db_filename", db_filename
+                ).eq("row_id", rid).execute()
+            else:
+                sc.table("app_external_pay_matches").insert({
+                    "db_filename": db_filename,
+                    "source": source,
+                    "row_id": rid,
+                    **payload,
+                    "matched_by": "relink",
+                }).execute()
             updated += 1
             if hit.get("payment_id") is not None:
                 used.add(int(hit["payment_id"]))
@@ -3142,6 +3215,7 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
             sc.table("app_external_pay_matches")
             .select("payment_id")
             .eq("db_filename", db_filename)
+            .eq("source", "onnuri")
             .execute()
         )
         used_payment_ids = {int(m["payment_id"]) for m in (mp.data or []) if m.get("payment_id") is not None}
@@ -3371,30 +3445,29 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
         return {}, err or "Supabase 연결 불가"
 
     try:
-        rr = (
-            sc.table("app_external_pay_rows")
-            .select("id, tx_date, tx_time, amount, tx_status, approval_code")
-            .eq("db_filename", db_filename)
-            .eq("source", "ulsanpay")
-            .gte("tx_date", verify_from.isoformat())
-            .order("tx_date")
-            .execute()
+        def _filt_rows(q):
+            return (
+                q.eq("db_filename", db_filename)
+                .eq("source", "ulsanpay")
+                .gte("tx_date", verify_from.isoformat())
+            )
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            "id, tx_date, tx_time, amount, tx_status, approval_code",
+            _filt_rows, order_col="id",
         )
-        rows = rr.data or []
     except Exception as e:
         return {}, f"공식 행 조회 실패: {e}"
     if not rows:
         return {}, None
 
     try:
-        mr = (
-            sc.table("app_external_pay_matches")
-            .select("row_id")
-            .eq("db_filename", db_filename)
-            .eq("source", "ulsanpay")
-            .execute()
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename).eq("source", "ulsanpay")
+        mr = _ext_pay_select_paged(
+            sc, "app_external_pay_matches", "row_id", _filt_m, order_col="id",
         )
-        matched_ids = {int(m["row_id"]) for m in (mr.data or []) if m.get("row_id") is not None}
+        matched_ids = {int(m["row_id"]) for m in mr if m.get("row_id") is not None}
     except Exception:
         matched_ids = set()
     todo = [r for r in rows if int(r["id"]) not in matched_ids]
@@ -3402,14 +3475,16 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
         return {}, None
 
     try:
-        pr = (
-            sc.table("app_payments")
-            .select("id, order_id, payment_date, amount, payment_method, card_company")
-            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
-            .gte("payment_date", verify_from.isoformat())
-            .execute()
+        def _filt_p(q):
+            return (
+                q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .gte("payment_date", verify_from.isoformat())
+            )
+        pays_all = _ext_pay_select_paged(
+            sc, "app_payments",
+            "id, order_id, payment_date, amount, payment_method, card_company",
+            _filt_p, order_col="id",
         )
-        pays_all = pr.data or []
     except Exception as e:
         return {}, f"ERP 결제 조회 실패: {e}"
 
@@ -3435,13 +3510,12 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
             return {}, f"주문 조회 실패: {e}"
 
     try:
-        mp = (
-            sc.table("app_external_pay_matches")
-            .select("payment_id")
-            .eq("db_filename", db_filename)
-            .execute()
+        def _filt_mp(q):
+            return q.eq("db_filename", db_filename).eq("source", "ulsanpay")
+        mp = _ext_pay_select_paged(
+            sc, "app_external_pay_matches", "payment_id", _filt_mp, order_col="id",
         )
-        used_payment_ids = {int(m["payment_id"]) for m in (mp.data or []) if m.get("payment_id") is not None}
+        used_payment_ids = {int(m["payment_id"]) for m in mp if m.get("payment_id") is not None}
     except Exception:
         used_payment_ids = set()
 
@@ -3485,16 +3559,15 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
 
     neg_orders = {int(p["order_id"]) for p in pays if p.get("order_id") is not None and (p.get("amount") or 0) < 0}
 
-    def _erp_approval(pay: dict) -> str:
-        return _ext_pay_norm_approval6(pay.get("card_company"))
-
-    # 키: (승인번호6, 금액)
+    # 키: (승인번호6, 절대금액) — Excel float 오인 후보도 함께 인덱싱
     idx: dict[tuple, list[dict]] = {}
     for p in candidate_pays:
-        key = (_erp_approval(p), int(p.get("amount") or 0))
-        if not key[0]:
+        try:
+            amt_k = abs(int(p.get("amount") or 0))
+        except (TypeError, ValueError):
             continue
-        idx.setdefault(key, []).append(p)
+        for alt in _ext_pay_approval_alts(p.get("card_company")):
+            idx.setdefault((alt, amt_k), []).append(p)
 
     counts: dict[str, int] = {}
     inserts: list[dict] = []
@@ -3505,7 +3578,18 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
         amt = int(r.get("amount") or 0)
         is_cancel = _ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0
         match_amt = abs(amt)
-        candidates = list(idx.get((appr, match_amt), []))
+        seen_c: set[int] = set()
+        candidates: list[dict] = []
+        for alt in _ext_pay_approval_alts(r.get("approval_code")):
+            for p in idx.get((alt, match_amt), []):
+                try:
+                    _id = int(p["id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if _id in seen_c:
+                    continue
+                seen_c.add(_id)
+                candidates.append(p)
 
         result_code = None
         matched_pay: dict | None = None
@@ -3528,7 +3612,7 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
                             continue
                         if _pid in used_payment_ids:
                             continue
-                        if _erp_approval(_p) != appr:
+                        if not _ext_pay_approvals_equal(_p.get("card_company"), appr):
                             continue
                         try:
                             _pa = abs(int(_p.get("amount") or 0))
@@ -3775,10 +3859,11 @@ def _ext_pay_list_matches_df(
     sc, err = get_supabase_client()
     if err or not sc:
         return pd.DataFrame()
+    erp_only_from = erp_from or verify_from or EXT_PAY_DEFAULT_VERIFY_FROM
     if source == "ulsanpay":
         _ext_pay_offset_ulsan_cancels(sc, db_filename)
         _ext_pay_rematch_ulsan_zeropad(sc, db_filename)
-    _ext_pay_relink_amount_and_near_date(sc, db_filename, source)
+    _ext_pay_relink_amount_and_near_date(sc, db_filename, source, erp_from=erp_only_from)
     try:
         def _filt_rows(q):
             q = q.eq("db_filename", db_filename).eq("source", source)
@@ -3828,7 +3913,6 @@ def _ext_pay_list_matches_df(
             except (TypeError, ValueError):
                 pass
 
-    erp_only_from = erp_from or verify_from or EXT_PAY_DEFAULT_VERIFY_FROM
     erp_only_pays = _ext_pay_unmatched_erp_pays(
         sc, db_filename, source, erp_only_from, set(payment_ids),
     )
@@ -3966,6 +4050,22 @@ def _ext_pay_list_matches_df(
             "메모": m.get("note") or "",
             "_fabricated": (not ap) and bool(erp_ap),
         })
+    official_aps: set[str] = set()
+    unmatched_official_keys: set[tuple[str, int]] = set()
+    for r in rows:
+        alts = _ext_pay_approval_alts(r.get("approval_code"))
+        official_aps.update(alts)
+        try:
+            _oa = abs(int(r.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        if not alts or not _oa:
+            continue
+        m = m_by_row.get(int(r["id"])) or {}
+        code = m.get("result_code") or "미매칭"
+        if code in ("official_only", "미매칭") or m.get("payment_id") is None:
+            for alt in alts:
+                unmatched_official_keys.add((alt, _oa))
     for p in erp_only_pays:
         try:
             cid_int = int(p["customer_id"]) if p.get("customer_id") is not None else None
@@ -3977,7 +4077,11 @@ def _ext_pay_list_matches_df(
             oid_int = None
         cust = cust_map.get(cid_int) or {}
         amt = int(p.get("amount") or 0)
-        erp_ap = _ext_pay_digits_only(p.get("approval_code") or p.get("phone_last4"))
+        erp_ap = _ext_pay_norm_approval6(p.get("approval_code") or p.get("phone_last4"))
+        erp_alts = set(_ext_pay_approval_alts(erp_ap))
+        if source == "ulsanpay" and erp_ap and (erp_ap, abs(amt)) in unmatched_official_keys:
+            continue
+        in_official = bool(erp_alts and official_aps and (erp_alts & official_aps))
         data.append({
             "공식일자": "",
             "ERP일자": p.get("payment_date") or "",
@@ -3992,8 +4096,12 @@ def _ext_pay_list_matches_df(
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
-            "메모": "공식 파일에 없음 · 가공 번호 의심",
-            "_fabricated": bool(erp_ap),
+            "메모": (
+                "공식 행과 미연결"
+                if in_official
+                else "공식 파일에 없음 · 가공 번호 의심"
+            ),
+            "_fabricated": bool(erp_ap) and not in_official,
         })
     return pd.DataFrame(data)
 
@@ -5918,8 +6026,8 @@ def _ulsan_approval_already_used(
                         rid = 0
                     if exclude_payment_id is not None and rid == int(exclude_payment_id):
                         continue
-                    existing = _ext_pay_norm_approval6(row.get("card_company"))
-                    if existing and existing == code:
+                    existing = row.get("card_company")
+                    if existing and _ext_pay_approvals_equal(existing, code):
                         return _ulsan_approval_store_label(row.get(ORDERS_PAYMENTS_TENANT_COL))
                 if len(rows) < page:
                     break
@@ -5939,8 +6047,7 @@ def _ulsan_approval_already_used(
         for rid, cc in rows:
             if exclude_payment_id is not None and int(rid) == int(exclude_payment_id):
                 continue
-            existing = _ext_pay_norm_approval6(cc)
-            if existing and existing == code:
+            if cc and _ext_pay_approvals_equal(cc, code):
                 return _ulsan_approval_store_label(db_filename)
         return None
     finally:
