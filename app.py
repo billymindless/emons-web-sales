@@ -2629,6 +2629,213 @@ def _ext_pay_rematch_ulsan_zeropad(sc, db_filename: str) -> int:
     return updated
 
 
+def _ext_pay_source_from_method(method: str | None) -> str | None:
+    m = str(method or "")
+    if "지역화폐" in m:
+        return "ulsanpay"
+    if "온누리" in m and "지류" not in m:
+        return "onnuri"
+    return None
+
+
+def _ext_pay_as_date(v) -> date | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip()[:10]
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _ext_pay_match_fields_changed(old_pay: dict | None, updates: dict) -> bool:
+    if not updates:
+        return False
+    keys = ("amount", "payment_method", "card_company", "onnuri_approval_code", "payment_date")
+    for k in keys:
+        if k not in updates:
+            continue
+        ov, nv = (old_pay or {}).get(k), updates.get(k)
+        if k == "amount":
+            try:
+                if int(round(float(ov or 0))) != int(round(float(nv or 0))):
+                    return True
+            except (TypeError, ValueError):
+                return True
+        elif k == "payment_date":
+            if _ext_pay_as_date(ov) != _ext_pay_as_date(nv):
+                return True
+        elif str(ov or "").strip() != str(nv or "").strip():
+            return True
+    return False
+
+
+def _ext_pay_rematch_after_payment_change(
+    db_filename: str,
+    *,
+    payment_id: int | None,
+    old_pay: dict | None,
+    new_pay: dict | None,
+    matched_by: str = "payment_change",
+) -> None:
+    """결제 금액·수단·승인번호 변경 후 관련 공식 행 매칭을 해제하고 재매칭."""
+    if not db_filename:
+        return
+    sources = set()
+    for p in (old_pay, new_pay):
+        src = _ext_pay_source_from_method((p or {}).get("payment_method"))
+        if src:
+            sources.add(src)
+    if not sources:
+        return
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return
+    try:
+        verify_from = _ext_pay_load_settings(db_filename)
+        extra_dates: list[date] = []
+        for p in (old_pay, new_pay):
+            d = _ext_pay_as_date((p or {}).get("payment_date"))
+            if d is not None:
+                extra_dates.append(d)
+        for source in sources:
+            _ext_pay_release_and_rematch_source(
+                sc, db_filename, source, payment_id, old_pay, new_pay,
+                verify_from, extra_dates, matched_by,
+            )
+    except Exception as e:
+        try:
+            st.session_state["_ext_pay_rematch_error"] = str(e)
+        except Exception:
+            pass
+
+
+def _ext_pay_release_and_rematch_source(
+    sc, db_filename: str, source: str, payment_id: int | None,
+    old_pay: dict | None, new_pay: dict | None,
+    verify_from: date, extra_dates: list[date], matched_by: str,
+) -> None:
+    def _filt_rows(q):
+        return q.eq("db_filename", db_filename).eq("source", source)
+    rows = _ext_pay_select_paged(
+        sc, "app_external_pay_rows",
+        "id, tx_date, amount, approval_code, phone_last4",
+        _filt_rows, order_col="id",
+    )
+    def _filt_m(q):
+        return q.eq("db_filename", db_filename).eq("source", source)
+    matches = _ext_pay_select_paged(
+        sc, "app_external_pay_matches",
+        "row_id, payment_id, result_code",
+        _filt_m, order_col="id",
+    )
+    release_ids: set[int] = set()
+    if payment_id is not None:
+        for m in matches:
+            try:
+                if m.get("payment_id") is not None and int(m["payment_id"]) == int(payment_id):
+                    release_ids.add(int(m["row_id"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+    if source == "ulsanpay":
+        approvals: set[str] = set()
+        for r in rows:
+            try:
+                rid = int(r["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if rid in release_ids:
+                ap = _ext_pay_norm_approval6(r.get("approval_code"))
+                if ap:
+                    approvals.add(ap)
+        for p in (old_pay, new_pay):
+            if _ext_pay_source_from_method((p or {}).get("payment_method")) != "ulsanpay":
+                continue
+            ap = _ext_pay_norm_approval6((p or {}).get("card_company"))
+            if ap:
+                approvals.add(ap)
+        for r in rows:
+            ap = _ext_pay_norm_approval6(r.get("approval_code"))
+            if ap and ap in approvals:
+                try:
+                    release_ids.add(int(r["id"]))
+                except (TypeError, ValueError, KeyError):
+                    continue
+    else:
+        keys: set[tuple[str, str, int]] = set()
+        for r in rows:
+            try:
+                rid = int(r["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if rid in release_ids:
+                try:
+                    keys.add((
+                        str(r.get("tx_date") or "")[:10],
+                        str(r.get("phone_last4") or ""),
+                        abs(int(r.get("amount") or 0)),
+                    ))
+                except (TypeError, ValueError):
+                    continue
+        for p in (old_pay, new_pay):
+            if _ext_pay_source_from_method((p or {}).get("payment_method")) != "onnuri":
+                continue
+            last4 = _ext_pay_digits_only((p or {}).get("onnuri_approval_code"))
+            last4 = last4[-4:] if len(last4) >= 4 else last4
+            try:
+                amt = abs(int(round(float((p or {}).get("amount") or 0))))
+            except (TypeError, ValueError):
+                amt = 0
+            pdt = str((p or {}).get("payment_date") or "")[:10]
+            if last4 and amt > 0 and pdt:
+                keys.add((pdt, last4, amt))
+        for r in rows:
+            try:
+                key = (
+                    str(r.get("tx_date") or "")[:10],
+                    str(r.get("phone_last4") or ""),
+                    abs(int(r.get("amount") or 0)),
+                )
+            except (TypeError, ValueError):
+                continue
+            if key in keys:
+                try:
+                    release_ids.add(int(r["id"]))
+                except (TypeError, ValueError, KeyError):
+                    continue
+    if release_ids:
+        for chunk in (list(release_ids)[i : i + 100] for i in range(0, len(release_ids), 100)):
+            try:
+                sc.table("app_external_pay_matches").delete().eq(
+                    "db_filename", db_filename
+                ).eq("source", source).in_("row_id", chunk).execute()
+            except Exception:
+                continue
+        for r in rows:
+            try:
+                rid = int(r["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if rid not in release_ids:
+                continue
+            d = _ext_pay_as_date(r.get("tx_date"))
+            if d is not None:
+                extra_dates.append(d)
+    vf = verify_from
+    if extra_dates:
+        vf = min([verify_from, *extra_dates])
+    if source == "ulsanpay":
+        _ext_pay_match_ulsanpay(db_filename, vf, matched_by)
+    else:
+        _ext_pay_match_onnuri(db_filename, vf, matched_by)
+
+
 def _ext_pay_insert_batch_and_rows(
     db_filename: str, source: str, file_name: str, rows: list[dict],
     verify_from: date, uploaded_by: str | None,
@@ -5296,13 +5503,39 @@ def _insert_payment_supabase(
     try:
         r = client.table("app_payments").insert(payload).execute()
         if r.data and len(r.data) > 0 and "id" in r.data[0]:
-            return int(r.data[0]["id"])
+            new_id = int(r.data[0]["id"])
+            if _ext_pay_source_from_method(payload.get("payment_method")):
+                _ext_pay_rematch_after_payment_change(
+                    db_filename, payment_id=new_id, old_pay=None, new_pay=payload,
+                )
+            return new_id
         if _error_detail is not None:
             _error_detail.append("INSERT 응답에 id가 없습니다. RLS·스키마·트리거를 확인하세요.")
         return None
     except Exception as e:
         if _error_detail is not None:
             _error_detail.append(str(e) or repr(e))
+        return None
+
+
+def _get_payment_row_supabase(db_filename: str, payment_id: int) -> dict | None:
+    if not db_filename or payment_id is None:
+        return None
+    client, err = get_supabase_client()
+    if err or not client:
+        return None
+    try:
+        r = (
+            client.table("app_payments")
+            .select("id, order_id, payment_date, amount, payment_method, card_company, onnuri_approval_code")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .eq("id", int(payment_id))
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception:
         return None
 
 
@@ -5320,11 +5553,22 @@ def _update_payment_supabase(db_filename: str, payment_id: int, updates: dict) -
                 updates[_fld] = int(round(float(updates[_fld])))
             except (TypeError, ValueError):
                 pass
+    old_pay = None
+    if _ext_pay_match_fields_changed(None, updates) or any(
+        k in updates for k in ("amount", "payment_method", "card_company", "onnuri_approval_code", "payment_date")
+    ):
+        old_pay = _get_payment_row_supabase(db_filename, payment_id)
     try:
         client.table("app_payments").update(updates).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", payment_id).execute()
-        return True
     except Exception:
         return False
+    if old_pay is not None and _ext_pay_match_fields_changed(old_pay, updates):
+        merged = dict(old_pay)
+        merged.update(updates)
+        _ext_pay_rematch_after_payment_change(
+            db_filename, payment_id=int(payment_id), old_pay=old_pay, new_pay=merged,
+        )
+    return True
 
 
 def _delete_payment_supabase(db_filename: str, payment_id: int) -> bool:
@@ -5334,11 +5578,16 @@ def _delete_payment_supabase(db_filename: str, payment_id: int) -> bool:
     client, err = get_supabase_client()
     if err or not client:
         return False
+    old_pay = _get_payment_row_supabase(db_filename, payment_id)
     try:
         client.table("app_payments").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", payment_id).execute()
-        return True
     except Exception:
         return False
+    if old_pay is not None and _ext_pay_source_from_method(old_pay.get("payment_method")):
+        _ext_pay_rematch_after_payment_change(
+            db_filename, payment_id=int(payment_id), old_pay=old_pay, new_pay=None,
+        )
+    return True
 
 
 def _get_order_supabase(db_filename: str, order_id: int) -> dict | None:
@@ -26520,6 +26769,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     st.caption(
         "빨간 행: 공식 파일에 승인번호가 없고 ERP에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
         "동일 승인번호의 공식 취소와 ERP 취소는 날짜가 달라도 상계되어 matched_ok 로 표시됩니다. "
+        "결제 금액·수단·승인번호를 바꾸면 해당 건은 자동 재매칭됩니다. "
         "결과 코드: matched_ok=정상 · official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
         "official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
         "erp_canceled_official_paid=ERP 취소인데 공식 결제완료 · ambiguous=시간까지 봐도 특정 불가 · 미매칭=아직 매칭 미실행"
