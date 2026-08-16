@@ -7924,6 +7924,30 @@ def _render_order_cost_verify(db_filename: str, order_id: int):
     else:
         st.success("✅ 원가·마진 검증 이상 없음")
 
+    if _supabase_orders_payments_available():
+        try:
+            sc2, err2 = get_supabase_client()
+            if sc2 and not err2:
+                _ir = (
+                    sc2.table("app_order_items")
+                    .select("line_cost")
+                    .eq("order_id", int(order_id))
+                    .execute()
+                )
+                _hq = sum(float(x.get("line_cost") or 0) for x in (_ir.data or []))
+                if _hq > 0:
+                    _seller = cost_price + disp_cost
+                    _gap = _seller - _hq
+                    st.caption(
+                        f"입력원가 {_seller:,.0f}원 · 본사원가 {_hq:,.0f}원 · 원가차이 {_gap:,.0f}원"
+                    )
+                    if _seller == 0:
+                        st.warning("원가 미입력 — 본사 원장 원가만 있습니다.")
+                    elif abs(_gap) >= 10000 or (abs(_gap) / max(_hq, _seller, 1)) >= 0.05:
+                        st.error(f"원가 불일치 (입력 {_seller:,.0f} / 본사 {_hq:,.0f})")
+        except Exception:
+            pass
+
 
 def _render_order_line_items(db_filename: str, order_id: int) -> None:
     """주문에 연결된 라인 아이템(app_order_items) 을 읽기 전용 테이블로 표시.
@@ -10978,6 +11002,59 @@ def _render_header_line_discrepancy_report(
             st.caption(f"CSV 생성 생략: {_csv_e}")
 
 
+def _render_delivery_cost_reconcile_report(
+    db_filename: str,
+    range_start_a: date,
+    range_end_a: date,
+    range_start_b: date,
+    range_end_b: date,
+    key_prefix: str,
+) -> None:
+    """배송일 기간의 입력원가 vs 본사 라인원가. 헤더는 수정하지 않음."""
+    with st.expander("배송일 원가 대사", expanded=False):
+        st.caption(
+            "판매자가 입력한 원가와 매입 원장 라인 합을 배송일 기준으로 비교합니다. "
+            "자동 보정하지 않습니다. 기간 A∪B."
+        )
+        if not db_filename:
+            st.info("매장이 없습니다.")
+            return
+        sc, err = get_supabase_client()
+        if err or not sc:
+            st.info("Supabase 연결이 필요합니다.")
+            return
+        try:
+            import import_cost_reconcile as _icr
+        except Exception as _e:
+            st.caption(f"대사 모듈 없음: {_e}")
+            return
+        d0 = min(range_start_a, range_start_b)
+        d1 = max(range_end_a, range_end_b)
+        with st.spinner("배송일 원가 대사 계산 중..."):
+            result = _icr.build_store_reconcile_report(sc, db_filename, d0, d1)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("원가 불일치", f"{result.mismatch:,}건")
+        m2.metric("원가 미입력", f"{result.blank:,}건")
+        m3.metric("앱만 있음", f"{result.app_only:,}건")
+        m4.metric("원가 일치", f"{result.ok:,}건")
+        df = _icr.reconcile_dataframe(result)
+        if df.empty:
+            st.info("해당 배송 기간에 비교할 주문이 없습니다.")
+            return
+        st.dataframe(
+            df,
+            width="stretch",
+            hide_index=True,
+            key=f"{key_prefix}_deliv_cost_df",
+            column_config={
+                "입력원가": st.column_config.NumberColumn("입력원가", format="%,.0f"),
+                "본사원가": st.column_config.NumberColumn("본사원가", format="%,.0f"),
+                "원가차이": st.column_config.NumberColumn("원가차이", format="%,.0f"),
+                "입력판매가": st.column_config.NumberColumn("입력판매가", format="%,.0f"),
+            },
+        )
+
+
 def _render_marketing_multi_period_comparison(
     merged_all: pd.DataFrame,
     range_start_a: date,
@@ -11364,6 +11441,12 @@ def render_marketing_insights_tenant():
         range_start_b, range_end_b,
         key_prefix="mi_tenant",
     )
+    _render_delivery_cost_reconcile_report(
+        db_filename,
+        range_start_a, range_end_a,
+        range_start_b, range_end_b,
+        key_prefix="mi_tenant",
+    )
 
     # ── 다면 분석 섹션 (매장 단일: store_map=None) ─────────────────
     _merged_for_mdim = (
@@ -11546,6 +11629,12 @@ def render_marketing_insights_superadmin():
 
     _render_header_line_discrepancy_report(
         merged_all,
+        range_start_a, range_end_a,
+        range_start_b, range_end_b,
+        key_prefix="mi_superadmin",
+    )
+    _render_delivery_cost_reconcile_report(
+        st.session_state.get("current_db") or "",
         range_start_a, range_end_a,
         range_start_b, range_end_b,
         key_prefix="mi_superadmin",
@@ -31741,6 +31830,118 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
         with st.expander(f"주문 그룹 미리보기 (최대 500건, 총 {preview.group_count:,}건)", expanded=False):
             st.dataframe(lps.preview_to_dataframe(preview, max_rows=500), width="stretch", hide_index=True)
 
+        st.markdown("#### 3-0. 입력원가 vs 본사원가")
+        st.caption("이미 입력된 판매가는 역산하지 않습니다. 헤더 원가·판매가는 바꾸지 않습니다.")
+        try:
+            import import_cost_reconcile as _icr
+            _rec = _icr.build_reconcile_from_preview(preview, getattr(preview, "orders_by_cid", {}) or {})
+            st.session_state[f"legacy_purchase_reconcile::{excel_upload.name}"] = _rec
+            _b1, _b2, _b3, _b4 = st.columns(4)
+            _b1.metric("원가 불일치", f"{_rec.mismatch:,}건")
+            _b2.metric("원가 미입력", f"{_rec.blank:,}건")
+            _b3.metric("본사만 있음", f"{_rec.hq_only:,}건")
+            _b4.metric("앱만 있음", f"{_rec.app_only:,}건")
+            _rec_df = _icr.reconcile_dataframe(_rec)
+            if not _rec_df.empty:
+                st.dataframe(
+                    _rec_df,
+                    width="stretch",
+                    hide_index=True,
+                    key=f"legacy_purchase_rec_df::{excel_upload.name}",
+                    column_config={
+                        "입력원가": st.column_config.NumberColumn("입력원가", format="%,.0f"),
+                        "본사원가": st.column_config.NumberColumn("본사원가", format="%,.0f"),
+                        "원가차이": st.column_config.NumberColumn("원가차이", format="%,.0f"),
+                        "입력판매가": st.column_config.NumberColumn("입력판매가", format="%,.0f"),
+                    },
+                )
+            _role = (st.session_state.get("current_user") or {}).get("role", "")
+            _gkey = ""
+            try:
+                _gkey = str((st.secrets.get("gemini") or {}).get("api_key") or "") or os.environ.get("GEMINI_API_KEY", "")
+            except Exception:
+                _gkey = os.environ.get("GEMINI_API_KEY", "")
+            if _role in ("store_admin", "superadmin"):
+                _g_disabled = not bool(_gkey.strip())
+                if st.button(
+                    "Gemini 분할·이상 제안",
+                    key=f"legacy_purchase_gemini::{excel_upload.name}",
+                    disabled=_g_disabled,
+                    help="확인한 묶음만 합산합니다. 키가 없으면 비활성.",
+                ):
+                    sc_g, _ = get_supabase_client()
+                    _fb = _icr.load_ai_feedback(sc_g, db_filename) if sc_g else []
+                    with st.spinner("Gemini 제안 생성 중..."):
+                        _sug = _icr.suggest_with_gemini(
+                            api_key=_gkey,
+                            reconcile=_rec,
+                            preview_groups=preview.groups,
+                            feedback=_fb,
+                        )
+                    st.session_state[f"legacy_purchase_gemini_sug::{excel_upload.name}"] = _sug
+                _sug = st.session_state.get(f"legacy_purchase_gemini_sug::{excel_upload.name}")
+                if _sug:
+                    if _sug.get("error"):
+                        st.warning(f"Gemini: {_sug.get('error')}")
+                    _merges = _sug.get("merges") or []
+                    _flags = _sug.get("fraud_flags") or []
+                    if _merges:
+                        st.caption("분할 주문 묶음 제안 (확인 시에만 합산 비교)")
+                        for _mi, _mg in enumerate(_merges[:20]):
+                            _oids = _mg.get("order_ids") or []
+                            _lab = f"주문 { _oids } · {_mg.get('reason') or ''} (신뢰 {_mg.get('confidence')})"
+                            _c1, _c2 = st.columns([3, 1])
+                            with _c1:
+                                st.write(_lab)
+                            with _c2:
+                                if st.button("확인", key=f"ai_merge_ok::{excel_upload.name}::{_mi}"):
+                                    sc_g, _ = get_supabase_client()
+                                    _who = (st.session_state.get("current_user") or {}).get("username") or ""
+                                    if sc_g:
+                                        _icr.save_ai_feedback(sc_g, db_filename, "merge", _mg, "accepted", _who)
+                                    _acc = st.session_state.setdefault(
+                                        f"legacy_purchase_ai_merges::{excel_upload.name}", []
+                                    )
+                                    _acc.append(_mg)
+                                    st.rerun()
+                                if st.button("거절", key=f"ai_merge_no::{excel_upload.name}::{_mi}"):
+                                    sc_g, _ = get_supabase_client()
+                                    _who = (st.session_state.get("current_user") or {}).get("username") or ""
+                                    if sc_g:
+                                        _icr.save_ai_feedback(sc_g, db_filename, "merge", _mg, "rejected", _who)
+                                    st.rerun()
+                    if _flags:
+                        st.caption("부정·이상 의심 (검토용, 확정 아님)")
+                        for _fi, _fl in enumerate(_flags[:20]):
+                            st.write(f"- {_fl.get('type')} · 주문 {_fl.get('order_id')} · {_fl.get('reason')}")
+                            _fc1, _fc2 = st.columns(2)
+                            with _fc1:
+                                if st.button("확인(검토)", key=f"ai_fr_ok::{excel_upload.name}::{_fi}"):
+                                    sc_g, _ = get_supabase_client()
+                                    _who = (st.session_state.get("current_user") or {}).get("username") or ""
+                                    if sc_g:
+                                        _icr.save_ai_feedback(sc_g, db_filename, "fraud", _fl, "accepted", _who)
+                                    st.rerun()
+                            with _fc2:
+                                if st.button("거절", key=f"ai_fr_no::{excel_upload.name}::{_fi}"):
+                                    sc_g, _ = get_supabase_client()
+                                    _who = (st.session_state.get("current_user") or {}).get("username") or ""
+                                    if sc_g:
+                                        _icr.save_ai_feedback(sc_g, db_filename, "fraud", _fl, "rejected", _who)
+                                    st.rerun()
+                    _acc_m = st.session_state.get(f"legacy_purchase_ai_merges::{excel_upload.name}") or []
+                    if _acc_m:
+                        _merged_rows = _icr.apply_confirmed_merges(_rec.rows, _acc_m)
+                        st.caption("확인된 AI 묶음 반영 비교")
+                        st.dataframe(
+                            _icr.reconcile_dataframe(_icr.ReconcileResult(rows=_merged_rows)),
+                            width="stretch",
+                            hide_index=True,
+                            key=f"legacy_purchase_ai_merged_df::{excel_upload.name}",
+                        )
+        except Exception as _rec_e:
+            st.caption(f"원가 대사 표를 만들지 못했습니다: {_rec_e}")
+
         # ── unresolved 그룹 수동 매핑 ──
         if preview.unresolved_count > 0:
             st.markdown("#### 3-2. 수동 매칭 필요 그룹")
@@ -31894,6 +32095,40 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                     f"라인 {result.items_inserted}건 (기존주문 attach {result.items_attached_existing}건 포함) · "
                     f"기존고객 주소 보완 {result.customers_address_filled}건."
                 )
+            _rec_done = st.session_state.get(f"legacy_purchase_reconcile::{excel_upload.name}")
+            if _rec_done and getattr(_rec_done, "rows", None):
+                _actor = (
+                    (st.session_state.get("current_user") or {}).get("username")
+                    or (st.session_state.get("current_user") or {}).get("name")
+                    or "legacy_purchase_import"
+                )
+                for _rr in _rec_done.rows:
+                    _code = _rr.get("_code") or ""
+                    if _code not in ("cost_mismatch", "cost_blank", "hq_only", "app_only"):
+                        continue
+                    try:
+                        _oid = int(_rr.get("주문ID") or 0)
+                    except (TypeError, ValueError):
+                        _oid = 0
+                    _lvl = _rr.get("_level") or "warning"
+                    _atype = {
+                        "cost_mismatch": "import_cost_mismatch",
+                        "cost_blank": "import_cost_blank",
+                        "hq_only": "import_hq_only",
+                        "app_only": "import_app_only",
+                    }.get(_code, "import_cost_mismatch")
+                    _msg = (
+                        f"{_rr.get('고객명') or ''} {_rr.get('전화') or ''} — "
+                        f"입력원가 {_rr.get('입력원가')}원 vs 본사원가 {_rr.get('본사원가')}원 "
+                        f"(차이 {_rr.get('원가차이')}) · 배송 {_rr.get('배송일') or ''} · {_rr.get('결과')}"
+                    )
+                    try:
+                        _insert_fraud_alert_to_admins(
+                            db_filename, _oid, _actor, _lvl, _atype, _msg.strip(),
+                            reason="매입 원장 원가 대사",
+                        )
+                    except Exception:
+                        pass
             for _k in list(st.session_state.keys()):
                 if isinstance(_k, str) and (
                     _k.startswith(f"legacy_purchase_preview::{excel_upload.name}")
@@ -31901,6 +32136,9 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                     or _k.startswith(f"legacy_purchase_ct_scan::{excel_upload.name}")
                     or _k.startswith(f"legacy_purchase_decisions::{excel_upload.name}")
                     or _k.startswith(f"legacy_purchase_decision::")
+                    or _k.startswith(f"legacy_purchase_reconcile::{excel_upload.name}")
+                    or _k.startswith(f"legacy_purchase_gemini")
+                    or _k.startswith(f"legacy_purchase_ai_merges")
                     or _k == _cache_key
                 ):
                     st.session_state.pop(_k, None)

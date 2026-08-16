@@ -578,6 +578,7 @@ class PurchasePreviewResult:
     total_sale_amount: int = 0
     total_cost_amount: int = 0
     yearly_stats: list[dict] = field(default_factory=list)
+    orders_by_cid: dict = field(default_factory=dict)
 
 
 def load_existing_customer_identity_map(client, store_name: str) -> dict[str, int]:
@@ -618,20 +619,41 @@ def load_existing_customer_identity_map(client, store_name: str) -> dict[str, in
     return result
 
 
-def _fetch_existing_orders(client, db_filename: str) -> dict[tuple[int, str], list[dict]]:
-    """대상 매장 앱 주문을 (customer_id, order_date) 로 그룹핑해 반환.
+def _order_rec_from_row(row: dict) -> dict | None:
+    try:
+        oid = int(row["id"]) if row.get("id") is not None else None
+        cid = int(row["customer_id"]) if row.get("customer_id") is not None else None
+    except (TypeError, ValueError, KeyError):
+        return None
+    if oid is None or cid is None:
+        return None
+    return {
+        "id": oid,
+        "customer_id": cid,
+        "order_date": str(row.get("order_date") or "")[:10],
+        "total_amount": float(row.get("total_amount") or 0),
+        "cost_price": float(row.get("cost_price") or 0),
+        "display_cost_amount": float(row.get("display_cost_amount") or 0),
+        "delivery_date": row.get("delivery_date"),
+        "category": row.get("category") or "",
+        "employee_names": row.get("employee_names") or "",
+        "import_source": row.get("import_source"),
+    }
 
-    반환: {(customer_id, order_date): [{"id":..., "total_amount":..., "cost_price":..., "delivery_date":..., "category":...}, ...]}
-    """
-    out: dict[tuple[int, str], list[dict]] = {}
+
+def _fetch_existing_orders(client, db_filename: str) -> tuple[dict[tuple[int, str], list[dict]], dict[int, list[dict]]]:
+    """앱 주문. 반환: (customer_id, order_date) 맵, customer_id 맵."""
+    by_date: dict[tuple[int, str], list[dict]] = {}
+    by_cid: dict[int, list[dict]] = {}
     if not db_filename:
-        return out
+        return by_date, by_cid
     _PAGE = 1000
     offset = 0
     while True:
         try:
             q = client.table("app_orders").select(
-                "id, customer_id, order_date, delivery_date, total_amount, cost_price, category"
+                "id, customer_id, order_date, delivery_date, total_amount, cost_price, "
+                "display_cost_amount, category, employee_names, import_source"
             ).eq("db_filename", db_filename).order("id").range(offset, offset + _PAGE - 1)
             r = q.execute()
         except Exception as e:
@@ -639,25 +661,51 @@ def _fetch_existing_orders(client, db_filename: str) -> dict[tuple[int, str], li
             break
         rows = (r.data or []) if hasattr(r, "data") else []
         for row in rows:
-            cid = row.get("customer_id")
-            od = row.get("order_date")
-            if cid is None or not od:
+            rec = _order_rec_from_row(row)
+            if not rec:
                 continue
-            try:
-                key = (int(cid), str(od)[:10])
-            except (TypeError, ValueError):
-                continue
-            out.setdefault(key, []).append({
-                "id": int(row["id"]) if row.get("id") is not None else None,
-                "total_amount": float(row.get("total_amount") or 0),
-                "cost_price": float(row.get("cost_price") or 0),
-                "delivery_date": row.get("delivery_date"),
-                "category": row.get("category") or "",
-            })
+            cid = rec["customer_id"]
+            od = rec["order_date"]
+            if od:
+                by_date.setdefault((cid, od), []).append(rec)
+            by_cid.setdefault(cid, []).append(rec)
         if len(rows) < _PAGE:
             break
         offset += _PAGE
-    return out
+    return by_date, by_cid
+
+
+def _delivery_fallback_candidates(group, orders_for_cid: list[dict]) -> tuple[list[dict], str]:
+    """등록일 미스일 때만. 배송일 정확 1건 또는 ±2일 최근접 1건."""
+    dd = parse_date(getattr(group, "delivery_date", None))
+    if not dd or not orders_for_cid:
+        return [], "none"
+    exact = [o for o in orders_for_cid if str(o.get("delivery_date") or "")[:10] == dd]
+    if len(exact) == 1:
+        return exact, "exact"
+    if len(exact) > 1:
+        return exact, "multi"
+    try:
+        gdate = date.fromisoformat(dd)
+    except ValueError:
+        return [], "none"
+    near: list[tuple[int, dict]] = []
+    for o in orders_for_cid:
+        od = str(o.get("delivery_date") or "")[:10]
+        if len(od) < 10:
+            continue
+        try:
+            gap = abs((date.fromisoformat(od) - gdate).days)
+        except ValueError:
+            continue
+        if 1 <= gap <= 2:
+            near.append((gap, o))
+    if not near:
+        return [], "none"
+    near.sort(key=lambda x: (x[0], int(x[1].get("id") or 0)))
+    if len(near) == 1 or near[0][0] < near[1][0]:
+        return [near[0][1]], "near"
+    return [x[1] for x in near], "multi"
 
 
 def _fetch_existing_items_ship_numbers(client, db_filename: str) -> set[str]:
@@ -754,9 +802,10 @@ def build_preview(
     if existing_customers_by_phone is None:
         existing_customers_by_phone = load_existing_customer_identity_map(client, store_name)
 
-    existing_orders_by_cid_date = _fetch_existing_orders(client, db_filename)
+    existing_orders_by_cid_date, existing_orders_by_cid = _fetch_existing_orders(client, db_filename)
     existing_ship_numbers = _fetch_existing_items_ship_numbers(client, db_filename)
     imported_pairs = _fetch_purchase_imported_pairs(client, db_filename)
+    result.orders_by_cid = existing_orders_by_cid
 
     # 세션 신규 고객 슬롯 (음수 id)
     session_new_phone_to_slot: dict[str, int] = {}
@@ -803,8 +852,32 @@ def build_preview(
             g.candidate_order_ids = [c["id"] for c in candidates if c.get("id") is not None]
             g.candidate_orders_meta = [c for c in candidates if c.get("id") is not None]
             if len(g.candidate_order_ids) == 0:
-                g.match_status = "to_create"
-                result.to_create_count += 1
+                fb, how = _delivery_fallback_candidates(
+                    g, existing_orders_by_cid.get(int(g.existing_customer_id), []),
+                )
+                if how == "exact" and len(fb) == 1:
+                    g.match_status = "to_attach"
+                    g.chosen_order_id = fb[0]["id"]
+                    g.candidate_order_ids = [fb[0]["id"]]
+                    g.candidate_orders_meta = fb
+                    g.reason = "배송일 정확 매칭"
+                    result.to_attach_count += 1
+                elif how == "near" and len(fb) == 1:
+                    g.match_status = "to_attach"
+                    g.chosen_order_id = fb[0]["id"]
+                    g.candidate_order_ids = [fb[0]["id"]]
+                    g.candidate_orders_meta = fb
+                    g.reason = "배송일 ±2일 근사 매칭"
+                    result.to_attach_count += 1
+                elif how == "multi" and fb:
+                    g.match_status = "unresolved"
+                    g.candidate_order_ids = [c["id"] for c in fb if c.get("id") is not None]
+                    g.candidate_orders_meta = fb
+                    g.reason = f"배송일 후보 {len(fb)}건"
+                    result.unresolved_count += 1
+                else:
+                    g.match_status = "to_create"
+                    result.to_create_count += 1
             elif len(g.candidate_order_ids) == 1:
                 g.match_status = "to_attach"
                 g.chosen_order_id = g.candidate_order_ids[0]
@@ -845,7 +918,22 @@ def preview_to_dataframe(preview: PurchasePreviewResult, max_rows: int = 500) ->
     rows = []
     for g in preview.groups[:max_rows]:
         _id_type = "매장 전시" if g.is_display_customer else "전화 매칭"
-        rows.append({
+        entered_sale = None
+        if g.match_status == "to_attach":
+            meta = None
+            if g.chosen_order_id:
+                for m in g.candidate_orders_meta or []:
+                    if m.get("id") == g.chosen_order_id:
+                        meta = m
+                        break
+            if meta is None and g.candidate_orders_meta:
+                meta = g.candidate_orders_meta[0]
+            if meta is not None:
+                try:
+                    entered_sale = int(round(float(meta.get("total_amount") or 0)))
+                except (TypeError, ValueError):
+                    entered_sale = None
+        row = {
             "상태": _STATUS_LABEL.get(g.match_status, g.match_status),
             "식별": _id_type,
             "고객명": g.customer_name + (f"[{g.customer_tag}]" if g.customer_tag else ""),
@@ -854,10 +942,14 @@ def preview_to_dataframe(preview: PurchasePreviewResult, max_rows: int = 500) ->
             "출고번호": g.ship_number,
             "라인수": len(g.items),
             "매입금액(합)": g.total_line_cost,
-            "판매가(역산)": g.sale_price,
             "후보주문": ", ".join(str(x) for x in g.candidate_order_ids[:5]) + ("…" if len(g.candidate_order_ids) > 5 else ""),
             "사유": g.reason,
-        })
+        }
+        if entered_sale:
+            row["입력판매가"] = entered_sale
+        else:
+            row["판매가(역산)"] = g.sale_price
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
