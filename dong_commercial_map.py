@@ -1395,17 +1395,23 @@ def aggregate_purchase_count_by_dong(
     `_client` 는 언더스코어 접두사로 Streamlit 캐시 해싱에서 제외됨(공식 규칙).
     최신 데이터 강제 조회가 필요하면 `aggregate_purchase_count_by_dong.clear()` 호출.
     """
-    def _empty_with_coverage(total_orders: int, mapped_orders: int) -> pd.DataFrame:
+    def _empty_with_coverage(
+        total_orders: int, mapped_orders: int,
+        unmapped_ids: list | None = None, total_amount: int = 0,
+    ) -> pd.DataFrame:
         _out = pd.DataFrame(columns=[
             "admin_dong_code", "admin_dong_name", "purchase_count", "purchase_amount",
         ])
         _out.attrs["total_orders_in_period"] = total_orders
         _out.attrs["mapped_orders_in_period"] = mapped_orders
+        _out.attrs["total_amount_in_period"] = int(total_amount)
+        _out.attrs["unmapped_customer_ids"] = list(unmapped_ids or [])
         return _out
 
     client = _client
     if not store_keys:
         return _empty_with_coverage(0, 0)
+    # 판매(계약)일 기준. delivery_date 는 사용하지 않는다.
     orders = _paginated_select(
         client, "app_orders", "id, customer_id, db_filename, order_date, total_amount",
         filters=[
@@ -1416,9 +1422,12 @@ def aggregate_purchase_count_by_dong(
     )
     if not orders:
         return _empty_with_coverage(0, 0)
+    _period_amount = int(pd.to_numeric(
+        pd.Series([o.get("total_amount") for o in orders]), errors="coerce"
+    ).fillna(0).sum())
     cust_ids = sorted({int(o["customer_id"]) for o in orders if o.get("customer_id") is not None})
     if not cust_ids:
-        return _empty_with_coverage(len(orders), 0)
+        return _empty_with_coverage(len(orders), 0, total_amount=_period_amount)
     custs: list[dict] = []
     _CHUNK = 500
     for i in range(0, len(cust_ids), _CHUNK):
@@ -1431,15 +1440,21 @@ def aggregate_purchase_count_by_dong(
         except Exception as e:
             logger.warning("app_customers 배치 조회 실패 (%d ids): %s", len(_batch), e)
     if not custs:
-        return _empty_with_coverage(len(orders), 0)
+        return _empty_with_coverage(len(orders), 0, unmapped_ids=cust_ids, total_amount=_period_amount)
     cdf = pd.DataFrame(custs).rename(columns={"id": "customer_id"})
     odf = pd.DataFrame(orders)
     odf["total_amount"] = pd.to_numeric(odf.get("total_amount"), errors="coerce").fillna(0)
     merged_all = odf.merge(cdf[["customer_id", "admin_dong_code", "admin_dong_name"]], on="customer_id", how="left")
     mapped_mask = merged_all["admin_dong_code"].notna() & (merged_all["admin_dong_code"] != "")
+    unmapped_ids = (
+        merged_all.loc[~mapped_mask, "customer_id"]
+        .dropna().map(lambda x: int(x)).unique().tolist()
+    )
     merged = merged_all[mapped_mask]
     if merged.empty:
-        return _empty_with_coverage(len(merged_all), 0)
+        return _empty_with_coverage(
+            len(merged_all), 0, unmapped_ids=unmapped_ids, total_amount=_period_amount,
+        )
     grp = merged.groupby(["admin_dong_code", "admin_dong_name"], as_index=False).agg(
         purchase_count=("id", "count"),
         purchase_amount=("total_amount", "sum"),
@@ -1448,6 +1463,8 @@ def aggregate_purchase_count_by_dong(
     grp = grp.sort_values("purchase_count", ascending=False)
     grp.attrs["total_orders_in_period"] = len(merged_all)
     grp.attrs["mapped_orders_in_period"] = int(mapped_mask.sum())
+    grp.attrs["total_amount_in_period"] = _period_amount
+    grp.attrs["unmapped_customer_ids"] = unmapped_ids
     return grp
 
 
@@ -1550,8 +1567,9 @@ def _fetch_customers_needing_admin_dong(
         ).is_("admin_dong_code", "null").not_.is_("address", "null")
         if store_names:
             q = q.in_("store_name", store_names)
+        # 최근 고객부터 처리 (오래된 미매핑이 배치를 선점하지 않도록).
         # not_found 쿨다운 스킵은 파이썬 필터로 처리하므로 여유있게 더 가져온다.
-        r = q.limit(limit if force_retry else limit * 3).execute()
+        r = q.order("id", desc=True).limit(limit if force_retry else limit * 3).execute()
         rows = (r.data or []) if hasattr(r, "data") else []
         if force_retry:
             return rows[:limit]
@@ -1582,8 +1600,81 @@ def backfill_admin_dong_batch(
     행정동 미매핑 고객을 최대 `max_records` 건 처리.
     반환: {"processed", "updated", "failed", "fail_reasons": {stage: count}, "errors": [...]}
     """
-    result: dict = {"processed": 0, "updated": 0, "failed": 0, "fail_reasons": {}, "errors": []}
     rows = _fetch_customers_needing_admin_dong(client, store_names, max_records, force_retry=force_retry)
+    return _apply_geocode_to_customer_rows(
+        client, rows,
+        sleep_between_calls_sec=sleep_between_calls_sec,
+        progress_callback=progress_callback,
+    )
+
+
+def backfill_admin_dong_for_ids(
+    client,
+    customer_ids: list,
+    sleep_between_calls_sec: float = 0.05,
+    progress_callback=None,
+) -> dict:
+    """기간 내 주문 고객 ID만 대상으로 행정동 변환. 전체 미매핑을 오래된 순으로
+    훑는 일반 백필과 달리, 현재 분석 기간의 미매핑 판매를 우선 보완한다."""
+    result: dict = {
+        "processed": 0, "updated": 0, "failed": 0,
+        "fail_reasons": {}, "errors": [],
+        "skipped_no_address": 0, "already_mapped": 0,
+    }
+    ids: list[int] = []
+    for x in customer_ids or []:
+        try:
+            ids.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    ids = sorted(set(ids))
+    if not ids:
+        return result
+
+    rows: list[dict] = []
+    _CHUNK = 200
+    for i in range(0, len(ids), _CHUNK):
+        _batch = ids[i:i + _CHUNK]
+        try:
+            r = client.table("app_customers").select(
+                "id, address, latitude, longitude, store_name, admin_dong_code, "
+                "admin_dong_fail_reason, admin_dong_fail_at, admin_dong_fail_count"
+            ).in_("id", _batch).execute()
+            rows.extend((r.data or []) if hasattr(r, "data") else [])
+        except Exception as e:
+            logger.warning("기간 미매핑 고객 조회 실패 (%d ids): %s", len(_batch), e)
+            result["errors"].append(f"조회 실패: {e}")
+
+    need: list[dict] = []
+    for row in rows:
+        if row.get("admin_dong_code"):
+            result["already_mapped"] += 1
+            continue
+        if not (row.get("address") or "").strip() and row.get("latitude") is None:
+            result["skipped_no_address"] += 1
+            continue
+        need.append(row)
+    geo = _apply_geocode_to_customer_rows(
+        client, need,
+        sleep_between_calls_sec=sleep_between_calls_sec,
+        progress_callback=progress_callback,
+    )
+    result["processed"] = int(geo.get("processed") or 0)
+    result["updated"] = int(geo.get("updated") or 0)
+    result["failed"] = int(geo.get("failed") or 0)
+    result["fail_reasons"] = geo.get("fail_reasons") or {}
+    result["errors"] = (result.get("errors") or []) + list(geo.get("errors") or [])
+    return result
+
+
+def _apply_geocode_to_customer_rows(
+    client,
+    rows: list[dict],
+    sleep_between_calls_sec: float = 0.05,
+    progress_callback=None,
+) -> dict:
+    """고객 row 목록에 geocode_to_admin_dong 을 적용하고 app_customers 를 갱신한다."""
+    result: dict = {"processed": 0, "updated": 0, "failed": 0, "fail_reasons": {}, "errors": []}
     if not rows:
         return result
 
@@ -1639,6 +1730,42 @@ def backfill_admin_dong_batch(
         if sleep_between_calls_sec > 0:
             time.sleep(sleep_between_calls_sec)
     return result
+
+
+def _remap_crm_dong_codes_to_selection(crm_df: pd.DataFrame, sel_codes: list[str]) -> pd.DataFrame:
+    """카카오 행정동 코드를 선택 GeoJSON adm_cd2 에 맞춰 정규화한 뒤 재집계.
+
+    10자리 완전 일치 → 앞 8자리 일치 순. 코드 자릿수 차이로 선택 동에서
+    탈락하는 매핑 건을 복구한다.
+    """
+    if crm_df is None or crm_df.empty or "admin_dong_code" not in crm_df.columns:
+        return crm_df if crm_df is not None else pd.DataFrame()
+    sel_set = {str(c) for c in sel_codes if c}
+    sel8: dict[str, str] = {}
+    for c in sel_codes:
+        s = str(c)
+        if s:
+            sel8.setdefault(s[:8], s)
+
+    def _remap(code) -> str:
+        s = "" if code is None or (isinstance(code, float) and pd.isna(code)) else str(code).strip()
+        if not s:
+            return s
+        if s in sel_set:
+            return s
+        prefix = s[:8]
+        if prefix in sel8:
+            return sel8[prefix]
+        return s
+
+    out = crm_df.copy()
+    out["admin_dong_code"] = out["admin_dong_code"].map(_remap)
+    agg: dict[str, str] = {"purchase_count": "sum"}
+    if "purchase_amount" in out.columns:
+        agg["purchase_amount"] = "sum"
+    if "admin_dong_name" in out.columns:
+        agg["admin_dong_name"] = "first"
+    return out.groupby("admin_dong_code", as_index=False).agg(agg)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2300,9 +2427,9 @@ def render_dong_commercial_map() -> None:
         )
         if _preset == "직접 입력":
             period_range = st.date_input(
-                "분석 기간 (구매건수 집계 구간)",
+                "분석 기간 (구매일 기준 집계)",
                 value=(_default_start, _today),
-                help="이 기간의 구매건수를 행정동별로 합산해 침투율을 계산합니다. "
+                help="app_orders.order_date(구매일/계약일) 기준입니다. 배송일(delivery_date)은 사용하지 않습니다. "
                      "인구·세대 데이터는 기간 종료월 기준으로 1회만 조회합니다.",
                 key="dcm_period_range",
             )
@@ -2318,7 +2445,7 @@ def render_dong_commercial_map() -> None:
                 period_range = (date(_py, 1, 1), date(_py, 6, 30))
             else:  # 하반기
                 period_range = (date(_py, 7, 1), date(_py, 12, 31))
-            st.caption(f"📅 {period_range[0]} ~ {period_range[1]} (구매일 기준 집계)")
+            st.caption(f"📅 {period_range[0]} ~ {period_range[1]} (구매일/계약일 기준 · 배송일 아님)")
 
     if not sel_labels:
         st.info("최소 1개 이상의 매장을 선택해 주세요.")
@@ -2533,8 +2660,41 @@ def render_dong_commercial_map() -> None:
     if do_render:
         if force_refresh:
             aggregate_purchase_count_by_dong.clear()
-        with st.spinner("행정동별 구매건수 집계 중…"):
+        with st.spinner("행정동별 구매건수 집계 중… (구매일 기준)"):
             _raw_df = aggregate_purchase_count_by_dong(client, sel_dbfns, start_date_str, end_date_str)
+
+        # 기간 내 미매핑 고객만 자동 변환 — 전체 미매핑을 오래된 순으로 훑는
+        # 백필 패널과 달리, 현재 분석 기간 판매가 지도에 바로 반영되게 한다.
+        _raw_attrs = _raw_df.attrs if (_raw_df is not None) else {}
+        _unmapped_ids = list(_raw_attrs.get("unmapped_customer_ids") or [])
+        _bf_key = ("dcm_period_backfill", start_date_str, end_date_str, tuple(sorted(sel_dbfns)))
+        _bf_done = st.session_state.get("dcm_period_backfill_key") == _bf_key
+        if _unmapped_ids and (force_refresh or not _bf_done):
+            _prog = st.progress(0.0, text=f"기간 내 미매핑 고객 {len(_unmapped_ids)}명 행정동 자동 변환 중…")
+
+            def _on_bf_progress(done: int, total: int) -> None:
+                _prog.progress(
+                    min(1.0, done / max(total, 1)),
+                    text=f"기간 내 미매핑 고객 행정동 변환 {done}/{total}",
+                )
+
+            _bf = backfill_admin_dong_for_ids(
+                client, _unmapped_ids, progress_callback=_on_bf_progress,
+            )
+            _prog.empty()
+            st.session_state["dcm_period_backfill_key"] = _bf_key
+            st.session_state["dcm_period_backfill_stat"] = _bf
+            if int(_bf.get("updated") or 0) > 0:
+                aggregate_purchase_count_by_dong.clear()
+                _raw_df = aggregate_purchase_count_by_dong(client, sel_dbfns, start_date_str, end_date_str)
+                _raw_attrs = _raw_df.attrs if (_raw_df is not None) else {}
+            _upd, _fail = int(_bf.get("updated") or 0), int(_bf.get("failed") or 0)
+            _skip = int(_bf.get("skipped_no_address") or 0)
+            if _upd or _fail or _skip:
+                st.info(
+                    f"기간 내 미매핑 자동 변환(구매일 기준): 성공 {_upd}명 · 실패 {_fail}명"
+                    + (f" · 주소없음 {_skip}명" if _skip else "")
+                )
 
         # 선택 행정동 스켈레톤 — GeoJSON 기준으로 만든 뒤 CRM 을 left-join 하여
         # 구매가 없는 동도 침투율 0 으로 포함(잠재 상권 분석).
@@ -2547,10 +2707,11 @@ def render_dong_commercial_map() -> None:
             _merged["purchase_count"] = 0
             _merged["purchase_amount"] = 0
         else:
+            _crm_aligned = _remap_crm_dong_codes_to_selection(_raw_df, [str(c) for c in sel_adm_codes])
             _amt_cols = ["admin_dong_code", "purchase_count"]
-            if "purchase_amount" in _raw_df.columns:
+            if "purchase_amount" in _crm_aligned.columns:
                 _amt_cols.append("purchase_amount")
-            _crm_slim = _raw_df[_amt_cols].copy()
+            _crm_slim = _crm_aligned[_amt_cols].copy()
             _crm_slim["admin_dong_code"] = _crm_slim["admin_dong_code"].astype(str)
             _merged = _skeleton.merge(_crm_slim, on="admin_dong_code", how="left")
             _merged["purchase_count"] = _merged["purchase_count"].fillna(0).astype(int)
@@ -2561,12 +2722,13 @@ def render_dong_commercial_map() -> None:
             )
         _merged = _attach_sigungu(_merged)
 
-        # attrs 캡처 (요약 지표의 미매핑 커버리지에 사용). skeleton 은 attrs 를 가지지 않으므로
-        # 원본 CRM 결과의 attrs 를 사용한다.
-        _raw_attrs = _raw_df.attrs if (_raw_df is not None) else {}
+        _selected_orders = int(pd.to_numeric(_merged.get("purchase_count"), errors="coerce").fillna(0).sum())
         st.session_state["dcm_mapping_coverage"] = {
             "total_orders": int(_raw_attrs.get("total_orders_in_period", 0) or 0),
             "mapped_orders": int(_raw_attrs.get("mapped_orders_in_period", 0) or 0),
+            "selected_orders": _selected_orders,
+            "total_amount": int(_raw_attrs.get("total_amount_in_period", 0) or 0),
+            "date_basis": "order_date",
         }
         st.session_state["dcm_raw_crm_df"] = _merged
         st.session_state["dcm_raw_cache_key"] = _cache_key
@@ -2585,13 +2747,15 @@ def render_dong_commercial_map() -> None:
         st.warning("선택한 행정동에 렌더링할 데이터가 없습니다.")
         return
 
-    st.caption(f"📅 분석 기간: {start_date} ~ {end_date} · 인구 기준월: {yyyymm}")
+    st.caption(f"📅 분석 기간: {start_date} ~ {end_date} (구매일/계약일 기준 · 배송일 아님) · 인구 기준월: {yyyymm}")
     _n_purch = int((crm_df["purchase_count"] > 0).sum())
     _amt_sum = int(pd.to_numeric(crm_df.get("purchase_amount"), errors="coerce").fillna(0).sum())
+    _cov = st.session_state.get("dcm_mapping_coverage") or {}
+    _period_n = int(_cov.get("total_orders") or 0)
     st.success(
         f"선택 행정동 {len(crm_df)}개 (구매 발생 {_n_purch}개 · 잠재 {len(crm_df) - _n_purch}개), "
-        f"기간 내 총 구매건수 {int(crm_df['purchase_count'].sum())} 건 · "
-        f"구매금액 합계 {_amt_sum:,} 원"
+        f"기간 내 판매 {_period_n:,}건(구매일) · 선택 동 반영 {int(crm_df['purchase_count'].sum()):,}건 · "
+        f"선택 동 구매금액 {_amt_sum:,} 원"
     )
 
     # 인구 데이터: 선택 행정동에 대해서만 조회 (불필요 API 호출 절감).
@@ -3082,8 +3246,14 @@ def _render_summary_metrics(df: pd.DataFrame) -> None:
     if df is None or df.empty:
         return
     _total_dong = len(df)
-    _total_orders = int(df["purchase_count"].sum())
-    _total_amount = int(pd.to_numeric(df.get("purchase_amount"), errors="coerce").fillna(0).sum())
+    _selected_orders = int(df["purchase_count"].sum())
+    _selected_amount = int(pd.to_numeric(df.get("purchase_amount"), errors="coerce").fillna(0).sum())
+    coverage = st.session_state.get("dcm_mapping_coverage") or {}
+    _total_o = int(coverage.get("total_orders") or 0)
+    _mapped_o = int(coverage.get("mapped_orders") or 0)
+    _period_amount = int(coverage.get("total_amount") or _selected_amount)
+    _total_orders = _total_o if _total_o > 0 else _selected_orders
+    _total_amount = _period_amount if _total_o > 0 else _selected_amount
     _y_col = df.attrs.get("quadrant_y_col") or ("attractiveness" if "attractiveness" in df.columns else "target_density")
     _valid = df[(df["penetration_rate"] > 0) | (df[_y_col] > 0)] if _y_col in df.columns else df
     _med_p = float(df.attrs.get("median_penetration", _valid["penetration_rate"].median() if not _valid.empty else 0.0))
@@ -3097,9 +3267,18 @@ def _render_summary_metrics(df: pd.DataFrame) -> None:
     with m1:
         st.metric("대상 행정동 수", f"{_total_dong:,}")
     with m2:
-        st.metric("총 구매건수", f"{_total_orders:,}")
+        st.metric(
+            "총 구매건수",
+            f"{_total_orders:,}",
+            help="app_orders.order_date(구매일/계약일) 기준. 배송일 아님. "
+                 f"선택 행정동 반영 {_selected_orders:,}건 · 행정동 매핑 {_mapped_o:,}건.",
+        )
     with m3:
-        st.metric("구매금액 합계", f"{_total_amount:,} 원")
+        st.metric(
+            "구매금액 합계",
+            f"{_total_amount:,} 원",
+            help=f"같은 기간 판매금액(구매일). 선택 행정동 반영 {_selected_amount:,} 원.",
+        )
     with m4:
         st.metric("침투율 중앙값", f"{_med_p:.3f}%")
     with m5:
@@ -3124,20 +3303,22 @@ def _render_summary_metrics(df: pd.DataFrame) -> None:
         f"{STRATEGY_UNSET}: {strat_counts.get(STRATEGY_UNSET, 0)}"
     )
 
-    coverage = st.session_state.get("dcm_mapping_coverage") or {}
-    _total_o = int(coverage.get("total_orders") or 0)
-    _mapped_o = int(coverage.get("mapped_orders") or 0)
     if _total_o > 0:
         _unmapped_o = _total_o - _mapped_o
         _unmapped_pct = _unmapped_o / _total_o * 100
+        _outside = max(0, _mapped_o - _selected_orders)
         _msg = (
-            f"⚠️ 선택 기간 내 구매건 중 행정동 미매핑 {_unmapped_o:,}건 "
-            f"(전체 {_total_o:,}건 대비 {_unmapped_pct:.1f}%) — 침투율 계산에서 제외됨. "
-            "위 '미변환 고객 백필' 패널에서 보완할 수 있습니다."
+            f"구매일 기준 기간 내 판매 {_total_o:,}건 중 "
+            f"행정동 매핑 {_mapped_o:,}건 · 선택 동 반영 {_selected_orders:,}건"
+            + (f" · 선택 외 지역 {_outside:,}건" if _outside else "")
+            + (f" · 미매핑 {_unmapped_o:,}건({_unmapped_pct:.1f}%)" if _unmapped_o else "")
+            + ". 침투율·지도는 선택 행정동 반영 건수만 사용합니다."
         )
         if _unmapped_pct >= 10:
-            st.warning(_msg)
-        elif _unmapped_o > 0:
+            st.warning("⚠️ " + _msg + " 렌더 시 기간 내 미매핑은 자동 변환을 시도합니다.")
+        elif _unmapped_o > 0 or _outside > 0:
+            st.caption(_msg)
+        else:
             st.caption(_msg)
 
 
