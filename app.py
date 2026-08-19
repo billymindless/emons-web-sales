@@ -5551,6 +5551,75 @@ def _get_current_store_name_for_customers(db_filename: str) -> str:
     return _get_store_name_by_db(db_filename) or db_filename
 
 
+def _admin_dong_fields_from_address(
+    address: str | None,
+    lat: float | None = None,
+    lon: float | None = None,
+) -> dict:
+    """주소/좌표로 행정동 컬럼을 채운다. 상권맵 집계 키(admin_dong_code)용.
+    실패해도 빈 dict — 매출 저장을 막지 않는다."""
+    if not (address or "").strip() and lat is None:
+        return {}
+    try:
+        from dong_commercial_map import geocode_to_admin_dong
+        info = geocode_to_admin_dong(address, lat=lat, lon=lon)
+    except Exception:
+        return {}
+    if info.get("ok") and info.get("admin_dong_code"):
+        return {
+            "admin_dong_name": info.get("admin_dong_name"),
+            "admin_dong_code": info.get("admin_dong_code"),
+            "admin_dong_fail_reason": None,
+            "admin_dong_fail_at": None,
+        }
+    return {}
+
+
+def _ensure_customer_admin_dong(
+    db_filename: str,
+    customer_id: int,
+    address: str | None = None,
+) -> None:
+    """기존 고객에 행정동이 비어 있으면 주소로 1회 채워 최근 매출이 상권맵에 바로 잡히게 한다."""
+    if not customer_id:
+        return
+    client, err = get_supabase_client()
+    if err or not client:
+        return
+    store_name = _get_current_store_name_for_customers(db_filename)
+    try:
+        q = (
+            client.table("app_customers")
+            .select("id, address, latitude, longitude, admin_dong_code")
+            .eq("id", int(customer_id))
+        )
+        if store_name:
+            q = q.eq("store_name", store_name)
+        row = q.maybe_single().execute()
+        data = row.data if isinstance(getattr(row, "data", None), dict) else None
+        if not data or data.get("admin_dong_code"):
+            return
+        addr = (address or data.get("address") or "").strip()
+        if not addr:
+            return
+        lat = data.get("latitude")
+        lon = data.get("longitude")
+        try:
+            lat_f = float(lat) if lat is not None else None
+            lon_f = float(lon) if lon is not None else None
+        except (TypeError, ValueError):
+            lat_f, lon_f = None, None
+        fields = _admin_dong_fields_from_address(addr, lat_f, lon_f)
+        if not fields:
+            return
+        uq = client.table("app_customers").update(fields).eq("id", int(customer_id))
+        if store_name:
+            uq = uq.eq("store_name", store_name)
+        uq.execute()
+    except Exception:
+        pass
+
+
 def _supabase_insert_customer(db_filename: str, name: str, phone1: str, phone2: str | None, address: str | None) -> tuple[int | None, str | None]:
     """
     Supabase app_customers 테이블에 고객 1건 INSERT. store_name(현재 매장) 필수 주입.
@@ -5581,8 +5650,13 @@ def _supabase_insert_customer(db_filename: str, name: str, phone1: str, phone2: 
                     _v = _geo.get(_k)
                     if _v:
                         payload[_k] = _v
+            payload.update(_admin_dong_fields_from_address(
+                addr_clean,
+                (_geo or {}).get("latitude") if _geo else None,
+                (_geo or {}).get("longitude") if _geo else None,
+            ))
         except Exception:
-            pass
+            payload.update(_admin_dong_fields_from_address(addr_clean))
     try:
         r = client.table("app_customers").insert(payload).execute()
         if r.data and len(r.data) > 0 and r.data[0].get("id") is not None:
@@ -5597,7 +5671,10 @@ def _supabase_insert_customer(db_filename: str, name: str, phone1: str, phone2: 
             pass
         # 지역 컬럼(sigungu/bname/road_name/building_name) 미마이그레이션 시 재시도
         if "42703" in str(detail) or "column" in str(detail).lower():
-            fallback = {k: v for k, v in payload.items() if k not in ("sigungu", "bname", "road_name", "building_name")}
+            fallback = {k: v for k, v in payload.items() if k not in (
+                "sigungu", "bname", "road_name", "building_name",
+                "admin_dong_name", "admin_dong_code", "admin_dong_fail_reason", "admin_dong_fail_at",
+            )}
             try:
                 r2 = client.table("app_customers").insert(fallback).execute()
                 if r2.data and len(r2.data) > 0 and r2.data[0].get("id") is not None:
@@ -30550,6 +30627,7 @@ def render_new_sales():
                     st.stop()
             else:
                 customer_id = int(selected_customer_row["id"])
+            _ensure_customer_admin_dong(db_filename, customer_id, address_full)
             order_payload = {
                 "customer_id": customer_id,
                 "employee_names": employee_names_str or None,
@@ -30690,6 +30768,7 @@ def render_new_sales():
                         st.stop()
                 else:
                     customer_id = int(selected_customer_row["id"])
+                _ensure_customer_admin_dong(db_filename, customer_id, address_full)
                 conn.execute("""
                     INSERT INTO Orders (customer_id, employee_names, order_date, delivery_date, category, cost_price, total_amount, visit_reason, purchase_reason, display_sales_amount, display_cost_amount, balance_status)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -33244,6 +33323,9 @@ def render_customer_balance():
                                                                 _v = _geo.get(_k)
                                                                 if _v:
                                                                     upd_cust[_k] = _v
+                                                            upd_cust.update(_admin_dong_fields_from_address(
+                                                                _upd_addr, _geo.get("latitude"), _geo.get("longitude"),
+                                                            ))
                                                     except Exception:
                                                         pass
                                                 sc.table("app_customers").update(upd_cust).eq("store_name", store_name).eq("id", cid).execute()
