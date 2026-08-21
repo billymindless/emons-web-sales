@@ -11797,7 +11797,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             date(2026, 3, 1), date(2026, 3, 2),
             date(2026, 5, 5), date(2026, 5, 24),
             date(2026, 6, 3), date(2026, 6, 6), date(2026, 8, 15),
-            date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26), date(2026, 9, 28),
+            date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),
             date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9),
             date(2026, 12, 25),
         }
@@ -14531,7 +14531,6 @@ _ERP_KR_HOLIDAYS = {
     date(2026, 6, 3),   # 지방선거일
     date(2026, 6, 6), date(2026, 8, 15),
     date(2026, 9, 24), date(2026, 9, 25), date(2026, 9, 26),
-    date(2026, 9, 28),  # 추석 대체공휴일 (9/26 토요일)
     date(2026, 10, 3), date(2026, 10, 5), date(2026, 10, 9), date(2026, 12, 25),
 }
 
