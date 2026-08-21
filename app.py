@@ -2999,8 +2999,7 @@ def _ext_pay_release_and_rematch_source(
         for p in (old_pay, new_pay):
             if _ext_pay_source_from_method((p or {}).get("payment_method")) != "onnuri":
                 continue
-            last4 = _ext_pay_digits_only((p or {}).get("onnuri_approval_code"))
-            last4 = last4[-4:] if len(last4) >= 4 else last4
+            last4 = _onnuri_last4_from_code((p or {}).get("onnuri_approval_code"))
             try:
                 amt = abs(int(round(float((p or {}).get("amount") or 0))))
             except (TypeError, ValueError):
@@ -3275,9 +3274,9 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
 
     def _phone_last4_for(pay: dict) -> str | None:
         # 1) 신규매출 입력 시 저장한 전화번호 뒤 4자리 (onnuri_approval_code 재사용)
-        stored = _ext_pay_digits_only(pay.get("onnuri_approval_code"))
-        if len(stored) >= 4:
-            return stored[-4:]
+        stored = _onnuri_last4_from_code(pay.get("onnuri_approval_code"))
+        if stored:
+            return stored
         # 2) 스탬프 이전 건: 고객 phone1 폴백
         oid = pay["_order"].get("customer_id")
         if oid is None:
@@ -3381,13 +3380,32 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
                 else:
                     result_code = "matched_ok"
         else:
-            # 시간(tx_time)으로 좁히기: 후보 결제의 payment_date는 날짜만이라 시간 정보 없음 → 지문에 시간 넣어 구분되었길 기대.
-            # 그래도 다중이면 ambiguous.
-            if is_cancel:
+            # 거래시간이 저장된 건은 공식 파일 시각으로 확정
+            _want_t = _onnuri_parse_time_input(r.get("tx_time"))
+            _timed = [
+                _p for _p in candidates
+                if _want_t and _onnuri_time_from_code(_p.get("onnuri_approval_code")) == _want_t
+            ]
+            if len(_timed) == 1:
+                matched_pay = _timed[0]
+                if is_cancel:
+                    if int(matched_pay["order_id"]) in neg_orders:
+                        result_code = "matched_ok"
+                        note_parts.append("공식 취소 · ERP도 취소 흔적")
+                    else:
+                        result_code = "official_canceled"
+                        note_parts.append("공식 취소인데 ERP는 잔존")
+                else:
+                    if int(matched_pay["order_id"]) in neg_orders:
+                        result_code = "erp_canceled_official_paid"
+                        note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                    else:
+                        result_code = "matched_ok"
+                        note_parts.append("거래시간으로 구분")
+            elif is_cancel:
                 result_code = "ambiguous"
                 note_parts.append("다중 후보·취소·시간으로 구분 불가")
             else:
-                # 임의로 가장 이른 id 매칭
                 matched_pay = sorted(candidates, key=lambda x: int(x["id"]))[0]
                 result_code = "ambiguous"
                 note_parts.append(f"다중 후보 {len(candidates)}건 · 임시로 최소 id 매칭")
@@ -3836,8 +3854,7 @@ def _ext_pay_unmatched_erp_pays(
             phone4 = ""
         else:
             approval = ""
-            stored = _ext_pay_digits_only(p.get("onnuri_approval_code"))
-            phone4 = stored[-4:] if len(stored) >= 4 else ""
+            phone4 = _onnuri_last4_from_code(p.get("onnuri_approval_code"))
         out.append({
             "payment_id": int(p["id"]),
             "order_id": oid,
@@ -6029,6 +6046,118 @@ def _recalc_order_actual_margin_supabase(db_filename: str, order_id: int) -> boo
     return _update_order_supabase(db_filename, order_id, {"actual_margin": actual_margin, "balance_status": balance_status})
 
 
+def _onnuri_last4_from_code(code) -> str:
+    """'2414' 또는 '2414-181529' → '2414'. 숫자 전체의 뒤 4자리를 쓰면 거래시간과 섞인다."""
+    s = str(code or "").strip()
+    if not s:
+        return ""
+    head = s.split("-", 1)[0]
+    digits = re.sub(r"\D", "", head)
+    return digits[-4:] if len(digits) >= 4 else digits
+
+
+def _onnuri_time_from_code(code) -> str | None:
+    """'2414-181529' → '181529'. 접미사 없으면 None."""
+    s = str(code or "").strip()
+    if "-" not in s:
+        return None
+    tail = re.sub(r"\D", "", s.split("-", 1)[1])
+    if len(tail) == 6:
+        hh, mm, ss = int(tail[:2]), int(tail[2:4]), int(tail[4:6])
+        if 0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60:
+            return tail
+    if len(tail) == 4:
+        hh, mm = int(tail[:2]), int(tail[2:4])
+        if 0 <= hh < 24 and 0 <= mm < 60:
+            return tail + "00"
+    return None
+
+
+def _onnuri_parse_time_input(raw) -> str | None:
+    """'18:15:29' / '181529' / '18:15' → '181529'."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if len(digits) == 6:
+        hh, mm, ss = int(digits[:2]), int(digits[2:4]), int(digits[4:6])
+        if 0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60:
+            return digits
+    if len(digits) == 4:
+        hh, mm = int(digits[:2]), int(digits[2:4])
+        if 0 <= hh < 24 and 0 <= mm < 60:
+            return digits + "00"
+    return None
+
+
+def _onnuri_format_ident(last4: str, time_hhmmss: str | None = None) -> str:
+    last4 = re.sub(r"\D", "", str(last4 or ""))[-4:]
+    if time_hhmmss:
+        return f"{last4}-{time_hhmmss}"
+    return last4
+
+
+def _onnuri_format_time_display(hhmmss: str | None) -> str:
+    if not hhmmss or len(hhmmss) != 6:
+        return ""
+    return f"{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}"
+
+
+def _onnuri_compose_ident(last4_raw: str, time_raw: str, *, require_time: bool) -> tuple[str | None, str | None]:
+    """반환: (식별자, 오류메시지)."""
+    last4 = re.sub(r"\D", "", str(last4_raw or ""))
+    if len(last4) != 4:
+        return None, "온누리 전화번호 뒤 4자리를 정확히 입력하세요."
+    time_raw = (time_raw or "").strip()
+    tx_time = _onnuri_parse_time_input(time_raw) if time_raw else None
+    if time_raw and not tx_time:
+        return None, "거래시간은 18:15:29 형식으로 입력하세요."
+    if require_time and not tx_time:
+        return None, "같은 날·같은 뒤 4자리·같은 금액이 있어 거래시간(예: 18:15:29)이 필요합니다."
+    return _onnuri_format_ident(last4, tx_time), None
+
+
+def _onnuri_same_form_collides(
+    *, this_index: int, last4: str, amount: int, slot_count: int,
+    last4_key_fn, amt_key_fn, method_key_fn,
+) -> bool:
+    if len(last4) != 4 or int(amount or 0) <= 0:
+        return False
+    for j in range(int(slot_count)):
+        if j == this_index:
+            continue
+        mj = st.session_state.get(method_key_fn(j), "")
+        if "온누리" not in str(mj) or "지류" in str(mj):
+            continue
+        aj = _parse_comma_to_int(st.session_state.get(amt_key_fn(j), "0"))
+        lj = re.sub(r"\D", "", str(st.session_state.get(last4_key_fn(j), "") or ""))
+        if aj == int(amount) and lj == last4:
+            return True
+    return False
+
+
+def _onnuri_should_ask_time(
+    db_filename: str, last4: str, amount: int, payment_date: str,
+    *, form_collides: bool = False, exclude_payment_id: int | None = None,
+) -> bool:
+    if len(last4) != 4 or int(amount or 0) <= 0 or not payment_date:
+        return False
+    if form_collides:
+        return True
+    return _onnuri_ident_already_used(
+        db_filename, last4, amount, payment_date, exclude_payment_id=exclude_payment_id,
+    )
+
+
+def _onnuri_time_input(key: str, *, visible: bool, label: str) -> None:
+    if not visible:
+        return
+    st.text_input(
+        label,
+        key=key,
+        max_chars=8,
+        placeholder="18:15:29",
+        help="디지털 온누리 매출내역의 거래시간입니다. 뒤 4자리·금액·날짜가 겹치면 이 시간으로 구분합니다.",
+    )
+
+
 def _count_payments_onnuri_dup_supabase(db_filename: str, payment_date: str, onnuri_last4: str) -> int:
     """동일 결제일 + 온누리 승인번호 뒤 4자리 조합 개수 (중복 검증용)."""
     if not db_filename or len(onnuri_last4) != 4:
@@ -6039,7 +6168,7 @@ def _count_payments_onnuri_dup_supabase(db_filename: str, payment_date: str, onn
     try:
         r = client.table("app_payments").select("onnuri_approval_code, payment_method").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("payment_date", payment_date).execute()
         rows = (r.data or []) if hasattr(r, "data") else []
-        return sum(1 for row in rows if "온누리" in str(row.get("payment_method") or "") and (str(row.get("onnuri_approval_code") or "")[-4:]) == onnuri_last4)
+        return sum(1 for row in rows if "온누리" in str(row.get("payment_method") or "") and _onnuri_last4_from_code(row.get("onnuri_approval_code")) == onnuri_last4)
     except Exception:
         return 0
 
@@ -6115,12 +6244,21 @@ def _ulsan_approval_already_used(
 
 def _onnuri_ident_already_used(
     db_filename: str, last4: str, amount: int, payment_date: str,
-    *, exclude_payment_id: int | None = None,
+    *, exclude_payment_id: int | None = None, tx_time: str | None = None,
 ) -> bool:
-    """같은 매장·같은 날·같은 금액·같은 온누리 식별자(전화 뒤4)의 양수 결제가 있으면 True."""
+    """같은 매장·같은 날·같은 금액·같은 뒤4. tx_time이 있으면 같은 거래시간만 중복."""
     last4 = re.sub(r"\D", "", str(last4 or ""))
+    want_time = _onnuri_parse_time_input(tx_time) if tx_time else None
     if not db_filename or len(last4) != 4 or int(amount or 0) <= 0 or not payment_date:
         return False
+
+    def _row_hits(code) -> bool:
+        if _onnuri_last4_from_code(code) != last4:
+            return False
+        if want_time:
+            return _onnuri_time_from_code(code) == want_time
+        return True
+
     if _supabase_orders_payments_available():
         sc, err = get_supabase_client()
         if err or not sc:
@@ -6144,8 +6282,7 @@ def _onnuri_ident_already_used(
                 meth = str(row.get("payment_method") or "")
                 if "온누리" not in meth or "지류" in meth:
                     continue
-                existing = re.sub(r"\D", "", str(row.get("onnuri_approval_code") or ""))
-                if existing[-4:] == last4:
+                if _row_hits(row.get("onnuri_approval_code")):
                     return True
             return False
         except Exception:
@@ -6166,8 +6303,7 @@ def _onnuri_ident_already_used(
                 continue
             if "온누리" not in str(meth or "") or "지류" in str(meth or ""):
                 continue
-            existing = re.sub(r"\D", "", str(code or ""))
-            if existing[-4:] == last4:
+            if _row_hits(code):
                 return True
         return False
     finally:
@@ -27089,7 +27225,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         _src_key = "ulsanpay"
         _empty_hint = "파싱된 행이 없습니다. 컬럼(거래일시·승인번호·결제금액)을 확인해 주세요."
     else:
-        st.caption("식별자: **결제일 + 전화번호 뒤 4자리 + 금액**.")
+        st.caption("식별자: **결제일 + 전화번호 뒤 4자리 + 금액** (겹치면 거래시간).")
         up = st.file_uploader(
             "온누리 매출내역 파일 (.xlsx / .csv)",
             type=["xlsx", "csv"],
@@ -27452,7 +27588,7 @@ def render_admin_settings():
     st.caption(
         "가맹점 포털에서 받은 **공식 결제내역**을 업로드하면 신규고객 매출 결제와 대조해 "
         "미입력·허위입력·결제 후 임의취소를 찾습니다. "
-        "온누리: **날짜 · 전화 뒤 4자리 · 금액** / 울산페이: **승인번호 6자리 · 결제금액**. "
+        "온누리: **날짜 · 전화 뒤 4자리 · 금액**(겹치면 거래시간) / 울산페이: **승인번호 6자리 · 결제금액**. "
         "같은 파일을 다시 올려도 **지문(fingerprint) 기반 중복 방지**됩니다."
     )
     with st.expander("외부파일 업로드 / 매칭 결과", expanded=False):
@@ -28725,13 +28861,15 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
         "title": "온누리 결제 시 전화번호 뒤 4자리는 어디에 있는 숫자인가요?",
         "keywords": (
             "온누리 전화번호 4자리 승인번호 구매자전화번호 검증파일 "
-            "디지털 온누리 매출내역 식별자"
+            "디지털 온누리 매출내역 식별자 거래시간 부부"
         ),
         "body": (
             "온누리(전자) 결제 식별자는 **승인번호가 아니라 구매자 전화번호 뒤 4자리**입니다.\n\n"
             "가맹점 포털의 **디지털 온누리 매출내역** 파일 `구매자전화번호` 열 "
             "(예: `010****2414`)의 **2414** 를 그대로 입력하세요.\n\n"
             "외부파일 대사는 **결제일 + 전화번호 뒤 4자리 + 결제금액** 으로 매칭합니다. "
+            "같은 날·같은 뒤 4자리·같은 금액이 두 건이면(부부 등) "
+            "매출내역의 **거래시간**(예: `18:15:29`)을 추가로 입력하세요. "
             "영수증의 승인번호를 넣으면 검증파일과 맞지 않습니다."
         ),
     },
@@ -30393,6 +30531,22 @@ def render_new_sales():
                 max_chars=4,
                 help="검증파일의 구매자전화번호(예: 010****2414) 뒤 4자리와 동일하게 입력하세요.",
             )
+            _ns_last4 = re.sub(r"\D", "", str(st.session_state.get(last4_key, "") or ""))
+            _ns_amt = _parse_comma_to_int(st.session_state.get(amt_key, "0"))
+            _ns_date = order_date.isoformat() if hasattr(order_date, "isoformat") else str(order_date)
+            _ns_form_hit = _onnuri_same_form_collides(
+                this_index=i, last4=_ns_last4, amount=_ns_amt, slot_count=slot_count,
+                last4_key_fn=lambda j: f"pay_onnuri_last4_{j}",
+                amt_key_fn=lambda j: f"pay_amt_{j}",
+                method_key_fn=lambda j: f"pay_method_{j}",
+            )
+            _onnuri_time_input(
+                f"pay_onnuri_time_{i}",
+                visible=_onnuri_should_ask_time(
+                    db_filename, _ns_last4, _ns_amt, _ns_date, form_collides=_ns_form_hit,
+                ),
+                label=f"온누리 거래시간 #{i+1} *",
+            )
             _file_input_with_paste(
                 "온누리상품권 영수증 사진(선택)",
                 type=["png", "jpg", "jpeg", "webp"],
@@ -30558,7 +30712,9 @@ def render_new_sales():
                 if len(_appr) != 6:
                     st.error(f"결제 #{i+1} 지역화폐 승인번호 6자리를 정확히 입력하세요.")
                     st.stop()
-        # 온누리(전자): 검증파일 구매자전화번호 뒤 4자리 필수
+        # 온누리(전자): 검증파일 구매자전화번호 뒤 4자리 필수. 겹치면 거래시간 필수.
+        _pay_date_dup = order_date.isoformat() if hasattr(order_date, "isoformat") else str(order_date)
+        _new_onnuri_codes: dict[int, str] = {}
         for i in range(slot_count):
             method = st.session_state.get(f"pay_method_{i}", "")
             amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
@@ -30568,13 +30724,25 @@ def render_new_sales():
                 continue
             last4_raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
             last4_digits = re.sub(r"\D", "", last4_raw)
-            if len(last4_digits) != 4:
-                st.error(f"결제 #{i+1} 온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
+            _form_hit = _onnuri_same_form_collides(
+                this_index=i, last4=last4_digits, amount=amt, slot_count=slot_count,
+                last4_key_fn=lambda j: f"pay_onnuri_last4_{j}",
+                amt_key_fn=lambda j: f"pay_amt_{j}",
+                method_key_fn=lambda j: f"pay_method_{j}",
+            )
+            _need_t = _onnuri_should_ask_time(
+                db_filename, last4_digits, amt, _pay_date_dup, form_collides=_form_hit,
+            )
+            _code, _err = _onnuri_compose_ident(
+                last4_raw, st.session_state.get(f"pay_onnuri_time_{i}", ""), require_time=_need_t,
+            )
+            if _err:
+                st.error(f"결제 #{i+1}: {_err}")
                 st.stop()
+            _new_onnuri_codes[i] = _code or last4_digits
         # 같은 폼·기존 DB 의 지역화폐 승인번호 / 온누리 식별자 중복 차단
         _seen_ulsan: set[str] = set()
-        _seen_onnuri: set[tuple[str, int]] = set()
-        _pay_date_dup = order_date.isoformat() if hasattr(order_date, "isoformat") else str(order_date)
+        _seen_onnuri: set[tuple[str, int, str]] = set()
         for i in range(slot_count):
             method = st.session_state.get(f"pay_method_{i}", "")
             amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
@@ -30594,15 +30762,22 @@ def render_new_sales():
                     st.stop()
                 _seen_ulsan.add(_appr)
             elif "온누리" in str(method) and "지류" not in str(method):
-                _last4 = re.sub(r"\D", "", (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip())
-                _okey = (_last4, int(amt))
+                _code = _new_onnuri_codes.get(i) or ""
+                _last4 = _onnuri_last4_from_code(_code)
+                _tx_t = _onnuri_time_from_code(_code) or ""
+                _okey = (_last4, int(amt), _tx_t)
                 if _okey in _seen_onnuri:
-                    st.error(f"결제 #{i+1}: 같은 등록 화면에 온누리 전화번호 뒤 4자리 {_last4} / 금액 {amt:,}원이 중복됩니다.")
-                    st.stop()
-                if _onnuri_ident_already_used(db_filename, _last4, amt, _pay_date_dup):
                     st.error(
-                        f"결제 #{i+1}: 온누리 전화번호 뒤 4자리 {_last4} · {amt:,}원 · {_pay_date_dup} 결제가 이미 있습니다. "
-                        "같은 건을 다시 입력할 수 없습니다."
+                        f"결제 #{i+1}: 같은 등록 화면에 온누리 뒤 4자리 {_last4} / 금액 {amt:,}원"
+                        + (f" / 거래시간 {_onnuri_format_time_display(_tx_t)}" if _tx_t else "")
+                        + " 이 중복됩니다."
+                    )
+                    st.stop()
+                if _onnuri_ident_already_used(db_filename, _last4, amt, _pay_date_dup, tx_time=_tx_t or None):
+                    st.error(
+                        f"결제 #{i+1}: 온누리 전화번호 뒤 4자리 {_last4} · {amt:,}원 · {_pay_date_dup}"
+                        + (f" · {_onnuri_format_time_display(_tx_t)}" if _tx_t else "")
+                        + " 결제가 이미 있습니다. 같은 건을 다시 입력할 수 없습니다."
                     )
                     st.stop()
                 _seen_onnuri.add(_okey)
@@ -30658,10 +30833,7 @@ def render_new_sales():
                 fee = _payment_fee_amount(method, amt)
                 total_fees += fee
                 total_paid_initial += amt
-                onnuri_code = None
-                if method and "온누리" in str(method) and "지류" not in str(method):
-                    raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
-                    onnuri_code = re.sub(r"\D", "", raw) or None
+                onnuri_code = _new_onnuri_codes.get(i)
                 _insert_payment_supabase(db_filename, {
                     "order_id": order_id,
                     "payment_date": order_date.isoformat(),
@@ -30797,10 +30969,7 @@ def render_new_sales():
                     fee = _payment_fee_amount(method, amt)
                     total_fees += fee
                     total_paid_initial += amt
-                    onnuri_code = None
-                    if method and "온누리" in str(method) and "지류" not in str(method):
-                        raw = (st.session_state.get(f"pay_onnuri_last4_{i}", "") or "").strip()
-                        onnuri_code = re.sub(r"\D", "", raw) or None
+                    onnuri_code = _new_onnuri_codes.get(i)
                     conn.execute("""
                         INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
@@ -30961,6 +31130,14 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
             max_chars=4,
             help="검증파일의 구매자전화번호 뒤 4자리",
         )
+        _sp_last4 = re.sub(r"\D", "", str(st.session_state.get(_onnuri_last4_key, "") or ""))
+        _sp_amt = _parse_comma_to_int(st.session_state.get(_actual_paid_key, "0"))
+        _sp_date = split_date.isoformat() if hasattr(split_date, "isoformat") else _today_kst().isoformat()
+        _onnuri_time_input(
+            f"{key_prefix}_onnuri_time",
+            visible=_onnuri_should_ask_time(db_filename, _sp_last4, _sp_amt, _sp_date),
+            label="온누리 거래시간 *",
+        )
     else:
         st.session_state.pop(_onnuri_last4_key, None)
         st.session_state.pop(f"{key_prefix}_onnuri", None)
@@ -31038,12 +31215,20 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         if is_onnuri_split:
             last4_raw = (st.session_state.get(_onnuri_last4_key, "") or "").strip()
             last4_digits = re.sub(r"\D", "", last4_raw)
-            if len(last4_digits) != 4:
-                st.error("온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
+            _need_t = _onnuri_should_ask_time(db_filename, last4_digits, actual_paid_int, pay_date_str)
+            onnuri_code, _on_err = _onnuri_compose_ident(
+                last4_raw, st.session_state.get(f"{key_prefix}_onnuri_time", ""), require_time=_need_t,
+            )
+            if _on_err:
+                st.error(_on_err)
                 return
-            onnuri_code = last4_digits
-            if _onnuri_ident_already_used(db_filename, last4_digits, actual_paid_int, pay_date_str):
-                st.error(f"온누리 {last4_digits} · {actual_paid_int:,}원 · {pay_date_str} 결제가 이미 있습니다.")
+            _tx_t = _onnuri_time_from_code(onnuri_code)
+            if _onnuri_ident_already_used(db_filename, last4_digits, actual_paid_int, pay_date_str, tx_time=_tx_t):
+                st.error(
+                    f"온누리 {last4_digits} · {actual_paid_int:,}원 · {pay_date_str}"
+                    + (f" · {_onnuri_format_time_display(_tx_t)}" if _tx_t else "")
+                    + " 결제가 이미 있습니다."
+                )
                 return
         if split_method == "지역화폐":
             _appr = re.sub(r"\D", "", str(split_card or ""))
@@ -31210,6 +31395,25 @@ def _customer_balance_payment_ui(
                 max_chars=4,
                 help="검증파일의 구매자전화번호 뒤 4자리",
             )
+            _bal_last4 = re.sub(r"\D", "", str(st.session_state.get(last4_key, "") or ""))
+            _bal_date = (
+                st.session_state.get(_pay_date_key).isoformat()
+                if hasattr(st.session_state.get(_pay_date_key), "isoformat")
+                else _today_kst().isoformat()
+            )
+            _bal_form_hit = _onnuri_same_form_collides(
+                this_index=i, last4=_bal_last4, amount=amt_int, slot_count=slot_count,
+                last4_key_fn=lambda j, _sk=_slot_key: _sk("onnuri_last4", j),
+                amt_key_fn=lambda j, _sk=_slot_key: _sk("amt", j),
+                method_key_fn=lambda j, _sk=_slot_key: _sk("method", j),
+            )
+            _onnuri_time_input(
+                _slot_key("onnuri_time", i),
+                visible=_onnuri_should_ask_time(
+                    db_filename, _bal_last4, amt_int, _bal_date, form_collides=_bal_form_hit,
+                ),
+                label=f"온누리 거래시간 #{i+1} *",
+            )
             _file_input_with_paste(
                 f"온누리상품권 영수증 사진(선택) #{i+1}",
                 type=["png", "jpg", "jpeg", "webp"],
@@ -31284,13 +31488,27 @@ def _customer_balance_payment_ui(
         idx1 = s["index"] + 1
         last4_raw = (st.session_state.get(s["last4_key"], "") or "").strip()
         last4_digits = re.sub(r"\D", "", last4_raw)
-        if len(last4_digits) != 4:
-            st.error(f"결제 #{idx1} 온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
+        _form_hit = _onnuri_same_form_collides(
+            this_index=s["index"], last4=last4_digits, amount=int(s["amount"]),
+            slot_count=slot_count,
+            last4_key_fn=lambda j, _sk=_slot_key: _sk("onnuri_last4", j),
+            amt_key_fn=lambda j, _sk=_slot_key: _sk("amt", j),
+            method_key_fn=lambda j, _sk=_slot_key: _sk("method", j),
+        )
+        _need_t = _onnuri_should_ask_time(
+            db_filename, last4_digits, int(s["amount"]), pay_date_str, form_collides=_form_hit,
+        )
+        _code, _err = _onnuri_compose_ident(
+            last4_raw, st.session_state.get(_slot_key("onnuri_time", s["index"]), ""),
+            require_time=_need_t,
+        )
+        if _err:
+            st.error(f"결제 #{idx1}: {_err}")
             return
-        onnuri_codes[s["index"]] = last4_digits
+        onnuri_codes[s["index"]] = _code
 
     _seen_ulsan_add: set[str] = set()
-    _seen_onnuri_add: set[tuple[str, int]] = set()
+    _seen_onnuri_add: set[tuple[str, int, str]] = set()
     for s in active:
         idx1 = s["index"] + 1
         method = s["method"] or ""
@@ -31309,12 +31527,14 @@ def _customer_balance_payment_ui(
                 return
             _seen_ulsan_add.add(_appr)
         elif s.get("is_onnuri"):
-            _last4 = onnuri_codes.get(s["index"]) or ""
-            _okey = (_last4, amt)
+            _code = onnuri_codes.get(s["index"]) or ""
+            _last4 = _onnuri_last4_from_code(_code)
+            _tx_t = _onnuri_time_from_code(_code) or ""
+            _okey = (_last4, amt, _tx_t)
             if _okey in _seen_onnuri_add:
                 st.error(f"결제 #{idx1}: 같은 화면에 온누리 식별자 {_last4} / {amt:,}원이 중복됩니다.")
                 return
-            if _onnuri_ident_already_used(db_filename, _last4, amt, pay_date_str):
+            if _onnuri_ident_already_used(db_filename, _last4, amt, pay_date_str, tx_time=_tx_t or None):
                 st.error(f"결제 #{idx1}: 온누리 {_last4} · {amt:,}원 · {pay_date_str} 결제가 이미 있습니다.")
                 return
             _seen_onnuri_add.add(_okey)
@@ -33714,11 +33934,30 @@ def render_customer_balance():
                                                         elif "온누리" in str(new_method) and "지류" not in str(new_method):
                                                             _cur_onnuri = prow.get("onnuri_approval_code") or ""
                                                             new_card_company = None
+                                                            _edit_last4_key = f"pay_edit_card_{prow['id']}"
+                                                            _edit_time_key = f"pay_edit_onnuri_time_{prow['id']}"
+                                                            if _edit_last4_key not in st.session_state:
+                                                                st.session_state[_edit_last4_key] = _onnuri_last4_from_code(_cur_onnuri)
+                                                            if _edit_time_key not in st.session_state:
+                                                                st.session_state[_edit_time_key] = _onnuri_format_time_display(
+                                                                    _onnuri_time_from_code(_cur_onnuri)
+                                                                )
                                                             new_onnuri_code = st.text_input(
                                                                 "온누리 전화번호 뒤 4자리 *",
-                                                                value=_cur_onnuri,
                                                                 max_chars=4,
-                                                                key=f"pay_edit_card_{prow['id']}",
+                                                                key=_edit_last4_key,
+                                                            )
+                                                            _ed_last4 = re.sub(r"\D", "", str(st.session_state.get(_edit_last4_key, "") or ""))
+                                                            _ed_amt_preview = int(float(prow.get("amount") or 0))
+                                                            _ed_date_preview = str(prow.get("payment_date") or "")[:10]
+                                                            _ed_need_t = bool(_onnuri_time_from_code(_cur_onnuri)) or _onnuri_should_ask_time(
+                                                                db_filename, _ed_last4, _ed_amt_preview, _ed_date_preview,
+                                                                exclude_payment_id=int(prow["id"]),
+                                                            )
+                                                            _onnuri_time_input(
+                                                                _edit_time_key,
+                                                                visible=_ed_need_t,
+                                                                label="온누리 거래시간 *",
                                                             )
                                                         else:
                                                             new_card_company = None
@@ -33786,6 +34025,36 @@ def render_customer_balance():
                                                             key=f"pay_receipt_{prow['id']}",
                                                         )
                                                         if st.button("수정 완료", key=f"pay_edit_{prow['id']}"):
+                                                            _onnuri_edit_err = None
+                                                            if "온누리" in str(new_method) and "지류" not in str(new_method) and new_amount > 0:
+                                                                _eds = (
+                                                                    new_pay_date.isoformat()
+                                                                    if isinstance(new_pay_date, date)
+                                                                    else _today_kst().isoformat()
+                                                                )
+                                                                _el4 = re.sub(
+                                                                    r"\D", "",
+                                                                    str(st.session_state.get(f"pay_edit_card_{prow['id']}", "") or ""),
+                                                                )
+                                                                _need_t = _onnuri_should_ask_time(
+                                                                    db_filename, _el4, int(new_amount), _eds,
+                                                                    exclude_payment_id=int(prow["id"]),
+                                                                )
+                                                                new_onnuri_code, _onnuri_edit_err = _onnuri_compose_ident(
+                                                                    st.session_state.get(f"pay_edit_card_{prow['id']}", ""),
+                                                                    st.session_state.get(f"pay_edit_onnuri_time_{prow['id']}", ""),
+                                                                    require_time=_need_t,
+                                                                )
+                                                                if not _onnuri_edit_err:
+                                                                    _ett = _onnuri_time_from_code(new_onnuri_code)
+                                                                    if _onnuri_ident_already_used(
+                                                                        db_filename, _el4, int(new_amount), _eds,
+                                                                        exclude_payment_id=int(prow["id"]),
+                                                                        tx_time=_ett,
+                                                                    ):
+                                                                        _onnuri_edit_err = (
+                                                                            "이미 같은 온누리 뒤 4자리·금액·날짜·거래시간 결제가 있습니다."
+                                                                        )
                                                             if not del_reason or len(del_reason.strip()) < 5:
                                                                 st.warning("사유를 5자 이상 입력하세요.")
                                                             elif new_method in _CARD_WITH_COMPANY and not (new_card_company or "").strip():
@@ -33803,8 +34072,8 @@ def render_customer_balance():
                                                                     f"지역화폐 승인번호가 이미 다른 결제에 등록되어 있습니다. "
                                                                     f"(매장: {_ulsan_at})"
                                                                 )
-                                                            elif "온누리" in str(new_method) and "지류" not in str(new_method) and len(re.sub(r"\D", "", (new_onnuri_code or "").strip())) != 4:
-                                                                st.warning("온누리 전화번호 뒤 4자리를 정확히 입력하세요.")
+                                                            elif _onnuri_edit_err:
+                                                                st.warning(_onnuri_edit_err)
                                                             else:
                                                                 receipt_path_saved = None
                                                                 if receipt_upload:
