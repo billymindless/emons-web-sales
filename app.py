@@ -9006,22 +9006,21 @@ def _handle_channel_talk_magic_link():
         )
         store_name = _get_current_store_name_for_customers(db_filename) if db_filename else None
         if sc and store_name:
-            r = (
-                sc.table("app_customers")
-                .select("id, name, phone1, phone2, address")
-                .eq("store_name", store_name)
-                .order("id", desc=True)
-                .limit(200)
-                .execute()
-            )
-            rows = r.data or []
-            q_lower = phone.lower()
-            results = [
-                row for row in rows
-                if q_lower in (str(row.get("phone1") or "").lower())
-                or q_lower in (str(row.get("phone2") or "").lower())
-            ]
-            st.session_state["_cust_search_results"] = results
+            q_safe = re.sub(r"[*,]", "", phone.strip())
+            if q_safe:
+                or_filter = f"phone1.ilike.*{q_safe}*,phone2.ilike.*{q_safe}*"
+                r = (
+                    sc.table("app_customers")
+                    .select("id, name, phone1, phone2, address")
+                    .eq("store_name", store_name)
+                    .or_(or_filter)
+                    .order("id", desc=True)
+                    .limit(50)
+                    .execute()
+                )
+                st.session_state["_cust_search_results"] = r.data or []
+            else:
+                st.session_state["_cust_search_results"] = []
     except Exception:
         st.session_state["_cust_search_results"] = []
 
@@ -29772,11 +29771,23 @@ def _customer_search_fragment_impl(db_filename: str):
                 sc, _ = get_supabase_client()
                 store_name = _get_current_store_name_for_customers(db_filename)
                 if sc and store_name:
-                    # 속도·안정성: 최근 200건 로드 후 클라이언트 필터링 (or_/ilike 지연·오류 회피)
-                    r = sc.table("app_customers").select("id, name, phone1, phone2, address").eq("store_name", store_name).order("id", desc=True).limit(200).execute()
-                    rows = r.data or []
-                    q_lower = q_clean.lower()
-                    results_list = [row for row in rows if q_lower in (str(row.get("name") or "").lower()) or q_lower in (str(row.get("phone1") or "").lower()) or q_lower in (str(row.get("phone2") or "").lower())]
+                    q_safe = re.sub(r"[*,]", "", q_clean)
+                    if q_safe:
+                        or_filter = (
+                            f"name.ilike.*{q_safe}*,"
+                            f"phone1.ilike.*{q_safe}*,"
+                            f"phone2.ilike.*{q_safe}*"
+                        )
+                        r = (
+                            sc.table("app_customers")
+                            .select("id, name, phone1, phone2, address")
+                            .eq("store_name", store_name)
+                            .or_(or_filter)
+                            .order("id", desc=True)
+                            .limit(50)
+                            .execute()
+                        )
+                        results_list = r.data or []
             else:
                 conn = get_tenant_conn(db_filename)
                 if conn:
