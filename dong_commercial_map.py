@@ -69,11 +69,11 @@ _POP_ENV_CANDIDATES: tuple[str, ...] = (
     "ELEVATOR_SERVICE_KEY",
 )
 
-# 국토교통부 아파트 매매 실거래가 상세 자료 API (data.go.kr 15126468).
-# 서비스명 RTMSDataSvcAptTradeDev / operation getRTMSDataSvcAptTradeDev.
+# 국토교통부 아파트 매매 실거래가 자료 API (data.go.kr 15126469).
+# 서비스명 RTMSDataSvcAptTrade / operation getRTMSDataSvcAptTrade.
 # 응답은 기본 XML (JSON 지원 안 함) → xml.etree 로 파싱.
 APT_TRADE_API_BASE_DEFAULT = (
-    "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
+    "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
 )
 
 # data.go.kr 일반 인증키는 계정 1개에 여러 API 활용신청이 승인되면 모두 공용 사용 가능.
@@ -317,18 +317,30 @@ def _get_apt_trade_service_key() -> str:
     return _get_apt_trade_service_key_diagnostic()[0]
 
 
+def _normalize_apt_trade_endpoint(url: str) -> str:
+    """서비스 베이스만 있으면 operation 경로를 붙인다."""
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if u.endswith("/RTMSDataSvcAptTrade"):
+        return u + "/getRTMSDataSvcAptTrade"
+    if u.endswith("/RTMSDataSvcAptTradeDev"):
+        return u + "/getRTMSDataSvcAptTradeDev"
+    return u
+
+
 def _get_apt_trade_endpoint() -> str:
     """[apt_trade_api] endpoint 값 우선, 없으면 기본값."""
     _toml = _load_toml_dict()
     val = str(((_toml.get("apt_trade_api") or {}).get("endpoint", "")) or "").strip()
     if val:
-        return val
+        return _normalize_apt_trade_endpoint(val)
     try:
         if hasattr(st, "secrets"):
             _sec = st.secrets.get("apt_trade_api", {}) or {}
             val = str(_sec.get("endpoint", "") or "").strip()
             if val:
-                return val
+                return _normalize_apt_trade_endpoint(val)
     except Exception:
         pass
     return APT_TRADE_API_BASE_DEFAULT
@@ -1956,7 +1968,7 @@ def prefetch_all_dong_population(client, yyyymm: str, max_workers: int = 8) -> d
 
 
 # ══════════════════════════════════════════════════════════════════
-# 국토교통부 아파트 매매 실거래가 (RTMSDataSvcAptTradeDev)
+# 국토교통부 아파트 매매 실거래가 (RTMSDataSvcAptTrade)
 # ══════════════════════════════════════════════════════════════════
 #
 # 구조 요약:
