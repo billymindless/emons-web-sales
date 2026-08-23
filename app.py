@@ -11862,6 +11862,42 @@ def render_marketing_insights_superadmin():
 
 # ========== 탭 0: 최고 관리자 메뉴 (Superadmin) — 6탭 구성 ==========
 
+def _daily_sales_employee_options(sales_df: "pd.DataFrame") -> list[str]:
+    """일별 매출 추이 판매자 선택 목록."""
+    names: set[str] = set()
+    if sales_df is None or sales_df.empty or "employee_names" not in sales_df.columns:
+        return []
+    for raw in sales_df["employee_names"].tolist():
+        for n in _kpi_parse_employee_list(raw):
+            names.add(n)
+    return sorted(names)
+
+
+def _daily_sales_df_for_employee(sales_df: "pd.DataFrame", employee: str) -> "pd.DataFrame":
+    """선택한 판매자 매출만. 공동 담당은 KPI와 같이 1/n."""
+    if sales_df is None or sales_df.empty:
+        return sales_df
+    if not employee or employee == "전체":
+        return sales_df
+    if "employee_names" not in sales_df.columns or "amount" not in sales_df.columns:
+        return sales_df.iloc[0:0].copy()
+    rows: list[dict] = []
+    for rec in sales_df.to_dict("records"):
+        emps = _kpi_parse_employee_list(rec.get("employee_names"))
+        if employee not in emps:
+            continue
+        n = len(emps) or 1
+        rec = dict(rec)
+        try:
+            rec["amount"] = float(rec.get("amount") or 0) / n
+        except (TypeError, ValueError):
+            rec["amount"] = 0.0
+        rows.append(rec)
+    if not rows:
+        return sales_df.iloc[0:0].copy()
+    return pd.DataFrame(rows)
+
+
 def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", key_prefix: str):
     """일별 매출 추이 — 기준 월 1개(강조 실선) + 비교 월 최대 12개(회색 점선).
     주말/공휴일 vrect 배경 음영, 요일별 평균 바 차트 포함.
@@ -11870,6 +11906,27 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
     try:
         if sales_df is None or sales_df.empty or "transaction_date" not in sales_df.columns or "amount" not in sales_df.columns:
             st.info("표시할 매출 데이터가 없습니다.")
+            return
+        _emp_opts = _daily_sales_employee_options(sales_df)
+        _emp_choices = ["전체"] + _emp_opts
+        _cu = st.session_state.get("current_user") or {}
+        _me = str(_cu.get("name") or "").strip()
+        _role = str(_cu.get("role") or "").strip()
+        _emp_default = 0
+        if _role == "user" and _me and _me in _emp_opts:
+            _emp_default = _emp_choices.index(_me)
+        _sel_emp = st.selectbox(
+            "판매자",
+            _emp_choices,
+            index=_emp_default,
+            key=f"{key_prefix}_employee",
+            help="본인 이름을 고르면 그 판매자의 일별 추이만 봅니다. 공동 담당 건은 1/n으로 나눕니다.",
+        )
+        if _sel_emp != "전체":
+            st.caption(f"표시: **{_sel_emp}** 담당 매출 (공동 담당 1/n)")
+        sales_df = _daily_sales_df_for_employee(sales_df, _sel_emp)
+        if sales_df is None or sales_df.empty:
+            st.info(f"{_sel_emp} 님의 매출 데이터가 없습니다.")
             return
         _sdf = sales_df[["transaction_date", "amount"]].copy()
         _sdf["transaction_date"] = pd.to_datetime(_sdf["transaction_date"], errors="coerce")
