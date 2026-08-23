@@ -11907,27 +11907,36 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         if sales_df is None or sales_df.empty or "transaction_date" not in sales_df.columns or "amount" not in sales_df.columns:
             st.info("표시할 매출 데이터가 없습니다.")
             return
-        _emp_opts = _daily_sales_employee_options(sales_df)
-        _emp_choices = ["전체"] + _emp_opts
+        _sales_src = sales_df
+        _emp_opts = _daily_sales_employee_options(_sales_src)
         _cu = st.session_state.get("current_user") or {}
         _me = str(_cu.get("name") or "").strip()
         _role = str(_cu.get("role") or "").strip()
-        _emp_default = 0
+        _emp_default: list[str] = []
         if _role == "user" and _me and _me in _emp_opts:
-            _emp_default = _emp_choices.index(_me)
-        _sel_emp = st.selectbox(
-            "판매자",
-            _emp_choices,
-            index=_emp_default,
-            key=f"{key_prefix}_employee",
-            help="본인 이름을 고르면 그 판매자의 일별 추이만 봅니다. 공동 담당 건은 1/n으로 나눕니다.",
+            _emp_default = [_me]
+        _sel_emps = st.multiselect(
+            "판매자 비교",
+            _emp_opts,
+            default=_emp_default,
+            max_selections=8,
+            key=f"{key_prefix}_employees",
+            help="여러 명을 고르면 같은 기준 월에서 판매자끼리 비교합니다. 비우면 매장 전체입니다. 공동 담당은 1/n.",
         )
-        if _sel_emp != "전체":
-            st.caption(f"표시: **{_sel_emp}** 담당 매출 (공동 담당 1/n)")
-        sales_df = _daily_sales_df_for_employee(sales_df, _sel_emp)
-        if sales_df is None or sales_df.empty:
-            st.info(f"{_sel_emp} 님의 매출 데이터가 없습니다.")
-            return
+        _compare_sellers = len(_sel_emps) >= 2
+        if len(_sel_emps) == 1:
+            st.caption(f"표시: **{_sel_emps[0]}** 담당 매출 (공동 담당 1/n)")
+            sales_df = _daily_sales_df_for_employee(_sales_src, _sel_emps[0])
+            if sales_df is None or sales_df.empty:
+                st.info(f"{_sel_emps[0]} 님의 매출 데이터가 없습니다.")
+                return
+        elif _compare_sellers:
+            st.caption(
+                "판매자 비교: **" + " · ".join(_sel_emps) + "** · 기준 월 추이를 겹쳐 봅니다. (공동 담당 1/n)"
+            )
+            sales_df = _sales_src
+        else:
+            sales_df = _sales_src
         _sdf = sales_df[["transaction_date", "amount"]].copy()
         _sdf["transaction_date"] = pd.to_datetime(_sdf["transaction_date"], errors="coerce")
         _sdf = _sdf.dropna(subset=["transaction_date"])
@@ -12030,6 +12039,130 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                     out.append(cum / _unit_div)
                 return out
             return [v / _unit_div for v in vals]
+
+        def _emp_day_raw(emp: str, ym: str, days: list[int]) -> list[float]:
+            edf = _daily_sales_df_for_employee(_sales_src, emp)
+            if edf is None or edf.empty or "transaction_date" not in edf.columns:
+                return [0.0] * len(days)
+            et = pd.to_datetime(edf["transaction_date"], errors="coerce")
+            edf = edf.assign(_day=et.dt.day, _ym=et.dt.strftime("%Y-%m"))
+            grp = edf[edf["_ym"] == ym].groupby("_day")["amount"].sum()
+            return [float(grp.get(d, 0)) for d in days]
+
+        if _compare_sellers:
+            _SELLER_PALETTE = [
+                "rgba(255,127,14,0.90)",
+                "rgba(31,119,180,0.90)",
+                "rgba(44,160,44,0.90)",
+                "rgba(214,39,40,0.85)",
+                "rgba(148,103,189,0.90)",
+                "rgba(23,190,207,0.90)",
+                "rgba(227,119,194,0.90)",
+                "rgba(140,86,75,0.90)",
+            ]
+            fig = go.Figure()
+            _emp_sum_rows = []
+            for _ei, _emp in enumerate(_sel_emps):
+                _ecolor = _SELLER_PALETTE[_ei % len(_SELLER_PALETTE)]
+                _eraw = _emp_day_raw(_emp, _base_ym, _base_days)
+                _eplot = _to_plot(_eraw)
+                _esum = sum(_eraw)
+                fig.add_trace(go.Scatter(
+                    x=_base_days, y=_eplot, mode="lines+markers",
+                    name=_emp,
+                    line=dict(color=_ecolor, width=2.4),
+                    marker=dict(size=6, color=_ecolor),
+                    hovertemplate=f"%{{x}}일<br>%{{y:{_unit_fmt}}}{_unit_label}<extra>{_emp}</extra>",
+                ))
+                _emp_sum_rows.append({"판매자": _emp, "누적": _esum})
+
+            _wknd_groups: list[tuple[int, int]] = []
+            _in_group = False
+            _grp_start = 0
+            for _d in _base_days:
+                if _base_day_meta[_d]["is_weekend"]:
+                    if not _in_group:
+                        _grp_start = _d
+                        _in_group = True
+                else:
+                    if _in_group:
+                        _wknd_groups.append((_grp_start, _d - 1))
+                        _in_group = False
+            if _in_group:
+                _wknd_groups.append((_grp_start, _base_days[-1]))
+            for (_gs, _ge) in _wknd_groups:
+                fig.add_vrect(
+                    x0=_gs - 0.5, x1=_ge + 0.5,
+                    fillcolor="rgba(255,0,0,0.07)",
+                    layer="below", line_width=0,
+                )
+            _ytitle = f"{'누적 ' if _is_cum else ''}매출 ({_unit_label})"
+            fig.update_layout(
+                height=380, margin=dict(l=10, r=10, t=10, b=10),
+                xaxis=dict(title="일(Day)", dtick=1 if _base_last_day <= 16 else 2,
+                           tickfont=dict(size=11), gridcolor="#EEEEEE"),
+                yaxis=dict(title=_ytitle, tickformat=",.0f",
+                           tickfont=dict(size=11), gridcolor="#EEEEEE"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1, font=dict(size=11)),
+                plot_bgcolor="white", hovermode="x unified",
+            )
+            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+            _DOW_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
+            fig_dow = go.Figure()
+            for _ei, _emp in enumerate(_sel_emps):
+                _ecolor = _SELLER_PALETTE[_ei % len(_SELLER_PALETTE)]
+                _edf = _daily_sales_df_for_employee(_sales_src, _emp)
+                _dow_vals = [0.0] * 7
+                if _edf is not None and not _edf.empty:
+                    _et = pd.to_datetime(_edf["transaction_date"], errors="coerce")
+                    _edf = _edf.assign(
+                        _date=_et.dt.date, _dow=_et.dt.weekday, _ym=_et.dt.strftime("%Y-%m"),
+                    )
+                    _edf = _edf[_edf["_ym"] == _base_ym]
+                    if not _edf.empty:
+                        _daily = _edf.groupby(["_date", "_dow"])["amount"].sum().reset_index()
+                        _avg = _daily.groupby("_dow")["amount"].mean()
+                        _dow_vals = [float(_avg.get(i, 0)) / _unit_div for i in range(7)]
+                fig_dow.add_trace(go.Bar(
+                    x=_DOW_LABELS, y=_dow_vals, name=_emp, marker_color=_ecolor,
+                    hovertemplate=f"%{{x}}<br>일평균: %{{y:{_unit_fmt}}}{_unit_label}<extra>{_emp}</extra>",
+                ))
+            fig_dow.update_layout(
+                height=260, margin=dict(l=10, r=10, t=36, b=10),
+                title=dict(text=f"요일별 평균 매출 — {_base_ym} · 판매자 비교", font_size=13),
+                xaxis=dict(title="요일", tickfont=dict(size=12),
+                           categoryorder="array", categoryarray=_DOW_LABELS),
+                yaxis=dict(title=f"일평균 ({_unit_label})", tickformat=",.0f", tickfont=dict(size=11)),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1, font=dict(size=11)),
+                plot_bgcolor="white", barmode="group",
+            )
+            for _wknd_label in ["토", "일"]:
+                fig_dow.add_vrect(
+                    x0=_DOW_LABELS.index(_wknd_label) - 0.5,
+                    x1=_DOW_LABELS.index(_wknd_label) + 0.5,
+                    fillcolor="rgba(255,0,0,0.07)", layer="below", line_width=0,
+                )
+            st.plotly_chart(fig_dow, width="stretch", config={"displayModeBar": False})
+
+            def _fmt_emp(v):
+                return f"{v / _unit_div:{_unit_fmt}}{_unit_label}"
+
+            _emp_sum_rows = sorted(_emp_sum_rows, key=lambda r: r["누적"], reverse=True)
+            _tbl = []
+            for i, r in enumerate(_emp_sum_rows, start=1):
+                _tbl.append({
+                    "순위": i,
+                    "판매자": r["판매자"],
+                    f"{_base_ym} {_base_max_day}일 누적": _fmt_emp(r["누적"]),
+                })
+            st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
+            st.caption(
+                "💡 선택한 판매자를 같은 기준 월에 겹쳐 비교합니다. 붉은 음영 = 주말·공휴일. 공동 담당은 1/n."
+            )
+            return
 
         _base_plot = _to_plot(_base_raw)
 
