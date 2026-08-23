@@ -11877,7 +11877,7 @@ def _daily_sales_df_for_employee(sales_df: "pd.DataFrame", employee: str) -> "pd
     """선택한 판매자 매출만. 공동 담당은 KPI와 같이 1/n."""
     if sales_df is None or sales_df.empty:
         return sales_df
-    if not employee or employee == "전체":
+    if not employee or employee in ("전체", "전체직원"):
         return sales_df
     if "employee_names" not in sales_df.columns or "amount" not in sales_df.columns:
         return sales_df.iloc[0:0].copy()
@@ -11909,32 +11909,34 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             st.info("표시할 매출 데이터가 없습니다.")
             return
         _sales_src = sales_df
-        _emp_opts = _daily_sales_employee_options(_sales_src)
-        _cu = st.session_state.get("current_user") or {}
-        _me = str(_cu.get("name") or "").strip()
-        _role = str(_cu.get("role") or "").strip()
-        _emp_default: list[str] = []
-        if _role == "user" and _me and _me in _emp_opts:
-            _emp_default = [_me]
-        _sel_emps = st.multiselect(
+        _ALL_EMP = "전체직원"
+        _emp_names = _daily_sales_employee_options(_sales_src)
+        _emp_opts = [_ALL_EMP] + _emp_names
+        _sel_raw = st.multiselect(
             "판매자 비교",
             _emp_opts,
-            default=_emp_default,
-            max_selections=8,
-            key=f"{key_prefix}_employees",
-            help="여러 명을 고르면 판매자·월·요일을 함께 비교합니다. 비우면 매장 전체입니다. 공동 담당은 1/n.",
+            default=list(_emp_opts),
+            key=f"{key_prefix}_employees_v3",
+            help="기본은 전체직원과 전 판매자입니다. 전체직원은 매장 합계이며 개별 판매자와 함께 고를 수 있습니다. 공동 담당은 1/n.",
         )
-        _compare_sellers = len(_sel_emps) >= 2
-        if len(_sel_emps) == 1:
-            st.caption(f"표시: **{_sel_emps[0]}** 담당 매출 (공동 담당 1/n)")
-            sales_df = _daily_sales_df_for_employee(_sales_src, _sel_emps[0])
+        if not _sel_raw:
+            _has_all = True
+            _sel_emps = []
+        else:
+            _has_all = _ALL_EMP in _sel_raw
+            _sel_emps = [e for e in _sel_raw if e != _ALL_EMP]
+        _plot_emps = ([_ALL_EMP] if _has_all else []) + _sel_emps
+        _compare_sellers = len(_plot_emps) >= 2
+        if len(_plot_emps) == 1 and _plot_emps[0] != _ALL_EMP:
+            st.caption(f"표시: **{_plot_emps[0]}** 담당 매출 (공동 담당 1/n)")
+            sales_df = _daily_sales_df_for_employee(_sales_src, _plot_emps[0])
             if sales_df is None or sales_df.empty:
-                st.info(f"{_sel_emps[0]} 님의 매출 데이터가 없습니다.")
+                st.info(f"{_plot_emps[0]} 님의 매출 데이터가 없습니다.")
                 return
         elif _compare_sellers:
             st.caption(
-                "판매자 비교: **" + " · ".join(_sel_emps)
-                + "** · 기준 월은 실선, 비교 월은 점선입니다. (공동 담당 1/n)"
+                "판매자 비교: **" + " · ".join(_plot_emps)
+                + "** · 기준 월은 실선, 비교 월은 점선입니다. (공동 담당은 1/n, 전체직원은 매장 합계)"
             )
             sales_df = _sales_src
         else:
@@ -12084,8 +12086,12 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
 
             fig = go.Figure()
             _emp_sum_map: dict[str, dict] = {}
-            for _ei, _emp in enumerate(_sel_emps):
-                _ecolor = _SELLER_PALETTE[_ei % len(_SELLER_PALETTE)]
+            for _ei, _emp in enumerate(_plot_emps):
+                if _emp == _ALL_EMP:
+                    _ecolor = "rgba(40,40,40,0.92)"
+                else:
+                    _pi = _sel_emps.index(_emp) if _emp in _sel_emps else _ei
+                    _ecolor = _SELLER_PALETTE[_pi % len(_SELLER_PALETTE)]
                 _eraw = _emp_day_raw(_emp, _base_ym, _base_days)
                 fig.add_trace(go.Scatter(
                     x=_base_days, y=_to_plot(_eraw), mode="lines+markers",
@@ -12147,11 +12153,17 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             _DOW_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
             fig_dow = go.Figure()
             _yms_dow = [_base_ym] + _cmp_yms_use
-            for _ei, _emp in enumerate(_sel_emps):
-                _ecolor = _SELLER_PALETTE[_ei % len(_SELLER_PALETTE)]
+            for _ei, _emp in enumerate(_plot_emps):
+                if _emp == _ALL_EMP:
+                    _ecolor = "rgba(40,40,40,0.92)"
+                else:
+                    _pi = _sel_emps.index(_emp) if _emp in _sel_emps else _ei
+                    _ecolor = _SELLER_PALETTE[_pi % len(_SELLER_PALETTE)]
                 for _yi, ym in enumerate(_yms_dow):
                     _is_base_ym = (ym == _base_ym)
-                    _bar_color = _ecolor if _is_base_ym else _ecolor.replace("0.90", "0.45").replace("0.85", "0.40")
+                    _bar_color = _ecolor if _is_base_ym else (
+                        _ecolor.replace("0.90", "0.45").replace("0.85", "0.40").replace("0.92", "0.40")
+                    )
                     fig_dow.add_trace(go.Bar(
                         x=_DOW_LABELS,
                         y=_emp_dow_avg(_emp, ym),
@@ -12181,7 +12193,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                 return f"{v / _unit_div:{_unit_fmt}}{_unit_label}"
 
             _ranked = sorted(
-                _sel_emps,
+                _plot_emps,
                 key=lambda e: float(_emp_sum_map.get(e, {}).get(_base_ym, 0)),
                 reverse=True,
             )
@@ -12203,6 +12215,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
             st.caption(
                 "💡 실선 = 기준 월, 점선 = 비교 월. 같은 색이 같은 판매자입니다. "
+                "전체직원(어두운 선)은 매장 합계입니다. "
                 "요일 막대는 판매자·월을 나란히 비교합니다. 붉은 음영 = 주말·공휴일. 공동 담당은 1/n."
             )
             return
