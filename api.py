@@ -540,6 +540,36 @@ async def solapi_friend_added_webhook(request: Request) -> JSONResponse:
 
 
 
+def _sms_text_from_payload(value) -> str:
+    """아이폰 단축어는 message 값이 객체/배열로 올 수 있다. 문자 원문만 꺼낸다."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        for item in value:
+            found = _sms_text_from_payload(item)
+            if found:
+                return found
+        return ""
+    if isinstance(value, dict):
+        for key in (
+            "message", "text", "body", "content", "Content",
+            "contents", "SMS", "sms", "입력",
+        ):
+            if key in value and value.get(key) is not None:
+                found = _sms_text_from_payload(value.get(key))
+                if found:
+                    return found
+        for v in value.values():
+            found = _sms_text_from_payload(v)
+            if found and ("입금" in found or "출금" in found or "[Web발신]" in found):
+                return found
+    return ""
+
+
 @app.post("/webhook/sms/deposit", summary="기업은행 입금 SMS 수신")
 async def sms_deposit_webhook(request: Request) -> JSONResponse:
     """사업장 휴대폰의 SMS 포워딩 앱이 전달한 기업은행 입금 문자를 파싱·적재.
@@ -553,25 +583,27 @@ async def sms_deposit_webhook(request: Request) -> JSONResponse:
     if expected_token and sent_token != expected_token:
         return JSONResponse({"status": "error", "reason": "unauthorized"}, status_code=401)
 
-    # 본문에서 문자 원문 추출 (JSON / form / raw 모두 시도)
+    # 본문에서 문자 원문 추출 (JSON / form / raw / 아이폰 단축어 객체 모두 시도)
     message = ""
     try:
         payload = await request.json()
-        if isinstance(payload, dict):
-            message = payload.get("message") or payload.get("text") or payload.get("body") or ""
-        elif isinstance(payload, str):
-            message = payload
+        message = _sms_text_from_payload(payload)
     except Exception:
         try:
             form = await request.form()
-            message = form.get("message") or form.get("text") or form.get("body") or ""
+            message = _sms_text_from_payload({
+                "message": form.get("message"),
+                "text": form.get("text"),
+                "body": form.get("body"),
+            })
         except Exception:
             try:
-                message = (await request.body()).decode("utf-8", errors="ignore")
+                message = (await request.body()).decode("utf-8", errors="ignore").strip()
             except Exception:
                 message = ""
 
     if not message:
+        logger.warning("sms deposit webhook: empty_message")
         return JSONResponse({"status": "error", "reason": "empty_message"}, status_code=400)
 
     try:
@@ -583,7 +615,12 @@ async def sms_deposit_webhook(request: Request) -> JSONResponse:
     parsed = deposit_sms.parse_ibk_sms(message)
     if not parsed:
         # 입금 문자가 아니거나(출금 등) 형식 불일치 → 무시(정상 200)
-        return JSONResponse({"status": "ignored", "reason": "not_a_deposit"}, status_code=200)
+        preview = " ".join((message or "").split())[:80]
+        logger.info("sms deposit webhook ignored: %s", preview)
+        return JSONResponse(
+            {"status": "ignored", "reason": "not_a_deposit", "preview": preview},
+            status_code=200,
+        )
 
     headers = _supa_headers()
     if not headers:
