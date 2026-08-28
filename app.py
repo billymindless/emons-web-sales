@@ -11915,9 +11915,9 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
         _sel_raw = st.multiselect(
             "판매자 비교",
             _emp_opts,
-            default=list(_emp_opts),
-            key=f"{key_prefix}_employees_v3",
-            help="기본은 전체직원과 전 판매자입니다. 전체직원은 매장 합계이며 개별 판매자와 함께 고를 수 있습니다. 공동 담당은 1/n.",
+            default=[_ALL_EMP],
+            key=f"{key_prefix}_employees_v4",
+            help="기본은 전체직원(매장 합계)만 표시합니다. 개별 판매자를 추가하면 직원별 추이를 함께 볼 수 있습니다. 공동 담당은 1/n.",
         )
         if not _sel_raw:
             _has_all = True
