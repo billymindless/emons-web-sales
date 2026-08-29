@@ -972,9 +972,10 @@ def render_lead_management() -> None:
             st.session_state.pop("lead_selected_id", None)
     with _hc4:
         if st.button("＋ 리드 등록", type="primary", width="stretch", key="lead_btn_open_form"):
-            st.session_state["lead_show_form"] = not st.session_state.get("lead_show_form", False)
+            st.session_state["lead_show_form"] = True
             st.session_state["lead_show_import"] = False
             st.session_state.pop("lead_selected_id", None)
+            _init_lead_reg_defaults()
 
     # ── 채널톡 가져오기 · 리드 등록 폼: 팝업(모달) ──────────
     # st.dialog 기반 공통 헬퍼. 미지원 환경에서는 expander 로 폴백.
@@ -983,9 +984,6 @@ def render_lead_management() -> None:
 
     def _dismiss_lead_import() -> None:
         st.session_state["lead_show_import"] = False
-
-    def _dismiss_lead_form() -> None:
-        st.session_state["lead_show_form"] = False
 
     def _dismiss_lead_detail() -> None:
         st.session_state.pop("lead_selected_id", None)
@@ -998,13 +996,11 @@ def render_lead_management() -> None:
             on_dismiss=_dismiss_lead_import,
         )
 
+    if st.session_state.get("lead_reg_flash"):
+        st.success(st.session_state.pop("lead_reg_flash"))
+
     if st.session_state.get("lead_show_form"):
-        _open_dialog(
-            "＋ 새 리드 등록",
-            _render_register_form,
-            width="medium",
-            on_dismiss=_dismiss_lead_form,
-        )
+        _open_lead_register_dialog()
 
     # ── Supabase 데이터 로드 ────────────────────
     supa = _supa()
@@ -1432,66 +1428,130 @@ def _render_import_panel() -> None:
 # 리드 등록 폼
 # ──────────────────────────────────────────────
 
-def _render_register_form() -> None:
+_LEAD_REG_KEYS: tuple[str, ...] = (
+    "lead_reg_source",
+    "lead_reg_send_now",
+    "lead_reg_phone",
+    "lead_reg_name",
+    "lead_reg_emps",
+    "lead_reg_store",
+    "lead_reg_memo",
+    "lead_reg_next",
+    "lead_reg_image",
+)
+_LEAD_REG_STORE_FALLBACK: tuple[str, ...] = ("울산학성점", "울산삼산점")
+_LEAD_REG_SOURCES: list[str] = ["전화_문의", "오프라인_방문", "온라인_채널톡", "기타"]
+
+
+def _lead_reg_store_options() -> list[str]:
+    names = list(_get_store_name_list())
+    if not names:
+        names = list(_LEAD_REG_STORE_FALLBACK)
+    for sn in _LEAD_REG_STORE_FALLBACK:
+        if sn not in names:
+            names.append(sn)
+    return [""] + names
+
+
+def _init_lead_reg_defaults() -> None:
+    """초안 키가 없을 때만 기본값을 넣는다. 이미 입력한 값은 덮어쓰지 않는다."""
     user = st.session_state.get("current_user") or {}
-    # 기본값: (미지정). 본인 소속 매장은 목록에만 포함되고 자동 선택하지 않음.
-    store_options = [""] + _get_store_name_list()
-    _store_index = 0
-
-    # 담당 직원 멀티셀렉트 옵션 — 매출 등록과 동일하게 직원 이름 기준
     emp_map = _get_employee_map()
-    _emp_name_list = sorted(emp_map.values())
-
-    # 현재 로그인 직원 기본 선택
-    _default_emp_names: list[str] = []
+    default_emps: list[str] = []
     _cur_uid = user.get("id")
     if _cur_uid is not None:
         _cur_name = emp_map.get(int(_cur_uid), "")
         if _cur_name:
-            _default_emp_names = [_cur_name]
+            default_emps = [_cur_name]
+    defaults: dict[str, Any] = {
+        "lead_reg_source": "전화_문의",
+        "lead_reg_send_now": False,
+        "lead_reg_phone": "",
+        "lead_reg_name": "",
+        "lead_reg_emps": default_emps,
+        "lead_reg_store": "",
+        "lead_reg_memo": "",
+        "lead_reg_next": date.today() + timedelta(days=3),
+        "lead_reg_image": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    st.markdown("#### ＋ 새 리드 등록")
+
+def _clear_lead_reg_state() -> None:
+    for k in _LEAD_REG_KEYS:
+        st.session_state.pop(k, None)
+
+
+def _dismiss_lead_register() -> None:
+    st.session_state["lead_show_form"] = False
+
+
+def _rerun_app() -> None:
+    try:
+        st.rerun(scope="app")
+    except TypeError:
+        st.rerun()
+
+
+def _render_register_form() -> None:
+    user = st.session_state.get("current_user") or {}
+    _init_lead_reg_defaults()
+    store_options = _lead_reg_store_options()
+    if st.session_state.get("lead_reg_store") not in store_options:
+        st.session_state["lead_reg_store"] = ""
+    if st.session_state.get("lead_reg_source") not in _LEAD_REG_SOURCES:
+        st.session_state["lead_reg_source"] = "전화_문의"
+
+    emp_map = _get_employee_map()
+    _emp_name_list = sorted(emp_map.values())
+    _emps_now = [n for n in (st.session_state.get("lead_reg_emps") or []) if n in _emp_name_list]
+    st.session_state["lead_reg_emps"] = _emps_now
+
+    st.caption("등록을 누르기 전에는 저장되지 않습니다. 입력 중 값이 초기화되지 않습니다.")
     if not _emp_name_list:
         st.warning(
             "담당 직원 목록을 불러오지 못했습니다. "
             "⚙️ 관리자 설정 → 1. 직원 마스터에서 직원이 등록되어 있는지 확인해 주세요."
         )
-    with st.form("lead_register_form_v2", clear_on_submit=True):
+    with st.form("lead_register_form_v3", clear_on_submit=False):
         c1, c2 = st.columns(2)
         with c1:
-            lead_source = st.radio(
+            st.radio(
                 "유입 경로",
-                ["전화_문의", "오프라인_방문", "온라인_채널톡", "기타"],
+                _LEAD_REG_SOURCES,
                 horizontal=True,
+                key="lead_reg_source",
             )
         with c2:
-            send_now = st.toggle("즉시 첫 메시지 발송", value=True)
+            st.toggle("즉시 첫 메시지 발송", key="lead_reg_send_now")
 
         cc1, cc2 = st.columns(2)
         with cc1:
-            phone_in = st.text_input("전화번호 *", placeholder="010-0000-0000")
+            st.text_input("전화번호 *", placeholder="010-0000-0000", key="lead_reg_phone")
         with cc2:
-            name_in = st.text_input("고객 이름")
+            st.text_input("고객 이름", key="lead_reg_name")
 
-        emp_names_sel = st.multiselect(
+        st.multiselect(
             "담당 직원 (복수 선택, 1/n 실적 분배 대상) *",
             options=_emp_name_list,
-            default=_default_emp_names,
+            key="lead_reg_emps",
             help="매출 등록과 동일하게 여러 명을 선택하면 1/n 실적 분배 대상이 됩니다.",
         )
-        store_in = st.selectbox(
+        st.selectbox(
             "담당 매장",
             options=store_options,
-            index=_store_index,
             format_func=lambda s: s if s else "(미지정)",
+            key="lead_reg_store",
             help="기본값은 (미지정)입니다. 울산삼산점·울산학성점만 선택할 수 있습니다.",
         )
-        memo_in = st.text_area("상담 메모", height=80, placeholder="예: 토레도 소파 4인용 가격 문의")
+        st.text_area("상담 메모", height=80, placeholder="예: 토레도 소파 4인용 가격 문의", key="lead_reg_memo")
         cc3, cc4 = st.columns(2)
         with cc3:
-            next_in = st.date_input("다음 연락 예정일", value=date.today() + timedelta(days=3))
+            st.date_input("다음 연락 예정일", key="lead_reg_next")
         with cc4:
-            image_in = st.text_input("MMS 첨부 이미지 URL (선택)", placeholder="https://...")
+            st.text_input("MMS 첨부 이미지 URL (선택)", placeholder="https://...", key="lead_reg_image")
 
         c5, c6 = st.columns([3, 1])
         with c5:
@@ -1500,73 +1560,114 @@ def _render_register_form() -> None:
             cancel = st.form_submit_button("취소", width="stretch")
 
     if cancel:
+        _clear_lead_reg_state()
         st.session_state["lead_show_form"] = False
-        st.rerun()
-    if submitted:
-        phone_clean = _normalize_phone(phone_in)
-        if not phone_clean or len(phone_clean) < 10:
-            st.error("전화번호를 올바르게 입력해 주세요.")
-            return
-        # 멀티셀렉트 → 첫 번째 직원 ID를 FK로, 전체 이름은 employee_names 텍스트로 저장
-        _emp_name_to_id = {v: k for k, v in emp_map.items()}
-        first_emp_id = _emp_name_to_id.get(emp_names_sel[0]) if emp_names_sel else None
-        employee_names_str = ",".join(emp_names_sel) if emp_names_sel else ""
-        try:
-            from lead_manager import register_lead
-            result = register_lead(
+        _rerun_app()
+        return
+    if not submitted:
+        return
+
+    lead_source = st.session_state.get("lead_reg_source") or "전화_문의"
+    send_now = bool(st.session_state.get("lead_reg_send_now"))
+    phone_in = str(st.session_state.get("lead_reg_phone") or "")
+    name_in = str(st.session_state.get("lead_reg_name") or "")
+    emp_names_sel = list(st.session_state.get("lead_reg_emps") or [])
+    store_in = str(st.session_state.get("lead_reg_store") or "")
+    memo_in = str(st.session_state.get("lead_reg_memo") or "")
+    next_in = st.session_state.get("lead_reg_next") or (date.today() + timedelta(days=3))
+    image_in = str(st.session_state.get("lead_reg_image") or "")
+
+    phone_clean = _normalize_phone(phone_in)
+    if not phone_clean or len(phone_clean) < 10:
+        st.error("전화번호를 올바르게 입력해 주세요.")
+        return
+    _emp_name_to_id = {v: k for k, v in emp_map.items()}
+    first_emp_id = _emp_name_to_id.get(emp_names_sel[0]) if emp_names_sel else None
+    employee_names_str = ",".join(emp_names_sel) if emp_names_sel else ""
+    try:
+        from lead_manager import register_lead
+        result = register_lead(
+            phone=phone_clean,
+            name=name_in or "",
+            memo=memo_in or "",
+            lead_source=lead_source,
+            store_name=store_in or "미지정",
+            employee_id=first_emp_id,
+            next_contact_date=str(next_in),
+            send_now=send_now,
+            image_url=image_in or "",
+        )
+        if result.get("ok") and result.get("lead_id") and employee_names_str:
+            try:
+                _supa().table("app_leads").update(
+                    {"employee_names": employee_names_str}
+                ).eq("id", result["lead_id"]).execute()
+            except Exception:
+                pass
+    except Exception as e:
+        st.error(f"오류: {e}")
+        return
+
+    if result.get("ok"):
+        _sr = result.get("send_result", {}) or {}
+        _label = {
+            "sent": "✅ 발송 완료", "lms_fallback": "LMS 발송 완료",
+            "skipped": f"발송 보류 ({_sr.get('error')})",
+            "failed": f"발송 실패 ({_sr.get('error')})",
+            "not_friend": "미친구(SMS 폴백)", "out_of_hours": "야간 발송 거부",
+        }.get(_sr.get("status", ""), "즉시발송 OFF")
+        if _sr.get("status") in ("sent", "lms_fallback"):
+            _log_customer_message(
                 phone=phone_clean,
-                name=name_in or "",
-                memo=memo_in or "",
-                lead_source=lead_source,
-                store_name=store_in or "미지정",
-                employee_id=first_emp_id,
-                next_contact_date=str(next_in),
-                send_now=send_now,
-                image_url=image_in or "",
+                channel="friendtalk" if _sr.get("status") == "sent" else "sms",
+                body=memo_in or "(자동 첫 메시지)",
+                status=_sr.get("status", ""),
+                sent_by=str(user.get("username") or ""),
+                solapi_msg_id=str(_sr.get("msg_id") or ""),
+                store_name=store_in,
             )
-            # employee_names 별도 저장 (마이그레이션 후에만 컬럼 존재)
-            if result.get("ok") and result.get("lead_id") and employee_names_str:
-                try:
-                    _supa().table("app_leads").update(
-                        {"employee_names": employee_names_str}
-                    ).eq("id", result["lead_id"]).execute()
-                except Exception:
-                    pass
-        except Exception as e:
-            st.error(f"오류: {e}")
-            return
+        st.session_state["lead_reg_flash"] = f"✅ 등록 완료 (ID: {result['lead_id']}) | {_label}"
+        _clear_lead_reg_state()
+        st.session_state["lead_show_form"] = False
+        _rerun_app()
+        return
+    if result.get("error") == "duplicate_phone":
+        ex = result.get("existing", {})
+        st.warning(
+            f"⚠️ 이미 등록된 번호입니다 — ID: {result.get('lead_id')} | "
+            f"성함: {ex.get('name', '—')} | 단계: {LEAD_STAGES.get(ex.get('lead_stage',''), '—')}"
+        )
+        return
+    st.error(f"등록 실패: {result.get('error')}")
 
-        if result.get("ok"):
-            _sr = result.get("send_result", {}) or {}
-            _label = {
-                "sent": "✅ 발송 완료", "lms_fallback": "LMS 발송 완료",
-                "skipped": f"발송 보류 ({_sr.get('error')})",
-                "failed": f"발송 실패 ({_sr.get('error')})",
-                "not_friend": "미친구(SMS 폴백)", "out_of_hours": "야간 발송 거부",
-            }.get(_sr.get("status", ""), "즉시발송 OFF")
-            st.success(f"✅ 등록 완료 (ID: {result['lead_id']}) | {_label}")
 
-            # 발신 로그 기록
-            if _sr.get("status") in ("sent", "lms_fallback"):
-                _log_customer_message(
-                    phone=phone_clean,
-                    channel="friendtalk" if _sr.get("status") == "sent" else "sms",
-                    body=memo_in or "(자동 첫 메시지)",
-                    status=_sr.get("status", ""),
-                    sent_by=str(user.get("username") or ""),
-                    solapi_msg_id=str(_sr.get("msg_id") or ""),
-                    store_name=store_in,
-                )
-            st.session_state["lead_show_form"] = False
-            st.rerun()
-        elif result.get("error") == "duplicate_phone":
-            ex = result.get("existing", {})
-            st.warning(
-                f"⚠️ 이미 등록된 번호입니다 — ID: {result.get('lead_id')} | "
-                f"성함: {ex.get('name', '—')} | 단계: {LEAD_STAGES.get(ex.get('lead_stage',''), '—')}"
-            )
-        else:
-            st.error(f"등록 실패: {result.get('error')}")
+def _lead_register_dialog_body() -> None:
+    _render_register_form()
+
+
+def _bind_lead_register_dialog():
+    body = _lead_register_dialog_body
+    if not hasattr(st, "dialog"):
+        return body
+    try:
+        return st.dialog(
+            "＋ 새 리드 등록", width="medium", on_dismiss=_dismiss_lead_register,
+        )(body)
+    except TypeError:
+        pass
+    try:
+        return st.dialog("＋ 새 리드 등록", width="medium")(body)
+    except TypeError:
+        return st.dialog("＋ 새 리드 등록")(body)
+
+
+_lead_register_dialog = _bind_lead_register_dialog()
+
+
+def _open_lead_register_dialog() -> None:
+    """모듈 단위로 고정된 다이얼로그. rerun마다 새 함수를 만들지 않는다."""
+    _init_lead_reg_defaults()
+    _lead_register_dialog()
 
 
 # ──────────────────────────────────────────────
