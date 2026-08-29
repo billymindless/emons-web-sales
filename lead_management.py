@@ -844,6 +844,136 @@ def _build_purchase_map(supa: Any) -> tuple[dict[str, str], dict[str, int]]:
     return phone_to_emp_names, phone_to_emp_id
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_purchase_map() -> tuple[dict[str, str], dict[str, int]]:
+    """주문 전체 스캔 결과를 5분 캐시. 목록 rerun마다 풀스캔하지 않는다."""
+    supa = _supa()
+    if not supa:
+        return {}, {}
+    return _build_purchase_map(supa)
+
+
+_LEAD_LIST_KEY = "lead_list_rows"
+_LEAD_MIG_KEY = "lead_list_migrations"
+_LEAD_FULL_SELECT = (
+    "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
+    "next_contact_date,assigned_employee_id,employee_names,store_name,"
+    "customer_type,classification_memo,classified_by,classified_at,last_contact_at,"
+    "created_at,converted_at,revenue_amount,converted_order_id"
+)
+_LEAD_LEGACY_SELECT = (
+    "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
+    "next_contact_date,assigned_employee_id,store_name,"
+    "created_at,converted_at,revenue_amount,converted_order_id"
+)
+
+
+def _rerun_app() -> None:
+    try:
+        st.rerun(scope="app")
+    except TypeError:
+        st.rerun()
+
+
+def _invalidate_lead_list() -> None:
+    st.session_state.pop(_LEAD_LIST_KEY, None)
+    st.session_state.pop(_LEAD_MIG_KEY, None)
+
+
+def _annotate_purchase_flags(rows: list[dict]) -> list[dict]:
+    phones = set((_cached_purchase_map()[0] or {}).keys())
+    for l in rows:
+        l["_is_customer"] = _normalize_phone(l.get("phone") or "") in phones
+    return rows
+
+
+def _fetch_leads_from_db() -> tuple[list[dict], list[str], str]:
+    """DB에서 리드 목록을 읽는다. 반환: (rows, migrations, error)."""
+    supa = _supa()
+    if not supa:
+        return [], [], "Supabase 연결 실패"
+    migrations: list[str] = []
+    try:
+        rows = (
+            supa.table("app_leads").select(_LEAD_FULL_SELECT)
+            .order("created_at", desc=True).limit(500).execute().data or []
+        )
+        return rows, migrations, ""
+    except Exception as e:
+        err = str(e)
+        missing = "42703" in err or any(
+            c in err for c in ("customer_type", "employee_names", "classification_memo", "last_contact_at")
+        )
+        if not missing:
+            return [], [], f"리드 조회 실패: {e}"
+        if "customer_type" in err or "classification_memo" in err or "last_contact_at" in err:
+            migrations.append("SUPABASE_APP_LEADS_CUSTOMER_TYPE.sql")
+        if "employee_names" in err:
+            migrations.append("SUPABASE_APP_LEADS_EMPLOYEE_NAMES.sql")
+        try:
+            rows = (
+                supa.table("app_leads").select(_LEAD_LEGACY_SELECT)
+                .order("created_at", desc=True).limit(500).execute().data or []
+            )
+        except Exception as e2:
+            return [], migrations, f"리드 조회 실패: {e2}"
+        for l in rows:
+            l.setdefault("customer_type", "신규잠재고객")
+            l.setdefault("classification_memo", None)
+            l.setdefault("classified_by", None)
+            l.setdefault("classified_at", None)
+            l.setdefault("last_contact_at", None)
+            l.setdefault("employee_names", None)
+        return rows, migrations, ""
+
+
+def _ensure_lead_list_loaded(*, force: bool = False) -> tuple[list[dict], list[str]]:
+    if force:
+        _invalidate_lead_list()
+    cached = st.session_state.get(_LEAD_LIST_KEY)
+    if cached is not None and not force:
+        return cached, st.session_state.get(_LEAD_MIG_KEY) or []
+    rows, mig, err = _fetch_leads_from_db()
+    if err:
+        st.error(err)
+        st.session_state[_LEAD_LIST_KEY] = []
+        st.session_state[_LEAD_MIG_KEY] = mig
+        return [], mig
+    rows = _annotate_purchase_flags(rows)
+    st.session_state[_LEAD_LIST_KEY] = rows
+    st.session_state[_LEAD_MIG_KEY] = mig
+    return rows, mig
+
+
+def _fetch_one_lead(lead_id: int) -> dict | None:
+    supa = _supa()
+    if not supa:
+        return None
+    try:
+        rows = (
+            supa.table("app_leads").select(_LEAD_FULL_SELECT)
+            .eq("id", lead_id).limit(1).execute().data or []
+        )
+    except Exception:
+        try:
+            rows = (
+                supa.table("app_leads").select(_LEAD_LEGACY_SELECT)
+                .eq("id", lead_id).limit(1).execute().data or []
+            )
+        except Exception:
+            return None
+    if not rows:
+        return None
+    return _annotate_purchase_flags(rows)[0]
+
+
+def _find_lead_for_dialog(lead_id: int) -> dict | None:
+    for l in st.session_state.get(_LEAD_LIST_KEY) or []:
+        if l.get("id") == lead_id:
+            return l
+    return _fetch_one_lead(int(lead_id))
+
+
 def _sync_leads_to_customers(full: bool = False) -> dict:
     """
     app_orders(매출) 기반으로 app_leads 동기화.
@@ -861,8 +991,8 @@ def _sync_leads_to_customers(full: bool = False) -> dict:
         result["errors"].append("Supabase 연결 실패")
         return result
 
-    # ① 매출 기반 phone 맵 구성
-    phone_to_emp_names, phone_to_emp_id = _build_purchase_map(supa)
+    # ① 매출 기반 phone 맵 구성 (5분 캐시 — 목록 rerun과 공유)
+    phone_to_emp_names, phone_to_emp_id = _cached_purchase_map()
     result["purchase_map_size"] = len(phone_to_emp_names)
 
     if not phone_to_emp_names:
@@ -921,203 +1051,15 @@ def _sync_leads_to_customers(full: bool = False) -> dict:
         return result
 
 
-def render_lead_management() -> None:
-    """3. 리드고객 관리 메인 페이지."""
-
-    # ── 백그라운드 자동 동기화 (세션당 1회) ──
-    if not st.session_state.get("_lead_synced"):
-        _sr = _sync_leads_to_customers(full=False)
-        st.session_state["_lead_synced"] = True
-        if _sr["stage_updated"] > 0 or _sr["emp_updated"] > 0:
-            st.toast(
-                f"🔄 자동 동기화: 계약완료 {_sr['stage_updated']}건 · 담당자 {_sr['emp_updated']}건 업데이트",
-                icon="✅",
-            )
-
-    # ── 페이지 헤더 ────────────────────────────
-    _hc1, _hc2, _hc3, _hc4 = st.columns([4, 1.4, 1.4, 1.4])
-    with _hc1:
-        st.title("📋 리드고객 관리")
-        st.caption("빠른 응답은 생각보다 꽤 강력한 무기입니다. (전체 매장 공유)")
-    with _hc2:
-        if st.button("🔄 담당자 동기화", width="stretch", key="lead_btn_full_sync",
-                     help="실제 매출(app_orders)이 있는 고객만 담당직원을 다시 매핑합니다"):
-            with st.spinner("동기화 중..."):
-                st.session_state.pop("_lead_synced", None)
-                _fsr = _sync_leads_to_customers(full=True)
-            st.session_state["_sync_last_result"] = _fsr
-            st.session_state["_lead_synced"] = True
-            st.rerun()
-
-    # 동기화 결과 표시 (rerun 직후 1회만)
-    if st.session_state.get("_sync_last_result"):
-        _r = st.session_state.pop("_sync_last_result")
-        if _r.get("errors"):
-            st.warning(f"⚠️ 오류: {_r['errors'][0]}")
-        st.success(
-            f"✅ 매출 phone {_r['purchase_map_size']}건 로드 · "
-            f"리드 매칭 {_r['total_matched']}건 · "
-            f"단계 업데이트 {_r['stage_updated']}건 · "
-            f"담당자 업데이트 {_r['emp_updated']}건"
-        )
-        if _r['purchase_map_size'] == 0:
-            st.error(
-                "💡 매출 phone이 0건입니다. `app_orders.customer_id`가 비어있을 가능성. "
-                "Supabase에서 `SELECT COUNT(customer_id) FROM app_orders;`로 확인해 주세요."
-            )
-    with _hc3:
-        if st.button("📥 채널톡 가져오기", width="stretch", key="lead_btn_import_ct"):
-            st.session_state["lead_show_import"] = True
-            st.session_state["lead_show_form"] = False
-            st.session_state.pop("lead_selected_id", None)
-    with _hc4:
-        if st.button("＋ 리드 등록", type="primary", width="stretch", key="lead_btn_open_form"):
-            st.session_state["lead_show_form"] = True
-            st.session_state["lead_show_import"] = False
-            st.session_state.pop("lead_selected_id", None)
-            _init_lead_reg_defaults()
-
-    # ── 채널톡 가져오기 · 리드 등록 폼: 팝업(모달) ──────────
-    # st.dialog 기반 공통 헬퍼. 미지원 환경에서는 expander 로 폴백.
-    # X/ESC 닫기 시에도 세션 플래그를 지워야 다른 버튼 클릭 시 재오픈되지 않음.
-    from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
-
-    def _dismiss_lead_import() -> None:
-        st.session_state["lead_show_import"] = False
-
-    def _dismiss_lead_detail() -> None:
-        st.session_state.pop("lead_selected_id", None)
-
-    if st.session_state.get("lead_show_import"):
-        _open_dialog(
-            "📥 채널톡 유입 고객 가져오기",
-            _render_import_panel,
-            width="medium",
-            on_dismiss=_dismiss_lead_import,
-        )
-
-    if st.session_state.get("lead_reg_flash"):
-        st.success(st.session_state.pop("lead_reg_flash"))
-
-    if st.session_state.get("lead_show_form"):
-        _open_lead_register_dialog()
-
-    # ── Supabase 데이터 로드 ────────────────────
-    supa = _supa()
-    if not supa:
-        st.error("Supabase 연결 실패")
-        return
-
-    _full_select = (
-        "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
-        "next_contact_date,assigned_employee_id,employee_names,store_name,"
-        "customer_type,classification_memo,classified_by,classified_at,last_contact_at,"
-        "created_at,converted_at,revenue_amount,converted_order_id"
-    )
-    _legacy_select = (
-        "id,phone,name,lead_source,lead_stage,memo,contact_memo,"
-        "next_contact_date,assigned_employee_id,store_name,"
-        "created_at,converted_at,revenue_amount,converted_order_id"
-    )
-    _migration_pending: list[str] = []
-    leads_raw: list[dict] = []
-    try:
-        leads_raw = supa.table("app_leads").select(_full_select) \
-            .order("created_at", desc=True).limit(500).execute().data or []
-    except Exception as e:
-        _err_msg = str(e)
-        # 새 컬럼이 누락된 경우 → 레거시 SELECT로 폴백
-        _is_missing_col = "42703" in _err_msg or any(
-            c in _err_msg for c in ("customer_type", "employee_names", "classification_memo", "last_contact_at")
-        )
-        if _is_missing_col:
-            if "customer_type" in _err_msg or "classification_memo" in _err_msg or "last_contact_at" in _err_msg:
-                _migration_pending.append("SUPABASE_APP_LEADS_CUSTOMER_TYPE.sql")
-            if "employee_names" in _err_msg:
-                _migration_pending.append("SUPABASE_APP_LEADS_EMPLOYEE_NAMES.sql")
-            try:
-                leads_raw = supa.table("app_leads").select(_legacy_select) \
-                    .order("created_at", desc=True).limit(500).execute().data or []
-            except Exception as e2:
-                st.error(f"리드 조회 실패: {e2}")
-                return
-            for _l in leads_raw:
-                _l.setdefault("customer_type", "신규잠재고객")
-                _l.setdefault("classification_memo", None)
-                _l.setdefault("classified_by", None)
-                _l.setdefault("classified_at", None)
-                _l.setdefault("last_contact_at", None)
-                _l.setdefault("employee_names", None)
-        else:
-            st.error(f"리드 조회 실패: {e}")
-            return
-
-    if _migration_pending:
-        _files = " · ".join(f"`{f}`" for f in _migration_pending)
-        st.warning(
-            f"⚠️ **SQL 마이그레이션 필요** — {_files} 파일을 "
-            "Supabase Dashboard › SQL Editor에서 실행하세요. "
-            "해당 기능(고객 유형 분류·다중 담당자·재유입 추적)은 마이그레이션 후 활성화됩니다."
-        )
-
+@st.fragment
+def _render_lead_list_fragment() -> None:
+    """필터·목록만 다시 그린다. 팝업/등록 초안은 건드리지 않는다."""
     emp_map = _get_employee_map()
+    leads_raw = list(st.session_state.get(_LEAD_LIST_KEY) or [])
+    _render_lead_filters_and_table(leads_raw, emp_map)
 
-    # ── 구매완료 판정: app_orders(실제 매출)이 있는 phone만 ──
-    # 단순 app_customers 등록만으론 구매완료로 분류하지 않음
-    _purchase_map, _ = _build_purchase_map(supa)
-    customer_phones: set[str] = set(_purchase_map.keys())
 
-    for _l in leads_raw:
-        _l["_is_customer"] = _normalize_phone(_l.get("phone") or "") in customer_phones
-
-    # ── 선택된 리드 상세 패널: 팝업(모달) ────────────
-    # '관리' 버튼 클릭 시 스크롤 이동 없이 팝업으로 열림. 저장·닫기 시 자동 종료.
-    _sel_id = st.session_state.get("lead_selected_id")
-    if _sel_id:
-        _sel = next((l for l in leads_raw if l.get("id") == _sel_id), None)
-        if _sel:
-            def _render_lead_detail_dialog(lead=_sel, emp_map_=emp_map, sid=_sel_id):
-                _render_lead_detail_panel(lead, emp_map_)
-                st.divider()
-                if st.button("닫기", key=f"lead_dlg_close_{sid}", width="stretch"):
-                    st.session_state.pop("lead_selected_id", None)
-                    st.rerun()
-
-            _open_dialog(
-                f"📋 {_sel.get('name') or '리드'} 상세 관리",
-                _render_lead_detail_dialog,
-                width="large",
-                on_dismiss=_dismiss_lead_detail,
-            )
-
-    # ── Stats 카드 (숨김 처리 — 추후 세일즈 퍼포먼스 메뉴로 이동 예정) ──
-    # 통계 위젯 비활성화. 로직은 유지하여 이전 시 그대로 재사용 가능.
-    if False:
-        _customer_count = sum(1 for _l in leads_raw if _l["_is_customer"])
-        _total = len(leads_raw)
-        _new = sum(1 for l in leads_raw if l.get("lead_stage") == "1_신규")
-        _consult = sum(1 for l in leads_raw if l.get("lead_stage") in ("2_상담중", "3_견적발송"))
-        _conv = sum(1 for l in leads_raw if l.get("lead_stage") == "4_계약완료" or l.get("_is_customer"))
-
-        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-        sc1.metric("전체 리드", f"{_total}건", help="전체 등록된 잠재 고객 수")
-        sc2.metric("신규", f"{_new}건", help="아직 첫 응대가 필요한 문의")
-        sc3.metric("상담중", f"{_consult}건", help="현재 커뮤니케이션이 진행 중인 리드")
-        sc4.metric(
-            "전환 완료",
-            f"{_conv}건",
-            delta=f"전환율 {round(_conv / _total * 100, 1)}%" if _total else None,
-            help="계약 완료 단계 또는 이미 우리 DB에 고객으로 등록된 리드",
-        )
-        sc5.metric(
-            "🛒 구매 완료",
-            f"{_customer_count}건",
-            help="app_customers 마스터에 phone이 매칭된 리드 (이미 구매한 고객)",
-        )
-
-        st.divider()
-
-    # ── Stage filter tabs (segmented) ──────────
+def _render_lead_filters_and_table(leads_raw: list[dict], emp_map: dict[int, str]) -> None:
     _stage_keys = ["전체"] + list(LEAD_STAGES.keys())
     _stage_labels = ["전체"] + [LEAD_STAGES[k] for k in LEAD_STAGES.keys()]
     if "lead_filter_stage" not in st.session_state:
@@ -1134,7 +1076,6 @@ def render_lead_management() -> None:
     _sel_stage = _stage_keys[_stage_labels.index(_sel_label)]
     st.session_state["lead_filter_stage"] = _sel_stage
 
-    # ── 검색 + 담당자 필터 + 토글 + 카운트 ─────────
     _emp_all_names = sorted(emp_map.values())
     _emp_filter_options = ["(전체)"] + _emp_all_names
 
@@ -1167,7 +1108,6 @@ def render_lead_management() -> None:
             help="DB에 이미 등록된(구매 완료) 고객을 목록에서 숨깁니다.",
         )
 
-    # ── 고객 유형 필터 (customer_type) ───────────
     _type_options = ["전체", "신규잠재고객", "기존구매고객_DB외", "AS요청", "재상담"]
     _type_labels = ["전체", "🆕 신규", "🔄 기존구매(DB외)", "🔧 AS요청", "💬 재상담"]
     _sel_type_label = st.radio(
@@ -1180,7 +1120,6 @@ def render_lead_management() -> None:
     )
     _sel_type = _type_options[_type_labels.index(_sel_type_label)]
 
-    # ── 필터링 ────────────────────────────────
     leads = leads_raw
     if _hide_customers:
         leads = [l for l in leads if not l.get("_is_customer")]
@@ -1203,11 +1142,6 @@ def render_lead_management() -> None:
             unsafe_allow_html=True,
         )
 
-    if not leads:
-        st.info("조건에 맞는 리드가 없습니다.")
-        return
-
-    # ── 담당자 필터 적용 (상단 selectbox 기반) ──
     _filter_emp_id = st.session_state.get("lead_filter_emp_id")
     if _filter_emp_id:
         _filter_emp_name = emp_map.get(int(_filter_emp_id), "")
@@ -1217,8 +1151,11 @@ def render_lead_management() -> None:
             or (_filter_emp_name and _filter_emp_name in (l.get("employee_names") or "").split(","))
         ]
 
-    # ── 테이블 헤더 ───────────────────────────
-    _ths = ["고객명", "연락처", "유형 ▼", "유입경로", "상태 ▼", "매장 ▼", "담당직원 ▼", "마지막 연락", ""]
+    if not leads:
+        st.info("조건에 맞는 리드가 없습니다.")
+        return
+
+    _ths = ["고객명", "연락처", "유형", "유입경로", "상태", "매장", "담당직원", "마지막 연락", ""]
     _ws = [1.5, 1.2, 1.2, 0.9, 1.2, 1.6, 1.8, 0.9, 0.6]
     _hc = st.columns(_ws)
     for _c, _t in zip(_hc, _ths):
@@ -1227,163 +1164,161 @@ def render_lead_management() -> None:
         "<div style='border-bottom:1px solid #e5e7eb;margin:0 0 4px 0;'></div>",
         unsafe_allow_html=True,
     )
+    st.caption("유형·상태·매장·담당직원은 **관리**에서 수정합니다.")
 
-    _emp_name_to_id = {v: k for k, v in emp_map.items()}
-    _stage_keys_list = list(LEAD_STAGES.keys())
-    _employees_by_store = _get_employees_by_store()
-    # 운영 매장만 (법인명·폐점 제외). 기존 리드에 저장된 값은 행별 옵션에만 보존.
-    _store_options_master = sorted(
-        sn for sn in _employees_by_store.keys() if _is_lead_selectable_store(sn)
-    )
-    # app_stores 활성 목록과 합집합 (직원 매핑에 없어도 선택 가능)
-    for _sn in _get_store_name_list():
-        if _sn not in _store_options_master:
-            _store_options_master.append(_sn)
-    _store_options_master = sorted(_store_options_master)
-
-    # 매장별 직원 매핑이 비어있으면 진단 안내
-    if not _employees_by_store and not _emp_all_names:
-        st.warning(
-            "⚠ 직원 명단을 불러오지 못했습니다. `app_users` 테이블 권한(RLS) 또는 "
-            "Supabase 연결을 확인하세요. 임시로 전체 이름 폴백을 사용합니다."
-        )
-
-    # ── 리드 행 (인라인 편집) ───────────────────
-    for _i, _lead in enumerate(leads):
+    for _lead in leads:
         _lid = _lead.get("id")
         _name = _lead.get("name") or "—"
         _phone = _format_phone_display(_lead.get("phone") or "")
         _source = LEAD_SOURCE_LABELS.get(_lead.get("lead_source") or "", _lead.get("lead_source") or "—")
         _stage = _lead.get("lead_stage") or "1_신규"
         _ctype = _lead.get("customer_type") or "신규잠재고객"
-
-        # 담당직원: employee_names(쉼표 구분) 우선, 없으면 assigned_employee_id
         _emp_names_raw = (_lead.get("employee_names") or "").strip()
         if _emp_names_raw:
-            _emp_names_list = [n.strip() for n in _emp_names_raw.split(",") if n.strip()]
+            _emp_label = " · ".join(n.strip() for n in _emp_names_raw.split(",") if n.strip()) or "—"
         else:
             _primary_emp_id = _lead.get("assigned_employee_id")
-            _fallback_name = emp_map.get(int(_primary_emp_id), "") if _primary_emp_id else ""
-            _emp_names_list = [_fallback_name] if _fallback_name else []
-
-        _store = _lead.get("store_name") or ""
+            _emp_label = emp_map.get(int(_primary_emp_id), "—") if _primary_emp_id else "—"
+        _store = _lead.get("store_name") or "—"
         _last_contact = (
             str(_lead.get("last_contact_at") or "")[:10]
             or str(_lead.get("created_at") or "")[:10]
         )
-
         _rc = st.columns(_ws)
-
-        # 고객명
         with _rc[0]:
-            st.markdown(
-                f"<div style='font-weight:500;'>{_name}</div>",
-                unsafe_allow_html=True,
-            )
-
+            st.markdown(f"<div style='font-weight:500;'>{_name}</div>", unsafe_allow_html=True)
         _rc[1].write(_phone)
-
-        # 유형 — 인라인 selectbox
-        with _rc[2]:
-            _type_key = f"inline_type_{_lid}"
-            _cur_type_idx = CUSTOMER_TYPE_KEYS.index(_ctype) if _ctype in CUSTOMER_TYPE_KEYS else 0
-            st.selectbox(
-                "유형",
-                CUSTOMER_TYPE_KEYS,
-                index=_cur_type_idx,
-                format_func=lambda k: CUSTOMER_TYPE_INLINE_DISPLAY.get(k, k),
-                key=_type_key,
-                label_visibility="collapsed",
-                on_change=_inline_save_type,
-                args=(_lid, _type_key),
-            )
-
+        _rc[2].write(CUSTOMER_TYPE_INLINE_DISPLAY.get(_ctype, _ctype))
         _rc[3].write(_source)
-
-        # 상태 — 인라인 selectbox (+ 구매완료 표시)
         with _rc[4]:
-            _stage_key = f"inline_stage_{_lid}"
-            _cur_stage_idx = _stage_keys_list.index(_stage) if _stage in _stage_keys_list else 0
-            st.selectbox(
-                "상태",
-                _stage_keys_list,
-                index=_cur_stage_idx,
-                format_func=lambda k: LEAD_STAGES.get(k, k),
-                key=_stage_key,
-                label_visibility="collapsed",
-                on_change=_inline_save_stage,
-                args=(_lid, _stage_key),
-            )
+            st.write(LEAD_STAGES.get(_stage, _stage))
             if _lead.get("_is_customer"):
                 st.markdown(
                     "<span style='background:#fef3c7;color:#92400e;padding:1px 6px;"
                     "border-radius:8px;font-size:0.68rem;font-weight:600;'>🛒 구매완료</span>",
                     unsafe_allow_html=True,
                 )
-
-        # 매장 — 인라인 selectbox (운영 매장만: 삼산·학성)
-        with _rc[5]:
-            _store_key = f"inline_store_{_lid}"
-            # 옵션: (미지정) + 운영 매장. 법인명(전시장)·폐점(양산/평산)은 목록에서 제외.
-            _row_store_options = [""] + list(_store_options_master)
-            _display_store = _store if _is_lead_selectable_store(_store) else ""
-            if _display_store and _display_store not in _row_store_options:
-                _row_store_options.append(_display_store)
-            _cur_store_idx = (
-                _row_store_options.index(_display_store)
-                if _display_store in _row_store_options
-                else 0
-            )
-            st.selectbox(
-                "매장",
-                _row_store_options,
-                index=_cur_store_idx,
-                format_func=lambda s: s if s else "(미지정)",
-                key=_store_key,
-                label_visibility="collapsed",
-                on_change=_inline_save_store,
-                args=(_lid, _store_key),
-            )
-
-        # 담당직원 — 인라인 multiselect (선택된 매장 직원만)
-        with _rc[6]:
-            _emp_key = f"inline_emps_{_lid}"
-            # 같은 행에서 선택 중인 매장(세션 상태) 우선 → 없으면 저장된 값 사용
-            _current_store_for_emp = st.session_state.get(f"inline_store_{_lid}", _store) or _store
-            _store_emps = _employees_for_store(
-                _current_store_for_emp, _employees_by_store, _emp_all_names
-            )
-            # 현재 저장된 이름 중 옵션에 없는 것은 강제 추가 (default 매칭 + 데이터 보존)
-            _row_options = list(dict.fromkeys(_store_emps + _emp_names_list))
-            _row_default = [n for n in _emp_names_list if n in _row_options]
-            if _current_store_for_emp:
-                _placeholder = f"{_current_store_for_emp} 직원 선택"
-            else:
-                _placeholder = "매장을 먼저 지정하세요"
-            st.multiselect(
-                "담당직원",
-                options=_row_options,
-                default=_row_default,
-                key=_emp_key,
-                label_visibility="collapsed",
-                placeholder=_placeholder,
-                on_change=_inline_save_emps,
-                args=(_lid, _emp_key, _emp_name_to_id),
-            )
-
+        _rc[5].write(_store if _is_lead_selectable_store(_store) else (_store or "—"))
+        _rc[6].write(_emp_label)
         _rc[7].write(_last_contact)
         with _rc[8]:
-            _is_sel = st.session_state.get("lead_selected_id") == _lid
-            if st.button("닫기" if _is_sel else "관리", key=f"lead_act_{_lid}_{_i}", width="stretch"):
-                if _is_sel:
-                    st.session_state.pop("lead_selected_id", None)
-                else:
-                    st.session_state["lead_selected_id"] = _lid
-                    st.session_state["lead_show_form"] = False
-                    st.session_state["lead_show_import"] = False
-                    st.rerun()
+            if st.button("관리", key=f"lead_act_{_lid}", width="stretch"):
+                st.session_state["lead_selected_id"] = _lid
+                st.session_state["lead_show_form"] = False
+                st.session_state["lead_show_import"] = False
+                _rerun_app()
 
-    # 상세 패널은 페이지 상단(타이틀 직후)에서 렌더링됨 — 여기서는 별도 처리 없음
+
+def render_lead_management() -> None:
+    """3. 리드고객 관리 메인 페이지."""
+
+    # ── 페이지 헤더 ────────────────────────────
+    _hc1, _hc2, _hc3, _hc4, _hc5 = st.columns([3.2, 1.1, 1.3, 1.3, 1.3])
+    with _hc1:
+        st.title("📋 리드고객 관리")
+        st.caption("빠른 응답은 생각보다 꽤 강력한 무기입니다. (전체 매장 공유)")
+    with _hc2:
+        if st.button("🔄 새로고침", width="stretch", key="lead_btn_refresh_list",
+                     help="리드 목록만 DB에서 다시 읽습니다. 필터·등록/관리 창은 유지합니다."):
+            with st.spinner("목록 새로고침 중..."):
+                _ensure_lead_list_loaded(force=True)
+            st.toast("리드 목록을 다시 불러왔습니다.", icon="🔄")
+    with _hc3:
+        if st.button("🔄 담당자 동기화", width="stretch", key="lead_btn_full_sync",
+                     help="실제 매출(app_orders)이 있는 고객만 담당직원을 다시 매핑합니다"):
+            with st.spinner("동기화 중..."):
+                _cached_purchase_map.clear()
+                _fsr = _sync_leads_to_customers(full=True)
+                _ensure_lead_list_loaded(force=True)
+            st.session_state["_sync_last_result"] = _fsr
+            _rerun_app()
+
+    # 동기화 결과 표시 (rerun 직후 1회만)
+    if st.session_state.get("_sync_last_result"):
+        _r = st.session_state.pop("_sync_last_result")
+        if _r.get("errors"):
+            st.warning(f"⚠️ 오류: {_r['errors'][0]}")
+        st.success(
+            f"✅ 매출 phone {_r['purchase_map_size']}건 로드 · "
+            f"리드 매칭 {_r['total_matched']}건 · "
+            f"단계 업데이트 {_r['stage_updated']}건 · "
+            f"담당자 업데이트 {_r['emp_updated']}건"
+        )
+        if _r['purchase_map_size'] == 0:
+            st.error(
+                "💡 매출 phone이 0건입니다. `app_orders.customer_id`가 비어있을 가능성. "
+                "Supabase에서 `SELECT COUNT(customer_id) FROM app_orders;`로 확인해 주세요."
+            )
+    with _hc4:
+        if st.button("📥 채널톡 가져오기", width="stretch", key="lead_btn_import_ct"):
+            st.session_state["lead_show_import"] = True
+            st.session_state["lead_show_form"] = False
+            st.session_state.pop("lead_selected_id", None)
+    with _hc5:
+        if st.button("＋ 리드 등록", type="primary", width="stretch", key="lead_btn_open_form"):
+            st.session_state["lead_show_form"] = True
+            st.session_state["lead_show_import"] = False
+            st.session_state.pop("lead_selected_id", None)
+            _init_lead_reg_defaults()
+
+    # ── 채널톡 가져오기 · 리드 등록 폼: 팝업(모달) ──────────
+    # st.dialog 기반 공통 헬퍼. 미지원 환경에서는 expander 로 폴백.
+    # X/ESC 닫기 시에도 세션 플래그를 지워야 다른 버튼 클릭 시 재오픈되지 않음.
+    from ui_dialogs import open_dialog as _open_dialog  # noqa: WPS433
+
+    def _dismiss_lead_import() -> None:
+        st.session_state["lead_show_import"] = False
+
+    def _dismiss_lead_detail() -> None:
+        st.session_state.pop("lead_selected_id", None)
+
+    if st.session_state.get("lead_show_import"):
+        _open_dialog(
+            "📥 채널톡 유입 고객 가져오기",
+            _render_import_panel,
+            width="medium",
+            on_dismiss=_dismiss_lead_import,
+        )
+
+    if st.session_state.get("lead_reg_flash"):
+        st.success(st.session_state.pop("lead_reg_flash"))
+
+    if st.session_state.get("lead_show_form"):
+        _open_lead_register_dialog()
+
+    # 목록은 session_state 캐시. 팝업 오픈/필터는 DB 풀스캔을 하지 않는다.
+    _, _migration_pending = _ensure_lead_list_loaded()
+    if _migration_pending:
+        _files = " · ".join(f"`{f}`" for f in _migration_pending)
+        st.warning(
+            f"⚠️ **SQL 마이그레이션 필요** — {_files} 파일을 "
+            "Supabase Dashboard › SQL Editor에서 실행하세요. "
+            "해당 기능(고객 유형 분류·다중 담당자·재유입 추적)은 마이그레이션 후 활성화됩니다."
+        )
+
+    emp_map = _get_employee_map()
+
+    # ── 선택된 리드 상세: 캐시된 1건(없으면 단건 조회) ────────────
+    _sel_id = st.session_state.get("lead_selected_id")
+    if _sel_id:
+        _sel = _find_lead_for_dialog(int(_sel_id))
+        if _sel:
+            def _render_lead_detail_dialog(lead=_sel, emp_map_=emp_map, sid=_sel_id):
+                _render_lead_detail_panel(lead, emp_map_)
+                st.divider()
+                if st.button("닫기", key=f"lead_dlg_close_{sid}", width="stretch"):
+                    st.session_state.pop("lead_selected_id", None)
+                    _rerun_app()
+
+            _open_dialog(
+                f"📋 {_sel.get('name') or '리드'} 상세 관리",
+                _render_lead_detail_dialog,
+                width="large",
+                on_dismiss=_dismiss_lead_detail,
+            )
+
+    _render_lead_list_fragment()
+
 
 
 # ──────────────────────────────────────────────
@@ -1414,6 +1349,9 @@ def _render_import_panel() -> None:
             if not _res.get("ok"):
                 st.error(f"❌ {_res.get('error')}")
             else:
+                if _res.get("imported"):
+                    _invalidate_lead_list()
+                    _ensure_lead_list_loaded()
                 st.success(
                     f"✅ 채널톡에서 {_res.get('total_seen')}명 조회 → "
                     f"**신규 등록 {_res.get('imported')}명**, 제외 {_res.get('skipped')}명"
@@ -1486,13 +1424,6 @@ def _clear_lead_reg_state() -> None:
 
 def _dismiss_lead_register() -> None:
     st.session_state["lead_show_form"] = False
-
-
-def _rerun_app() -> None:
-    try:
-        st.rerun(scope="app")
-    except TypeError:
-        st.rerun()
 
 
 def _render_register_form() -> None:
@@ -1629,6 +1560,7 @@ def _render_register_form() -> None:
         st.session_state["lead_reg_flash"] = f"✅ 등록 완료 (ID: {result['lead_id']}) | {_label}"
         _clear_lead_reg_state()
         st.session_state["lead_show_form"] = False
+        _invalidate_lead_list()
         _rerun_app()
         return
     if result.get("error") == "duplicate_phone":
@@ -1816,7 +1748,8 @@ def _render_classify_tab(lead: dict) -> None:
             supa.table("app_leads").update(_upd).eq("id", _lid).execute()
             st.success(f"✅ 유형 분류 완료: {CUSTOMER_TYPE_LABELS[_new_type]}")
             st.session_state.pop("lead_selected_id", None)
-            st.rerun()
+            _invalidate_lead_list()
+            _rerun_app()
         except Exception as e:
             _emsg = str(e)
             if "customer_type" in _emsg or "42703" in _emsg:
@@ -1956,6 +1889,21 @@ def _render_stage_change_tab(lead: dict, emp_map: dict[int, str]) -> None:
         index=_idx,
         key=f"stage_sel_{_lid}",
     )
+    _store_opts = [""] + list(_get_store_name_list())
+    for _sn in ("울산학성점", "울산삼산점"):
+        if _sn not in _store_opts:
+            _store_opts.append(_sn)
+    _cur_store = str(lead.get("store_name") or "")
+    if _cur_store and _cur_store not in _store_opts:
+        _store_opts.append(_cur_store)
+    _store_idx = _store_opts.index(_cur_store) if _cur_store in _store_opts else 0
+    _new_store = st.selectbox(
+        "담당 매장",
+        _store_opts,
+        index=_store_idx,
+        format_func=lambda s: s if s else "(미지정)",
+        key=f"stage_store_{_lid}",
+    )
     _nc = st.date_input("다음 연락 예정일", value=None, key=f"stage_nc_{_lid}")
     _memo = st.text_area("사후 메모", height=70, key=f"stage_memo_{_lid}")
 
@@ -1997,6 +1945,7 @@ def _render_stage_change_tab(lead: dict, emp_map: dict[int, str]) -> None:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "assigned_employee_id": _new_first_emp_id,
             "employee_names": _new_emp_names_str or None,
+            "store_name": _new_store or "미지정",
         }
         if _memo:
             _upd["contact_memo"] = _memo
@@ -2007,7 +1956,8 @@ def _render_stage_change_tab(lead: dict, emp_map: dict[int, str]) -> None:
             supa.table("app_leads").update(_upd).eq("id", _lid).execute()
             st.success(f"✅ {LEAD_STAGES[_new]} 단계 + 담당직원 업데이트 완료")
             st.session_state.pop("lead_selected_id", None)
-            st.rerun()
+            _invalidate_lead_list()
+            _rerun_app()
         except Exception as e:
             _emsg = str(e)
             if "employee_names" in _emsg or "42703" in _emsg:
@@ -2020,7 +1970,8 @@ def _render_stage_change_tab(lead: dict, emp_map: dict[int, str]) -> None:
                         "다중 담당자를 활용하려면 `SUPABASE_APP_LEADS_EMPLOYEE_NAMES.sql`을 실행하세요."
                     )
                     st.session_state.pop("lead_selected_id", None)
-                    st.rerun()
+                    _invalidate_lead_list()
+                    _rerun_app()
                 except Exception as e2:
                     st.error(f"업데이트 실패: {e2}")
             else:
