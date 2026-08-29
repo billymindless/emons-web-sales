@@ -175,7 +175,16 @@ def _inject_mobile_css():
             [data-testid="stSelectbox"] > div { min-height: 44px !important; }
             /* 지도 말풍선: 모바일 가독성 */
             .leaflet-popup-content .map-popup { font-size: 14px !important; line-height: 1.4 !important; max-width: min(280px, 85vw) !important; padding: 6px 8px !important; }
+            .erp-cal-detail { display: none !important; }
+            .erp-cal-sum { display: block !important; text-align: center; margin-top: 2px; font-size: 0.7rem; color: #6A1B9A; font-weight: 600; }
+            .erp-cal-wrap td { height: auto !important; min-height: 44px !important; min-width: 0 !important; padding: 4px 2px !important; }
+            .erp-cal-plus-bar { position: sticky; bottom: 0; z-index: 20; padding: 8px 0 12px 0; background: #fff; }
         }
+        @media (min-width: 769px) {
+            .erp-cal-plus-bar { display: none; }
+        }
+        .erp-cal-sum { display: none; }
+        .erp-cal-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #7C3AED; margin-right: 3px; vertical-align: middle; }
         /* 지도 말풍선 공통 */
         .leaflet-popup-content .map-popup { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
         </style>
@@ -18653,6 +18662,19 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
 
 # ---------- 탭 3: 월별 캘린더 ----------
 
+def _erp_cal_clamp_selected_day(year: int, month: int, today: date) -> date:
+    """선택일이 해당 월에 없으면 오늘(같은 월) 또는 1일로 맞춘다."""
+    cur = st.session_state.get("erp_cal_selected_day")
+    if isinstance(cur, date) and cur.year == int(year) and cur.month == int(month):
+        return cur
+    if today.year == int(year) and today.month == int(month):
+        d = today
+    else:
+        d = date(int(year), int(month), 1)
+    st.session_state["erp_cal_selected_day"] = d
+    return d
+
+
 @st.fragment
 def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     """전체 공개 월별 근무 캘린더 — 모든 유저가 모든 매장 근무 일정 열람 가능.
@@ -18683,76 +18705,37 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         _dbf_to_sn = {current_db: "내 매장"}
         store_color = {current_db: palette[0]}
 
-    # ── 필터 컨트롤 (연도 / 월 / 매장 / 직원) — 전체 유저 공개 ──
-    col_y, col_m, col_store, col_emp = st.columns([1, 1, 2, 2])
+    # ── 연·월만 상단. 매장·직원 필터는 캘린더 아래 ─────────────
+    if "erp_cal_store" not in st.session_state:
+        st.session_state["erp_cal_store"] = "전체 매장"
+    if "erp_cal_emp" not in st.session_state:
+        st.session_state["erp_cal_emp"] = "(전체 직원)"
+    col_y, col_m = st.columns([1, 1])
     with col_y:
         year = st.number_input("연도", min_value=2020, max_value=2100,
                                value=today.year, step=1, key="erp_cal_year")
     with col_m:
         month = st.number_input("월", min_value=1, max_value=12,
                                 value=today.month, step=1, key="erp_cal_month")
-    with col_store:
-        sel_store = st.selectbox("📍 매장 선택",
-                                 ["전체 매장"] + all_store_names + ["기타 (외부/행사)"],
-                                 key="erp_cal_store")
+    sel_store = st.session_state.get("erp_cal_store") or "전체 매장"
+    selected_emp = st.session_state.get("erp_cal_emp") or "(전체 직원)"
+    _store_opts = ["전체 매장"] + all_store_names + ["기타 (외부/행사)"]
+    if sel_store not in _store_opts:
+        sel_store = "전체 매장"
+        st.session_state["erp_cal_store"] = sel_store
     _sel_is_etc = (sel_store == "기타 (외부/행사)")
-    # 특정 매장 선택이어도 타 매장 직원이 해당 매장에서 근무한 기록은
-    # 그 직원 소속 db 에 work_location_name 으로 저장됨 → 전체 db 조회 후 필터링
-    target_dbs = all_dbs  # 항상 전체 조회
+    target_dbs = all_dbs
     _sel_dbf = _sn_to_dbf.get(sel_store) if (sel_store not in ("전체 매장", "기타 (외부/행사)")) else None
     show_store_tag = (sel_store == "전체 매장")
-
-    # 직원 목록: 전체/기타 → 전체 매장 직원, 특정 매장 → 해당 매장 소속 직원만
     _emp_list_dbs = [_sel_dbf] if _sel_dbf else all_dbs
     all_emps: list[str] = []
     for dbf in _emp_list_dbs:
         all_emps += _erp_get_employee_names_for_store(dbf)
     all_emps = sorted(set(all_emps))
-
-    with col_emp:
-        selected_emp = st.selectbox("👤 직원 필터",
-                                    ["(전체 직원)"] + all_emps,
-                                    key="erp_cal_emp")
-
-    # ── 월 카운터 위젯 (필터된 직원 또는 본인 기준) ──────────────
-    _ctr_target_emp = selected_emp if (selected_emp and selected_emp != "(전체 직원)") else me_name
-    _ctr_target_db = _sel_dbf if _sel_dbf else current_db
-    if _ctr_target_emp:
-        _cal_ctr = _erp_compute_monthly_remaining(_ctr_target_db, _ctr_target_emp, int(year), int(month))
-        _ct_target_h = _cal_ctr["target_min"] / 60.0
-        _ct_worked_h = _cal_ctr["worked_min"] / 60.0
-        _ct_remain_h = _cal_ctr["remaining_min"] / 60.0
-        _ct_pct = _cal_ctr["percent"]
-        _ct_weekly = round(_ct_target_h / 4.33, 1)
-        _ct_planned_min = _erp_compute_monthly_planned_minutes(
-            _ctr_target_emp, int(year), int(month),
-            fallback_db=_ctr_target_db,
-        )
-        _ct_planned_h = _ct_planned_min / 60.0
-        if _ct_pct >= 100:
-            _cc = "#E53935"
-        elif _ct_pct >= 80:
-            _cc = "#FB8C00"
-        else:
-            _cc = "#2E7D32"
-        # 계획 대비 목표 진행률 (계획이 있을 때만 표기)
-        _plan_vs_target = ""
-        if _ct_planned_h > 0 and _ct_target_h > 0:
-            _plan_pct = _ct_planned_h / _ct_target_h * 100.0
-            _plan_color = "#2E7D32" if _plan_pct >= 100 else "#FB8C00" if _plan_pct >= 80 else "#E53935"
-            _plan_vs_target = (f" <span style='color:{_plan_color}; font-size:0.82em;'>"
-                               f"(목표 대비 {_plan_pct:.0f}%)</span>")
-        st.markdown(
-            f"<div style='margin:6px 0 10px 0; padding:8px 12px; background:#FAFAFA;"
-            f" border-left:4px solid {_cc}; border-radius:4px; font-size:0.88rem;'>"
-            f"⏱️ <b>{_ctr_target_emp}</b> · {int(year)}년 {int(month)}월 카운터 &nbsp;|&nbsp; "
-            f"목표 <b>{_ct_target_h:.0f}h</b> (주 {_ct_weekly:g}h) "
-            f"&nbsp;|&nbsp; 계획 <b>{_ct_planned_h:.1f}h</b>{_plan_vs_target} "
-            f"&nbsp;|&nbsp; 누적 <b>{_ct_worked_h:.1f}h</b> ({_ct_pct:g}%) "
-            f"&nbsp;|&nbsp; 잔여 <b style='color:{_cc}; font-size:1.1rem;'>{_ct_remain_h:+.1f}h</b>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+    if selected_emp not in (["(전체 직원)"] + all_emps):
+        selected_emp = "(전체 직원)"
+        st.session_state["erp_cal_emp"] = selected_emp
+    _erp_cal_clamp_selected_day(int(year), int(month), today)
 
     # ── 데이터 로드 ─────────────────────────────────────────────
     last_day = _cal.monthrange(int(year), int(month))[1]
@@ -18977,73 +18960,16 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             if not _emp_n or (_me_aliases and _emp_n not in _me_aliases):
                 continue
             _editable_shifts.append(_s)
-    if me_name:
-        with st.expander("✏️ 정기 근무시간 수정 (팝업)", expanded=False):
-            if not _editable_shifts:
-                st.info("이번 달 등록된 본인 정기 근무일이 없습니다. "
-                        "정기 근무일정은 [정기근무일정] 탭에서 먼저 등록해 주세요.")
-            else:
-                st.caption("아래에서 근무일을 선택하고 [편집] 버튼을 누르면 팝업 창에서 바로 수정할 수 있습니다.")
-                _qe_options: list[tuple[int, str]] = []
-                for _s in _editable_shifts:
-                    _sid = int(_s.get("id") or 0)
-                    _d = str(_s.get("shift_date") or "")[:10]
-                    _emp = _s.get("employee_name") or ""
-                    _ss = str(_s.get("shift_start") or "")[:5]
-                    _ee = str(_s.get("shift_end") or "")[:5]
-                    _wl = (_s.get("work_location_name") or "").strip()
-                    _eff_dbf_q = _shift_effective_dbf(_s) or _s.get("_dbf") or current_db
-                    _loc_lbl = _wl if _wl else (_dbf_to_sn.get(_eff_dbf_q, "") or "")
-                    _label = f"{_d} · {_emp} · {_ss}~{_ee}" + (f" · {_loc_lbl}" if _loc_lbl else "")
-                    _qe_options.append((_sid, _label))
-                # ID 자체를 selectbox 값으로 사용 (레이블은 format_func 로 표시).
-                # 문자열 레이블을 되짚어 ID를 찾던 이전 방식에서 발생하던
-                # "다른 날짜를 골라도 이전 근무일이 팝업에 뜨는" 버그를 원천 차단.
-                _qe_id_list = [_sid for _sid, _ in _qe_options]
-                _qe_id_to_label = {_sid: _lbl for _sid, _lbl in _qe_options}
-                _qe_pick_id = st.selectbox(
-                    "근무일 선택",
-                    options=_qe_id_list,
-                    format_func=lambda _sid: _qe_id_to_label.get(_sid, str(_sid)),
-                    key="erp_calendar_quick_edit_pick_id",
-                    index=0,
-                )
-                _qe_pick_id = int(_qe_pick_id or 0)
-                if st.button("✏️ 편집 팝업 열기", key="erp_calendar_quick_edit_open", type="primary"):
-                    if _qe_pick_id:
-                        st.session_state["erp_shift_edit_id"] = _qe_pick_id
-                        st.rerun(scope="fragment")
+    _adj_dialog = None
+    if me_name and hasattr(st, "dialog"):
+        try:
+            _dlg_dec = st.dialog("🧑‍💼 근무시간 관리 · 신청 등록", width="large")
+        except TypeError:
+            _dlg_dec = st.dialog("🧑‍💼 근무시간 관리 · 신청 등록")
 
-    # ── ➕➖ 추가근무·휴가신청 팝업 트리거 ─────────────────────────
-    # 근무시간 관리 탭의 '신청 등록' 폼을 캘린더에서 바로 열 수 있는 팝업으로 재사용.
-    # superadmin 은 me_name 이 비어 있으므로 팝업 대상에서 제외.
-    # 팝업 open/close 상태는 st.dialog 데코레이터가 내부적으로 관리하므로
-    # session_state 플래그 없이 버튼 클릭 시 즉시 호출한다.
-    if me_name:
-        if hasattr(st, "dialog"):
-            try:
-                _dlg_dec = st.dialog("🧑‍💼 근무시간 관리 · 신청 등록", width="large")
-            except TypeError:
-                _dlg_dec = st.dialog("🧑‍💼 근무시간 관리 · 신청 등록")
-
-            @_dlg_dec
-            def _adj_dialog():
-                _erp_render_my_adj_form(current_db, role, me_name, today)
-        else:
-            _adj_dialog = None
-
-        with st.expander("➕➖ 추가근무·휴가신청 (팝업)", expanded=False):
-            st.caption("추가근무·휴가 등 신청을 팝업 창에서 바로 등록할 수 있습니다.")
-            if st.button("📤 신청 등록 팝업 열기", key="erp_calendar_adj_btn", type="primary"):
-                if _adj_dialog is not None:
-                    _adj_dialog()
-                else:
-                    st.info("이 Streamlit 버전은 팝업(st.dialog) 을 지원하지 않습니다. "
-                            "'추가근무·휴무 신청' 탭에서 등록해 주세요.")
-
-    # ── 📥 근무시간 상세 엑셀 다운로드 (카운터 ↔ 캘린더 검증용) ──────
-    _erp_render_attendance_excel_export(current_db, role, me_name, all_dbs,
-                                        int(year), int(month))
+        @_dlg_dec
+        def _adj_dialog():
+            _erp_render_my_adj_form(current_db, role, me_name, today)
 
     # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
     cal_obj = _cal.Calendar(firstweekday=6)
@@ -19051,7 +18977,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     dow_labels = [("일", "#E53935"), ("월", "#37474F"), ("화", "#37474F"),
                   ("수", "#37474F"), ("목", "#37474F"), ("금", "#37474F"), ("토", "#1565C0")]
 
-    html = ["<table style='width:100%; border-collapse:collapse; font-size:0.82rem;'>"]
+    html = ["<table class='erp-cal-wrap' style='width:100%; border-collapse:collapse; font-size:0.82rem;'>"]
     html.append("<thead><tr>")
     for lbl, lc in dow_labels:
         html.append(f"<th style='border:1px solid #ddd; padding:6px; background:#F5F5F5; color:{lc};'>{lbl}</th>")
@@ -19075,6 +19001,18 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                               ("#1565C0" if _cell_date.weekday() == 5 else "#37474F")
             _hol_tag = " 🔴" if (_cell_date in _ERP_KR_HOLIDAYS and _cell_date.weekday() < 5) else ""
             cell.append(f"<div style='font-weight:bold; font-size:0.88rem; color:{day_label_color};'>{d_num}{_hol_tag}</div>")
+            _n_cell = (
+                len(shifts_by_date.get(d_iso, []))
+                + len(logs_by_date.get(d_iso, []))
+                + len(events_by_date.get(d_iso, []))
+            )
+            if _n_cell:
+                cell.append(
+                    f"<div class='erp-cal-sum'><span class='erp-cal-dot'></span>{_n_cell}</div>"
+                )
+            else:
+                cell.append("<div class='erp-cal-sum'></div>")
+            cell.append("<div class='erp-cal-detail'>")
             if d_iso in shortage_dates:
                 _short_stores = shortage_dates[d_iso]
                 _short_label = " · ".join(_short_stores) if _short_stores else "인원부족"
@@ -19250,11 +19188,186 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     f" <span style='font-size:0.68rem; color:{sc}; font-weight:600;'>{emp}</span>"
                     f"{_time_txt}{sn_tag}{_lg_note_html}</div>"
                 )
-            cell.append("</td>")
+            cell.append("</div></td>")
             html.append("".join(cell))
         html.append("</tr>")
     html.append("</tbody></table>")
     st.markdown("".join(html), unsafe_allow_html=True)
+
+    # ── 당일 일정 (기본: 오늘) ────────────────────────────────
+    _sel_day = st.date_input(
+        "선택한 날",
+        key="erp_cal_selected_day",
+        min_value=date(int(year), int(month), 1),
+        max_value=date(int(year), int(month), last_day),
+    )
+    if not isinstance(_sel_day, date):
+        _sel_day = date(int(year), int(month), 1)
+    _sel_iso = _sel_day.isoformat()
+    _dow_names = ["월", "화", "수", "목", "금", "토", "일"]
+    _sel_dow = _dow_names[_sel_day.weekday()]
+    st.markdown(f"**{_sel_day.month}월 {_sel_day.day}일 ({_sel_dow}) 일정**")
+    _day_shifts = list(shifts_by_date.get(_sel_iso, []))
+    _day_logs = list(logs_by_date.get(_sel_iso, []))
+    _day_evs = list(events_by_date.get(_sel_iso, []))
+    if not (_day_shifts or _day_logs or _day_evs):
+        st.caption("이 날 등록된 일정이 없습니다.")
+    for _ev in _day_evs:
+        st.markdown(f"📌 {( _ev.get('title') or '').strip()}")
+    for _i, _sh in enumerate(_day_shifts):
+        _emp = (_sh.get("employee_name") or "").strip()
+        _ss = str(_sh.get("shift_start") or "")[:5]
+        _ee = str(_sh.get("shift_end") or "")[:5]
+        _wl = (_sh.get("work_location_name") or "").strip()
+        _lbl = f"{_emp}  {_ss}~{_ee}" + (f"  · {_wl}" if _wl else "")
+        _can_edit = bool(_sh.get("id")) and (not _me_aliases or _emp in _me_aliases)
+        if _can_edit:
+            _c_l, _c_b = st.columns([4, 1])
+            _c_l.write(_lbl)
+            if _c_b.button("수정", key=f"erp_cal_day_edit_{_sh.get('id')}_{_i}"):
+                st.session_state["erp_shift_edit_id"] = int(_sh.get("id") or 0)
+                st.rerun(scope="fragment")
+        else:
+            st.write(_lbl)
+    for _lg in _day_logs:
+        _wt = _lg.get("work_type") or "정상"
+        _emp = _lg.get("employee_name") or ""
+        _st = str(_lg.get("start_time") or "")[:5]
+        _et = str(_lg.get("end_time") or "")[:5]
+        _tm = f" {_st}~{_et}" if _st and _et else ""
+        st.write(f"{_wt}  {_emp}{_tm}")
+
+    if me_name:
+        st.markdown('<div class="erp-cal-plus-bar">', unsafe_allow_html=True)
+        _p1, _p2 = st.columns(2)
+        with _p1:
+            if st.button("➕ 추가근무·휴가", type="primary", width="stretch", key="erp_cal_plus_adj"):
+                st.session_state["my_new_date"] = _sel_day
+                if _adj_dialog is not None:
+                    _adj_dialog()
+                else:
+                    st.info("팝업을 지원하지 않는 환경입니다. 아래 expander에서 등록해 주세요.")
+        with _p2:
+            _day_mine = [
+                s for s in _day_shifts
+                if s.get("id") and (not _me_aliases or (s.get("employee_name") or "").strip() in _me_aliases)
+            ]
+            if st.button("✏️ 정기근무 수정", width="stretch", key="erp_cal_plus_shift"):
+                if len(_day_mine) == 1:
+                    st.session_state["erp_shift_edit_id"] = int(_day_mine[0].get("id") or 0)
+                    st.rerun(scope="fragment")
+                elif len(_day_mine) > 1:
+                    st.session_state["erp_cal_plus_pick"] = True
+                else:
+                    st.toast("이 날 수정할 본인 정기근무가 없습니다.", icon="ℹ️")
+        if st.session_state.get("erp_cal_plus_pick") and len(_day_mine) > 1:
+            _pick_map = {
+                int(s.get("id") or 0): (
+                    f"{str(s.get('shift_start') or '')[:5]}~{str(s.get('shift_end') or '')[:5]} "
+                    f"{s.get('employee_name') or ''}"
+                )
+                for s in _day_mine if s.get("id")
+            }
+            _pid = st.selectbox(
+                "수정할 근무",
+                options=list(_pick_map.keys()),
+                format_func=lambda i: _pick_map.get(i, str(i)),
+                key="erp_cal_plus_shift_id",
+            )
+            if st.button("편집 팝업 열기", key="erp_cal_plus_shift_go", type="primary"):
+                st.session_state["erp_shift_edit_id"] = int(_pid or 0)
+                st.session_state.pop("erp_cal_plus_pick", None)
+                st.rerun(scope="fragment")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── 매장·직원 필터 + 월 카운터 (캘린더 아래) ────────────────
+    col_store, col_emp = st.columns([1, 1])
+    with col_store:
+        st.selectbox("📍 매장 선택", _store_opts, key="erp_cal_store")
+    with col_emp:
+        st.selectbox("👤 직원 필터", ["(전체 직원)"] + all_emps, key="erp_cal_emp")
+    _ctr_target_emp = selected_emp if (selected_emp and selected_emp != "(전체 직원)") else me_name
+    _ctr_target_db = _sel_dbf if _sel_dbf else current_db
+    if _ctr_target_emp:
+        _cal_ctr = _erp_compute_monthly_remaining(_ctr_target_db, _ctr_target_emp, int(year), int(month))
+        _ct_target_h = _cal_ctr["target_min"] / 60.0
+        _ct_worked_h = _cal_ctr["worked_min"] / 60.0
+        _ct_remain_h = _cal_ctr["remaining_min"] / 60.0
+        _ct_pct = _cal_ctr["percent"]
+        _ct_weekly = round(_ct_target_h / 4.33, 1)
+        _ct_planned_min = _erp_compute_monthly_planned_minutes(
+            _ctr_target_emp, int(year), int(month),
+            fallback_db=_ctr_target_db,
+        )
+        _ct_planned_h = _ct_planned_min / 60.0
+        if _ct_pct >= 100:
+            _cc = "#E53935"
+        elif _ct_pct >= 80:
+            _cc = "#FB8C00"
+        else:
+            _cc = "#2E7D32"
+        _plan_vs_target = ""
+        if _ct_planned_h > 0 and _ct_target_h > 0:
+            _plan_pct = _ct_planned_h / _ct_target_h * 100.0
+            _plan_color = "#2E7D32" if _plan_pct >= 100 else "#FB8C00" if _plan_pct >= 80 else "#E53935"
+            _plan_vs_target = (f" <span style='color:{_plan_color}; font-size:0.82em;'>"
+                               f"(목표 대비 {_plan_pct:.0f}%)</span>")
+        st.markdown(
+            f"<div style='margin:6px 0 10px 0; padding:8px 12px; background:#FAFAFA;"
+            f" border-left:4px solid {_cc}; border-radius:4px; font-size:0.88rem;'>"
+            f"⏱️ <b>{_ctr_target_emp}</b> · {int(year)}년 {int(month)}월 카운터 &nbsp;|&nbsp; "
+            f"목표 <b>{_ct_target_h:.0f}h</b> (주 {_ct_weekly:g}h) "
+            f"&nbsp;|&nbsp; 계획 <b>{_ct_planned_h:.1f}h</b>{_plan_vs_target} "
+            f"&nbsp;|&nbsp; 누적 <b>{_ct_worked_h:.1f}h</b> ({_ct_pct:g}%) "
+            f"&nbsp;|&nbsp; 잔여 <b style='color:{_cc}; font-size:1.1rem;'>{_ct_remain_h:+.1f}h</b>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    if me_name:
+        with st.expander("✏️ 정기 근무시간 수정 (팝업)", expanded=False):
+            if not _editable_shifts:
+                st.info("이번 달 등록된 본인 정기 근무일이 없습니다. "
+                        "정기 근무일정은 [정기근무일정] 탭에서 먼저 등록해 주세요.")
+            else:
+                st.caption("아래에서 근무일을 선택하고 [편집] 버튼을 누르면 팝업 창에서 바로 수정할 수 있습니다.")
+                _qe_options: list[tuple[int, str]] = []
+                for _s in _editable_shifts:
+                    _sid = int(_s.get("id") or 0)
+                    _d = str(_s.get("shift_date") or "")[:10]
+                    _emp = _s.get("employee_name") or ""
+                    _ss = str(_s.get("shift_start") or "")[:5]
+                    _ee = str(_s.get("shift_end") or "")[:5]
+                    _wl = (_s.get("work_location_name") or "").strip()
+                    _eff_dbf_q = _shift_effective_dbf(_s) or _s.get("_dbf") or current_db
+                    _loc_lbl = _wl if _wl else (_dbf_to_sn.get(_eff_dbf_q, "") or "")
+                    _label = f"{_d} · {_emp} · {_ss}~{_ee}" + (f" · {_loc_lbl}" if _loc_lbl else "")
+                    _qe_options.append((_sid, _label))
+                _qe_id_list = [_sid for _sid, _ in _qe_options]
+                _qe_id_to_label = {_sid: _lbl for _sid, _lbl in _qe_options}
+                _qe_pick_id = st.selectbox(
+                    "근무일 선택",
+                    options=_qe_id_list,
+                    format_func=lambda _sid: _qe_id_to_label.get(_sid, str(_sid)),
+                    key="erp_calendar_quick_edit_pick_id",
+                    index=0,
+                )
+                _qe_pick_id = int(_qe_pick_id or 0)
+                if st.button("✏️ 편집 팝업 열기", key="erp_calendar_quick_edit_open", type="primary"):
+                    if _qe_pick_id:
+                        st.session_state["erp_shift_edit_id"] = _qe_pick_id
+                        st.rerun(scope="fragment")
+        with st.expander("➕➖ 추가근무·휴가신청 (팝업)", expanded=False):
+            st.caption("추가근무·휴가 등 신청을 팝업 창에서 바로 등록할 수 있습니다.")
+            if st.button("📤 신청 등록 팝업 열기", key="erp_calendar_adj_btn", type="primary"):
+                st.session_state["my_new_date"] = _sel_day
+                if _adj_dialog is not None:
+                    _adj_dialog()
+                else:
+                    st.info("이 Streamlit 버전은 팝업(st.dialog) 을 지원하지 않습니다. "
+                            "'추가근무·휴무 신청' 탭에서 등록해 주세요.")
+    _erp_render_attendance_excel_export(current_db, role, me_name, all_dbs,
+                                        int(year), int(month))
 
     # ── ✏️ 캘린더 배지 클릭 → 즉시 편집 팝업 ─────────────────────
     def _render_shift_quick_edit(sh: dict) -> None:
@@ -23280,13 +23393,15 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
     #  - early_leave (-): 실제 퇴근 시각만 입력 → shift.end 와의 차이를 자동 계산
     _needs_timeslot = new_kind in ("overtime", "meeting") and new_sign == "+"
     _is_early_leave = new_kind == "early_leave"
+    _sel_cal = st.session_state.get("erp_cal_selected_day")
+    _adj_date_default = _sel_cal if isinstance(_sel_cal, date) else today
 
     with st.form("my_new_adj_form", clear_on_submit=True):
         if _needs_timeslot:
             st.caption("📌 추가근무·회의는 실제 시간대를 입력하면 캘린더에 자동 반영됩니다.")
             ts1, ts2, ts3, ts4 = st.columns([1.2, 1, 1, 2])
             with ts1:
-                new_date = st.date_input("날짜", value=today, key="my_new_date")
+                new_date = st.date_input("날짜", value=_adj_date_default, key="my_new_date")
             with ts2:
                 new_start = _erp_time_input_30min("시작 시간", value=dt_time(18, 0), key="my_new_start")
             with ts3:
@@ -23306,7 +23421,7 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
             st.caption("📌 조기퇴근은 실제 퇴근 시각만 입력하면 근무일정 종료시각과의 차이가 자동으로 계산됩니다.")
             el1, el2 = st.columns([1.2, 1])
             with el1:
-                new_date = st.date_input("퇴근일", value=today, key="my_new_date")
+                new_date = st.date_input("퇴근일", value=_adj_date_default, key="my_new_date")
             with el2:
                 new_end = _erp_time_input_30min("실제 퇴근 시각", value=dt_time(15, 0), key="my_new_end")
             _peek_ss, _peek_ee = _erp_shift_bounds_for_date(current_db, me_name, new_date)
@@ -23324,7 +23439,7 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
         else:
             gc1, gc2, gc3 = st.columns([1, 1, 3])
             with gc1:
-                new_date = st.date_input("대상 일자", value=today, key="my_new_date")
+                new_date = st.date_input("대상 일자", value=_adj_date_default, key="my_new_date")
             with gc2:
                 new_hours = st.number_input("시간(h)", min_value=0.25, max_value=744.0, step=0.5,
                                             value=1.0, key="my_new_h")
