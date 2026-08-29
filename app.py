@@ -179,12 +179,33 @@ def _inject_mobile_css():
             .erp-cal-sum { display: block !important; text-align: center; margin-top: 2px; font-size: 0.7rem; color: #6A1B9A; font-weight: 600; }
             .erp-cal-wrap td { height: auto !important; min-height: 44px !important; min-width: 0 !important; padding: 4px 2px !important; }
             .erp-cal-plus-bar { position: sticky; bottom: 0; z-index: 20; padding: 8px 0 12px 0; background: #fff; }
+            /* 근무 캘린더: 모바일에서도 7열 유지 (전역 column 세로 배치 예외) */
+            .st-key-erp_cal_grid [data-testid="column"] {
+                min-width: 0 !important;
+                width: 14.28% !important;
+                flex: 1 1 0 !important;
+            }
+            .st-key-erp_cal_grid [data-testid="stHorizontalBlock"] > div {
+                flex: 1 1 0 !important;
+                min-width: 0 !important;
+                max-width: none !important;
+            }
+            .st-key-erp_cal_grid .stButton > button {
+                min-height: 36px !important;
+                padding: 0.15rem 0 !important;
+                font-size: 0.8rem !important;
+                line-height: 1.1 !important;
+            }
+            .st-key-erp_cal_grid [data-testid="stVerticalBlock"] > div { margin-bottom: 0.08rem !important; }
         }
         @media (min-width: 769px) {
             .erp-cal-plus-bar { display: none; }
         }
         .erp-cal-sum { display: none; }
         .erp-cal-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #7C3AED; margin-right: 3px; vertical-align: middle; }
+        .st-key-erp_cal_grid [data-testid="stHorizontalBlock"] > div:first-child .stButton button { color: #E53935 !important; }
+        .st-key-erp_cal_grid [data-testid="stHorizontalBlock"] > div:last-child .stButton button { color: #1565C0 !important; }
+        .erp-cal-cell-on { background: #E3F2FD; border-radius: 4px; }
         /* 지도 말풍선 공통 */
         .leaflet-popup-content .map-popup { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
         </style>
@@ -18971,36 +18992,26 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         def _adj_dialog():
             _erp_render_my_adj_form(current_db, role, me_name, today)
 
-    # ── 캘린더 HTML 렌더링 ──────────────────────────────────────
+    # ── 클릭 가능한 캘린더 (칸 = 버튼, fragment만 재실행) ─────
     cal_obj = _cal.Calendar(firstweekday=6)
     weeks = cal_obj.monthdayscalendar(int(year), int(month))
     dow_labels = [("일", "#E53935"), ("월", "#37474F"), ("화", "#37474F"),
                   ("수", "#37474F"), ("목", "#37474F"), ("금", "#37474F"), ("토", "#1565C0")]
+    _sel_day = st.session_state.get("erp_cal_selected_day")
+    if not isinstance(_sel_day, date):
+        _sel_day = _erp_cal_clamp_selected_day(int(year), int(month), today)
+    _sel_iso = _sel_day.isoformat()
 
-    html = ["<table class='erp-cal-wrap' style='width:100%; border-collapse:collapse; font-size:0.82rem;'>"]
-    html.append("<thead><tr>")
-    for lbl, lc in dow_labels:
-        html.append(f"<th style='border:1px solid #ddd; padding:6px; background:#F5F5F5; color:{lc};'>{lbl}</th>")
-    html.append("</tr></thead><tbody>")
-
+    cell_html: dict[int, str] = {}
     for week in weeks:
-        html.append("<tr>")
         for d_num in week:
             if d_num == 0:
-                html.append("<td style='border:1px solid #eee; height:115px; background:#FAFAFA;'></td>")
                 continue
             d_iso = date(int(year), int(month), d_num).isoformat()
             is_today = (d_iso == today.isoformat())
             bcolor = "#E53935" if d_iso in shortage_dates else ("#FB8C00" if d_iso in overstaff_dates else ("#1976D2" if is_today else "#ddd"))
-            bw = "2px" if (d_iso in shortage_dates or d_iso in overstaff_dates or is_today) else "1px"
-            bg = "#E3F2FD" if is_today else ("white")
-            cell = [f"<td style='border:{bw} solid {bcolor}; vertical-align:top; padding:4px; height:115px; min-width:90px; background:{bg};'>"]
-            _cell_date = date(int(year), int(month), d_num)
-            _is_holiday_cell = _erp_is_weekend_or_holiday(_cell_date)
-            day_label_color = "#E53935" if (_cell_date.weekday() == 6 or _cell_date in _ERP_KR_HOLIDAYS) else \
-                              ("#1565C0" if _cell_date.weekday() == 5 else "#37474F")
-            _hol_tag = " 🔴" if (_cell_date in _ERP_KR_HOLIDAYS and _cell_date.weekday() < 5) else ""
-            cell.append(f"<div style='font-weight:bold; font-size:0.88rem; color:{day_label_color};'>{d_num}{_hol_tag}</div>")
+            _on = " erp-cal-cell-on" if d_iso == _sel_iso else ""
+            cell = [f"<div class='erp-cal-cell{_on}' style='border-left:3px solid {bcolor}; padding:2px 2px 4px 4px;'>"]
             _n_cell = (
                 len(shifts_by_date.get(d_iso, []))
                 + len(logs_by_date.get(d_iso, []))
@@ -19188,24 +19199,41 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                     f" <span style='font-size:0.68rem; color:{sc}; font-weight:600;'>{emp}</span>"
                     f"{_time_txt}{sn_tag}{_lg_note_html}</div>"
                 )
-            cell.append("</div></td>")
-            html.append("".join(cell))
-        html.append("</tr>")
-    html.append("</tbody></table>")
-    st.markdown("".join(html), unsafe_allow_html=True)
+            cell.append("</div></div>")
+            cell_html[d_num] = "".join(cell)
 
-    # ── 당일 일정 (기본: 오늘) ────────────────────────────────
-    _sel_day = st.date_input(
-        "선택한 날",
-        key="erp_cal_selected_day",
-        min_value=date(int(year), int(month), 1),
-        max_value=date(int(year), int(month), last_day),
-    )
-    if not isinstance(_sel_day, date):
-        _sel_day = date(int(year), int(month), 1)
-    _sel_iso = _sel_day.isoformat()
+    with st.container(key="erp_cal_grid"):
+        _hdr = st.columns(7)
+        for _hi, (_lbl, _lc) in enumerate(dow_labels):
+            _hdr[_hi].markdown(
+                f"<div style='text-align:center;font-weight:600;color:{_lc};font-size:0.78rem;'>{_lbl}</div>",
+                unsafe_allow_html=True,
+            )
+        for week in weeks:
+            _wcols = st.columns(7)
+            for _ci, d_num in enumerate(week):
+                with _wcols[_ci]:
+                    if d_num == 0:
+                        st.markdown("<div style='min-height:36px;'></div>", unsafe_allow_html=True)
+                        continue
+                    _cd = date(int(year), int(month), d_num)
+                    _hol = "🔴" if (_cd in _ERP_KR_HOLIDAYS and _cd.weekday() < 5) else ""
+                    _btype = "primary" if _cd == _sel_day else ("secondary" if _cd == today else "tertiary")
+                    if st.button(
+                        f"{d_num}{_hol}",
+                        key=f"erp_cal_pick_{int(year)}_{int(month)}_{d_num}",
+                        type=_btype,
+                        width="stretch",
+                    ):
+                        st.session_state["erp_cal_selected_day"] = _cd
+                        st.session_state.pop("erp_cal_plus_pick", None)
+                        st.rerun(scope="fragment")
+                    st.markdown(cell_html.get(d_num, ""), unsafe_allow_html=True)
+
+    # ── 당일 일정 (칸을 누르면 여기가 바뀜) ──────────────────
     _dow_names = ["월", "화", "수", "목", "금", "토", "일"]
     _sel_dow = _dow_names[_sel_day.weekday()]
+    st.caption("날짜를 누르면 아래에 일정이 표시됩니다.")
     st.markdown(f"**{_sel_day.month}월 {_sel_day.day}일 ({_sel_dow}) 일정**")
     _day_shifts = list(shifts_by_date.get(_sel_iso, []))
     _day_logs = list(logs_by_date.get(_sel_iso, []))
