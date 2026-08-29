@@ -176,7 +176,7 @@ def _inject_mobile_css():
             /* 지도 말풍선: 모바일 가독성 */
             .leaflet-popup-content .map-popup { font-size: 14px !important; line-height: 1.4 !important; max-width: min(280px, 85vw) !important; padding: 6px 8px !important; }
             .erp-cal-detail { display: none !important; }
-            .erp-cal-sum { display: block !important; text-align: center; margin-top: 2px; font-size: 0.7rem; color: #6A1B9A; font-weight: 600; }
+            .erp-cal-sum { display: none !important; }
             .erp-cal-wrap td { height: auto !important; min-height: 44px !important; min-width: 0 !important; padding: 4px 2px !important; }
             .erp-cal-plus-bar { position: sticky; bottom: 0; z-index: 20; padding: 8px 0 12px 0; background: #fff; }
             /* 근무 캘린더: 모바일에서도 7열 유지 (전역 column 세로 배치 예외) */
@@ -190,13 +190,31 @@ def _inject_mobile_css():
                 min-width: 0 !important;
                 max-width: none !important;
             }
+            .st-key-erp_cal_grid .stButton { margin-bottom: 0 !important; }
             .st-key-erp_cal_grid .stButton > button {
-                min-height: 36px !important;
-                padding: 0.15rem 0 !important;
-                font-size: 0.8rem !important;
-                line-height: 1.1 !important;
+                min-height: 0 !important;
+                height: auto !important;
+                padding: 3px 0 2px 0 !important;
+                font-size: 1.15rem !important;
+                font-weight: 700 !important;
+                line-height: 1.15 !important;
+                white-space: pre-line !important;
             }
-            .st-key-erp_cal_grid [data-testid="stVerticalBlock"] > div { margin-bottom: 0.08rem !important; }
+            .st-key-erp_cal_grid [data-testid="stVerticalBlock"] > div { margin-bottom: 0 !important; }
+            .st-key-erp_cal_grid [data-testid="stMarkdownContainer"]:has(.erp-cal-cell) {
+                display: none !important;
+                height: 0 !important;
+                margin: 0 !important;
+                overflow: hidden !important;
+            }
+            .erp-cal-out {
+                color: #BDBDBD !important;
+                text-align: center;
+                font-size: 1.05rem;
+                font-weight: 600;
+                line-height: 1.15;
+                padding: 4px 0 2px 0;
+            }
         }
         @media (min-width: 769px) {
             .erp-cal-plus-bar { display: none; }
@@ -206,6 +224,8 @@ def _inject_mobile_css():
         .st-key-erp_cal_grid [data-testid="stHorizontalBlock"] > div:first-child .stButton button { color: #E53935 !important; }
         .st-key-erp_cal_grid [data-testid="stHorizontalBlock"] > div:last-child .stButton button { color: #1565C0 !important; }
         .erp-cal-cell-on { background: #E3F2FD; border-radius: 4px; }
+        .erp-cal-out { color: #BDBDBD; text-align: center; font-size: 0.95rem; font-weight: 600; padding: 6px 0; }
+        .st-key-erp_cal_grid .stButton > button { white-space: pre-line; }
         /* 지도 말풍선 공통 */
         .leaflet-popup-content .map-popup { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
         </style>
@@ -18994,7 +19014,7 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
 
     # ── 클릭 가능한 캘린더 (칸 = 버튼, fragment만 재실행) ─────
     cal_obj = _cal.Calendar(firstweekday=6)
-    weeks = cal_obj.monthdayscalendar(int(year), int(month))
+    weeks = cal_obj.monthdatescalendar(int(year), int(month))
     dow_labels = [("일", "#E53935"), ("월", "#37474F"), ("화", "#37474F"),
                   ("수", "#37474F"), ("목", "#37474F"), ("금", "#37474F"), ("토", "#1565C0")]
     _sel_day = st.session_state.get("erp_cal_selected_day")
@@ -19003,11 +19023,23 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     _sel_iso = _sel_day.isoformat()
 
     cell_html: dict[int, str] = {}
+    day_people: dict[int, int] = {}
     for week in weeks:
-        for d_num in week:
-            if d_num == 0:
+        for _cd in week:
+            if _cd.month != int(month) or _cd.year != int(year):
                 continue
-            d_iso = date(int(year), int(month), d_num).isoformat()
+            d_num = _cd.day
+            d_iso = _cd.isoformat()
+            _who: set[str] = set()
+            for _s in shifts_by_date.get(d_iso, []):
+                _en = (_s.get("employee_name") or "").strip()
+                if _en:
+                    _who.add(_en)
+            for _l in logs_by_date.get(d_iso, []):
+                _en = (_l.get("employee_name") or "").strip()
+                if _en:
+                    _who.add(_en)
+            day_people[d_num] = len(_who)
             is_today = (d_iso == today.isoformat())
             bcolor = "#E53935" if d_iso in shortage_dates else ("#FB8C00" if d_iso in overstaff_dates else ("#1976D2" if is_today else "#ddd"))
             _on = " erp-cal-cell-on" if d_iso == _sel_iso else ""
@@ -19211,16 +19243,20 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
             )
         for week in weeks:
             _wcols = st.columns(7)
-            for _ci, d_num in enumerate(week):
+            for _ci, _cd in enumerate(week):
                 with _wcols[_ci]:
-                    if d_num == 0:
-                        st.markdown("<div style='min-height:36px;'></div>", unsafe_allow_html=True)
+                    if _cd.month != int(month) or _cd.year != int(year):
+                        st.markdown(
+                            f"<div class='erp-cal-out'>{_cd.day}</div>",
+                            unsafe_allow_html=True,
+                        )
                         continue
-                    _cd = date(int(year), int(month), d_num)
+                    d_num = _cd.day
                     _hol = "🔴" if (_cd in _ERP_KR_HOLIDAYS and _cd.weekday() < 5) else ""
+                    _n_ppl = int(day_people.get(d_num, 0) or 0)
                     _btype = "primary" if _cd == _sel_day else ("secondary" if _cd == today else "tertiary")
                     if st.button(
-                        f"{d_num}{_hol}",
+                        f"{d_num}{_hol}\n{_n_ppl}명",
                         key=f"erp_cal_pick_{int(year)}_{int(month)}_{d_num}",
                         type=_btype,
                         width="stretch",
