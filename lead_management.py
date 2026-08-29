@@ -400,6 +400,17 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _patch_cached_lead(lead_id: int, **fields: Any) -> None:
+    """인라인 저장 후 목록 캐시만 갱신. 전체 재조회하지 않는다."""
+    rows = st.session_state.get(_LEAD_LIST_KEY)
+    if not isinstance(rows, list):
+        return
+    for l in rows:
+        if l.get("id") == lead_id:
+            l.update(fields)
+            break
+
+
 def _inline_save_type(lead_id: int, key: str) -> None:
     """리드 목록 inline selectbox — customer_type 즉시 저장."""
     new_val = st.session_state.get(key)
@@ -414,6 +425,7 @@ def _inline_save_type(lead_id: int, key: str) -> None:
             "customer_type": new_val,
             "updated_at": _now_iso(),
         }).eq("id", lead_id).execute()
+        _patch_cached_lead(lead_id, customer_type=new_val)
         st.toast(f"유형 저장: {CUSTOMER_TYPE_INLINE_DISPLAY.get(new_val, new_val)}", icon="✅")
     except Exception as e:
         _emsg = str(e)
@@ -437,7 +449,28 @@ def _inline_save_stage(lead_id: int, key: str) -> None:
             "lead_stage": new_val,
             "updated_at": _now_iso(),
         }).eq("id", lead_id).execute()
+        _patch_cached_lead(lead_id, lead_stage=new_val)
         st.toast(f"상태 저장: {LEAD_STAGES.get(new_val, new_val)}", icon="✅")
+    except Exception as e:
+        st.toast(f"❌ 저장 실패: {str(e)[:60]}", icon="⚠️")
+
+
+def _inline_save_source(lead_id: int, key: str) -> None:
+    """리드 목록 inline selectbox — lead_source 즉시 저장."""
+    new_val = st.session_state.get(key)
+    if not new_val:
+        return
+    supa = _supa()
+    if not supa:
+        st.toast("❌ DB 연결 실패", icon="⚠️")
+        return
+    try:
+        supa.table("app_leads").update({
+            "lead_source": new_val,
+            "updated_at": _now_iso(),
+        }).eq("id", lead_id).execute()
+        _patch_cached_lead(lead_id, lead_source=new_val)
+        st.toast(f"유입경로 저장: {LEAD_SOURCE_LABELS.get(new_val, new_val)}", icon="✅")
     except Exception as e:
         st.toast(f"❌ 저장 실패: {str(e)[:60]}", icon="⚠️")
 
@@ -459,6 +492,7 @@ def _inline_save_store(lead_id: int, key: str) -> None:
             "store_name": save_val,
             "updated_at": _now_iso(),
         }).eq("id", lead_id).execute()
+        _patch_cached_lead(lead_id, store_name=save_val)
         st.toast(f"매장 저장: {save_val}", icon="✅")
     except Exception as e:
         st.toast(f"❌ 매장 저장 실패: {str(e)[:60]}", icon="⚠️")
@@ -479,6 +513,7 @@ def _inline_save_emps(lead_id: int, key: str, emp_name_to_id: dict[str, int]) ->
             "assigned_employee_id": first_id,
             "updated_at": _now_iso(),
         }).eq("id", lead_id).execute()
+        _patch_cached_lead(lead_id, employee_names=names_str, assigned_employee_id=first_id)
         st.toast(f"담당자 저장: {names_str or '미배정'}", icon="✅")
     except Exception as e:
         _emsg = str(e)
@@ -489,6 +524,7 @@ def _inline_save_emps(lead_id: int, key: str, emp_name_to_id: dict[str, int]) ->
                     "assigned_employee_id": first_id,
                     "updated_at": _now_iso(),
                 }).eq("id", lead_id).execute()
+                _patch_cached_lead(lead_id, assigned_employee_id=first_id)
                 st.toast("⚠ 1명만 저장됨 (SUPABASE_APP_LEADS_EMPLOYEE_NAMES.sql 실행 필요)", icon="⚠️")
             except Exception as e2:
                 st.toast(f"❌ 저장 실패: {str(e2)[:60]}", icon="⚠️")
@@ -1155,8 +1191,8 @@ def _render_lead_filters_and_table(leads_raw: list[dict], emp_map: dict[int, str
         st.info("조건에 맞는 리드가 없습니다.")
         return
 
-    _ths = ["고객명", "연락처", "유형", "유입경로", "상태", "매장", "담당직원", "마지막 연락", ""]
-    _ws = [1.5, 1.2, 1.2, 0.9, 1.2, 1.6, 1.8, 0.9, 0.6]
+    _ths = ["고객명", "연락처", "유형 ▼", "유입경로 ▼", "상태 ▼", "매장 ▼", "담당직원 ▼", "마지막 연락", ""]
+    _ws = [1.5, 1.2, 1.2, 1.2, 1.2, 1.5, 1.8, 0.9, 0.6]
     _hc = st.columns(_ws)
     for _c, _t in zip(_hc, _ths):
         _c.markdown(f"<div style='color:#475569;font-weight:600;font-size:0.82rem;'>{_t}</div>", unsafe_allow_html=True)
@@ -1164,22 +1200,31 @@ def _render_lead_filters_and_table(leads_raw: list[dict], emp_map: dict[int, str
         "<div style='border-bottom:1px solid #e5e7eb;margin:0 0 4px 0;'></div>",
         unsafe_allow_html=True,
     )
-    st.caption("유형·상태·매장·담당직원은 **관리**에서 수정합니다.")
+    st.caption("유형·유입경로·상태·매장·담당직원은 목록에서 바로 바꿀 수 있습니다. 세부 항목은 **관리**에서 수정합니다.")
+
+    _stage_keys_list = list(LEAD_STAGES.keys())
+    _source_keys = list(LEAD_SOURCE_LABELS.keys())
+    _emp_name_to_id = {v: k for k, v in emp_map.items()}
+    _store_options_master = [""] + list(_get_store_name_list())
+    for _sn in ("울산학성점", "울산삼산점"):
+        if _sn not in _store_options_master:
+            _store_options_master.append(_sn)
 
     for _lead in leads:
         _lid = _lead.get("id")
         _name = _lead.get("name") or "—"
         _phone = _format_phone_display(_lead.get("phone") or "")
-        _source = LEAD_SOURCE_LABELS.get(_lead.get("lead_source") or "", _lead.get("lead_source") or "—")
+        _source = _lead.get("lead_source") or "기타"
         _stage = _lead.get("lead_stage") or "1_신규"
         _ctype = _lead.get("customer_type") or "신규잠재고객"
         _emp_names_raw = (_lead.get("employee_names") or "").strip()
         if _emp_names_raw:
-            _emp_label = " · ".join(n.strip() for n in _emp_names_raw.split(",") if n.strip()) or "—"
+            _emp_names_list = [n.strip() for n in _emp_names_raw.split(",") if n.strip()]
         else:
             _primary_emp_id = _lead.get("assigned_employee_id")
-            _emp_label = emp_map.get(int(_primary_emp_id), "—") if _primary_emp_id else "—"
-        _store = _lead.get("store_name") or "—"
+            _fallback_name = emp_map.get(int(_primary_emp_id), "") if _primary_emp_id else ""
+            _emp_names_list = [_fallback_name] if _fallback_name else []
+        _store = str(_lead.get("store_name") or "")
         _last_contact = (
             str(_lead.get("last_contact_at") or "")[:10]
             or str(_lead.get("created_at") or "")[:10]
@@ -1188,18 +1233,92 @@ def _render_lead_filters_and_table(leads_raw: list[dict], emp_map: dict[int, str
         with _rc[0]:
             st.markdown(f"<div style='font-weight:500;'>{_name}</div>", unsafe_allow_html=True)
         _rc[1].write(_phone)
-        _rc[2].write(CUSTOMER_TYPE_INLINE_DISPLAY.get(_ctype, _ctype))
-        _rc[3].write(_source)
+
+        with _rc[2]:
+            _type_key = f"inline_type_{_lid}"
+            _type_opts = list(CUSTOMER_TYPE_KEYS)
+            if _ctype not in _type_opts:
+                _type_opts.append(_ctype)
+            st.selectbox(
+                "유형",
+                _type_opts,
+                index=_type_opts.index(_ctype) if _ctype in _type_opts else 0,
+                format_func=lambda k: CUSTOMER_TYPE_INLINE_DISPLAY.get(k, k),
+                key=_type_key,
+                label_visibility="collapsed",
+                on_change=_inline_save_type,
+                args=(_lid, _type_key),
+            )
+
+        with _rc[3]:
+            _src_key = f"inline_source_{_lid}"
+            _src_opts = list(_source_keys)
+            if _source not in _src_opts:
+                _src_opts.append(_source)
+            st.selectbox(
+                "유입경로",
+                _src_opts,
+                index=_src_opts.index(_source) if _source in _src_opts else 0,
+                format_func=lambda k: LEAD_SOURCE_LABELS.get(k, k),
+                key=_src_key,
+                label_visibility="collapsed",
+                on_change=_inline_save_source,
+                args=(_lid, _src_key),
+            )
+
         with _rc[4]:
-            st.write(LEAD_STAGES.get(_stage, _stage))
+            _stage_key = f"inline_stage_{_lid}"
+            _stage_opts = list(_stage_keys_list)
+            if _stage not in _stage_opts:
+                _stage_opts.append(_stage)
+            st.selectbox(
+                "상태",
+                _stage_opts,
+                index=_stage_opts.index(_stage) if _stage in _stage_opts else 0,
+                format_func=lambda k: LEAD_STAGES.get(k, k),
+                key=_stage_key,
+                label_visibility="collapsed",
+                on_change=_inline_save_stage,
+                args=(_lid, _stage_key),
+            )
             if _lead.get("_is_customer"):
                 st.markdown(
                     "<span style='background:#fef3c7;color:#92400e;padding:1px 6px;"
                     "border-radius:8px;font-size:0.68rem;font-weight:600;'>🛒 구매완료</span>",
                     unsafe_allow_html=True,
                 )
-        _rc[5].write(_store if _is_lead_selectable_store(_store) else (_store or "—"))
-        _rc[6].write(_emp_label)
+
+        with _rc[5]:
+            _store_key = f"inline_store_{_lid}"
+            _row_stores = list(_store_options_master)
+            if _store and _store not in _row_stores:
+                _row_stores.append(_store)
+            st.selectbox(
+                "매장",
+                _row_stores,
+                index=_row_stores.index(_store) if _store in _row_stores else 0,
+                format_func=lambda s: s if s else "(미지정)",
+                key=_store_key,
+                label_visibility="collapsed",
+                on_change=_inline_save_store,
+                args=(_lid, _store_key),
+            )
+
+        with _rc[6]:
+            _emp_key = f"inline_emps_{_lid}"
+            _row_emp_opts = list(dict.fromkeys(_emp_all_names + _emp_names_list))
+            if _emp_key not in st.session_state:
+                st.session_state[_emp_key] = [n for n in _emp_names_list if n in _row_emp_opts]
+            st.multiselect(
+                "담당직원",
+                options=_row_emp_opts,
+                key=_emp_key,
+                label_visibility="collapsed",
+                placeholder="직원 선택",
+                on_change=_inline_save_emps,
+                args=(_lid, _emp_key, _emp_name_to_id),
+            )
+
         _rc[7].write(_last_contact)
         with _rc[8]:
             if st.button("관리", key=f"lead_act_{_lid}", width="stretch"):
