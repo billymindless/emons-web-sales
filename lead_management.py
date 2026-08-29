@@ -533,16 +533,8 @@ def _log_customer_message(
 # 채널톡 → 리드 가져오기
 # ──────────────────────────────────────────────
 
-def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
-    """
-    채널톡 Open API에서 최근 사용자 N명 조회 → 신규 phone만 리드로 등록.
-
-    제외 조건:
-        - phone 없음
-        - 이미 app_customers에 등록된 phone
-        - 이미 app_leads에 등록된 phone
-    """
-    import requests
+def _channeltalk_api_headers() -> tuple[dict[str, str] | None, str]:
+    """채널톡 Open API 헤더. 실패 시 (None, error)."""
     access_key = (
         os.environ.get("CHANNEL_TALK_ACCESS_KEY", "")
         or os.environ.get("CHANNEL_TALK_API_KEY", "")
@@ -550,40 +542,127 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
     access_secret = os.environ.get("CHANNEL_TALK_ACCESS_SECRET", "")
     if not access_key or not access_secret:
         try:
-            access_key = access_key or str(st.secrets.get("CHANNEL_TALK_API_KEY", ""))
+            access_key = access_key or str(
+                st.secrets.get("CHANNEL_TALK_ACCESS_KEY", "")
+                or st.secrets.get("CHANNEL_TALK_API_KEY", "")
+            )
             access_secret = access_secret or str(st.secrets.get("CHANNEL_TALK_ACCESS_SECRET", ""))
         except Exception:
             pass
-
     if not access_key or not access_secret:
-        return {"ok": False, "error": "채널톡 API 키 미설정", "imported": 0, "skipped": 0, "details": []}
-
-    headers = {
+        return None, "채널톡 API 키 미설정"
+    return {
         "x-access-key": access_key,
         "x-access-secret": access_secret,
+        "Accept": "application/json",
         "Content-Type": "application/json",
-    }
-    try:
-        resp = requests.get(
-            "https://api.channel.io/open/v5/users",
-            headers=headers,
-            params={"limit": str(min(limit, 100)), "sortOrder": "desc"},
-            timeout=15.0,
-        )
-    except Exception as e:
-        return {"ok": False, "error": f"채널톡 API 호출 실패: {e}", "imported": 0, "skipped": 0, "details": []}
+    }, ""
 
-    if resp.status_code >= 400:
-        return {"ok": False, "error": f"채널톡 응답 {resp.status_code}: {resp.text[:200]}", "imported": 0, "skipped": 0, "details": []}
 
-    try:
-        data = resp.json()
-    except Exception:
-        return {"ok": False, "error": "응답 파싱 실패", "imported": 0, "skipped": 0, "details": []}
+def _fetch_channeltalk_recent_users(headers: dict[str, str], limit: int) -> tuple[list[dict], str]:
+    """
+    채널톡은 사용자 전체 목록 GET이 없다. 최근 상담(user-chats)에서 사용자를 모은다.
+    GET /open/v5/user-chats?state=opened|closed|snoozed
+    """
+    import requests
 
-    users = data.get("users") or data.get("items") or []
-    if not isinstance(users, list):
-        return {"ok": False, "error": "유효한 사용자 목록 없음", "imported": 0, "skipped": 0, "details": []}
+    want = max(1, min(int(limit or 50), 100))
+    per_state = min(max(want, 25), 500)
+    by_id: dict[str, dict] = {}
+    last_err = ""
+
+    def _put_user(u: Any) -> None:
+        if not isinstance(u, dict):
+            return
+        uid = str(u.get("id") or "").strip()
+        if not uid:
+            return
+        by_id.setdefault(uid, u)
+
+    for state in ("opened", "closed", "snoozed"):
+        if len(by_id) >= want:
+            break
+        try:
+            resp = requests.get(
+                "https://api.channel.io/open/v5/user-chats",
+                headers=headers,
+                params={"state": state, "sortOrder": "desc", "limit": str(per_state)},
+                timeout=15.0,
+            )
+        except Exception as e:
+            last_err = f"채널톡 API 호출 실패: {e}"
+            continue
+        if resp.status_code >= 400:
+            last_err = f"채널톡 응답 {resp.status_code}: {resp.text[:200]}"
+            continue
+        try:
+            data = resp.json() or {}
+        except Exception:
+            last_err = "응답 파싱 실패"
+            continue
+        if not isinstance(data, dict):
+            last_err = "유효한 사용자 목록 없음"
+            continue
+
+        related = data.get("users") or []
+        if isinstance(related, list):
+            for u in related:
+                _put_user(u)
+
+        if len(by_id) >= want:
+            break
+
+        chats = data.get("userChats") or []
+        if not isinstance(chats, list):
+            continue
+        missing: list[str] = []
+        for ch in chats:
+            if not isinstance(ch, dict):
+                continue
+            uid = str(ch.get("userId") or "").strip()
+            if uid and uid not in by_id and uid not in missing:
+                missing.append(uid)
+        for uid in missing:
+            if len(by_id) >= want:
+                break
+            try:
+                ur = requests.get(
+                    f"https://api.channel.io/open/v5/users/{uid}",
+                    headers=headers,
+                    timeout=10.0,
+                )
+            except Exception:
+                continue
+            if ur.status_code >= 400:
+                continue
+            try:
+                udata = ur.json() or {}
+            except Exception:
+                continue
+            _put_user(udata.get("user") if isinstance(udata, dict) else None)
+
+    users = list(by_id.values())[:want]
+    if users:
+        return users, ""
+    return [], last_err or "유효한 사용자 목록 없음"
+
+
+def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
+    """
+    채널톡 최근 상담(user-chats)에서 사용자 N명 조회 → 신규 phone만 리드로 등록.
+
+    제외 조건:
+        - phone 없음
+        - 이미 app_customers에 등록된 phone
+        - 이미 app_leads에 등록된 phone
+    """
+    headers, cred_err = _channeltalk_api_headers()
+    if not headers:
+        return {"ok": False, "error": cred_err, "imported": 0, "skipped": 0, "details": []}
+
+    users, fetch_err = _fetch_channeltalk_recent_users(headers, limit)
+    if fetch_err:
+        return {"ok": False, "error": fetch_err, "imported": 0, "skipped": 0, "details": []}
 
     supa = _supa()
     if not supa:
