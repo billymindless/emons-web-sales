@@ -19247,7 +19247,9 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         _ss = str(_sh.get("shift_start") or "")[:5]
         _ee = str(_sh.get("shift_end") or "")[:5]
         _wl = (_sh.get("work_location_name") or "").strip()
-        _lbl = f"{_emp}  {_ss}~{_ee}" + (f"  · {_wl}" if _wl else "")
+        _eff_dbf = _shift_effective_dbf(_sh) or _sh.get("_dbf") or current_db
+        _loc = _wl if _wl else (_dbf_to_sn.get(_eff_dbf, "") or "")
+        _lbl = f"{_emp}  {_ss}~{_ee}" + (f"  · {_loc}" if _loc else "")
         _can_edit = bool(_sh.get("id")) and (not _me_aliases or _emp in _me_aliases)
         if _can_edit:
             _c_l, _c_b = st.columns([4, 1])
@@ -19263,7 +19265,10 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
         _st = str(_lg.get("start_time") or "")[:5]
         _et = str(_lg.get("end_time") or "")[:5]
         _tm = f" {_st}~{_et}" if _st and _et else ""
-        st.write(f"{_wt}  {_emp}{_tm}")
+        _lg_wloc = (_lg.get("work_location_name") or "").strip()
+        _lg_eff = _shift_effective_dbf(_lg) or _lg.get("_dbf") or current_db
+        _lg_loc = _lg_wloc if _lg_wloc else (_dbf_to_sn.get(_lg_eff, "") or "")
+        st.write(f"{_wt}  {_emp}{_tm}" + (f"  · {_lg_loc}" if _lg_loc else ""))
 
     if me_name:
         st.markdown('<div class="erp-cal-plus-bar">', unsafe_allow_html=True)
