@@ -41,7 +41,7 @@ import time
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -1367,119 +1367,6 @@ async def _ct_fetch_lead_info(
         return None
 
 
-async def _ct_reactivate_lead(
-    client: httpx.AsyncClient,
-    headers: dict,
-    lead_id: int | None,
-    customer_type: str | None,
-) -> None:
-    """
-    기존 app_leads 레코드를 재유입 처리.
-
-    - INSERT 절대 없음. 같은 고객의 재유입이 쌓여도 app_leads 레코드는 1개 유지.
-    - last_contact_at 갱신.
-    - 분류된 고객(기존구매/AS/재상담)인 경우 lead_stage를 '2_상담중'으로 전환
-      (계약완료·실패·보류는 유지).
-    - 미분류(신규잠재고객 또는 NULL)인 경우 lead_stage는 건드리지 않고
-      last_contact_at만 갱신 → momo에서 직원이 분류하도록 유도.
-    """
-    if not lead_id:
-        return
-    now_iso = datetime.now(timezone.utc).isoformat()
-    patch_body: dict = {
-        "last_contact_at": now_iso,
-        "updated_at": now_iso,
-    }
-    if customer_type in ("기존구매고객_DB외", "AS요청", "재상담"):
-        # 단, 이미 완료/실패/보류 상태면 그대로 유지 → 서버 측 조건 분기 필요.
-        # PostgREST는 부분 업데이트 시 조건만 URL params로 부착하면 됨.
-        try:
-            await client.patch(
-                _supa_url("app_leads"),
-                headers={**headers, "Prefer": "return=minimal"},
-                params={
-                    "id": f"eq.{lead_id}",
-                    "lead_stage": "not.in.(4_계약완료,5_실패,6_보류)",
-                },
-                json={**patch_body, "lead_stage": "2_상담중"},
-                timeout=5.0,
-            )
-        except Exception as e:
-            logger.warning("리드 재활성화(상담중) 실패: %s", e)
-        # last_contact_at은 완료/실패/보류 리드에서도 갱신해 두기 위해 별도 호출
-        try:
-            await client.patch(
-                _supa_url("app_leads"),
-                headers={**headers, "Prefer": "return=minimal"},
-                params={
-                    "id": f"eq.{lead_id}",
-                    "lead_stage": "in.(4_계약완료,5_실패,6_보류)",
-                },
-                json=patch_body,
-                timeout=5.0,
-            )
-        except Exception:
-            pass
-    else:
-        # 미분류 → 시간만 갱신
-        try:
-            await client.patch(
-                _supa_url("app_leads"),
-                headers={**headers, "Prefer": "return=minimal"},
-                params={"id": f"eq.{lead_id}"},
-                json=patch_body,
-                timeout=5.0,
-            )
-        except Exception as e:
-            logger.warning("리드 last_contact_at 갱신 실패: %s", e)
-
-
-async def _ct_register_online_lead(
-    client: httpx.AsyncClient,
-    headers: dict,
-    cleaned_phone: str,
-    name: str,
-    customer_type: str = "신규잠재고객",
-) -> None:
-    """채널톡 신규 고객 → app_leads에 온라인_채널톡으로 자동 등록 (중복 시 무시).
-
-    customer_type: 신규잠재고객(완전 미지) | 재상담(app_customers 매칭).
-    """
-    try:
-        # 이미 리드가 있으면 등록 생략 (전사 전화번호 기준)
-        existing = await _ct_fetch_lead_info(client, headers, cleaned_phone)
-        if existing:
-            return
-
-        from datetime import timedelta
-        now_utc = datetime.now(timezone.utc)
-        next_nurture_at = (now_utc + timedelta(days=2)).isoformat()
-        now_iso = now_utc.isoformat()
-
-        await client.post(
-            _supa_url("app_leads"),
-            headers={**headers, "Prefer": "return=minimal"},
-            json={
-                "store_name": CHANNEL_TALK_DEFAULT_STORE,
-                "phone": cleaned_phone,
-                "name": name or "",
-                "lead_source": "온라인_채널톡",
-                "lead_stage": "1_신규",
-                "customer_type": customer_type,
-                "nurturing_step": 0,
-                "next_nurture_at": next_nurture_at,
-                "last_contact_at": now_iso,
-            },
-            timeout=5.0,
-        )
-        logger.info(
-            "온라인 채널톡 리드 자동 등록: phone=%s customer_type=%s",
-            cleaned_phone, customer_type,
-        )
-    except Exception as e:
-        logger.warning("온라인 리드 등록 실패 (계속 진행): %s", e)
-
-
 async def _ct_upsert_user(
     phone: str,
     name: str,
@@ -1652,29 +1539,27 @@ async def channel_talk_custom_tab(request: Request) -> JSONResponse:
             except Exception as e:
                 logger.warning("channel-talk: lead 조회 실패 (계속 진행): %s", e)
 
-            # 분기 처리 — 리드 자동 등록 / 재유입 재활성화
-            if lead_info:
-                # ── 분기 A & B — 재유입: 기존 리드 UPDATE만, INSERT 없음 ──
-                await _ct_reactivate_lead(
-                    client, headers,
-                    lead_id=lead_info.get("id"),
-                    customer_type=lead_info.get("customer_type"),
-                )
-            elif not order_info:
-                # 구매 이력 없음 + 리드 없음 → 신규 등록
-                if not is_new:
-                    # ── 분기 C — app_customers 매칭, app_leads 없음 → 재상담 1회 생성 ──
-                    await _ct_register_online_lead(
-                        client, headers, cleaned_phone, name_from_ct,
-                        customer_type="재상담",
+            # 분기 처리 — 리드 자동 등록 / 재유입 재활성화 (lead_service.upsert_lead 로 통합)
+            # 구매 이력이 이미 있으면(order_info) 신규 리드 생성은 스킵.
+            # 리드가 있으면 재유입 분기(A/B) 로 UPDATE 되고, 없으면 C/D 로 신규 INSERT 된다.
+            if lead_info or not order_info:
+                try:
+                    from lead_service import upsert_lead as _upsert_lead_ct
+                    # customer_type 자동 판별: lead 있으면 유지, 없으면 app_customers 매칭 여부(=is_new의 반대)로 결정
+                    _ct_type = None
+                    if not lead_info:
+                        _ct_type = "신규잠재고객" if is_new else "재상담"
+                    _upsert_lead_ct(
+                        phone=cleaned_phone,
+                        name=name_from_ct,
+                        lead_source="온라인_채널톡",
+                        customer_type=_ct_type,
+                        source_system="channel_talk",
+                        log_note=False,
                     )
-                else:
-                    # ── 분기 D — 완전 미지 고객 → 신규 잠재고객 ──
-                    await _ct_register_online_lead(
-                        client, headers, cleaned_phone, name_from_ct,
-                        customer_type="신규잠재고객",
-                    )
-                # 방금 만든 리드를 다시 조회해 Snippet에 반영
+                except Exception as _e_up:
+                    logger.warning("channel-talk: upsert_lead 실패 (계속 진행): %s", _e_up)
+                # 최신 상태를 Snippet 응답에 반영하기 위해 재조회
                 try:
                     lead_info = await _ct_fetch_lead_info(client, headers, cleaned_phone)
                 except Exception:
@@ -1730,17 +1615,14 @@ async def _handle_chat_created(payload: dict) -> JSONResponse:
     chat.created/opened 이벤트 처리. 핵심 원칙: 같은 고객의 재유입은
     `app_leads` 레코드를 새로 INSERT하지 않고 기존 레코드만 UPDATE.
 
-    분기:
-      A) 기존 lead 존재 + customer_type IN ('기존구매고객_DB외','AS요청','재상담')
-         → lead_stage='2_상담중' + last_contact_at=now, INSERT 없음
-      B) 기존 lead 존재 + customer_type='신규잠재고객'(or NULL)
-         → last_contact_at만 갱신 (분류 대기)
-      C) lead 없음 + app_customers 매칭
-         → customer_type='재상담'으로 신규 INSERT 1회
-      D) lead 없음 + app_customers 없음
-         → customer_type='신규잠재고객'으로 신규 INSERT 1회
+    실제 upsert·재유입 분기(A/B/C/D)는 lead_service.upsert_lead 로 위임한다.
+    이 함수는 채널톡 payload 파싱 + app_chat_history 재유입 메타 로그만 담당.
 
-    모든 분기에서 app_chat_history에 재유입 로그 1건 INSERT.
+    분기 요약 (lead_service 와 동일):
+      A) 기존 lead + customer_type ∈ (기존구매/AS/재상담)  → 2_상담중 승격 + last_contact_at
+      B) 기존 lead + customer_type ∈ (신규잠재고객 | NULL) → last_contact_at 만 갱신
+      C) lead 없음 + app_customers 매칭                    → 재상담으로 신규 INSERT
+      D) lead 없음 + app_customers 없음                    → 신규잠재고객으로 신규 INSERT
     """
     user_obj = payload.get("user") or {}
     chat_obj = payload.get("chat") or {}
@@ -1758,70 +1640,33 @@ async def _handle_chat_created(payload: dict) -> JSONResponse:
     if not phone:
         return JSONResponse({"ok": True, "skipped": True, "reason": "no_phone"})
 
-    headers = _supa_headers()
-    if not headers:
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
         return JSONResponse({"ok": False, "error": "supabase not configured"}, status_code=500)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # 전사 전화번호 기준 리드 조회 (store 무관)
-        lead_info = await _ct_fetch_lead_info(client, headers, phone)
+    try:
+        from lead_service import upsert_lead
+    except ImportError as e:
+        logger.error("lead_service import 실패: %s", e)
+        return JSONResponse({"ok": False, "error": "lead_service import 실패"}, status_code=500)
 
-        # 분기 결정
-        branch = ""
-        if lead_info:
-            ctype = lead_info.get("customer_type")
-            if ctype in ("기존구매고객_DB외", "AS요청", "재상담"):
-                branch = "A"
-            else:
-                branch = "B"
-            await _ct_reactivate_lead(
-                client, headers,
-                lead_id=lead_info.get("id"),
-                customer_type=ctype,
-            )
-        else:
-            # app_customers 매칭 여부 확인
-            cust_matched = False
-            try:
-                or_parts: list[str] = []
-                for v in _phone_variants(phone):
-                    or_parts.append(f"phone1.eq.{v}")
-                    or_parts.append(f"phone2.eq.{v}")
-                cust_resp = await client.get(
-                    _supa_url("app_customers"),
-                    headers=headers,
-                    params={
-                        "or": "(" + ",".join(or_parts) + ")",
-                        "select": "id",
-                        "limit": "1",
-                    },
-                )
-                cust_matched = bool(
-                    cust_resp.status_code == 200 and (cust_resp.json() or [])
-                )
-            except Exception as e:
-                logger.warning("chat.created: app_customers 조회 실패: %s", e)
+    # upsert_lead: 재유입은 UPDATE, 신규는 INSERT. customer_type 미지정 시 app_customers 매칭 여부로 자동 분류.
+    result = upsert_lead(
+        phone=phone,
+        name=name_from_ct,
+        lead_source="온라인_채널톡",
+        source_system="channel_talk",
+        log_note=False,  # 아래에서 chat_id 를 포함한 재유입 메타 로그를 직접 남김
+    )
+    branch = result.get("branch") or ""
 
-            if cust_matched:
-                branch = "C"
-                await _ct_register_online_lead(
-                    client, headers, phone, name_from_ct,
-                    customer_type="재상담",
-                )
-            else:
-                branch = "D"
-                await _ct_register_online_lead(
-                    client, headers, phone, name_from_ct,
-                    customer_type="신규잠재고객",
-                )
-
-        # ── app_chat_history 재유입 로그 INSERT ──
-        # chat.created 시점에는 대화 내용이 비어 있으므로 메타 로그만 남김.
-        # 실제 대화 전문은 chat.closed에서 별도 저장됨.
-        try:
+    # ── app_chat_history 재유입 로그 INSERT ──
+    # chat.created 시점에는 대화 내용이 비어 있으므로 메타 로그만 남긴다.
+    # 실제 대화 전문은 chat.closed 에서 별도 저장됨.
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(
                 _supa_url("app_chat_history"),
-                headers={**headers, "Prefer": "return=minimal"},
+                headers={**_supa_headers(), "Prefer": "return=minimal"},
                 json={
                     "customer_phone": phone,
                     "channel": "채널톡_재유입" if branch == "A" else "채널톡_신규대화",
@@ -1829,13 +1674,15 @@ async def _handle_chat_created(payload: dict) -> JSONResponse:
                     "summary": f"[분기{branch}] 채팅 시작",
                     "handled_by": "system",
                 },
-                timeout=5.0,
             )
-        except Exception as e:
-            logger.warning("chat.created 로그 INSERT 실패: %s", e)
+    except Exception as e:
+        logger.warning("chat.created 로그 INSERT 실패: %s", e)
 
-    logger.info("chat.created 처리 완료: phone=%s branch=%s chat_id=%s", phone, branch, chat_id)
-    return JSONResponse({"ok": True, "branch": branch})
+    logger.info(
+        "chat.created 처리 완료: phone=%s branch=%s created=%s chat_id=%s",
+        phone, branch, result.get("created"), chat_id,
+    )
+    return JSONResponse({"ok": bool(result.get("ok")), "branch": branch, "created": bool(result.get("created"))})
 
 
 # ──────────────────────────────────────────────
@@ -2105,6 +1952,218 @@ async def run_lead_care() -> JSONResponse:
 
     logger.info("run-lead-care 완료: sent=%d failed=%d", sent, failed)
     return JSONResponse({"ok": True, "processed": len(leads), "sent": sent, "failed": failed})
+
+
+# ──────────────────────────────────────────────
+# /v1/leads — 리드 통합 API (채널톡·모모·Cursor Grok Bot 공용)
+#
+# 인증:
+#   Authorization: Bearer $LEAD_API_TOKEN
+#   LEAD_API_TOKEN 미설정 환경은 401 (프로덕션 안전 기본값).
+# ──────────────────────────────────────────────
+
+
+class LeadUpsertBody(BaseModel):
+    """POST /v1/leads 페이로드.
+
+    phone 만 필수. 나머지는 지정 시에만 반영되며, 기존 memo 는 절대 덮어쓰지 않고
+    새 memo 는 app_chat_history 에 append 된다.
+    """
+
+    phone: str = Field(..., description="전화번호. 하이픈/공백 포함 형식 자유")
+    name: str | None = None
+    memo: str | None = None
+    lead_source: str | None = Field(
+        None,
+        description="온라인_채널톡 | 전화_문의 | 오프라인_방문 | 카카오톡 | 기타",
+    )
+    store_name: str | None = None
+    employee_names: str | None = Field(
+        None, description="담당 직원 이름 (쉼표 구분). 매출 employee_names 규칙과 동일.",
+    )
+    customer_type: str | None = Field(
+        None, description="신규잠재고객 | 기존구매고객_DB외 | AS요청 | 재상담",
+    )
+    next_contact_date: str | None = Field(None, description="YYYY-MM-DD")
+    classification_memo: str | None = None
+    source_system: str = Field(
+        "webhook",
+        description="channel_talk | grok_bot | momo_ui | channel_talk_import | emons_seller | webhook",
+    )
+
+
+class LeadPatchBody(BaseModel):
+    """PATCH /v1/leads/{id} 페이로드. 전달된 필드만 갱신."""
+
+    lead_stage: str | None = Field(None, description="1_신규|2_상담중|3_견적발송|4_계약완료|5_실패|6_보류")
+    memo: str | None = None
+    employee_names: str | None = None
+    next_contact_date: str | None = None
+    customer_type: str | None = None
+    classification_memo: str | None = None
+    source_system: str = "grok_bot"
+
+
+class LeadNoteBody(BaseModel):
+    """POST /v1/leads/{id}/notes 페이로드."""
+
+    summary: str = Field(..., description="한 줄 상담 메모/활동 기록")
+    full_text: str | None = None
+    channel: str = Field(
+        "grok_note",
+        description="app_chat_history.channel 값 (예: grok_note, channel_talk_note)",
+    )
+    handled_by: str = "grok_bot"
+
+
+def _verify_lead_token(authorization: str | None) -> None:
+    """Authorization: Bearer <LEAD_API_TOKEN> 검증. 미설정이면 401 (안전 기본값)."""
+    expected = os.environ.get("LEAD_API_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(status_code=401, detail="LEAD_API_TOKEN not configured")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = authorization.split(None, 1)[1].strip()
+    if not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="invalid token")
+
+
+@app.get("/v1/leads", summary="리드 목록/검색 (Bearer 필요)")
+async def v1_list_leads(
+    phone: str | None = None,
+    stage: str | None = None,
+    store: str | None = None,
+    customer_type: str | None = None,
+    q: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    authorization: str | None = Header(None),
+) -> JSONResponse:
+    _verify_lead_token(authorization)
+    try:
+        from lead_service import search_leads
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": f"lead_service import 실패: {e}"}, status_code=500)
+    rows = search_leads(
+        phone=phone, stage=stage, store=store,
+        customer_type=customer_type, q=q,
+        limit=limit, offset=offset,
+    )
+    return JSONResponse({"ok": True, "count": len(rows), "leads": rows})
+
+
+@app.get("/v1/leads/{lead_id}", summary="리드 단건 상세 + 최근 상담 이력 (Bearer 필요)")
+async def v1_get_lead(
+    lead_id: int,
+    history_limit: int = 20,
+    authorization: str | None = Header(None),
+) -> JSONResponse:
+    _verify_lead_token(authorization)
+    try:
+        from lead_service import get_lead_by_id
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": f"lead_service import 실패: {e}"}, status_code=500)
+    lead = get_lead_by_id(lead_id)
+    if not lead:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    # 최근 상담 이력 함께 조회 (모모 화면과 동일한 소스)
+    history: list[dict] = []
+    try:
+        headers = _supa_headers()
+        if headers:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                resp = await client.get(
+                    _supa_url("app_chat_history"),
+                    headers=headers,
+                    params={
+                        "customer_phone": f"eq.{lead.get('phone')}",
+                        "order": "created_at.desc",
+                        "limit": str(max(1, min(history_limit, 100))),
+                        "select": "id,channel,summary,handled_by,created_at",
+                    },
+                )
+                history = resp.json() if resp.status_code == 200 else []
+    except Exception as e:
+        logger.warning("chat_history 조회 실패: %s", e)
+    return JSONResponse({"ok": True, "lead": lead, "history": history})
+
+
+@app.post("/v1/leads", summary="리드 upsert (Bearer 필요)")
+async def v1_upsert_lead(
+    body: LeadUpsertBody,
+    authorization: str | None = Header(None),
+) -> JSONResponse:
+    _verify_lead_token(authorization)
+    try:
+        from lead_service import upsert_lead
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": f"lead_service import 실패: {e}"}, status_code=500)
+    result = upsert_lead(
+        phone=body.phone,
+        name=body.name,
+        memo=body.memo,
+        lead_source=body.lead_source,
+        store_name=body.store_name,
+        employee_names=body.employee_names,
+        customer_type=body.customer_type,
+        next_contact_date=body.next_contact_date,
+        classification_memo=body.classification_memo,
+        source_system=body.source_system,
+        log_note=True,
+    )
+    status_code = 200 if result.get("ok") else 400
+    if result.get("error") == "phone_empty":
+        status_code = 400
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.patch("/v1/leads/{lead_id}", summary="리드 부분 수정 (Bearer 필요)")
+async def v1_patch_lead(
+    lead_id: int,
+    body: LeadPatchBody,
+    authorization: str | None = Header(None),
+) -> JSONResponse:
+    _verify_lead_token(authorization)
+    try:
+        from lead_service import update_lead
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": f"lead_service import 실패: {e}"}, status_code=500)
+    result = update_lead(
+        lead_id,
+        lead_stage=body.lead_stage,
+        memo=body.memo,
+        employee_names=body.employee_names,
+        next_contact_date=body.next_contact_date,
+        customer_type=body.customer_type,
+        classification_memo=body.classification_memo,
+        source_system=body.source_system,
+    )
+    status_code = 200 if result.get("ok") else 400
+    return JSONResponse(result, status_code=status_code)
+
+
+@app.post("/v1/leads/{lead_id}/notes", summary="리드 상담 이력 append (Bearer 필요)")
+async def v1_add_lead_note(
+    lead_id: int,
+    body: LeadNoteBody,
+    authorization: str | None = Header(None),
+) -> JSONResponse:
+    _verify_lead_token(authorization)
+    try:
+        from lead_service import append_chat_history, get_lead_by_id
+    except ImportError as e:
+        return JSONResponse({"ok": False, "error": f"lead_service import 실패: {e}"}, status_code=500)
+    lead = get_lead_by_id(lead_id)
+    if not lead or not lead.get("phone"):
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    ok = append_chat_history(
+        lead["phone"],
+        channel=body.channel,
+        summary=body.summary,
+        full_text=body.full_text or "",
+        handled_by=body.handled_by,
+    )
+    return JSONResponse({"ok": ok, "lead_id": lead_id})
 
 
 # ──────────────────────────────────────────────

@@ -39,3 +39,5 @@ services:
         sync: false   # 채널톡 자동 가입 시 기본 store_name (예: '채널톡')
       - key: EMONS_AUTH_SECRET
         sync: false   # momo Streamlit과 동일한 HMAC 서명 키 (매직링크 자동 로그인용)
+      - key: LEAD_API_TOKEN
+        sync: false   # /v1/leads Bearer 토큰. Cursor MCP·에몬스 셀러 외부 프로그램 공용. 미설정 시 /v1 라우트는 전부 401.

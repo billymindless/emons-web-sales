@@ -10,3 +10,6 @@ __pycache__/
 
 # 매입/매출 원장 샘플 (실제 고객 PII 포함, 커밋 금지)
 samples/
+
+# Cursor MCP 로컬 설정 (LEAD_API_TOKEN 포함) — 예시 파일(.example)은 커밋
+.cursor/mcp.json

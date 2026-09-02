@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Cursor MCP 예시 — 모모 리드 API 를 Cursor Grok Bot(및 다른 Cursor 에이전트)의 도구로 노출한다.",
+    "1) 이 파일을 .cursor/mcp.json 으로 복사한다 (mcp.json 은 .gitignore 로 개인 로컬에만 둔다).",
+    "2) LEAD_API_BASE_URL 은 Render 배포 도메인, LEAD_API_TOKEN 은 render.yaml 의 값과 동일하게 설정.",
+    "3) Cursor 재시작 후 'Chat > Tools' 에서 momo-leads 서버가 노출되는지 확인.",
+    "4) grok.com 웹 채팅은 이 MCP 를 못 쓴다 — Cursor Ultra 안의 Grok/Claude/GPT 에이전트만 도구 호출 가능."
+  ],
+  "mcpServers": {
+    "momo-leads": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-openapi-proxy"
+      ],
+      "env": {
+        "OPENAPI_SPEC_URL": "https://<render-service>.onrender.com/openapi.json",
+        "API_BASE_URL": "https://<render-service>.onrender.com",
+        "API_AUTH_TYPE": "Bearer",
+        "API_AUTH_BEARER": "REPLACE_WITH_LEAD_API_TOKEN",
+        "TOOL_WHITELIST": "v1_list_leads,v1_get_lead,v1_upsert_lead,v1_patch_lead,v1_add_lead_note",
+        "AGENT_INSTRUCTIONS": "리드 도구는 전화번호 1개 = 리드 1건 규칙을 따른다. 같은 전화로 POST /v1/leads 를 여러 번 보내도 새 row 를 만들지 말고 UPDATE 로 처리한다. lead_stage 를 바꾸기 전 반드시 GET /v1/leads/{id} 로 현재 단계를 확인. 이 API 는 조회·메모·단계 수정만 담당하며 절대 고객에게 문자를 발송하지 않는다. 발송이 필요하면 사람에게 넘긴다."
+      }
+    }
+  }
+}

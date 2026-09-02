@@ -744,6 +744,7 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
             skipped += 1
             continue
 
+        # 이미 app_customers 에 있는 실 구매고객은 upsert 대상에서 제외 (매출 이력 우선)
         try:
             cust_rows = supa.table("app_customers").select("id") \
                 .eq("phone", phone).limit(1).execute().data or []
@@ -754,47 +755,48 @@ def import_leads_from_channeltalk(limit: int = 50) -> dict[str, Any]:
         except Exception:
             pass
 
+        # lead_service.upsert_lead 로 위임: 있으면 UPDATE(재유입 분기), 없으면 INSERT.
+        # 채널톡 웹훅과 동일한 규칙을 공유한다.
         try:
-            lead_rows = supa.table("app_leads").select("id,assigned_employee_id") \
-                .eq("phone", phone).limit(1).execute().data or []
-            if lead_rows:
-                # 이미 리드 존재 → 판매담당자만 업데이트 (비어 있을 때)
-                _existing = lead_rows[0]
-                if _sales_rep_id and not _existing.get("assigned_employee_id"):
-                    try:
-                        supa.table("app_leads").update(
-                            {"assigned_employee_id": _sales_rep_id}
-                        ).eq("id", _existing["id"]).execute()
-                        details.append({"phone": phone, "name": name, "reason": f"리드 담당자 업데이트 → {_sales_rep_name}"})
-                    except Exception:
-                        pass
-                else:
-                    skipped += 1
-                    details.append({"phone": phone, "name": name, "reason": "이미 리드 등록"})
-                continue
-        except Exception:
-            pass
-
-        try:
-            _insert_row: dict = {
-                "store_name": "전체",
-                "phone": phone,
-                "name": name or "채널톡 고객",
-                "memo": (u.get("memo") or "")[:500],
-                "lead_source": "온라인_채널톡",
-                "lead_stage": "1_신규",
-                "customer_type": "신규잠재고객",
-                "nurturing_step": 0,
-            }
-            if _sales_rep_id:
-                _insert_row["assigned_employee_id"] = _sales_rep_id
-            supa.table("app_leads").insert(_insert_row).execute()
-            imported += 1
-            _rep_label = f" (담당: {_sales_rep_name})" if _sales_rep_name else ""
-            details.append({"phone": phone, "name": name, "reason": f"신규 등록{_rep_label}"})
-        except Exception as e:
+            from lead_service import upsert_lead  # noqa: WPS433
+        except ImportError as _e_imp:
             skipped += 1
-            details.append({"phone": phone, "name": name, "reason": f"등록 실패: {str(e)[:80]}"})
+            details.append({"phone": phone, "name": name, "reason": f"lead_service import 실패: {_e_imp}"})
+            continue
+
+        _memo = (u.get("memo") or "")[:500]
+        _res = upsert_lead(
+            phone=phone,
+            name=name or "채널톡 고객",
+            memo=_memo or None,
+            lead_source="온라인_채널톡",
+            store_name="전체",
+            employee_names=_sales_rep_name.strip() or None,
+            customer_type="신규잠재고객",  # 이 시점에는 app_customers 매칭이 없음을 위에서 확인
+            source_system="channel_talk_import",
+            log_note=False,
+        )
+        if not _res.get("ok"):
+            skipped += 1
+            details.append({"phone": phone, "name": name, "reason": f"등록 실패: {_res.get('error') or ''}"})
+            continue
+
+        # assigned_employee_id 는 upsert_lead 스코프 밖 (호환 유지용) — 필요 시 별도 UPDATE
+        if _sales_rep_id and _res.get("lead_id"):
+            try:
+                supa.table("app_leads").update(
+                    {"assigned_employee_id": _sales_rep_id}
+                ).eq("id", _res["lead_id"]).is_("assigned_employee_id", "null").execute()
+            except Exception:
+                pass
+
+        _rep_label = f" (담당: {_sales_rep_name})" if _sales_rep_name else ""
+        if _res.get("created"):
+            imported += 1
+            details.append({"phone": phone, "name": name, "reason": f"신규 등록{_rep_label}"})
+        else:
+            skipped += 1
+            details.append({"phone": phone, "name": name, "reason": f"이미 리드 등록 (재유입 분기 {_res.get('branch')}){_rep_label}"})
 
     return {"ok": True, "imported": imported, "skipped": skipped, "details": details, "total_seen": len(users)}
 
