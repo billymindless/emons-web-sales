@@ -3,6 +3,7 @@
     "momo-leads": {
       "command": "python3",
       "args": [
+        "-u",
         "/ABS/PATH/TO/emons-web-sales/scripts/momo_leads_mcp.py"
       ],
       "env": {

@@ -214,6 +214,12 @@ def _handle(msg: dict) -> None:
     if method == "tools/list":
         _reply(msg_id, {"tools": TOOLS})
         return
+    if method in ("resources/list", "resources/templates/list"):
+        _reply(msg_id, {"resources": []})
+        return
+    if method == "prompts/list":
+        _reply(msg_id, {"prompts": []})
+        return
     if method == "tools/call":
         name = params.get("name")
         args = params.get("arguments") or {}
@@ -234,17 +240,41 @@ def _handle(msg: dict) -> None:
         _reply(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})
 
 
+def _read_message() -> dict | None:
+    """newline JSON 또는 LSP Content-Length 프레임을 모두 읽는다."""
+    header = ""
+    while True:
+        ch = sys.stdin.read(1)
+        if ch == "":
+            return None
+        header += ch
+        if header.endswith("\r\n\r\n") or header.endswith("\n\n"):
+            break
+        if header.startswith("{") or header.startswith("["):
+            # Content-Length 없이 바로 JSON 한 줄
+            rest = sys.stdin.readline()
+            raw = header + rest
+            return json.loads(raw)
+    length = 0
+    for line in header.splitlines():
+        if line.lower().startswith("content-length:"):
+            length = int(line.split(":", 1)[1].strip())
+    if not length:
+        return None
+    body = sys.stdin.read(length)
+    return json.loads(body)
+
+
 def main() -> None:
     _log(f"momo-leads MCP started base={BASE_URL} token_set={bool(TOKEN)}")
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    while True:
         try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            _log(f"invalid json: {line[:120]}")
+            msg = _read_message()
+        except json.JSONDecodeError as e:
+            _log(f"invalid json: {e}")
             continue
+        if msg is None:
+            break
         _handle(msg)
 
 
