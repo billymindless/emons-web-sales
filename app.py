@@ -29549,7 +29549,7 @@ def _render_ai_sales_reports_new(srs):
     _yoy = kpi.get("prev_year") or {}
     _fmt_pct = lambda v: (f"{v:+.1f}%" if isinstance(v, (int, float)) else "-")
     with k1:
-        st.metric("순매출 (주문금액)", f"{kpi['sales_amount']:,}원",
+        st.metric("순매출 (판매일)", f"{kpi['sales_amount']:,}원",
                   _fmt_pct(_prev.get("sales_diff_pct")))
     with k2:
         st.metric("판매건수", f"{kpi['sales_count']:,}건")
@@ -29561,8 +29561,8 @@ def _render_ai_sales_reports_new(srs):
     with k5:
         st.metric("실수납액", f"{kpi['payments_amount']:,}원")
     st.caption(
-        "순매출·객단가·건수는 기간 내 **주문 판매가(app_orders.total_amount)** 기준입니다. "
-        "실수납액은 결제일자 기준이라 선수금·잔금 때문에 순매출과 다를 수 있습니다."
+        "순매출·판매건수·객단가·마진율·직원/카테고리/방문사유 집계는 **판매일(order_date)** 기준입니다. "
+        "실수납액은 **결제일(payment_date)** 기준이라 선수금·잔금 때문에 순매출과 다를 수 있습니다."
     )
 
     def _fmt_krw_col(df: pd.DataFrame, cols: list) -> pd.DataFrame:

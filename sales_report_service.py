@@ -148,10 +148,12 @@ def _get_client():
 
 
 def _fetch_orders(store_keys: list[str], start: date, end: date) -> pd.DataFrame:
-    """app_orders 조회. delivery_date 기준 기간 필터.
+    """app_orders 조회. order_date(판매일/계약일) 기준 기간 필터.
 
-    delivery_date 를 기준으로 하는 이유: 매출·마진 산정 시점이 배송일이며
-    ``sales`` 테이블·``payments`` 와 정합성이 맞기 때문 (app.py 의 대시보드 KPI 관례).
+    판매일 기준을 쓰는 이유: 매장에서 "8월 매출"이라 부르는 값은 8월에 계약한
+    주문 합계이고, 배송일(delivery_date)과 시점 차이가 있어 배송일 기준으로 필터
+    하면 실제 판매일 매출과 큰 차이가 난다 (예: 학성 2026-08 학성 배송 190M
+    vs 판매 132M). 실수납액만 결제일(app_payments.payment_date) 기준을 유지한다.
     """
     client = _get_client()
     if client is None or not store_keys:
@@ -163,8 +165,8 @@ def _fetch_orders(store_keys: list[str], start: date, end: date) -> pd.DataFrame
     try:
         q = client.table("app_orders").select(cols)\
             .in_("db_filename", store_keys)\
-            .gte("delivery_date", start.isoformat())\
-            .lte("delivery_date", end.isoformat())
+            .gte("order_date", start.isoformat())\
+            .lte("order_date", end.isoformat())
         r = q.execute()
         rows = (r.data or []) if hasattr(r, "data") else []
         return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -416,13 +418,16 @@ def _to_num(s: pd.Series) -> pd.Series:
 
 def compute_kpi(sales: pd.DataFrame, orders: pd.DataFrame, payments: pd.DataFrame) -> dict:
     """핵심 KPI 계산.
+
+    판매(순매출·건수·객단가·마진)는 **판매일(order_date)** 기준,
+    실수납액만 **결제일(payment_date)** 기준이다.
       - sales_amount: app_orders.total_amount 합 (계약 판매가).
         sales 원장은 매입 원장 임포트·모모 전용 매장에 거의 없어, 원장만 합치면
         건수·수납액과 어긋난 과소 집계가 난다. 판매건수와 같은 주문 집합을 쓴다.
       - sales_count: 주문 건수 (app_orders)
       - aov: 판매건수 > 0 인 경우 sales_amount / sales_count
       - margin_rate: (total_amount - cost_price - display_cost_amount) / total_amount
-      - payments_amount: app_payments.amount 합
+      - payments_amount: app_payments.amount 합 (결제일 기준)
     """
     if not orders.empty and "total_amount" in orders.columns:
         sales_amount = int(_to_num(orders["total_amount"]).sum())
@@ -468,8 +473,9 @@ def diff_pct(current: float, prev: float) -> float | None:
 def group_by_employee(sales: pd.DataFrame, orders: pd.DataFrame, top: int = 5) -> list[dict]:
     """직원별 매출·건수 (Top N).
 
-    주문 판매가(app_orders.total_amount)를 employee_names 1/n 배분한다.
-    sales 원장이 비어 있는 매장(학성 등)에서도 KPI 순매출과 같은 기준을 쓴다.
+    판매일(order_date) 기준 주문 판매가(app_orders.total_amount)를
+    employee_names 1/n 배분한다. sales 원장이 비어 있는 매장(학성 등)에서도
+    KPI 순매출과 같은 기준을 쓴다.
     """
     src = orders if (orders is not None and not orders.empty) else sales
     amt_col = "total_amount" if src is orders and "total_amount" in (src.columns if src is not None else []) else "amount"
@@ -1122,7 +1128,7 @@ def render_markdown(dataset: dict, ai_summary: dict | None = None) -> str:
     # 2. 핵심 KPI
     lines.append("\n## 2. 핵심 KPI\n")
     kpi_rows = [{
-        "지표": "순매출 (주문 판매가)",
+        "지표": "순매출 (판매일 기준)",
         "이번 기간": _fmt_krw(kpi.get("sales_amount")),
         "WoW/MoM": _fmt_pct(prev.get("sales_diff_pct")),
         "YoY": (_fmt_pct(yoy.get("sales_diff_pct")) if yoy else "N/A"),
