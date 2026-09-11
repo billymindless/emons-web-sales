@@ -32477,7 +32477,7 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                 st.error(f"Supabase 연결 실패: {err}")
             else:
                 with st.spinner(f"주소 보완 중… ({len(df_raw):,}행)"):
-                    _addr_groups, _ = lps.group_orders(df_raw, mapping)
+                    _addr_groups, _, _ = lps.group_orders(df_raw, mapping)
                     addr_result = lps.backfill_customer_addresses(
                         client, _addr_groups, store_name=_store_name,
                     )
@@ -32504,7 +32504,7 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                 st.error(f"Supabase 연결 실패: {err}")
                 return
             with st.spinner(f"그룹핑 및 매칭 계산 중… ({len(df_raw):,}행)"):
-                groups, gstats = lps.group_orders(df_raw, mapping, margin_rate=margin_pct / 100.0)
+                groups, gstats, skipped_rows = lps.group_orders(df_raw, mapping, margin_rate=margin_pct / 100.0)
                 preview = lps.build_preview(
                     client, groups,
                     store_name=_store_name,
@@ -32513,6 +32513,7 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                 preview.skipped_return = gstats["skipped_return"]
                 preview.skipped_invalid = gstats["skipped_invalid"]
                 preview.total_lines = gstats["total_lines"]
+                preview.skipped_rows = skipped_rows
             # 채널톡 스캔 (읽기 전용)
             phones_set = {g.phone1_digits for g in groups if g.phone1_digits}
             with st.spinner("채널톡_자동가입 매장 스캔 중…"):
@@ -32540,9 +32541,28 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
 
         _r1, _r2, _r3, _r4 = st.columns(4)
         _r1.metric("신규 주문 생성", f"{preview.to_create_count:,}")
-        _r2.metric("자동 매칭 (attach)", f"{preview.to_attach_count:,}")
+        _r2.metric(f"자동 매칭 (±{lps.MATCH_WINDOW_DAYS}일 창)", f"{preview.to_attach_count:,}")
         _r3.metric("수동 선택 필요", f"{preview.unresolved_count:,}")
         _r4.metric("이미 임포트 (스킵)", f"{preview.invalid_count:,}")
+
+        _r5, _r6, _r7, _r8 = st.columns(4)
+        _r5.metric("전시품 (매장 자산)", f"{preview.display_count:,}")
+        _r6.metric("미매칭 (앱 주문 없음)", f"{preview.no_match_count:,}")
+        _r7.metric("파싱 오류 (라인)", f"{preview.skipped_invalid:,}")
+        _r8.metric("이미 임포트 (스킵)", f"{preview.invalid_count:,}")
+
+        # 미매칭·전시품·오류 리뷰용 엑셀 다운로드
+        try:
+            _review_xlsx = lps.build_review_excel(preview)
+            st.download_button(
+                "📥 미매칭·전시품·오류 리스트 다운로드 (엑셀)",
+                data=_review_xlsx,
+                file_name=f"legacy_purchase_review_{excel_upload.name.rsplit('.', 1)[0]}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"legacy_purchase_review_dl::{excel_upload.name}",
+            )
+        except Exception as _dle:
+            st.caption(f"리뷰 엑셀을 만들지 못했습니다: {_dle}")
 
         if preview.yearly_stats:
             st.caption("연도별 분포")
@@ -32684,34 +32704,48 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
         except Exception as _rec_e:
             st.caption(f"원가 대사 표를 만들지 못했습니다: {_rec_e}")
 
-        # ── unresolved 그룹 수동 매핑 ──
+        # ── unresolved 그룹 수동 매핑 (같은 창 안 2건+) ──
+        _decisions_key = f"legacy_purchase_decisions::{excel_upload.name}"
+        _decisions: dict[str, str] = st.session_state.get(_decisions_key, {})
+
         if preview.unresolved_count > 0:
-            st.markdown("#### 3-2. 수동 매칭 필요 그룹")
+            st.markdown("#### 3-2. 수동 매칭 필요 그룹 (창 안 후보 2건+)")
             st.caption(
-                f"동일 (고객, 등록일) 에 앱 주문이 2건 이상 존재하는 그룹입니다 ({preview.unresolved_count}건). "
-                "각 그룹에 대해 후보 중 하나를 선택하거나, '신규 주문으로 등록'을 선택할 수 있습니다."
+                f"등록일 ±{lps.MATCH_WINDOW_DAYS}일 창 안에 앱 주문이 2건 이상 있는 그룹입니다 ({preview.unresolved_count}건). "
+                "추천 주문이 기본 선택되어 있습니다. 다른 주문에 붙이거나 '신규 주문으로 등록' 을 선택할 수 있습니다."
             )
             _unresolved = [g for g in preview.groups if g.match_status == "unresolved"]
-            _decisions_key = f"legacy_purchase_decisions::{excel_upload.name}"
-            _decisions: dict[str, str] = st.session_state.get(_decisions_key, {})
             for _ug in _unresolved[:100]:  # UI 부하 방지: 최대 100건 노출
                 gk = f"{_ug.phone1_digits}::{_ug.order_date}::{_ug.ship_number}"
-                _label_hdr = f"{_ug.customer_name} · {_ug.order_date} · 출고#{_ug.ship_number} · {len(_ug.items)}라인 · 매입 {_ug.total_line_cost:,}원"
+                _label_hdr = (
+                    f"{_ug.customer_name} · {_ug.order_date} · 출고#{_ug.ship_number} · "
+                    f"{len(_ug.items)}라인 · 매입 {_ug.total_line_cost:,}원"
+                )
                 _options = ["(신규 주문으로 등록)"]
-                _option_ids = [None]
+                _option_ids: list[Optional[int]] = [None]
                 for meta in _ug.candidate_orders_meta:
                     _dd = str(meta.get("delivery_date") or "-")[:10]
+                    _od = str(meta.get("order_date") or "-")[:10]
                     _tot = int(meta.get("total_amount") or 0)
                     _cat = str(meta.get("category") or "-")
-                    _options.append(f"#{meta.get('id')} · {_cat[:20]} · 배송 {_dd} · 판매 {_tot:,}원")
+                    _mark = " ⭐추천" if _ug.recommended_order_id and meta.get("id") == _ug.recommended_order_id else ""
+                    _options.append(
+                        f"#{meta.get('id')} · {_cat[:20]} · 등록 {_od} · 배송 {_dd} · 판매 {_tot:,}원{_mark}"
+                    )
                     _option_ids.append(meta.get("id"))
                 _prev = _decisions.get(gk)
-                _default_idx = 0
+                # 기본값: 이전 선택 → 추천 후보 → 첫 후보 → 신규 순
                 if _prev is not None:
                     try:
                         _default_idx = _option_ids.index(int(_prev)) if _prev != "new" else 0
                     except ValueError:
                         _default_idx = 0
+                elif _ug.recommended_order_id and _ug.recommended_order_id in _option_ids:
+                    _default_idx = _option_ids.index(_ug.recommended_order_id)
+                elif len(_option_ids) >= 2:
+                    _default_idx = 1
+                else:
+                    _default_idx = 0
                 _sel_idx = st.selectbox(
                     _label_hdr, list(range(len(_options))),
                     format_func=lambda i, _opts=_options: _opts[i],
@@ -32720,16 +32754,93 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                 )
                 _chosen = _option_ids[_sel_idx]
                 _decisions[gk] = "new" if _chosen is None else str(_chosen)
-            st.session_state[_decisions_key] = _decisions
             if len(_unresolved) > 100:
-                st.warning(f"목록이 길어 앞 100건만 UI에 노출됩니다. 나머지 {len(_unresolved) - 100}건은 임포트 시 자동으로 '신규 주문' 처리됩니다.")
+                st.warning(
+                    f"목록이 길어 앞 100건만 UI에 노출됩니다. 나머지 {len(_unresolved) - 100}건은 "
+                    f"기본 추천 주문에 자동 attach 됩니다."
+                )
+
+        # ── no_match: 고객은 있지만 창 안 후보 0건. 수동 결정 (기본 = 미결정 스킵) ──
+        if preview.no_match_count > 0:
+            st.markdown("#### 3-3. 미매칭 그룹 (앱 주문 후보 없음)")
+            st.caption(
+                f"고객은 앱에 있지만 등록일 ±{lps.MATCH_WINDOW_DAYS}일 창에 후보 주문이 없는 그룹입니다 "
+                f"({preview.no_match_count}건). 기본값은 **미결정(스킵)** 이며, 사용자가 직접 "
+                "이 고객의 다른 최근 주문에 붙이거나 '신규 주문으로 등록' 을 선택하면 임포트됩니다."
+            )
+            _nomatches = [g for g in preview.groups if g.match_status == "no_match"]
+            for _ug in _nomatches[:100]:
+                gk = f"{_ug.phone1_digits}::{_ug.order_date}::{_ug.ship_number}"
+                _label_hdr = (
+                    f"{_ug.customer_name} · {_ug.order_date} · 출고#{_ug.ship_number} · "
+                    f"{len(_ug.items)}라인 · 매입 {_ug.total_line_cost:,}원"
+                )
+                _options = ["(미결정 — 스킵)", "(신규 주문으로 등록)"]
+                _option_ids: list[Optional[int] | str] = ["skip", None]
+                for meta in _ug.candidate_orders_meta:
+                    _dd = str(meta.get("delivery_date") or "-")[:10]
+                    _od = str(meta.get("order_date") or "-")[:10]
+                    _tot = int(meta.get("total_amount") or 0)
+                    _cat = str(meta.get("category") or "-")
+                    _options.append(
+                        f"#{meta.get('id')} · {_cat[:20]} · 등록 {_od} · 배송 {_dd} · 판매 {_tot:,}원"
+                    )
+                    _option_ids.append(meta.get("id"))
+                _prev = _decisions.get(gk)
+                if _prev == "skip":
+                    _default_idx = 0
+                elif _prev == "new":
+                    _default_idx = 1
+                elif _prev is not None:
+                    try:
+                        _default_idx = _option_ids.index(int(_prev))
+                    except (ValueError, TypeError):
+                        _default_idx = 0
+                else:
+                    _default_idx = 0
+                _sel_idx = st.selectbox(
+                    _label_hdr, list(range(len(_options))),
+                    format_func=lambda i, _opts=_options: _opts[i],
+                    index=_default_idx,
+                    key=f"legacy_purchase_no_match_decision::{gk}::{excel_upload.name}",
+                )
+                _chosen = _option_ids[_sel_idx]
+                if _chosen == "skip":
+                    _decisions[gk] = "skip"
+                elif _chosen is None:
+                    _decisions[gk] = "new"
+                else:
+                    _decisions[gk] = str(_chosen)
+            if len(_nomatches) > 100:
+                st.warning(
+                    f"미매칭 목록이 길어 앞 100건만 UI에 노출됩니다. 나머지 {len(_nomatches) - 100}건은 "
+                    f"미결정으로 스킵됩니다 (엑셀 다운로드로 확인 후 재업로드 하세요)."
+                )
+
+        st.session_state[_decisions_key] = _decisions
 
         st.markdown("#### 4. 임포트 확정")
-        _total_committable = preview.to_create_count + preview.to_attach_count
-        if preview.unresolved_count > 0:
-            _decisions = st.session_state.get(f"legacy_purchase_decisions::{excel_upload.name}", {})
-            _resolved = sum(1 for _v in _decisions.values() if _v)
-            _total_committable += _resolved
+        # 확정 가능 건수:
+        # - to_create + to_attach: 이미 계산된 값
+        # - unresolved: 기본 추천에 attach 되므로 전부 확정 가능
+        # - no_match: 사용자가 명시적으로 'new' 또는 후보 id 를 고른 것만
+        _decisions_now = st.session_state.get(f"legacy_purchase_decisions::{excel_upload.name}", {})
+        _no_match_gks = {
+            f"{g.phone1_digits}::{g.order_date}::{g.ship_number}"
+            for g in preview.groups if g.match_status == "no_match"
+        }
+        def _is_nm_resolved(_k: str, _v: object) -> bool:
+            if _k not in _no_match_gks or _v in (None, "", "skip"):
+                return False
+            return True
+
+        _no_match_resolved = sum(
+            1 for _k, _v in _decisions_now.items() if _is_nm_resolved(_k, _v)
+        )
+        _total_committable = (
+            preview.to_create_count + preview.to_attach_count
+            + preview.unresolved_count + _no_match_resolved
+        )
         if _total_committable == 0:
             st.warning(
                 "임포트할 유효 그룹이 없습니다. "
@@ -32756,14 +32867,22 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                 st.error(f"Supabase 연결 실패: {err}")
                 return
 
-            # unresolved 결정 반영
+            # unresolved / no_match 결정 반영
+            # - unresolved (창 안 후보 2건+): 결정 없으면 추천 후보에 attach (안전 기본값)
+            # - no_match (창 안 후보 0건): 결정 없으면 미결정으로 스킵 (기본값)
             _decisions = st.session_state.get(f"legacy_purchase_decisions::{excel_upload.name}", {})
             for g in preview.groups:
-                if g.match_status != "unresolved":
+                if g.match_status not in ("unresolved", "no_match"):
                     continue
                 gk = f"{g.phone1_digits}::{g.order_date}::{g.ship_number}"
                 dec = _decisions.get(gk)
-                if dec and dec != "new":
+                if dec == "skip":
+                    # 스킵 유지 (match_status 그대로 두면 commit_import 이 스킵)
+                    continue
+                if dec == "new":
+                    g.match_status = "to_create"
+                    continue
+                if dec and dec not in ("skip", "new"):
                     try:
                         _cid = int(dec)
                         if _cid in g.candidate_order_ids:
@@ -32772,13 +32891,17 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                             continue
                     except ValueError:
                         pass
-                # 기본값: 신규 주문
-                g.match_status = "to_create"
+                # 결정 없음 → 상태별 기본값
+                if g.match_status == "unresolved" and g.recommended_order_id:
+                    g.match_status = "to_attach"
+                    g.chosen_order_id = int(g.recommended_order_id)
+                # no_match: 결정 없으면 그대로 (스킵)
 
             # 카운터 재계산 (표시용, 실제로는 commit_import 이 다시 계산)
             preview.to_create_count = sum(1 for g in preview.groups if g.match_status == "to_create")
             preview.to_attach_count = sum(1 for g in preview.groups if g.match_status == "to_attach")
-            preview.unresolved_count = 0
+            preview.unresolved_count = sum(1 for g in preview.groups if g.match_status == "unresolved")
+            preview.no_match_count = sum(1 for g in preview.groups if g.match_status == "no_match")
 
             _current_user = st.session_state.get("current_user") or {}
             _created_by = _current_user.get("name") or _current_user.get("username") or "legacy_purchase_import"
@@ -32827,7 +32950,8 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             if result.failed_orders or result.failed_payments or result.failed_items or result.errors:
                 st.warning(
                     f"실패: 주문 {result.failed_orders}건 / 결제 {result.failed_payments}건 / 라인 {result.failed_items}건. "
-                    f"스킵: 수동미결정 {result.groups_unresolved_skipped}건 / 무효 {result.groups_invalid_skipped}건."
+                    f"스킵: 미매칭 {result.groups_no_match_skipped}건 / 수동미결정 {result.groups_unresolved_skipped}건 / "
+                    f"전시품 {result.groups_display_skipped}건 / 무효 {result.groups_invalid_skipped}건."
                 )
                 for _msg in result.errors[:10]:
                     st.error(_msg)
@@ -32837,6 +32961,14 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                     f"라인 {result.items_inserted}건 (기존주문 attach {result.items_attached_existing}건 포함) · "
                     f"기존고객 주소 보완 {result.customers_address_filled}건."
                 )
+                if (result.groups_no_match_skipped or result.groups_display_skipped
+                        or result.groups_unresolved_skipped):
+                    st.info(
+                        f"스킵 그룹: 미매칭 {result.groups_no_match_skipped}건 · "
+                        f"수동미결정 {result.groups_unresolved_skipped}건 · "
+                        f"전시품 {result.groups_display_skipped}건. "
+                        "위 '📥 미매칭·전시품·오류 리스트 다운로드' 엑셀에서 상세를 확인할 수 있습니다."
+                    )
             _rec_done = st.session_state.get(f"legacy_purchase_reconcile::{excel_upload.name}")
             if _rec_done and getattr(_rec_done, "rows", None):
                 _actor = (
@@ -32878,6 +33010,7 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                     or _k.startswith(f"legacy_purchase_ct_scan::{excel_upload.name}")
                     or _k.startswith(f"legacy_purchase_decisions::{excel_upload.name}")
                     or _k.startswith(f"legacy_purchase_decision::")
+                    or _k.startswith(f"legacy_purchase_no_match_decision::")
                     or _k.startswith(f"legacy_purchase_reconcile::{excel_upload.name}")
                     or _k.startswith(f"legacy_purchase_gemini")
                     or _k.startswith(f"legacy_purchase_ai_merges")

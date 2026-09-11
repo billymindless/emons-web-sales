@@ -163,6 +163,15 @@ _MAPPING_HINTS: dict[str, tuple[list[str], list[str]]] = {
 # 임포트에서 제외할 주문구분 값
 EXCLUDED_ORDER_KINDS: set[str] = {"회수"}
 
+# 전시품(매장 자산) 판별용 주문구분
+DISPLAY_ORDER_KINDS: set[str] = {"매장분"}
+
+# 전시품 판별용 고객명 패턴 (정규화 후 부분일치). 예: '울산삼산리빙(법)'
+_DISPLAY_NAME_PATTERNS: tuple[str, ...] = ("리빙(법)",)
+
+# 매칭 창: 등록일 기준 ±N 일 이내 앱 주문을 후보로 본다.
+MATCH_WINDOW_DAYS: int = 2
+
 # TOTAL 요약 행 판별용 마커 (정상가 등의 셀에 들어가는 문자열)
 _TOTAL_MARKERS: set[str] = {"TOTAL", "SUM", "합계", "총계"}
 
@@ -240,6 +249,25 @@ def _normalize_name_key(name: Any) -> str:
     if not s:
         return ""
     return re.sub(r"\s+", "", s).lower()
+
+
+def is_display_row(customer_name: Any, order_kind: Any = None) -> bool:
+    """전시품(매장 자산) 여부.
+
+    - 고객명 정규화 후 `_DISPLAY_NAME_PATTERNS` 중 하나를 포함 (예: '울산삼산리빙(법)')
+    - 또는 주문구분이 `DISPLAY_ORDER_KINDS` 에 포함 (예: '매장분')
+
+    전화가 있어도 True 면 주문 매칭에서 제외한다.
+    """
+    nk = _normalize_name_key(customer_name)
+    if nk:
+        for pat in _DISPLAY_NAME_PATTERNS:
+            pk = _normalize_name_key(pat)
+            if pk and pk in nk:
+                return True
+    if _clean_str(order_kind) in DISPLAY_ORDER_KINDS:
+        return True
+    return False
 
 
 def compute_identity_key(phone_digits: str, customer_name: Any) -> str:
@@ -397,6 +425,20 @@ class LineItem:
 
 
 @dataclass
+class SkippedRow:
+    """그룹으로 만들지 못한 라인(등록일·출고가 오류 등). 미매칭 엑셀 리포트용."""
+    row_index: int
+    customer_name: str
+    phone1: str
+    order_date: str
+    ship_number: str
+    product_name: str
+    unit_cost: int
+    order_kind: str
+    reason: str
+
+
+@dataclass
 class OrderGroup:
     """1개의 매출 주문. (identity_key, order_date, ship_number) 3튜플 = 1 그룹.
 
@@ -417,17 +459,22 @@ class OrderGroup:
     employee_names: str
     # 라인
     items: list[LineItem] = field(default_factory=list)
+    # 전시품 여부: 고객명 패턴(리빙(법) 등) 또는 주문구분 '매장분' → True.
+    # True 인 그룹은 주문 매칭 없이 목록에만 남기고 commit_import 에서 스킵.
+    is_display: bool = False
     # 파생 집계
     total_unit_cost: int = 0     # sum(unit_cost * quantity)  = 라인 원가 합
     total_line_cost: int = 0     # sum(line_cost)             = 원장 원본 매입금액 합
     total_line_total: int = 0    # sum(line_total)            = VAT 포함 매입 총액
     sale_price: int = 0          # 판매가 = 원가합 / (1 - margin)
     # 매칭 상태
-    match_status: str = "unresolved"  # 'to_create' | 'to_attach' | 'unresolved' | 'invalid'
+    match_status: str = "unresolved"
+    # 'to_create' | 'to_attach' | 'unresolved' | 'no_match' | 'display' | 'invalid'
     existing_customer_id: Optional[int] = None   # 음수 = 세션 신규 슬롯
     candidate_order_ids: list[int] = field(default_factory=list)
     candidate_orders_meta: list[dict] = field(default_factory=list)  # [{"id":..., "total_amount":..., "delivery_date":..., "category":...}, ...]
     chosen_order_id: Optional[int] = None
+    recommended_order_id: Optional[int] = None  # unresolved/no_match 후보 중 가장 가까운 앱 주문 id
     reason: str = ""
 
     @property
@@ -454,14 +501,18 @@ def group_orders(
     mapping: dict[str, str],
     *,
     margin_rate: float = DEFAULT_MARGIN_RATE,
-) -> tuple[list[OrderGroup], dict[str, int]]:
-    """엑셀 df + 매핑 → OrderGroup 리스트 + 카운트 통계.
+) -> tuple[list[OrderGroup], dict[str, int], list[SkippedRow]]:
+    """엑셀 df + 매핑 → (OrderGroup 리스트, 카운트 통계, 스킵된 행 리스트).
 
-    통계: {total_lines, skipped_return, skipped_invalid, group_count}
+    통계: {total_lines, skipped_return, skipped_invalid, group_count, display_count}
     """
-    stats = {"total_lines": 0, "skipped_return": 0, "skipped_invalid": 0, "group_count": 0}
+    stats = {
+        "total_lines": 0, "skipped_return": 0, "skipped_invalid": 0,
+        "group_count": 0, "display_count": 0,
+    }
+    skipped_rows: list[SkippedRow] = []
     if df_raw is None or df_raw.empty:
-        return [], stats
+        return [], stats, skipped_rows
     df = _apply_mapping(df_raw, mapping)
     stats["total_lines"] = len(df)
 
@@ -496,6 +547,17 @@ def group_orders(
             problems.append("출고가 없음")
         if problems:
             stats["skipped_invalid"] += 1
+            skipped_rows.append(SkippedRow(
+                row_index=int(i),
+                customer_name=_name_parsed or _clean_str(row.get("customer_name")),
+                phone1=phone1_raw,
+                order_date=order_date or _clean_str(row.get("order_date")),
+                ship_number=ship_number,
+                product_name=_clean_str(row.get("product_name")),
+                unit_cost=unit_cost,
+                order_kind=kind,
+                reason=" / ".join(problems),
+            ))
             continue
 
         # 그룹핑 키: identity_key (전화 or NAME:이름) + 등록일 + 출고번호(옵션)
@@ -514,8 +576,12 @@ def group_orders(
                 address=combine_address(row.get("address"), row.get("address2")),
                 delivery_date=parse_date(row.get("delivery_date")),
                 employee_names=_clean_str(row.get("employee_names")),
+                is_display=is_display_row(_name_parsed, kind),
             )
             groups[key] = group
+        # 그룹 안에 매장분 라인이 하나라도 있으면 전시품으로 표시 (첫 라인이 주문이었더라도)
+        elif not group.is_display and is_display_row(_name_parsed, kind):
+            group.is_display = True
 
         # 첫 등장이 아니어도 배송일/담당자 등이 비어있으면 보완
         if not group.delivery_date:
@@ -555,7 +621,8 @@ def group_orders(
         g.sale_price = compute_sale_price(g.total_line_cost, margin_rate)
 
     stats["group_count"] = len(groups)
-    return list(groups.values()), stats
+    stats["display_count"] = sum(1 for g in groups.values() if g.is_display)
+    return list(groups.values()), stats, skipped_rows
 
 
 # ---------------------------------------------------------------------------
@@ -574,11 +641,16 @@ class PurchasePreviewResult:
     to_create_count: int = 0
     to_attach_count: int = 0
     unresolved_count: int = 0
+    no_match_count: int = 0
+    """고객은 존재하지만 ±MATCH_WINDOW_DAYS 창에 앱 주문이 없는 그룹 수."""
+    display_count: int = 0
+    """전시품(매장 자산) 그룹 수. commit_import 에서 스킵된다."""
     invalid_count: int = 0
     total_sale_amount: int = 0
     total_cost_amount: int = 0
     yearly_stats: list[dict] = field(default_factory=list)
     orders_by_cid: dict = field(default_factory=dict)
+    skipped_rows: list[SkippedRow] = field(default_factory=list)
 
 
 def load_existing_customer_identity_map(client, store_name: str) -> dict[str, int]:
@@ -673,6 +745,60 @@ def _fetch_existing_orders(client, db_filename: str) -> tuple[dict[tuple[int, st
             break
         offset += _PAGE
     return by_date, by_cid
+
+
+def _window_candidates(
+    orders_for_cid: list[dict], order_date: Optional[str], window_days: int = MATCH_WINDOW_DAYS,
+) -> list[dict]:
+    """등록일 ±window_days 앱 주문 후보. 날짜 간격 → id 순 정렬."""
+    if not order_date or not orders_for_cid:
+        return []
+    try:
+        gdate = date.fromisoformat(order_date)
+    except ValueError:
+        return []
+    scored: list[tuple[int, int, dict]] = []
+    for o in orders_for_cid:
+        od = str(o.get("order_date") or "")[:10]
+        if len(od) < 10:
+            continue
+        try:
+            odate = date.fromisoformat(od)
+        except ValueError:
+            continue
+        gap = abs((odate - gdate).days)
+        if gap <= window_days:
+            scored.append((gap, int(o.get("id") or 0), o))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [o for _, _, o in scored]
+
+
+def _pick_recommended(candidates: list[dict], sale_price: int, order_date: Optional[str]) -> Optional[dict]:
+    """후보 중 추천 1건: (날짜 간격 → 판매가 차이 → id) 오름차순."""
+    if not candidates:
+        return None
+    try:
+        gdate = date.fromisoformat(order_date) if order_date else None
+    except ValueError:
+        gdate = None
+    scored: list[tuple[int, int, int, dict]] = []
+    for c in candidates:
+        if gdate is not None:
+            od = str(c.get("order_date") or "")[:10]
+            try:
+                gap = abs((date.fromisoformat(od) - gdate).days) if len(od) == 10 else 9999
+            except ValueError:
+                gap = 9999
+        else:
+            gap = 0
+        try:
+            tot = int(round(float(c.get("total_amount") or 0)))
+        except (TypeError, ValueError):
+            tot = 0
+        amt_diff = abs(tot - int(sale_price or 0))
+        scored.append((gap, amt_diff, int(c.get("id") or 0), c))
+    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+    return scored[0][3]
 
 
 def _delivery_fallback_candidates(group, orders_for_cid: list[dict]) -> tuple[list[dict], str]:
@@ -821,6 +947,15 @@ def build_preview(
             result.groups.append(g)
             continue
 
+        # 전시품(매장 자산): 주문/고객 매칭·생성 없이 목록에만 남긴다.
+        # commit_import 에서 invalid 와 동일하게 스킵된다.
+        if g.is_display:
+            g.match_status = "display"
+            g.reason = "전시품 (매장 자산): 주문 미첨부"
+            result.display_count += 1
+            result.groups.append(g)
+            continue
+
         # 고객 매칭 (identity_key 기반: 전화 우선, 없으면 이름 기반)
         existing_cid = existing_customers_by_phone.get(g.identity_key)
         if existing_cid is not None:
@@ -847,19 +982,42 @@ def build_preview(
 
         # 앱 후보 주문 조회 (DB 실존 고객만 대상, 세션 신규 슬롯은 무조건 to_create)
         if g.existing_customer_id is not None and g.existing_customer_id >= 0:
-            key = (int(g.existing_customer_id), g.order_date or "")
-            candidates = existing_orders_by_cid_date.get(key, [])
-            g.candidate_order_ids = [c["id"] for c in candidates if c.get("id") is not None]
-            g.candidate_orders_meta = [c for c in candidates if c.get("id") is not None]
-            if len(g.candidate_order_ids) == 0:
-                fb, how = _delivery_fallback_candidates(
-                    g, existing_orders_by_cid.get(int(g.existing_customer_id), []),
-                )
+            orders_for_cid = existing_orders_by_cid.get(int(g.existing_customer_id), [])
+            window_cands = _window_candidates(orders_for_cid, g.order_date, MATCH_WINDOW_DAYS)
+            if len(window_cands) == 1:
+                # 창 안에 정확히 1건 → 자동 attach
+                _only = window_cands[0]
+                g.candidate_order_ids = [_only["id"]]
+                g.candidate_orders_meta = [_only]
+                g.chosen_order_id = _only["id"]
+                g.recommended_order_id = _only["id"]
+                _gap = 0
+                try:
+                    _gap = abs((date.fromisoformat(str(_only.get("order_date") or "")[:10])
+                                - date.fromisoformat(g.order_date)).days)
+                except (TypeError, ValueError):
+                    _gap = 0
+                g.reason = f"등록일 {'정확' if _gap == 0 else f'±{_gap}일'} 매칭"
+                g.match_status = "to_attach"
+                result.to_attach_count += 1
+            elif len(window_cands) >= 2:
+                # 창 안에 2건+ → 수동. 추천은 (날짜 간격 → 금액 차이 → id) 최소.
+                g.candidate_order_ids = [c["id"] for c in window_cands]
+                g.candidate_orders_meta = window_cands
+                rec = _pick_recommended(window_cands, g.sale_price, g.order_date)
+                g.recommended_order_id = int(rec["id"]) if rec else None
+                g.match_status = "unresolved"
+                g.reason = f"등록일 ±{MATCH_WINDOW_DAYS}일 후보 {len(window_cands)}건 (추천 #{g.recommended_order_id})"
+                result.unresolved_count += 1
+            else:
+                # 창 안 0건 → 배송일 폴백 시도
+                fb, how = _delivery_fallback_candidates(g, orders_for_cid)
                 if how == "exact" and len(fb) == 1:
                     g.match_status = "to_attach"
                     g.chosen_order_id = fb[0]["id"]
                     g.candidate_order_ids = [fb[0]["id"]]
                     g.candidate_orders_meta = fb
+                    g.recommended_order_id = fb[0]["id"]
                     g.reason = "배송일 정확 매칭"
                     result.to_attach_count += 1
                 elif how == "near" and len(fb) == 1:
@@ -867,25 +1025,30 @@ def build_preview(
                     g.chosen_order_id = fb[0]["id"]
                     g.candidate_order_ids = [fb[0]["id"]]
                     g.candidate_orders_meta = fb
+                    g.recommended_order_id = fb[0]["id"]
                     g.reason = "배송일 ±2일 근사 매칭"
                     result.to_attach_count += 1
                 elif how == "multi" and fb:
-                    g.match_status = "unresolved"
                     g.candidate_order_ids = [c["id"] for c in fb if c.get("id") is not None]
                     g.candidate_orders_meta = fb
-                    g.reason = f"배송일 후보 {len(fb)}건"
+                    rec = _pick_recommended(fb, g.sale_price, g.order_date)
+                    g.recommended_order_id = int(rec["id"]) if rec else None
+                    g.match_status = "unresolved"
+                    g.reason = f"배송일 후보 {len(fb)}건 (추천 #{g.recommended_order_id})"
                     result.unresolved_count += 1
                 else:
-                    g.match_status = "to_create"
-                    result.to_create_count += 1
-            elif len(g.candidate_order_ids) == 1:
-                g.match_status = "to_attach"
-                g.chosen_order_id = g.candidate_order_ids[0]
-                result.to_attach_count += 1
-            else:
-                g.match_status = "unresolved"
-                g.reason = f"동일 (고객, 등록일) 앱 주문 {len(g.candidate_order_ids)}건 존재"
-                result.unresolved_count += 1
+                    # 미매칭: 고객은 있는데 ±MATCH_WINDOW_DAYS 창·배송일 후보 모두 0건.
+                    # 신규 주문을 자동으로 만들지 않는다. 참고용으로 이 고객 최근 주문 10건까지 노출.
+                    _recent = sorted(
+                        (o for o in orders_for_cid if o.get("id") is not None),
+                        key=lambda o: str(o.get("order_date") or "0000-00-00"),
+                        reverse=True,
+                    )[:10]
+                    g.candidate_order_ids = [c["id"] for c in _recent]
+                    g.candidate_orders_meta = _recent
+                    g.match_status = "no_match"
+                    g.reason = f"등록일 ±{MATCH_WINDOW_DAYS}일 창 후보 없음 (고객 존재)"
+                    result.no_match_count += 1
         else:
             g.match_status = "to_create"
             result.to_create_count += 1
@@ -907,17 +1070,26 @@ def build_preview(
     return result
 
 
+_STATUS_LABEL: dict[str, str] = {
+    "to_create":  "신규(완납)",
+    "to_attach":  "라인만 추가(기존 금액·잔금 유지)",
+    "unresolved": "수동 선택 필요",
+    "no_match":   "미매칭 (앱 주문 없음)",
+    "display":    "전시품 (매장 자산)",
+    "invalid":    "스킵/오류",
+}
+
+
 def preview_to_dataframe(preview: PurchasePreviewResult, max_rows: int = 500) -> pd.DataFrame:
     """미리보기 결과를 화면 표시용 DataFrame 으로."""
-    _STATUS_LABEL = {
-        "to_create":  "신규(완납)",
-        "to_attach":  "라인만 추가(기존 금액·잔금 유지)",
-        "unresolved": "수동 선택 필요",
-        "invalid":    "스킵/오류",
-    }
     rows = []
     for g in preview.groups[:max_rows]:
-        _id_type = "매장 전시" if g.is_display_customer else "전화 매칭"
+        if g.is_display:
+            _id_type = "전시품"
+        elif g.is_display_customer:
+            _id_type = "이름 매칭"
+        else:
+            _id_type = "전화 매칭"
         entered_sale = None
         if g.match_status == "to_attach":
             meta = None
@@ -942,6 +1114,7 @@ def preview_to_dataframe(preview: PurchasePreviewResult, max_rows: int = 500) ->
             "출고번호": g.ship_number,
             "라인수": len(g.items),
             "매입금액(합)": g.total_line_cost,
+            "추천주문": g.recommended_order_id if g.recommended_order_id else "",
             "후보주문": ", ".join(str(x) for x in g.candidate_order_ids[:5]) + ("…" if len(g.candidate_order_ids) > 5 else ""),
             "사유": g.reason,
         }
@@ -951,6 +1124,59 @@ def preview_to_dataframe(preview: PurchasePreviewResult, max_rows: int = 500) ->
             row["판매가(역산)"] = g.sale_price
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def build_review_excel(preview: PurchasePreviewResult) -> bytes:
+    """미매칭·수동필요·전시품·오류 시트로 나눈 리뷰용 엑셀 바이트."""
+
+    def _group_df(statuses: tuple[str, ...]) -> pd.DataFrame:
+        rows = []
+        for g in preview.groups:
+            if g.match_status not in statuses:
+                continue
+            rows.append({
+                "상태": _STATUS_LABEL.get(g.match_status, g.match_status),
+                "고객명": g.customer_name + (f"[{g.customer_tag}]" if g.customer_tag else ""),
+                "전화1": g.phone1,
+                "등록일": g.order_date or "",
+                "배송일": g.delivery_date or "",
+                "출고번호": g.ship_number,
+                "라인수": len(g.items),
+                "매입금액(합)": g.total_line_cost,
+                "판매가(역산)": g.sale_price,
+                "추천주문": g.recommended_order_id or "",
+                "후보주문": ", ".join(str(x) for x in g.candidate_order_ids[:10])
+                + ("…" if len(g.candidate_order_ids) > 10 else ""),
+                "품목(라인)": " / ".join(
+                    (it.product_name or "").strip() for it in g.items if it.product_name
+                )[:500],
+                "사유": g.reason,
+            })
+        return pd.DataFrame(rows)
+
+    def _skipped_df() -> pd.DataFrame:
+        rows = []
+        for s in preview.skipped_rows:
+            rows.append({
+                "row_index": s.row_index,
+                "고객명": s.customer_name,
+                "전화1": s.phone1,
+                "등록일": s.order_date,
+                "출고번호": s.ship_number,
+                "품명": s.product_name,
+                "출고가": s.unit_cost,
+                "주문구분": s.order_kind,
+                "사유": s.reason,
+            })
+        return pd.DataFrame(rows)
+
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        _group_df(("no_match",)).to_excel(xw, sheet_name="미매칭", index=False)
+        _group_df(("unresolved",)).to_excel(xw, sheet_name="수동선택", index=False)
+        _group_df(("display",)).to_excel(xw, sheet_name="전시품", index=False)
+        _skipped_df().to_excel(xw, sheet_name="오류(파싱실패)", index=False)
+    return bio.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -1059,6 +1285,8 @@ class PurchaseCommitResult:
     items_inserted: int = 0
     items_attached_existing: int = 0
     groups_unresolved_skipped: int = 0
+    groups_no_match_skipped: int = 0
+    groups_display_skipped: int = 0
     groups_invalid_skipped: int = 0
     failed_orders: int = 0
     failed_payments: int = 0
@@ -1325,8 +1553,10 @@ def commit_import(
       2b) to_create 주문에만 app_payments 전액 완납 INSERT (미수 처리 방지용)
       3) 모든 to_create/to_attach 그룹 → app_order_items INSERT
          (to_attach 는 라인만 붙이고, 주문 헤더·기존 결제·잔금은 절대 변경하지 않음)
-      4) unresolved · invalid 는 스킵 (카운트만)
+      4) display · no_match · unresolved · invalid 는 스킵 (카운트만).
+         전시품(display)·미매칭(no_match)·확정 안된 후보(unresolved) 는 고객/주문/결제/라인 어느 것도 INSERT 하지 않는다.
     """
+    _SKIP_STATUSES = {"display", "no_match", "unresolved", "invalid"}
     res = PurchaseCommitResult()
     if client is None or not store_name or not db_filename:
         res.errors.append("client/store_name/db_filename 필수")
@@ -1334,18 +1564,21 @@ def commit_import(
 
     # 기존(이미 DB에 있던) 고객 → 엑셀 주소 매핑. Phase 1 의 신규 슬롯 교체 전에 캡처해야
     # 이번에 새로 생성되는 고객이 섞여 들어가지 않는다.
+    # 전시품/미매칭/미확정 그룹은 주소 보완도 하지 않음 (확정된 그룹 소속 고객만 보완).
     existing_cid_to_address: dict[int, str] = {}
     for g in preview.groups:
-        if g.match_status == "invalid":
+        if g.match_status in _SKIP_STATUSES:
             continue
         cid = g.existing_customer_id
         if cid is not None and cid > 0 and g.address:
             existing_cid_to_address.setdefault(cid, g.address)
 
     # ---- Phase 1: 신규 고객 INSERT ----
+    # 확정된 to_create/to_attach 그룹의 신규 슬롯만 실제 INSERT.
+    # 전시품/미매칭/미확정 그룹은 신규 고객 생성 대상에서 제외.
     slot_to_group: dict[int, OrderGroup] = {}
     for g in preview.groups:
-        if g.match_status in ("invalid",):
+        if g.match_status in _SKIP_STATUSES:
             continue
         if g.existing_customer_id is not None and g.existing_customer_id < 0:
             slot_to_group.setdefault(g.existing_customer_id, g)
@@ -1514,10 +1747,14 @@ def commit_import(
         if progress_cb:
             progress_cb("라인 저장", min(1.0, (_bi + len(chunk)) / max(1, len(item_payloads))))
 
-    # ---- Phase 4: unresolved/invalid 카운트 ----
+    # ---- Phase 4: 스킵 카운트 (display / no_match / unresolved / invalid) ----
     for g in preview.groups:
         if g.match_status == "unresolved":
             res.groups_unresolved_skipped += 1
+        elif g.match_status == "no_match":
+            res.groups_no_match_skipped += 1
+        elif g.match_status == "display":
+            res.groups_display_skipped += 1
         elif g.match_status == "invalid":
             res.groups_invalid_skipped += 1
 
