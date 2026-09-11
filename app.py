@@ -4641,143 +4641,95 @@ def load_customers_cached(db_filename: str, limit: int | None = 50, col_list: st
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=1800)
-def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFrame:
-    """Sales 테이블 캐시 로딩 (ttl=30분). Supabase sales 테이블, id 기준. limit=None이면 전체(대시보드 집계용).
-    employee_names, order_id 포함 조회 - 대시보드 직원별 집계에 활용.
+def _load_orders_as_sales(
+    db_filename: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    """app_orders 를 'sales' 스키마로 변환해 반환 (계약 시점 매출 통일 관례).
 
-    PostgREST 기본 행 상한(1000) 초과 시 누락 방지를 위해 limit=None 이거나 limit>1000 이면 페이지네이션으로 전체 조회.
+    - transaction_date ← order_date (판매일/계약일)
+    - amount ← total_amount (계약 시점 판매가)
+    - order_id ← id
+    - employee_names 유지 · note 는 None
+    매장 격리는 app_orders.db_filename 서버 필터로 이미 보장되므로 별도 후처리 없음.
     """
-
-    def _run_query(select_cols: str) -> list:
-        tenant_col = _sales_tenant_column()
-
-        def _base():
-            q = client.table("sales").select(select_cols)
-            if tenant_col:
-                q = q.eq(tenant_col, db_filename)
-            return q.order("id", desc=True)
-
-        if limit is not None and limit <= 1000:
-            return (_base().limit(limit).execute().data or [])
-
-        _PAGE = 1000
-        rows_all: list = []
-        offset = 0
-        while True:
-            r = _base().range(offset, offset + _PAGE - 1).execute()
-            page = r.data or []
-            rows_all.extend(page)
-            if len(page) < _PAGE:
-                break
-            offset += _PAGE
-            if limit is not None and len(rows_all) >= limit:
-                rows_all = rows_all[:limit]
-                break
-        return rows_all
-
+    _cols_out = ["transaction_date", "amount", "order_id", "employee_names", "note"]
+    _empty = pd.DataFrame(columns=_cols_out)
+    if not db_filename or not _supabase_orders_payments_available():
+        return _empty
     client, err = get_supabase_client()
-    if err:
-        if "supabase_error" not in st.session_state:
+    if err or client is None:
+        if err and "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = err
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names", "note"])
+        return _empty
+
+    def _base():
+        q = client.table("app_orders").select("id, order_date, total_amount, employee_names")\
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+        if start_date:
+            q = q.gte("order_date", start_date)
+        if end_date:
+            q = q.lte("order_date", end_date)
+        return q.order("id", desc=True)
+
     try:
-        rows = _run_query("transaction_date, amount, order_id, employee_names, note")
-        if rows:
-            st.session_state.pop("supabase_error", None)
-            return _filter_sales_to_store_orders(db_filename, pd.DataFrame(rows))
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names", "note"])
+        if limit is not None and limit <= 1000:
+            rows = _base().limit(limit).execute().data or []
+        else:
+            _PAGE = 1000
+            rows = []
+            offset = 0
+            while True:
+                r = _base().range(offset, offset + _PAGE - 1).execute()
+                page = r.data or []
+                rows.extend(page)
+                if len(page) < _PAGE:
+                    break
+                offset += _PAGE
+                if limit is not None and len(rows) >= limit:
+                    rows = rows[:limit]
+                    break
     except Exception as e:
-        # employee_names 컬럼이 없는 구 스키마면 기본 컬럼만 조회
-        try:
-            rows2 = _run_query("transaction_date, amount, order_id")
-            if rows2:
-                df2 = pd.DataFrame(rows2)
-                df2["employee_names"] = None
-                if "note" not in df2.columns:
-                    df2["note"] = None
-                return _filter_sales_to_store_orders(db_filename, df2)
-        except Exception:
-            pass
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "employee_names", "note"])
+        return _empty
+
+    if not rows:
+        return _empty
+    st.session_state.pop("supabase_error", None)
+    df = pd.DataFrame(rows).rename(columns={
+        "order_date": "transaction_date",
+        "total_amount": "amount",
+        "id": "order_id",
+    })
+    if "employee_names" not in df.columns:
+        df["employee_names"] = None
+    df["note"] = None
+    return df[_cols_out]
 
 
-@st.cache_data(ttl=600)
-def _get_store_order_ids_cached(db_filename: str) -> list[int]:
-    """매장별 app_orders id 목록 캐시. sales 테넌트 컬럼 미설정 시 2차 격리 필터에 사용.
+@st.cache_data(ttl=1800)
+def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFrame:
+    """매출 로더 (ttl=30분).
 
-    PostgREST 기본 상한(1000) 초과 시 누락 방지를 위해 페이지네이션으로 전체 조회.
-    (id 리스트가 잘리면 sales 필터가 최신 1000건 주문만 통과시켜 실 매출/미수금이 사라짐.)
+    2026-09 관례 변경: 매장 매출은 **계약 시점 total_amount (app_orders)** 기준으로 통일.
+    기존 sales 원장(분개 인식일·조정 반영)이 아닌 app_orders 를 sales 스키마로 변환해 반환.
+    반환 스키마(transaction_date, amount, order_id, employee_names, note)는 그대로 유지되어
+    대시보드·판매 리포트가 코드 변경 없이 계약 시점 기준으로 재계산된다.
     """
-    if not db_filename or not _supabase_orders_payments_available():
-        return []
-    client, err = get_supabase_client()
-    if err or not client:
-        return []
-    try:
-        _PAGE = 1000
-        all_ids: list[int] = []
-        offset = 0
-        while True:
-            r = client.table("app_orders").select("id").eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).order("id").range(offset, offset + _PAGE - 1).execute()
-            rows = (r.data or []) if hasattr(r, "data") else []
-            all_ids.extend(int(x["id"]) for x in rows if x.get("id") is not None)
-            if len(rows) < _PAGE:
-                break
-            offset += _PAGE
-        return all_ids
-    except Exception:
-        return []
-
-
-def _filter_sales_to_store_orders(db_filename: str, sales_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    sales 테이블 매장 격리 보정.
-    - sales_tenant_column이 있으면 테넌트 필터가 이미 적용되므로 그대로 반환.
-    - 없으면 app_orders(db_filename) 기준 order_id 교집합만 유지.
-    """
-    if sales_df.empty:
-        return sales_df
-    if _sales_tenant_column():
-        return sales_df
-    if "order_id" not in sales_df.columns:
-        return sales_df.iloc[0:0].copy()
-
-    valid_order_ids = _get_store_order_ids_cached(db_filename)
-    if not valid_order_ids:
-        return sales_df.iloc[0:0].copy()
-
-    _oid = pd.to_numeric(sales_df["order_id"], errors="coerce")
-    filtered = sales_df[_oid.isin(valid_order_ids)].copy()
-    return filtered
+    return _load_orders_as_sales(db_filename, limit=limit)
 
 
 @st.cache_data(ttl=600)
 def load_sales_with_employees_cached(db_filename: str, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
-    """sales 테이블에서 employee_names 포함 조회 (직원별 판매 실적 보고서용). transaction_date 기준 필터."""
-    client, err = get_supabase_client()
-    if err:
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "note", "employee_names"])
-    try:
-        q = client.table("sales").select("transaction_date, amount, order_id, note, employee_names")
-        tenant_col = _sales_tenant_column()
-        if tenant_col:
-            q = q.eq(tenant_col, db_filename)
-        if start_date:
-            q = q.gte("transaction_date", start_date)
-        if end_date:
-            q = q.lte("transaction_date", end_date)
-        q = q.order("transaction_date", desc=False)
-        r = q.execute()
-        if r.data:
-            return _filter_sales_to_store_orders(db_filename, pd.DataFrame(r.data))
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "note", "employee_names"])
-    except Exception as e:
-        if "supabase_error" not in st.session_state:
-            st.session_state["supabase_error"] = str(e)
-        return pd.DataFrame(columns=["transaction_date", "amount", "order_id", "note", "employee_names"])
+    """직원 포함 매출 로더 (ttl=10분).
+
+    2026-09 관례 변경: 매출은 **계약 시점 total_amount (app_orders)** 기준. 기간 필터는
+    transaction_date(=order_date) 로 그대로 적용된다. 반환 스키마는 기존과 동일.
+    """
+    return _load_orders_as_sales(db_filename, start_date=start_date, end_date=end_date)
 
 
 @st.cache_data(ttl=1800)
@@ -5298,7 +5250,6 @@ def clear_data_cache():
         "load_sales_cached",
         "load_sales_with_employees_cached",
         "load_payment_history_dashboard_cached",
-        "_get_store_order_ids_cached",
         "_cached_store_aov_30d",
         "_cached_employee_monthly_max",
         "_count_orders_on_date",
@@ -5334,7 +5285,7 @@ def clear_data_cache():
 def _invalidate_orders() -> None:
     """주문 CRUD 후 호출. 주문 · 매출 · 결제 통합 캐시 무효화."""
     for _name in ("_load_orders_supabase", "load_orders_cached", "load_sales_cached",
-                  "load_sales_with_employees_cached", "_get_store_order_ids_cached",
+                  "load_sales_with_employees_cached",
                   "_cached_store_aov_30d", "_cached_employee_monthly_max",
                   "_count_orders_on_date"):
         _fn = globals().get(_name)
