@@ -174,26 +174,59 @@ def _fetch_orders(store_keys: list[str], start: date, end: date) -> pd.DataFrame
         return pd.DataFrame()
 
 
-def _fetch_orders_by_order_date(store_keys: list[str], start: date, end: date) -> pd.DataFrame:
-    """app_orders 조회. order_date(계약/주문일) 기준 기간 필터.
+def _apply_sales_ledger_to_orders(orders: pd.DataFrame) -> pd.DataFrame:
+    """orders.total_amount 를 sales 원장 조정·반품을 반영한 effective 값으로 덮어쓴다.
 
-    지역·건물(아파트) 집계용 — 마케팅 인사이트 지도(app.py)가 order_date 기준으로
-    orders.total_amount 를 집계하는 것과 동일한 정의를 맞추기 위해 사용한다.
+    - sales 원장에 order_id 매칭 행이 하나라도 있으면: sum(sales.amount) 사용
+      (계약 시 초기 INSERT 분 + 이후 조정·반품 이력 자동 반영)
+    - 하나도 없으면: 원 total_amount 유지 (매입 원장 임포트 등 sales 미기록 매장 대응)
+    반환은 새 DataFrame (원본 mutate 없음).
     """
+    if orders is None or orders.empty or "id" not in orders.columns:
+        return orders
     client = _get_client()
-    if client is None or not store_keys:
-        return pd.DataFrame()
-    cols = "id, db_filename, customer_id, order_date, total_amount"
+    if client is None:
+        return orders
+    _oids = [int(x) for x in pd.to_numeric(orders["id"], errors="coerce").dropna().astype(int).tolist()]
+    if not _oids:
+        return orders
+    sales_sum: dict[int, float] = {}
+    _CHUNK = 500
     try:
-        q = client.table("app_orders").select(cols)\
-            .in_("db_filename", store_keys)\
-            .gte("order_date", start.isoformat())\
-            .lte("order_date", end.isoformat())
-        r = q.execute()
-        rows = (r.data or []) if hasattr(r, "data") else []
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+        for i in range(0, len(_oids), _CHUNK):
+            batch = _oids[i:i + _CHUNK]
+            r = client.table("sales").select("order_id, amount").in_("order_id", batch).execute()
+            for row in (r.data or []):
+                oid = row.get("order_id")
+                if oid is None:
+                    continue
+                try:
+                    sales_sum[int(oid)] = sales_sum.get(int(oid), 0.0) + float(row.get("amount") or 0)
+                except (TypeError, ValueError):
+                    continue
+    except Exception as _e:
+        logger.warning("_apply_sales_ledger_to_orders sales join failed: %s", _e)
+        return orders
+
+    if not sales_sum:
+        return orders
+    out = orders.copy()
+
+    def _eff(row) -> float:
+        oid = row.get("id")
+        try:
+            oi = int(oid) if oid is not None else None
+        except (TypeError, ValueError):
+            oi = None
+        if oi is not None and oi in sales_sum:
+            return float(sales_sum[oi])
+        try:
+            return float(row.get("total_amount") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    out["total_amount"] = out.apply(_eff, axis=1)
+    return out
 
 
 def _sales_tenant_column() -> str | None:
@@ -419,15 +452,14 @@ def _to_num(s: pd.Series) -> pd.Series:
 def compute_kpi(sales: pd.DataFrame, orders: pd.DataFrame, payments: pd.DataFrame) -> dict:
     """핵심 KPI 계산.
 
-    판매(순매출·건수·객단가·마진)는 **판매일(order_date)** 기준,
-    실수납액만 **결제일(payment_date)** 기준이다.
-      - sales_amount: app_orders.total_amount 합 (계약 판매가).
-        sales 원장은 매입 원장 임포트·모모 전용 매장에 거의 없어, 원장만 합치면
-        건수·수납액과 어긋난 과소 집계가 난다. 판매건수와 같은 주문 집합을 쓴다.
+    판매(순매출·건수·객단가·마진)는 **판매일(order_date)** 기준, 실수납액만 결제일 기준.
+    orders["total_amount"] 는 build_dataset 에서 _apply_sales_ledger_to_orders 로 이미
+    조정·반품이 반영된 effective 값이라, 단순 sum 만 하면 된다.
+      - sales_amount: sum(orders.total_amount) — 계약 시점 baseline + sales 원장 조정/반품
       - sales_count: 주문 건수 (app_orders)
-      - aov: 판매건수 > 0 인 경우 sales_amount / sales_count
+      - aov: sales_amount / sales_count
       - margin_rate: (total_amount - cost_price - display_cost_amount) / total_amount
-      - payments_amount: app_payments.amount 합 (결제일 기준)
+      - payments_amount: sum(app_payments.amount) (결제일 기준)
     """
     if not orders.empty and "total_amount" in orders.columns:
         sales_amount = int(_to_num(orders["total_amount"]).sum())
@@ -856,21 +888,14 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
     """
     store_keys, store_names, display_name = _store_keys_and_names(store_key)
 
-    orders = _fetch_orders(store_keys, start, end)
+    orders = _apply_sales_ledger_to_orders(_fetch_orders(store_keys, start, end))
     sales = _fetch_sales(store_keys, start, end)
     payments = _fetch_payments(store_keys, start, end)
 
-    # 지역·건물 집계용: order_date(계약/주문일) 기준 주문 — 마케팅 인사이트 지도와
-    # 동일한 정의(order_date + orders.total_amount)로 통일하기 위함.
-    orders_by_order_date = _fetch_orders_by_order_date(store_keys, start, end)
-
-    # 고객은 orders.customer_id + orders_by_order_date.customer_id 로 조회
-    # (매장 필터 무관, merge 커버리지 최대화)
+    # 고객 id 집합 (지역·건물 merge 커버리지)
     _cids_set: set[int] = set()
     if not orders.empty and "customer_id" in orders.columns:
         _cids_set |= set(pd.to_numeric(orders["customer_id"], errors="coerce").dropna().astype(int).tolist())
-    if not orders_by_order_date.empty and "customer_id" in orders_by_order_date.columns:
-        _cids_set |= set(pd.to_numeric(orders_by_order_date["customer_id"], errors="coerce").dropna().astype(int).tolist())
     customers = _fetch_customers_by_ids(sorted(_cids_set))
     leads = _fetch_leads(store_names, start, end)
     building_aliases = _fetch_building_aliases(store_names)
@@ -879,14 +904,14 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
 
     # WoW/MoM (직전 동일 길이 기간)
     prev_start, prev_end = prev_period(start, end)
-    p_orders = _fetch_orders(store_keys, prev_start, prev_end)
+    p_orders = _apply_sales_ledger_to_orders(_fetch_orders(store_keys, prev_start, prev_end))
     p_sales = _fetch_sales(store_keys, prev_start, prev_end)
     p_payments = _fetch_payments(store_keys, prev_start, prev_end)
     kpi_prev = compute_kpi(p_sales, p_orders, p_payments)
 
     # YoY (있으면)
     yoy_start, yoy_end = year_ago_period(start, end)
-    y_orders = _fetch_orders(store_keys, yoy_start, yoy_end)
+    y_orders = _apply_sales_ledger_to_orders(_fetch_orders(store_keys, yoy_start, yoy_end))
     y_sales = _fetch_sales(store_keys, yoy_start, yoy_end)
     y_payments = _fetch_payments(store_keys, yoy_start, yoy_end)
     kpi_yoy = compute_kpi(y_sales, y_orders, y_payments)
@@ -924,8 +949,8 @@ def build_dataset(period_type: str, start: date, end: date, store_key: str) -> d
         "generated_at": pd.Timestamp.now(tz="Asia/Seoul").isoformat(),
         "kpi": kpi_now,
         "by_employee": group_by_employee(sales, orders),
-        "by_region": group_by_region(orders_by_order_date, customers),
-        "by_building": group_by_building(orders_by_order_date, customers, aliases=building_aliases),
+        "by_region": group_by_region(orders, customers),
+        "by_building": group_by_building(orders, customers, aliases=building_aliases),
         "by_category": group_by_category(orders),
         "by_visit_reason": group_by_visit_reason(orders),
         "by_purchase_reason": group_by_purchase_reason(orders),

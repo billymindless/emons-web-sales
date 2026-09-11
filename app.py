@@ -4647,13 +4647,16 @@ def _load_orders_as_sales(
     end_date: str | None = None,
     limit: int | None = None,
 ) -> pd.DataFrame:
-    """app_orders 를 'sales' 스키마로 변환해 반환 (계약 시점 매출 통일 관례).
+    """계약월 매출 = app_orders.total_amount 를 baseline 으로, sales 원장 조정/반품을 병합.
 
-    - transaction_date ← order_date (판매일/계약일)
-    - amount ← total_amount (계약 시점 판매가)
-    - order_id ← id
-    - employee_names 유지 · note 는 None
-    매장 격리는 app_orders.db_filename 서버 필터로 이미 보장되므로 별도 후처리 없음.
+    정의:
+      - 각 주문에 대한 매출 = sum(sales.amount WHERE order_id = order.id) — 조정·반품 반영
+      - sales 원장에 해당 주문 행이 하나도 없으면 fallback = app_orders.total_amount
+        (매입 원장 임포트 등 sales 미기록 매장 대응)
+      - transaction_date = 주문의 order_date → 매출은 **계약월** 버킷에 잡힘
+
+    반환 스키마 (transaction_date, amount, order_id, employee_names, note) — 기존 sales 로더와 호환.
+    매장 격리는 app_orders.db_filename 서버 필터로 보장.
     """
     _cols_out = ["transaction_date", "amount", "order_id", "employee_names", "note"]
     _empty = pd.DataFrame(columns=_cols_out)
@@ -4665,7 +4668,8 @@ def _load_orders_as_sales(
             st.session_state["supabase_error"] = err
         return _empty
 
-    def _base():
+    # 1) 계약월 필터로 주문 로드
+    def _base_orders():
         q = client.table("app_orders").select("id, order_date, total_amount, employee_names")\
             .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
         if start_date:
@@ -4676,48 +4680,84 @@ def _load_orders_as_sales(
 
     try:
         if limit is not None and limit <= 1000:
-            rows = _base().limit(limit).execute().data or []
+            order_rows = _base_orders().limit(limit).execute().data or []
         else:
             _PAGE = 1000
-            rows = []
+            order_rows = []
             offset = 0
             while True:
-                r = _base().range(offset, offset + _PAGE - 1).execute()
+                r = _base_orders().range(offset, offset + _PAGE - 1).execute()
                 page = r.data or []
-                rows.extend(page)
+                order_rows.extend(page)
                 if len(page) < _PAGE:
                     break
                 offset += _PAGE
-                if limit is not None and len(rows) >= limit:
-                    rows = rows[:limit]
+                if limit is not None and len(order_rows) >= limit:
+                    order_rows = order_rows[:limit]
                     break
     except Exception as e:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
         return _empty
-
-    if not rows:
+    if not order_rows:
         return _empty
     st.session_state.pop("supabase_error", None)
-    df = pd.DataFrame(rows).rename(columns={
-        "order_date": "transaction_date",
-        "total_amount": "amount",
-        "id": "order_id",
-    })
-    if "employee_names" not in df.columns:
-        df["employee_names"] = None
-    df["note"] = None
-    return df[_cols_out]
+
+    orders_df = pd.DataFrame(order_rows)
+
+    # 2) 위 주문들에 대한 sales 원장 이력을 order_id 로 조회 (조정·반품 이력 포함, 날짜 무관)
+    _oids = [int(x) for x in pd.to_numeric(orders_df["id"], errors="coerce").dropna().astype(int).tolist()]
+    sales_sum_by_oid: dict[int, float] = {}
+    if _oids:
+        _CHUNK = 500
+        try:
+            for i in range(0, len(_oids), _CHUNK):
+                batch = _oids[i:i + _CHUNK]
+                r = client.table("sales").select("order_id, amount").in_("order_id", batch).execute()
+                for row in (r.data or []):
+                    oid = row.get("order_id")
+                    if oid is None:
+                        continue
+                    try:
+                        sales_sum_by_oid[int(oid)] = (
+                            sales_sum_by_oid.get(int(oid), 0.0) + float(row.get("amount") or 0)
+                        )
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as e:
+            # sales 조회 실패 → 조용히 fallback (전 주문 total_amount 사용)
+            logging.getLogger(__name__).warning("sales sum join failed: %s", e)
+            sales_sum_by_oid = {}
+
+    # 3) 주문별 최종 매출: sales 원장 있으면 그 합, 없으면 total_amount fallback
+    def _eff_amount(row) -> float:
+        oid = row.get("id")
+        try:
+            oid_i = int(oid) if oid is not None else None
+        except (TypeError, ValueError):
+            oid_i = None
+        if oid_i is not None and oid_i in sales_sum_by_oid:
+            return float(sales_sum_by_oid[oid_i])
+        try:
+            return float(row.get("total_amount") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    orders_df["amount"] = orders_df.apply(_eff_amount, axis=1)
+    orders_df = orders_df.rename(columns={"order_date": "transaction_date", "id": "order_id"})
+    if "employee_names" not in orders_df.columns:
+        orders_df["employee_names"] = None
+    orders_df["note"] = None
+    return orders_df[_cols_out]
 
 
 @st.cache_data(ttl=1800)
 def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFrame:
     """매출 로더 (ttl=30분).
 
-    2026-09 관례 변경: 매장 매출은 **계약 시점 total_amount (app_orders)** 기준으로 통일.
-    기존 sales 원장(분개 인식일·조정 반영)이 아닌 app_orders 를 sales 스키마로 변환해 반환.
-    반환 스키마(transaction_date, amount, order_id, employee_names, note)는 그대로 유지되어
-    대시보드·판매 리포트가 코드 변경 없이 계약 시점 기준으로 재계산된다.
+    2026-09 관례: 계약월(order_date) 매출 = **app_orders.total_amount** baseline
+    + **sales 원장 조정·반품** 자동 반영. `_load_orders_as_sales` 참조.
+    반환 스키마(transaction_date, amount, order_id, employee_names, note)는 기존 동일.
     """
     return _load_orders_as_sales(db_filename, limit=limit)
 
@@ -4726,8 +4766,8 @@ def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFram
 def load_sales_with_employees_cached(db_filename: str, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
     """직원 포함 매출 로더 (ttl=10분).
 
-    2026-09 관례 변경: 매출은 **계약 시점 total_amount (app_orders)** 기준. 기간 필터는
-    transaction_date(=order_date) 로 그대로 적용된다. 반환 스키마는 기존과 동일.
+    2026-09 관례: 계약월(order_date) 매출 = **app_orders.total_amount** baseline
+    + **sales 원장 조정·반품** 자동 반영. `_load_orders_as_sales` 참조.
     """
     return _load_orders_as_sales(db_filename, start_date=start_date, end_date=end_date)
 
@@ -29512,7 +29552,7 @@ def _render_ai_sales_reports_new(srs):
     with k5:
         st.metric("실수납액", f"{kpi['payments_amount']:,}원")
     st.caption(
-        "순매출·판매건수·객단가·마진율·직원/카테고리/방문사유 집계는 **판매일(order_date)** 기준입니다. "
+        "순매출은 **판매일(order_date)** 기준 · **계약 시점 total_amount + sales 원장 조정·반품**을 반영합니다. "
         "실수납액은 **결제일(payment_date)** 기준이라 선수금·잔금 때문에 순매출과 다를 수 있습니다."
     )
 
