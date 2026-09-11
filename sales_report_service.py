@@ -416,13 +416,18 @@ def _to_num(s: pd.Series) -> pd.Series:
 
 def compute_kpi(sales: pd.DataFrame, orders: pd.DataFrame, payments: pd.DataFrame) -> dict:
     """핵심 KPI 계산.
-      - sales_amount: sales.amount 합 (순매출, 조정·반품 반영)
+      - sales_amount: app_orders.total_amount 합 (계약 판매가).
+        sales 원장은 매입 원장 임포트·모모 전용 매장에 거의 없어, 원장만 합치면
+        건수·수납액과 어긋난 과소 집계가 난다. 판매건수와 같은 주문 집합을 쓴다.
       - sales_count: 주문 건수 (app_orders)
       - aov: 판매건수 > 0 인 경우 sales_amount / sales_count
       - margin_rate: (total_amount - cost_price - display_cost_amount) / total_amount
       - payments_amount: app_payments.amount 합
     """
-    sales_amount = int(_to_num(sales.get("amount", pd.Series(dtype=float))).sum()) if not sales.empty else 0
+    if not orders.empty and "total_amount" in orders.columns:
+        sales_amount = int(_to_num(orders["total_amount"]).sum())
+    else:
+        sales_amount = int(_to_num(sales.get("amount", pd.Series(dtype=float))).sum()) if not sales.empty else 0
     sales_count = int(len(orders))
     aov = int(round(sales_amount / sales_count)) if sales_count > 0 else 0
 
@@ -461,19 +466,23 @@ def diff_pct(current: float, prev: float) -> float | None:
 
 
 def group_by_employee(sales: pd.DataFrame, orders: pd.DataFrame, top: int = 5) -> list[dict]:
-    """직원별 매출·마진·건수 (Top N).
-    sales.employee_names(콤마 구분) 를 1/n 배분하여 순매출 집계.
+    """직원별 매출·건수 (Top N).
+
+    주문 판매가(app_orders.total_amount)를 employee_names 1/n 배분한다.
+    sales 원장이 비어 있는 매장(학성 등)에서도 KPI 순매출과 같은 기준을 쓴다.
     """
-    if sales.empty:
+    src = orders if (orders is not None and not orders.empty) else sales
+    amt_col = "total_amount" if src is orders and "total_amount" in (src.columns if src is not None else []) else "amount"
+    if src is None or src.empty or amt_col not in src.columns:
         return []
-    df = sales.copy()
+    df = src.copy()
     if "employee_names" not in df.columns:
         df["employee_names"] = ""
     df["_names"] = df["employee_names"].fillna("").astype(str).str.strip()
     df = df[df["_names"] != ""]
     if df.empty:
         return []
-    df["_amount"] = _to_num(df["amount"])
+    df["_amount"] = _to_num(df[amt_col])
     rows: list[dict] = []
     for _, r in df.iterrows():
         names = [n.strip() for n in r["_names"].split(",") if n.strip()]
@@ -1113,7 +1122,7 @@ def render_markdown(dataset: dict, ai_summary: dict | None = None) -> str:
     # 2. 핵심 KPI
     lines.append("\n## 2. 핵심 KPI\n")
     kpi_rows = [{
-        "지표": "순매출 (sales.amount)",
+        "지표": "순매출 (주문 판매가)",
         "이번 기간": _fmt_krw(kpi.get("sales_amount")),
         "WoW/MoM": _fmt_pct(prev.get("sales_diff_pct")),
         "YoY": (_fmt_pct(yoy.get("sales_diff_pct")) if yoy else "N/A"),
