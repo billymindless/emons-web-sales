@@ -7710,14 +7710,15 @@ def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
             except Exception:
                 pass
             # app_leads.converted_order_id → app_orders.id FK (ON DELETE 없음).
-            # 리드 자체는 유지하고 전환 연결만 해제해야 주문을 지울 수 있다.
+            # 리드 행은 유지하고 전환 연결만 해제. lead_stage 는 운영 CHECK
+            # (1_신규/2_상담중/3_견적발송/4_계약완료/5_실패/6_보류)만 사용.
             try:
                 _lead_now = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
                 sc.table("app_leads").update({
                     "converted_order_id": None,
                     "converted_at": None,
                     "revenue_amount": None,
-                    "lead_stage": "3_매장방문",
+                    "lead_stage": "2_상담중",
                     "updated_at": _lead_now,
                 }).eq("converted_order_id", int(order_id)).eq("lead_stage", "4_계약완료").execute()
                 sc.table("app_leads").update({
