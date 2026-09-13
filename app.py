@@ -7693,7 +7693,10 @@ def _save_order_snapshot_to_payload(db_filename: str, order_id: int, snapshot: d
 
 
 def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
-    """주문 및 연관 결제 데이터를 실제로 삭제한다 (관리자 승인 후 호출).
+    """주문 및 연관 결제·매출 원장 데이터를 실제로 삭제한다 (관리자 승인 후 호출).
+
+    app_leads.converted_order_id 는 ON DELETE 가 없어, 주문 삭제 전에
+    해당 리드의 전환 연결만 해제한다 (리드 행은 유지).
     반환: (성공여부: bool, 오류메시지: str | None)
     """
     try:
@@ -7706,6 +7709,25 @@ def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
                 sc.table("sales").delete().eq("order_id", int(order_id)).execute()
             except Exception:
                 pass
+            # app_leads.converted_order_id → app_orders.id FK (ON DELETE 없음).
+            # 리드 자체는 유지하고 전환 연결만 해제해야 주문을 지울 수 있다.
+            try:
+                _lead_now = datetime.now(tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+                sc.table("app_leads").update({
+                    "converted_order_id": None,
+                    "converted_at": None,
+                    "revenue_amount": None,
+                    "lead_stage": "3_매장방문",
+                    "updated_at": _lead_now,
+                }).eq("converted_order_id", int(order_id)).eq("lead_stage", "4_계약완료").execute()
+                sc.table("app_leads").update({
+                    "converted_order_id": None,
+                    "converted_at": None,
+                    "revenue_amount": None,
+                    "updated_at": _lead_now,
+                }).eq("converted_order_id", int(order_id)).execute()
+            except Exception as _lead_e:
+                return False, f"리드 연결 해제 실패: {_lead_e}"
             sc.table("app_orders").delete().eq("id", int(order_id)).eq("db_filename", db_filename).execute()
         else:
             conn = get_tenant_conn(db_filename)
