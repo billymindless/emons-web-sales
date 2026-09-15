@@ -4647,16 +4647,14 @@ def _load_orders_as_sales(
     end_date: str | None = None,
     limit: int | None = None,
 ) -> pd.DataFrame:
-    """계약월 매출 = app_orders.total_amount 를 baseline 으로, sales 원장 조정/반품을 병합.
+    """매출 행 = sales 원장 분개 그대로 + sales 없는 주문만 계약일 fallback.
 
-    정의:
-      - 각 주문에 대한 매출 = sum(sales.amount WHERE order_id = order.id) — 조정·반품 반영
-      - sales 원장에 해당 주문 행이 하나도 없으면 fallback = app_orders.total_amount
-        (매입 원장 임포트 등 sales 미기록 매장 대응)
-      - transaction_date = 주문의 order_date → 매출은 **계약월** 버킷에 잡힘
+    - sales 원장이 있는 주문: 각 원장 행을 transaction_date·amount 그대로 반환
+      (신규 계약분·당일 조정/반품이 각각 그 날짜의 일일 판매에 잡힘)
+    - sales 원장이 하나도 없는 주문: order_date + total_amount 1행 (매입 원장 임포트 대응)
+    - start/end 는 결과의 transaction_date 로 필터 (계약일이 기간 밖이어도 당일 조정은 포함)
 
-    반환 스키마 (transaction_date, amount, order_id, employee_names, note) — 기존 sales 로더와 호환.
-    매장 격리는 app_orders.db_filename 서버 필터로 보장.
+    반환 스키마 (transaction_date, amount, order_id, employee_names, note).
     """
     _cols_out = ["transaction_date", "amount", "order_id", "employee_names", "note"]
     _empty = pd.DataFrame(columns=_cols_out)
@@ -4668,33 +4666,28 @@ def _load_orders_as_sales(
             st.session_state["supabase_error"] = err
         return _empty
 
-    # 1) 계약월 필터로 주문 로드
-    def _base_orders():
-        q = client.table("app_orders").select("id, order_date, total_amount, employee_names")\
-            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
-        if start_date:
-            q = q.gte("order_date", start_date)
-        if end_date:
-            q = q.lte("order_date", end_date)
-        return q.order("id", desc=True)
+    def _page_query(make_q, row_limit: int | None = None) -> list:
+        _PAGE = 1000
+        rows: list = []
+        offset = 0
+        while True:
+            r = make_q().range(offset, offset + _PAGE - 1).execute()
+            page = r.data or []
+            rows.extend(page)
+            if len(page) < _PAGE:
+                break
+            offset += _PAGE
+            if row_limit is not None and len(rows) >= row_limit:
+                return rows[:row_limit]
+        return rows
 
     try:
-        if limit is not None and limit <= 1000:
-            order_rows = _base_orders().limit(limit).execute().data or []
-        else:
-            _PAGE = 1000
-            order_rows = []
-            offset = 0
-            while True:
-                r = _base_orders().range(offset, offset + _PAGE - 1).execute()
-                page = r.data or []
-                order_rows.extend(page)
-                if len(page) < _PAGE:
-                    break
-                offset += _PAGE
-                if limit is not None and len(order_rows) >= limit:
-                    order_rows = order_rows[:limit]
-                    break
+        order_rows = _page_query(
+            lambda: client.table("app_orders")
+            .select("id, order_date, total_amount, employee_names")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .order("id", desc=True),
+        )
     except Exception as e:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
@@ -4704,71 +4697,82 @@ def _load_orders_as_sales(
     st.session_state.pop("supabase_error", None)
 
     orders_df = pd.DataFrame(order_rows)
-
-    # 2) 위 주문들에 대한 sales 원장 이력을 order_id 로 조회 (조정·반품 이력 포함, 날짜 무관)
     _oids = [int(x) for x in pd.to_numeric(orders_df["id"], errors="coerce").dropna().astype(int).tolist()]
-    sales_sum_by_oid: dict[int, float] = {}
+    _emp_by_oid = {}
+    if "employee_names" in orders_df.columns:
+        for _, _or in orders_df.iterrows():
+            try:
+                _emp_by_oid[int(_or["id"])] = _or.get("employee_names")
+            except (TypeError, ValueError):
+                continue
+
+    sales_rows: list = []
     if _oids:
-        _CHUNK = 500
+        _CHUNK = 200
+        _SALES_COLS = "transaction_date, amount, order_id, employee_names, note"
         try:
             for i in range(0, len(_oids), _CHUNK):
                 batch = _oids[i:i + _CHUNK]
-                r = client.table("sales").select("order_id, amount").in_("order_id", batch).execute()
-                for row in (r.data or []):
-                    oid = row.get("order_id")
-                    if oid is None:
-                        continue
-                    try:
-                        sales_sum_by_oid[int(oid)] = (
-                            sales_sum_by_oid.get(int(oid), 0.0) + float(row.get("amount") or 0)
-                        )
-                    except (TypeError, ValueError):
-                        continue
+                sales_rows.extend(_page_query(
+                    lambda b=batch: client.table("sales").select(_SALES_COLS).in_("order_id", b).order("id"),
+                ))
         except Exception as e:
-            # sales 조회 실패 → 조용히 fallback (전 주문 total_amount 사용)
-            logging.getLogger(__name__).warning("sales sum join failed: %s", e)
-            sales_sum_by_oid = {}
+            logging.getLogger(__name__).warning("sales ledger fetch failed: %s", e)
+            sales_rows = []
 
-    # 3) 주문별 최종 매출: sales 원장 있으면 그 합, 없으면 total_amount fallback
-    def _eff_amount(row) -> float:
-        oid = row.get("id")
-        try:
-            oid_i = int(oid) if oid is not None else None
-        except (TypeError, ValueError):
-            oid_i = None
-        if oid_i is not None and oid_i in sales_sum_by_oid:
-            return float(sales_sum_by_oid[oid_i])
-        try:
-            return float(row.get("total_amount") or 0)
-        except (TypeError, ValueError):
-            return 0.0
+    parts: list[pd.DataFrame] = []
+    oids_with_sales: set[int] = set()
+    if sales_rows:
+        sdf = pd.DataFrame(sales_rows)
+        sdf["order_id"] = pd.to_numeric(sdf.get("order_id"), errors="coerce")
+        sdf = sdf.dropna(subset=["order_id"])
+        sdf["order_id"] = sdf["order_id"].astype(int)
+        oids_with_sales = set(sdf["order_id"].tolist())
+        if "employee_names" not in sdf.columns:
+            sdf["employee_names"] = None
+        _blank = sdf["employee_names"].fillna("").astype(str).str.strip() == ""
+        if _blank.any():
+            sdf.loc[_blank, "employee_names"] = sdf.loc[_blank, "order_id"].map(_emp_by_oid)
+        if "note" not in sdf.columns:
+            sdf["note"] = None
+        parts.append(sdf[_cols_out])
 
-    orders_df["amount"] = orders_df.apply(_eff_amount, axis=1)
-    orders_df = orders_df.rename(columns={"order_date": "transaction_date", "id": "order_id"})
-    if "employee_names" not in orders_df.columns:
-        orders_df["employee_names"] = None
-    orders_df["note"] = None
-    return orders_df[_cols_out]
+    _no_sales = ~pd.to_numeric(orders_df["id"], errors="coerce").isin(oids_with_sales)
+    fallback = orders_df.loc[_no_sales].copy()
+    if not fallback.empty:
+        fallback = fallback.rename(columns={"order_date": "transaction_date", "total_amount": "amount", "id": "order_id"})
+        if "employee_names" not in fallback.columns:
+            fallback["employee_names"] = None
+        fallback["note"] = None
+        parts.append(fallback[_cols_out])
+
+    if not parts:
+        return _empty
+    out = pd.concat(parts, ignore_index=True)
+    out["transaction_date"] = pd.to_datetime(out["transaction_date"], errors="coerce")
+    out = out.dropna(subset=["transaction_date"])
+    if start_date:
+        _lo = pd.to_datetime(start_date, errors="coerce")
+        if pd.notna(_lo):
+            out = out[out["transaction_date"] >= _lo]
+    if end_date:
+        _hi = pd.to_datetime(end_date, errors="coerce")
+        if pd.notna(_hi):
+            out = out[out["transaction_date"] <= (_hi + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+    if limit is not None:
+        out = out.head(int(limit))
+    return out.reset_index(drop=True)
 
 
 @st.cache_data(ttl=1800)
 def load_sales_cached(db_filename: str, limit: int | None = None) -> pd.DataFrame:
-    """매출 로더 (ttl=30분).
-
-    2026-09 관례: 계약월(order_date) 매출 = **app_orders.total_amount** baseline
-    + **sales 원장 조정·반품** 자동 반영. `_load_orders_as_sales` 참조.
-    반환 스키마(transaction_date, amount, order_id, employee_names, note)는 기존 동일.
-    """
+    """매출 로더 (ttl=30분). sales 원장 분개 + 원장 없는 주문 fallback. `_load_orders_as_sales` 참조."""
     return _load_orders_as_sales(db_filename, limit=limit)
 
 
 @st.cache_data(ttl=600)
 def load_sales_with_employees_cached(db_filename: str, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
-    """직원 포함 매출 로더 (ttl=10분).
-
-    2026-09 관례: 계약월(order_date) 매출 = **app_orders.total_amount** baseline
-    + **sales 원장 조정·반품** 자동 반영. `_load_orders_as_sales` 참조.
-    """
+    """직원 포함 매출 로더 (ttl=10분). sales 원장 분개 + 원장 없는 주문 fallback."""
     return _load_orders_as_sales(db_filename, start_date=start_date, end_date=end_date)
 
 
