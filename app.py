@@ -8407,8 +8407,13 @@ def _render_hq_recon_table(db_filename: str, report, cache_key: str) -> None:
         st.caption(f"엑셀 다운로드 준비 실패: {_e}")
 
 
-def _load_hq_history_report(db_filename: str, hq):
-    """(공유) 저장된 스냅샷 날짜 범위 선택 + report 캐시 반환. 캐시 없으면 조회·대사."""
+def _load_hq_history_report(db_filename: str, hq, view_id: str = "view"):
+    """(공유) 저장된 스냅샷 날짜 범위 선택 + report 캐시 반환. 캐시 없으면 조회·대사.
+
+    두 탭(원가 확인표 / 불일치 금액 수정)에서 동시에 렌더링되므로 위젯 key 를
+    view_id 로 구분해야 `StreamlitDuplicateElementKey` 를 피할 수 있다. 리포트 캐시는
+    날짜 범위만 반영해 뷰 간 공유된다.
+    """
     client, _err = get_supabase_client()
     if not client:
         st.error(f"Supabase 연결 실패: {_err}")
@@ -8416,22 +8421,24 @@ def _load_hq_history_report(db_filename: str, hq):
 
     _today = datetime.now(tz=KST).date()
     _default_from = _today - timedelta(days=60)
-    _from_key = f"hq_hist_from::{db_filename}"
-    _to_key = f"hq_hist_to::{db_filename}"
     _c1, _c2, _c3 = st.columns([1.2, 1.2, 1])
     with _c1:
         _dfrom = st.date_input(
-            "시작일", value=st.session_state.get(_from_key, _default_from),
-            key=_from_key,
+            "시작일", value=_default_from,
+            key=f"hq_hist_from::{db_filename}::{view_id}",
         )
     with _c2:
         _dto = st.date_input(
-            "종료일", value=st.session_state.get(_to_key, _today),
-            key=_to_key,
+            "종료일", value=_today,
+            key=f"hq_hist_to::{db_filename}::{view_id}",
         )
     with _c3:
         st.markdown("<div style='height:1.7rem;'></div>", unsafe_allow_html=True)
-        _refresh = st.button("다시 조회", key=f"hq_hist_refresh::{db_filename}::{id(hq)}", width="stretch")
+        _refresh = st.button(
+            "다시 조회",
+            key=f"hq_hist_refresh::{db_filename}::{view_id}",
+            width="stretch",
+        )
 
     if _dfrom and _dto and _dfrom > _dto:
         st.warning("시작일이 종료일보다 늦습니다.")
@@ -8473,7 +8480,7 @@ def _hq_invalidate_history_caches(db_filename: str) -> None:
 
 def _render_hq_history_view(db_filename: str, hq) -> None:
     """2. 원가 확인표: 저장된 스냅샷을 날짜 범위로 다시 조회. 파일 재업로드 불필요."""
-    report, _dfrom, _dto = _load_hq_history_report(db_filename, hq)
+    report, _dfrom, _dto = _load_hq_history_report(db_filename, hq, view_id="view")
     if report is None:
         return
     _cache_key = f"hist::{db_filename}::{_dfrom}::{_dto}"
@@ -8806,7 +8813,7 @@ def _render_hq_edit_row_action(
 
 def _render_hq_edit_menu(db_filename: str, hq) -> None:
     """3. 불일치 금액 수정: 상태별 대상 선택 → 원가 확정 / 수동 매칭 / 매장 전시 지정·해제."""
-    report, _dfrom, _dto = _load_hq_history_report(db_filename, hq)
+    report, _dfrom, _dto = _load_hq_history_report(db_filename, hq, view_id="edit")
     if report is None:
         return
 
