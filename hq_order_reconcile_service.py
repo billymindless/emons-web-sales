@@ -4,8 +4,9 @@
 역할:
     - 엑셀/CSV 파싱 (제목·TOTAL 스킵, 회수/취소 제외)
     - 업로드 이력 + 출고번호 단위 스냅샷 upsert (중복 스킵, 감/증액 delta 감지)
-    - 앱 주문(app_orders)과 같은 전화면 출고·주문을 한 건으로 합산 매칭
-      (전화 없을 때만 이름 + 등록일 ±2일)
+    - 앱 주문(app_orders)과 같은 전화면 후보를 모은 뒤,
+      단건 원가/판매가가 본사와 2만원 이내면 그 주문만 매칭 (이전 달 합산 금지).
+      맞는 단건이 없을 때만 합산. 전화 없을 때는 이름 + 등록일 ±2일.
     - 원가 대사 (앱(모모) 원가 vs 본사원가) + 계약 변경 gap 판정
     - 미리보기·다운로드용 DataFrame / 엑셀 빌더
 
@@ -35,6 +36,8 @@ MATCH_WINDOW_DAYS: int = 2
 
 COST_ABS_THRESHOLD: int = 10_000
 COST_PCT_THRESHOLD: float = 0.05
+# 단건 앱 주문의 원가/판매가가 본사와 이 금액 이내면 다른 주문을 합산하지 않음
+SINGLETON_ABS_THRESHOLD: int = 20_000
 
 # 스킵 대상 주문구분 — 매장 회수는 대사·스냅샷에서 완전 제외
 EXCLUDED_ORDER_KINDS: set[str] = {"회수"}
@@ -920,6 +923,48 @@ def _fetch_orders_by_identity(
     return out
 
 
+def _order_date_gap(order: dict, target: Optional[date]) -> int:
+    od = _parse_date(order.get("order_date"))
+    if od is None or target is None:
+        return 10_000
+    return abs((od - target).days)
+
+
+def _select_singleton_or_all(
+    orders: list[dict],
+    hq_cost: int,
+    hq_total: int,
+    target_date: Optional[date],
+) -> tuple[list[dict], str]:
+    """같은 전화 후보 중 단건이 본사원가/합계와 맞으면 그 주문만 쓰고 합산하지 않는다.
+
+    엄희선처럼 9월 단건 원가가 본사와 일치하면 8월 이전 주문을 붙이지 않는다.
+    """
+    if not orders:
+        return [], ""
+    hits: list[dict] = []
+    for o in orders:
+        cost = _seller_cost(o)
+        sale = _to_int(o.get("total_amount"))
+        if abs(cost - hq_cost) <= SINGLETON_ABS_THRESHOLD:
+            hits.append(o)
+            continue
+        if hq_cost and abs(sale - hq_cost) <= SINGLETON_ABS_THRESHOLD:
+            hits.append(o)
+            continue
+        if hq_total and abs(sale - hq_total) <= SINGLETON_ABS_THRESHOLD:
+            hits.append(o)
+    if not hits:
+        return list(orders), ""
+    hits.sort(key=lambda o: (_order_date_gap(o, target_date), int(o.get("id") or 0)))
+    best = hits[0]
+    try:
+        bid = int(best.get("id"))
+    except (TypeError, ValueError):
+        bid = 0
+    return [best], f"단건 매칭 #{bid} (합산 안 함)"
+
+
 def _window_cands(orders: list[dict], target: Optional[date], window: int = MATCH_WINDOW_DAYS) -> list[tuple[int, dict]]:
     if not orders or target is None:
         return []
@@ -938,8 +983,8 @@ def _window_cands(orders: list[dict], target: Optional[date], window: int = MATC
 def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> ReconcileReport:
     """본사 rows + 앱 주문으로 대사 리포트 생성.
 
-    - 전화가 있으면 전화번호 기준으로 본사 출고를 한 건으로 합산하고,
-      같은 전화의 앱 주문 원가·판매가도 합산해 비교한다. (등록일 ±2일 제한 없음)
+    - 전화가 있으면 본사 출고는 전화 기준으로 묶고, 앱 후보는 같은 전화에서 고른다.
+      단건 원가/판매가가 본사원가·합계와 2만원 이내면 그 주문만 쓰고 합산하지 않는다.
     - 전화가 없으면 (이름, 등록일) + ±2일 창으로 기존과 같이 매칭.
     """
     report = ReconcileReport()
@@ -974,6 +1019,7 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
         lookup = key[2] if is_phone else first.identity_key
         raw_cands = orders_by_ident.get(lookup, [])
 
+        singleton_note = ""
         if is_display:
             # 전시판매(매장분): 앱 전시원가가 있는 주문만 후보. 자동 합산하지 않고
             # 본사원가와 전시원가가 맞는 단건만 자동, 나머지는 관리자 수동 매칭.
@@ -984,8 +1030,11 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
             ]
             matched = close if len(close) == 1 else []
         elif is_phone:
-            matched = list(raw_cands)
+            matched, singleton_note = _select_singleton_or_all(
+                raw_cands, hq_cost, hq_total, target_date,
+            )
         else:
+            singleton_note = ""
             matched = [o for _, o in _window_cands(raw_cands, target_date, MATCH_WINDOW_DAYS)]
         _seen_m: set[int] = set()
         _uniq_m: list[dict] = []
@@ -1069,7 +1118,9 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
                 bits.append(ship_note)
             if is_display:
                 bits.append("앱(모모) 전시원가 비교")
-            if len(oids) == 1:
+            if singleton_note:
+                bits.append(singleton_note)
+            elif len(oids) == 1:
                 bits.append(f"자동 매칭 #{oids[0]}")
             else:
                 bits.append("앱주문 " + ",".join(f"#{i}" for i in oids) + " 합산")
@@ -1197,6 +1248,7 @@ __all__ = [
     "MATCH_WINDOW_DAYS",
     "COST_ABS_THRESHOLD",
     "COST_PCT_THRESHOLD",
+    "SINGLETON_ABS_THRESHOLD",
     "HQRow",
     "SnapshotResult",
     "ReconcileRow",
