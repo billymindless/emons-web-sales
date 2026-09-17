@@ -8217,6 +8217,88 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
                 st.rerun()
 
 
+def _render_hq_display_manual_match(report, cache_key: str) -> None:
+    """본사 구분=매장분(전시판매) 행을 앱 주문에 수동 매칭. 앱 주문 금액은 바꾸지 않는다."""
+    if report is None or not getattr(report, "rows", None):
+        return
+    pending = [
+        (idx, row) for idx, row in enumerate(report.rows)
+        if row.is_display and row.result_code != "ok"
+    ]
+    if not pending:
+        return
+
+    st.markdown("##### 전시판매(매장분) 수동 매칭")
+    st.caption(
+        "본사 파일 **구분=매장분** 은 전시판매입니다. 본사원가에 전시품 원가가 있을 수 있어 "
+        "같은 전화(또는 이름)의 앱 주문 중 하나를 관리자가 고릅니다. "
+        "확정하면 결과는 **원가 일치**, 사유는 **관리자 강제매칭.** 입니다. "
+        "앱 주문·매출·결제는 변경하지 않습니다. **구분=회수** 는 대사에서 제외됩니다."
+    )
+
+    _labels = []
+    for _idx, row in pending:
+        _labels.append(
+            f"{row.customer_name or '(고객명 없음)'} · 본사원가 {int(row.hq_cost):,} · "
+            f"전화 {row.phone1_digits or '-'} · {row.result_label}"
+        )
+    _sel = st.selectbox(
+        "전시판매 행 선택",
+        list(range(len(pending))),
+        format_func=lambda i: _labels[i],
+        key=f"hq_disp_row::{cache_key}",
+    )
+    _idx, _row = pending[_sel]
+    _cands = list(_row.candidate_orders or [])
+    if not _cands:
+        st.info("같은 전화/이름으로 찾을 앱 주문이 없습니다. 신규매출에 전시품으로 등록된 건이 있는지 확인하세요.")
+        return
+
+    _opt_ids: list[int] = []
+    _opt_labels: list[str] = []
+    for o in _cands:
+        try:
+            oid = int(o.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if oid in _opt_ids:
+            continue
+        od = str(o.get("order_date") or "")[:10]
+        dd = str(o.get("delivery_date") or "")[:10]
+        sc = int(o.get("cost_price") or 0)
+        dc = int(o.get("display_cost_amount") or 0)
+        sale = int(o.get("total_amount") or 0)
+        _opt_ids.append(oid)
+        _opt_labels.append(
+            f"#{oid} · 등록 {od or '-'} · 배송 {dd or '-'} · "
+            f"앱(모모) 원가 {sc:,} · 앱(모모) 전시원가 {dc:,} · 판매가 {sale:,}"
+        )
+    _pick = st.selectbox(
+        "매칭할 앱(모모) 주문",
+        list(range(len(_opt_ids))),
+        format_func=lambda i: _opt_labels[i],
+        key=f"hq_disp_ord::{cache_key}::{_idx}",
+    )
+    if st.button("✅ 전시판매 수동 매칭", key=f"hq_disp_btn::{cache_key}::{_idx}", type="primary"):
+        _oid = _opt_ids[_pick]
+        _chosen = next((o for o in _cands if int(o.get("id") or 0) == _oid), None)
+        _row.order_id = _oid
+        _row.order_ids = [_oid]
+        if _chosen:
+            _row.seller_cost = int(_chosen.get("cost_price") or 0)
+            _row.display_cost = int(_chosen.get("display_cost_amount") or 0)
+            _row.entered_sale = int(_chosen.get("total_amount") or 0)
+        _row.result_label = "원가 일치"
+        _row.result_code = "ok"
+        _row.reason = "관리자 강제매칭."
+        _counts: dict[str, int] = {}
+        for _rr in report.rows:
+            _counts[_rr.result_code] = _counts.get(_rr.result_code, 0) + 1
+        report.counts = _counts
+        st.success(f"전시판매를 앱 주문 #{_oid} 에 매칭했습니다. 결과 원가 일치 · 관리자 강제매칭.")
+        st.rerun()
+
+
 def _render_admin_hq_upload(db_filename: str) -> None:
     """관리자 전용: 본사 ERP 주문조회(대) 엑셀 등록 + 원가 대사.
 
@@ -8257,7 +8339,7 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         "본사 주문조회 엑셀 (.xlsx) 또는 CSV",
         type=["xlsx", "csv"],
         key=f"hq_upload_file::{db_filename}",
-        help="첫번째 시트/전체 CSV 를 읽어 헤더를 자동 감지합니다. TOTAL / 회수 / 취소 는 자동 제외됩니다.",
+        help="첫번째 시트/전체 CSV 를 읽어 헤더를 자동 감지합니다. TOTAL 과 구분=회수 는 제외합니다. 구분=매장분은 전시판매로 넣습니다.",
     )
     if up is None:
         return
@@ -8282,10 +8364,10 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             "전화": r.phone1_digits,
             "등록일": r.order_date.isoformat() if r.order_date else "",
             "담당": r.employee_names,
+            "구분": "전시판매(매장분)" if r.is_display else (r.order_kind or "주문"),
             "주문금액": r.order_amount,
             "합계": r.total_amount_hq,
             "상태": r.order_status,
-            "전시": "○" if r.is_display else "",
         } for r in rows[:15]])
         st.dataframe(_hq_money_styler(prev, ["주문금액", "합계"]), width="stretch", hide_index=True)
 
@@ -8294,6 +8376,8 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         "동일 출고번호가 이미 있으면 중복(dup) 으로 카운트되며, `주문금액` 이나 `주문상태` 가 다르면 revised 로 갱신됩니다. "
         "이후 앱 주문과 **같은 전화번호면 출고·주문을 한 건으로 합산**해 매칭합니다. "
         "전화가 없을 때만 이름 + 등록일 ±2일을 씁니다. "
+        "**구분=매장분**은 전시판매로 보고 앱(모모) 전시원가와 비교하며, 자동이 안 되면 관리자가 수동 매칭합니다. "
+        "**구분=회수**는 대사·스냅샷에서 제외합니다. "
         "**본사원가**는 전산 출고 `주문금액 + 부가세`(합계)이고, **앱(모모) 원가**는 매장 입력 `cost_price`입니다."
     )
 
@@ -8359,7 +8443,7 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             "cost_mismatch": "원가 불일치",
             "cost_blank": "원가 미입력",
             "hq_only": "본사만 있음",
-            "unresolved": "수동 선택 필요",
+            "unresolved": "전시판매 수동매칭",
         }
         _sum_cols = st.columns(len(_label_map))
         for _i, (_code, _lbl) in enumerate(_label_map.items()):
@@ -8381,6 +8465,7 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         )
 
         _render_hq_cost_edit_panel(db_filename, report, cache_key)
+        _render_hq_display_manual_match(report, cache_key)
 
         try:
             _xlsx_bytes = hq.build_review_excel(report)

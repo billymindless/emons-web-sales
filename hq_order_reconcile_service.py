@@ -36,10 +36,13 @@ MATCH_WINDOW_DAYS: int = 2
 COST_ABS_THRESHOLD: int = 10_000
 COST_PCT_THRESHOLD: float = 0.05
 
-# 스킵 대상 주문구분 (매입 원장 규칙과 동일)
+# 스킵 대상 주문구분 — 매장 회수는 대사·스냅샷에서 완전 제외
 EXCLUDED_ORDER_KINDS: set[str] = {"회수"}
 
-# 전시(매장 자산) 판별
+# 대사에 넣는 주문구분. 매장분 = 전시판매 (앱 전시원가와 수동 매칭)
+INCLUDED_ORDER_KINDS: set[str] = {"주문", "매장분"}
+
+# 전시판매(본사 파일 구분 = 매장분)
 DISPLAY_ORDER_KINDS: set[str] = {"매장분"}
 _DISPLAY_NAME_PATTERNS: tuple[str, ...] = ("리빙(법)",)
 
@@ -303,8 +306,8 @@ def _hq_ship_cost(row: HQRow) -> int:
 def parse_hq_order_export(file_bytes: bytes, filename: str) -> list[HQRow]:
     """본사 주문조회(대) 엑셀/CSV → HQRow 리스트.
 
-    - 제목 행, TOTAL 요약 행, 회수/취소로 판정되는 행은 제외.
-    - `주문구분 = 주문` 만 통과. 나머지는 스킵.
+    - 제목 행, TOTAL 요약 행, `주문구분=회수` 는 제외.
+    - `주문` 과 `매장분`(전시판매) 만 통과. 회수는 대사에서 완전히 뺀다.
     - ship_number 가 비어도 통과. 그룹핑 단계에서 contract_no / identity_key + 등록일 fallback.
     """
     raw = _read_raw(file_bytes, filename)
@@ -337,10 +340,9 @@ def parse_hq_order_export(file_bytes: bytes, filename: str) -> list[HQRow]:
                 continue
             # 주문구분 없는 데이터는 취급하지 않음
             continue
-        if kind in EXCLUDED_ORDER_KINDS:
+        if kind in EXCLUDED_ORDER_KINDS or "회수" in kind:
             continue
-        if kind != "주문":
-            # 회수/기타 → 스킵
+        if kind not in INCLUDED_ORDER_KINDS:
             continue
 
         status = _clean_str(_get(row, "order_status"))
@@ -690,6 +692,9 @@ class ReconcileRow:
     result_label: str = ""
     result_code: str = ""
     reason: str = ""
+    is_display: bool = False
+    order_kind: str = ""
+    candidate_orders: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -945,13 +950,12 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
 
     grouped: dict[tuple, list[HQRow]] = {}
     for r in hq_rows:
-        if r.is_display:
-            continue
         pk = _phone_match_key(r.phone1_digits or r.phone2_digits)
+        kind_tag = "D" if r.is_display else "O"
         if pk:
-            key: tuple = ("P", pk)
+            key: tuple = (kind_tag, "P", pk)
         else:
-            key = ("N", r.identity_key, r.order_date.isoformat() if r.order_date else "")
+            key = (kind_tag, "N", r.identity_key, r.order_date.isoformat() if r.order_date else "")
         grouped.setdefault(key, []).append(r)
 
     counts: dict[str, int] = {}
@@ -965,11 +969,21 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
         hq_cost = sum(_hq_ship_cost(x) for x in group)
         hq_total = sum(int(x.order_amount or 0) for x in group)
         first = group[0]
-        is_phone = key[0] == "P"
-        lookup = key[1] if is_phone else first.identity_key
+        is_display = bool(first.is_display) or key[0] == "D"
+        is_phone = key[1] == "P"
+        lookup = key[2] if is_phone else first.identity_key
         raw_cands = orders_by_ident.get(lookup, [])
 
-        if is_phone:
+        if is_display:
+            # 전시판매(매장분): 앱 전시원가가 있는 주문만 후보. 자동 합산하지 않고
+            # 본사원가와 전시원가가 맞는 단건만 자동, 나머지는 관리자 수동 매칭.
+            disp_cands = [o for o in raw_cands if _display_cost(o) > 0]
+            close = [
+                o for o in disp_cands
+                if classify_cost_gap(_display_cost(o), hq_cost)[1] == "ok"
+            ]
+            matched = close if len(close) == 1 else []
+        elif is_phone:
             matched = list(raw_cands)
         else:
             matched = [o for _, o in _window_cands(raw_cands, target_date, MATCH_WINDOW_DAYS)]
@@ -986,6 +1000,14 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
             _uniq_m.append(o)
         matched = _uniq_m
 
+        _brief_keys = (
+            "id", "order_date", "delivery_date", "cost_price",
+            "display_cost_amount", "total_amount", "employee_names",
+        )
+        cand_src = raw_cands
+        if is_display:
+            cand_src = [o for o in raw_cands if _display_cost(o) > 0] or list(raw_cands)
+        cand_src = [{k: o.get(k) for k in _brief_keys} for o in cand_src]
         row = ReconcileRow(
             hq_ships=[x.ship_number for x in group],
             identity_key=first.identity_key,
@@ -997,23 +1019,35 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
             hq_cost=hq_cost,
             hq_total=hq_total,
             hq_status=first.order_status,
+            is_display=is_display,
+            order_kind=first.order_kind or ("매장분" if is_display else "주문"),
+            candidate_orders=list(cand_src),
         )
 
         ship_note = ""
+        if is_display:
+            ship_note = "전시판매(매장분)"
         if is_phone and len(group) > 1:
             d1 = dates[0].isoformat() if dates else ""
             d2 = dates[-1].isoformat() if dates else ""
             span = d1 if d1 == d2 else f"{d1}~{d2}"
-            ship_note = f"전화 동일 출고 {len(group)}건 합산 ({span})"
+            extra = f"전화 동일 출고 {len(group)}건 합산 ({span})"
+            ship_note = f"{ship_note} · {extra}".strip(" ·") if ship_note else extra
 
         if not matched:
-            row.result_label = "본사만 있음"
-            row.result_code = "hq_only"
-            row.reason = ship_note or (
-                "앱 주문 없음 (동일 전화)" if is_phone
-                else f"앱 주문 없음 (등록일 ±{MATCH_WINDOW_DAYS}일)"
-            )
-            _tick("hq_only")
+            if is_display:
+                row.result_label = "전시판매 수동매칭"
+                row.result_code = "unresolved"
+                row.reason = ship_note or "매장분(전시판매) — 관리자 수동 매칭"
+                _tick("unresolved")
+            else:
+                row.result_label = "본사만 있음"
+                row.result_code = "hq_only"
+                row.reason = ship_note or (
+                    "앱 주문 없음 (동일 전화)" if is_phone
+                    else f"앱 주문 없음 (등록일 ±{MATCH_WINDOW_DAYS}일)"
+                )
+                _tick("hq_only")
         else:
             oids: list[int] = []
             for o in matched:
@@ -1026,12 +1060,15 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
             row.seller_cost = sum(_seller_cost(o) for o in matched)
             row.display_cost = sum(_display_cost(o) for o in matched)
             row.entered_sale = sum(_to_int(o.get("total_amount")) for o in matched)
-            label, code = classify_cost_gap(int(row.seller_cost or 0), hq_cost)
+            compare_cost = int(row.display_cost or 0) if is_display else int(row.seller_cost or 0)
+            label, code = classify_cost_gap(compare_cost, hq_cost)
             row.result_label = label
             row.result_code = code
             bits = []
             if ship_note:
                 bits.append(ship_note)
+            if is_display:
+                bits.append("앱(모모) 전시원가 비교")
             if len(oids) == 1:
                 bits.append(f"자동 매칭 #{oids[0]}")
             else:
@@ -1051,7 +1088,7 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
 
 def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
     _cols = [
-        "주문ID", "고객명", "전화", "등록일", "담당",
+        "주문ID", "구분", "고객명", "전화", "등록일", "담당",
         "본사원가", "주문금액",
         "앱(모모) 원가", "앱(모모) 원가차이",
         "앱(모모) 전시원가", "앱(모모) 전시원가차이",
@@ -1073,6 +1110,7 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
                 ",".join(str(i) for i in r.order_ids) if r.order_ids
                 else (r.order_id if r.order_id is not None else "")
             ),
+            "구분": "전시판매(매장분)" if r.is_display else (r.order_kind or "주문"),
             "고객명": r.customer_name,
             "전화": r.phone1_digits,
             "등록일": (
