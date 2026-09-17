@@ -4643,17 +4643,41 @@ def load_customers_cached(db_filename: str, limit: int | None = 50, col_list: st
         return pd.DataFrame()
 
 
+def _sales_ledger_has_principal(ledger_amounts: list, total_amount: float) -> bool:
+    """sales 원장에 계약 원금이 들어 있는지.
+
+    앱 신규 주문은 total_amount 전액을 sales에 넣고 이후 수정은 차액만 넣는다.
+    매입 임포트 주문은 원금 행이 없다가 금액 수정 시 차액만 생겨, 원금 없이 차액만 남는다.
+    그 상태에서 원장만 집계하면 누적매출이 계약액만큼 빠진다.
+    """
+    amts = [float(a or 0) for a in (ledger_amounts or [])]
+    tot = float(total_amount or 0)
+    if not amts:
+        return False
+    if abs(sum(amts) - tot) < 1:
+        return True
+    pos = [a for a in amts if a > 0]
+    if not pos:
+        return False
+    if abs(tot) < 1:
+        return True
+    return max(pos) >= abs(tot) * 0.5
+
+
 def _load_orders_as_sales(
     db_filename: str,
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int | None = None,
 ) -> pd.DataFrame:
-    """매출 행 = sales 원장 분개 그대로 + sales 없는 주문만 계약일 fallback.
+    """매출 행 = sales 원장 분개 + 원금 없는 주문은 계약액 보정.
 
     - sales 원장이 있는 주문: 각 원장 행을 transaction_date·amount 그대로 반환
       (신규 계약분·당일 조정/반품이 각각 그 날짜의 일일 판매에 잡힘)
-    - sales 원장이 하나도 없는 주문: order_date + total_amount 1행 (매입 원장 임포트 대응)
+    - 원장에 계약 원금이 없고 차액만 있으면: 계약일(order_date)에
+      (total_amount - 원장합) 보정행을 추가. 임포트 주문 수정 후 누적매출이
+      빠지는 것을 막는다.
+    - sales 원장이 하나도 없는 주문: order_date + total_amount 1행
     - start/end 는 결과의 transaction_date 로 필터 (계약일이 기간 밖이어도 당일 조정은 포함)
 
     반환 스키마 (transaction_date, amount, order_id, employee_names, note).
@@ -4737,7 +4761,37 @@ def _load_orders_as_sales(
             sdf.loc[_blank, "employee_names"] = sdf.loc[_blank, "order_id"].map(_emp_by_oid)
         if "note" not in sdf.columns:
             sdf["note"] = None
+        sdf["amount"] = pd.to_numeric(sdf["amount"], errors="coerce").fillna(0)
         parts.append(sdf[_cols_out])
+
+        # 원금 없는 차액-only 원장 → 계약일에 빠진 원금 보정
+        _tot_by_oid: dict[int, float] = {}
+        _od_by_oid: dict[int, object] = {}
+        for _, _or in orders_df.iterrows():
+            try:
+                _oid = int(_or["id"])
+            except (TypeError, ValueError):
+                continue
+            _tot_by_oid[_oid] = float(_or.get("total_amount") or 0)
+            _od_by_oid[_oid] = _or.get("order_date")
+        _seed_rows: list[dict] = []
+        for _oid, _g in sdf.groupby("order_id"):
+            _amts = pd.to_numeric(_g["amount"], errors="coerce").fillna(0).tolist()
+            _tot = _tot_by_oid.get(int(_oid), 0.0)
+            if _sales_ledger_has_principal(_amts, _tot):
+                continue
+            _seed = _tot - float(sum(_amts))
+            if abs(_seed) < 1:
+                continue
+            _seed_rows.append({
+                "transaction_date": _od_by_oid.get(int(_oid)),
+                "amount": _seed,
+                "order_id": int(_oid),
+                "employee_names": _emp_by_oid.get(int(_oid)),
+                "note": "계약금액 보정(원장 원금 없음)",
+            })
+        if _seed_rows:
+            parts.append(pd.DataFrame(_seed_rows)[_cols_out])
 
     _no_sales = ~pd.to_numeric(orders_df["id"], errors="coerce").isin(oids_with_sales)
     fallback = orders_df.loc[_no_sales].copy()
