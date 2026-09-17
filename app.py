@@ -7990,7 +7990,12 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         if hist is None or hist.empty:
             st.caption("아직 업로드 이력이 없습니다.")
         else:
-            st.dataframe(hist, width="stretch", hide_index=True)
+            st.dataframe(
+                hist, width="stretch", hide_index=True,
+                column_config={
+                    "hq_amount_sum": st.column_config.NumberColumn("hq_amount_sum", format="%,.0f"),
+                },
+            )
 
     st.markdown("---")
     st.markdown("#### 1. 파일 업로드")
@@ -8028,7 +8033,13 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             "상태": r.order_status,
             "전시": "○" if r.is_display else "",
         } for r in rows[:15]])
-        st.dataframe(prev, width="stretch", hide_index=True)
+        st.dataframe(
+            prev, width="stretch", hide_index=True,
+            column_config={
+                "주문금액": st.column_config.NumberColumn("주문금액", format="%,.0f"),
+                "합계": st.column_config.NumberColumn("합계", format="%,.0f"),
+            },
+        )
 
     st.markdown("#### 2. 스냅샷 저장 & 대사")
     st.caption(
@@ -8081,7 +8092,14 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             "이전 상태": r.get("prev_order_status"),
             "현재 상태": r.get("order_status"),
         } for r in snap.revised])
-        st.dataframe(_rev_df, width="stretch", hide_index=True)
+        st.dataframe(
+            _rev_df, width="stretch", hide_index=True,
+            column_config={
+                "이전 주문금액": st.column_config.NumberColumn("이전 주문금액", format="%,.0f"),
+                "현재 주문금액": st.column_config.NumberColumn("현재 주문금액", format="%,.0f"),
+                "Δ": st.column_config.NumberColumn("Δ", format="%,.0f"),
+            },
+        )
 
     st.markdown("##### 원가 대사표")
     df_recon = hq.reconcile_to_dataframe(report)
@@ -8101,7 +8119,16 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         for _i, (_code, _lbl) in enumerate(_label_map.items()):
             _sum_cols[_i].metric(_lbl, f"{_counts.get(_code, 0):,}")
 
-        st.dataframe(df_recon, width="stretch", hide_index=True)
+        st.dataframe(
+            df_recon, width="stretch", hide_index=True,
+            column_config={
+                "본사원가": st.column_config.NumberColumn("본사원가", format="%,.0f"),
+                "본사합계": st.column_config.NumberColumn("본사합계", format="%,.0f"),
+                "입력원가": st.column_config.NumberColumn("입력원가", format="%,.0f"),
+                "원가차이": st.column_config.NumberColumn("원가차이", format="%,.0f"),
+                "입력판매가": st.column_config.NumberColumn("입력판매가", format="%,.0f"),
+            },
+        )
 
         try:
             _xlsx_bytes = hq.build_review_excel(report)
