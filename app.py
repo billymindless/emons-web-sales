@@ -29580,6 +29580,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
     },
     {
         "title": "한 고객의 여러 주문에 결제를 나누어 등록하려면 어떻게 하나요? (복수 주문 분배 결제)",
+        "visible_role": "admin_only",
         "keywords": (
             "분배 결제 복수 주문 분개 나누기 여러 주문 동일 고객 배분 합계 실입금액 일치 "
             "분배 결제 일괄 등록 잔금 복수"
@@ -29627,10 +29628,21 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
 
 def _faq_filter_items(query: str) -> list[dict[str, str]]:
     q = (query or "").strip().lower()
+    _role = (st.session_state.get("current_user") or {}).get("role") or "user"
+    _is_admin = _role in ("store_admin", "superadmin")
+
+    def _visible(item: dict) -> bool:
+        vr = item.get("visible_role")
+        if vr == "admin_only" and not _is_admin:
+            return False
+        return True
+
     if not q:
-        return list(APP_FAQ_ITEMS)
+        return [e for e in APP_FAQ_ITEMS if _visible(e)]
     out = []
     for e in APP_FAQ_ITEMS:
+        if not _visible(e):
+            continue
         blob = " ".join([e.get("title", ""), e.get("keywords", ""), e.get("body", "")]).lower()
         if q in blob:
             out.append(e)
@@ -35251,8 +35263,9 @@ def render_customer_balance():
                     if len(orders_with_balance) == 0 and len(orders_overpaid) == 0:
                         st.info("등록된 주문이 없습니다.")
                     else:
-                        # 복수 주문 분배 결제 UI (잔금 있는 주문 2건 이상일 때)
-                        if len(orders_with_balance) >= 2:
+                        # 복수 주문 분배 결제 UI — 매장관리자/최고관리자만 노출
+                        _split_role = (st.session_state.get("current_user") or {}).get("role") or "user"
+                        if len(orders_with_balance) >= 2 and _split_role in ("store_admin", "superadmin"):
                             with st.expander("💳 복수 주문 분배 결제 (한 번의 결제로 여러 주문에 배분)", expanded=False):
                                 _multi_order_split_payment_ui(db_filename, orders_with_balance.reset_index(drop=True), key_prefix=f"split_{selected_cid}")
 
