@@ -1156,8 +1156,8 @@ def create_payment_change_task(
     db_filename: str | None,
     assignees: list[str] | None = None,
 ) -> tuple[int | None, str | None]:
-    """결제변경 사후 검증 태스크 생성 + 메타 저장 + 검증자 알림.
-    결제 반영은 호출 측(매출관리)에서 이미 완료된 상태로 들어온다."""
+    """결제변경 검증 태스크 생성 + 메타 저장 + 검증자 알림.
+    결제 자동 반영(원본 취소행 + 신규 결제행)은 호출 측에서 이미 처리한 뒤 태스크만 생성한다."""
     client, err = _client()
     if err or not client:
         return None, err or "Supabase 연결 불가"
@@ -1181,7 +1181,7 @@ def create_payment_change_task(
         f"원본 결제: {_fmt(op)}\n"
         f"변경 결제: {_fmt(npd)}\n"
         f"사유: {reason or '-'}\n"
-        f"(결제는 매출관리에서 즉시 반영됨 — 본 건은 증빙 확인 후 완료 처리)"
+        f"(요청 등록 시 원본 결제 취소행·신규 결제행이 자동 저장됨 — 본 태스크는 증빙 검증용)"
     )
 
     try:
