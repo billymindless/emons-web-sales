@@ -8307,7 +8307,7 @@ _HQ_RECON_MONEY_COLS: list[str] = [
 ]
 
 _HQ_RESULT_FILTER_LABELS: list[str] = [
-    "전체", "원가 일치", "원가 불일치", "원가 미입력", "본사만 있음", "전시판매 수동매칭",
+    "전체", "원가 일치", "원가 불일치", "원가 미입력", "본사만 있음", "전시판매 수동매칭", "매장 전시",
 ]
 _HQ_RESULT_FILTER_CODES: dict[str, str | None] = {
     "전체": None,
@@ -8316,11 +8316,24 @@ _HQ_RESULT_FILTER_CODES: dict[str, str | None] = {
     "원가 미입력": "cost_blank",
     "본사만 있음": "hq_only",
     "전시판매 수동매칭": "unresolved",
+    "매장 전시": "store_display",
+}
+
+# 3. 불일치 금액 수정에서 다룰 상태 목록 (원가 일치는 제외)
+_HQ_EDIT_FILTER_LABELS: list[str] = [
+    "원가 불일치", "원가 미입력", "본사만 있음", "전시판매 수동매칭", "매장 전시",
+]
+_HQ_EDIT_FILTER_CODES: dict[str, str] = {
+    "원가 불일치": "cost_mismatch",
+    "원가 미입력": "cost_blank",
+    "본사만 있음": "hq_only",
+    "전시판매 수동매칭": "unresolved",
+    "매장 전시": "store_display",
 }
 
 
 def _render_hq_recon_table(db_filename: str, report, cache_key: str) -> None:
-    """대사 리포트 → 결과 필터·검색·표·확정 패널. history/upload 양쪽에서 재사용."""
+    """대사 리포트 → 결과 필터·검색·표. 원가 수정/매장 전시 지정은 3번 탭에서 처리한다."""
     import hq_order_reconcile_service as hq
 
     df_recon = hq.reconcile_to_dataframe(report)
@@ -8328,7 +8341,7 @@ def _render_hq_recon_table(db_filename: str, report, cache_key: str) -> None:
         st.info("대사 대상 행이 없습니다.")
         return
 
-    # 결과별 카운트 카드
+    # 결과별 카운트 카드 (매장 전시 포함)
     _counts = report.counts or {}
     _card_map = {
         "ok": "원가 일치",
@@ -8336,12 +8349,12 @@ def _render_hq_recon_table(db_filename: str, report, cache_key: str) -> None:
         "cost_blank": "원가 미입력",
         "hq_only": "본사만 있음",
         "unresolved": "전시판매 수동매칭",
+        "store_display": "매장 전시",
     }
     _sum_cols = st.columns(len(_card_map))
     for _i, (_code, _lbl) in enumerate(_card_map.items()):
         _sum_cols[_i].metric(_lbl, f"{_counts.get(_code, 0):,}")
 
-    # 결과 필터 라디오 + 검색어
     _f1, _f2 = st.columns([2.6, 1])
     with _f1:
         _sel_label = st.radio(
@@ -8375,23 +8388,16 @@ def _render_hq_recon_table(db_filename: str, report, cache_key: str) -> None:
         )
         _df = _df[_mask]
 
-    st.caption(
-        f"표시 {len(_df):,} / 전체 {len(df_recon):,}건 · "
-        "**본사원가** = ERP 출고 `주문금액 + 부가세`, **앱(모모) 원가** = `cost_price`, "
-        "**앱(모모) 전시원가** = `display_cost_amount` 를 각각 비교합니다."
-    )
+    st.caption(f"표시 {len(_df):,} / 전체 {len(df_recon):,}건")
     st.dataframe(
         _hq_money_styler(_df, _HQ_RECON_MONEY_COLS),
         width="stretch", hide_index=True,
     )
 
-    _render_hq_cost_edit_panel(db_filename, report, cache_key)
-    _render_hq_display_manual_match(report, cache_key)
-
     try:
         _xlsx_bytes = hq.build_review_excel(report)
         st.download_button(
-            "📥 대사 결과 Excel 다운로드",
+            "대사 결과 Excel 다운로드",
             data=_xlsx_bytes,
             file_name=f"HQ대사_{db_filename}_{datetime.now(tz=KST).strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -8401,18 +8407,12 @@ def _render_hq_recon_table(db_filename: str, report, cache_key: str) -> None:
         st.caption(f"엑셀 다운로드 준비 실패: {_e}")
 
 
-def _render_hq_history_view(db_filename: str, hq) -> None:
-    """저장된 스냅샷을 날짜 범위로 다시 조회. 파일 재업로드 불필요."""
-    st.markdown("#### 🔎 저장된 대사 결과 조회")
-    st.caption(
-        "이미 업로드해 둔 본사 스냅샷을 **등록일** 범위로 다시 대사합니다. "
-        "파일을 다시 올릴 필요 없이 결과별로 걸러 볼 수 있습니다."
-    )
-
+def _load_hq_history_report(db_filename: str, hq):
+    """(공유) 저장된 스냅샷 날짜 범위 선택 + report 캐시 반환. 캐시 없으면 조회·대사."""
     client, _err = get_supabase_client()
     if not client:
         st.error(f"Supabase 연결 실패: {_err}")
-        return
+        return None, None, None
 
     _today = datetime.now(tz=KST).date()
     _default_from = _today - timedelta(days=60)
@@ -8421,21 +8421,21 @@ def _render_hq_history_view(db_filename: str, hq) -> None:
     _c1, _c2, _c3 = st.columns([1.2, 1.2, 1])
     with _c1:
         _dfrom = st.date_input(
-            "시작일 (등록일)", value=st.session_state.get(_from_key, _default_from),
+            "시작일", value=st.session_state.get(_from_key, _default_from),
             key=_from_key,
         )
     with _c2:
         _dto = st.date_input(
-            "종료일 (등록일)", value=st.session_state.get(_to_key, _today),
+            "종료일", value=st.session_state.get(_to_key, _today),
             key=_to_key,
         )
     with _c3:
         st.markdown("<div style='height:1.7rem;'></div>", unsafe_allow_html=True)
-        _refresh = st.button("🔄 다시 조회", key=f"hq_hist_refresh::{db_filename}", width="stretch")
+        _refresh = st.button("다시 조회", key=f"hq_hist_refresh::{db_filename}::{id(hq)}", width="stretch")
 
     if _dfrom and _dto and _dfrom > _dto:
-        st.warning("시작일이 종료일보다 늦습니다. 날짜를 조정하세요.")
-        return
+        st.warning("시작일이 종료일보다 늦습니다.")
+        return None, _dfrom, _dto
 
     _hist_key = f"hq_hist_report::{db_filename}::{_dfrom}::{_dto}"
     if _refresh:
@@ -8448,38 +8448,46 @@ def _render_hq_history_view(db_filename: str, hq) -> None:
                 snaps = hq.load_snapshots(client, db_filename, _dfrom, _dto)
             except Exception as _e:
                 st.error(f"스냅샷 조회 실패: {_e}")
-                return
+                return None, _dfrom, _dto
             hq_rows = hq.snapshots_to_hqrows(snaps)
         if not hq_rows:
-            st.info("이 기간에 저장된 본사 스냅샷이 없습니다. 오른쪽 상단 **📤 새 파일 업로드** 탭에서 파일을 등록하세요.")
-            return
+            st.info("이 기간에 저장된 본사 스냅샷이 없습니다.")
+            return None, _dfrom, _dto
         with st.spinner(f"앱 주문과 대사 중… (본사 {len(hq_rows):,}건)"):
             try:
                 report = hq.build_hq_reconcile(client, db_filename, hq_rows)
             except Exception as _e:
                 st.error(f"대사 실행 실패: {_e}")
-                return
+                return None, _dfrom, _dto
         st.session_state[_hist_key] = report
 
+    return report, _dfrom, _dto
+
+
+def _hq_invalidate_history_caches(db_filename: str) -> None:
+    """저장된 대사 리포트 캐시(날짜별)만 초기화. 날짜 입력값은 유지."""
+    for _k in list(st.session_state.keys()):
+        if isinstance(_k, str) and _k.startswith(f"hq_hist_report::{db_filename}::"):
+            st.session_state.pop(_k, None)
+
+
+def _render_hq_history_view(db_filename: str, hq) -> None:
+    """2. 원가 확인표: 저장된 스냅샷을 날짜 범위로 다시 조회. 파일 재업로드 불필요."""
+    report, _dfrom, _dto = _load_hq_history_report(db_filename, hq)
+    if report is None:
+        return
     _cache_key = f"hist::{db_filename}::{_dfrom}::{_dto}"
     _render_hq_recon_table(db_filename, report, _cache_key)
 
 
 def _render_hq_new_upload(db_filename: str, hq) -> None:
-    """새 본사 파일 업로드 → 스냅샷 upsert → 대사."""
-    st.markdown("#### 📤 새 파일 업로드")
-    st.caption(
-        "본사 ERP **주문조회(대)** 엑셀/CSV 를 등록합니다. 출고번호 기준 중복은 자동 스킵되고, "
-        "이전 업로드와 비교해 **주문금액/상태 변경** 은 revised 로 표시됩니다. "
-        "앱 주문·결제·매출 데이터는 절대 변경되지 않습니다."
-    )
-
+    """1. 새 파일 업로드: 파일 파싱 → 스냅샷 upsert → 대사."""
     client, _err = get_supabase_client()
     if not client:
         st.error(f"Supabase 연결 실패: {_err}")
         return
 
-    with st.expander("📚 최근 업로드 이력 (최대 30건)", expanded=False):
+    with st.expander("최근 업로드 이력 (최대 30건)", expanded=False):
         hist = hq.load_upload_history(client, db_filename, limit=30)
         if hist is None or hist.empty:
             st.caption("아직 업로드 이력이 없습니다.")
@@ -8487,10 +8495,9 @@ def _render_hq_new_upload(db_filename: str, hq) -> None:
             st.dataframe(_hq_money_styler(hist, ["hq_amount_sum"]), width="stretch", hide_index=True)
 
     up = st.file_uploader(
-        "본사 주문조회 엑셀 (.xlsx) 또는 CSV",
+        "본사 주문조회 엑셀(.xlsx) / CSV",
         type=["xlsx", "csv"],
         key=f"hq_upload_file::{db_filename}",
-        help="첫번째 시트/전체 CSV 를 읽어 헤더를 자동 감지합니다. TOTAL 과 구분=회수 는 제외합니다. 구분=매장분은 전시판매로 넣습니다.",
     )
     if up is None:
         return
@@ -8504,30 +8511,13 @@ def _render_hq_new_upload(db_filename: str, hq) -> None:
             return
     rows: list = st.session_state[cache_key]
     if not rows:
-        st.warning("파싱 결과 유효 행이 없습니다. (헤더/주문구분 확인)")
+        st.warning("파싱 결과 유효 행이 없습니다.")
         return
 
     st.success(f"파싱된 주문 행: **{len(rows):,}건**")
-    with st.expander("원본 파싱 미리보기 (앞 15행)", expanded=False):
-        prev = pd.DataFrame([{
-            "고객": r.customer_name,
-            "전화": r.phone1_digits,
-            "등록일": r.order_date.isoformat() if r.order_date else "",
-            "담당": r.employee_names,
-            "구분": "전시판매(매장분)" if r.is_display else (r.order_kind or "주문"),
-            "주문금액": r.order_amount,
-            "합계": r.total_amount_hq,
-            "상태": r.order_status,
-        } for r in rows[:15]])
-        st.dataframe(_hq_money_styler(prev, ["주문금액", "합계"]), width="stretch", hide_index=True)
-
-    st.caption(
-        "저장 시 앱 주문과 같은 전화면 **단건 앱(모모) 원가가 본사원가와 2만원 이내면 그 주문만** 쓰고 이전 달은 합치지 않습니다. "
-        "전화가 없을 때만 이름 + 등록일 ±2일. **구분=매장분** 은 전시판매(수동 매칭), **구분=회수** 는 대사·스냅샷에서 제외."
-    )
 
     _btn_key = f"hq_process::{up.name}::{up.size}"
-    if st.button("💾 저장 & 대사 실행", key=_btn_key, type="primary"):
+    if st.button("저장 & 대사 실행", key=_btn_key, type="primary"):
         _uploader = _current_username() or "hq_upload"
         with st.spinner("스냅샷 저장 중…"):
             snap = hq.process_hq_upload(
@@ -8538,33 +8528,26 @@ def _render_hq_new_upload(db_filename: str, hq) -> None:
                 uploaded_by=_uploader,
             )
         st.session_state[f"hq_snap::{cache_key}"] = snap
-        with st.spinner("앱 주문과 대사 중…"):
-            report = hq.build_hq_reconcile(client, db_filename, rows)
-        st.session_state[f"hq_report::{cache_key}"] = report
-        # 조회 탭의 캐시된 리포트는 오래된 상태이므로 지운다.
-        for _k in list(st.session_state.keys()):
-            if isinstance(_k, str) and _k.startswith(f"hq_hist_report::{db_filename}::"):
-                st.session_state.pop(_k, None)
-        st.success("스냅샷 저장 완료. **🔎 저장된 대사 결과 조회** 탭에서 날짜별 결과를 다시 볼 수 있습니다.")
+        _hq_invalidate_history_caches(db_filename)
+        st.success("스냅샷 저장 완료. **2. 원가 확인표** 에서 날짜별 결과를 확인하세요.")
 
     snap = st.session_state.get(f"hq_snap::{cache_key}")
-    report = st.session_state.get(f"hq_report::{cache_key}")
-    if snap is None or report is None:
+    if snap is None:
         return
 
     summary = snap.summary()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("신규", f"{summary['new']:,}")
-    c2.metric("중복(변경 없음)", f"{summary['dup']:,}")
+    c2.metric("중복", f"{summary['dup']:,}")
     c3.metric("변경(revised)", f"{summary['revised']:,}")
-    c4.metric("이전에 있었지만 이번 없음", f"{summary['missing']:,}")
+    c4.metric("이번 파일에 없음", f"{summary['missing']:,}")
     if snap.errors:
-        with st.expander(f"⚠️ 저장 중 경고 {len(snap.errors)}건", expanded=False):
+        with st.expander(f"저장 중 경고 {len(snap.errors)}건", expanded=False):
             for _em in snap.errors[:50]:
                 st.warning(_em)
 
     if snap.revised:
-        st.markdown("##### 변경(revised) 상세 — 이전값과의 차이")
+        st.markdown("##### 변경(revised) 상세")
         _rev_df = pd.DataFrame([{
             "고객": r.get("customer_name"),
             "등록일": r.get("order_date"),
@@ -8579,31 +8562,322 @@ def _render_hq_new_upload(db_filename: str, hq) -> None:
             width="stretch", hide_index=True,
         )
 
-    st.markdown("##### 원가 대사표 (이번 업로드)")
-    _render_hq_recon_table(db_filename, report, cache_key)
+
+def _hq_mark_store_display(
+    hq,
+    db_filename: str,
+    report,
+    row_index: int,
+    value: bool,
+) -> bool:
+    """report 안의 특정 row 를 매장 전시(True) / 해제(False) 로 UPDATE 하고 report state 즉시 반영."""
+    client, _err = get_supabase_client()
+    if not client:
+        st.error(f"Supabase 연결 실패: {_err}")
+        return False
+    if row_index < 0 or row_index >= len(report.rows):
+        return False
+    row = report.rows[row_index]
+    ship_numbers = list(row.hq_ships or [])
+    if not ship_numbers:
+        st.error("출고번호가 없어 스냅샷을 특정할 수 없습니다.")
+        return False
+    order_date = row.order_date
+    ok_all = True
+    for sn in ship_numbers:
+        ok = hq.set_snapshot_store_display(client, db_filename, sn, order_date, value)
+        ok_all = ok_all and ok
+    if not ok_all:
+        st.error("스냅샷 UPDATE 실패. Supabase 로그를 확인하세요.")
+        return False
+    # 리포트 즉시 갱신
+    if value:
+        row.is_store_display = True
+        row.result_label = "매장 전시"
+        row.result_code = "store_display"
+        row.reason = "매장 자체 전시분 (판매 아님) · 관리자 지정"
+        row.order_id = None
+        row.order_ids = []
+        row.seller_cost = None
+        row.display_cost = None
+        row.entered_sale = None
+        row.order_kind = "매장전시"
+    else:
+        row.is_store_display = False
+        row.result_label = "본사만 있음"
+        row.result_code = "hq_only"
+        row.reason = "매장 전시 해제 (관리자 지정) — 재조회 시 자동 매칭 재시도"
+    # counts 재계산
+    _counts: dict[str, int] = {}
+    for _rr in report.rows:
+        _counts[_rr.result_code] = _counts.get(_rr.result_code, 0) + 1
+    report.counts = _counts
+    return True
+
+
+def _render_hq_edit_row_action(
+    hq,
+    db_filename: str,
+    report,
+    row_index: int,
+    cache_key: str,
+) -> None:
+    """선택된 대사 행의 상태에 따라 원가 확정 / 수동 매칭 / 매장 전시 지정·해제 액션 표시."""
+    row = report.rows[row_index]
+    code = row.result_code
+    hq_cost = int(row.hq_cost or 0)
+    oids = list(row.order_ids or [])
+    st.markdown(
+        f"**대상**: {row.customer_name or '(고객명 없음)'} · 본사원가 {hq_cost:,}원 · "
+        f"전화 {row.phone1_digits or '-'} · 등록일 {row.order_date.isoformat() if row.order_date else '-'} · "
+        f"현재 결과 **{row.result_label}**"
+    )
+
+    _btn_disp_key = f"hq_edit_mark_sd::{cache_key}::{row_index}"
+    _btn_undo_key = f"hq_edit_undo_sd::{cache_key}::{row_index}"
+
+    # 원가 불일치 / 원가 미입력 (앱 매칭 1건) → 원가 확정 + 소액 보정
+    if code in ("cost_mismatch", "cost_blank") and len(oids) == 1:
+        _oid = int(oids[0])
+        _seller = int(row.seller_cost or 0)
+        _disp = int(row.display_cost or 0)
+        _pick_options: list[tuple[str, str, int, int]] = []
+        if _seller > 0:
+            _pick_options.append((
+                "general",
+                f"앱(모모) 원가 {_seller:,} 유지 (본사 대비 {(_seller - hq_cost):+,})",
+                _seller, _disp,
+            ))
+        if _disp > 0:
+            _pick_options.append((
+                "display",
+                f"앱(모모) 전시원가 {_disp:,} → 앱(모모) 원가로 이동 (본사 대비 {(_disp - hq_cost):+,})",
+                _disp, 0,
+            ))
+        if _pick_options:
+            _pick_ids = [x[0] for x in _pick_options]
+            _pick = st.radio(
+                "최종 입력 (본사원가 / 앱(모모) 원가)",
+                _pick_ids,
+                index=0,
+                format_func=lambda x: next(o[1] for o in _pick_options if o[0] == x),
+                key=f"hq_edit_pick::{cache_key}::{_oid}",
+                horizontal=False,
+            )
+            if st.button("선택한 원가로 확정", key=f"hq_edit_pick_btn::{cache_key}::{_oid}", type="primary"):
+                _target = next(o for o in _pick_options if o[0] == _pick)
+                _, _lbl, _new_cost, _new_disp = _target
+                _ok = _update_order_supabase(
+                    db_filename, _oid,
+                    {"cost_price": _new_cost, "display_cost_amount": _new_disp},
+                )
+                if not _ok:
+                    st.error(f"주문 #{_oid} 업데이트 실패.")
+                else:
+                    _recalc_order_actual_margin_supabase(db_filename, _oid)
+                    row.seller_cost = int(_new_cost)
+                    row.display_cost = int(_new_disp)
+                    row.result_label = "원가 일치"
+                    row.result_code = "ok"
+                    row.reason = "관리자 강제매칭."
+                    _counts: dict[str, int] = {}
+                    for _rr in report.rows:
+                        _counts[_rr.result_code] = _counts.get(_rr.result_code, 0) + 1
+                    report.counts = _counts
+                    clear_data_cache()
+                    st.success(f"주문 #{_oid} 확정.")
+                    st.rerun()
+        else:
+            st.info("확정 가능한 앱(모모) 원가가 없습니다 (원가/전시원가 모두 0).")
+
+        # 소액 보정
+        _SMALL_GAP = 20_000
+        _gap = hq_cost - _seller
+        if _seller > 0 and 0 < abs(_gap) <= _SMALL_GAP:
+            st.markdown("**소액 보정**")
+            _apply = st.radio(
+                f"차이 {_gap:+,}원 처리",
+                ["앱(모모) 원가 유지", f"본사원가 {hq_cost:,}원 적용"],
+                index=0,
+                key=f"hq_edit_small::{cache_key}::{_oid}",
+                horizontal=True,
+            )
+            if _apply.startswith("본사원가") and st.button(
+                "본사원가로 맞춤", key=f"hq_edit_small_btn::{cache_key}::{_oid}", type="primary",
+            ):
+                _ok = _update_order_supabase(db_filename, _oid, {"cost_price": hq_cost})
+                if not _ok:
+                    st.error(f"주문 #{_oid} 업데이트 실패.")
+                else:
+                    _recalc_order_actual_margin_supabase(db_filename, _oid)
+                    row.seller_cost = int(hq_cost)
+                    row.result_label = "원가 일치"
+                    row.result_code = "ok"
+                    row.reason = "관리자 강제매칭."
+                    _counts = {}
+                    for _rr in report.rows:
+                        _counts[_rr.result_code] = _counts.get(_rr.result_code, 0) + 1
+                    report.counts = _counts
+                    clear_data_cache()
+                    st.success(f"주문 #{_oid} 본사원가 적용.")
+                    st.rerun()
+
+        # 매장 전시로 분류
+        if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key):
+            if _hq_mark_store_display(hq, db_filename, report, row_index, True):
+                st.success("매장 전시로 분류했습니다.")
+                st.rerun()
+
+    # 전시판매 수동 매칭
+    elif code == "unresolved":
+        _cands = list(getattr(row, "candidate_orders", None) or [])
+        if not _cands:
+            st.info("같은 전화/이름의 앱 주문 후보가 없습니다.")
+        else:
+            _opt_ids: list[int] = []
+            _opt_labels: list[str] = []
+            for o in _cands:
+                try:
+                    oid = int(o.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if oid in _opt_ids:
+                    continue
+                od = str(o.get("order_date") or "")[:10]
+                dd = str(o.get("delivery_date") or "")[:10]
+                sc = int(o.get("cost_price") or 0)
+                dc = int(o.get("display_cost_amount") or 0)
+                sale = int(o.get("total_amount") or 0)
+                _opt_ids.append(oid)
+                _opt_labels.append(
+                    f"#{oid} · 등록 {od or '-'} · 배송 {dd or '-'} · "
+                    f"앱(모모) 원가 {sc:,} · 앱(모모) 전시원가 {dc:,} · 판매가 {sale:,}"
+                )
+            _pick = st.selectbox(
+                "매칭할 앱(모모) 주문",
+                list(range(len(_opt_ids))),
+                format_func=lambda i: _opt_labels[i],
+                key=f"hq_disp_ord::{cache_key}::{row_index}",
+            )
+            if st.button("전시판매 수동 매칭", key=f"hq_disp_btn::{cache_key}::{row_index}", type="primary"):
+                _oid = _opt_ids[_pick]
+                _chosen = next((o for o in _cands if int(o.get("id") or 0) == _oid), None)
+                row.order_id = _oid
+                row.order_ids = [_oid]
+                if _chosen:
+                    row.seller_cost = int(_chosen.get("cost_price") or 0)
+                    row.display_cost = int(_chosen.get("display_cost_amount") or 0)
+                    row.entered_sale = int(_chosen.get("total_amount") or 0)
+                row.result_label = "원가 일치"
+                row.result_code = "ok"
+                row.reason = "관리자 강제매칭."
+                _counts = {}
+                for _rr in report.rows:
+                    _counts[_rr.result_code] = _counts.get(_rr.result_code, 0) + 1
+                report.counts = _counts
+                st.success(f"앱 주문 #{_oid} 에 매칭했습니다.")
+                st.rerun()
+
+        # 매장 전시로 분류
+        if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key):
+            if _hq_mark_store_display(hq, db_filename, report, row_index, True):
+                st.success("매장 전시로 분류했습니다.")
+                st.rerun()
+
+    # 본사만 있음
+    elif code == "hq_only":
+        st.caption("앱 주문과 매칭되는 후보가 없습니다. 매장 자체 전시분이면 아래 버튼으로 분류하세요.")
+        if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key, type="primary"):
+            if _hq_mark_store_display(hq, db_filename, report, row_index, True):
+                st.success("매장 전시로 분류했습니다.")
+                st.rerun()
+
+    # 매장 전시 (해제)
+    elif code == "store_display":
+        st.caption("매장 자체 전시분으로 분류된 행입니다. 잘못 분류된 경우 해제하면 대사 대상으로 복귀합니다.")
+        if st.button("매장 전시 해제", key=_btn_undo_key):
+            if _hq_mark_store_display(hq, db_filename, report, row_index, False):
+                st.success("매장 전시를 해제했습니다.")
+                st.rerun()
+
+    else:
+        st.info("이 상태에서는 자동 액션이 없습니다.")
+
+
+def _render_hq_edit_menu(db_filename: str, hq) -> None:
+    """3. 불일치 금액 수정: 상태별 대상 선택 → 원가 확정 / 수동 매칭 / 매장 전시 지정·해제."""
+    report, _dfrom, _dto = _load_hq_history_report(db_filename, hq)
+    if report is None:
+        return
+
+    _cache_key = f"edit::{db_filename}::{_dfrom}::{_dto}"
+
+    _counts = report.counts or {}
+    _card_cols = st.columns(len(_HQ_EDIT_FILTER_LABELS))
+    for _i, _lbl in enumerate(_HQ_EDIT_FILTER_LABELS):
+        _code = _HQ_EDIT_FILTER_CODES[_lbl]
+        _card_cols[_i].metric(_lbl, f"{_counts.get(_code, 0):,}")
+
+    _sel_label = st.radio(
+        "수정 대상 상태",
+        _HQ_EDIT_FILTER_LABELS,
+        index=0,
+        horizontal=True,
+        label_visibility="collapsed",
+        key=f"hq_edit_filter::{_cache_key}",
+    )
+    _sel_code = _HQ_EDIT_FILTER_CODES[_sel_label]
+
+    _targets = [
+        (i, r) for i, r in enumerate(report.rows) if r.result_code == _sel_code
+    ]
+    if not _targets:
+        st.info(f"'{_sel_label}' 상태의 행이 없습니다.")
+        return
+
+    _labels: list[str] = []
+    for _i, r in _targets:
+        _seller = int(getattr(r, "seller_cost", 0) or 0)
+        _disp = int(getattr(r, "display_cost", 0) or 0)
+        _date = r.order_date.isoformat() if r.order_date else "-"
+        _labels.append(
+            f"{r.customer_name or '(고객명 없음)'} · 본사원가 {int(r.hq_cost):,} · "
+            f"앱 원가 {_seller:,} · 앱 전시원가 {_disp:,} · 전화 {r.phone1_digits or '-'} · 등록 {_date}"
+        )
+    _pick = st.selectbox(
+        "대상 행",
+        list(range(len(_targets))),
+        format_func=lambda i: _labels[i],
+        key=f"hq_edit_pick_row::{_cache_key}::{_sel_code}",
+    )
+    _row_idx = _targets[_pick][0]
+
+    st.markdown("---")
+    _render_hq_edit_row_action(hq, db_filename, report, _row_idx, _cache_key)
 
 
 def _render_admin_hq_upload(db_filename: str) -> None:
-    """관리자 전용: 본사 ERP 주문조회(대) 파일 등록 + 원가 대사.
-
-    두 탭:
-      1) 저장된 대사 결과 조회 — 날짜 범위로 스냅샷 다시 대사 (파일 재업로드 불필요)
-      2) 새 파일 업로드 — 엑셀 파싱 → 스냅샷 upsert → 대사
-    """
+    """관리자 전용: 본사 ERP 주문조회(대) 파일 등록 + 원가 대사 (3-탭)."""
     try:
         import hq_order_reconcile_service as hq
     except Exception as _e:
         st.error(f"hq_order_reconcile_service 로드 실패: {_e}")
         return
 
-    st.header("📥 ERP 파일 등록 & 원가 대사 (본사 주문조회)")
+    st.header("ERP 파일 등록 & 원가 대사")
     st.markdown(f"매장: **{db_filename}**")
 
-    _tab_hist, _tab_new = st.tabs(["🔎 저장된 대사 결과 조회", "📤 새 파일 업로드"])
-    with _tab_hist:
-        _render_hq_history_view(db_filename, hq)
+    _tab_new, _tab_view, _tab_edit = st.tabs([
+        "1. 새 파일 업로드",
+        "2. 원가 확인표",
+        "3. 불일치 금액 수정",
+    ])
     with _tab_new:
         _render_hq_new_upload(db_filename, hq)
+    with _tab_view:
+        _render_hq_history_view(db_filename, hq)
+    with _tab_edit:
+        _render_hq_edit_menu(db_filename, hq)
 
 
 def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_file):

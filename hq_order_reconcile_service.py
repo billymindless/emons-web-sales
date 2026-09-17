@@ -49,6 +49,14 @@ INCLUDED_ORDER_KINDS: set[str] = {"주문", "매장분"}
 DISPLAY_ORDER_KINDS: set[str] = {"매장분"}
 _DISPLAY_NAME_PATTERNS: tuple[str, ...] = ("리빙(법)",)
 
+# 매장 자체 전시분 (판매 아님) 자동 감지 이름 패턴.
+# 예) 울산삼산점(법), 울산학성점(법), 에몬스리빙삼산(법)
+# `리빙(법)` 단독은 매칭에서 제외 → 기존 전시판매(매장분) 로 유지.
+_STORE_DISPLAY_NAME_REGEXES: tuple[Any, ...] = (
+    re.compile(r".+점\s*\(\s*법\s*\)\s*$"),
+    re.compile(r"^\s*에몬스리빙.+\(\s*법\s*\)\s*$"),
+)
+
 # 취소로 간주할 주문상태 표기 (본사 파일)
 CANCELLED_STATUS_TOKENS: set[str] = {"취소", "취소요청", "회수", "반품"}
 
@@ -226,6 +234,19 @@ def _is_display(customer_name: Any, order_kind: Any) -> bool:
     return False
 
 
+def _is_store_display(customer_name: Any) -> bool:
+    """매장 자체 전시분(판매 아님) 자동 감지. `리빙(법)` 단독은 제외."""
+    s = _clean_str(customer_name)
+    if not s:
+        return False
+    if _normalize_name_key(s) == _normalize_name_key("리빙(법)"):
+        return False
+    for rx in _STORE_DISPLAY_NAME_REGEXES:
+        if rx.search(s):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 파싱
 # ---------------------------------------------------------------------------
@@ -294,6 +315,7 @@ class HQRow:
     total_amount_hq: int = 0
     outlet: bool = False
     is_display: bool = False
+    is_store_display: bool = False
     identity_key: str = ""
     raw_row: dict[str, Any] = field(default_factory=dict)
 
@@ -381,6 +403,7 @@ def parse_hq_order_export(file_bytes: bytes, filename: str) -> list[HQRow]:
             or (_to_int(_get(row, "order_amount")) + _to_int(_get(row, "vat"))),
             outlet=_to_bool(_get(row, "outlet")),
             is_display=_is_display(cust, kind),
+            is_store_display=_is_store_display(cust),
             identity_key=ident,
         )
         # ship_number fallback (contract_no)
@@ -576,6 +599,9 @@ def process_hq_upload(
             payload["prev_order_amount"] = None
             payload["prev_order_status"] = None
             payload["prev_uploaded_at"] = None
+            # 최초 INSERT 시에만 자동 감지된 매장 전시 분류를 저장한다.
+            # 이후 revised UPDATE 에서는 payload 에 넣지 않아 관리자 수동 지정값을 보존.
+            payload["is_store_display"] = bool(r.is_store_display)
             try:
                 _ins = client.table("app_hq_order_snapshots").insert(payload).execute()
                 _new_id = None
@@ -696,6 +722,7 @@ class ReconcileRow:
     result_code: str = ""
     reason: str = ""
     is_display: bool = False
+    is_store_display: bool = False
     order_kind: str = ""
     candidate_orders: list[dict] = field(default_factory=list)
 
@@ -991,10 +1018,14 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
     if not hq_rows:
         return report
 
-    orders_by_ident = _fetch_orders_by_identity(client, db_filename, hq_rows)
+    # 매장 자체 전시분(판매 아님)은 앱 주문 매칭 대상에서 제외한다.
+    normal_rows = [r for r in hq_rows if not r.is_store_display]
+    store_rows = [r for r in hq_rows if r.is_store_display]
+
+    orders_by_ident = _fetch_orders_by_identity(client, db_filename, normal_rows)
 
     grouped: dict[tuple, list[HQRow]] = {}
-    for r in hq_rows:
+    for r in normal_rows:
         pk = _phone_match_key(r.phone1_digits or r.phone2_digits)
         kind_tag = "D" if r.is_display else "O"
         if pk:
@@ -1129,6 +1160,44 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
 
         report.rows.append(row)
 
+    # 매장 자체 전시분: 앱 주문 매칭 없이 별도 결과 코드로만 표시
+    store_grouped: dict[tuple, list[HQRow]] = {}
+    for r in store_rows:
+        pk = _phone_match_key(r.phone1_digits or r.phone2_digits)
+        if pk:
+            skey: tuple = ("SD", "P", pk)
+        else:
+            skey = ("SD", "N", r.identity_key, r.order_date.isoformat() if r.order_date else "")
+        store_grouped.setdefault(skey, []).append(r)
+
+    for _skey, group in store_grouped.items():
+        dates = sorted({x.order_date for x in group if x.order_date})
+        target_date = dates[0] if dates else None
+        hq_cost = sum(_hq_ship_cost(x) for x in group)
+        hq_total = sum(int(x.order_amount or 0) for x in group)
+        first = group[0]
+        row = ReconcileRow(
+            hq_ships=[x.ship_number for x in group],
+            identity_key=first.identity_key,
+            phone1_digits=first.phone1_digits or first.phone2_digits,
+            customer_name=first.customer_name,
+            order_date=target_date,
+            order_date_end=dates[-1] if dates else None,
+            employee_names=first.employee_names,
+            hq_cost=hq_cost,
+            hq_total=hq_total,
+            hq_status=first.order_status,
+            is_display=False,
+            is_store_display=True,
+            order_kind="매장전시",
+            candidate_orders=[],
+        )
+        row.result_label = "매장 전시"
+        row.result_code = "store_display"
+        row.reason = "매장 자체 전시분 (판매 아님)"
+        _tick("store_display")
+        report.rows.append(row)
+
     report.counts = counts
     return report
 
@@ -1157,15 +1226,22 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
         # 전시원가차이: 전시원가가 0이면 계산하지 않음 (전시품이 없는 주문)
         disp_diff = None if (disp is None or int(disp) == 0) else (int(disp) - int(r.hq_cost))
         is_disp = bool(getattr(r, "is_display", False))
+        is_store_disp = bool(getattr(r, "is_store_display", False))
         kind = getattr(r, "order_kind", "") or ""
         oids = getattr(r, "order_ids", None) or []
         date_end = getattr(r, "order_date_end", None)
+        if is_store_disp:
+            kind_label = "매장 전시"
+        elif is_disp:
+            kind_label = "전시판매(매장분)"
+        else:
+            kind_label = kind or "주문"
         out.append({
             "주문ID": (
                 ",".join(str(i) for i in oids) if oids
                 else (r.order_id if r.order_id is not None else "")
             ),
-            "구분": "전시판매(매장분)" if is_disp else (kind or "주문"),
+            "구분": kind_label,
             "고객명": r.customer_name,
             "전화": r.phone1_digits,
             "등록일": (
@@ -1203,6 +1279,7 @@ def build_review_excel(report: ReconcileReport) -> bytes:
             ("cost_mismatch", "원가불일치"),
             ("cost_blank", "원가미입력"),
             ("unresolved", "수동선택"),
+            ("store_display", "매장전시"),
         ):
             sub = df_all[df_all["_code"] == code].drop(columns=["_code"], errors="ignore")
             if sub.empty:
@@ -1267,6 +1344,13 @@ def snapshots_to_hqrows(snapshot_rows: list[dict]) -> list[HQRow]:
         phone1 = _phone_digits(s.get("phone1_digits"))
         kind = _clean_str(s.get("order_kind"))
         is_disp = bool(s.get("is_display")) or _is_display(cust, kind)
+        # 관리자 수동 지정값(True/False)이 스냅샷에 있으면 그 값을 그대로 사용한다.
+        # 컬럼이 없거나 NULL 이면 이름 기반 자동 감지로 폴백.
+        _raw_sd = s.get("is_store_display")
+        if _raw_sd is None:
+            is_store_disp = _is_store_display(cust)
+        else:
+            is_store_disp = bool(_raw_sd)
         ident = _identity_key(phone1, cust)
         if not ident:
             continue
@@ -1292,10 +1376,42 @@ def snapshots_to_hqrows(snapshot_rows: list[dict]) -> list[HQRow]:
             total_amount_hq=total_hq,
             outlet=_to_bool(s.get("outlet")),
             is_display=is_disp,
+            is_store_display=is_store_disp,
             identity_key=ident,
         )
         out.append(r)
     return out
+
+
+def set_snapshot_store_display(
+    client,
+    db_filename: str,
+    ship_number: str,
+    order_date: Any,
+    value: bool,
+) -> bool:
+    """스냅샷의 매장 전시 분류 flag 를 갱신한다. `(db_filename, ship_number, order_date)` UNIQUE."""
+    if not client or not db_filename or not ship_number:
+        return False
+    od: Optional[str] = None
+    if isinstance(order_date, date):
+        od = order_date.isoformat()
+    elif order_date:
+        od = str(order_date)[:10]
+    try:
+        q = (
+            client.table("app_hq_order_snapshots")
+            .update({"is_store_display": bool(value)})
+            .eq("db_filename", db_filename)
+            .eq("ship_number", str(ship_number))
+        )
+        if od:
+            q = q.eq("order_date", od)
+        r = q.execute()
+        return bool(getattr(r, "data", None))
+    except Exception as e:
+        logger.warning("set_snapshot_store_display failed: %s", e)
+        return False
 
 
 def load_upload_history(client, db_filename: str, limit: int = 30) -> pd.DataFrame:
@@ -1342,4 +1458,5 @@ __all__ = [
     "load_upload_history",
     "load_snapshots",
     "snapshots_to_hqrows",
+    "set_snapshot_store_display",
 ]
