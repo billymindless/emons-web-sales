@@ -8083,10 +8083,6 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
     """
     if report is None or not getattr(report, "rows", None):
         return
-    try:
-        import hq_order_reconcile_service as hq
-    except Exception:
-        return
 
     # 후보 행: cost_mismatch/cost_blank + 매칭 앱 1건
     editable = [
@@ -8099,9 +8095,10 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
 
     st.markdown("##### 원가 확정 / 소액 수정")
     st.caption(
-        "본사 대사 기준 앱 `cost_price` 를 확정합니다. **판매가·매출·결제·전시 판매가는 바뀌지 않습니다.** "
-        "전시원가를 고르면 그 값을 `cost_price` 로 옮기고 `display_cost_amount` 는 0 이 됩니다. "
-        "차이가 1~20,000원이면 본사원가로 맞추는 소액 보정도 사용할 수 있습니다."
+        "**본사원가**와 **앱(모모) 원가** 중 맞는 쪽을 확정합니다. **판매가·매출·결제·전시 판매가는 바뀌지 않습니다.** "
+        "앱(모모) 전시원가를 고르면 그 값을 앱(모모) 원가(`cost_price`)로 옮기고 전시원가는 0이 됩니다. "
+        "차이가 1~20,000원이면 본사원가로 맞추는 소액 보정도 사용할 수 있습니다. "
+        "확정하면 결과는 **원가 일치**, 사유는 **관리자 강제매칭.** 으로 바뀝니다."
     )
 
     _labels: list[str] = []
@@ -8111,7 +8108,7 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
         disp = int(row.display_cost or 0)
         _labels.append(
             f"#{oid} · {row.customer_name or '(고객명 없음)'} · 본사원가 {int(row.hq_cost):,} · "
-            f"일반 {seller:,} · 전시 {disp:,} · {row.result_label}"
+            f"앱(모모) 원가 {seller:,} · 앱(모모) 전시원가 {disp:,} · {row.result_label}"
         )
     _sel = st.selectbox(
         "수정 대상 행 선택",
@@ -8130,13 +8127,13 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
     if _seller > 0:
         _pick_options.append((
             "general",
-            f"일반원가 {_seller:,}원 유지 (차이 {(_seller - _hq_cost):+,}원)",
+            f"앱(모모) 원가 {_seller:,}원 유지 (본사원가 대비 {(_seller - _hq_cost):+,}원)",
             _seller, _disp,
         ))
     if _disp > 0:
         _pick_options.append((
             "display",
-            f"전시원가 {_disp:,}원 → 일반원가로 이동 (차이 {(_disp - _hq_cost):+,}원, 전시원가 0)",
+            f"앱(모모) 전시원가 {_disp:,}원 → 앱(모모) 원가로 이동 (본사원가 대비 {(_disp - _hq_cost):+,}원)",
             _disp, 0,
         ))
     if _pick_options:
@@ -8144,7 +8141,7 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
         _pick_key = f"hq_edit_pick::{cache_key}::{_oid}"
         _pick_default = 0
         _pick = st.radio(
-            "최종 입력 원가",
+            "최종 입력 (본사원가 / 앱(모모) 원가)",
             _pick_ids,
             index=_pick_default,
             format_func=lambda x: next(o[1] for o in _pick_options if o[0] == x),
@@ -8168,24 +8165,20 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
                 # 세션 report 상태 갱신 (다시 실행 안 해도 결과 반영)
                 _row.seller_cost = int(_new_cost)
                 _row.display_cost = int(_new_disp)
-                _new_label, _new_code = hq.classify_cost_gap(int(_new_cost), _hq_cost)
-                _prev_code = _row.result_code
-                _row.result_label = _new_label
-                _row.result_code = _new_code
-                _row.reason = (_row.reason + f" · 관리자 확정({_pick})").strip(" ·")
-                # counts 재계산
+                _row.result_label = "원가 일치"
+                _row.result_code = "ok"
+                _row.reason = "관리자 강제매칭."
                 _counts_new: dict[str, int] = {}
                 for _rr in report.rows:
                     _counts_new[_rr.result_code] = _counts_new.get(_rr.result_code, 0) + 1
                 report.counts = _counts_new
                 clear_data_cache()
                 st.success(
-                    f"주문 #{_oid} 확정: cost_price={_new_cost:,}원, display_cost_amount={_new_disp:,}원 "
-                    f"→ 결과 `{_new_code}`."
+                    f"주문 #{_oid} 확정: 앱(모모) 원가 {_new_cost:,}원 · 결과 원가 일치 · 관리자 강제매칭."
                 )
                 st.rerun()
     else:
-        st.info("이 주문에는 확정 가능한 원가가 없습니다. (일반/전시 모두 0원)")
+        st.info("이 주문에는 확정 가능한 앱(모모) 원가가 없습니다. (원가·전시원가 모두 0원)")
 
     # 2) 소액 보정 (현재 cost_price 기준 차이 1~20,000원)
     _SMALL_GAP = 20_000
@@ -8196,7 +8189,7 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
         _apply_key = f"hq_edit_small::{cache_key}::{_oid}"
         _apply = st.radio(
             f"차이 {_gap:+,}원 처리",
-            ["앱 원가 유지", f"본사원가 {_hq_cost:,}원 적용"],
+            ["앱(모모) 원가 유지", f"본사원가 {_hq_cost:,}원 적용"],
             index=0,
             key=_apply_key,
             horizontal=True,
@@ -8212,14 +8205,15 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
             else:
                 _recalc_order_actual_margin_supabase(db_filename, _oid)
                 _row.seller_cost = int(_hq_cost)
-                _row.result_label, _row.result_code = hq.classify_cost_gap(int(_hq_cost), _hq_cost)
-                _row.reason = (_row.reason + " · 관리자 소액 보정").strip(" ·")
+                _row.result_label = "원가 일치"
+                _row.result_code = "ok"
+                _row.reason = "관리자 강제매칭."
                 _counts_new = {}
                 for _rr in report.rows:
                     _counts_new[_rr.result_code] = _counts_new.get(_rr.result_code, 0) + 1
                 report.counts = _counts_new
                 clear_data_cache()
-                st.success(f"주문 #{_oid} cost_price 를 본사원가 {_hq_cost:,}원 으로 맞춤.")
+                st.success(f"주문 #{_oid} 앱(모모) 원가를 본사원가 {_hq_cost:,}원으로 맞춤. 결과 원가 일치 · 관리자 강제매칭.")
                 st.rerun()
 
 
@@ -8300,7 +8294,7 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         "동일 출고번호가 이미 있으면 중복(dup) 으로 카운트되며, `주문금액` 이나 `주문상태` 가 다르면 revised 로 갱신됩니다. "
         "이후 앱 주문과 **같은 전화번호면 출고·주문을 한 건으로 합산**해 매칭합니다. "
         "전화가 없을 때만 이름 + 등록일 ±2일을 씁니다. "
-        "**본사원가** 는 전산 출고 원가와 같이 `주문금액 + 부가세`(합계) 입니다."
+        "**본사원가**는 전산 출고 `주문금액 + 부가세`(합계)이고, **앱(모모) 원가**는 매장 입력 `cost_price`입니다."
     )
 
     _btn_key = f"hq_process::{up.name}::{up.size}"
@@ -8372,14 +8366,16 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             _sum_cols[_i].metric(_lbl, f"{_counts.get(_code, 0):,}")
 
         st.caption(
-            "**일반원가** = `cost_price`, **전시원가** = `display_cost_amount` 를 본사원가와 각각 비교합니다. "
-            "본사 ERP 출고에는 전시품 원가가 없으므로 전시원가는 참고 열입니다. "
-            "전시 판매가(`display_sales_amount`)는 `total_amount` 에 포함되어 전체 매출은 그대로 유지됩니다."
+            "**본사원가** = ERP 출고 `주문금액 + 부가세`. "
+            "**앱(모모) 원가** = `cost_price`, **앱(모모) 전시원가** = `display_cost_amount` 를 본사원가와 각각 비교합니다. "
+            "본사 ERP 출고에는 전시품 원가가 없으므로 앱(모모) 전시원가는 참고 열입니다. "
+            "전시 판매가는 전체 매출에 그대로 포함됩니다."
         )
         st.dataframe(
             _hq_money_styler(
                 df_recon,
-                ["본사원가", "주문금액", "일반원가", "일반원가차이", "전시원가", "전시원가차이", "입력판매가"],
+                ["본사원가", "주문금액", "앱(모모) 원가", "앱(모모) 원가차이",
+                 "앱(모모) 전시원가", "앱(모모) 전시원가차이", "입력판매가"],
             ),
             width="stretch", hide_index=True,
         )

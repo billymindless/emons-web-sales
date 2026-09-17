@@ -6,7 +6,7 @@
     - 업로드 이력 + 출고번호 단위 스냅샷 upsert (중복 스킵, 감/증액 delta 감지)
     - 앱 주문(app_orders)과 같은 전화면 출고·주문을 한 건으로 합산 매칭
       (전화 없을 때만 이름 + 등록일 ±2일)
-    - 원가 대사 (입력원가 vs 본사원가) + 계약 변경 gap 판정
+    - 원가 대사 (앱(모모) 원가 vs 본사원가) + 계약 변경 gap 판정
     - 미리보기·다운로드용 DataFrame / 엑셀 빌더
 
 주의:
@@ -1053,8 +1053,8 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
     _cols = [
         "주문ID", "고객명", "전화", "등록일", "담당",
         "본사원가", "주문금액",
-        "일반원가", "일반원가차이",
-        "전시원가", "전시원가차이",
+        "앱(모모) 원가", "앱(모모) 원가차이",
+        "앱(모모) 전시원가", "앱(모모) 전시원가차이",
         "입력판매가",
         "상태", "결과", "사유", "출고번호",
     ]
@@ -1083,10 +1083,10 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
             "담당": r.employee_names,
             "본사원가": int(r.hq_cost),
             "주문금액": int(r.hq_total),
-            "일반원가": seller,
-            "일반원가차이": gen_diff,
-            "전시원가": disp,
-            "전시원가차이": disp_diff,
+            "앱(모모) 원가": seller,
+            "앱(모모) 원가차이": gen_diff,
+            "앱(모모) 전시원가": disp,
+            "앱(모모) 전시원가차이": disp_diff,
             "입력판매가": r.entered_sale,
             "상태": r.hq_status,
             "결과": r.result_label,
