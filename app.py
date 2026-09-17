@@ -8012,6 +8012,17 @@ def _render_admin_delete_requests(db_filename: str):
         st.rerun()
 
 
+def _hq_money_styler(df: pd.DataFrame, cols: list[str]):
+    """Streamlit NumberColumn 서식이 무시되는 환경 대비, 천단위 콤마를 Styler로 고정."""
+    show = df.copy()
+    use = [c for c in cols if c in show.columns]
+    for c in use:
+        show[c] = pd.to_numeric(show[c], errors="coerce")
+    if not use:
+        return show
+    return show.style.format({c: "{:,.0f}" for c in use}, na_rep="")
+
+
 def _render_admin_hq_upload(db_filename: str) -> None:
     """관리자 전용: 본사 ERP 주문조회(대) 엑셀 등록 + 원가 대사.
 
@@ -8044,12 +8055,7 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         if hist is None or hist.empty:
             st.caption("아직 업로드 이력이 없습니다.")
         else:
-            st.dataframe(
-                hist, width="stretch", hide_index=True,
-                column_config={
-                    "hq_amount_sum": st.column_config.NumberColumn("hq_amount_sum", format="%,.0f"),
-                },
-            )
+            st.dataframe(_hq_money_styler(hist, ["hq_amount_sum"]), width="stretch", hide_index=True)
 
     st.markdown("---")
     st.markdown("#### 1. 파일 업로드")
@@ -8087,13 +8093,7 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             "상태": r.order_status,
             "전시": "○" if r.is_display else "",
         } for r in rows[:15]])
-        st.dataframe(
-            prev, width="stretch", hide_index=True,
-            column_config={
-                "주문금액": st.column_config.NumberColumn("주문금액", format="%,.0f"),
-                "합계": st.column_config.NumberColumn("합계", format="%,.0f"),
-            },
-        )
+        st.dataframe(_hq_money_styler(prev, ["주문금액", "합계"]), width="stretch", hide_index=True)
 
     st.markdown("#### 2. 스냅샷 저장 & 대사")
     st.caption(
@@ -8148,12 +8148,8 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             "현재 상태": r.get("order_status"),
         } for r in snap.revised])
         st.dataframe(
-            _rev_df, width="stretch", hide_index=True,
-            column_config={
-                "이전 주문금액": st.column_config.NumberColumn("이전 주문금액", format="%,.0f"),
-                "현재 주문금액": st.column_config.NumberColumn("현재 주문금액", format="%,.0f"),
-                "Δ": st.column_config.NumberColumn("Δ", format="%,.0f"),
-            },
+            _hq_money_styler(_rev_df, ["이전 주문금액", "현재 주문금액", "Δ"]),
+            width="stretch", hide_index=True,
         )
 
     st.markdown("##### 원가 대사표")
@@ -8175,14 +8171,8 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             _sum_cols[_i].metric(_lbl, f"{_counts.get(_code, 0):,}")
 
         st.dataframe(
-            df_recon, width="stretch", hide_index=True,
-            column_config={
-                "본사원가": st.column_config.NumberColumn("본사원가", format="%,.0f"),
-                "주문금액": st.column_config.NumberColumn("주문금액", format="%,.0f"),
-                "입력원가": st.column_config.NumberColumn("입력원가", format="%,.0f"),
-                "원가차이": st.column_config.NumberColumn("원가차이", format="%,.0f"),
-                "입력판매가": st.column_config.NumberColumn("입력판매가", format="%,.0f"),
-            },
+            _hq_money_styler(df_recon, ["본사원가", "주문금액", "입력원가", "원가차이", "입력판매가"]),
+            width="stretch", hide_index=True,
         )
 
         try:
