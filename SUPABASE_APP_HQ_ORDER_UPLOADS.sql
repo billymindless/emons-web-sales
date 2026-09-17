@@ -5,7 +5,8 @@
 --   - snapshots: 출고번호 단위 최신 스냅샷 + 이전값 (감/증액·취소 감지)
 -- 규칙:
 --   - 주문/결제/매출 원본은 절대 변경하지 않음. 이 두 테이블만 upsert.
---   - (db_filename, ship_number) UNIQUE — 재업로드 시 중복 스킵/변경 감지.
+--   - (db_filename, ship_number, order_date) UNIQUE — 출고번호가 매장별 순환
+--     시퀀스이므로 시간이 지나면 재사용됨. 등록일까지 조합해야 실질적 유일성 확보.
 -- =====================================================================
 
 CREATE TABLE IF NOT EXISTS app_hq_order_uploads (
@@ -53,9 +54,12 @@ CREATE TABLE IF NOT EXISTS app_hq_order_snapshots (
   prev_order_status  TEXT,
   prev_uploaded_at   TIMESTAMPTZ,
   first_seen_at      TIMESTAMPTZ DEFAULT now(),
-  last_seen_at       TIMESTAMPTZ DEFAULT now(),
-  CONSTRAINT uniq_hq_ship UNIQUE (db_filename, ship_number)
+  last_seen_at       TIMESTAMPTZ DEFAULT now()
 );
+
+-- 실질 유일성: (매장, 출고번호, 등록일). 출고번호가 매장별 순환이라 등록일 조합 필수.
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_hq_ship_date
+  ON app_hq_order_snapshots(db_filename, ship_number, order_date);
 
 CREATE INDEX IF NOT EXISTS idx_app_hq_snap_store_date
   ON app_hq_order_snapshots(db_filename, order_date);

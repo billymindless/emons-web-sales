@@ -373,8 +373,18 @@ class SnapshotResult:
         }
 
 
-def _fetch_snapshots_by_ship(client, db_filename: str, ship_numbers: list[str]) -> dict[str, dict]:
-    out: dict[str, dict] = {}
+def _snapshot_key(ship_number: str, order_date: Any) -> tuple[str, str]:
+    """스냅샷 dedup 키. 출고번호는 매장별 순환이므로 등록일까지 조합."""
+    od = ""
+    if isinstance(order_date, date):
+        od = order_date.isoformat()
+    elif order_date:
+        od = str(order_date)[:10]
+    return (str(ship_number or ""), od)
+
+
+def _fetch_snapshots_by_ship(client, db_filename: str, ship_numbers: list[str]) -> dict[tuple[str, str], dict]:
+    out: dict[tuple[str, str], dict] = {}
     if not client or not db_filename or not ship_numbers:
         return out
     _CHUNK = 300
@@ -390,16 +400,17 @@ def _fetch_snapshots_by_ship(client, db_filename: str, ship_numbers: list[str]) 
             )
             for row in (r.data or []):
                 sn = row.get("ship_number")
-                if sn:
-                    out[sn] = row
+                if not sn:
+                    continue
+                out[_snapshot_key(sn, row.get("order_date"))] = row
         except Exception as e:
             logger.warning("_fetch_snapshots_by_ship failed: %s", e)
             break
     return out
 
 
-def _fetch_all_snapshot_ship_numbers(client, db_filename: str) -> set[str]:
-    out: set[str] = set()
+def _fetch_all_snapshot_keys(client, db_filename: str) -> set[tuple[str, str]]:
+    out: set[tuple[str, str]] = set()
     if not client or not db_filename:
         return out
     _PAGE = 1000
@@ -408,19 +419,19 @@ def _fetch_all_snapshot_ship_numbers(client, db_filename: str) -> set[str]:
         try:
             r = (
                 client.table("app_hq_order_snapshots")
-                .select("ship_number")
+                .select("ship_number, order_date")
                 .eq("db_filename", db_filename)
                 .range(offset, offset + _PAGE - 1)
                 .execute()
             )
             page = r.data or []
         except Exception as e:
-            logger.warning("_fetch_all_snapshot_ship_numbers failed: %s", e)
+            logger.warning("_fetch_all_snapshot_keys failed: %s", e)
             break
         for row in page:
             sn = row.get("ship_number")
             if sn:
-                out.add(sn)
+                out.add(_snapshot_key(sn, row.get("order_date")))
         if len(page) < _PAGE:
             break
         offset += _PAGE
@@ -493,7 +504,8 @@ def process_hq_upload(
     now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
     for r in rows:
-        prev = existing.get(r.ship_number) or {}
+        _key = _snapshot_key(r.ship_number, r.order_date)
+        prev = existing.get(_key) or {}
         payload = {
             "db_filename": db_filename,
             "ship_number": r.ship_number,
@@ -521,7 +533,15 @@ def process_hq_upload(
             payload["prev_order_status"] = None
             payload["prev_uploaded_at"] = None
             try:
-                client.table("app_hq_order_snapshots").insert(payload).execute()
+                _ins = client.table("app_hq_order_snapshots").insert(payload).execute()
+                _new_id = None
+                if getattr(_ins, "data", None):
+                    try:
+                        _new_id = int(_ins.data[0].get("id"))
+                    except (TypeError, ValueError, KeyError):
+                        _new_id = None
+                # 같은 파일 내에서 동일 키가 다시 등장할 때 재INSERT 하지 않도록 즉시 등록
+                existing[_key] = {**payload, "id": _new_id, "order_date": payload.get("order_date")}
                 res.new.append({**payload, "_row_status": "new"})
             except Exception as e:
                 res.errors.append(f"신규 스냅샷 저장 실패 ({r.ship_number}): {e}")
@@ -538,6 +558,7 @@ def process_hq_upload(
                     "last_seen_at": now_iso,
                     "source_upload_id": res.upload_id,
                 }).eq("id", prev["id"]).execute()
+                existing[_key] = {**prev, "last_seen_at": now_iso, "source_upload_id": res.upload_id}
             except Exception as e:
                 res.errors.append(f"dup 갱신 실패 ({r.ship_number}): {e}")
             res.dup.append({**prev, "_row_status": "dup"})
@@ -549,6 +570,7 @@ def process_hq_upload(
         payload["prev_uploaded_at"] = prev.get("last_seen_at")
         try:
             client.table("app_hq_order_snapshots").update(payload).eq("id", prev["id"]).execute()
+            existing[_key] = {**payload, "id": prev.get("id")}
             res.revised.append({
                 **payload,
                 "_row_status": "revised",
@@ -557,12 +579,12 @@ def process_hq_upload(
         except Exception as e:
             res.errors.append(f"revised 갱신 실패 ({r.ship_number}): {e}")
 
-    # missing: 이 매장 스냅샷에 있는데 이번 파일 ship_numbers 에 없음
+    # missing: 이 매장 스냅샷에 있는데 이번 파일에 없음 (복합 키 기준)
     try:
-        all_snap = _fetch_all_snapshot_ship_numbers(client, db_filename)
-        seen = set(ship_numbers)
-        for sn in all_snap - seen:
-            res.missing.append({"ship_number": sn, "_row_status": "missing"})
+        all_snap = _fetch_all_snapshot_keys(client, db_filename)
+        seen_keys = {_snapshot_key(r.ship_number, r.order_date) for r in rows if r.ship_number}
+        for sn, od in all_snap - seen_keys:
+            res.missing.append({"ship_number": sn, "order_date": od, "_row_status": "missing"})
     except Exception as e:
         logger.info("missing 계산 스킵: %s", e)
 
