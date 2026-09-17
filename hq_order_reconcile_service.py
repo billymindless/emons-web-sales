@@ -1144,7 +1144,7 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
         "앱(모모) 원가", "앱(모모) 원가차이",
         "앱(모모) 전시원가", "앱(모모) 전시원가차이",
         "입력판매가",
-        "상태", "결과", "사유", "출고번호",
+        "상태", "결과", "사유",
     ]
     if not report.rows:
         return pd.DataFrame(columns=_cols)
@@ -1184,7 +1184,6 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
             "상태": r.hq_status,
             "결과": r.result_label,
             "사유": r.reason,
-            "출고번호": ", ".join(r.hq_ships),
         })
     return pd.DataFrame(out, columns=_cols)
 
@@ -1216,6 +1215,88 @@ def build_review_excel(report: ReconcileReport) -> bytes:
 # ---------------------------------------------------------------------------
 # 업로드 이력 조회
 # ---------------------------------------------------------------------------
+
+def load_snapshots(
+    client,
+    db_filename: str,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+) -> list[dict]:
+    """저장된 본사 스냅샷을 `order_date` 범위로 조회 (페이징).
+
+    - `date_from`/`date_to` 둘 다 None 이면 전체.
+    - 반환은 원본 컬럼 dict 리스트. `snapshots_to_hqrows` 로 HQRow 변환 가능.
+    """
+    if not client or not db_filename:
+        return []
+    out: list[dict] = []
+    _PAGE = 1000
+    offset = 0
+    while True:
+        try:
+            q = (
+                client.table("app_hq_order_snapshots")
+                .select("*")
+                .eq("db_filename", db_filename)
+            )
+            if date_from is not None:
+                q = q.gte("order_date", date_from.isoformat())
+            if date_to is not None:
+                q = q.lte("order_date", date_to.isoformat())
+            r = q.order("order_date").range(offset, offset + _PAGE - 1).execute()
+            page = r.data or []
+        except Exception as e:
+            logger.warning("load_snapshots failed: %s", e)
+            break
+        out.extend(page)
+        if len(page) < _PAGE:
+            break
+        offset += _PAGE
+    return out
+
+
+def snapshots_to_hqrows(snapshot_rows: list[dict]) -> list[HQRow]:
+    """`app_hq_order_snapshots` dict 리스트를 `HQRow` 로 변환.
+
+    - `build_hq_reconcile` 가 파일 재파싱 없이 저장된 결과를 다시 대사할 수 있게 한다.
+    - `identity_key` 는 전화 last-10 우선, 없으면 `NAME:` + 이름 정규화 (파서와 동일 규칙).
+    """
+    out: list[HQRow] = []
+    for s in snapshot_rows or []:
+        cust = _clean_str(s.get("customer_name"))
+        phone1 = _phone_digits(s.get("phone1_digits"))
+        kind = _clean_str(s.get("order_kind"))
+        is_disp = bool(s.get("is_display")) or _is_display(cust, kind)
+        ident = _identity_key(phone1, cust)
+        if not ident:
+            continue
+        order_amount = _to_int(s.get("order_amount"))
+        vat = _to_int(s.get("vat"))
+        total_hq = _to_int(s.get("total_amount_hq")) or (order_amount + vat)
+        r = HQRow(
+            ship_number=_clean_str(s.get("ship_number")),
+            contract_no=_clean_str(s.get("contract_no")),
+            order_kind=kind or ("매장분" if is_disp else "주문"),
+            order_status=_clean_str(s.get("order_status")),
+            customer_name=cust,
+            phone1_digits=phone1,
+            phone2_digits="",
+            address="",
+            employee_names=_clean_str(s.get("employee_names")),
+            order_date=_parse_date(s.get("order_date")),
+            contract_date=_parse_date(s.get("contract_date")),
+            ship_date=_parse_date(s.get("ship_date")),
+            delivery_date=_parse_date(s.get("delivery_date")),
+            order_amount=order_amount,
+            vat=vat,
+            total_amount_hq=total_hq,
+            outlet=_to_bool(s.get("outlet")),
+            is_display=is_disp,
+            identity_key=ident,
+        )
+        out.append(r)
+    return out
+
 
 def load_upload_history(client, db_filename: str, limit: int = 30) -> pd.DataFrame:
     if not client or not db_filename:
@@ -1259,4 +1340,6 @@ __all__ = [
     "reconcile_to_dataframe",
     "build_review_excel",
     "load_upload_history",
+    "load_snapshots",
+    "snapshots_to_hqrows",
 ]
