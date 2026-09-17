@@ -8223,7 +8223,7 @@ def _render_hq_display_manual_match(report, cache_key: str) -> None:
         return
     pending = [
         (idx, row) for idx, row in enumerate(report.rows)
-        if row.is_display and row.result_code != "ok"
+        if getattr(row, "is_display", False) and row.result_code != "ok"
     ]
     if not pending:
         return
@@ -8249,7 +8249,7 @@ def _render_hq_display_manual_match(report, cache_key: str) -> None:
         key=f"hq_disp_row::{cache_key}",
     )
     _idx, _row = pending[_sel]
-    _cands = list(_row.candidate_orders or [])
+    _cands = list(getattr(_row, "candidate_orders", None) or [])
     if not _cands:
         st.info("같은 전화/이름으로 찾을 앱 주문이 없습니다. 신규매출에 전시품으로 등록된 건이 있는지 확인하세요.")
         return

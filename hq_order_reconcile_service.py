@@ -1100,22 +1100,26 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
     out = []
     for r in report.rows:
         seller = r.seller_cost if r.seller_cost is not None else None
-        disp = r.display_cost if r.display_cost is not None else None
+        disp = getattr(r, "display_cost", None)
         # 일반원가차이: 일반원가가 0이면 (원가 미입력) 차이를 계산하지 않음
         gen_diff = None if (seller is None or int(seller) == 0) else (int(seller) - int(r.hq_cost))
         # 전시원가차이: 전시원가가 0이면 계산하지 않음 (전시품이 없는 주문)
         disp_diff = None if (disp is None or int(disp) == 0) else (int(disp) - int(r.hq_cost))
+        is_disp = bool(getattr(r, "is_display", False))
+        kind = getattr(r, "order_kind", "") or ""
+        oids = getattr(r, "order_ids", None) or []
+        date_end = getattr(r, "order_date_end", None)
         out.append({
             "주문ID": (
-                ",".join(str(i) for i in r.order_ids) if r.order_ids
+                ",".join(str(i) for i in oids) if oids
                 else (r.order_id if r.order_id is not None else "")
             ),
-            "구분": "전시판매(매장분)" if r.is_display else (r.order_kind or "주문"),
+            "구분": "전시판매(매장분)" if is_disp else (kind or "주문"),
             "고객명": r.customer_name,
             "전화": r.phone1_digits,
             "등록일": (
-                f"{r.order_date.isoformat()}~{r.order_date_end.isoformat()}"
-                if r.order_date and r.order_date_end and r.order_date_end != r.order_date
+                f"{r.order_date.isoformat()}~{date_end.isoformat()}"
+                if r.order_date and date_end and date_end != r.order_date
                 else (r.order_date.isoformat() if r.order_date else "")
             ),
             "담당": r.employee_names,
