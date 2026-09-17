@@ -8038,9 +8038,8 @@ def _render_admin_hq_upload(db_filename: str) -> None:
     st.header("📥 ERP 파일 등록 (본사 주문조회)")
     st.caption(
         "본사 ERP 에서 내려받은 **주문조회(대)** 엑셀을 등록합니다. "
-        "같은 출고(매장+출고번호+등록일)를 다시 올려도 스냅샷·업로드 이력이 늘어나지 않습니다. "
-        "주문금액/합계/상태가 바뀐 경우만 revised 로 갱신됩니다. "
-        "앱 주문·결제·매출 데이터는 절대 변경되지 않습니다."
+        "출고번호 기준으로 중복은 자동 스킵되고, 이전 업로드와 비교해 **주문금액/상태 변경(감/증액)** 은 revised 로 표시됩니다. "
+        "앱 주문·결제·매출 데이터는 절대 변경되지 않으며, `app_hq_order_uploads` / `app_hq_order_snapshots` 에만 기록됩니다."
     )
 
     st.markdown(f"저장 대상 매장: **{db_filename}**")
@@ -8057,16 +8056,6 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             st.caption("아직 업로드 이력이 없습니다.")
         else:
             st.dataframe(_hq_money_styler(hist, ["hq_amount_sum"]), width="stretch", hide_index=True)
-
-    saved_df = hq.load_reconcile_matches(client, db_filename)
-    if saved_df is not None and not saved_df.empty:
-        with st.expander(f"📌 저장된 원가 대사 ({len(saved_df):,}건)", expanded=True):
-            st.caption("같은 전화는 1행으로 유지됩니다. 파일을 다시 올려도 행이 복제되지 않습니다.")
-            st.dataframe(
-                _hq_money_styler(saved_df, ["본사원가", "입력원가", "원가차이", "입력판매가"]),
-                width="stretch",
-                hide_index=True,
-            )
 
     st.markdown("---")
     st.markdown("#### 1. 파일 업로드")
@@ -8108,8 +8097,9 @@ def _render_admin_hq_upload(db_filename: str) -> None:
 
     st.markdown("#### 2. 스냅샷 저장 & 대사")
     st.caption(
-        "이미 있는 출고는 중복으로만 집계하고 새 행을 만들지 않습니다. "
-        "앱 주문은 **같은 전화 = 1건** 으로 매칭합니다. 전화에 주문이 여러 건이면 등록일 ±2일로 좁힙니다. "
+        "동일 출고번호가 이미 있으면 중복(dup) 으로 카운트되며, `주문금액` 이나 `주문상태` 가 다르면 revised 로 갱신됩니다. "
+        "이후 앱 주문과 **같은 전화번호면 출고·주문을 한 건으로 합산**해 매칭합니다. "
+        "전화가 없을 때만 이름 + 등록일 ±2일을 씁니다. "
         "**본사원가** 는 전산 출고 원가와 같이 `주문금액 + 부가세`(합계) 입니다."
     )
 
@@ -8127,12 +8117,6 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         st.session_state[f"hq_snap::{cache_key}"] = snap
         with st.spinner("앱 주문과 대사 중…"):
             report = hq.build_hq_reconcile(client, db_filename, rows)
-            report.upload_id = getattr(snap, "upload_id", None)
-            _save_errs = hq.save_reconcile_matches(
-                client, db_filename, report, upload_id=report.upload_id,
-            )
-            if _save_errs:
-                snap.errors.extend(_save_errs)
         st.session_state[f"hq_report::{cache_key}"] = report
 
     snap = st.session_state.get(f"hq_snap::{cache_key}")
@@ -8141,8 +8125,6 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         return
 
     summary = snap.summary()
-    if getattr(snap, "skipped_duplicate_upload", False):
-        st.info("이미 등록된 출고와 내용이 같습니다. 스냅샷·업로드 이력을 새로 만들지 않았습니다.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("신규", f"{summary['new']:,}")
     c2.metric("중복(변경 없음)", f"{summary['dup']:,}")

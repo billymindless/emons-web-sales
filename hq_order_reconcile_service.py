@@ -4,14 +4,14 @@
 역할:
     - 엑셀/CSV 파싱 (제목·TOTAL 스킵, 회수/취소 제외)
     - 업로드 이력 + 출고번호 단위 스냅샷 upsert (중복 스킵, 감/증액 delta 감지)
-    - 앱 주문(app_orders)과 (전화 또는 이름) + 등록일 ±2일 매칭
+    - 앱 주문(app_orders)과 같은 전화면 출고·주문을 한 건으로 합산 매칭
+      (전화 없을 때만 이름 + 등록일 ±2일)
     - 원가 대사 (입력원가 vs 본사원가) + 계약 변경 gap 판정
     - 미리보기·다운로드용 DataFrame / 엑셀 빌더
 
 주의:
     - 이 모듈은 `app_orders` / `app_payments` / `sales` 를 **절대 변경하지 않는다**.
-    - write 는 `app_hq_order_uploads` / `app_hq_order_snapshots` / `app_hq_reconcile_matches` 뿐.
-    - 동일 출고(매장+출고번호+등록일) 재업로드는 스냅샷·업로드 이력을 새로 만들지 않는다.
+    - write 는 `app_hq_order_uploads` INSERT 와 `app_hq_order_snapshots` upsert 뿐.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Optional
 
 import pandas as pd
@@ -138,9 +138,29 @@ def _to_bool(v: Any) -> bool:
 
 
 def _phone_digits(v: Any) -> str:
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float) and pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    # 엑셀 숫자/과학적 표기 (1.094667915E10, 1094667915.0)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        try:
+            n = int(round(float(v)))
+            return str(n) if n > 0 else ""
+        except (TypeError, ValueError, OverflowError):
+            pass
     s = _clean_str(v)
     if not s:
         return ""
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?[eE][-+]?\d+", s):
+        try:
+            n = int(round(float(s)))
+            return str(n) if n > 0 else ""
+        except (TypeError, ValueError, OverflowError):
+            pass
     return re.sub(r"\D", "", s)
 
 
@@ -153,9 +173,18 @@ def _normalize_name_key(v: Any) -> str:
     return re.sub(r"\s+", "", s).lower()
 
 
+def _phone_match_key(digits: str) -> str:
+    """전화 비교 키. 010-xxxx-xxxx / 10자리 변형을 같은 값으로 본다."""
+    d = re.sub(r"\D", "", digits or "")
+    if len(d) >= 10:
+        return d[-10:]
+    return d
+
+
 def _identity_key(phone_digits: str, customer_name: Any) -> str:
-    if phone_digits:
-        return phone_digits
+    pk = _phone_match_key(phone_digits)
+    if pk:
+        return pk
     n = _normalize_name_key(customer_name)
     return f"NAME:{n}" if n else ""
 
@@ -318,7 +347,7 @@ def parse_hq_order_export(file_bytes: bytes, filename: str) -> list[HQRow]:
         cust = _clean_str(_get(row, "customer_name"))
         phone1 = _phone_digits(_get(row, "phone1"))
         phone2 = _phone_digits(_get(row, "phone2"))
-        ident = _identity_key(phone1, cust)
+        ident = _identity_key(phone1 or phone2, cust)
         if not ident:
             # 전화/이름 둘 다 없으면 매칭 불가 → 스킵 (로그만)
             logger.info("hq skip: no identity, row=%r", row.to_dict())
@@ -373,7 +402,6 @@ class SnapshotResult:
     revised: list[dict] = field(default_factory=list)
     missing: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-    skipped_duplicate_upload: bool = False
 
     def summary(self) -> dict[str, int]:
         return {
@@ -382,11 +410,6 @@ class SnapshotResult:
             "revised": len(self.revised),
             "missing": len(self.missing),
         }
-
-
-def _is_unique_violation(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return "23505" in msg or "duplicate key" in msg or "uniq_hq_" in msg
 
 
 def _snapshot_key(ship_number: str, order_date: Any) -> tuple[str, str]:
@@ -495,72 +518,33 @@ def process_hq_upload(
             res.errors.append(f"업로드 이력 저장 실패: {e}")
         return res
 
+    # 업로드 이력 먼저 INSERT (요약값은 나중에 update)
+    order_dates = [r.order_date for r in rows if r.order_date]
+    hq_sum = sum(_hq_ship_cost(r) for r in rows)
+    try:
+        ur = client.table("app_hq_order_uploads").insert({
+            "db_filename": db_filename,
+            "filename": filename or "",
+            "uploaded_by": uploaded_by or "",
+            "row_count": len(rows),
+            "hq_amount_sum": hq_sum,
+            "order_date_min": (min(order_dates).isoformat() if order_dates else None),
+            "order_date_max": (max(order_dates).isoformat() if order_dates else None),
+            "note": note or None,
+        }).execute()
+        if ur.data:
+            res.upload_id = int(ur.data[0]["id"])
+    except Exception as e:
+        res.errors.append(f"업로드 이력 저장 실패: {e}")
+        return res
+
     ship_numbers = [r.ship_number for r in rows if r.ship_number]
     existing = _fetch_snapshots_by_ship(client, db_filename, ship_numbers)
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-    # 파일 내·기존 스냅샷 기준으로 미리 분류. 전부 dup 이면 업로드 이력도 새로 만들지 않는다.
-    planned: list[tuple[str, HQRow, dict]] = []
-    seen_keys: set[tuple[str, str]] = set()
     for r in rows:
         _key = _snapshot_key(r.ship_number, r.order_date)
         prev = existing.get(_key) or {}
-        if _key in seen_keys:
-            planned.append(("dup", r, prev))
-            continue
-        seen_keys.add(_key)
-        if not prev:
-            planned.append(("new", r, {}))
-            continue
-        prev_amount = int(prev.get("order_amount") or 0)
-        prev_status = _clean_str(prev.get("order_status"))
-        prev_total = int(prev.get("total_amount_hq") or 0)
-        if (
-            prev_amount == int(r.order_amount or 0)
-            and prev_status == (r.order_status or "")
-            and prev_total == int(r.total_amount_hq or 0)
-        ):
-            planned.append(("dup", r, prev))
-        else:
-            planned.append(("revised", r, prev))
-
-    n_new = sum(1 for k, _, _ in planned if k == "new")
-    n_rev = sum(1 for k, _, _ in planned if k == "revised")
-    skip_upload_row = n_new == 0 and n_rev == 0
-    if skip_upload_row:
-        res.skipped_duplicate_upload = True
-        for _kind, r, prev in planned:
-            res.dup.append({
-                **(prev or {}),
-                "ship_number": r.ship_number,
-                "order_date": r.order_date.isoformat() if r.order_date else None,
-                "_row_status": "dup",
-            })
-        return res
-
-    order_dates = [r.order_date for r in rows if r.order_date]
-    hq_sum = sum(_hq_ship_cost(r) for r in rows)
-    if not skip_upload_row:
-        try:
-            ur = client.table("app_hq_order_uploads").insert({
-                "db_filename": db_filename,
-                "filename": filename or "",
-                "uploaded_by": uploaded_by or "",
-                "row_count": len(rows),
-                "hq_amount_sum": hq_sum,
-                "order_date_min": (min(order_dates).isoformat() if order_dates else None),
-                "order_date_max": (max(order_dates).isoformat() if order_dates else None),
-                "note": note or None,
-            }).execute()
-            if ur.data:
-                res.upload_id = int(ur.data[0]["id"])
-        except Exception as e:
-            res.errors.append(f"업로드 이력 저장 실패: {e}")
-            return res
-
-    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-    for kind, r, prev in planned:
-        _key = _snapshot_key(r.ship_number, r.order_date)
         payload = {
             "db_filename": db_filename,
             "ship_number": r.ship_number,
@@ -582,19 +566,7 @@ def process_hq_upload(
             "source_upload_id": res.upload_id,
             "last_seen_at": now_iso,
         }
-        if kind == "dup":
-            res.dup.append({**(prev or {}), "ship_number": r.ship_number, "_row_status": "dup"})
-            if prev.get("id") and res.upload_id:
-                try:
-                    client.table("app_hq_order_snapshots").update({
-                        "last_seen_at": now_iso,
-                        "source_upload_id": res.upload_id,
-                    }).eq("id", prev["id"]).execute()
-                except Exception as e:
-                    res.errors.append(f"dup 갱신 실패 ({r.ship_number}): {e}")
-            continue
-
-        if kind == "new":
+        if not prev:
             payload["first_seen_at"] = now_iso
             payload["prev_order_amount"] = None
             payload["prev_order_status"] = None
@@ -607,19 +579,33 @@ def process_hq_upload(
                         _new_id = int(_ins.data[0].get("id"))
                     except (TypeError, ValueError, KeyError):
                         _new_id = None
+                # 같은 파일 내에서 동일 키가 다시 등장할 때 재INSERT 하지 않도록 즉시 등록
                 existing[_key] = {**payload, "id": _new_id, "order_date": payload.get("order_date")}
                 res.new.append({**payload, "_row_status": "new"})
             except Exception as e:
-                if _is_unique_violation(e):
-                    res.dup.append({**payload, "_row_status": "dup"})
-                else:
-                    res.errors.append(f"신규 스냅샷 저장 실패 ({r.ship_number}): {e}")
+                res.errors.append(f"신규 스냅샷 저장 실패 ({r.ship_number}): {e}")
             continue
 
         prev_amount = int(prev.get("order_amount") or 0)
+        prev_status = _clean_str(prev.get("order_status"))
         new_amount = int(r.order_amount or 0)
+        new_status = r.order_status or ""
+        if prev_amount == new_amount and prev_status == new_status:
+            # 값 동일 → dup, last_seen_at 만 갱신
+            try:
+                client.table("app_hq_order_snapshots").update({
+                    "last_seen_at": now_iso,
+                    "source_upload_id": res.upload_id,
+                }).eq("id", prev["id"]).execute()
+                existing[_key] = {**prev, "last_seen_at": now_iso, "source_upload_id": res.upload_id}
+            except Exception as e:
+                res.errors.append(f"dup 갱신 실패 ({r.ship_number}): {e}")
+            res.dup.append({**prev, "_row_status": "dup"})
+            continue
+
+        # revised
         payload["prev_order_amount"] = prev_amount
-        payload["prev_order_status"] = _clean_str(prev.get("order_status")) or None
+        payload["prev_order_status"] = prev_status or None
         payload["prev_uploaded_at"] = prev.get("last_seen_at")
         try:
             client.table("app_hq_order_snapshots").update(payload).eq("id", prev["id"]).execute()
@@ -641,16 +627,16 @@ def process_hq_upload(
     except Exception as e:
         logger.info("missing 계산 스킵: %s", e)
 
-    if res.upload_id:
-        try:
-            client.table("app_hq_order_uploads").update({
-                "new_count": len(res.new),
-                "dup_count": len(res.dup),
-                "revised_count": len(res.revised),
-                "missing_count": len(res.missing),
-            }).eq("id", res.upload_id).execute()
-        except Exception as e:
-            logger.info("upload 요약 갱신 실패: %s", e)
+    # 업로드 요약 update
+    try:
+        client.table("app_hq_order_uploads").update({
+            "new_count": len(res.new),
+            "dup_count": len(res.dup),
+            "revised_count": len(res.revised),
+            "missing_count": len(res.missing),
+        }).eq("id", res.upload_id).execute()
+    except Exception as e:
+        logger.info("upload 요약 갱신 실패: %s", e)
 
     return res
 
@@ -680,12 +666,14 @@ class ReconcileRow:
     phone1_digits: str = ""
     customer_name: str = ""
     order_date: Optional[date] = None
+    order_date_end: Optional[date] = None
     employee_names: str = ""
     hq_cost: int = 0
     hq_total: int = 0
     hq_status: str = ""
     prev_hq_cost: Optional[int] = None
     order_id: Optional[int] = None
+    order_ids: list[int] = field(default_factory=list)
     seller_cost: Optional[int] = None
     entered_sale: Optional[int] = None
     result_label: str = ""
@@ -701,11 +689,30 @@ class ReconcileReport:
 
 
 def _phone_variants(digits: str) -> list[str]:
-    if not digits:
+    """DB exact-match 용 전화 표기 변형."""
+    d = re.sub(r"\D", "", digits or "")
+    if not d:
         return []
-    if len(digits) == 11 and digits.startswith("010"):
-        return [digits, f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"]
-    return [digits]
+    out: set[str] = {d}
+    last10 = d[-10:] if len(d) >= 10 else d
+    if last10:
+        out.add(last10)
+    if len(last10) == 10 and last10.startswith("10"):
+        full11 = "0" + last10
+        mid, tail = last10[2:6], last10[6:]
+        out.update({
+            full11,
+            last10,
+            f"010-{mid}-{tail}",
+            f"010 {mid} {tail}",
+            f"010.{mid}.{tail}",
+            f"+82{last10}",
+            f"82{last10}",
+        })
+    if len(d) == 11 and d.startswith("010"):
+        out.add(f"{d[:3]}-{d[3:7]}-{d[7:]}")
+        out.add(d[1:])
+    return [x for x in out if x]
 
 
 def _store_name_for_db(client, db_filename: str) -> str:
@@ -716,92 +723,129 @@ def _store_name_for_db(client, db_filename: str) -> str:
             client.table("app_stores")
             .select("store_name")
             .eq("db_filename", db_filename)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
-        if r.data:
-            return _clean_str(r.data.get("store_name"))
+        rows = r.data or []
+        if rows:
+            return _clean_str(rows[0].get("store_name"))
     except Exception as e:
         logger.info("store_name lookup failed: %s", e)
     return ""
 
 
-def _load_match_map(client, db_filename: str) -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    if not client or not db_filename:
-        return out
-    try:
-        r = (
-            client.table("app_hq_reconcile_matches")
-            .select("*")
-            .eq("db_filename", db_filename)
-            .execute()
-        )
-    except Exception as e:
-        logger.info("load match map skipped: %s", e)
-        return out
-    for row in (r.data or []):
-        ident = _clean_str(row.get("identity_key"))
-        if ident:
-            out[ident] = row
-    return out
+def _iter_store_customers(client, store_name: str) -> Iterable[dict]:
+    """매장 고객을 페이지 단위로 조회한다."""
+    if not client or not store_name:
+        return
+    page = 1000
+    offset = 0
+    while True:
+        try:
+            r = (
+                client.table("app_customers")
+                .select("id, phone1, phone2")
+                .eq("store_name", store_name)
+                .range(offset, offset + page - 1)
+                .execute()
+            )
+        except Exception as e:
+            logger.info("store customers fetch failed: %s", e)
+            return
+        rows = r.data or []
+        for row in rows:
+            yield row
+        if len(rows) < page:
+            return
+        offset += page
+
+
+def _customer_phone_keys(row: dict) -> set[str]:
+    keys: set[str] = set()
+    for col in ("phone1", "phone2"):
+        k = _phone_match_key(_phone_digits(row.get(col)))
+        if k:
+            keys.add(k)
+    return keys
 
 
 def _fetch_orders_by_identity(
-    client, db_filename: str, hq_rows: list[HQRow],
+    client, db_filename: str, hq_rows: list[HQRow], window_days: int = MATCH_WINDOW_DAYS,
 ) -> dict[str, list[dict]]:
-    """전화 identity 마다 해당 매장 앱 주문을 모두 모은다. 날짜 창으로 미리 자르지 않는다."""
+    """전화 identity 마다 앱 주문 후보를 모은다. 파일 기간 ±30일."""
     out: dict[str, list[dict]] = {}
     if not client or not db_filename or not hq_rows:
         return out
 
-    phones = sorted({
-        p for r in hq_rows for p in (r.phone1_digits, r.phone2_digits) if p
-    })
-    if not phones:
+    dates = [r.order_date for r in hq_rows if r.order_date]
+    if not dates:
         return out
+    lookback = max(int(window_days or 0), 30)
+    lo = min(dates) - timedelta(days=lookback)
+    hi = max(dates) + timedelta(days=lookback)
 
-    variants: list[str] = []
-    for p in phones:
-        variants.extend(_phone_variants(p))
-    variants = sorted(set(variants))
-    store_name = _store_name_for_db(client, db_filename)
+    wanted_keys: set[str] = set()
+    raw_phones: list[str] = []
+    for r in hq_rows:
+        for p in (r.phone1_digits, r.phone2_digits):
+            k = _phone_match_key(p)
+            if k:
+                wanted_keys.add(k)
+                raw_phones.append(p)
 
     candidate_customer_ids: set[int] = set()
-    cust_phones: dict[int, set[str]] = {}
-    _CHUNK = 200
-    for i in range(0, len(variants), _CHUNK):
-        batch = variants[i:i + _CHUNK]
-        for col in ("phone1", "phone2"):
-            try:
-                q = client.table("app_customers").select("id, phone1, phone2").in_(col, batch)
-                if store_name:
-                    q = q.eq("store_name", store_name)
-                resp = q.execute()
-            except Exception as e:
-                logger.info("customers by %s fetch failed: %s", col, e)
-                continue
-            for row in (resp.data or []):
+    cust_phone_keys: dict[int, set[str]] = {}
+
+    def _absorb_customer(row: dict) -> None:
+        try:
+            cid = int(row["id"])
+        except (TypeError, ValueError, KeyError):
+            return
+        keys = _customer_phone_keys(row)
+        if not keys:
+            return
+        if keys & wanted_keys:
+            candidate_customer_ids.add(cid)
+            cust_phone_keys.setdefault(cid, set()).update(keys)
+
+    if wanted_keys:
+        variants: list[str] = []
+        seen_v: set[str] = set()
+        for p in raw_phones:
+            for v in _phone_variants(p):
+                if v not in seen_v:
+                    seen_v.add(v)
+                    variants.append(v)
+        _CHUNK = 200
+        for i in range(0, len(variants), _CHUNK):
+            batch = variants[i:i + _CHUNK]
+            for col in ("phone1", "phone2"):
                 try:
-                    cid = int(row["id"])
-                except (TypeError, ValueError, KeyError):
+                    r = (
+                        client.table("app_customers")
+                        .select("id, phone1, phone2")
+                        .in_(col, batch)
+                        .execute()
+                    )
+                except Exception as e:
+                    logger.info("customers by %s fetch failed: %s", col, e)
                     continue
-                candidate_customer_ids.add(cid)
-                cust_phones.setdefault(cid, set())
-                d1 = _phone_digits(row.get("phone1"))
-                d2 = _phone_digits(row.get("phone2"))
-                if d1:
-                    cust_phones[cid].add(d1)
-                if d2:
-                    cust_phones[cid].add(d2)
+                for row in (r.data or []):
+                    _absorb_customer(row)
+
+        store_name = _store_name_for_db(client, db_filename)
+        if store_name:
+            for row in _iter_store_customers(client, store_name):
+                _absorb_customer(row)
 
     if not candidate_customer_ids:
         return out
 
     orders_all: list[dict] = []
     ids_list = sorted(candidate_customer_ids)
-    for i in range(0, len(ids_list), _CHUNK):
-        batch = ids_list[i:i + _CHUNK]
+    _CHUNK2 = 200
+    for i in range(0, len(ids_list), _CHUNK2):
+        batch = ids_list[i:i + _CHUNK2]
         try:
             r = (
                 client.table("app_orders")
@@ -811,178 +855,177 @@ def _fetch_orders_by_identity(
                 )
                 .in_("customer_id", batch)
                 .eq("db_filename", db_filename)
+                .gte("order_date", lo.isoformat())
+                .lte("order_date", hi.isoformat())
                 .execute()
             )
             orders_all.extend(r.data or [])
         except Exception as e:
             logger.info("orders by customer fetch failed: %s", e)
 
-    for hr in hq_rows:
-        hq_phones = {p for p in (hr.phone1_digits, hr.phone2_digits) if p}
-        if not hq_phones or not hr.identity_key:
+    missing_phone = [cid for cid in ids_list if cid not in cust_phone_keys]
+    for i in range(0, len(missing_phone), 200):
+        batch = missing_phone[i:i + 200]
+        try:
+            r = client.table("app_customers").select("id, phone1, phone2").in_("id", batch).execute()
+            for row in r.data or []:
+                _absorb_customer(row)
+        except Exception as e:
+            logger.info("customer phones fetch failed: %s", e)
+
+    for o in orders_all:
+        cid = o.get("customer_id")
+        if cid is None:
             continue
-        cands: list[dict] = []
-        for o in orders_all:
-            cid = o.get("customer_id")
-            if cid is None:
-                continue
-            if cust_phones.get(int(cid), set()) & hq_phones:
-                cands.append(o)
-        if cands:
-            out.setdefault(hr.identity_key, []).extend(cands)
+        try:
+            icid = int(cid)
+        except (TypeError, ValueError):
+            continue
+        for k in cust_phone_keys.get(icid, set()):
+            if k in wanted_keys:
+                out.setdefault(k, []).append(o)
 
     for k, arr in list(out.items()):
         seen: set[int] = set()
         uniq = []
         for o in arr:
             oid = o.get("id")
-            if oid is None or int(oid) in seen:
+            if oid is None:
                 continue
-            seen.add(int(oid))
+            try:
+                ioid = int(oid)
+            except (TypeError, ValueError):
+                continue
+            if ioid in seen:
+                continue
+            seen.add(ioid)
             uniq.append(o)
         out[k] = uniq
     return out
 
 
-def _window_cands(
-    orders: list[dict],
-    targets: list[date],
-    window: int = MATCH_WINDOW_DAYS,
-) -> list[tuple[int, dict]]:
-    if not orders or not targets:
+def _window_cands(orders: list[dict], target: Optional[date], window: int = MATCH_WINDOW_DAYS) -> list[tuple[int, dict]]:
+    if not orders or target is None:
         return []
     out: list[tuple[int, dict]] = []
     for o in orders:
         od = _parse_date(o.get("order_date"))
         if od is None:
             continue
-        gap = min(abs((od - t).days) for t in targets)
+        gap = abs((od - target).days)
         if gap <= window:
             out.append((gap, o))
     out.sort(key=lambda x: (x[0], int(x[1].get("id") or 0)))
     return out
 
 
-def _apply_order_to_row(row: ReconcileRow, o: dict, hq_cost: int, reason: str) -> None:
-    row.order_id = int(o.get("id")) if o.get("id") is not None else None
-    row.seller_cost = _seller_cost(o)
-    row.entered_sale = _to_int(o.get("total_amount"))
-    label, code = classify_cost_gap(row.seller_cost, hq_cost)
-    row.result_label = label
-    row.result_code = code
-    row.reason = reason
-
-
-def _restore_prior_match(row: ReconcileRow, prev: dict, hq_cost: int) -> bool:
-    raw_oid = prev.get("order_id")
-    if raw_oid is None or str(raw_oid).strip() == "":
-        return False
-    try:
-        row.order_id = int(raw_oid)
-    except (TypeError, ValueError):
-        return False
-    if prev.get("seller_cost") is not None:
-        try:
-            row.seller_cost = int(prev.get("seller_cost"))
-        except (TypeError, ValueError):
-            row.seller_cost = None
-    if prev.get("entered_sale") is not None:
-        try:
-            row.entered_sale = int(prev.get("entered_sale"))
-        except (TypeError, ValueError):
-            row.entered_sale = None
-    if row.seller_cost is not None:
-        label, code = classify_cost_gap(row.seller_cost, hq_cost)
-        row.result_label = label
-        row.result_code = code
-    else:
-        row.result_label = _clean_str(prev.get("result_label")) or "이전 매칭 유지"
-        row.result_code = _clean_str(prev.get("result_code")) or "ok"
-    row.reason = "이전 매칭 유지"
-    return True
-
-
 def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> ReconcileReport:
     """본사 rows + 앱 주문으로 대사 리포트 생성.
 
-    Grouping: identity_key(전화 우선) 1건. 같은 전화의 출고는 본사원가를 합산한다.
-    Matching: 앱 주문이 1건이면 날짜와 무관하게 자동 매칭.
-    2건 이상이면 등록일 ±MATCH_WINDOW_DAYS 로 좁히고, 그래도 애매하면 unresolved.
+    - 전화가 있으면 전화번호 기준으로 본사 출고를 한 건으로 합산하고,
+      같은 전화의 앱 주문 원가·판매가도 합산해 비교한다. (등록일 ±2일 제한 없음)
+    - 전화가 없으면 (이름, 등록일) + ±2일 창으로 기존과 같이 매칭.
     """
     report = ReconcileReport()
     if not hq_rows:
         return report
 
     orders_by_ident = _fetch_orders_by_identity(client, db_filename, hq_rows)
-    prior = _load_match_map(client, db_filename)
 
-    grouped: dict[str, list[HQRow]] = {}
+    grouped: dict[tuple, list[HQRow]] = {}
     for r in hq_rows:
         if r.is_display:
             continue
-        ident = r.identity_key or _identity_key(r.phone1_digits, r.customer_name)
-        if not ident:
-            continue
-        grouped.setdefault(ident, []).append(r)
+        pk = _phone_match_key(r.phone1_digits or r.phone2_digits)
+        if pk:
+            key: tuple = ("P", pk)
+        else:
+            key = ("N", r.identity_key, r.order_date.isoformat() if r.order_date else "")
+        grouped.setdefault(key, []).append(r)
 
     counts: dict[str, int] = {}
 
     def _tick(code: str) -> None:
         counts[code] = counts.get(code, 0) + 1
 
-    for ident, group in grouped.items():
+    for key, group in grouped.items():
+        dates = sorted({x.order_date for x in group if x.order_date})
+        target_date = dates[0] if dates else None
         hq_cost = sum(_hq_ship_cost(x) for x in group)
         hq_total = sum(int(x.order_amount or 0) for x in group)
         first = group[0]
-        hq_dates = [x.order_date for x in group if x.order_date]
-        target_date = min(hq_dates) if hq_dates else first.order_date
-        all_cands = orders_by_ident.get(ident, [])
+        is_phone = key[0] == "P"
+        lookup = key[1] if is_phone else first.identity_key
+        raw_cands = orders_by_ident.get(lookup, [])
+
+        if is_phone:
+            matched = list(raw_cands)
+        else:
+            matched = [o for _, o in _window_cands(raw_cands, target_date, MATCH_WINDOW_DAYS)]
+        _seen_m: set[int] = set()
+        _uniq_m: list[dict] = []
+        for o in matched:
+            try:
+                _mid = int(o.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if _mid in _seen_m:
+                continue
+            _seen_m.add(_mid)
+            _uniq_m.append(o)
+        matched = _uniq_m
 
         row = ReconcileRow(
             hq_ships=[x.ship_number for x in group],
-            identity_key=ident,
-            phone1_digits=first.phone1_digits,
+            identity_key=first.identity_key,
+            phone1_digits=first.phone1_digits or first.phone2_digits,
             customer_name=first.customer_name,
             order_date=target_date,
+            order_date_end=dates[-1] if dates else None,
             employee_names=first.employee_names,
             hq_cost=hq_cost,
             hq_total=hq_total,
             hq_status=first.order_status,
         )
 
-        if len(all_cands) == 1:
-            o = all_cands[0]
-            od = _parse_date(o.get("order_date"))
-            gap = abs((od - target_date).days) if od and target_date else None
-            reason = "자동 매칭 (전화 1건)"
-            if gap is not None:
-                reason = f"자동 매칭 (전화 1건, Δ{gap}일)"
-            _apply_order_to_row(row, o, hq_cost, reason)
-            _tick(row.result_code)
-        elif len(all_cands) > 1:
-            windowed = _window_cands(all_cands, hq_dates, MATCH_WINDOW_DAYS)
-            if len(windowed) == 1:
-                gap, o = windowed[0]
-                _apply_order_to_row(row, o, hq_cost, f"자동 매칭 (전화 {len(all_cands)}건 중 Δ{gap}일)")
-                _tick(row.result_code)
-            else:
-                pick = windowed[0] if windowed else (None, all_cands[0])
-                gap, o = pick
-                row.order_id = int(o.get("id")) if o.get("id") is not None else None
-                row.seller_cost = _seller_cost(o)
-                row.entered_sale = _to_int(o.get("total_amount"))
-                n = len(windowed) if windowed else len(all_cands)
-                row.result_label = f"수동 선택 필요 ({n}건)"
-                row.result_code = "unresolved"
-                row.reason = f"후보 {n}건, 추천 #{row.order_id}"
-                _tick("unresolved")
-        elif prior.get(ident) and _restore_prior_match(row, prior[ident], hq_cost):
-            _tick(row.result_code)
-        else:
+        ship_note = ""
+        if is_phone and len(group) > 1:
+            d1 = dates[0].isoformat() if dates else ""
+            d2 = dates[-1].isoformat() if dates else ""
+            span = d1 if d1 == d2 else f"{d1}~{d2}"
+            ship_note = f"전화 동일 출고 {len(group)}건 합산 ({span})"
+
+        if not matched:
             row.result_label = "본사만 있음"
             row.result_code = "hq_only"
-            row.reason = "앱 주문 없음 (동일 전화)"
+            row.reason = ship_note or (
+                "앱 주문 없음 (동일 전화)" if is_phone
+                else f"앱 주문 없음 (등록일 ±{MATCH_WINDOW_DAYS}일)"
+            )
             _tick("hq_only")
+        else:
+            oids: list[int] = []
+            for o in matched:
+                if o.get("id") is None:
+                    continue
+                oids.append(int(o["id"]))
+            oids = sorted(set(oids))
+            row.order_ids = oids
+            row.order_id = oids[0] if oids else None
+            row.seller_cost = sum(_seller_cost(o) for o in matched)
+            row.entered_sale = sum(_to_int(o.get("total_amount")) for o in matched)
+            label, code = classify_cost_gap(int(row.seller_cost or 0), hq_cost)
+            row.result_label = label
+            row.result_code = code
+            bits = []
+            if ship_note:
+                bits.append(ship_note)
+            if len(oids) == 1:
+                bits.append(f"자동 매칭 #{oids[0]}")
+            else:
+                bits.append("앱주문 " + ",".join(f"#{i}" for i in oids) + " 합산")
+            row.reason = " · ".join(bits)
+            _tick(code)
 
         report.rows.append(row)
 
@@ -1006,10 +1049,17 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
         seller = r.seller_cost if r.seller_cost is not None else None
         diff = None if seller is None else (int(seller) - int(r.hq_cost))
         out.append({
-            "주문ID": r.order_id if r.order_id is not None else "",
+            "주문ID": (
+                ",".join(str(i) for i in r.order_ids) if r.order_ids
+                else (r.order_id if r.order_id is not None else "")
+            ),
             "고객명": r.customer_name,
             "전화": r.phone1_digits,
-            "등록일": r.order_date.isoformat() if r.order_date else "",
+            "등록일": (
+                f"{r.order_date.isoformat()}~{r.order_date_end.isoformat()}"
+                if r.order_date and r.order_date_end and r.order_date_end != r.order_date
+                else (r.order_date.isoformat() if r.order_date else "")
+            ),
             "담당": r.employee_names,
             "본사원가": int(r.hq_cost),
             "주문금액": int(r.hq_total),
@@ -1046,102 +1096,6 @@ def build_review_excel(report: ReconcileReport) -> bytes:
             sub.to_excel(w, sheet_name=sheet, index=False)
     bio.seek(0)
     return bio.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# 대사 결과 persist (UNIQUE db_filename + identity_key → upsert, 행 중복 없음)
-# ---------------------------------------------------------------------------
-
-def save_reconcile_matches(
-    client,
-    db_filename: str,
-    report: ReconcileReport,
-    upload_id: Optional[int] = None,
-) -> list[str]:
-    """전화 단위 대사 결과를 upsert. 같은 identity 재업로드 시 행이 늘지 않는다."""
-    errors: list[str] = []
-    if not client or not db_filename or not report.rows:
-        return errors
-    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    payloads: list[dict] = []
-    for r in report.rows:
-        if not r.identity_key:
-            continue
-        payloads.append({
-            "db_filename": db_filename,
-            "identity_key": r.identity_key,
-            "phone1_digits": r.phone1_digits or None,
-            "customer_name": r.customer_name or None,
-            "order_id": r.order_id,
-            "hq_ships": ", ".join(r.hq_ships) if r.hq_ships else None,
-            "order_date": r.order_date.isoformat() if r.order_date else None,
-            "hq_cost": int(r.hq_cost or 0),
-            "seller_cost": r.seller_cost,
-            "entered_sale": r.entered_sale,
-            "result_code": r.result_code or None,
-            "result_label": r.result_label or None,
-            "reason": r.reason or None,
-            "source_upload_id": upload_id,
-            "updated_at": now_iso,
-        })
-    _CHUNK = 200
-    for i in range(0, len(payloads), _CHUNK):
-        batch = payloads[i:i + _CHUNK]
-        try:
-            client.table("app_hq_reconcile_matches").upsert(
-                batch, on_conflict="db_filename,identity_key",
-            ).execute()
-        except Exception as e:
-            if _is_unique_violation(e):
-                # 레이스 시 단건 재시도
-                for one in batch:
-                    try:
-                        client.table("app_hq_reconcile_matches").upsert(
-                            one, on_conflict="db_filename,identity_key",
-                        ).execute()
-                    except Exception as e2:
-                        errors.append(f"대사 저장 실패 ({one.get('identity_key')}): {e2}")
-            else:
-                errors.append(f"대사 결과 저장 실패: {e}")
-    return errors
-
-
-def load_reconcile_matches(client, db_filename: str) -> pd.DataFrame:
-    if not client or not db_filename:
-        return pd.DataFrame()
-    try:
-        r = (
-            client.table("app_hq_reconcile_matches")
-            .select("*")
-            .eq("db_filename", db_filename)
-            .order("updated_at", desc=True)
-            .execute()
-        )
-        rows = r.data or []
-    except Exception as e:
-        logger.info("load_reconcile_matches failed: %s", e)
-        return pd.DataFrame()
-    if not rows:
-        return pd.DataFrame()
-    out = []
-    for row in rows:
-        seller = row.get("seller_cost")
-        hq_cost = int(row.get("hq_cost") or 0)
-        diff = None if seller is None else (int(seller) - hq_cost)
-        out.append({
-            "주문ID": row.get("order_id") if row.get("order_id") is not None else "",
-            "고객명": row.get("customer_name") or "",
-            "전화": row.get("phone1_digits") or "",
-            "등록일": str(row.get("order_date") or "")[:10],
-            "본사원가": hq_cost,
-            "입력원가": int(seller) if seller is not None else None,
-            "원가차이": diff,
-            "입력판매가": row.get("entered_sale"),
-            "결과": row.get("result_label") or "",
-            "사유": row.get("reason") or "",
-            "출고번호": row.get("hq_ships") or "",
-        })
-    return pd.DataFrame(out)
 
 
 # ---------------------------------------------------------------------------
@@ -1188,7 +1142,5 @@ __all__ = [
     "build_hq_reconcile",
     "reconcile_to_dataframe",
     "build_review_excel",
-    "save_reconcile_matches",
-    "load_reconcile_matches",
     "load_upload_history",
 ]
