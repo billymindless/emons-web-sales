@@ -646,7 +646,17 @@ def process_hq_upload(
 # ---------------------------------------------------------------------------
 
 def _seller_cost(order: dict) -> int:
-    return int(_to_int(order.get("cost_price"))) + int(_to_int(order.get("display_cost_amount")))
+    """본사 대사용 입력원가. cost_price 만 사용. display_cost_amount(전시원가)는 제외.
+
+    본사 ERP 출고에는 전시품 원가가 없어, 앱 전시원가를 더하면 대사가 어긋난다.
+    전시원가는 `_display_cost` 로 별도 열에 표시한다.
+    """
+    return int(_to_int(order.get("cost_price")))
+
+
+def _display_cost(order: dict) -> int:
+    """앱 전시품 원가 (`display_cost_amount`). 본사 대사에서는 참고 열."""
+    return int(_to_int(order.get("display_cost_amount")))
 
 
 def classify_cost_gap(seller_cost: int, hq_cost: int) -> tuple[str, str]:
@@ -674,7 +684,8 @@ class ReconcileRow:
     prev_hq_cost: Optional[int] = None
     order_id: Optional[int] = None
     order_ids: list[int] = field(default_factory=list)
-    seller_cost: Optional[int] = None
+    seller_cost: Optional[int] = None  # 일반원가 (cost_price) 합
+    display_cost: Optional[int] = None  # 전시원가 (display_cost_amount) 합
     entered_sale: Optional[int] = None
     result_label: str = ""
     result_code: str = ""
@@ -1013,6 +1024,7 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
             row.order_ids = oids
             row.order_id = oids[0] if oids else None
             row.seller_cost = sum(_seller_cost(o) for o in matched)
+            row.display_cost = sum(_display_cost(o) for o in matched)
             row.entered_sale = sum(_to_int(o.get("total_amount")) for o in matched)
             label, code = classify_cost_gap(int(row.seller_cost or 0), hq_cost)
             row.result_label = label
@@ -1038,16 +1050,24 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
 # ---------------------------------------------------------------------------
 
 def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
+    _cols = [
+        "주문ID", "고객명", "전화", "등록일", "담당",
+        "본사원가", "주문금액",
+        "일반원가", "일반원가차이",
+        "전시원가", "전시원가차이",
+        "입력판매가",
+        "상태", "결과", "사유", "출고번호",
+    ]
     if not report.rows:
-        return pd.DataFrame(columns=[
-            "주문ID", "고객명", "전화", "등록일", "담당",
-            "본사원가", "주문금액", "입력원가", "원가차이", "입력판매가",
-            "상태", "결과", "사유", "출고번호",
-        ])
+        return pd.DataFrame(columns=_cols)
     out = []
     for r in report.rows:
         seller = r.seller_cost if r.seller_cost is not None else None
-        diff = None if seller is None else (int(seller) - int(r.hq_cost))
+        disp = r.display_cost if r.display_cost is not None else None
+        # 일반원가차이: 일반원가가 0이면 (원가 미입력) 차이를 계산하지 않음
+        gen_diff = None if (seller is None or int(seller) == 0) else (int(seller) - int(r.hq_cost))
+        # 전시원가차이: 전시원가가 0이면 계산하지 않음 (전시품이 없는 주문)
+        disp_diff = None if (disp is None or int(disp) == 0) else (int(disp) - int(r.hq_cost))
         out.append({
             "주문ID": (
                 ",".join(str(i) for i in r.order_ids) if r.order_ids
@@ -1063,15 +1083,17 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
             "담당": r.employee_names,
             "본사원가": int(r.hq_cost),
             "주문금액": int(r.hq_total),
-            "입력원가": seller,
-            "원가차이": diff,
+            "일반원가": seller,
+            "일반원가차이": gen_diff,
+            "전시원가": disp,
+            "전시원가차이": disp_diff,
             "입력판매가": r.entered_sale,
             "상태": r.hq_status,
             "결과": r.result_label,
             "사유": r.reason,
             "출고번호": ", ".join(r.hq_ships),
         })
-    return pd.DataFrame(out)
+    return pd.DataFrame(out, columns=_cols)
 
 
 def build_review_excel(report: ReconcileReport) -> bytes:

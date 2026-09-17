@@ -1663,6 +1663,53 @@ def _parse_comma_to_int(s):
     return int(re.sub(r"\D", "", str(s)) or 0)
 
 
+def _validate_new_sales_costs(
+    *,
+    has_display: bool,
+    selected_categories: list[str],
+    general_sales: int,
+    general_cost: int,
+    display_sales: int,
+    display_cost: int,
+) -> list[str]:
+    """신규매출 저장 전 원가·판매가 검증. 에러 메시지 리스트를 반환한다.
+
+    본사 ERP 대사가 어긋나지 않도록 전시품 원가를 일반 원가 칸에 섞어 넣는 실수를 차단한다.
+    """
+    errs: list[str] = []
+    _cats = [c for c in (selected_categories or []) if c]
+    _only_display = has_display and _cats and all(c == "전시품" for c in _cats)
+
+    # 판매가 총합 0원 차단
+    if (general_sales + (display_sales if has_display else 0)) <= 0:
+        errs.append("판매가(필수)를 입력하세요. 일반/전시품 합계가 0원보다 커야 합니다.")
+
+    # 일반 판매가 있으면 일반 원가 필수
+    if general_sales > 0 and general_cost <= 0:
+        errs.append("일반제품 원가(필수)를 입력하세요.")
+
+    # 전시품 선택 시 전시 판매가·원가 필수
+    if has_display and display_sales <= 0:
+        errs.append("전시품 판매가(필수)를 입력하세요.")
+    if has_display and display_cost <= 0:
+        errs.append("전시품 원가(필수)를 입력하세요.")
+
+    # 전시품만 선택했는데 일반 원가/판매가에 값이 있으면 차단
+    if _only_display and general_sales > 0:
+        errs.append("전시품만 선택한 주문은 일반제품 판매가를 0원으로 두세요. 판매가는 '전시품 판매가' 칸에 입력하세요.")
+    if _only_display and general_cost > 0:
+        errs.append("전시품만 선택한 주문은 일반제품 원가를 0원으로 두세요. 원가는 '전시품 원가' 칸에 입력하세요.")
+
+    # 일반 원가와 전시 원가가 같은 양수 → 한 금액을 두 칸에 넣은 실수 차단
+    if has_display and general_cost > 0 and display_cost > 0 and general_cost == display_cost:
+        errs.append(
+            f"일반제품 원가와 전시품 원가가 모두 {general_cost:,}원 으로 동일합니다. "
+            "한 금액을 두 칸에 중복 입력한 상태로 보입니다. 실제 원가로 각각 나눠 입력해 주세요."
+        )
+
+    return errs
+
+
 def _fmt_num(x):
     """글로벌 숫자 포맷: 금액/숫자에 천 단위 콤마 적용 (화면 출력용)."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
@@ -8023,6 +8070,159 @@ def _hq_money_styler(df: pd.DataFrame, cols: list[str]):
     return show.style.format({c: "{:,.0f}" for c in use}, na_rep="")
 
 
+def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None:
+    """ERP 대사 결과에서 관리자가 앱 주문 원가를 확정하거나 소액 차이를 본사원가로 맞추는 UI.
+
+    - 대상: `cost_mismatch` 또는 `cost_blank`, 매칭 앱 주문 정확히 1건.
+    - 두 단계 라디오:
+      1) **최종 원가 선택**: 일반원가(`cost_price`) vs 전시원가(`display_cost_amount`) 중 하나를
+         본사 대사 확정값으로 둔다. 전시원가 선택 시 값을 `cost_price` 로 옮기고 전시원가는 0.
+      2) **소액 보정 (1~20,000원)**: 확정 후 남은 차이가 소액이면 본사원가로 `cost_price` 를 재조정.
+    - 부작용: `app_orders.cost_price`, `display_cost_amount`, `actual_margin`, `balance_status` 만 UPDATE.
+      `total_amount` / `sales` / `app_payments` 는 변경하지 않는다.
+    """
+    if report is None or not getattr(report, "rows", None):
+        return
+    try:
+        import hq_order_reconcile_service as hq
+    except Exception:
+        return
+
+    # 후보 행: cost_mismatch/cost_blank + 매칭 앱 1건
+    editable = [
+        (idx, row) for idx, row in enumerate(report.rows)
+        if row.result_code in ("cost_mismatch", "cost_blank")
+        and len(row.order_ids or []) == 1
+    ]
+    if not editable:
+        return
+
+    st.markdown("##### 원가 확정 / 소액 수정")
+    st.caption(
+        "본사 대사 기준 앱 `cost_price` 를 확정합니다. **판매가·매출·결제·전시 판매가는 바뀌지 않습니다.** "
+        "전시원가를 고르면 그 값을 `cost_price` 로 옮기고 `display_cost_amount` 는 0 이 됩니다. "
+        "차이가 1~20,000원이면 본사원가로 맞추는 소액 보정도 사용할 수 있습니다."
+    )
+
+    _labels: list[str] = []
+    for idx, row in editable:
+        oid = int(row.order_ids[0])
+        seller = int(row.seller_cost or 0)
+        disp = int(row.display_cost or 0)
+        _labels.append(
+            f"#{oid} · {row.customer_name or '(고객명 없음)'} · 본사원가 {int(row.hq_cost):,} · "
+            f"일반 {seller:,} · 전시 {disp:,} · {row.result_label}"
+        )
+    _sel = st.selectbox(
+        "수정 대상 행 선택",
+        list(range(len(editable))),
+        format_func=lambda i: _labels[i],
+        key=f"hq_edit_row::{cache_key}",
+    )
+    _idx, _row = editable[_sel]
+    _oid = int(_row.order_ids[0])
+    _hq_cost = int(_row.hq_cost)
+    _seller = int(_row.seller_cost or 0)
+    _disp = int(_row.display_cost or 0)
+
+    # 1) 일반 vs 전시 최종 입력
+    _pick_options: list[tuple[str, str, int, int]] = []  # (id, label, new_cost, new_disp)
+    if _seller > 0:
+        _pick_options.append((
+            "general",
+            f"일반원가 {_seller:,}원 유지 (차이 {(_seller - _hq_cost):+,}원)",
+            _seller, _disp,
+        ))
+    if _disp > 0:
+        _pick_options.append((
+            "display",
+            f"전시원가 {_disp:,}원 → 일반원가로 이동 (차이 {(_disp - _hq_cost):+,}원, 전시원가 0)",
+            _disp, 0,
+        ))
+    if _pick_options:
+        _pick_ids = [x[0] for x in _pick_options]
+        _pick_key = f"hq_edit_pick::{cache_key}::{_oid}"
+        _pick_default = 0
+        _pick = st.radio(
+            "최종 입력 원가",
+            _pick_ids,
+            index=_pick_default,
+            format_func=lambda x: next(o[1] for o in _pick_options if o[0] == x),
+            key=_pick_key,
+            horizontal=False,
+        )
+        _btn_pick = st.button(
+            "✅ 선택한 원가로 확정",
+            key=f"hq_edit_pick_btn::{cache_key}::{_oid}",
+            type="primary",
+        )
+        if _btn_pick:
+            _target = next(o for o in _pick_options if o[0] == _pick)
+            _, _lbl, _new_cost, _new_disp = _target
+            _updates = {"cost_price": _new_cost, "display_cost_amount": _new_disp}
+            _ok = _update_order_supabase(db_filename, _oid, _updates)
+            if not _ok:
+                st.error(f"주문 #{_oid} 업데이트 실패. Supabase 로그를 확인하세요.")
+            else:
+                _recalc_order_actual_margin_supabase(db_filename, _oid)
+                # 세션 report 상태 갱신 (다시 실행 안 해도 결과 반영)
+                _row.seller_cost = int(_new_cost)
+                _row.display_cost = int(_new_disp)
+                _new_label, _new_code = hq.classify_cost_gap(int(_new_cost), _hq_cost)
+                _prev_code = _row.result_code
+                _row.result_label = _new_label
+                _row.result_code = _new_code
+                _row.reason = (_row.reason + f" · 관리자 확정({_pick})").strip(" ·")
+                # counts 재계산
+                _counts_new: dict[str, int] = {}
+                for _rr in report.rows:
+                    _counts_new[_rr.result_code] = _counts_new.get(_rr.result_code, 0) + 1
+                report.counts = _counts_new
+                clear_data_cache()
+                st.success(
+                    f"주문 #{_oid} 확정: cost_price={_new_cost:,}원, display_cost_amount={_new_disp:,}원 "
+                    f"→ 결과 `{_new_code}`."
+                )
+                st.rerun()
+    else:
+        st.info("이 주문에는 확정 가능한 원가가 없습니다. (일반/전시 모두 0원)")
+
+    # 2) 소액 보정 (현재 cost_price 기준 차이 1~20,000원)
+    _SMALL_GAP = 20_000
+    _current_cost = _seller  # display를 고른 경우 위에서 rerun 되므로 여기서는 현재 값 기준
+    _gap = _hq_cost - _current_cost
+    if _current_cost > 0 and 0 < abs(_gap) <= _SMALL_GAP:
+        st.markdown("**소액 보정 (본사원가 적용)**")
+        _apply_key = f"hq_edit_small::{cache_key}::{_oid}"
+        _apply = st.radio(
+            f"차이 {_gap:+,}원 처리",
+            ["앱 원가 유지", f"본사원가 {_hq_cost:,}원 적용"],
+            index=0,
+            key=_apply_key,
+            horizontal=True,
+        )
+        if _apply.startswith("본사원가") and st.button(
+            "✅ 본사원가로 맞춤",
+            key=f"hq_edit_small_btn::{cache_key}::{_oid}",
+            type="primary",
+        ):
+            _ok = _update_order_supabase(db_filename, _oid, {"cost_price": _hq_cost})
+            if not _ok:
+                st.error(f"주문 #{_oid} 업데이트 실패.")
+            else:
+                _recalc_order_actual_margin_supabase(db_filename, _oid)
+                _row.seller_cost = int(_hq_cost)
+                _row.result_label, _row.result_code = hq.classify_cost_gap(int(_hq_cost), _hq_cost)
+                _row.reason = (_row.reason + " · 관리자 소액 보정").strip(" ·")
+                _counts_new = {}
+                for _rr in report.rows:
+                    _counts_new[_rr.result_code] = _counts_new.get(_rr.result_code, 0) + 1
+                report.counts = _counts_new
+                clear_data_cache()
+                st.success(f"주문 #{_oid} cost_price 를 본사원가 {_hq_cost:,}원 으로 맞춤.")
+                st.rerun()
+
+
 def _render_admin_hq_upload(db_filename: str) -> None:
     """관리자 전용: 본사 ERP 주문조회(대) 엑셀 등록 + 원가 대사.
 
@@ -8171,10 +8371,20 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         for _i, (_code, _lbl) in enumerate(_label_map.items()):
             _sum_cols[_i].metric(_lbl, f"{_counts.get(_code, 0):,}")
 
+        st.caption(
+            "**일반원가** = `cost_price`, **전시원가** = `display_cost_amount` 를 본사원가와 각각 비교합니다. "
+            "본사 ERP 출고에는 전시품 원가가 없으므로 전시원가는 참고 열입니다. "
+            "전시 판매가(`display_sales_amount`)는 `total_amount` 에 포함되어 전체 매출은 그대로 유지됩니다."
+        )
         st.dataframe(
-            _hq_money_styler(df_recon, ["본사원가", "주문금액", "입력원가", "원가차이", "입력판매가"]),
+            _hq_money_styler(
+                df_recon,
+                ["본사원가", "주문금액", "일반원가", "일반원가차이", "전시원가", "전시원가차이", "입력판매가"],
+            ),
             width="stretch", hide_index=True,
         )
+
+        _render_hq_cost_edit_panel(db_filename, report, cache_key)
 
         try:
             _xlsx_bytes = hq.build_review_excel(report)
@@ -31244,6 +31454,11 @@ def render_new_sales():
             st.session_state["display_sales_amount"] = "0"
         if "display_cost_amount" not in st.session_state:
             st.session_state["display_cost_amount"] = "0"
+        st.markdown("**전시품 판매 (본사 ERP 원가 대사 제외 · 전체 매출에는 포함)**")
+        st.caption(
+            "일반제품 원가 칸에 전시품 원가를 넣지 마세요. 본사 ERP 출고에는 전시품 원가가 없어 대사 결과가 어긋납니다. "
+            "전시 판매가는 `total_amount` 에 포함되어 전체 매출·직원 KPI 에는 그대로 반영됩니다."
+        )
         st.text_input(
             "전시품 판매가 *", key="display_sales_amount",
             on_change=lambda: st.session_state.__setitem__(
@@ -31498,20 +31713,20 @@ def render_new_sales():
         final_sales_save = general_sales_int + display_sales_int
         final_cost_save = cost_price_int + display_cost_int
         basic_margin_save = final_sales_save - final_cost_save
-        # 판매가/원가 0원 등록 차단 — 0원 매출은 KPI·마진율 계산을 왜곡시킴
-        if final_sales_save <= 0:
-            st.error("판매가(필수)를 입력하세요. 일반/전시품 합계가 0원보다 커야 합니다.")
+
+        # 원가·판매가 검증 (버튼 직후 & INSERT 직전에 동일 함수로 두 번 호출)
+        _cost_errs = _validate_new_sales_costs(
+            has_display=bool(has_display),
+            selected_categories=selected_categories or [],
+            general_sales=general_sales_int,
+            general_cost=cost_price_int,
+            display_sales=display_sales_int,
+            display_cost=display_cost_int,
+        )
+        if _cost_errs:
+            for _em in _cost_errs:
+                st.error(_em)
             st.stop()
-        if general_sales_int > 0 and cost_price_int <= 0:
-            st.error("일반제품 원가(필수)를 입력하세요.")
-            st.stop()
-        if has_display:
-            if display_sales_int <= 0:
-                st.error("전시품 판매가(필수)를 입력하세요.")
-                st.stop()
-            if display_cost_int <= 0:
-                st.error("전시품 원가(필수)를 입력하세요.")
-                st.stop()
         # 결제 합계 및 미수금(잔금) 계산 — 완불이 아니어도 저장 가능(계약금만 받고 저장 가능)
         total_payment_slots = sum(_parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0")) for i in range(slot_count))
         unpaid_balance = final_sales_save - total_payment_slots  # 판매가 - 수납액 = 미수금
@@ -31642,6 +31857,20 @@ def render_new_sales():
 
         _saving_msg = st.empty()
         _saving_msg.info("⏳ 저장하는 중입니다... 잠시 기다려 주세요.")
+
+        # 저장 직전 이중 검증 (버튼 직후 통과 후 다른 폼 변경/rerun 사이 방어)
+        _cost_errs2 = _validate_new_sales_costs(
+            has_display=bool(has_display),
+            selected_categories=selected_categories or [],
+            general_sales=general_sales_int,
+            general_cost=cost_price_int,
+            display_sales=display_sales_int,
+            display_cost=display_cost_int,
+        )
+        if _cost_errs2:
+            for _em in _cost_errs2:
+                st.error(_em)
+            st.stop()
 
         if use_supabase_op:
             if is_new_customer:
