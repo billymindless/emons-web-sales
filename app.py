@@ -538,6 +538,8 @@ def _render_erp_icon_rail(role: str) -> None:
             _go("product_taxonomy")
         if st.button("🗑️", key="rail_del", help="주문 삭제 요청 관리", width="stretch"):
             _go("delete_requests")
+        if st.button("📥", key="rail_hq_upload", help="ERP 파일 등록 (본사 주문조회)", width="stretch"):
+            _go("hq_upload")
         if st.button("⚙️", key="rail_settings", help="관리자 설정", width="stretch"):
             _go("admin_settings")
     if role == "superadmin":
@@ -7954,6 +7956,164 @@ def _render_admin_delete_requests(db_filename: str):
 
     if st.button("🔄 새로고침", key="del_req_refresh_btn"):
         st.rerun()
+
+
+def _render_admin_hq_upload(db_filename: str) -> None:
+    """관리자 전용: 본사 ERP 주문조회(대) 엑셀 등록 + 원가 대사.
+
+    - 파일 업로드 → 파싱 → 스냅샷 upsert → 미리보기 + 대사표 표시
+    - 앱 주문/결제/매출은 절대 변경하지 않음. 스냅샷·업로드 이력만 저장.
+    """
+    try:
+        import hq_order_reconcile_service as hq
+    except Exception as _e:
+        st.error(f"hq_order_reconcile_service 로드 실패: {_e}")
+        return
+
+    st.header("📥 ERP 파일 등록 (본사 주문조회)")
+    st.caption(
+        "본사 ERP 에서 내려받은 **주문조회(대)** 엑셀을 등록합니다. "
+        "출고번호 기준으로 중복은 자동 스킵되고, 이전 업로드와 비교해 **주문금액/상태 변경(감/증액)** 은 revised 로 표시됩니다. "
+        "앱 주문·결제·매출 데이터는 절대 변경되지 않으며, `app_hq_order_uploads` / `app_hq_order_snapshots` 에만 기록됩니다."
+    )
+
+    st.markdown(f"저장 대상 매장: **{db_filename}**")
+
+    client, _err = get_supabase_client()
+    if not client:
+        st.error(f"Supabase 연결 실패: {_err}")
+        return
+
+    # ── 업로드 이력
+    with st.expander("📚 최근 업로드 이력 (최대 30건)", expanded=False):
+        hist = hq.load_upload_history(client, db_filename, limit=30)
+        if hist is None or hist.empty:
+            st.caption("아직 업로드 이력이 없습니다.")
+        else:
+            st.dataframe(hist, width="stretch", hide_index=True)
+
+    st.markdown("---")
+    st.markdown("#### 1. 파일 업로드")
+    up = st.file_uploader(
+        "본사 주문조회 엑셀 (.xlsx) 또는 CSV",
+        type=["xlsx", "csv"],
+        key=f"hq_upload_file::{db_filename}",
+        help="첫번째 시트/전체 CSV 를 읽어 헤더를 자동 감지합니다. TOTAL / 회수 / 취소 는 자동 제외됩니다.",
+    )
+    if up is None:
+        return
+
+    cache_key = f"hq_parsed::{up.name}::{up.size}"
+    if cache_key not in st.session_state:
+        try:
+            st.session_state[cache_key] = hq.parse_hq_order_export(up.getvalue(), up.name)
+        except Exception as _e:
+            st.error(f"파일 파싱 실패: {_e}")
+            return
+    rows: list = st.session_state[cache_key]
+    if not rows:
+        st.warning("파싱 결과 유효 행이 없습니다. (헤더/주문구분 확인)")
+        return
+
+    st.success(f"파싱된 주문 행: **{len(rows):,}건**")
+    with st.expander("원본 파싱 미리보기 (앞 15행)", expanded=False):
+        prev = pd.DataFrame([{
+            "출고번호": r.ship_number,
+            "고객": r.customer_name,
+            "전화": r.phone1_digits,
+            "등록일": r.order_date.isoformat() if r.order_date else "",
+            "담당": r.employee_names,
+            "주문금액": r.order_amount,
+            "합계": r.total_amount_hq,
+            "상태": r.order_status,
+            "전시": "○" if r.is_display else "",
+        } for r in rows[:15]])
+        st.dataframe(prev, width="stretch", hide_index=True)
+
+    st.markdown("#### 2. 스냅샷 저장 & 대사")
+    st.caption(
+        "동일 출고번호가 이미 있으면 중복(dup) 으로 카운트되며, `주문금액` 이나 `주문상태` 가 다르면 revised 로 갱신됩니다. "
+        "이후 앱 주문과 `(전화 또는 이름) + 등록일 ±2일` 기준으로 매칭해 원가 대사표를 출력합니다."
+    )
+
+    _btn_key = f"hq_process::{up.name}::{up.size}"
+    if st.button("💾 저장 & 대사 실행", key=_btn_key, type="primary"):
+        _uploader = _current_username() or "hq_upload"
+        with st.spinner("스냅샷 저장 중…"):
+            snap = hq.process_hq_upload(
+                client,
+                db_filename=db_filename,
+                rows=rows,
+                filename=up.name,
+                uploaded_by=_uploader,
+            )
+        st.session_state[f"hq_snap::{cache_key}"] = snap
+        with st.spinner("앱 주문과 대사 중…"):
+            report = hq.build_hq_reconcile(client, db_filename, rows)
+        st.session_state[f"hq_report::{cache_key}"] = report
+
+    snap = st.session_state.get(f"hq_snap::{cache_key}")
+    report = st.session_state.get(f"hq_report::{cache_key}")
+    if snap is None or report is None:
+        return
+
+    summary = snap.summary()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("신규", f"{summary['new']:,}")
+    c2.metric("중복(변경 없음)", f"{summary['dup']:,}")
+    c3.metric("변경(revised)", f"{summary['revised']:,}")
+    c4.metric("이전에 있었지만 이번 없음", f"{summary['missing']:,}")
+    if snap.errors:
+        with st.expander(f"⚠️ 저장 중 경고 {len(snap.errors)}건", expanded=False):
+            for _em in snap.errors[:50]:
+                st.warning(_em)
+
+    # revised 상세
+    if snap.revised:
+        st.markdown("##### 변경(revised) 상세 — 이전값과의 차이")
+        _rev_df = pd.DataFrame([{
+            "출고번호": r.get("ship_number"),
+            "고객": r.get("customer_name"),
+            "등록일": r.get("order_date"),
+            "이전 주문금액": r.get("prev_order_amount"),
+            "현재 주문금액": r.get("order_amount"),
+            "Δ": r.get("_delta_amount"),
+            "이전 상태": r.get("prev_order_status"),
+            "현재 상태": r.get("order_status"),
+        } for r in snap.revised])
+        st.dataframe(_rev_df, width="stretch", hide_index=True)
+
+    st.markdown("##### 원가 대사표")
+    df_recon = hq.reconcile_to_dataframe(report)
+    if df_recon.empty:
+        st.info("대사 대상 행이 없습니다.")
+    else:
+        # 결과별 카운트 요약
+        _counts = report.counts or {}
+        _label_map = {
+            "ok": "원가 일치",
+            "cost_mismatch": "원가 불일치",
+            "cost_blank": "원가 미입력",
+            "hq_only": "본사만 있음",
+            "unresolved": "수동 선택 필요",
+        }
+        _sum_cols = st.columns(len(_label_map))
+        for _i, (_code, _lbl) in enumerate(_label_map.items()):
+            _sum_cols[_i].metric(_lbl, f"{_counts.get(_code, 0):,}")
+
+        st.dataframe(df_recon, width="stretch", hide_index=True)
+
+        try:
+            _xlsx_bytes = hq.build_review_excel(report)
+            st.download_button(
+                "📥 대사 결과 Excel 다운로드",
+                data=_xlsx_bytes,
+                file_name=f"HQ대사_{db_filename}_{datetime.now(tz=KST).strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"hq_download::{cache_key}",
+            )
+        except Exception as _e:
+            st.caption(f"엑셀 다운로드 준비 실패: {_e}")
 
 
 def _save_payment_receipt(conn: sqlite3.Connection, payment_id: int, uploaded_file):
@@ -32360,6 +32520,31 @@ def _render_chat_history_section(customer_id: int, phone: str, customer_name: st
                     st.error("저장에 실패했습니다. Supabase 연결을 확인하세요.")
 
 
+def _render_hq_upload_reference(db_filename: str) -> None:
+    """고객 및 잔금 관리 하단에 표시되는 본사 ERP 대사 참조 expander (읽기 전용).
+
+    - 업로드는 사이드바 "📥 ERP 파일 등록" 에서만 수행. 여기서는 최근 이력만 미리보기.
+    """
+    try:
+        import hq_order_reconcile_service as hq
+    except Exception:
+        return
+    with st.expander("🔎 본사 주문조회 대사 (최근 업로드, 참조용)", expanded=False):
+        st.caption(
+            "사이드바 **📥 ERP 파일 등록** 에서 등록한 본사 주문조회 파일의 최근 이력입니다. "
+            "여기서는 조회만 가능하며, 앱 주문·매출·결제 데이터는 이 화면에서 변경되지 않습니다."
+        )
+        client, _ = get_supabase_client()
+        if not client:
+            st.caption("Supabase 연결 실패 — 이력 조회 불가.")
+            return
+        hist = hq.load_upload_history(client, db_filename, limit=10)
+        if hist is None or hist.empty:
+            st.caption("아직 등록된 본사 주문조회 파일이 없습니다.")
+            return
+        st.dataframe(hist, width="stretch", hide_index=True)
+
+
 def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
     """매입 원장(엑셀) 통합 임포트 UI.
 
@@ -33638,6 +33823,8 @@ def render_customer_balance():
         _render_legacy_purchase_bulk_import(db_filename)
         # 잘못된 임포트 롤백 (엑셀 업로드 없이도 항상 표시)
         _render_legacy_purchase_rollback(db_filename)
+        # 본사 ERP 주문조회 최근 업로드/스냅샷 참조용 (읽기 전용)
+        _render_hq_upload_reference(db_filename)
 
         st.subheader("고객 검색 (이름 또는 전화번호)")
         search_query = st.text_input("이름 또는 전화번호로 검색", key="gen_search")
@@ -37009,6 +37196,15 @@ def main():
         _del_db = st.session_state.get("current_db")
         if _del_db:
             _render_admin_delete_requests(_del_db)
+        else:
+            st.warning("매장 DB 정보를 찾을 수 없습니다.")
+        return
+
+    # 관리자 전용: 본사 ERP 주문조회 파일 등록 화면 라우팅
+    if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "hq_upload":
+        _hq_db = st.session_state.get("current_db")
+        if _hq_db:
+            _render_admin_hq_upload(_hq_db)
         else:
             st.warning("매장 DB 정보를 찾을 수 없습니다.")
         return
