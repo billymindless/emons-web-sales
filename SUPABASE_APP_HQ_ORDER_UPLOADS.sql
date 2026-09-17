@@ -82,3 +82,41 @@ CREATE POLICY "Allow all app_hq_order_uploads"
   ON app_hq_order_uploads FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow all app_hq_order_snapshots"
   ON app_hq_order_snapshots FOR ALL USING (true) WITH CHECK (true);
+
+
+-- =====================================================================
+-- app_hq_reconcile_matches : 전화(identity) 단위 원가 대사 결과.
+--   UNIQUE (db_filename, identity_key) — 같은 전화 재업로드 시 upsert, 행 중복 없음.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS app_hq_reconcile_matches (
+  id                 BIGSERIAL PRIMARY KEY,
+  db_filename        TEXT NOT NULL,
+  identity_key       TEXT NOT NULL,
+  phone1_digits      TEXT,
+  customer_name      TEXT,
+  order_id           BIGINT,
+  hq_ships           TEXT,
+  order_date         DATE,
+  hq_cost            BIGINT DEFAULT 0,
+  seller_cost        BIGINT,
+  entered_sale       BIGINT,
+  result_code        TEXT,
+  result_label       TEXT,
+  reason             TEXT,
+  source_upload_id   BIGINT REFERENCES app_hq_order_uploads(id) ON DELETE SET NULL,
+  matched_at         TIMESTAMPTZ DEFAULT now(),
+  updated_at         TIMESTAMPTZ DEFAULT now(),
+  CONSTRAINT uniq_hq_match UNIQUE (db_filename, identity_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_hq_match_store
+  ON app_hq_reconcile_matches(db_filename, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_hq_match_order
+  ON app_hq_reconcile_matches(db_filename, order_id);
+
+COMMENT ON TABLE app_hq_reconcile_matches IS '본사 주문조회 원가 대사 결과. 전화(identity_key) 1건. 재업로드 시 upsert.';
+
+ALTER TABLE app_hq_reconcile_matches ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_hq_reconcile_matches" ON app_hq_reconcile_matches;
+CREATE POLICY "Allow all app_hq_reconcile_matches"
+  ON app_hq_reconcile_matches FOR ALL USING (true) WITH CHECK (true);
