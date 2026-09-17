@@ -8044,7 +8044,8 @@ def _render_admin_hq_upload(db_filename: str) -> None:
     st.markdown("#### 2. 스냅샷 저장 & 대사")
     st.caption(
         "동일 출고번호가 이미 있으면 중복(dup) 으로 카운트되며, `주문금액` 이나 `주문상태` 가 다르면 revised 로 갱신됩니다. "
-        "이후 앱 주문과 `(전화 또는 이름) + 등록일 ±2일` 기준으로 매칭해 원가 대사표를 출력합니다."
+        "이후 앱 주문과 `(전화 또는 이름) + 등록일 ±2일` 기준으로 매칭해 원가 대사표를 출력합니다. "
+        "**본사원가** 는 전산 출고 원가와 같이 `주문금액 + 부가세`(합계) 입니다."
     )
 
     _btn_key = f"hq_process::{up.name}::{up.size}"
@@ -8123,7 +8124,7 @@ def _render_admin_hq_upload(db_filename: str) -> None:
             df_recon, width="stretch", hide_index=True,
             column_config={
                 "본사원가": st.column_config.NumberColumn("본사원가", format="%,.0f"),
-                "본사합계": st.column_config.NumberColumn("본사합계", format="%,.0f"),
+                "주문금액": st.column_config.NumberColumn("주문금액", format="%,.0f"),
                 "입력원가": st.column_config.NumberColumn("입력원가", format="%,.0f"),
                 "원가차이": st.column_config.NumberColumn("원가차이", format="%,.0f"),
                 "입력판매가": st.column_config.NumberColumn("입력판매가", format="%,.0f"),

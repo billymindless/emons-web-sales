@@ -262,6 +262,14 @@ class HQRow:
     raw_row: dict[str, Any] = field(default_factory=dict)
 
 
+def _hq_ship_cost(row: HQRow) -> int:
+    """전산 출고 원가 = 주문금액 + 부가세 (파일의 합계). 합계가 비면 두 칸을 더한다."""
+    total = int(row.total_amount_hq or 0)
+    if total:
+        return total
+    return int(row.order_amount or 0) + int(row.vat or 0)
+
+
 def parse_hq_order_export(file_bytes: bytes, filename: str) -> list[HQRow]:
     """본사 주문조회(대) 엑셀/CSV → HQRow 리스트.
 
@@ -334,7 +342,8 @@ def parse_hq_order_export(file_bytes: bytes, filename: str) -> list[HQRow]:
             delivery_date=_parse_date(_get(row, "delivery_date")),
             order_amount=_to_int(_get(row, "order_amount")),
             vat=_to_int(_get(row, "vat")),
-            total_amount_hq=_to_int(_get(row, "total_hq")),
+            total_amount_hq=_to_int(_get(row, "total_hq"))
+            or (_to_int(_get(row, "order_amount")) + _to_int(_get(row, "vat"))),
             outlet=_to_bool(_get(row, "outlet")),
             is_display=_is_display(cust, kind),
             identity_key=ident,
@@ -481,7 +490,7 @@ def process_hq_upload(
 
     # 업로드 이력 먼저 INSERT (요약값은 나중에 update)
     order_dates = [r.order_date for r in rows if r.order_date]
-    hq_sum = sum(int(r.order_amount or 0) for r in rows)
+    hq_sum = sum(_hq_ship_cost(r) for r in rows)
     try:
         ur = client.table("app_hq_order_uploads").insert({
             "db_filename": db_filename,
@@ -788,7 +797,8 @@ def _window_cands(orders: list[dict], target: Optional[date], window: int = MATC
 def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> ReconcileReport:
     """본사 rows + 앱 주문으로 대사 리포트 생성.
 
-    Grouping: (identity_key, order_date) 로 본사 rows 를 묶어 order_amount 합계 = 본사원가.
+    Grouping: (identity_key, order_date) 로 본사 rows 를 묶어
+    본사원가 = 합계(주문금액+부가세) 합. 비교 기준은 전산 출고 원가와 동일.
     Matching: 그 그룹의 identity 후보 앱 주문 중 order_date ±MATCH_WINDOW_DAYS 내 최근접 1건.
     """
     report = ReconcileReport()
@@ -813,8 +823,8 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
 
     for (ident, od_str), group in grouped.items():
         target_date = _parse_date(od_str) if od_str else None
-        hq_cost = sum(int(x.order_amount or 0) for x in group)
-        hq_total = sum(int(x.total_amount_hq or 0) for x in group)
+        hq_cost = sum(_hq_ship_cost(x) for x in group)
+        hq_total = sum(int(x.order_amount or 0) for x in group)
         # 이전 원가 합 (revised 표시용) — snapshots.prev_order_amount 는 delta 감지에서만 씀
         prev_hq_cost = None
         first = group[0]
@@ -873,7 +883,7 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
     if not report.rows:
         return pd.DataFrame(columns=[
             "주문ID", "고객명", "전화", "등록일", "담당",
-            "본사원가", "본사합계", "입력원가", "원가차이", "입력판매가",
+            "본사원가", "주문금액", "입력원가", "원가차이", "입력판매가",
             "상태", "결과", "사유", "출고번호",
         ])
     out = []
@@ -887,7 +897,7 @@ def reconcile_to_dataframe(report: ReconcileReport) -> pd.DataFrame:
             "등록일": r.order_date.isoformat() if r.order_date else "",
             "담당": r.employee_names,
             "본사원가": int(r.hq_cost),
-            "본사합계": int(r.hq_total),
+            "주문금액": int(r.hq_total),
             "입력원가": seller,
             "원가차이": diff,
             "입력판매가": r.entered_sale,
