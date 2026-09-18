@@ -8622,6 +8622,32 @@ def _hq_mark_store_display(
     return True
 
 
+def _hq_set_merge_target_fallback(
+    client, db_filename: str, ship_number: str, order_date, target_order_id
+) -> bool:
+    """`hq_order_reconcile_service.set_snapshot_merge_target` 미배포 시 인라인 UPDATE."""
+    if not client or not db_filename or not ship_number:
+        return False
+    od = None
+    if hasattr(order_date, "isoformat"):
+        od = order_date.isoformat()
+    elif order_date:
+        od = str(order_date)[:10]
+    try:
+        q = (
+            client.table("app_hq_order_snapshots")
+            .update({"merge_target_order_id": int(target_order_id) if target_order_id else None})
+            .eq("db_filename", db_filename)
+            .eq("ship_number", str(ship_number))
+        )
+        if od:
+            q = q.eq("order_date", od)
+        r = q.execute()
+        return bool(getattr(r, "data", None))
+    except Exception:
+        return False
+
+
 def _hq_apply_merge(
     hq,
     db_filename: str,
@@ -8642,15 +8668,57 @@ def _hq_apply_merge(
         st.error("출고번호가 없어 스냅샷을 특정할 수 없습니다.")
         return False
     order_date = row.order_date
+    _set_fn = getattr(hq, "set_snapshot_merge_target", None)
     ok_all = True
     for sn in ship_numbers:
-        ok = hq.set_snapshot_merge_target(client, db_filename, sn, order_date, int(target_order_id))
+        if callable(_set_fn):
+            ok = _set_fn(client, db_filename, sn, order_date, int(target_order_id))
+        else:
+            ok = _hq_set_merge_target_fallback(client, db_filename, sn, order_date, int(target_order_id))
         ok_all = ok_all and ok
     if not ok_all:
         st.error("스냅샷 UPDATE 실패.")
         return False
     _hq_invalidate_history_caches(db_filename)
     return True
+
+
+def _hq_search_orders_by_phone_fallback(client, digits: str, limit: int = 30) -> list[dict]:
+    """`hq_order_reconcile_service.search_orders_by_phone` 미배포 시 인라인 fallback.
+
+    전화 표기 변형(010-xxxx-xxxx / 10자리 등)을 자체 생성해 `app_orders` 를 최신순 조회.
+    """
+    if not client or not digits:
+        return []
+    _d = "".join(ch for ch in str(digits) if ch.isdigit())
+    if not _d:
+        return []
+    last10 = _d[-10:] if len(_d) >= 10 else _d
+    variants = {_d, last10}
+    if len(last10) == 10 and last10.startswith("10"):
+        full11 = "0" + last10
+        mid, tail = last10[2:6], last10[6:]
+        variants.update({
+            full11,
+            f"010-{mid}-{tail}",
+            f"010 {mid} {tail}",
+            f"{full11[:3]}-{mid}-{tail}",
+        })
+    try:
+        r = (
+            client.table("app_orders")
+            .select(
+                "id, order_date, delivery_date, customer_name, phone, "
+                "employee_names, total_amount, cost_price, display_cost_amount"
+            )
+            .in_("phone", list(variants))
+            .order("order_date", desc=True)
+            .limit(int(limit))
+            .execute()
+        )
+        return list(r.data or [])
+    except Exception:
+        return []
 
 
 def _render_hq_merge_into_order(hq, db_filename: str, report, row_index: int, cache_key: str) -> None:
@@ -8679,7 +8747,11 @@ def _render_hq_merge_into_order(hq, db_filename: str, report, row_index: int, ca
     _cands = st.session_state.get(_cands_key)
     if _cands is None:
         with st.spinner("앱 주문 검색 중…"):
-            _cands = hq.search_orders_by_phone(client, db_filename, _digits, limit=30)
+            _search_fn = getattr(hq, "search_orders_by_phone", None)
+            if callable(_search_fn):
+                _cands = _search_fn(client, db_filename, _digits, limit=30)
+            else:
+                _cands = _hq_search_orders_by_phone_fallback(client, _digits, limit=30)
         st.session_state[_cands_key] = _cands
     if not _cands:
         st.info(f"전화 {_digits} 로 검색된 앱 주문이 없습니다.")
@@ -8760,7 +8832,11 @@ def _render_hq_merge_history(db_filename: str, hq) -> None:
                     key=f"hq_merge_undo::{db_filename}::{sn}::{od}",
                     width="stretch",
                 ):
-                    ok = hq.set_snapshot_merge_target(client, db_filename, sn, od, None)
+                    _set_fn = getattr(hq, "set_snapshot_merge_target", None)
+                    if callable(_set_fn):
+                        ok = _set_fn(client, db_filename, sn, od, None)
+                    else:
+                        ok = _hq_set_merge_target_fallback(client, db_filename, sn, od, None)
                     if ok:
                         _hq_invalidate_history_caches(db_filename)
                         st.success(f"출고 #{sn} 합산 해제.")
