@@ -32,7 +32,7 @@ CREATE POLICY "Allow all app_external_pay_settings" ON app_external_pay_settings
 CREATE TABLE IF NOT EXISTS app_external_pay_batches (
     id           BIGSERIAL PRIMARY KEY,
     db_filename  TEXT NOT NULL,
-    source       TEXT NOT NULL,         -- 'onnuri' | 'ulsanpay'
+    source       TEXT NOT NULL,         -- 'onnuri' | 'ulsanpay' | 'card' | 'mainpay'
     file_name    TEXT,
     parsed_count INTEGER NOT NULL DEFAULT 0,
     inserted_count INTEGER NOT NULL DEFAULT 0,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS app_external_pay_rows (
     id            BIGSERIAL PRIMARY KEY,
     batch_id      BIGINT REFERENCES app_external_pay_batches (id) ON DELETE SET NULL,
     db_filename   TEXT NOT NULL,
-    source        TEXT NOT NULL,        -- 'onnuri' | 'ulsanpay'
+    source        TEXT NOT NULL,        -- 'onnuri' | 'ulsanpay' | 'card' | 'mainpay'
     tx_date       DATE NOT NULL,
     tx_time       TEXT,                 -- 'HH:MM:SS'
     phone_last4   TEXT,                 -- 전화번호 뒤 4자리 (숫자만)
@@ -62,17 +62,23 @@ CREATE TABLE IF NOT EXISTS app_external_pay_rows (
     tx_status     TEXT,                 -- 결제완료 / 취소 / ...
     settle_status TEXT,                 -- 정산예정 / 정산중 / 정산완료
     buyer_name_masked TEXT,             -- 조*임 등
-    approval_code TEXT,                 -- 온누리 승인번호(있으면), 울산페이 6자리 등
+    approval_code TEXT,                 -- 온누리 승인번호(있으면), 울산페이 6자리, 카드 승인번호 등
     raw_json      JSONB,
     fingerprint   TEXT NOT NULL,
     created_at    TIMESTAMPTZ DEFAULT now(),
     UNIQUE (fingerprint)
 );
 
+-- 카드매출 대사용 추가 컬럼 (source='card'/'mainpay')
+ALTER TABLE app_external_pay_rows ADD COLUMN IF NOT EXISTS card_company TEXT;
+ALTER TABLE app_external_pay_rows ADD COLUMN IF NOT EXISTS card_kind TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_ext_rows_db_src_date
     ON app_external_pay_rows (db_filename, source, tx_date);
 CREATE INDEX IF NOT EXISTS idx_ext_rows_match_key
     ON app_external_pay_rows (db_filename, source, tx_date, phone_last4, amount);
+CREATE INDEX IF NOT EXISTS idx_ext_rows_card
+    ON app_external_pay_rows (db_filename, source, tx_date, card_company, amount);
 
 ALTER TABLE app_external_pay_rows ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Allow all app_external_pay_rows" ON app_external_pay_rows;
@@ -88,7 +94,7 @@ CREATE TABLE IF NOT EXISTS app_external_pay_matches (
     payment_id    BIGINT,                -- app_payments.id (없으면 NULL: official_only)
     order_id      BIGINT,
     customer_id   BIGINT,
-    result_code   TEXT NOT NULL,         -- matched_ok / official_canceled / erp_canceled_official_paid / erp_only / official_only / ambiguous
+    result_code   TEXT NOT NULL,         -- matched_ok / official_canceled / erp_canceled_official_paid / erp_only / official_only / ambiguous / amount_mismatch / manual_matched
     note          TEXT,
     matched_by    TEXT,
     matched_at    TIMESTAMPTZ DEFAULT now(),
@@ -103,4 +109,25 @@ CREATE INDEX IF NOT EXISTS idx_ext_matches_payment
 ALTER TABLE app_external_pay_matches ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Allow all app_external_pay_matches" ON app_external_pay_matches;
 CREATE POLICY "Allow all app_external_pay_matches" ON app_external_pay_matches
+    FOR ALL USING (true) WITH CHECK (true);
+
+-- 5) 파일 대응 행 없이 ERP 결제만 존재하는 케이스(현금·계좌이체 등)의 수기 확인 스탬프
+--    UI 상 "현금 수금으로 확인" 등 버튼으로 payment_id 단위로 스탬프. 매장·결제 UNIQUE.
+CREATE TABLE IF NOT EXISTS app_external_pay_manual_confirms (
+    id            BIGSERIAL PRIMARY KEY,
+    db_filename   TEXT NOT NULL,
+    source        TEXT NOT NULL,        -- 'cash' | 'transfer' | 'card' | 'mainpay' | 'onnuri' | 'ulsanpay'
+    payment_id    BIGINT NOT NULL,
+    note          TEXT,
+    confirmed_by  TEXT,
+    confirmed_at  TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (db_filename, payment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ext_manual_confirms_db
+    ON app_external_pay_manual_confirms (db_filename, source);
+
+ALTER TABLE app_external_pay_manual_confirms ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all app_external_pay_manual_confirms" ON app_external_pay_manual_confirms;
+CREATE POLICY "Allow all app_external_pay_manual_confirms" ON app_external_pay_manual_confirms
     FOR ALL USING (true) WITH CHECK (true);

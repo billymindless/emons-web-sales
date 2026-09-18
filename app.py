@@ -2184,6 +2184,66 @@ _ULSANPAY_HEADER_ALIASES = {
 }
 
 
+# 카드 매출내역 (신용/체크카드 통합) 헤더 별칭
+_CARD_HEADER_ALIASES = {
+    # 매입일자(정산 기준)를 우선 인식하고, 실 거래일자는 서브 후보로 처리
+    "tx_date":       ("매입일자", "거래일시", "거래일자", "거래일", "결제일자", "결제일", "승인일자"),
+    "tx_time":       ("거래일시", "거래시간", "결제시간", "시간"),
+    # 매입금액을 기본으로. 지급금액은 수수료 차감 후이므로 우선 순위가 낮음.
+    "amount":        ("매입금액", "매출금액", "승인금액", "결제금액", "거래금액", "판매금액"),
+    "approval_code": ("승인번호", "승인 번호", "승인코드", "Approval"),
+    "card_company":  ("카드사", "제휴카드사", "카드사명", "발급사"),
+    "card_kind":     ("카드종류", "카드구분", "구분"),
+    "tx_status":     ("거래상태", "결제상태", "상태"),
+}
+
+
+# 메인페이 매출내역 헤더 별칭 (카드사·카드번호 없음, 승인번호+금액 기반)
+_MAINPAY_HEADER_ALIASES = {
+    "tx_date":       ("매입일자", "거래일시", "거래일자", "거래일", "결제일자", "결제일", "승인일자"),
+    "tx_time":       ("거래일시", "거래시간", "결제시간", "시간"),
+    "amount":        ("결제금액", "승인금액", "매입금액", "거래금액"),
+    "approval_code": ("승인번호", "승인 번호", "승인코드", "거래번호", "Approval"),
+    "tx_status":     ("거래상태", "결제상태", "상태", "구분"),
+}
+
+
+# 카드사명 정규화. ERP 저장값(예: 'KB국민카드')과 공식파일 표기(예: '국민', 'KB국민', 'BC신한')를 하나로 통일.
+_CARD_COMPANY_NORM_MAP = {
+    "신한": "신한", "신한카드": "신한", "shinhan": "신한",
+    "국민": "KB국민", "kb": "KB국민", "kb국민": "KB국민", "kb국민카드": "KB국민",
+    "우리": "우리", "우리카드": "우리",
+    "bc": "BC", "bc카드": "BC", "비씨": "BC", "비씨카드": "BC",
+    "삼성": "삼성", "삼성카드": "삼성",
+    "현대": "현대", "현대카드": "현대",
+    "롯데": "롯데", "롯데카드": "롯데",
+    "하나": "하나", "하나카드": "하나", "kebhana": "하나",
+    "농협": "농협", "nh농협": "농협", "nh": "농협", "nh농협카드": "농협",
+    "카카오뱅크": "카카오뱅크", "카카오": "카카오뱅크",
+    "토스뱅크": "토스뱅크", "토스": "토스뱅크",
+    "케이뱅크": "케이뱅크",
+}
+
+
+def _card_company_norm(v) -> str:
+    """카드사 정규화. 공백·괄호·'BC신한'·'국민(KB)' 등의 표기를 하나의 키로 축약.
+    매칭되지 않으면 원문(strip)을 그대로 반환하여 신규 카드사도 매칭 가능."""
+    if v is None:
+        return ""
+    s = re.sub(r"\s+", "", str(v).strip())
+    if not s:
+        return ""
+    # 괄호·특수문자 제거 후 소문자화하여 alias lookup
+    key = re.sub(r"[()·\-_/\\.]", "", s).lower()
+    if key in _CARD_COMPANY_NORM_MAP:
+        return _CARD_COMPANY_NORM_MAP[key]
+    # 'BC신한'·'신한(BC)' 같이 조합된 케이스: 대표 카드사 substring 매칭 (긴 것부터)
+    for tok in sorted(_CARD_COMPANY_NORM_MAP.keys(), key=len, reverse=True):
+        if tok and tok in key:
+            return _CARD_COMPANY_NORM_MAP[tok]
+    return s
+
+
 def _ext_pay_map_columns(df_columns, aliases: dict | None = None) -> dict[str, str]:
     """실제 컬럼명을 canonical key로 매핑. 못 찾으면 해당 key 없음."""
     alias_map = aliases or _ONNURI_HEADER_ALIASES
@@ -2272,12 +2332,16 @@ def _ext_pay_parse_time(v) -> str | None:
 
 def _ext_pay_fingerprint(source: str, db_filename: str, tx_date: str, tx_time: str | None,
                          phone_last4: str | None, amount: int, tx_status: str | None,
-                         approval_code: str | None = None) -> str:
+                         approval_code: str | None = None,
+                         card_company: str | None = None) -> str:
     """공식 파일 1행의 지문.
     온누리: `source|db|date|time|phone_last4|amount|tx_status`
-    울산페이: 뒤에 `|approval_code` 를 붙여 승인번호 6자리로 구분."""
+    울산페이: 뒤에 `|approval_code` 를 붙여 승인번호 6자리로 구분.
+    카드: 뒤에 `|card_company_norm|approval_code` 를 붙여 동일 일자·금액·카드사 중복 구분.
+    메인페이: 뒤에 `|approval_code` 만 붙임."""
+    src = (source or "").strip()
     parts = [
-        (source or "").strip(),
+        src,
         (db_filename or "").strip(),
         (tx_date or "").strip(),
         (tx_time or "").strip(),
@@ -2285,8 +2349,13 @@ def _ext_pay_fingerprint(source: str, db_filename: str, tx_date: str, tx_time: s
         str(int(amount)) if amount is not None else "",
         (tx_status or "").strip(),
     ]
-    if (source or "").strip() == "ulsanpay":
+    if src == "ulsanpay":
         parts.append(_ext_pay_norm_approval6(approval_code))
+    elif src == "card":
+        parts.append(_card_company_norm(card_company))
+        parts.append(str(approval_code or "").strip())
+    elif src == "mainpay":
+        parts.append(str(approval_code or "").strip())
     return "|".join(parts)
 
 
@@ -2430,6 +2499,104 @@ def _ext_pay_parse_ulsanpay_file(uploaded_file) -> tuple[list[dict], str | None]
         if amt is None:
             continue
         appr = _ext_pay_norm_approval6(row.get(colmap["approval_code"]))
+        if not appr:
+            continue
+        tx_status = str(row.get(colmap["tx_status"]) or "").strip() if "tx_status" in colmap else ""
+        raw = {k: (None if pd.isna(v) else str(v)) for k, v in row.items() if v is not None}
+        out.append({
+            "tx_date": tx_date,
+            "tx_time": tx_time,
+            "phone_last4": None,
+            "amount": int(amt),
+            "tx_status": tx_status or None,
+            "settle_status": None,
+            "buyer_name_masked": None,
+            "approval_code": appr,
+            "raw": raw,
+        })
+    return out, None
+
+
+def _ext_pay_parse_card_file(uploaded_file) -> tuple[list[dict], str | None]:
+    """카드 매출내역(신용/체크카드 통합) → 정규화 행.
+    필수: 매입일자, 매입금액, 카드사. 승인번호·카드종류는 있으면 저장(매칭 서브키·표시용)."""
+    df, err = _ext_pay_read_uploaded_df(uploaded_file)
+    if err:
+        return [], err
+    df = _ext_pay_promote_header_row(
+        df, {"매입일자", "거래일시", "승인번호", "카드사", "매입금액", "결제금액"}
+    )
+    colmap = _ext_pay_map_columns(df.columns, _CARD_HEADER_ALIASES)
+    if "tx_date" not in colmap or "amount" not in colmap or "card_company" not in colmap:
+        return [], (
+            "필수 컬럼(매입일자, 매입금액, 카드사)을 찾을 수 없습니다. "
+            f"감지된 컬럼: {list(df.columns)}"
+        )
+
+    out: list[dict] = []
+    for _, row in df.iterrows():
+        raw_dt = row.get(colmap["tx_date"])
+        tx_date = _ext_pay_parse_date(raw_dt)
+        if not tx_date:
+            continue
+        tx_time = _ext_pay_parse_time(raw_dt)
+        if not tx_time and "tx_time" in colmap:
+            tx_time = _ext_pay_parse_time(row.get(colmap["tx_time"]))
+        amt = _ext_pay_parse_amount(row.get(colmap["amount"]))
+        if amt is None:
+            continue
+        card_raw = str(row.get(colmap["card_company"]) or "").strip() if "card_company" in colmap else ""
+        card_norm = _card_company_norm(card_raw)
+        if not card_norm:
+            continue
+        appr = str(row.get(colmap["approval_code"]) or "").strip() if "approval_code" in colmap else ""
+        card_kind = str(row.get(colmap["card_kind"]) or "").strip() if "card_kind" in colmap else ""
+        tx_status = str(row.get(colmap["tx_status"]) or "").strip() if "tx_status" in colmap else ""
+        raw = {k: (None if pd.isna(v) else str(v)) for k, v in row.items() if v is not None}
+        out.append({
+            "tx_date": tx_date,
+            "tx_time": tx_time,
+            "phone_last4": None,
+            "amount": int(amt),
+            "tx_status": tx_status or None,
+            "settle_status": None,
+            "buyer_name_masked": None,
+            "approval_code": appr or None,
+            "card_company": card_norm,
+            "card_kind": card_kind or None,
+            "raw": raw,
+        })
+    return out, None
+
+
+def _ext_pay_parse_mainpay_file(uploaded_file) -> tuple[list[dict], str | None]:
+    """메인페이 매출내역 → 정규화 행. 필수: 매입/거래일자·결제금액·승인번호."""
+    df, err = _ext_pay_read_uploaded_df(uploaded_file)
+    if err:
+        return [], err
+    df = _ext_pay_promote_header_row(
+        df, {"매입일자", "거래일시", "승인번호", "결제금액", "승인금액"}
+    )
+    colmap = _ext_pay_map_columns(df.columns, _MAINPAY_HEADER_ALIASES)
+    if "tx_date" not in colmap or "amount" not in colmap or "approval_code" not in colmap:
+        return [], (
+            "필수 컬럼(매입일자, 승인번호, 결제금액)을 찾을 수 없습니다. "
+            f"감지된 컬럼: {list(df.columns)}"
+        )
+
+    out: list[dict] = []
+    for _, row in df.iterrows():
+        raw_dt = row.get(colmap["tx_date"])
+        tx_date = _ext_pay_parse_date(raw_dt)
+        if not tx_date:
+            continue
+        tx_time = _ext_pay_parse_time(raw_dt)
+        if not tx_time and "tx_time" in colmap:
+            tx_time = _ext_pay_parse_time(row.get(colmap["tx_time"]))
+        amt = _ext_pay_parse_amount(row.get(colmap["amount"]))
+        if amt is None:
+            continue
+        appr = str(row.get(colmap["approval_code"]) or "").strip()
         if not appr:
             continue
         tx_status = str(row.get(colmap["tx_status"]) or "").strip() if "tx_status" in colmap else ""
@@ -2789,16 +2956,25 @@ def _ext_pay_relink_amount_and_near_date(
     sc, db_filename: str, source: str, erp_from: date | None = None,
 ) -> int:
     """기존 official_only·미매칭 공식 행을 금액·근사일자로 재연결."""
-    if not sc or not db_filename or source not in ("ulsanpay", "onnuri"):
+    if not sc or not db_filename or source not in ("ulsanpay", "onnuri", "card", "mainpay"):
         return 0
+    _row_cols = "id, tx_date, amount, tx_status, approval_code, phone_last4"
+    if source == "card":
+        _row_cols = "id, tx_date, amount, tx_status, approval_code, phone_last4, card_company, card_kind"
     try:
         def _filt_rows(q):
             return q.eq("db_filename", db_filename).eq("source", source)
-        rows = _ext_pay_select_paged(
-            sc, "app_external_pay_rows",
-            "id, tx_date, amount, tx_status, approval_code, phone_last4",
-            _filt_rows, order_col="id",
-        )
+        try:
+            rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows", _row_cols, _filt_rows, order_col="id",
+            )
+        except Exception:
+            # card_company/card_kind 컬럼 미배포 환경 폴백
+            rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows",
+                "id, tx_date, amount, tx_status, approval_code, phone_last4",
+                _filt_rows, order_col="id",
+            )
         def _filt_m(q):
             return q.eq("db_filename", db_filename).eq("source", source)
         matches = _ext_pay_select_paged(
@@ -2863,6 +3039,64 @@ def _ext_pay_relink_amount_and_near_date(
                 hit = diff_amt[0]
                 code = "amount_mismatch"
                 notes.append("공식파일에 있으나 금액 다름")
+                _dn = _ext_pay_date_gap_note(file_date, hit.get("payment_date"))
+                if _dn:
+                    notes.append(_dn)
+        elif source == "card":
+            # 카드: (카드사, 절대금액) 일치 + 매입일자 gap 최소 후보 1건 재매칭
+            cc = _card_company_norm(r.get("card_company"))
+            if not cc:
+                continue
+            fd = _ext_pay_as_date(file_date)
+            same = [
+                p for p in leftover
+                if _card_company_norm(p.get("card_company")) == cc
+                and abs(int(p.get("amount") or 0)) == oamt
+            ]
+            diff_amt = [
+                p for p in leftover
+                if _card_company_norm(p.get("card_company")) == cc
+                and abs(int(p.get("amount") or 0)) != oamt
+            ]
+            if same:
+                def _gap_c(p):
+                    ed = _ext_pay_as_date(p.get("payment_date"))
+                    if fd is None or ed is None:
+                        return 99
+                    return abs((fd - ed).days)
+                hit = sorted(same, key=lambda p: (_gap_c(p), int(p.get("payment_id") or 0)))[0]
+                code = "matched_ok"
+                _dn = _ext_pay_date_gap_note(file_date, hit.get("payment_date"))
+                if _dn:
+                    notes.append(_dn)
+            elif len(diff_amt) == 1:
+                hit = diff_amt[0]
+                code = "amount_mismatch"
+                notes.append("공식파일에 있으나 금액 다름")
+        elif source == "mainpay":
+            # 메인페이: 승인번호 우선, 없거나 유일 후보 없으면 금액+근사일자
+            appr = str(r.get("approval_code") or "").strip()
+            fd = _ext_pay_as_date(file_date)
+            same_ap = [
+                p for p in leftover
+                if appr
+                and str(p.get("approval_code") or "").strip() == appr
+                and abs(int(p.get("amount") or 0)) == oamt
+            ]
+            same_amt = [p for p in leftover if abs(int(p.get("amount") or 0)) == oamt]
+            candidates = same_ap or same_amt
+            if candidates:
+                def _gap_m(p):
+                    ed = _ext_pay_as_date(p.get("payment_date"))
+                    if fd is None or ed is None:
+                        return 99
+                    return abs((fd - ed).days)
+                sorted_c = sorted(candidates, key=lambda p: (_gap_m(p), int(p.get("payment_id") or 0)))
+                # 금액만 매칭이고 후보 다수면 재연결 보류
+                if not same_ap and len(sorted_c) > 1:
+                    continue
+                hit = sorted_c[0]
+                code = "matched_ok"
                 _dn = _ext_pay_date_gap_note(file_date, hit.get("payment_date"))
                 if _dn:
                     notes.append(_dn)
@@ -2936,6 +3170,10 @@ def _ext_pay_source_from_method(method: str | None) -> str | None:
         return "ulsanpay"
     if "온누리" in m and "지류" not in m:
         return "onnuri"
+    if m in ("신용카드", "체크카드"):
+        return "card"
+    if m == "메인페이":
+        return "mainpay"
     return None
 
 
@@ -3080,6 +3318,67 @@ def _ext_pay_release_and_rematch_source(
                     release_ids.add(int(r["id"]))
                 except (TypeError, ValueError, KeyError):
                     continue
+    elif source == "card":
+        # 카드: (카드사정규화, 절대금액) 조합을 키로 release 대상 확장
+        keys_card: set[tuple[str, int]] = set()
+        for r in rows:
+            try:
+                rid = int(r["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if rid in release_ids:
+                keys_card.add((
+                    _card_company_norm(r.get("card_company")),
+                    abs(int(r.get("amount") or 0)),
+                ))
+        for p in (old_pay, new_pay):
+            if _ext_pay_source_from_method((p or {}).get("payment_method")) != "card":
+                continue
+            cc = _card_company_norm((p or {}).get("card_company"))
+            try:
+                amt = abs(int(round(float((p or {}).get("amount") or 0))))
+            except (TypeError, ValueError):
+                amt = 0
+            if cc and amt > 0:
+                keys_card.add((cc, amt))
+        for r in rows:
+            try:
+                key = (_card_company_norm(r.get("card_company")), abs(int(r.get("amount") or 0)))
+            except (TypeError, ValueError):
+                continue
+            if key in keys_card:
+                try:
+                    release_ids.add(int(r["id"]))
+                except (TypeError, ValueError, KeyError):
+                    continue
+    elif source == "mainpay":
+        # 메인페이: 절대금액만으로 release 대상 확장 (승인번호는 부가 서브키)
+        amts: set[int] = set()
+        for r in rows:
+            try:
+                rid = int(r["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if rid in release_ids:
+                try:
+                    amts.add(abs(int(r.get("amount") or 0)))
+                except (TypeError, ValueError):
+                    continue
+        for p in (old_pay, new_pay):
+            if _ext_pay_source_from_method((p or {}).get("payment_method")) != "mainpay":
+                continue
+            try:
+                amt = abs(int(round(float((p or {}).get("amount") or 0))))
+            except (TypeError, ValueError):
+                amt = 0
+            if amt > 0:
+                amts.add(amt)
+        for r in rows:
+            try:
+                if abs(int(r.get("amount") or 0)) in amts:
+                    release_ids.add(int(r["id"]))
+            except (TypeError, ValueError, KeyError):
+                continue
     else:
         keys: set[tuple[str, str, int]] = set()
         for r in rows:
@@ -3144,6 +3443,10 @@ def _ext_pay_release_and_rematch_source(
         vf = min([verify_from, *extra_dates])
     if source == "ulsanpay":
         _ext_pay_match_ulsanpay(db_filename, vf, matched_by)
+    elif source == "card":
+        _ext_pay_match_card(db_filename, vf, matched_by)
+    elif source == "mainpay":
+        _ext_pay_match_mainpay(db_filename, vf, matched_by)
     else:
         _ext_pay_match_onnuri(db_filename, vf, matched_by)
 
@@ -3191,6 +3494,7 @@ def _ext_pay_insert_batch_and_rows(
             source, db_filename, r["tx_date"], r.get("tx_time"),
             r.get("phone_last4"), int(r["amount"]), r.get("tx_status"),
             approval_code=r.get("approval_code"),
+            card_company=r.get("card_company"),
         )
         payload = {
             "batch_id": batch_id,
@@ -3207,6 +3511,9 @@ def _ext_pay_insert_batch_and_rows(
             "raw_json": _ext_pay_safe_raw(r.get("raw")),
             "fingerprint": fp,
         }
+        if source == "card":
+            payload["card_company"] = r.get("card_company")
+            payload["card_kind"] = r.get("card_kind")
         try:
             sc.table("app_external_pay_rows").insert(payload).execute()
             inserted += 1
@@ -3215,6 +3522,17 @@ def _ext_pay_insert_batch_and_rows(
             if "duplicate" in msg or "unique" in msg or "23505" in msg or "conflict" in msg:
                 duplicates += 1
                 continue
+            # 스키마에 card_company/card_kind 컬럼이 아직 없는 환경: 해당 필드를 제거 후 재시도
+            if source == "card" and ("card_company" in msg or "card_kind" in msg or "column" in msg):
+                fallback = {k: v for k, v in payload.items() if k not in ("card_company", "card_kind")}
+                try:
+                    sc.table("app_external_pay_rows").insert(fallback).execute()
+                    inserted += 1
+                    continue
+                except Exception as e2:
+                    if first_row_err is None:
+                        first_row_err = str(e2)
+                    continue
             if first_row_err is None:
                 first_row_err = str(e)
             continue
@@ -3815,6 +4133,737 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
     return counts, None
 
 
+def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | None) -> tuple[dict, str | None]:
+    """공식 카드매출 행 ↔ ERP 신용/체크카드 결제 매칭.
+    키: (카드사 정규화, 절대금액). 서브키: 승인번호. 신규고객 필터 없음."""
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return {}, err or "Supabase 연결 불가"
+
+    try:
+        def _filt_rows(q):
+            return (
+                q.eq("db_filename", db_filename)
+                .eq("source", "card")
+                .gte("tx_date", verify_from.isoformat())
+            )
+        try:
+            rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows",
+                "id, tx_date, tx_time, amount, tx_status, approval_code, card_company, card_kind",
+                _filt_rows, order_col="id",
+            )
+        except Exception:
+            rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows",
+                "id, tx_date, tx_time, amount, tx_status, approval_code",
+                _filt_rows, order_col="id",
+            )
+    except Exception as e:
+        return {}, f"공식 행 조회 실패: {e}"
+    if not rows:
+        return {}, None
+
+    try:
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename).eq("source", "card")
+        mr = _ext_pay_select_paged(
+            sc, "app_external_pay_matches", "row_id", _filt_m, order_col="id",
+        )
+        matched_ids = {int(m["row_id"]) for m in mr if m.get("row_id") is not None}
+    except Exception:
+        matched_ids = set()
+    todo = [r for r in rows if int(r["id"]) not in matched_ids]
+    if not todo:
+        return {}, None
+
+    try:
+        def _filt_p(q):
+            return (
+                q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .gte("payment_date", verify_from.isoformat())
+            )
+        pays_all = _ext_pay_select_paged(
+            sc, "app_payments",
+            "id, order_id, payment_date, amount, payment_method, card_company",
+            _filt_p, order_col="id",
+        )
+    except Exception as e:
+        return {}, f"ERP 결제 조회 실패: {e}"
+
+    pays = [p for p in pays_all if str(p.get("payment_method") or "") in ("신용카드", "체크카드")]
+    order_ids = sorted({int(p["order_id"]) for p in pays if p.get("order_id") is not None})
+    orders_map: dict[int, dict] = {}
+    if order_ids:
+        try:
+            for chunk in (order_ids[i : i + 200] for i in range(0, len(order_ids), 200)):
+                _or = (
+                    sc.table("app_orders")
+                    .select("id, customer_id, order_date")
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                    .in_("id", chunk)
+                    .execute()
+                )
+                for row in _or.data or []:
+                    orders_map[int(row["id"])] = row
+        except Exception as e:
+            return {}, f"주문 조회 실패: {e}"
+
+    try:
+        def _filt_mp(q):
+            return q.eq("db_filename", db_filename).eq("source", "card")
+        mp = _ext_pay_select_paged(
+            sc, "app_external_pay_matches", "payment_id", _filt_mp, order_col="id",
+        )
+        used_payment_ids = {int(m["payment_id"]) for m in mp if m.get("payment_id") is not None}
+    except Exception:
+        used_payment_ids = set()
+
+    candidate_pays: list[dict] = []
+    for p in pays:
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError):
+            continue
+        if pid in used_payment_ids:
+            continue
+        o = orders_map.get(int(p["order_id"])) if p.get("order_id") is not None else None
+        if not o:
+            continue
+        candidate_pays.append({**p, "_order": o})
+
+    neg_orders = {int(p["order_id"]) for p in pays if p.get("order_id") is not None and (p.get("amount") or 0) < 0}
+
+    # 인덱스 키: (카드사정규화, 절대금액)
+    idx: dict[tuple, list[dict]] = {}
+    for p in candidate_pays:
+        try:
+            amt_k = abs(int(p.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        cc = _card_company_norm(p.get("card_company"))
+        if not cc:
+            continue
+        idx.setdefault((cc, amt_k), []).append(p)
+
+    counts: dict[str, int] = {}
+    inserts: list[dict] = []
+
+    for r in todo:
+        row_id = int(r["id"])
+        cc = _card_company_norm(r.get("card_company"))
+        amt = int(r.get("amount") or 0)
+        is_cancel = _ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0
+        match_amt = abs(amt)
+        file_date = str(r.get("tx_date") or "")[:10]
+        fd = _ext_pay_as_date(file_date)
+
+        result_code = None
+        matched_pay: dict | None = None
+        note_parts: list[str] = []
+        candidates: list[dict] = []
+        if not cc:
+            result_code = "official_only"
+            note_parts.append("카드사 미상")
+        else:
+            candidates = list(idx.get((cc, match_amt), []))
+
+        if candidates:
+            # 매입일자 gap ±2일 이내 우선
+            def _gap(p):
+                ed = _ext_pay_as_date(p.get("payment_date"))
+                if fd is None or ed is None:
+                    return 99
+                return abs((fd - ed).days)
+            candidates = sorted(candidates, key=lambda p: (_gap(p), int(p.get("id") or 0)))
+            # 승인번호 매칭 (서브키)
+            appr = str(r.get("approval_code") or "").strip()
+            if appr:
+                # ERP측 승인번호는 별도 저장 안 됨. 그러나 후보 유일 조건은 유지
+                pass
+            if len(candidates) == 1:
+                matched_pay = candidates[0]
+            else:
+                # 매입일자 ±2일 초과 후보 제외
+                near = [p for p in candidates if _gap(p) <= 2]
+                if len(near) == 1:
+                    matched_pay = near[0]
+                elif near:
+                    matched_pay = near[0]
+                    result_code = "ambiguous"
+                    note_parts.append(f"카드사·금액 후보 {len(near)}건 · 임시로 가장 가까운 일자 매칭")
+                else:
+                    matched_pay = candidates[0]
+                    result_code = "ambiguous"
+                    note_parts.append(f"카드사·금액 후보 {len(candidates)}건 · 근사일 초과")
+
+            if matched_pay is not None and result_code is None:
+                _dn = _ext_pay_date_gap_note(file_date, matched_pay.get("payment_date"))
+                if _dn:
+                    note_parts.append(_dn)
+                if is_cancel:
+                    if int(matched_pay["order_id"]) in neg_orders:
+                        result_code = "matched_ok"
+                        note_parts.append("공식 취소 · ERP도 취소 흔적")
+                    else:
+                        result_code = "official_canceled"
+                        note_parts.append("공식 취소인데 ERP는 잔존")
+                else:
+                    if int(matched_pay["order_id"]) in neg_orders:
+                        result_code = "erp_canceled_official_paid"
+                        note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                    else:
+                        result_code = "matched_ok"
+        else:
+            if result_code is None:
+                # 금액 다른 카드사 매칭 후보 (amount_mismatch 케이스)
+                amt_alts = []
+                if cc:
+                    for _p in candidate_pays:
+                        try:
+                            _pid = int(_p["id"])
+                        except (TypeError, ValueError):
+                            continue
+                        if _pid in used_payment_ids:
+                            continue
+                        if _card_company_norm(_p.get("card_company")) != cc:
+                            continue
+                        try:
+                            _pa = abs(int(_p.get("amount") or 0))
+                        except (TypeError, ValueError):
+                            continue
+                        if _pa != match_amt and _pa > 0:
+                            amt_alts.append(_p)
+                if len(amt_alts) == 1:
+                    matched_pay = amt_alts[0]
+                    result_code = "amount_mismatch"
+                    note_parts.append("공식파일에 있으나 금액 다름")
+                    _dn = _ext_pay_date_gap_note(file_date, matched_pay.get("payment_date"))
+                    if _dn:
+                        note_parts.append(_dn)
+                elif is_cancel:
+                    result_code = "official_canceled"
+                    note_parts.append("공식 취소·ERP에 대응 결제 없음")
+                else:
+                    result_code = "official_only"
+
+        pay_id = int(matched_pay["id"]) if matched_pay else None
+        order_id = int(matched_pay["order_id"]) if matched_pay and matched_pay.get("order_id") is not None else None
+        cust_id = None
+        if matched_pay:
+            _o = matched_pay["_order"] or {}
+            cust_id = int(_o["customer_id"]) if _o.get("customer_id") is not None else None
+
+        inserts.append({
+            "db_filename": db_filename,
+            "source": "card",
+            "row_id": row_id,
+            "payment_id": pay_id,
+            "order_id": order_id,
+            "customer_id": cust_id,
+            "result_code": result_code,
+            "note": " · ".join(note_parts) or None,
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        counts[result_code] = counts.get(result_code, 0) + 1
+        if pay_id is not None:
+            used_payment_ids.add(pay_id)
+            for k, lst in list(idx.items()):
+                idx[k] = [x for x in lst if int(x["id"]) != pay_id]
+
+    leftover_pays = [p for p in candidate_pays if int(p["id"]) not in used_payment_ids]
+    counts["erp_only"] = counts.get("erp_only", 0) + len(leftover_pays)
+
+    for chunk in (inserts[i : i + 200] for i in range(0, len(inserts), 200)):
+        try:
+            sc.table("app_external_pay_matches").insert(chunk).execute()
+        except Exception:
+            for one in chunk:
+                try:
+                    sc.table("app_external_pay_matches").insert(one).execute()
+                except Exception:
+                    continue
+
+    _ext_pay_relink_amount_and_near_date(sc, db_filename, "card")
+    return counts, None
+
+
+def _ext_pay_match_mainpay(db_filename: str, verify_from: date, matched_by: str | None) -> tuple[dict, str | None]:
+    """공식 메인페이 행 ↔ ERP 메인페이 결제 매칭.
+    키: 절대금액 + (있으면) 승인번호. 신규고객 필터 없음."""
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return {}, err or "Supabase 연결 불가"
+
+    try:
+        def _filt_rows(q):
+            return (
+                q.eq("db_filename", db_filename)
+                .eq("source", "mainpay")
+                .gte("tx_date", verify_from.isoformat())
+            )
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            "id, tx_date, tx_time, amount, tx_status, approval_code",
+            _filt_rows, order_col="id",
+        )
+    except Exception as e:
+        return {}, f"공식 행 조회 실패: {e}"
+    if not rows:
+        return {}, None
+
+    try:
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename).eq("source", "mainpay")
+        mr = _ext_pay_select_paged(
+            sc, "app_external_pay_matches", "row_id", _filt_m, order_col="id",
+        )
+        matched_ids = {int(m["row_id"]) for m in mr if m.get("row_id") is not None}
+    except Exception:
+        matched_ids = set()
+    todo = [r for r in rows if int(r["id"]) not in matched_ids]
+    if not todo:
+        return {}, None
+
+    try:
+        def _filt_p(q):
+            return (
+                q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .gte("payment_date", verify_from.isoformat())
+            )
+        pays_all = _ext_pay_select_paged(
+            sc, "app_payments",
+            "id, order_id, payment_date, amount, payment_method, card_company",
+            _filt_p, order_col="id",
+        )
+    except Exception as e:
+        return {}, f"ERP 결제 조회 실패: {e}"
+
+    pays = [p for p in pays_all if str(p.get("payment_method") or "") == "메인페이"]
+    order_ids = sorted({int(p["order_id"]) for p in pays if p.get("order_id") is not None})
+    orders_map: dict[int, dict] = {}
+    if order_ids:
+        try:
+            for chunk in (order_ids[i : i + 200] for i in range(0, len(order_ids), 200)):
+                _or = (
+                    sc.table("app_orders")
+                    .select("id, customer_id, order_date")
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                    .in_("id", chunk)
+                    .execute()
+                )
+                for row in _or.data or []:
+                    orders_map[int(row["id"])] = row
+        except Exception as e:
+            return {}, f"주문 조회 실패: {e}"
+
+    try:
+        def _filt_mp(q):
+            return q.eq("db_filename", db_filename).eq("source", "mainpay")
+        mp = _ext_pay_select_paged(
+            sc, "app_external_pay_matches", "payment_id", _filt_mp, order_col="id",
+        )
+        used_payment_ids = {int(m["payment_id"]) for m in mp if m.get("payment_id") is not None}
+    except Exception:
+        used_payment_ids = set()
+
+    candidate_pays: list[dict] = []
+    for p in pays:
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError):
+            continue
+        if pid in used_payment_ids:
+            continue
+        o = orders_map.get(int(p["order_id"])) if p.get("order_id") is not None else None
+        if not o:
+            continue
+        candidate_pays.append({**p, "_order": o})
+
+    neg_orders = {int(p["order_id"]) for p in pays if p.get("order_id") is not None and (p.get("amount") or 0) < 0}
+
+    # 인덱스: (절대금액)만
+    idx: dict[int, list[dict]] = {}
+    for p in candidate_pays:
+        try:
+            amt_k = abs(int(p.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        idx.setdefault(amt_k, []).append(p)
+
+    counts: dict[str, int] = {}
+    inserts: list[dict] = []
+
+    for r in todo:
+        row_id = int(r["id"])
+        amt = int(r.get("amount") or 0)
+        is_cancel = _ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0
+        match_amt = abs(amt)
+        file_date = str(r.get("tx_date") or "")[:10]
+        fd = _ext_pay_as_date(file_date)
+        result_code = None
+        matched_pay: dict | None = None
+        note_parts: list[str] = []
+        candidates = list(idx.get(match_amt, []))
+
+        if candidates:
+            def _gap(p):
+                ed = _ext_pay_as_date(p.get("payment_date"))
+                if fd is None or ed is None:
+                    return 99
+                return abs((fd - ed).days)
+            candidates = sorted(candidates, key=lambda p: (_gap(p), int(p.get("id") or 0)))
+            if len(candidates) == 1:
+                matched_pay = candidates[0]
+            else:
+                near = [p for p in candidates if _gap(p) <= 2]
+                if len(near) == 1:
+                    matched_pay = near[0]
+                elif near:
+                    matched_pay = near[0]
+                    result_code = "ambiguous"
+                    note_parts.append(f"동일 금액 후보 {len(near)}건 · 임시로 가장 가까운 일자 매칭")
+                else:
+                    matched_pay = candidates[0]
+                    result_code = "ambiguous"
+                    note_parts.append(f"동일 금액 후보 {len(candidates)}건 · 근사일 초과")
+            if matched_pay is not None and result_code is None:
+                _dn = _ext_pay_date_gap_note(file_date, matched_pay.get("payment_date"))
+                if _dn:
+                    note_parts.append(_dn)
+                if is_cancel:
+                    if int(matched_pay["order_id"]) in neg_orders:
+                        result_code = "matched_ok"
+                        note_parts.append("공식 취소 · ERP도 취소 흔적")
+                    else:
+                        result_code = "official_canceled"
+                        note_parts.append("공식 취소인데 ERP는 잔존")
+                else:
+                    if int(matched_pay["order_id"]) in neg_orders:
+                        result_code = "erp_canceled_official_paid"
+                        note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                    else:
+                        result_code = "matched_ok"
+        else:
+            if is_cancel:
+                result_code = "official_canceled"
+                note_parts.append("공식 취소·ERP에 대응 결제 없음")
+            else:
+                result_code = "official_only"
+
+        pay_id = int(matched_pay["id"]) if matched_pay else None
+        order_id = int(matched_pay["order_id"]) if matched_pay and matched_pay.get("order_id") is not None else None
+        cust_id = None
+        if matched_pay:
+            _o = matched_pay["_order"] or {}
+            cust_id = int(_o["customer_id"]) if _o.get("customer_id") is not None else None
+
+        inserts.append({
+            "db_filename": db_filename,
+            "source": "mainpay",
+            "row_id": row_id,
+            "payment_id": pay_id,
+            "order_id": order_id,
+            "customer_id": cust_id,
+            "result_code": result_code,
+            "note": " · ".join(note_parts) or None,
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        counts[result_code] = counts.get(result_code, 0) + 1
+        if pay_id is not None:
+            used_payment_ids.add(pay_id)
+            for k, lst in list(idx.items()):
+                idx[k] = [x for x in lst if int(x["id"]) != pay_id]
+
+    leftover_pays = [p for p in candidate_pays if int(p["id"]) not in used_payment_ids]
+    counts["erp_only"] = counts.get("erp_only", 0) + len(leftover_pays)
+
+    for chunk in (inserts[i : i + 200] for i in range(0, len(inserts), 200)):
+        try:
+            sc.table("app_external_pay_matches").insert(chunk).execute()
+        except Exception:
+            for one in chunk:
+                try:
+                    sc.table("app_external_pay_matches").insert(one).execute()
+                except Exception:
+                    continue
+
+    _ext_pay_relink_amount_and_near_date(sc, db_filename, "mainpay")
+    return counts, None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 수동 매칭 서비스 (플랜: manual_link_confirm)
+# 1) 공식 행 ↔ ERP 결제 수동 링크 (자동매칭 실패 행을 사용자가 특정 결제에 붙임)
+# 2) ERP-only 결제(현금 등) 수기 확인 스탬프
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _ext_pay_manual_link(
+    db_filename: str, source: str, row_id: int, payment_id: int,
+    matched_by: str | None, note: str | None = None,
+) -> tuple[bool, str | None]:
+    """공식 파일 1행을 특정 ERP 결제(payment_id)에 수동 매칭.
+    - app_external_pay_matches 를 upsert (row_id UNIQUE)
+    - result_code='manual_matched', matched_by 저장
+    - order_id/customer_id 는 payment→order 를 통해 자동 조회
+    반환: (성공, 에러메시지)."""
+    if not db_filename or not row_id or not payment_id:
+        return False, "필수 파라미터 누락"
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return False, err or "Supabase 연결 불가"
+
+    # 결제 → 주문 → 고객 자동 조회
+    try:
+        pr = (
+            sc.table("app_payments")
+            .select("id, order_id, amount, payment_date, payment_method")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .eq("id", int(payment_id))
+            .limit(1)
+            .execute()
+        )
+        pay_rows = pr.data or []
+        if not pay_rows:
+            return False, f"결제 id={payment_id} 를 찾을 수 없습니다."
+        pay = pay_rows[0]
+    except Exception as e:
+        return False, f"결제 조회 실패: {e}"
+
+    order_id = pay.get("order_id")
+    customer_id = None
+    if order_id is not None:
+        try:
+            _or = (
+                sc.table("app_orders")
+                .select("customer_id")
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .eq("id", int(order_id))
+                .limit(1)
+                .execute()
+            )
+            if _or.data and _or.data[0].get("customer_id") is not None:
+                customer_id = int(_or.data[0]["customer_id"])
+        except Exception:
+            pass
+
+    _note = (note or "").strip() or "관리자 수동 매칭"
+    payload = {
+        "db_filename": db_filename,
+        "source": source,
+        "row_id": int(row_id),
+        "payment_id": int(payment_id),
+        "order_id": int(order_id) if order_id is not None else None,
+        "customer_id": customer_id,
+        "result_code": "manual_matched",
+        "note": _note,
+        "matched_by": (matched_by or "").strip() or None,
+    }
+    # 기존 매칭이 있으면 update, 없으면 insert
+    try:
+        existing = (
+            sc.table("app_external_pay_matches")
+            .select("id")
+            .eq("db_filename", db_filename)
+            .eq("row_id", int(row_id))
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            sc.table("app_external_pay_matches").update(payload).eq(
+                "db_filename", db_filename
+            ).eq("row_id", int(row_id)).execute()
+        else:
+            sc.table("app_external_pay_matches").insert(payload).execute()
+        return True, None
+    except Exception as e:
+        return False, f"매칭 저장 실패: {e}"
+
+
+def _ext_pay_unlink_row(db_filename: str, source: str, row_id: int) -> tuple[bool, str | None]:
+    """공식 행의 매칭을 해제. 자동 매칭이 잘못 붙었을 때 관리자가 되돌리는 용도."""
+    if not db_filename or not row_id:
+        return False, "필수 파라미터 누락"
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return False, err or "Supabase 연결 불가"
+    try:
+        sc.table("app_external_pay_matches").delete().eq(
+            "db_filename", db_filename
+        ).eq("source", source).eq("row_id", int(row_id)).execute()
+        return True, None
+    except Exception as e:
+        return False, f"매칭 해제 실패: {e}"
+
+
+def _ext_pay_manual_confirm(
+    db_filename: str, source: str, payment_id: int,
+    note: str | None, confirmed_by: str | None,
+) -> tuple[bool, str | None]:
+    """파일 대응 없이 ERP 결제만 존재하는 케이스(현금 등)에 수기 확인 스탬프.
+    - app_external_pay_manual_confirms 에 (db_filename, payment_id) UNIQUE 로 upsert."""
+    if not db_filename or not payment_id:
+        return False, "필수 파라미터 누락"
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return False, err or "Supabase 연결 불가"
+    payload = {
+        "db_filename": db_filename,
+        "source": (source or "").strip() or "cash",
+        "payment_id": int(payment_id),
+        "note": (note or "").strip() or None,
+        "confirmed_by": (confirmed_by or "").strip() or None,
+    }
+    try:
+        sc.table("app_external_pay_manual_confirms").upsert(
+            payload, on_conflict="db_filename,payment_id"
+        ).execute()
+        return True, None
+    except Exception as e:
+        return False, f"수기 확인 저장 실패: {e}"
+
+
+def _ext_pay_manual_unconfirm(db_filename: str, payment_id: int) -> tuple[bool, str | None]:
+    """수기 확인 스탬프 취소."""
+    if not db_filename or not payment_id:
+        return False, "필수 파라미터 누락"
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return False, err or "Supabase 연결 불가"
+    try:
+        sc.table("app_external_pay_manual_confirms").delete().eq(
+            "db_filename", db_filename
+        ).eq("payment_id", int(payment_id)).execute()
+        return True, None
+    except Exception as e:
+        return False, f"수기 확인 취소 실패: {e}"
+
+
+def _ext_pay_list_manual_confirms(db_filename: str) -> dict[int, dict]:
+    """매장의 수기 확인 스탬프. payment_id → row."""
+    if not db_filename:
+        return {}
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return {}
+    try:
+        r = (
+            sc.table("app_external_pay_manual_confirms")
+            .select("payment_id, source, note, confirmed_by, confirmed_at")
+            .eq("db_filename", db_filename)
+            .execute()
+        )
+        out: dict[int, dict] = {}
+        for row in r.data or []:
+            try:
+                pid = int(row["payment_id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            out[pid] = row
+        return out
+    except Exception:
+        return {}
+
+
+def _ext_pay_list_unmatched_erp_all_methods(
+    db_filename: str, verify_from: date,
+) -> list[dict]:
+    """매장의 verify_from 이후 결제 중 아직 어떤 공식 매칭 · 수기 확인도 없는 항목.
+    현금(수금) · 계좌이체 등 파일 대응이 없는 결제 수단을 포함하여 전체 반환."""
+    if not db_filename or verify_from is None:
+        return []
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return []
+    try:
+        def _filt(q):
+            return (
+                q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .gte("payment_date", verify_from.isoformat())
+                .gt("amount", 0)
+            )
+        pays = _ext_pay_select_paged(
+            sc, "app_payments",
+            "id, order_id, payment_date, amount, payment_method, card_company",
+            _filt, order_col="id",
+        )
+    except Exception:
+        return []
+    try:
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename)
+        matches = _ext_pay_select_paged(
+            sc, "app_external_pay_matches", "payment_id", _filt_m, order_col="id",
+        )
+        matched_ids = {int(m["payment_id"]) for m in matches if m.get("payment_id") is not None}
+    except Exception:
+        matched_ids = set()
+    confirmed = _ext_pay_list_manual_confirms(db_filename)
+    # 주문·고객 로드
+    order_ids = sorted({
+        int(p["order_id"]) for p in pays if p.get("order_id") is not None
+    })
+    orders_map: dict[int, dict] = {}
+    if order_ids:
+        for chunk in (order_ids[i : i + 200] for i in range(0, len(order_ids), 200)):
+            try:
+                r = (
+                    sc.table("app_orders")
+                    .select("id, customer_id")
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                    .in_("id", chunk)
+                    .execute()
+                )
+                for row in r.data or []:
+                    orders_map[int(row["id"])] = row
+            except Exception:
+                continue
+    cust_ids = sorted({
+        int(o.get("customer_id")) for o in orders_map.values()
+        if o.get("customer_id") is not None
+    })
+    cust_map: dict[int, dict] = {}
+    for i in range(0, len(cust_ids), 100):
+        cust_map.update(_get_customers_by_ids_supabase(db_filename, cust_ids[i : i + 100]))
+    emp_map = _fetch_order_employee_names_map_by_ids(db_filename, list(orders_map.keys()))
+
+    out: list[dict] = []
+    for p in pays:
+        try:
+            pid = int(p["id"])
+        except (TypeError, ValueError):
+            continue
+        if pid in matched_ids:
+            continue
+        try:
+            oid = int(p["order_id"]) if p.get("order_id") is not None else None
+        except (TypeError, ValueError):
+            oid = None
+        o = orders_map.get(oid) if oid is not None else None
+        cid = int(o["customer_id"]) if o and o.get("customer_id") is not None else None
+        cust = cust_map.get(cid) or {}
+        conf = confirmed.get(pid) or {}
+        out.append({
+            "payment_id": pid,
+            "order_id": oid,
+            "customer_id": cid,
+            "payment_date": str(p.get("payment_date") or "")[:10],
+            "amount": int(p.get("amount") or 0),
+            "payment_method": str(p.get("payment_method") or ""),
+            "card_company": p.get("card_company") or "",
+            "customer_name": cust.get("name") or "",
+            "customer_phone": cust.get("phone1") or "",
+            "employee_names": (emp_map.get(oid) or "").strip() if oid is not None else "",
+            "confirmed": bool(conf),
+            "confirm_source": conf.get("source"),
+            "confirm_note": conf.get("note"),
+            "confirmed_by": conf.get("confirmed_by"),
+            "confirmed_at": conf.get("confirmed_at"),
+        })
+    return out
+
+
 def _ext_pay_new_customer_order_ids(sc, db_filename: str, order_rows: list[dict]) -> set[int]:
     """entry_source=new_customer_sale 이거나 해당 고객의 첫 주문이면 신규고객 매출."""
     out: set[int] = set()
@@ -3872,7 +4921,9 @@ def _ext_pay_new_customer_order_ids(sc, db_filename: str, order_rows: list[dict]
 def _ext_pay_unmatched_erp_pays(
     sc, db_filename: str, source: str, erp_from: date, used_payment_ids: set[int],
 ) -> list[dict]:
-    """공식 파일에 매칭되지 않은 신규고객 ERP 결제 (erp_only)."""
+    """공식 파일에 매칭되지 않은 ERP 결제 (erp_only).
+    - onnuri/ulsanpay: 신규고객 매출로 한정 (기존 정책 유지)
+    - card/mainpay: 전체 고객 (신규 필터 없음)"""
     try:
         def _filt(q):
             q = q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).gt("amount", 0)
@@ -3891,6 +4942,10 @@ def _ext_pay_unmatched_erp_pays(
         meth = str(p.get("payment_method") or "")
         if source == "ulsanpay":
             return "지역화폐" in meth
+        if source == "card":
+            return meth in ("신용카드", "체크카드")
+        if source == "mainpay":
+            return meth == "메인페이"
         return ("온누리" in meth) and ("지류" not in meth)
 
     leftover = []
@@ -3930,7 +4985,11 @@ def _ext_pay_unmatched_erp_pays(
                 orders_map[int(row["id"])] = row
         except Exception:
             continue
-    new_oids = _ext_pay_new_customer_order_ids(sc, db_filename, list(orders_map.values()))
+    # 카드/메인페이는 전체 고객 대상 (신규 필터 우회)
+    if source in ("card", "mainpay"):
+        new_oids = {int(o.get("id")) for o in orders_map.values() if o.get("id") is not None}
+    else:
+        new_oids = _ext_pay_new_customer_order_ids(sc, db_filename, list(orders_map.values()))
 
     out: list[dict] = []
     for p in leftover:
@@ -3949,8 +5008,17 @@ def _ext_pay_unmatched_erp_pays(
             amt = int(p.get("amount") or 0)
         except (TypeError, ValueError):
             amt = 0
+        card_company = None
         if source == "ulsanpay":
             approval = _ext_pay_norm_approval6(p.get("card_company"))
+            phone4 = ""
+        elif source == "card":
+            # 카드: 승인번호는 별도 저장 안 됨(card_company 컬럼에 카드사명이 저장됨)
+            approval = ""
+            phone4 = ""
+            card_company = _card_company_norm(p.get("card_company"))
+        elif source == "mainpay":
+            approval = ""
             phone4 = ""
         else:
             approval = ""
@@ -3963,6 +5031,8 @@ def _ext_pay_unmatched_erp_pays(
             "amount": amt,
             "approval_code": approval,
             "phone_last4": phone4,
+            "card_company": card_company,
+            "payment_method": str(p.get("payment_method") or ""),
         })
     return out
 
@@ -3987,11 +5057,23 @@ def _ext_pay_list_matches_df(
             if verify_from is not None:
                 q = q.gte("tx_date", verify_from.isoformat())
             return q
-        rows = _ext_pay_select_paged(
-            sc, "app_external_pay_rows",
-            "id, tx_date, tx_time, phone_last4, amount, tx_status, settle_status, buyer_name_masked, approval_code",
-            _filt_rows, order_col="id",
+        _sel = (
+            "id, tx_date, tx_time, phone_last4, amount, tx_status, settle_status, "
+            "buyer_name_masked, approval_code"
         )
+        if source == "card":
+            _sel += ", card_company, card_kind"
+        try:
+            rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows", _sel, _filt_rows, order_col="id",
+            )
+        except Exception:
+            # card_company/card_kind 컬럼 미배포 환경 폴백
+            rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows",
+                "id, tx_date, tx_time, phone_last4, amount, tx_status, settle_status, buyer_name_masked, approval_code",
+                _filt_rows, order_col="id",
+            )
         rows.sort(key=lambda r: (str(r.get("tx_date") or ""), str(r.get("tx_time") or ""), int(r.get("id") or 0)))
     except Exception:
         rows = []
@@ -4150,11 +5232,16 @@ def _ext_pay_list_matches_df(
             erp_amt_disp = ""
             erp_date_disp = ""
         erp_ap = pay_ap_by_id.get(pid_int, "") if pid_int is not None else ""
-        data.append({
+        # 카드/메인페이는 승인번호 정규화(6자리 zero-pad)를 하지 않고 원문 유지
+        _appr_disp = ap or (r.get("approval_code") or "")
+        if source in ("card", "mainpay"):
+            _appr_disp = str(r.get("approval_code") or "")
+        row_dict = {
+            "row_id": int(r.get("id") or 0),
             "공식일자": str(r.get("tx_date") or "")[:10],
             "ERP일자": erp_date_disp,
             "뒤4": r.get("phone_last4") or "",
-            "승인번호": ap or (r.get("approval_code") or ""),
+            "승인번호": _appr_disp,
             "공식금액": f"{official_amt:,}",
             "ERP금액": erp_amt_disp,
             "공식상태": r.get("tx_status") or "",
@@ -4165,8 +5252,12 @@ def _ext_pay_list_matches_df(
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
             "메모": m.get("note") or "",
-            "_fabricated": (not ap) and bool(erp_ap),
-        })
+            "_fabricated": source == "ulsanpay" and (not ap) and bool(erp_ap),
+        }
+        if source == "card":
+            row_dict["카드사"] = r.get("card_company") or ""
+            row_dict["카드종류"] = r.get("card_kind") or ""
+        data.append(row_dict)
     official_aps: set[str] = set()
     for r in rows:
         official_aps.update(_ext_pay_approval_alts(r.get("approval_code")))
@@ -4185,7 +5276,8 @@ def _ext_pay_list_matches_df(
         erp_alts = set(_ext_pay_approval_alts(erp_ap))
         if source == "ulsanpay" and erp_alts and (erp_alts & official_aps):
             continue
-        data.append({
+        row_dict = {
+            "row_id": 0,  # ERP-only 는 row_id 없음
             "공식일자": "",
             "ERP일자": p.get("payment_date") or "",
             "뒤4": p.get("phone_last4") or "",
@@ -4199,9 +5291,13 @@ def _ext_pay_list_matches_df(
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
-            "메모": "공식 파일에 없음 · 가공 번호 의심",
-            "_fabricated": bool(erp_ap),
-        })
+            "메모": "공식 파일에 없음",
+            "_fabricated": source == "ulsanpay" and bool(erp_ap),
+        }
+        if source == "card":
+            row_dict["카드사"] = _card_company_norm(p.get("card_company")) or ""
+            row_dict["카드종류"] = ""
+        data.append(row_dict)
     return pd.DataFrame(data)
 
 
@@ -29404,11 +30500,12 @@ def _render_kpi_weights_admin_section(role: str, me_uname: str) -> None:
 
 
 def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
-    """관리자 설정 8번: 온누리 / 울산페이 외부파일 대사.
+    """관리자 설정 8번: 온누리 / 울산페이 / 카드매출 외부파일 대사.
     - 검증 시작일 저장 (기본 2026-08-01)
     - 매장 선택 → 출처 선택 → 파일 업로드 → 파싱·중복 skip·자동 매칭
     - 온누리: 날짜·전화 뒤4·금액 / 울산페이: 승인번호 6자리·결제금액
-    - 결과 표 (미결·취소 의심 필터)"""
+    - 카드: 매입일자(±2일)·카드사·매입금액 / 메인페이: 매입일자·승인번호·금액
+    - 결과 표 (미결·취소 의심 필터) · 수동 매칭 · ERP-only 수기 확인"""
     is_super = role == "superadmin"
     current_db = st.session_state.get("current_db")
 
@@ -29441,7 +30538,10 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         key="extpay_scope_db",
     )
 
-    _src_label = {"onnuri": "온누리", "ulsanpay": "울산페이"}
+    _src_label = {
+        "onnuri": "온누리", "ulsanpay": "울산페이",
+        "card": "신용/체크카드", "mainpay": "메인페이",
+    }
     batches = _ext_pay_list_batches(sel_db, limit=20)
     if batches:
         st.markdown("##### 업로드 이력 (모든 관리자 공통)")
@@ -29482,7 +30582,47 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
 
     st.markdown("---")
 
-    src_labels = {"onnuri": "온누리 (디지털)", "ulsanpay": "울산페이"}
+    src_labels = {
+        "onnuri":   "온누리 (디지털)",
+        "ulsanpay": "울산페이",
+        "card":     "신용/체크카드",
+        "mainpay":  "메인페이",
+    }
+    _parse_fn_by = {
+        "onnuri":   _ext_pay_parse_onnuri_file,
+        "ulsanpay": _ext_pay_parse_ulsanpay_file,
+        "card":     _ext_pay_parse_card_file,
+        "mainpay":  _ext_pay_parse_mainpay_file,
+    }
+    _match_fn_by = {
+        "onnuri":   _ext_pay_match_onnuri,
+        "ulsanpay": _ext_pay_match_ulsanpay,
+        "card":     _ext_pay_match_card,
+        "mainpay":  _ext_pay_match_mainpay,
+    }
+    _uploader_hint = {
+        "onnuri":   ("온누리 매출내역 파일 (.xlsx / .csv)",
+                     "가맹점 포털에서 다운로드한 파일을 그대로 올리면 됩니다. 같은 파일을 다시 올려도 지문(fingerprint) 기반 중복 방지됩니다."),
+        "ulsanpay": ("울산페이 거래내역서 (.xlsx / .csv)",
+                     "가맹점 포털에서 받은 거래내역서를 그대로 올리면 됩니다. 결제금액·승인번호 6자리로 매칭합니다."),
+        "card":     ("카드매출내역 (신용/체크카드) (.xlsx / .csv)",
+                     "PG/여신금융협회에서 받은 카드매출내역을 그대로 올리면 됩니다. 매입일자·카드사·매입금액으로 ERP 신용/체크카드 결제와 대조합니다."),
+        "mainpay":  ("메인페이 매출내역 (.xlsx / .csv)",
+                     "메인페이 정산자료를 그대로 올리면 됩니다. 매입일자·승인번호·결제금액으로 ERP 메인페이 결제와 대조합니다."),
+    }
+    _caption_by = {
+        "onnuri":   "식별자: **결제일 + 전화번호 뒤 4자리 + 금액** (겹치면 거래시간).",
+        "ulsanpay": "식별자: **승인번호 6자리** · 금액: **결제금액** (거래금액 아님). ERP 지역화폐 승인과 대조합니다.",
+        "card":     "식별자: **매입일자(±2일) + 카드사 + 매입금액**. 승인번호는 있으면 후보 좁힘 서브키.",
+        "mainpay":  "식별자: **금액 + 매입일자(±2일)**. 승인번호는 있으면 유일 후보 확정에 사용.",
+    }
+    _empty_hint_by = {
+        "onnuri":   "파싱된 행이 없습니다. 파일 컬럼(거래일자·결제금액 등)을 확인해 주세요.",
+        "ulsanpay": "파싱된 행이 없습니다. 컬럼(거래일시·승인번호·결제금액)을 확인해 주세요.",
+        "card":     "파싱된 행이 없습니다. 컬럼(매입일자·카드사·매입금액)을 확인해 주세요.",
+        "mainpay":  "파싱된 행이 없습니다. 컬럼(매입일자·승인번호·결제금액)을 확인해 주세요.",
+    }
+
     sel_src = st.radio(
         "출처",
         options=list(src_labels.keys()),
@@ -29491,30 +30631,18 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         key=f"extpay_src_{sel_db}",
     )
 
-    if sel_src == "ulsanpay":
-        st.caption("식별자: **승인번호 6자리** · 금액: **결제금액** (거래금액 아님). ERP 지역화폐 승인과 대조합니다.")
-        up = st.file_uploader(
-            "울산페이 거래내역서 (.xlsx / .csv)",
-            type=["xlsx", "csv"],
-            key=f"extpay_upload_ulsan_{sel_db}",
-            help="가맹점 포털에서 받은 거래내역서를 그대로 올리면 됩니다. 결제금액·승인번호 6자리로 매칭합니다.",
-        )
-        _parse_fn = _ext_pay_parse_ulsanpay_file
-        _match_fn = _ext_pay_match_ulsanpay
-        _src_key = "ulsanpay"
-        _empty_hint = "파싱된 행이 없습니다. 컬럼(거래일시·승인번호·결제금액)을 확인해 주세요."
-    else:
-        st.caption("식별자: **결제일 + 전화번호 뒤 4자리 + 금액** (겹치면 거래시간).")
-        up = st.file_uploader(
-            "온누리 매출내역 파일 (.xlsx / .csv)",
-            type=["xlsx", "csv"],
-            key=f"extpay_upload_{sel_db}",
-            help="가맹점 포털에서 다운로드한 파일을 그대로 올리면 됩니다. 같은 파일을 다시 올려도 지문(fingerprint) 기반 중복 방지됩니다.",
-        )
-        _parse_fn = _ext_pay_parse_onnuri_file
-        _match_fn = _ext_pay_match_onnuri
-        _src_key = "onnuri"
-        _empty_hint = "파싱된 행이 없습니다. 파일 컬럼(거래일자·결제금액 등)을 확인해 주세요."
+    st.caption(_caption_by.get(sel_src, ""))
+    _uploader_label, _uploader_help = _uploader_hint[sel_src]
+    up = st.file_uploader(
+        _uploader_label,
+        type=["xlsx", "csv"],
+        key=f"extpay_upload_{sel_db}_{sel_src}",
+        help=_uploader_help,
+    )
+    _parse_fn = _parse_fn_by[sel_src]
+    _match_fn = _match_fn_by[sel_src]
+    _src_key = sel_src
+    _empty_hint = _empty_hint_by[sel_src]
 
     if up is not None:
         if st.button("업로드 & 자동 매칭", type="primary", key=f"extpay_run_{sel_db}_{_src_key}"):
@@ -29585,6 +30713,10 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         df = df.drop(columns=["뒤4", "구매자", "정산"], errors="ignore")
     elif sel_src == "onnuri" and "승인번호" in df.columns:
         df = df.drop(columns=["승인번호"], errors="ignore")
+    elif sel_src == "card":
+        df = df.drop(columns=["뒤4", "구매자", "정산"], errors="ignore")
+    elif sel_src == "mainpay":
+        df = df.drop(columns=["뒤4", "구매자", "정산"], errors="ignore")
     if only_alerts:
         _alert_codes = {
             "official_only", "official_canceled",
@@ -29594,9 +30726,11 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         df = df[df["결과"].isin(_alert_codes)]
         if df.empty:
             st.success("표시할 알림이 없습니다. (모두 정상 매칭)")
+            _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
             return
     _flag_col = "_fabricated"
-    _all_cols = [c for c in df.columns if c != _flag_col]
+    _hidden = {_flag_col, "row_id"}
+    _all_cols = [c for c in df.columns if c not in _hidden]
     _show = df[_all_cols]
     _red = (
         df[_flag_col].reindex(_show.index).fillna(False).astype(bool)
@@ -29656,7 +30790,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
                 if _cell.value is not None and str(_cell.value).strip() != "":
                     _cell.value = str(_cell.value)
                     _cell.number_format = "@"
-    _src_fn = "ulsanpay" if sel_src == "ulsanpay" else "onnuri"
+    _src_fn = sel_src
     st.download_button(
         "📥 엑셀 다운로드",
         data=_buf.getvalue(),
@@ -29668,11 +30802,367 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         "빨간 행: 공식 파일에 승인번호가 없고 ERP에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
         "동일 승인번호의 공식 취소와 ERP 취소는 날짜가 달라도 상계되어 matched_ok 로 표시됩니다. "
         "결제 금액·수단·승인번호를 바꾸면 해당 건은 자동 재매칭됩니다. "
-        "결과 코드: matched_ok=정상 · official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
+        "결과 코드: matched_ok=정상 · manual_matched=관리자 수동 매칭 · "
+        "official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
         "amount_mismatch=공식파일에 있으나 금액 다름(오입력 의심) · "
         "official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
         "erp_canceled_official_paid=ERP 취소인데 공식 결제완료 · ambiguous=시간까지 봐도 특정 불가 · 미매칭=아직 매칭 미실행"
     )
+
+    # 수동 매칭 (자동매칭 실패 행 → ERP 결제 지정)
+    _render_ext_pay_manual_match_ui(sel_db, sel_src, df, new_from, me_uname)
+
+    # ERP-only 수기 확인 (현금 수금 등 공식파일 자체가 없는 결제)
+    _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
+
+
+def _render_ext_pay_manual_match_ui(
+    sel_db: str, sel_src: str, df: "pd.DataFrame", new_from: date, me_uname: str,
+) -> None:
+    """official_only / ambiguous / amount_mismatch / 미매칭 인 공식 행에 대해 ERP 결제를 수동 지정.
+    - 공식 행을 선택 → 매장·기간·수단·금액 조건으로 후보 조회 → 라디오 선택 → 저장."""
+    if df is None or df.empty or "row_id" not in df.columns:
+        return
+    _unmatched_codes = {"official_only", "ambiguous", "amount_mismatch", "미매칭"}
+    _target = df[df["결과"].isin(_unmatched_codes) & (df["row_id"] > 0)]
+    if _target.empty:
+        return
+    with st.expander(f"🔧 공식 행 수동 매칭 ({len(_target)}건 대기)", expanded=False):
+        st.caption(
+            "자동매칭이 실패한 공식 파일 행을 특정 ERP 결제에 직접 붙일 수 있습니다. "
+            "결과에 `manual_matched` 로 저장되며, 재실행해도 유지됩니다."
+        )
+        _options: list[tuple[int, str]] = []
+        for _r in _target.to_dict("records"):
+            _label_parts = [
+                str(_r.get("공식일자") or ""),
+                _r.get("카드사") or _r.get("승인번호") or _r.get("뒤4") or "",
+                f"{_r.get('공식금액') or ''}원",
+                f"[{_r.get('결과') or ''}]",
+            ]
+            _label_parts = [p for p in _label_parts if str(p).strip()]
+            _options.append((int(_r["row_id"]), " · ".join(_label_parts)))
+        if not _options:
+            return
+        _sel_row = st.selectbox(
+            "매칭할 공식 파일 행",
+            options=[o[0] for o in _options],
+            format_func=lambda k: dict(_options).get(k, str(k)),
+            key=f"extpay_manual_row_{sel_db}_{sel_src}",
+        )
+        _row = _target[_target["row_id"] == _sel_row].iloc[0].to_dict()
+
+        # 후보 ERP 결제 조회: 매장·기간·수단·금액
+        try:
+            _off_amt = int(str(_row.get("공식금액") or "0").replace(",", "").strip() or 0)
+        except (TypeError, ValueError):
+            _off_amt = 0
+
+        c_a, c_b, c_c = st.columns(3)
+        with c_a:
+            _from_d = st.date_input(
+                "조회 시작",
+                value=new_from,
+                key=f"extpay_manual_from_{sel_db}_{sel_src}_{_sel_row}",
+            )
+        with c_b:
+            _to_d = st.date_input(
+                "조회 종료",
+                value=(new_from + timedelta(days=90)) if isinstance(new_from, date) else date.today(),
+                key=f"extpay_manual_to_{sel_db}_{sel_src}_{_sel_row}",
+            )
+        with c_c:
+            _amt_tol = st.number_input(
+                "금액 허용오차",
+                min_value=0, max_value=100000, value=0, step=100,
+                key=f"extpay_manual_tol_{sel_db}_{sel_src}_{_sel_row}",
+                help="0이면 정확히 일치. ± 값으로 소액 오차 허용.",
+            )
+
+        # ERP 후보 로드
+        sc, _err = get_supabase_client()
+        _cand_pays: list[dict] = []
+        if not _err and sc:
+            try:
+                _q = (
+                    sc.table("app_payments")
+                    .select("id, order_id, payment_date, amount, payment_method, card_company")
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, sel_db)
+                    .gte("payment_date", _from_d.isoformat())
+                    .lte("payment_date", _to_d.isoformat())
+                    .gt("amount", 0)
+                )
+                # 출처별 결제 수단 필터
+                if sel_src == "ulsanpay":
+                    _q = _q.ilike("payment_method", "%지역화폐%")
+                elif sel_src == "onnuri":
+                    _q = _q.ilike("payment_method", "%온누리%")
+                elif sel_src == "card":
+                    _q = _q.in_("payment_method", ["신용카드", "체크카드"])
+                elif sel_src == "mainpay":
+                    _q = _q.eq("payment_method", "메인페이")
+                _r = _q.limit(1000).execute()
+                _cand_pays = _r.data or []
+            except Exception as e:
+                st.error(f"결제 후보 조회 실패: {e}")
+                _cand_pays = []
+
+        # 이미 다른 공식 행에 매칭된 payment_id 는 제외
+        _used_pids: set[int] = set()
+        if not _err and sc:
+            try:
+                _mr = (
+                    sc.table("app_external_pay_matches")
+                    .select("payment_id, row_id")
+                    .eq("db_filename", sel_db)
+                    .eq("source", sel_src)
+                    .execute()
+                )
+                for _m in _mr.data or []:
+                    if _m.get("payment_id") is None:
+                        continue
+                    # 현재 선택 행의 매칭은 제외 (교체 가능)
+                    try:
+                        if int(_m.get("row_id") or 0) == int(_sel_row):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        _used_pids.add(int(_m["payment_id"]))
+                    except (TypeError, ValueError):
+                        pass
+            except Exception:
+                pass
+
+        # 금액 필터 (허용오차 반영)
+        def _within_amt(p):
+            try:
+                a = abs(int(p.get("amount") or 0))
+            except (TypeError, ValueError):
+                return False
+            if _off_amt <= 0:
+                return True
+            return abs(a - _off_amt) <= int(_amt_tol)
+
+        _filtered = [p for p in _cand_pays if _within_amt(p) and int(p.get("id") or 0) not in _used_pids]
+
+        if not _filtered:
+            st.info("조건에 맞는 미매칭 ERP 결제가 없습니다. 기간·금액·허용오차를 조정해 주세요.")
+            return
+
+        # 담당 매니저·고객명 배지
+        _oids = sorted({int(p["order_id"]) for p in _filtered if p.get("order_id") is not None})
+        _emp = _fetch_order_employee_names_map_by_ids(sel_db, _oids)
+        _cust_ids: list[int] = []
+        _order_to_cust: dict[int, int] = {}
+        if _oids:
+            for _ch in (_oids[i : i + 200] for i in range(0, len(_oids), 200)):
+                try:
+                    _r = (
+                        sc.table("app_orders")
+                        .select("id, customer_id")
+                        .eq(ORDERS_PAYMENTS_TENANT_COL, sel_db)
+                        .in_("id", _ch)
+                        .execute()
+                    )
+                    for _o in _r.data or []:
+                        if _o.get("customer_id") is not None:
+                            try:
+                                _order_to_cust[int(_o["id"])] = int(_o["customer_id"])
+                                _cust_ids.append(int(_o["customer_id"]))
+                            except (TypeError, ValueError):
+                                pass
+                except Exception:
+                    continue
+        _cust_map: dict[int, dict] = {}
+        _uniq_c = sorted(set(_cust_ids))
+        for i in range(0, len(_uniq_c), 100):
+            _cust_map.update(_get_customers_by_ids_supabase(sel_db, _uniq_c[i : i + 100]))
+
+        def _cand_label(p: dict) -> str:
+            try:
+                _pid = int(p["id"])
+            except (TypeError, ValueError):
+                _pid = 0
+            _oid = int(p["order_id"]) if p.get("order_id") is not None else None
+            _cid = _order_to_cust.get(_oid) if _oid else None
+            _cust = _cust_map.get(_cid) or {}
+            _emp_nm = (_emp.get(_oid) or "").strip() if _oid else ""
+            return " · ".join([
+                str(p.get("payment_date") or ""),
+                f"{int(p.get('amount') or 0):,}원",
+                str(p.get("payment_method") or ""),
+                str(p.get("card_company") or "").strip(),
+                _cust.get("name") or "",
+                f"({_emp_nm})" if _emp_nm else "",
+                f"#pid{_pid}",
+            ]).strip(" ·")
+
+        _pid_options = [(int(p["id"]), _cand_label(p)) for p in _filtered]
+        _sel_pid = st.radio(
+            "매칭할 ERP 결제 선택",
+            options=[o[0] for o in _pid_options],
+            format_func=lambda k: dict(_pid_options).get(k, f"#pid{k}"),
+            key=f"extpay_manual_pid_{sel_db}_{sel_src}_{_sel_row}",
+        )
+        _memo = st.text_input(
+            "메모 (선택)",
+            key=f"extpay_manual_memo_{sel_db}_{sel_src}_{_sel_row}",
+            placeholder="예: 실물 영수증 확인 후 수동 매칭",
+        )
+        b1, b2 = st.columns([1, 1])
+        with b1:
+            if st.button("이 결제로 수동 매칭", type="primary",
+                         key=f"extpay_manual_apply_{sel_db}_{sel_src}_{_sel_row}"):
+                ok, err = _ext_pay_manual_link(
+                    sel_db, sel_src, int(_sel_row), int(_sel_pid),
+                    me_uname, _memo or None,
+                )
+                if ok:
+                    flash("수동 매칭을 저장했습니다.")
+                    st.rerun()
+                else:
+                    st.error(err or "매칭 실패")
+        with b2:
+            if st.button("이 공식 행 매칭 해제",
+                         key=f"extpay_manual_unlink_{sel_db}_{sel_src}_{_sel_row}"):
+                ok, err = _ext_pay_unlink_row(sel_db, sel_src, int(_sel_row))
+                if ok:
+                    flash("매칭을 해제했습니다.")
+                    st.rerun()
+                else:
+                    st.error(err or "해제 실패")
+
+
+def _render_ext_pay_manual_and_erp_only(
+    sel_db: str, sel_src: str, new_from: date, me_uname: str,
+) -> None:
+    """검증 시작일 이후 어떤 공식 행과도 매칭되지 않은 ERP 결제 리스트.
+    현금(수금)·계좌이체·아직 파일 미업로드된 결제 등을 한 화면에서 수기 확인 처리."""
+    with st.expander("💵 ERP-only (공식 파일 대응이 없는 결제) — 수기 확인", expanded=False):
+        st.caption(
+            "매장의 검증 시작일 이후 결제 중 어떤 공식 파일과도 매칭되지 않은 항목입니다. "
+            "현금 수금·계좌이체 등 파일 자체가 없는 결제는 아래에서 '수기 확인' 을 스탬프하면 정상 처리됩니다."
+        )
+        _rows = _ext_pay_list_unmatched_erp_all_methods(sel_db, new_from)
+        if not _rows:
+            st.success("모든 ERP 결제가 매칭 또는 수기 확인되었습니다.")
+            return
+        _method_labels = sorted({r.get("payment_method") or "-" for r in _rows})
+        c_m, c_c, c_n = st.columns([2, 1, 1])
+        with c_m:
+            _sel_methods = st.multiselect(
+                "결제 수단",
+                options=_method_labels,
+                default=_method_labels,
+                key=f"extpay_erpon_meth_{sel_db}_{sel_src}",
+            )
+        with c_c:
+            _only_unconf = st.checkbox(
+                "미확인만 보기",
+                value=True,
+                key=f"extpay_erpon_unconf_{sel_db}_{sel_src}",
+            )
+        with c_n:
+            _limit = st.number_input(
+                "표시 개수",
+                min_value=10, max_value=500, value=100, step=10,
+                key=f"extpay_erpon_limit_{sel_db}_{sel_src}",
+            )
+
+        _visible = [
+            r for r in _rows
+            if (r.get("payment_method") or "-") in set(_sel_methods)
+            and (not _only_unconf or not r.get("confirmed"))
+        ][: int(_limit)]
+
+        if not _visible:
+            st.info("조건에 맞는 항목이 없습니다.")
+            return
+
+        _df = pd.DataFrame([{
+            "결제일자": r.get("payment_date") or "",
+            "금액": f"{int(r.get('amount') or 0):,}",
+            "수단": r.get("payment_method") or "",
+            "카드사": r.get("card_company") or "",
+            "고객명": r.get("customer_name") or "",
+            "고객전화": r.get("customer_phone") or "",
+            "담당매니저": r.get("employee_names") or "",
+            "수기확인": "확인됨" if r.get("confirmed") else "",
+            "확인자": r.get("confirmed_by") or "",
+            "확인메모": r.get("confirm_note") or "",
+            "payment_id": r.get("payment_id"),
+        } for r in _visible])
+        st.dataframe(
+            _df.drop(columns=["payment_id"]),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.markdown("###### 개별 수기 확인 처리")
+        _pid_options = [(int(r["payment_id"]), (
+            f"{r.get('payment_date') or ''} · {int(r.get('amount') or 0):,}원 · "
+            f"{r.get('payment_method') or ''} · {r.get('customer_name') or ''} · #pid{r.get('payment_id')}"
+        )) for r in _visible]
+        _sel_pid = st.selectbox(
+            "결제 선택",
+            options=[o[0] for o in _pid_options],
+            format_func=lambda k: dict(_pid_options).get(k, f"#pid{k}"),
+            key=f"extpay_erpon_pid_{sel_db}_{sel_src}",
+        )
+        _sel_row = next((r for r in _visible if int(r["payment_id"]) == int(_sel_pid)), None)
+        _default_src = "cash"
+        if _sel_row is not None:
+            _pm = _sel_row.get("payment_method") or ""
+            if "현금" in _pm:
+                _default_src = "cash"
+            elif "이체" in _pm:
+                _default_src = "transfer"
+            elif _pm in ("신용카드", "체크카드"):
+                _default_src = "card"
+            elif _pm == "메인페이":
+                _default_src = "mainpay"
+            elif "온누리" in _pm and "지류" not in _pm:
+                _default_src = "onnuri"
+            elif "지역화폐" in _pm:
+                _default_src = "ulsanpay"
+
+        c_s, c_note = st.columns([1, 2])
+        with c_s:
+            _conf_src_options = ["cash", "transfer", "card", "mainpay", "onnuri", "ulsanpay"]
+            _conf_src = st.selectbox(
+                "확인 유형",
+                options=_conf_src_options,
+                index=_conf_src_options.index(_default_src) if _default_src in _conf_src_options else 0,
+                key=f"extpay_erpon_src_{sel_db}_{sel_src}",
+            )
+        with c_note:
+            _memo = st.text_input(
+                "메모",
+                key=f"extpay_erpon_memo_{sel_db}_{sel_src}",
+                placeholder="예: 실물 현금 수령 확인",
+            )
+        b1, b2 = st.columns([1, 1])
+        with b1:
+            if st.button("수기 확인 처리", type="primary",
+                         key=f"extpay_erpon_apply_{sel_db}_{sel_src}"):
+                ok, err = _ext_pay_manual_confirm(
+                    sel_db, _conf_src, int(_sel_pid), _memo or None, me_uname,
+                )
+                if ok:
+                    flash("수기 확인을 저장했습니다.")
+                    st.rerun()
+                else:
+                    st.error(err or "저장 실패")
+        with b2:
+            if st.button("이 결제 수기 확인 취소",
+                         key=f"extpay_erpon_undo_{sel_db}_{sel_src}"):
+                ok, err = _ext_pay_manual_unconfirm(sel_db, int(_sel_pid))
+                if ok:
+                    flash("수기 확인을 취소했습니다.")
+                    st.rerun()
+                else:
+                    st.error(err or "취소 실패")
 
 
 def render_admin_settings():
@@ -29865,13 +31355,14 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 8. 온누리 / 울산페이 외부파일 대사 ─────────────────────────
-    st.subheader("8. 🧾 온누리 / 울산페이 외부파일 대사")
+    # ── 8. 온누리 / 울산페이 / 카드매출 외부파일 대사 ─────────────
+    st.subheader("8. 🧾 온누리 / 울산페이 / 카드매출 외부파일 대사")
     st.caption(
-        "가맹점 포털에서 받은 **공식 결제내역**을 업로드하면 신규고객 매출 결제와 대조해 "
+        "가맹점 포털·PG 에서 받은 **공식 결제내역**을 업로드하면 ERP 결제와 대조해 "
         "미입력·허위입력·결제 후 임의취소를 찾습니다. "
-        "온누리: **날짜 · 전화 뒤 4자리 · 금액**(겹치면 거래시간) / 울산페이: **승인번호 6자리 · 결제금액**. "
-        "같은 파일을 다시 올려도 **지문(fingerprint) 기반 중복 방지**됩니다."
+        "온누리: **날짜 · 전화 뒤 4자리 · 금액** / 울산페이: **승인번호 6자리 · 결제금액** / "
+        "카드: **매입일자 · 카드사 · 매입금액** / 메인페이: **매입일자 · 승인번호 · 결제금액**. "
+        "같은 파일을 다시 올려도 **지문(fingerprint) 기반 중복 방지** 되며, 파일이 없는 현금 수금 등은 **수기 확인** 으로 처리할 수 있습니다."
     )
     with st.expander("외부파일 업로드 / 매칭 결과", expanded=False):
         _render_external_pay_admin_section(role, me_uname)
