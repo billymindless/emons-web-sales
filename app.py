@@ -8683,78 +8683,143 @@ def _hq_apply_merge(
     return True
 
 
-def _hq_search_orders_by_phone_fallback(client, digits: str, limit: int = 30) -> list[dict]:
-    """`hq_order_reconcile_service.search_orders_by_phone` 미배포 시 인라인 fallback.
+def _hq_search_orders_for_merge(
+    client, db_filename: str, query: str, limit: int = 30
+) -> list[dict]:
+    """병합용 앱 주문 검색.
 
-    전화 표기 변형(010-xxxx-xxxx / 10자리 등)을 자체 생성해 `app_orders` 를 최신순 조회.
+    1. 검색어(이름/전화 부분)를 `app_customers` 에 `ilike` 로 부분 매칭 → customer_id 리스트
+    2. `app_orders` 에서 `customer_id in (...)` 로 조회 (db_filename 필터)
+    3. 매칭이 없으면 fallback 으로 `app_orders.phone` in_ / customer_name ilike 재시도
+
+    `app_orders.phone` 은 하이픈 포함/미포함 등 표기가 섞여 있어 in_ 만으로는 부분 검색이 안 된다.
+    앱 UI 다른 곳의 고객 검색과 동일한 `app_customers.phone1/phone2/name ilike` 경로를 사용한다.
     """
-    if not client or not digits:
+    if not client:
         return []
-    _d = "".join(ch for ch in str(digits) if ch.isdigit())
-    if not _d:
+    q_clean = re.sub(r"[*,%]", "", (query or "").strip())
+    if not q_clean:
         return []
-    last10 = _d[-10:] if len(_d) >= 10 else _d
-    variants = {_d, last10}
-    if len(last10) == 10 and last10.startswith("10"):
-        full11 = "0" + last10
-        mid, tail = last10[2:6], last10[6:]
-        variants.update({
-            full11,
-            f"010-{mid}-{tail}",
-            f"010 {mid} {tail}",
-            f"{full11[:3]}-{mid}-{tail}",
-        })
+
+    _customer_ids: list[int] = []
     try:
-        r = (
-            client.table("app_orders")
-            .select(
-                "id, order_date, delivery_date, customer_name, phone, "
-                "employee_names, total_amount, cost_price, display_cost_amount"
-            )
-            .in_("phone", list(variants))
-            .order("order_date", desc=True)
-            .limit(int(limit))
-            .execute()
+        or_filter = (
+            f"name.ilike.*{q_clean}*,"
+            f"phone1.ilike.*{q_clean}*,"
+            f"phone2.ilike.*{q_clean}*"
         )
-        return list(r.data or [])
+        qb = client.table("app_customers").select("id").or_(or_filter)
+        try:
+            _store_name = _get_current_store_name_for_customers(db_filename)
+        except Exception:
+            _store_name = ""
+        if _store_name:
+            qb = qb.eq("store_name", _store_name)
+        r = qb.order("id", desc=True).limit(200).execute()
+        for row in (r.data or []):
+            try:
+                _customer_ids.append(int(row.get("id")))
+            except (TypeError, ValueError):
+                continue
     except Exception:
-        return []
+        _customer_ids = []
+
+    out: list[dict] = []
+    if _customer_ids:
+        try:
+            r = (
+                client.table("app_orders")
+                .select(
+                    "id, order_date, delivery_date, customer_name, phone, "
+                    "employee_names, total_amount, cost_price, display_cost_amount"
+                )
+                .eq("db_filename", db_filename)
+                .in_("customer_id", _customer_ids)
+                .order("order_date", desc=True)
+                .limit(int(limit))
+                .execute()
+            )
+            out = list(r.data or [])
+        except Exception:
+            out = []
+
+    # 백업: customer_id 매칭이 실패하면 app_orders.customer_name/phone 으로 직접 시도.
+    if not out:
+        try:
+            _digits = "".join(ch for ch in q_clean if ch.isdigit())
+            if _digits and len(_digits) >= 4:
+                # 하이픈 포함/미포함 변형 (last-10 은 정확 매칭용)
+                variants = {_digits}
+                last10 = _digits[-10:] if len(_digits) >= 10 else _digits
+                variants.add(last10)
+                if len(last10) == 10 and last10.startswith("10"):
+                    variants.update({
+                        "0" + last10,
+                        f"010-{last10[2:6]}-{last10[6:]}",
+                    })
+                r = (
+                    client.table("app_orders")
+                    .select(
+                        "id, order_date, delivery_date, customer_name, phone, "
+                        "employee_names, total_amount, cost_price, display_cost_amount"
+                    )
+                    .eq("db_filename", db_filename)
+                    .in_("phone", list(variants))
+                    .order("order_date", desc=True)
+                    .limit(int(limit))
+                    .execute()
+                )
+                out = list(r.data or [])
+            elif not any(ch.isdigit() for ch in q_clean):
+                r = (
+                    client.table("app_orders")
+                    .select(
+                        "id, order_date, delivery_date, customer_name, phone, "
+                        "employee_names, total_amount, cost_price, display_cost_amount"
+                    )
+                    .eq("db_filename", db_filename)
+                    .ilike("customer_name", f"%{q_clean}%")
+                    .order("order_date", desc=True)
+                    .limit(int(limit))
+                    .execute()
+                )
+                out = list(r.data or [])
+        except Exception:
+            pass
+    return out
 
 
 def _render_hq_merge_into_order(hq, db_filename: str, report, row_index: int, cache_key: str) -> None:
-    """hq_only 행을 기존 앱 주문에 원가 합산으로 붙이는 UI. 전화 검색 + 후보 selectbox + 합산 버튼."""
+    """hq_only 행을 기존 앱 주문에 원가 합산으로 붙이는 UI. 이름/전화 검색 + 후보 selectbox + 합산 버튼."""
     row = report.rows[row_index]
-    _default_phone = row.phone1_digits or ""
+    _default_query = row.customer_name or row.phone1_digits or ""
     st.markdown("**다른 앱 주문에 원가 합산** (분할 출고 등)")
-    _q_key = f"hq_merge_phone::{cache_key}::{row_index}"
+    _q_key = f"hq_merge_q::{cache_key}::{row_index}"
     if _q_key not in st.session_state:
-        st.session_state[_q_key] = _default_phone
+        st.session_state[_q_key] = _default_query
     _q = st.text_input(
-        "전화번호로 검색 (숫자만 또는 010-xxxx-xxxx)",
+        "고객 검색 (이름 또는 전화번호)",
         value=st.session_state[_q_key],
         key=_q_key,
+        placeholder="예: 홍길동, 010-1234, 3255",
     )
-    _digits = "".join(ch for ch in (_q or "") if ch.isdigit())
-    if not _digits:
-        st.caption("전화번호를 입력하면 같은 고객의 앱 주문을 조회합니다.")
+    _q_clean = (_q or "").strip()
+    if not _q_clean:
+        st.caption("고객 이름 또는 전화번호를 입력하면 같은 고객의 앱 주문을 조회합니다.")
         return
 
     client, _err = get_supabase_client()
     if not client:
         st.error(f"Supabase 연결 실패: {_err}")
         return
-    _cands_key = f"hq_merge_cands::{cache_key}::{row_index}::{_digits}"
+    _cands_key = f"hq_merge_cands::{cache_key}::{row_index}::{_q_clean}"
     _cands = st.session_state.get(_cands_key)
     if _cands is None:
         with st.spinner("앱 주문 검색 중…"):
-            _search_fn = getattr(hq, "search_orders_by_phone", None)
-            if callable(_search_fn):
-                _cands = _search_fn(client, db_filename, _digits, limit=30)
-            else:
-                _cands = _hq_search_orders_by_phone_fallback(client, _digits, limit=30)
+            _cands = _hq_search_orders_for_merge(client, db_filename, _q_clean, limit=30)
         st.session_state[_cands_key] = _cands
     if not _cands:
-        st.info(f"전화 {_digits} 로 검색된 앱 주문이 없습니다.")
+        st.info(f"'{_q_clean}' 로 검색된 앱 주문이 없습니다.")
         return
 
     _opt_ids: list[int] = []
