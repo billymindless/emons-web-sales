@@ -8685,144 +8685,120 @@ def _hq_apply_merge(
 
 def _hq_search_orders_for_merge(
     client, db_filename: str, query: str, limit: int = 30, extra_tokens: list[str] | None = None,
-) -> list[dict]:
-    """병합용 앱 주문 검색. 이름/전화 부분일치.
+) -> tuple[list[dict], str]:
+    """병합용 앱 주문 검색. 고객및잔금 관리와 동일한 경로.
 
-    기존 버그: `3255` 같은 끝자리만 들어오면 `app_orders.phone` 정확일치(`in_`)만
-    시도해서 `010-5183-3255` 를 찾지 못했다. 고객및잔금 관리와 같이 `ilike *토큰*` 을 쓴다.
+    `app_orders` 에는 customer_name/phone 컬럼이 없다. 그 컬럼을 select 하면
+    PGRST204 로 전체가 실패하고, 예외를 삼키면 '검색 결과 없음'만 보인다.
+    고객은 app_customers(name/phone1/phone2) 에서 찾고, 주문은 customer_id 로 조회한다.
     """
     if not client:
-        return []
-    raw_tokens: list[str] = []
-    for t in [query, *(extra_tokens or [])]:
-        s = re.sub(r"[*,%]", "", str(t or "").strip())
-        if s:
-            raw_tokens.append(s)
-    tokens: list[str] = []
-    _seen_t: set[str] = set()
-    for t in raw_tokens:
-        for piece in (t, "".join(ch for ch in t if ch.isdigit())):
-            if not piece or piece in _seen_t:
-                continue
-            _seen_t.add(piece)
-            tokens.append(piece)
-            digits = "".join(ch for ch in piece if ch.isdigit())
-            if len(digits) >= 4:
-                last4 = digits[-4:]
-                if last4 not in _seen_t:
-                    _seen_t.add(last4)
-                    tokens.append(last4)
-            if len(digits) >= 10:
-                last10 = digits[-10:]
-                for extra in (
-                    last10,
-                    ("0" + last10) if last10.startswith("10") else "",
-                    (f"010-{last10[2:6]}-{last10[6:]}") if last10.startswith("10") else "",
-                ):
-                    if extra and extra not in _seen_t:
-                        _seen_t.add(extra)
-                        tokens.append(extra)
-    tokens = [t for t in tokens if t][:12]
-    if not tokens:
-        return []
+        return [], "Supabase 클라이언트가 없습니다."
 
+    queries: list[str] = []
+    _seen_q: set[str] = set()
+    for raw in [query, *(extra_tokens or [])]:
+        s = re.sub(r"[*,%]", "", str(raw or "").strip())
+        if not s or s in _seen_q:
+            continue
+        _seen_q.add(s)
+        queries.append(s)
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if len(digits) >= 4 and digits[-4:] not in _seen_q:
+            _seen_q.add(digits[-4:])
+            queries.append(digits[-4:])
+    if not queries:
+        return [], ""
+
+    try:
+        store_name = _get_current_store_name_for_customers(db_filename) or ""
+    except Exception:
+        store_name = ""
+    if store_name.endswith(".db") or store_name == "알 수 없음":
+        store_name = ""
+
+    customers: list[dict] = []
+    seen_cid: set[int] = set()
+    last_err = ""
+    for q_safe in queries:
+        or_filter = (
+            f"name.ilike.*{q_safe}*,"
+            f"phone1.ilike.*{q_safe}*,"
+            f"phone2.ilike.*{q_safe}*"
+        )
+        for use_store in (True, False):
+            try:
+                qb = (
+                    client.table("app_customers")
+                    .select("id, name, phone1, phone2")
+                    .or_(or_filter)
+                )
+                if use_store and store_name:
+                    qb = qb.eq("store_name", store_name)
+                r = qb.order("id", desc=True).limit(50).execute()
+                for row in (r.data or []):
+                    try:
+                        cid = int(row.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    if cid in seen_cid:
+                        continue
+                    seen_cid.add(cid)
+                    customers.append(row)
+                if customers:
+                    break
+            except Exception as e:
+                last_err = str(e)
+                continue
+        if customers:
+            break
+
+    if not customers:
+        return [], last_err
+
+    cust_by_id = {int(c["id"]): c for c in customers if c.get("id") is not None}
+    cids = list(cust_by_id.keys())
     _ORDER_COLS = (
-        "id, order_date, delivery_date, customer_name, phone, "
+        "id, customer_id, order_date, delivery_date, "
         "employee_names, total_amount, cost_price, display_cost_amount"
     )
-    out: list[dict] = []
-    seen_ids: set[int] = set()
-
-    def _absorb(rows) -> None:
-        for o in rows or []:
-            try:
-                oid = int(o.get("id"))
-            except (TypeError, ValueError):
-                continue
-            if oid in seen_ids:
-                continue
-            seen_ids.add(oid)
-            out.append(o)
-
-    def _safe_store_name() -> str:
-        try:
-            name = _get_current_store_name_for_customers(db_filename) or ""
-        except Exception:
-            name = ""
-        if not name or name.endswith(".db") or name == "알 수 없음":
-            return ""
-        return name
-
-    # 1) app_customers: name/phone1/phone2 ilike. 매장 필터는 보조. 비면 매장 없이 재시도.
-    customer_ids: list[int] = []
-    cust_or = ",".join(
-        f"{col}.ilike.*{t}*"
-        for t in tokens
-        for col in ("name", "phone1", "phone2")
-    )
-    store_name = _safe_store_name()
-    for use_store in (True, False):
-        try:
-            qb = client.table("app_customers").select("id").or_(cust_or)
-            if use_store and store_name:
-                qb = qb.eq("store_name", store_name)
-            r = qb.order("id", desc=True).limit(200).execute()
-            for row in (r.data or []):
-                try:
-                    cid = int(row.get("id"))
-                except (TypeError, ValueError):
-                    continue
-                if cid not in customer_ids:
-                    customer_ids.append(cid)
-            if customer_ids:
-                break
-        except Exception:
-            continue
-
-    if customer_ids:
-        for with_db in (True, False):
-            try:
-                qb = (
-                    client.table("app_orders")
-                    .select(_ORDER_COLS)
-                    .in_("customer_id", customer_ids)
-                    .order("order_date", desc=True)
-                    .limit(int(limit))
-                )
-                if with_db and db_filename:
-                    qb = qb.eq("db_filename", db_filename)
-                r = qb.execute()
-                _absorb(r.data)
-            except Exception:
-                continue
-            if out:
-                break
-
-    # 2) app_orders 직접: 이름/전화 부분일치 (customer_id 비어 있는 주문 포함)
-    if len(out) < int(limit):
-        ord_or = ",".join(
-            f"{col}.ilike.*{t}*"
-            for t in tokens
-            for col in ("customer_name", "phone")
+    order_rows: list[dict] = []
+    try:
+        r = (
+            client.table("app_orders")
+            .select(_ORDER_COLS)
+            .eq("db_filename", db_filename)
+            .in_("customer_id", cids)
+            .order("order_date", desc=True)
+            .limit(int(limit))
+            .execute()
         )
-        for with_db in (True, False):
-            try:
-                qb = (
-                    client.table("app_orders")
-                    .select(_ORDER_COLS)
-                    .or_(ord_or)
-                    .order("order_date", desc=True)
-                    .limit(int(limit))
-                )
-                if with_db and db_filename:
-                    qb = qb.eq("db_filename", db_filename)
-                r = qb.execute()
-                _absorb(r.data)
-            except Exception:
-                continue
-            if out:
-                break
-    return out[: int(limit)]
+        order_rows = list(r.data or [])
+    except Exception as e:
+        last_err = str(e)
+        order_rows = []
+
+    if not order_rows:
+        try:
+            df = _load_orders_supabase(db_filename, _ORDER_COLS, limit=None)
+            if df is not None and not df.empty and "customer_id" in df.columns:
+                matched = df[df["customer_id"].isin(cids)]
+                order_rows = matched.head(int(limit)).to_dict("records")
+        except Exception as e:
+            last_err = str(e)
+
+    out: list[dict] = []
+    for o in order_rows:
+        try:
+            cid = int(o.get("customer_id"))
+        except (TypeError, ValueError):
+            cid = None
+        cust = cust_by_id.get(cid) or {}
+        rec = dict(o)
+        rec["customer_name"] = cust.get("name") or "-"
+        rec["phone"] = cust.get("phone1") or ""
+        out.append(rec)
+    return out[: int(limit)], last_err if not out else ""
 
 
 def _render_hq_merge_into_order(hq, db_filename: str, report, row_index: int, cache_key: str) -> None:
@@ -8848,16 +8824,26 @@ def _render_hq_merge_into_order(hq, db_filename: str, report, row_index: int, ca
     if not client:
         st.error(f"Supabase 연결 실패: {_err}")
         return
+    _search_err = ""
     with st.spinner("앱 주문 검색 중…"):
-        _cands = _hq_search_orders_for_merge(
-            client,
-            db_filename,
-            _q_clean,
-            limit=30,
-            extra_tokens=[row.customer_name or "", row.phone1_digits or ""],
-        )
+        try:
+            _found = _hq_search_orders_for_merge(
+                client,
+                db_filename,
+                _q_clean,
+                limit=30,
+                extra_tokens=[row.customer_name or "", row.phone1_digits or ""],
+            )
+        except TypeError:
+            _found = _hq_search_orders_for_merge(client, db_filename, _q_clean, 30)
+        if isinstance(_found, tuple):
+            _cands, _search_err = _found
+        else:
+            _cands = _found or []
     if not _cands:
         st.info(f"'{_q_clean}' 로 검색된 앱 주문이 없습니다.")
+        if _search_err:
+            st.caption(f"조회 오류: {_search_err}")
         return
 
     _opt_ids: list[int] = []
