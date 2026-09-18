@@ -316,6 +316,7 @@ class HQRow:
     outlet: bool = False
     is_display: bool = False
     is_store_display: bool = False
+    merge_target_order_id: Optional[int] = None
     identity_key: str = ""
     raw_row: dict[str, Any] = field(default_factory=dict)
 
@@ -1018,8 +1019,13 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
     if not hq_rows:
         return report
 
+    # 관리자 병합 지정된 스냅샷은 별도로 처리한다 (기존 대사 row 에 hq_cost 를 합산).
+    merge_rows = [r for r in hq_rows if r.merge_target_order_id and not r.is_store_display]
     # 매장 자체 전시분(판매 아님)은 앱 주문 매칭 대상에서 제외한다.
-    normal_rows = [r for r in hq_rows if not r.is_store_display]
+    normal_rows = [
+        r for r in hq_rows
+        if not r.is_store_display and not r.merge_target_order_id
+    ]
     store_rows = [r for r in hq_rows if r.is_store_display]
 
     orders_by_ident = _fetch_orders_by_identity(client, db_filename, normal_rows)
@@ -1198,6 +1204,98 @@ def build_hq_reconcile(client, db_filename: str, hq_rows: list[HQRow]) -> Reconc
         _tick("store_display")
         report.rows.append(row)
 
+    # 병합 지정된 스냅샷: 대상 앱 주문 대사 row 의 hq_cost 에 합산해 재분류.
+    if merge_rows:
+        _merged_by_target: dict[int, list[HQRow]] = {}
+        for mr in merge_rows:
+            _merged_by_target.setdefault(int(mr.merge_target_order_id), []).append(mr)
+
+        # report.rows 중 order_ids 안에 대상 id 가 있는 첫 매칭을 찾는다.
+        def _find_target_row(target_id: int) -> Optional[ReconcileRow]:
+            for _r in report.rows:
+                if target_id in (getattr(_r, "order_ids", None) or []):
+                    return _r
+            return None
+
+        _unmatched_targets: list[int] = []
+        for _tid, mgroup in _merged_by_target.items():
+            _add_cost = sum(_hq_ship_cost(x) for x in mgroup)
+            _add_total = sum(int(x.order_amount or 0) for x in mgroup)
+            _add_ships = [x.ship_number for x in mgroup]
+            target_row = _find_target_row(_tid)
+            if target_row is None:
+                _unmatched_targets.append(_tid)
+                continue
+
+            # 결과 코드 되돌리기 위해 기존 count 감소
+            _prev_code = target_row.result_code
+            if counts.get(_prev_code):
+                counts[_prev_code] = counts.get(_prev_code, 0) - 1
+
+            target_row.hq_cost = int(target_row.hq_cost or 0) + _add_cost
+            target_row.hq_total = int(target_row.hq_total or 0) + _add_total
+            target_row.hq_ships = list(target_row.hq_ships or []) + _add_ships
+
+            # 재분류
+            _is_disp = bool(getattr(target_row, "is_display", False))
+            _compare_cost = int(target_row.display_cost or 0) if _is_disp else int(target_row.seller_cost or 0)
+            label, code = classify_cost_gap(_compare_cost, int(target_row.hq_cost))
+            target_row.result_label = label
+            target_row.result_code = code
+            _merge_note = "본사만 있음 병합 " + ",".join(f"#{s}" for s in _add_ships) + " (관리자 지정)"
+            target_row.reason = (target_row.reason + " · " + _merge_note) if target_row.reason else _merge_note
+            _tick(code)
+
+        # 대상 앱 주문이 이번 대사 결과에 없을 때: 앱 주문을 조회해 새 row 로 표시.
+        if _unmatched_targets:
+            orders_by_id = fetch_orders_by_ids(client, db_filename, _unmatched_targets) if client else {}
+            for _tid, mgroup in _merged_by_target.items():
+                if _find_target_row(_tid) is not None:
+                    continue
+                _add_cost = sum(_hq_ship_cost(x) for x in mgroup)
+                _add_total = sum(int(x.order_amount or 0) for x in mgroup)
+                _add_ships = [x.ship_number for x in mgroup]
+                first = mgroup[0]
+                target = orders_by_id.get(_tid) if orders_by_id else None
+                _seller = _seller_cost(target) if target else 0
+                _disp = _display_cost(target) if target else 0
+                _sale = _to_int(target.get("total_amount")) if target else 0
+                _phone = _phone_digits(target.get("phone")) if target else (first.phone1_digits or first.phone2_digits)
+                _cust = _clean_str(target.get("customer_name")) if target else first.customer_name
+                _od = _parse_date(target.get("order_date")) if target else first.order_date
+                _emp = _clean_str(target.get("employee_names")) if target else first.employee_names
+                row = ReconcileRow(
+                    hq_ships=_add_ships,
+                    identity_key=first.identity_key,
+                    phone1_digits=_phone,
+                    customer_name=_cust,
+                    order_date=_od,
+                    order_date_end=_od,
+                    employee_names=_emp,
+                    hq_cost=_add_cost,
+                    hq_total=_add_total,
+                    hq_status=first.order_status,
+                    order_id=_tid,
+                    order_ids=[_tid],
+                    seller_cost=_seller,
+                    display_cost=_disp,
+                    entered_sale=_sale,
+                    is_display=False,
+                    order_kind=first.order_kind or "주문",
+                    candidate_orders=[],
+                )
+                if target is not None:
+                    label, code = classify_cost_gap(_seller, _add_cost)
+                    row.result_label = label
+                    row.result_code = code
+                    row.reason = f"본사만 있음 병합 {','.join('#'+s for s in _add_ships)} → 앱 주문 #{_tid} (관리자 지정)"
+                else:
+                    row.result_label = "본사만 있음"
+                    row.result_code = "hq_only"
+                    row.reason = f"병합 대상 앱 주문 #{_tid} 를 찾을 수 없음. 관리자 확인 필요."
+                _tick(row.result_code)
+                report.rows.append(row)
+
     report.counts = counts
     return report
 
@@ -1351,6 +1449,11 @@ def snapshots_to_hqrows(snapshot_rows: list[dict]) -> list[HQRow]:
             is_store_disp = _is_store_display(cust)
         else:
             is_store_disp = bool(_raw_sd)
+        _raw_mt = s.get("merge_target_order_id")
+        try:
+            merge_target = int(_raw_mt) if _raw_mt is not None else None
+        except (TypeError, ValueError):
+            merge_target = None
         ident = _identity_key(phone1, cust)
         if not ident:
             continue
@@ -1377,6 +1480,7 @@ def snapshots_to_hqrows(snapshot_rows: list[dict]) -> list[HQRow]:
             outlet=_to_bool(s.get("outlet")),
             is_display=is_disp,
             is_store_display=is_store_disp,
+            merge_target_order_id=merge_target,
             identity_key=ident,
         )
         out.append(r)
@@ -1412,6 +1516,105 @@ def set_snapshot_store_display(
     except Exception as e:
         logger.warning("set_snapshot_store_display failed: %s", e)
         return False
+
+
+def set_snapshot_merge_target(
+    client,
+    db_filename: str,
+    ship_number: str,
+    order_date: Any,
+    target_order_id: Optional[int],
+) -> bool:
+    """hq_only 스냅샷을 기존 앱 주문의 본사 원가에 합산 연결. `None` 이면 해제.
+
+    - app_orders / app_payments / sales 는 변경하지 않는다.
+    - `merge_target_order_id` 컬럼만 UPDATE.
+    - 대사 재실행 시 build_hq_reconcile 가 대상 앱 주문 대사 row 의 hq_cost 에 합산해 재분류.
+    """
+    if not client or not db_filename or not ship_number:
+        return False
+    od: Optional[str] = None
+    if isinstance(order_date, date):
+        od = order_date.isoformat()
+    elif order_date:
+        od = str(order_date)[:10]
+    try:
+        q = (
+            client.table("app_hq_order_snapshots")
+            .update({"merge_target_order_id": int(target_order_id) if target_order_id else None})
+            .eq("db_filename", db_filename)
+            .eq("ship_number", str(ship_number))
+        )
+        if od:
+            q = q.eq("order_date", od)
+        r = q.execute()
+        return bool(getattr(r, "data", None))
+    except Exception as e:
+        logger.warning("set_snapshot_merge_target failed: %s", e)
+        return False
+
+
+def fetch_orders_by_ids(client, db_filename: str, order_ids: list[int]) -> dict[int, dict]:
+    """지정한 앱 주문 id 를 (db 무관) 일괄 조회. 병합 대상 앱 주문 참조용."""
+    out: dict[int, dict] = {}
+    if not client or not order_ids:
+        return out
+    _ids = sorted({int(x) for x in order_ids if x is not None})
+    _CHUNK = 200
+    for i in range(0, len(_ids), _CHUNK):
+        chunk = _ids[i:i + _CHUNK]
+        try:
+            r = (
+                client.table("app_orders")
+                .select(
+                    "id, db_filename, order_date, delivery_date, customer_name, phone, "
+                    "employee_names, total_amount, cost_price, display_cost_amount"
+                )
+                .in_("id", chunk)
+                .execute()
+            )
+            for row in (r.data or []):
+                try:
+                    out[int(row.get("id"))] = row
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            logger.warning("fetch_orders_by_ids failed: %s", e)
+            break
+    return out
+
+
+def search_orders_by_phone(
+    client,
+    db_filename: str,
+    phone_digits: str,
+    limit: int = 30,
+) -> list[dict]:
+    """관리자 병합용: 전화 last-10 으로 앱 주문 후보 검색. 최신순.
+
+    `_phone_variants` 로 010-xxxx-xxxx / 10자리 등 모든 표기를 in_ 매칭.
+    """
+    if not client or not phone_digits:
+        return []
+    variants = list(_phone_variants(phone_digits))
+    if not variants:
+        return []
+    try:
+        r = (
+            client.table("app_orders")
+            .select(
+                "id, order_date, delivery_date, customer_name, phone, "
+                "employee_names, total_amount, cost_price, display_cost_amount"
+            )
+            .in_("phone", variants)
+            .order("order_date", desc=True)
+            .limit(int(limit))
+            .execute()
+        )
+        return list(r.data or [])
+    except Exception as e:
+        logger.warning("search_orders_by_phone failed: %s", e)
+        return []
 
 
 def load_upload_history(client, db_filename: str, limit: int = 30) -> pd.DataFrame:
@@ -1459,4 +1662,7 @@ __all__ = [
     "load_snapshots",
     "snapshots_to_hqrows",
     "set_snapshot_store_display",
+    "set_snapshot_merge_target",
+    "fetch_orders_by_ids",
+    "search_orders_by_phone",
 ]

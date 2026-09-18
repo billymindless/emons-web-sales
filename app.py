@@ -8622,6 +8622,153 @@ def _hq_mark_store_display(
     return True
 
 
+def _hq_apply_merge(
+    hq,
+    db_filename: str,
+    report,
+    row_index: int,
+    target_order_id: int,
+) -> bool:
+    """hq_only 스냅샷을 대상 앱 주문에 원가 합산 연결. `merge_target_order_id` UPDATE."""
+    client, _err = get_supabase_client()
+    if not client:
+        st.error(f"Supabase 연결 실패: {_err}")
+        return False
+    if row_index < 0 or row_index >= len(report.rows):
+        return False
+    row = report.rows[row_index]
+    ship_numbers = list(row.hq_ships or [])
+    if not ship_numbers:
+        st.error("출고번호가 없어 스냅샷을 특정할 수 없습니다.")
+        return False
+    order_date = row.order_date
+    ok_all = True
+    for sn in ship_numbers:
+        ok = hq.set_snapshot_merge_target(client, db_filename, sn, order_date, int(target_order_id))
+        ok_all = ok_all and ok
+    if not ok_all:
+        st.error("스냅샷 UPDATE 실패.")
+        return False
+    _hq_invalidate_history_caches(db_filename)
+    return True
+
+
+def _render_hq_merge_into_order(hq, db_filename: str, report, row_index: int, cache_key: str) -> None:
+    """hq_only 행을 기존 앱 주문에 원가 합산으로 붙이는 UI. 전화 검색 + 후보 selectbox + 합산 버튼."""
+    row = report.rows[row_index]
+    _default_phone = row.phone1_digits or ""
+    st.markdown("**다른 앱 주문에 원가 합산** (분할 출고 등)")
+    _q_key = f"hq_merge_phone::{cache_key}::{row_index}"
+    if _q_key not in st.session_state:
+        st.session_state[_q_key] = _default_phone
+    _q = st.text_input(
+        "전화번호로 검색 (숫자만 또는 010-xxxx-xxxx)",
+        value=st.session_state[_q_key],
+        key=_q_key,
+    )
+    _digits = "".join(ch for ch in (_q or "") if ch.isdigit())
+    if not _digits:
+        st.caption("전화번호를 입력하면 같은 고객의 앱 주문을 조회합니다.")
+        return
+
+    client, _err = get_supabase_client()
+    if not client:
+        st.error(f"Supabase 연결 실패: {_err}")
+        return
+    _cands_key = f"hq_merge_cands::{cache_key}::{row_index}::{_digits}"
+    _cands = st.session_state.get(_cands_key)
+    if _cands is None:
+        with st.spinner("앱 주문 검색 중…"):
+            _cands = hq.search_orders_by_phone(client, db_filename, _digits, limit=30)
+        st.session_state[_cands_key] = _cands
+    if not _cands:
+        st.info(f"전화 {_digits} 로 검색된 앱 주문이 없습니다.")
+        return
+
+    _opt_ids: list[int] = []
+    _opt_labels: list[str] = []
+    for o in _cands:
+        try:
+            oid = int(o.get("id"))
+        except (TypeError, ValueError):
+            continue
+        _od = str(o.get("order_date") or "")[:10]
+        _cust = str(o.get("customer_name") or "-")
+        _sc = int(o.get("cost_price") or 0)
+        _sale = int(o.get("total_amount") or 0)
+        _opt_ids.append(oid)
+        _opt_labels.append(
+            f"#{oid} · {_cust} · 등록 {_od or '-'} · 앱(모모) 원가 {_sc:,} · 판매가 {_sale:,}"
+        )
+    _pick = st.selectbox(
+        "합산할 앱(모모) 주문",
+        list(range(len(_opt_ids))),
+        format_func=lambda i: _opt_labels[i],
+        key=f"hq_merge_pick::{cache_key}::{row_index}",
+    )
+    _add_cost = int(row.hq_cost or 0)
+    st.caption(f"이 스냅샷의 본사 원가 **{_add_cost:,}원** 을 위 앱 주문의 본사 원가에 더해 재분류합니다.")
+    if st.button(
+        "선택한 앱 주문에 원가 합산",
+        key=f"hq_merge_btn::{cache_key}::{row_index}",
+        type="primary",
+    ):
+        _tid = _opt_ids[_pick]
+        if _hq_apply_merge(hq, db_filename, report, row_index, _tid):
+            st.success(f"앱 주문 #{_tid} 에 본사 원가 {_add_cost:,}원 합산 완료. 대사 결과를 갱신합니다.")
+            st.rerun()
+
+
+def _render_hq_merge_history(db_filename: str, hq) -> None:
+    """3번 탭 하단: 현재 병합된 스냅샷 목록 + 합산 해제 버튼."""
+    client, _err = get_supabase_client()
+    if not client:
+        return
+    try:
+        r = (
+            client.table("app_hq_order_snapshots")
+            .select("id, ship_number, order_date, customer_name, phone1_digits, order_amount, total_amount_hq, merge_target_order_id")
+            .eq("db_filename", db_filename)
+            .not_.is_("merge_target_order_id", "null")
+            .order("order_date", desc=True)
+            .limit(100)
+            .execute()
+        )
+        rows = r.data or []
+    except Exception as _e:
+        st.caption(f"병합 이력 조회 실패: {_e}")
+        return
+    if not rows:
+        return
+
+    with st.expander(f"병합 이력 ({len(rows)}건) · 합산 해제", expanded=False):
+        for _row in rows:
+            sn = _row.get("ship_number") or ""
+            od = str(_row.get("order_date") or "")[:10]
+            cust = _row.get("customer_name") or "-"
+            phone = _row.get("phone1_digits") or "-"
+            tid = _row.get("merge_target_order_id")
+            hq_cost = int(_row.get("total_amount_hq") or 0) or int(_row.get("order_amount") or 0)
+            _c1, _c2 = st.columns([4, 1])
+            _c1.markdown(
+                f"출고 **#{sn}** · {cust} · 전화 {phone} · 등록 {od} · "
+                f"본사원가 {hq_cost:,}원 → 앱 주문 **#{tid}** 에 합산"
+            )
+            with _c2:
+                if st.button(
+                    "합산 해제",
+                    key=f"hq_merge_undo::{db_filename}::{sn}::{od}",
+                    width="stretch",
+                ):
+                    ok = hq.set_snapshot_merge_target(client, db_filename, sn, od, None)
+                    if ok:
+                        _hq_invalidate_history_caches(db_filename)
+                        st.success(f"출고 #{sn} 합산 해제.")
+                        st.rerun()
+                    else:
+                        st.error("합산 해제 실패.")
+
+
 def _render_hq_edit_row_action(
     hq,
     db_filename: str,
@@ -8793,8 +8940,10 @@ def _render_hq_edit_row_action(
 
     # 본사만 있음
     elif code == "hq_only":
-        st.caption("앱 주문과 매칭되는 후보가 없습니다. 매장 자체 전시분이면 아래 버튼으로 분류하세요.")
-        if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key, type="primary"):
+        st.caption("앱 주문과 매칭되는 후보가 없습니다. 분할 출고 등으로 기존 앱 주문에 원가를 합산하거나 매장 전시로 분류하세요.")
+        _render_hq_merge_into_order(hq, db_filename, report, row_index, cache_key)
+        st.markdown("---")
+        if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key):
             if _hq_mark_store_display(hq, db_filename, report, row_index, True):
                 st.success("매장 전시로 분류했습니다.")
                 st.rerun()
@@ -8861,6 +9010,9 @@ def _render_hq_edit_menu(db_filename: str, hq) -> None:
 
     st.markdown("---")
     _render_hq_edit_row_action(hq, db_filename, report, _row_idx, _cache_key)
+
+    st.markdown("---")
+    _render_hq_merge_history(db_filename, hq)
 
 
 def _render_admin_hq_upload(db_filename: str) -> None:

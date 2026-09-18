@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS app_hq_order_snapshots (
   outlet             TEXT,                    -- 아울렛 여부
   is_display         BOOLEAN DEFAULT FALSE,   -- 리빙(법)·매장분 = 전시품(고객 판매)
   is_store_display   BOOLEAN DEFAULT FALSE,   -- 매장 자체 전시분 (판매 아님, 대사 대상 제외)
+  merge_target_order_id BIGINT,               -- hq_only 스냅샷을 기존 앱 주문의 본사 원가에 합산 연결 (분할 출고 등)
   source_upload_id   BIGINT REFERENCES app_hq_order_uploads(id) ON DELETE SET NULL,
   prev_order_amount  BIGINT,                  -- 직전 값 (revised 감지용)
   prev_order_status  TEXT,
@@ -77,6 +78,14 @@ COMMENT ON COLUMN app_hq_order_snapshots.is_store_display  IS '매장 자체 전
 
 -- 기존 배포 환경 마이그레이션 (컬럼 없는 경우에만 추가)
 ALTER TABLE app_hq_order_snapshots ADD COLUMN IF NOT EXISTS is_store_display BOOLEAN DEFAULT FALSE;
+ALTER TABLE app_hq_order_snapshots ADD COLUMN IF NOT EXISTS merge_target_order_id BIGINT;
+
+CREATE INDEX IF NOT EXISTS idx_app_hq_snap_merge_target
+  ON app_hq_order_snapshots(db_filename, merge_target_order_id)
+  WHERE merge_target_order_id IS NOT NULL;
+
+COMMENT ON COLUMN app_hq_order_snapshots.merge_target_order_id
+  IS '분할 출고 등: hq_only 스냅샷을 기존 앱 주문(app_orders.id)의 본사 원가에 합산 연결. NULL 이면 미합산.';
 
 ALTER TABLE app_hq_order_uploads   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app_hq_order_snapshots ENABLE ROW LEVEL SECURITY;
