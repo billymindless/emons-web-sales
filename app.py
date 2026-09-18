@@ -8984,6 +8984,416 @@ def _render_hq_merge_history(db_filename: str, hq) -> None:
                         st.error("합산 해제 실패.")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 원가 불일치 → 사내 업무 소명 요청 (task_board 재사용)
+# ─────────────────────────────────────────────────────────────────────
+
+_HQ_EXPLAIN_TAG_PREFIX = "hq-cost"
+
+
+def _hq_split_names(raw: str) -> list[str]:
+    """'김수홀 허유진' 또는 '김수홀, 허유진' → ['김수홀', '허유진']. 공백·쉼표 분리."""
+    if not raw:
+        return []
+    parts: list[str] = []
+    for chunk in str(raw).replace(",", " ").split():
+        chunk = chunk.strip()
+        if chunk and chunk.lower() not in ("nan", "none", "null"):
+            parts.append(chunk)
+    # 중복 제거
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _hq_resolve_assignees_from_names(display_names: list[str], store_id, role: str) -> tuple[list[str], list[str]]:
+    """표시명 리스트 → (매칭된 username 리스트, 매칭 실패한 이름 리스트).
+
+    사내 업무 등록에서 쓰는 `_internal_work_employee_options` 와 동일한 후보군을 사용해
+    표시명(name 우선, 없으면 username) 부분 일치로 username 을 찾는다."""
+    if not display_names:
+        return [], []
+    options = _internal_work_employee_options(store_id, role, cross_store=True)
+    if not options:
+        return [], list(display_names)
+    users_list = _get_supabase_users_list() or []
+    uname_to_name: dict[str, str] = {}
+    for u in users_list:
+        uname = (u.get("username") or "").strip()
+        if not uname:
+            continue
+        uname_to_name[uname] = (u.get("name") or uname).strip()
+    matched: list[str] = []
+    unmatched: list[str] = []
+    seen_u: set[str] = set()
+    for disp in display_names:
+        target = disp.strip()
+        if not target:
+            continue
+        picked = ""
+        # 1) name 정확 일치
+        for uname, _lbl in options:
+            nm = uname_to_name.get(uname, uname)
+            if nm == target:
+                picked = uname
+                break
+        # 2) name 부분 일치
+        if not picked:
+            for uname, _lbl in options:
+                nm = uname_to_name.get(uname, uname)
+                if target in nm or nm in target:
+                    picked = uname
+                    break
+        # 3) username 부분 일치
+        if not picked:
+            for uname, _lbl in options:
+                if target in uname:
+                    picked = uname
+                    break
+        if picked and picked not in seen_u:
+            seen_u.add(picked)
+            matched.append(picked)
+        elif not picked:
+            unmatched.append(target)
+    return matched, unmatched
+
+
+def _hq_explain_row_tag(row) -> str:
+    """행을 식별하는 태그 조각. 출고번호가 있으면 그것으로, 없으면 order_id, 없으면 이름+날짜."""
+    ships = list(getattr(row, "hq_ships", None) or [])
+    if ships:
+        return f"ship-{ships[0]}"
+    oids = list(getattr(row, "order_ids", None) or [])
+    if oids:
+        return f"order-{int(oids[0])}"
+    od = getattr(row, "order_date", None)
+    od_s = od.isoformat() if hasattr(od, "isoformat") and od else "no-date"
+    nm = (getattr(row, "customer_name", "") or "no-name").strip()
+    return f"row-{nm}-{od_s}"
+
+
+def _hq_explain_row_tags(db_filename: str, row) -> list[str]:
+    """검색·저장 공통 태그 리스트. `hq-cost` 는 필터용, 나머지는 식별용."""
+    tags = [_HQ_EXPLAIN_TAG_PREFIX, f"db-{db_filename}", _hq_explain_row_tag(row)]
+    return tags
+
+
+def _hq_find_explain_task(db_filename: str, row) -> dict | None:
+    """이 행에 대해 이미 생성된 소명 요청 업무를 찾는다. 태그 문자열에 식별 조각이 포함되면 매칭."""
+    try:
+        import task_board as _tb  # noqa: WPS433
+    except Exception:
+        return None
+    row_tag = _hq_explain_row_tag(row)
+    try:
+        tasks = _tb.load_tasks_cached(store_name=None, include_done=True)
+    except Exception:
+        return None
+    for t in tasks or []:
+        tags = str(t.get("tags") or "")
+        if _HQ_EXPLAIN_TAG_PREFIX in tags and row_tag in tags and (t.get("db_filename") or "") == db_filename:
+            return t
+    return None
+
+
+def _render_hq_cost_explain_request(
+    db_filename: str,
+    report,
+    row_index: int,
+    cache_key: str,
+) -> None:
+    """cost_mismatch / cost_blank 행에 사내 업무 소명 요청 UI. 원가 데이터는 변경하지 않는다."""
+    try:
+        import task_board as _tb  # noqa: WPS433
+    except Exception as _tb_e:
+        st.caption(f"사내 업무 모듈을 불러오지 못했습니다: {_tb_e}")
+        return
+
+    row = report.rows[row_index]
+    hq_cost = int(getattr(row, "hq_cost", 0) or 0)
+    seller = int(getattr(row, "seller_cost", 0) or 0)
+    disp = int(getattr(row, "display_cost", 0) or 0)
+    diff = seller - hq_cost
+    order_date_s = row.order_date.isoformat() if getattr(row, "order_date", None) else "-"
+    cust = (getattr(row, "customer_name", "") or "(고객명 없음)").strip()
+    phone = getattr(row, "phone1_digits", "") or "-"
+
+    # 매장 표시명
+    _store_label = _get_store_name_by_db(db_filename) or db_filename
+    if _store_label.endswith(".db"):
+        _store_label = {
+            "store_1.db": "울산 삼산점",
+            "store_2.db": "울산 학성점",
+        }.get(db_filename, _store_label)
+
+    current_user = st.session_state.get("current_user") or {}
+    role = (current_user.get("role") or "user").strip()
+    me_uname = _current_username()
+    store_id = current_user.get("store_id") or st.session_state.get("current_store_id")
+
+    # 기존 업무 있으면 재사용
+    existing = _hq_find_explain_task(db_filename, row)
+    key_base = f"hq_explain::{cache_key}::{row_index}"
+
+    st.markdown("---")
+    st.markdown("### 판매담당 소명 요청 (사내 업무)")
+
+    _c1, _c2, _c3, _c4 = st.columns(4)
+    _c1.metric("본사원가", f"{hq_cost:,}")
+    _c2.metric("앱(모모) 원가", f"{seller:,}")
+    _c3.metric("앱(모모) 전시원가", f"{disp:,}")
+    _c4.metric("차이 (앱 − 본사)", f"{diff:+,}")
+
+    st.caption(
+        f"고객 **{cust}** · 등록일 {order_date_s} · 전화 {phone} · 매장 {_store_label}"
+    )
+
+    if existing:
+        _render_hq_cost_explain_thread(existing, key_base, me_uname)
+        return
+
+    # 판매담당 자동 매칭
+    row_emps = _hq_split_names(getattr(row, "employee_names", "") or "")
+    matched_users, unmatched_names = _hq_resolve_assignees_from_names(row_emps, store_id, role)
+
+    emp_options = _internal_work_employee_options(store_id, role, cross_store=True)
+    emp_uname_to_label = {u: lbl for u, lbl in emp_options}
+    all_unames = [u for u, _ in emp_options]
+
+    default_assignees = [u for u in matched_users if u in emp_uname_to_label]
+    if not default_assignees:
+        default_assignees = []
+
+    assignees = st.multiselect(
+        "담당자 (첫 번째가 책임자, 자동 매칭됨 · 수정 가능)",
+        options=all_unames,
+        default=default_assignees,
+        format_func=lambda u: emp_uname_to_label.get(u, u),
+        key=f"{key_base}::assignees",
+    )
+    if unmatched_names:
+        st.caption(
+            f"자동 매칭 실패 담당자: {', '.join(unmatched_names)} — 위 목록에서 직접 선택해 주세요."
+        )
+
+    _default_title = f"[원가소명] {cust} · {order_date_s} · 차이 {diff:+,}원"
+    title = st.text_input(
+        "제목",
+        value=_default_title,
+        key=f"{key_base}::title",
+    )
+
+    _placeholder = f"본사 {hq_cost:,} / 앱 {seller:,}. 차이 사유 회신 바랍니다."
+    memo = st.text_area(
+        "요청 메모 (필수)",
+        placeholder=_placeholder,
+        height=110,
+        key=f"{key_base}::memo",
+    )
+
+    ver_key = f"{key_base}::files_ver"
+    ver = int(st.session_state.get(ver_key, 0))
+    files = _file_input_with_paste(
+        "이미지·문서 첨부 (Ctrl+V 로 화면 캡처 붙여넣기 가능)",
+        accept_multiple_files=True,
+        key=f"{key_base}::files::{ver}",
+    )
+    _render_upload_preview(files)
+
+    if st.button("소명 요청 보내기", type="primary", key=f"{key_base}::send"):
+        if not (title or "").strip():
+            st.error("제목을 입력해 주세요.")
+            return
+        if not (memo or "").strip():
+            st.error("요청 메모를 입력해 주세요.")
+            return
+        if not assignees:
+            st.error("담당자를 최소 1명 지정해 주세요.")
+            return
+
+        _body = (
+            f"매장: {_store_label}\n"
+            f"고객: {cust}\n"
+            f"전화: {phone}\n"
+            f"등록일: {order_date_s}\n"
+            f"본사원가: {hq_cost:,}원\n"
+            f"앱(모모) 원가: {seller:,}원\n"
+            f"앱(모모) 전시원가: {disp:,}원\n"
+            f"차이(앱−본사): {diff:+,}원\n"
+            f"판매담당: {', '.join(row_emps) if row_emps else '-'}\n\n"
+            f"요청 메모:\n{memo.strip()}"
+        )
+        tags = ",".join(_hq_explain_row_tags(db_filename, row))
+        # 매장명 조회 (task_board.create_task 는 store_name 을 그대로 저장)
+        _store_name_for_task = _store_label
+        new_id, err = _tb.create_task(
+            title=title.strip(),
+            description=_body,
+            created_by=me_uname,
+            store_name=_store_name_for_task,
+            db_filename=db_filename,
+            parent_task_id=None,
+            start_date=None,
+            due_date=None,
+            priority="normal",
+            assignees=list(assignees),
+            category=None,
+            tags=tags,
+            is_pinned=False,
+            scope="store",
+        )
+        if err or not new_id:
+            st.error(f"업무 생성 실패: {err or '알 수 없는 오류'}")
+            return
+        # 첨부
+        att_errs: list[str] = []
+        for _f in (files or []):
+            try:
+                _f.seek(0)
+            except Exception:
+                pass
+            _, ferr = _tb.attach_file(
+                task_id=int(new_id), comment_id=None,
+                uploaded_file=_f, uploaded_by=me_uname,
+            )
+            if ferr:
+                att_errs.append(f"{getattr(_f, 'name', 'file')}: {ferr}")
+        st.session_state[ver_key] = ver + 1
+        if att_errs:
+            st.warning("일부 첨부 실패: " + "; ".join(att_errs))
+        _tb.clear_task_caches()
+        st.success(f"업무 #{new_id} 생성 완료. 담당자에게 알림이 발송되었습니다.")
+        st.rerun()
+
+
+def _render_hq_cost_explain_thread(task: dict, key_base: str, me_uname: str) -> None:
+    """생성된 소명 업무의 상태·댓글·답신 입력. 사내 업무 메뉴와 병행 사용 가능."""
+    try:
+        import task_board as _tb  # noqa: WPS433
+    except Exception:
+        st.caption("사내 업무 모듈 로드 실패.")
+        return
+
+    tid = int(task.get("id"))
+    status_code = str(task.get("status") or "")
+    status_label = _tb.TASK_STATUS_LABELS.get(status_code, status_code or "-")
+    st.info(
+        f"이 행은 이미 사내 업무 **#{tid}** 로 소명 요청되었습니다. 상태: **{status_label}**"
+    )
+    st.caption(
+        f"제목: {task.get('title') or ''} · "
+        f"작성자: {task.get('created_by') or '-'} · "
+        f"생성 {str(task.get('created_at') or '')[:16].replace('T', ' ')}"
+    )
+    st.caption("📋 사내 업무 메뉴에서도 동일 건 확인·회신할 수 있습니다.")
+
+    # 기존 댓글
+    try:
+        comments = _tb.load_task_comments_cached(tid)
+    except Exception:
+        comments = []
+    try:
+        atts = _tb.load_task_attachments_cached(tid)
+    except Exception:
+        atts = []
+
+    atts_by_comment: dict[int, list[dict]] = {}
+    atts_task: list[dict] = []
+    for a in atts:
+        cid_raw = a.get("comment_id")
+        if cid_raw:
+            atts_by_comment.setdefault(int(cid_raw), []).append(a)
+        else:
+            atts_task.append(a)
+
+    if atts_task:
+        st.markdown("**업무 첨부**")
+        _cols = st.columns(min(len(atts_task), 3))
+        for i, a in enumerate(atts_task):
+            with _cols[i % len(_cols)]:
+                _render_attachment_inline(a, key_suffix=f"hqexpl_task_{tid}")
+
+    if comments:
+        st.markdown("**댓글 타임라인**")
+        for c in comments:
+            _cid = int(c.get("id") or 0)
+            _author = c.get("author") or "-"
+            _at = str(c.get("created_at") or "")[:16].replace("T", " ")
+            _body = c.get("body") or ""
+            st.markdown(f"- **{_author}** · {_at}\n\n  {_body}")
+            _c_atts = atts_by_comment.get(_cid, [])
+            if _c_atts:
+                _acols = st.columns(min(len(_c_atts), 3))
+                for j, a in enumerate(_c_atts):
+                    with _acols[j % len(_acols)]:
+                        _render_attachment_inline(a, key_suffix=f"hqexpl_c{_cid}")
+
+    # 답신 입력
+    st.markdown("**답신 남기기**")
+    reply_key = f"{key_base}::reply_body"
+    reply_body = st.text_area(
+        "내용",
+        placeholder="회신 내용을 입력하세요. Ctrl+V 로 이미지 붙여넣기 가능.",
+        height=100,
+        key=reply_key,
+    )
+    ver_key = f"{key_base}::reply_files_ver"
+    ver = int(st.session_state.get(ver_key, 0))
+    files = _file_input_with_paste(
+        "답신 이미지·문서 첨부",
+        accept_multiple_files=True,
+        key=f"{key_base}::reply_files::{ver}",
+    )
+    _render_upload_preview(files)
+
+    _bc1, _bc2 = st.columns([1, 1])
+    with _bc1:
+        if st.button("답신 등록", type="primary", key=f"{key_base}::reply_send"):
+            body = (reply_body or "").strip()
+            if not body and not (files or []):
+                st.error("내용을 입력하거나 파일을 첨부해 주세요.")
+                return
+            new_cid: int | None = None
+            if body:
+                new_cid, cerr = _tb.post_comment(tid, me_uname, body)
+                if cerr:
+                    st.error(f"댓글 등록 실패: {cerr}")
+                    return
+            att_errs: list[str] = []
+            for _f in (files or []):
+                try:
+                    _f.seek(0)
+                except Exception:
+                    pass
+                _, ferr = _tb.attach_file(
+                    task_id=tid, comment_id=new_cid,
+                    uploaded_file=_f, uploaded_by=me_uname,
+                )
+                if ferr:
+                    att_errs.append(f"{getattr(_f, 'name', 'file')}: {ferr}")
+            st.session_state[ver_key] = ver + 1
+            if att_errs:
+                st.warning("일부 첨부 실패: " + "; ".join(att_errs))
+            _tb.clear_task_caches()
+            st.success("답신을 등록했습니다.")
+            st.rerun()
+    with _bc2:
+        if status_code and status_code != "done":
+            if st.button("소명 완료로 종료", key=f"{key_base}::close"):
+                ok, cerr = _tb.update_status(tid, "done", me_uname)
+                if ok:
+                    _tb.clear_task_caches()
+                    st.success(f"업무 #{tid} 를 완료 처리했습니다.")
+                    st.rerun()
+                else:
+                    st.error(f"상태 변경 실패: {cerr}")
+
+
 def _render_hq_edit_row_action(
     hq,
     db_filename: str,
@@ -9096,6 +9506,9 @@ def _render_hq_edit_row_action(
             if _hq_mark_store_display(hq, db_filename, report, row_index, True):
                 st.success("매장 전시로 분류했습니다.")
                 st.rerun()
+
+        # 판매담당 소명 요청 (사내 업무)
+        _render_hq_cost_explain_request(db_filename, report, row_index, cache_key)
 
     # 전시판매 수동 매칭
     elif code == "unresolved":
