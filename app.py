@@ -538,7 +538,7 @@ def _render_erp_icon_rail(role: str) -> None:
             _go("product_taxonomy")
         if st.button("🗑️", key="rail_del", help="주문 삭제 요청 관리", width="stretch"):
             _go("delete_requests")
-        if st.button("📥", key="rail_hq_upload", help="ERP 파일 등록 (본사 주문조회)", width="stretch"):
+        if st.button("📥", key="rail_hq_upload", help="에몬스&모모 원가 매칭", width="stretch"):
             _go("hq_upload")
         if st.button("⚙️", key="rail_settings", help="관리자 설정", width="stretch"):
             _go("admin_settings")
@@ -8684,109 +8684,145 @@ def _hq_apply_merge(
 
 
 def _hq_search_orders_for_merge(
-    client, db_filename: str, query: str, limit: int = 30
+    client, db_filename: str, query: str, limit: int = 30, extra_tokens: list[str] | None = None,
 ) -> list[dict]:
-    """병합용 앱 주문 검색.
+    """병합용 앱 주문 검색. 이름/전화 부분일치.
 
-    1. 검색어(이름/전화 부분)를 `app_customers` 에 `ilike` 로 부분 매칭 → customer_id 리스트
-    2. `app_orders` 에서 `customer_id in (...)` 로 조회 (db_filename 필터)
-    3. 매칭이 없으면 fallback 으로 `app_orders.phone` in_ / customer_name ilike 재시도
-
-    `app_orders.phone` 은 하이픈 포함/미포함 등 표기가 섞여 있어 in_ 만으로는 부분 검색이 안 된다.
-    앱 UI 다른 곳의 고객 검색과 동일한 `app_customers.phone1/phone2/name ilike` 경로를 사용한다.
+    기존 버그: `3255` 같은 끝자리만 들어오면 `app_orders.phone` 정확일치(`in_`)만
+    시도해서 `010-5183-3255` 를 찾지 못했다. 고객및잔금 관리와 같이 `ilike *토큰*` 을 쓴다.
     """
     if not client:
         return []
-    q_clean = re.sub(r"[*,%]", "", (query or "").strip())
-    if not q_clean:
+    raw_tokens: list[str] = []
+    for t in [query, *(extra_tokens or [])]:
+        s = re.sub(r"[*,%]", "", str(t or "").strip())
+        if s:
+            raw_tokens.append(s)
+    tokens: list[str] = []
+    _seen_t: set[str] = set()
+    for t in raw_tokens:
+        for piece in (t, "".join(ch for ch in t if ch.isdigit())):
+            if not piece or piece in _seen_t:
+                continue
+            _seen_t.add(piece)
+            tokens.append(piece)
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            if len(digits) >= 4:
+                last4 = digits[-4:]
+                if last4 not in _seen_t:
+                    _seen_t.add(last4)
+                    tokens.append(last4)
+            if len(digits) >= 10:
+                last10 = digits[-10:]
+                for extra in (
+                    last10,
+                    ("0" + last10) if last10.startswith("10") else "",
+                    (f"010-{last10[2:6]}-{last10[6:]}") if last10.startswith("10") else "",
+                ):
+                    if extra and extra not in _seen_t:
+                        _seen_t.add(extra)
+                        tokens.append(extra)
+    tokens = [t for t in tokens if t][:12]
+    if not tokens:
         return []
 
-    _customer_ids: list[int] = []
-    try:
-        or_filter = (
-            f"name.ilike.*{q_clean}*,"
-            f"phone1.ilike.*{q_clean}*,"
-            f"phone2.ilike.*{q_clean}*"
-        )
-        qb = client.table("app_customers").select("id").or_(or_filter)
-        try:
-            _store_name = _get_current_store_name_for_customers(db_filename)
-        except Exception:
-            _store_name = ""
-        if _store_name:
-            qb = qb.eq("store_name", _store_name)
-        r = qb.order("id", desc=True).limit(200).execute()
-        for row in (r.data or []):
+    _ORDER_COLS = (
+        "id, order_date, delivery_date, customer_name, phone, "
+        "employee_names, total_amount, cost_price, display_cost_amount"
+    )
+    out: list[dict] = []
+    seen_ids: set[int] = set()
+
+    def _absorb(rows) -> None:
+        for o in rows or []:
             try:
-                _customer_ids.append(int(row.get("id")))
+                oid = int(o.get("id"))
             except (TypeError, ValueError):
                 continue
-    except Exception:
-        _customer_ids = []
+            if oid in seen_ids:
+                continue
+            seen_ids.add(oid)
+            out.append(o)
 
-    out: list[dict] = []
-    if _customer_ids:
+    def _safe_store_name() -> str:
         try:
-            r = (
-                client.table("app_orders")
-                .select(
-                    "id, order_date, delivery_date, customer_name, phone, "
-                    "employee_names, total_amount, cost_price, display_cost_amount"
-                )
-                .eq("db_filename", db_filename)
-                .in_("customer_id", _customer_ids)
-                .order("order_date", desc=True)
-                .limit(int(limit))
-                .execute()
-            )
-            out = list(r.data or [])
+            name = _get_current_store_name_for_customers(db_filename) or ""
         except Exception:
-            out = []
+            name = ""
+        if not name or name.endswith(".db") or name == "알 수 없음":
+            return ""
+        return name
 
-    # 백업: customer_id 매칭이 실패하면 app_orders.customer_name/phone 으로 직접 시도.
-    if not out:
+    # 1) app_customers: name/phone1/phone2 ilike. 매장 필터는 보조. 비면 매장 없이 재시도.
+    customer_ids: list[int] = []
+    cust_or = ",".join(
+        f"{col}.ilike.*{t}*"
+        for t in tokens
+        for col in ("name", "phone1", "phone2")
+    )
+    store_name = _safe_store_name()
+    for use_store in (True, False):
         try:
-            _digits = "".join(ch for ch in q_clean if ch.isdigit())
-            if _digits and len(_digits) >= 4:
-                # 하이픈 포함/미포함 변형 (last-10 은 정확 매칭용)
-                variants = {_digits}
-                last10 = _digits[-10:] if len(_digits) >= 10 else _digits
-                variants.add(last10)
-                if len(last10) == 10 and last10.startswith("10"):
-                    variants.update({
-                        "0" + last10,
-                        f"010-{last10[2:6]}-{last10[6:]}",
-                    })
-                r = (
+            qb = client.table("app_customers").select("id").or_(cust_or)
+            if use_store and store_name:
+                qb = qb.eq("store_name", store_name)
+            r = qb.order("id", desc=True).limit(200).execute()
+            for row in (r.data or []):
+                try:
+                    cid = int(row.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if cid not in customer_ids:
+                    customer_ids.append(cid)
+            if customer_ids:
+                break
+        except Exception:
+            continue
+
+    if customer_ids:
+        for with_db in (True, False):
+            try:
+                qb = (
                     client.table("app_orders")
-                    .select(
-                        "id, order_date, delivery_date, customer_name, phone, "
-                        "employee_names, total_amount, cost_price, display_cost_amount"
-                    )
-                    .eq("db_filename", db_filename)
-                    .in_("phone", list(variants))
+                    .select(_ORDER_COLS)
+                    .in_("customer_id", customer_ids)
                     .order("order_date", desc=True)
                     .limit(int(limit))
-                    .execute()
                 )
-                out = list(r.data or [])
-            elif not any(ch.isdigit() for ch in q_clean):
-                r = (
+                if with_db and db_filename:
+                    qb = qb.eq("db_filename", db_filename)
+                r = qb.execute()
+                _absorb(r.data)
+            except Exception:
+                continue
+            if out:
+                break
+
+    # 2) app_orders 직접: 이름/전화 부분일치 (customer_id 비어 있는 주문 포함)
+    if len(out) < int(limit):
+        ord_or = ",".join(
+            f"{col}.ilike.*{t}*"
+            for t in tokens
+            for col in ("customer_name", "phone")
+        )
+        for with_db in (True, False):
+            try:
+                qb = (
                     client.table("app_orders")
-                    .select(
-                        "id, order_date, delivery_date, customer_name, phone, "
-                        "employee_names, total_amount, cost_price, display_cost_amount"
-                    )
-                    .eq("db_filename", db_filename)
-                    .ilike("customer_name", f"%{q_clean}%")
+                    .select(_ORDER_COLS)
+                    .or_(ord_or)
                     .order("order_date", desc=True)
                     .limit(int(limit))
-                    .execute()
                 )
-                out = list(r.data or [])
-        except Exception:
-            pass
-    return out
+                if with_db and db_filename:
+                    qb = qb.eq("db_filename", db_filename)
+                r = qb.execute()
+                _absorb(r.data)
+            except Exception:
+                continue
+            if out:
+                break
+    return out[: int(limit)]
 
 
 def _render_hq_merge_into_order(hq, db_filename: str, report, row_index: int, cache_key: str) -> None:
@@ -8812,12 +8848,14 @@ def _render_hq_merge_into_order(hq, db_filename: str, report, row_index: int, ca
     if not client:
         st.error(f"Supabase 연결 실패: {_err}")
         return
-    _cands_key = f"hq_merge_cands::{cache_key}::{row_index}::{_q_clean}"
-    _cands = st.session_state.get(_cands_key)
-    if _cands is None:
-        with st.spinner("앱 주문 검색 중…"):
-            _cands = _hq_search_orders_for_merge(client, db_filename, _q_clean, limit=30)
-        st.session_state[_cands_key] = _cands
+    with st.spinner("앱 주문 검색 중…"):
+        _cands = _hq_search_orders_for_merge(
+            client,
+            db_filename,
+            _q_clean,
+            limit=30,
+            extra_tokens=[row.customer_name or "", row.phone1_digits or ""],
+        )
     if not _cands:
         st.info(f"'{_q_clean}' 로 검색된 앱 주문이 없습니다.")
         return
@@ -8873,6 +8911,10 @@ def _render_hq_merge_history(db_filename: str, hq) -> None:
         )
         rows = r.data or []
     except Exception as _e:
+        _msg = str(_e)
+        # 컬럼 미배포(PGRST204) 는 마이그레이션 전이므로 조용히 숨긴다.
+        if "merge_target_order_id" in _msg or "PGRST204" in _msg:
+            return
         st.caption(f"병합 이력 조회 실패: {_e}")
         return
     if not rows:
@@ -9164,8 +9206,14 @@ def _render_admin_hq_upload(db_filename: str) -> None:
         st.error(f"hq_order_reconcile_service 로드 실패: {_e}")
         return
 
-    st.header("ERP 파일 등록 & 원가 대사")
-    st.markdown(f"매장: **{db_filename}**")
+    st.header("에몬스&모모 원가 매칭")
+    _store_label = _get_store_name_by_db(db_filename) or db_filename
+    if _store_label.endswith(".db"):
+        _store_label = {
+            "store_1.db": "울산 삼산점",
+            "store_2.db": "울산 학성점",
+        }.get(db_filename, _store_label)
+    st.markdown(f"매장: **{_store_label}**")
 
     _tab_new, _tab_view, _tab_edit = st.tabs([
         "1. 새 파일 업로드",
@@ -33757,7 +33805,7 @@ def _render_chat_history_section(customer_id: int, phone: str, customer_name: st
 def _render_hq_upload_reference(db_filename: str) -> None:
     """고객 및 잔금 관리 하단에 표시되는 본사 ERP 대사 참조 expander (읽기 전용).
 
-    - 업로드는 사이드바 "📥 ERP 파일 등록" 에서만 수행. 여기서는 최근 이력만 미리보기.
+    - 업로드는 사이드바 "📥 에몬스&모모 원가 매칭" 에서만 수행. 여기서는 최근 이력만 미리보기.
     """
     try:
         import hq_order_reconcile_service as hq
@@ -33765,7 +33813,7 @@ def _render_hq_upload_reference(db_filename: str) -> None:
         return
     with st.expander("🔎 본사 주문조회 대사 (최근 업로드, 참조용)", expanded=False):
         st.caption(
-            "사이드바 **📥 ERP 파일 등록** 에서 등록한 본사 주문조회 파일의 최근 이력입니다. "
+            "사이드바 **📥 에몬스&모모 원가 매칭** 에서 등록한 본사 주문조회 파일의 최근 이력입니다. "
             "여기서는 조회만 가능하며, 앱 주문·매출·결제 데이터는 이 화면에서 변경되지 않습니다."
         )
         client, _ = get_supabase_client()
