@@ -1081,6 +1081,7 @@ def _supabase_run_app_tables_sql():
         "SUPABASE_APP_WORK_ADJ_LONG_SERVICE.sql",
         "SUPABASE_APP_WORK_ADJ_EARLY_LEAVE.sql",
         "SUPABASE_APP_ATTENDANCE_CLEANUP.sql",
+        "SUPABASE_APP_HQ_ORDER_UPLOADS.sql",
     ]
     ok = False
     for fname in sql_files:
@@ -8570,6 +8571,39 @@ def _render_hq_new_upload(db_filename: str, hq) -> None:
         )
 
 
+def _hq_name_looks_store_display(name: str) -> bool:
+    """울산삼산점(법), 울산학성(법), 에몬스리빙삼산(법). 리빙(법) 단독은 제외."""
+    s = (name or "").strip()
+    if not s:
+        return False
+    compact = re.sub(r"\s+", "", s)
+    if compact in ("리빙(법)", "리빙법"):
+        return False
+    return bool(re.search(r"\(\s*법\s*\)\s*$", s)) and (
+        "점" in s or s.startswith("울산") or s.startswith("에몬스")
+    )
+
+
+def _hq_set_store_display_fallback(client, db_filename: str, ship_number: str, order_date, value: bool):
+    """set_snapshot_store_display 가 없거나 실패할 때 직접 UPDATE. (ok, err)."""
+    od = ""
+    if order_date:
+        od = str(order_date)[:10]
+    try:
+        q = (
+            client.table("app_hq_order_snapshots")
+            .update({"is_store_display": bool(value)})
+            .eq("db_filename", db_filename)
+            .eq("ship_number", str(ship_number))
+        )
+        if od:
+            q = q.eq("order_date", od)
+        q.execute()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 def _hq_mark_store_display(
     hq,
     db_filename: str,
@@ -8591,12 +8625,24 @@ def _hq_mark_store_display(
         return False
     order_date = row.order_date
     ok_all = True
+    last_err = ""
+    _set_fn = getattr(hq, "set_snapshot_store_display", None)
     for sn in ship_numbers:
-        ok = hq.set_snapshot_store_display(client, db_filename, sn, order_date, value)
+        if callable(_set_fn):
+            ok = _set_fn(client, db_filename, sn, order_date, value)
+            if not ok:
+                ok, last_err = _hq_set_store_display_fallback(client, db_filename, sn, order_date, value)
+        else:
+            ok, last_err = _hq_set_store_display_fallback(client, db_filename, sn, order_date, value)
         ok_all = ok_all and ok
     if not ok_all:
-        st.error("스냅샷 UPDATE 실패. Supabase 로그를 확인하세요.")
-        return False
+        st.warning(
+            "스냅샷 저장은 실패했지만 이번 화면에는 매장 전시로 반영합니다. "
+            "Supabase SQL Editor에서 아래를 실행하면 다음 조회부터 유지됩니다.\n\n"
+            "`ALTER TABLE app_hq_order_snapshots ADD COLUMN IF NOT EXISTS is_store_display BOOLEAN DEFAULT FALSE;`"
+        )
+        if last_err:
+            st.caption(f"저장 오류: {last_err}")
     # 리포트 즉시 갱신
     if value:
         row.is_store_display = True
@@ -9109,13 +9155,20 @@ def _render_hq_edit_row_action(
 
     # 본사만 있음
     elif code == "hq_only":
-        st.caption("앱 주문과 매칭되는 후보가 없습니다. 분할 출고 등으로 기존 앱 주문에 원가를 합산하거나 매장 전시로 분류하세요.")
-        _render_hq_merge_into_order(hq, db_filename, report, row_index, cache_key)
-        st.markdown("---")
-        if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key):
-            if _hq_mark_store_display(hq, db_filename, report, row_index, True):
-                st.success("매장 전시로 분류했습니다.")
-                st.rerun()
+        if _hq_name_looks_store_display(getattr(row, "customer_name", "") or ""):
+            st.caption("매장명+(법) 패턴입니다. 고객 판매가 아니라 매장 전시로 분류하세요.")
+            if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key):
+                if _hq_mark_store_display(hq, db_filename, report, row_index, True):
+                    st.success("매장 전시로 분류했습니다.")
+                    st.rerun()
+        else:
+            st.caption("앱 주문과 매칭되는 후보가 없습니다. 분할 출고 등으로 기존 앱 주문에 원가를 합산하거나 매장 전시로 분류하세요.")
+            _render_hq_merge_into_order(hq, db_filename, report, row_index, cache_key)
+            st.markdown("---")
+            if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key):
+                if _hq_mark_store_display(hq, db_filename, report, row_index, True):
+                    st.success("매장 전시로 분류했습니다.")
+                    st.rerun()
 
     # 매장 전시 (해제)
     elif code == "store_display":

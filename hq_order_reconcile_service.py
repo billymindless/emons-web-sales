@@ -55,6 +55,8 @@ _DISPLAY_NAME_PATTERNS: tuple[str, ...] = ("리빙(법)",)
 _STORE_DISPLAY_NAME_REGEXES: tuple[Any, ...] = (
     re.compile(r".+점\s*\(\s*법\s*\)\s*$"),
     re.compile(r"^\s*에몬스리빙.+\(\s*법\s*\)\s*$"),
+    # 울산학성(법) 처럼 '점' 없는 매장명+(법)
+    re.compile(r"^\s*(울산|에몬스).+\(\s*법\s*\)\s*$"),
 )
 
 # 취소로 간주할 주문상태 표기 (본사 파일)
@@ -1442,13 +1444,10 @@ def snapshots_to_hqrows(snapshot_rows: list[dict]) -> list[HQRow]:
         phone1 = _phone_digits(s.get("phone1_digits"))
         kind = _clean_str(s.get("order_kind"))
         is_disp = bool(s.get("is_display")) or _is_display(cust, kind)
-        # 관리자 수동 지정값(True/False)이 스냅샷에 있으면 그 값을 그대로 사용한다.
-        # 컬럼이 없거나 NULL 이면 이름 기반 자동 감지로 폴백.
+        # True 는 관리자/자동 지정. False/NULL 은 DEFAULT FALSE 또는 컬럼 없음이므로
+        # 이름 패턴(울산삼산점(법) 등) 자동 감지를 다시 적용한다.
         _raw_sd = s.get("is_store_display")
-        if _raw_sd is None:
-            is_store_disp = _is_store_display(cust)
-        else:
-            is_store_disp = bool(_raw_sd)
+        is_store_disp = bool(_raw_sd) or _is_store_display(cust)
         _raw_mt = s.get("merge_target_order_id")
         try:
             merge_target = int(_raw_mt) if _raw_mt is not None else None
@@ -1512,7 +1511,19 @@ def set_snapshot_store_display(
         if od:
             q = q.eq("order_date", od)
         r = q.execute()
-        return bool(getattr(r, "data", None))
+        # PostgREST 가 갱신 행을 안 돌려주면 data=[] 가 된다. 예외만 없으면 성공으로 본다.
+        if getattr(r, "data", None):
+            return True
+        chk = (
+            client.table("app_hq_order_snapshots")
+            .select("id")
+            .eq("db_filename", db_filename)
+            .eq("ship_number", str(ship_number))
+        )
+        if od:
+            chk = chk.eq("order_date", od)
+        cr = chk.limit(1).execute()
+        return bool(getattr(cr, "data", None))
     except Exception as e:
         logger.warning("set_snapshot_store_display failed: %s", e)
         return False
