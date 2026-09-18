@@ -9415,97 +9415,66 @@ def _render_hq_edit_row_action(
     _btn_disp_key = f"hq_edit_mark_sd::{cache_key}::{row_index}"
     _btn_undo_key = f"hq_edit_undo_sd::{cache_key}::{row_index}"
 
-    # 원가 불일치 / 원가 미입력 (앱 매칭 1건) → 원가 확정 + 소액 보정
+    # 원가 불일치 / 원가 미입력 (앱 매칭 1건) → 앱원가 / 본사원가 / 매장전시 한 줄
     if code in ("cost_mismatch", "cost_blank") and len(oids) == 1:
         _oid = int(oids[0])
         _seller = int(row.seller_cost or 0)
         _disp = int(row.display_cost or 0)
-        _pick_options: list[tuple[str, str, int, int]] = []
-        if _seller > 0:
-            _pick_options.append((
-                "general",
-                f"앱(모모) 원가 {_seller:,} 유지 (본사 대비 {(_seller - hq_cost):+,})",
-                _seller, _disp,
-            ))
-        if _disp > 0:
-            _pick_options.append((
-                "display",
-                f"앱(모모) 전시원가 {_disp:,} → 앱(모모) 원가로 이동 (본사 대비 {(_disp - hq_cost):+,})",
-                _disp, 0,
-            ))
-        if _pick_options:
-            _pick_ids = [x[0] for x in _pick_options]
-            _pick = st.radio(
-                "최종 입력 (본사원가 / 앱(모모) 원가)",
-                _pick_ids,
-                index=0,
-                format_func=lambda x: next(o[1] for o in _pick_options if o[0] == x),
-                key=f"hq_edit_pick::{cache_key}::{_oid}",
-                horizontal=False,
-            )
-            if st.button("선택한 원가로 확정", key=f"hq_edit_pick_btn::{cache_key}::{_oid}", type="primary"):
-                _target = next(o for o in _pick_options if o[0] == _pick)
-                _, _lbl, _new_cost, _new_disp = _target
-                _ok = _update_order_supabase(
-                    db_filename, _oid,
-                    {"cost_price": _new_cost, "display_cost_amount": _new_disp},
-                )
-                if not _ok:
-                    st.error(f"주문 #{_oid} 업데이트 실패.")
-                else:
-                    _recalc_order_actual_margin_supabase(db_filename, _oid)
-                    row.seller_cost = int(_new_cost)
-                    row.display_cost = int(_new_disp)
-                    row.result_label = "원가 일치"
-                    row.result_code = "ok"
-                    row.reason = "관리자 강제매칭."
-                    _counts: dict[str, int] = {}
-                    for _rr in report.rows:
-                        _counts[_rr.result_code] = _counts.get(_rr.result_code, 0) + 1
-                    report.counts = _counts
-                    clear_data_cache()
-                    st.success(f"주문 #{_oid} 확정.")
-                    st.rerun()
-        else:
-            st.info("확정 가능한 앱(모모) 원가가 없습니다 (원가/전시원가 모두 0).")
+        _app_cost = _seller if _seller > 0 else _disp
+        _gap = _app_cost - hq_cost
+        st.caption(
+            f"차이(앱 − 본사) **{_gap:+,}원** · 앱(모모) 원가 {_app_cost:,} · 본사원가 {hq_cost:,}"
+        )
 
-        # 소액 보정
-        _SMALL_GAP = 20_000
-        _gap = hq_cost - _seller
-        if _seller > 0 and 0 < abs(_gap) <= _SMALL_GAP:
-            st.markdown("**소액 보정**")
-            _apply = st.radio(
-                f"차이 {_gap:+,}원 처리",
-                ["앱(모모) 원가 유지", f"본사원가 {hq_cost:,}원 적용"],
-                index=0,
-                key=f"hq_edit_small::{cache_key}::{_oid}",
-                horizontal=True,
+        def _hq_confirm_order_cost(_new_cost: int, _new_disp: int, _msg: str) -> None:
+            _ok = _update_order_supabase(
+                db_filename, _oid,
+                {"cost_price": _new_cost, "display_cost_amount": _new_disp},
             )
-            if _apply.startswith("본사원가") and st.button(
-                "본사원가로 맞춤", key=f"hq_edit_small_btn::{cache_key}::{_oid}", type="primary",
+            if not _ok:
+                st.error(f"주문 #{_oid} 업데이트 실패.")
+                return
+            _recalc_order_actual_margin_supabase(db_filename, _oid)
+            row.seller_cost = int(_new_cost)
+            row.display_cost = int(_new_disp)
+            row.result_label = "원가 일치"
+            row.result_code = "ok"
+            row.reason = "관리자 강제매칭."
+            _counts: dict[str, int] = {}
+            for _rr in report.rows:
+                _counts[_rr.result_code] = _counts.get(_rr.result_code, 0) + 1
+            report.counts = _counts
+            clear_data_cache()
+            st.success(_msg)
+            st.rerun()
+
+        _b1, _b2, _b3 = st.columns(3)
+        with _b1:
+            _app_disabled = _app_cost <= 0
+            if st.button(
+                f"앱(모모) 원가 {_app_cost:,}",
+                key=f"hq_edit_keep_app::{cache_key}::{_oid}",
+                type="primary",
+                disabled=_app_disabled,
+                width="stretch",
             ):
-                _ok = _update_order_supabase(db_filename, _oid, {"cost_price": hq_cost})
-                if not _ok:
-                    st.error(f"주문 #{_oid} 업데이트 실패.")
-                else:
-                    _recalc_order_actual_margin_supabase(db_filename, _oid)
-                    row.seller_cost = int(hq_cost)
-                    row.result_label = "원가 일치"
-                    row.result_code = "ok"
-                    row.reason = "관리자 강제매칭."
-                    _counts = {}
-                    for _rr in report.rows:
-                        _counts[_rr.result_code] = _counts.get(_rr.result_code, 0) + 1
-                    report.counts = _counts
-                    clear_data_cache()
-                    st.success(f"주문 #{_oid} 본사원가 적용.")
+                _hq_confirm_order_cost(_app_cost, _disp if _seller > 0 else 0, f"주문 #{_oid} 앱(모모) 원가 확정.")
+        with _b2:
+            if st.button(
+                f"본사원가 {hq_cost:,}",
+                key=f"hq_edit_apply_hq::{cache_key}::{_oid}",
+                width="stretch",
+            ):
+                _hq_confirm_order_cost(hq_cost, _disp, f"주문 #{_oid} 본사원가 적용.")
+        with _b3:
+            if st.button(
+                "매장 전시로 분류",
+                key=_btn_disp_key,
+                width="stretch",
+            ):
+                if _hq_mark_store_display(hq, db_filename, report, row_index, True):
+                    st.success("매장 전시로 분류했습니다.")
                     st.rerun()
-
-        # 매장 전시로 분류
-        if st.button("이 행을 매장 전시로 분류", key=_btn_disp_key):
-            if _hq_mark_store_display(hq, db_filename, report, row_index, True):
-                st.success("매장 전시로 분류했습니다.")
-                st.rerun()
 
         # 판매담당 소명 요청 (사내 업무)
         _render_hq_cost_explain_request(db_filename, report, row_index, cache_key)
