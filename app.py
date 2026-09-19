@@ -3451,14 +3451,111 @@ def _ext_pay_release_and_rematch_source(
         _ext_pay_match_onnuri(db_filename, vf, matched_by)
 
 
+def _ext_pay_dryrun_conflicts(
+    sc, db_filename: str, source: str, rows: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """지문(fingerprint) 사전 조회로 파싱 행을 신규/충돌로 분류.
+
+    반환:
+      fresh    : DB 에 없는 파싱행 목록 (각 항목에 `_fp` 키 주입)
+      conflicts: 이미 DB 지문과 겹치는 파싱행 목록.
+                 각 항목 = {"parsed": <파싱행 + _fp>, "existing": <DB 행 dict>}.
+                 파일 내부 자기중복은 existing.batch_id=None 로 표기됨.
+    """
+    fresh: list[dict] = []
+    conflicts: list[dict] = []
+    if not rows:
+        return fresh, conflicts
+
+    fp_to_parsed: dict[str, dict] = {}
+    for r in rows:
+        try:
+            fp = _ext_pay_fingerprint(
+                source, db_filename, r["tx_date"], r.get("tx_time"),
+                r.get("phone_last4"), int(r["amount"]), r.get("tx_status"),
+                approval_code=r.get("approval_code"),
+                card_company=r.get("card_company"),
+            )
+        except Exception:
+            fp = None
+        r2 = dict(r)
+        r2["_fp"] = fp
+        if not fp:
+            fresh.append(r2)
+            continue
+        if fp in fp_to_parsed:
+            # 파일 내부 자기중복: 첫 건만 fresh, 나머지는 conflict (existing=파일의 첫 등장)
+            first = fp_to_parsed[fp]
+            conflicts.append({
+                "parsed": r2,
+                "existing": {
+                    "id": None,
+                    "batch_id": None,
+                    "tx_date": first.get("tx_date"),
+                    "tx_time": first.get("tx_time"),
+                    "amount": first.get("amount"),
+                    "approval_code": first.get("approval_code"),
+                    "card_company": first.get("card_company"),
+                    "phone_last4": first.get("phone_last4"),
+                    "created_at": None,
+                    "_within_file": True,
+                },
+            })
+            continue
+        fp_to_parsed[fp] = r2
+
+    unique_fps = list(fp_to_parsed.keys())
+    if not unique_fps:
+        return fresh, conflicts
+
+    existing_by_fp: dict[str, dict] = {}
+    for i in range(0, len(unique_fps), 100):
+        chunk = unique_fps[i:i + 100]
+        base_cols = "id,batch_id,tx_date,tx_time,amount,approval_code,fingerprint,phone_last4,created_at"
+        try:
+            resp = (
+                sc.table("app_external_pay_rows")
+                .select(base_cols + ",card_company,card_kind")
+                .in_("fingerprint", chunk)
+                .execute()
+            )
+            data = resp.data or []
+        except Exception:
+            try:
+                resp = (
+                    sc.table("app_external_pay_rows")
+                    .select(base_cols)
+                    .in_("fingerprint", chunk)
+                    .execute()
+                )
+                data = resp.data or []
+            except Exception:
+                data = []
+        for row in data:
+            fpv = row.get("fingerprint")
+            if fpv:
+                existing_by_fp[fpv] = row
+
+    for fp, parsed in fp_to_parsed.items():
+        if fp in existing_by_fp:
+            conflicts.append({"parsed": parsed, "existing": existing_by_fp[fp]})
+        else:
+            fresh.append(parsed)
+    return fresh, conflicts
+
+
 def _ext_pay_insert_batch_and_rows(
     db_filename: str, source: str, file_name: str, rows: list[dict],
     verify_from: date, uploaded_by: str | None,
-) -> tuple[int, int, int, str | None]:
-    """배치·행 저장. verify_from 이전은 skip. fingerprint 중복도 skip. 반환: (inserted, skipped_before_date, skipped_duplicate, error_or_None)."""
+) -> tuple[int, int, int, str | None, list[dict]]:
+    """배치·행 저장. verify_from 이전은 skip, fingerprint 중복은 conflicts 로 분리 반환.
+
+    반환: (inserted, skipped_before_date, skipped_duplicate, error_or_None, conflicts)
+      conflicts 각 항목 = {"parsed": <파싱행 + _fp + _batch_id + _source>, "existing": <DB 행 dict>}
+    """
     sc, err = get_supabase_client()
     if err or not sc:
-        return 0, 0, 0, err or "Supabase 연결 불가"
+        return 0, 0, 0, err or "Supabase 연결 불가", []
     parsed_count = len(rows)
     filtered: list[dict] = []
     before_date = 0
@@ -3472,8 +3569,10 @@ def _ext_pay_insert_batch_and_rows(
             continue
         filtered.append(r)
 
+    fresh, conflicts = _ext_pay_dryrun_conflicts(sc, db_filename, source, filtered)
+    duplicates = len(conflicts)
+
     inserted = 0
-    duplicates = 0
     first_row_err: str | None = None
     batch_id: int | None = None
     try:
@@ -3487,10 +3586,17 @@ def _ext_pay_insert_batch_and_rows(
         if br.data and len(br.data) > 0 and br.data[0].get("id") is not None:
             batch_id = int(br.data[0]["id"])
     except Exception as e:
-        return 0, before_date, 0, f"배치 저장 실패: {e}"
+        return 0, before_date, 0, f"배치 저장 실패: {e}", []
 
-    for r in filtered:
-        fp = _ext_pay_fingerprint(
+    # conflict 항목에 배치·소스 정보 부여 (재등록 UI 에서 참조)
+    for c in conflicts:
+        c["parsed"]["_batch_id"] = batch_id
+        c["parsed"]["_source"] = source
+        c["parsed"]["_db_filename"] = db_filename
+        c["parsed"]["_file_name"] = file_name or None
+
+    for r in fresh:
+        fp = r.get("_fp") or _ext_pay_fingerprint(
             source, db_filename, r["tx_date"], r.get("tx_time"),
             r.get("phone_last4"), int(r["amount"]), r.get("tx_status"),
             approval_code=r.get("approval_code"),
@@ -3520,7 +3626,14 @@ def _ext_pay_insert_batch_and_rows(
         except Exception as e:
             msg = str(e).lower()
             if "duplicate" in msg or "unique" in msg or "23505" in msg or "conflict" in msg:
+                # dryrun 이후 타 세션이 삽입한 극단 케이스 → conflict 로 격상
                 duplicates += 1
+                parsed_promoted = {**r, "_batch_id": batch_id, "_source": source,
+                                   "_db_filename": db_filename, "_file_name": file_name or None}
+                conflicts.append({
+                    "parsed": parsed_promoted,
+                    "existing": {"_race_condition": True, "fingerprint": fp},
+                })
                 continue
             # 스키마에 card_company/card_kind 컬럼이 아직 없는 환경: 해당 필드를 제거 후 재시도
             if source == "card" and ("card_company" in msg or "card_kind" in msg or "column" in msg):
@@ -3545,9 +3658,142 @@ def _ext_pay_insert_batch_and_rows(
             }).eq("id", batch_id).execute()
     except Exception:
         pass
-    if inserted == 0 and filtered and first_row_err:
-        return inserted, before_date, duplicates, f"행 저장 실패: {first_row_err}"
-    return inserted, before_date, duplicates, None
+    if inserted == 0 and fresh and first_row_err:
+        return inserted, before_date, duplicates, f"행 저장 실패: {first_row_err}", conflicts
+    return inserted, before_date, duplicates, None, conflicts
+
+
+def _ext_pay_normalize_time_input(raw: str | None) -> tuple[str | None, str | None]:
+    """사용자 입력 시각을 `HH:MM:SS` 로 정규화.
+
+    허용 케이스:
+      '13:27:39' / '13.27.39' / '13-27-39' / '13 27 39' / '13：27：39' → '13:27:39'
+      '132739'  (숫자 6자리) → '13:27:39'
+      '13:27' / '1327'       → '13:27:00'
+      '9:2:5'                → '09:02:05'
+
+    반환: (hhmmss, error). 실패 시 hhmmss=None, error=사유 문자열.
+    """
+    if raw is None:
+        return None, "시각이 비어 있습니다. 예: 13:27:39 또는 132739"
+    s = str(raw).strip().replace("：", ":")
+    if not s:
+        return None, "시각이 비어 있습니다. 예: 13:27:39 또는 132739"
+    # 콜론/구분자가 있으면 파트 분할
+    if re.search(r"[:.\-\s]", s):
+        parts = re.split(r"[:.\-\s]+", s)
+        parts = [p for p in parts if p != ""]
+        if len(parts) < 2 or len(parts) > 3:
+            return None, "시각 형식이 올바르지 않습니다. 예: 13:27:39 또는 132739"
+        try:
+            hh = int(parts[0])
+            mm = int(parts[1])
+            ss = int(parts[2]) if len(parts) == 3 else 0
+        except ValueError:
+            return None, "시각 형식이 올바르지 않습니다. 예: 13:27:39 또는 132739"
+    else:
+        digits = re.sub(r"\D", "", s)
+        if len(digits) == 6:
+            hh, mm, ss = int(digits[0:2]), int(digits[2:4]), int(digits[4:6])
+        elif len(digits) == 4:
+            hh, mm, ss = int(digits[0:2]), int(digits[2:4]), 0
+        else:
+            return None, "시각 형식이 올바르지 않습니다. 예: 13:27:39 또는 132739"
+    if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60):
+        return None, f"시각 값이 범위를 벗어났습니다: {hh:02d}:{mm:02d}:{ss:02d}"
+    return f"{hh:02d}:{mm:02d}:{ss:02d}", None
+
+
+def _ext_pay_reinsert_with_time_override(
+    db_filename: str, source: str, batch_id: int | None,
+    parsed_row: dict, new_tx_time_raw: str, uploaded_by: str | None,
+) -> tuple[bool, str | None]:
+    """중복 파싱행의 tx_time 을 수기 입력 시각으로 대체 후 별개 거래로 삽입.
+
+    - 시각 자동 정규화 (`_ext_pay_normalize_time_input`) 실패 시 즉시 오류 반환.
+    - raw_json 에 manual_time_override(from/to/by) 병합.
+    - 삽입 성공: (True, None).
+    - 재중복(23505): (False, "정규화된 시각이 기존 다른 행과 여전히 충돌합니다 ...").
+    """
+    hhmmss, terr = _ext_pay_normalize_time_input(new_tx_time_raw)
+    if terr or not hhmmss:
+        return False, terr or "시각 형식이 올바르지 않습니다."
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return False, err or "Supabase 연결 불가"
+
+    r = dict(parsed_row)
+    from_tx_time = r.get("tx_time")
+    r["tx_time"] = hhmmss
+
+    # raw_json 에 override 메타를 병합
+    raw = dict(r.get("raw") or {})
+    raw["manual_time_override"] = {
+        "from": from_tx_time,
+        "to": hhmmss,
+        "by": (uploaded_by or "").strip() or None,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    r["raw"] = raw
+
+    try:
+        fp = _ext_pay_fingerprint(
+            source, db_filename, r["tx_date"], r.get("tx_time"),
+            r.get("phone_last4"), int(r["amount"]), r.get("tx_status"),
+            approval_code=r.get("approval_code"),
+            card_company=r.get("card_company"),
+        )
+    except Exception as e:
+        return False, f"지문 재계산 실패: {e}"
+
+    payload = {
+        "batch_id": batch_id,
+        "db_filename": db_filename,
+        "source": source,
+        "tx_date": r["tx_date"],
+        "tx_time": r.get("tx_time"),
+        "phone_last4": r.get("phone_last4"),
+        "amount": int(r["amount"]),
+        "tx_status": r.get("tx_status"),
+        "settle_status": r.get("settle_status"),
+        "buyer_name_masked": r.get("buyer_name_masked"),
+        "approval_code": r.get("approval_code"),
+        "raw_json": _ext_pay_safe_raw(r.get("raw")),
+        "fingerprint": fp,
+    }
+    if source == "card":
+        payload["card_company"] = r.get("card_company")
+        payload["card_kind"] = r.get("card_kind")
+    try:
+        sc.table("app_external_pay_rows").insert(payload).execute()
+    except Exception as e:
+        msg = str(e).lower()
+        if "duplicate" in msg or "unique" in msg or "23505" in msg or "conflict" in msg:
+            return False, (
+                f"정규화된 시각 {hhmmss} 로도 이미 저장된 행과 지문이 겹칩니다. 다른 초 값을 시도하세요."
+            )
+        if source == "card" and ("card_company" in msg or "card_kind" in msg or "column" in msg):
+            fallback = {k: v for k, v in payload.items() if k not in ("card_company", "card_kind")}
+            try:
+                sc.table("app_external_pay_rows").insert(fallback).execute()
+            except Exception as e2:
+                return False, f"행 저장 실패: {e2}"
+        else:
+            return False, f"행 저장 실패: {e}"
+
+    # 배치 카운트 조정 (선택적)
+    if batch_id is not None:
+        try:
+            br = sc.table("app_external_pay_batches").select("inserted_count, skipped_count").eq("id", batch_id).limit(1).execute()
+            cur = (br.data or [{}])[0]
+            ins = int(cur.get("inserted_count") or 0) + 1
+            skp = max(0, int(cur.get("skipped_count") or 0) - 1)
+            sc.table("app_external_pay_batches").update({
+                "inserted_count": ins, "skipped_count": skp,
+            }).eq("id", batch_id).execute()
+        except Exception:
+            pass
+    return True, None
 
 
 def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str | None) -> tuple[dict, str | None]:
@@ -30653,7 +30899,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             elif not parsed:
                 st.warning(_empty_hint)
             else:
-                inserted, skipped_before, skipped_dup, ierr = _ext_pay_insert_batch_and_rows(
+                inserted, skipped_before, skipped_dup, ierr, conflicts = _ext_pay_insert_batch_and_rows(
                     sel_db, _src_key, getattr(up, "name", "") or "", parsed, new_from, me_uname,
                 )
                 if ierr:
@@ -30672,8 +30918,19 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
                             _msg_parts.append(
                                 " · ".join(f"{k} {v}" for k, v in counts.items())
                             )
+                        _conflicts_key = f"extpay_conflicts_{sel_db}_{_src_key}"
+                        if conflicts:
+                            st.session_state[_conflicts_key] = conflicts
+                            _msg_parts.append(
+                                f"중복 상세 {len(conflicts)}건 아래 패널에서 확인 후 별개 거래면 시각 재입력"
+                            )
+                        else:
+                            st.session_state.pop(_conflicts_key, None)
                         flash(" · ".join(_msg_parts))
                         st.rerun()
+
+    # 중복 skip 된 파일 행 상세 (지문 충돌) — 별개 거래로 강제 등록 가능
+    _render_ext_pay_conflict_panel(sel_db, sel_src, new_from, me_uname)
 
     st.markdown("##### 검증 결과")
     f1, f2 = st.columns(2)
@@ -30814,6 +31071,140 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
 
     # ERP-only 수기 확인 (현금 수금 등 공식파일 자체가 없는 결제)
     _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
+
+
+def _render_ext_pay_conflict_panel(
+    sel_db: str, sel_src: str, new_from: date, me_uname: str,
+) -> None:
+    """업로드 시 지문(fingerprint) 충돌로 skip 된 파일 행을 상세 노출.
+
+    - 이번 파일 행 vs 기존 DB 행을 2열로 비교 표시.
+    - 사용자가 원장 상 정확한 거래시각(HH:MM:SS)을 재입력해 별개 거래로 강제 등록 가능.
+    - 시각 입력은 콜론 없이 6자리 숫자만 입력해도 자동 포맷 (`_ext_pay_normalize_time_input`).
+    - `st.session_state[f"extpay_conflicts_{sel_db}_{sel_src}"]` 에 저장된 목록을 소비."""
+    key = f"extpay_conflicts_{sel_db}_{sel_src}"
+    conflicts = st.session_state.get(key) or []
+    if not conflicts:
+        return
+
+    _match_fn = {
+        "onnuri":   _ext_pay_match_onnuri,
+        "ulsanpay": _ext_pay_match_ulsanpay,
+        "card":     _ext_pay_match_card,
+        "mainpay":  _ext_pay_match_mainpay,
+    }.get(sel_src, _ext_pay_match_onnuri)
+
+    with st.expander(
+        f"⚠︎ 중복 skip 된 행 상세 ({len(conflicts)}건) — 별개 거래면 거래시각 재입력하여 등록",
+        expanded=True,
+    ):
+        st.caption(
+            "이번 업로드에서 지문(날짜·시각·금액·승인번호 조합)이 기존 저장 행과 겹쳐 skip 된 행입니다. "
+            "정말 다른 거래인 경우 원장에서 정확한 거래시각(초 단위)을 확인하여 아래 입력창에 넣고 "
+            "[별개 거래로 강제 등록] 을 눌러 주세요. 콜론 없이 `132739` 처럼 6자리 숫자만 입력해도 자동으로 `13:27:39` 형식으로 변환됩니다."
+        )
+        for idx, c in enumerate(list(conflicts)):
+            parsed = c.get("parsed") or {}
+            existing = c.get("existing") or {}
+            orig_fp = parsed.get("_fp") or ""
+            uid = orig_fp or f"idx{idx}"
+
+            st.markdown(f"**충돌 #{idx + 1}**")
+            col_l, col_r = st.columns(2)
+            with col_l:
+                st.markdown("*이번 파일 행*")
+                _lines = [
+                    f"- 날짜: `{parsed.get('tx_date') or '-'}`",
+                    f"- 시각: `{parsed.get('tx_time') or '-'}`",
+                    f"- 금액: `{int(parsed.get('amount') or 0):,}` 원",
+                    f"- 승인번호: `{parsed.get('approval_code') or '-'}`",
+                ]
+                if sel_src == "card":
+                    _lines.append(f"- 카드사: `{parsed.get('card_company') or '-'}`")
+                    if parsed.get("card_kind"):
+                        _lines.append(f"- 카드종류: `{parsed.get('card_kind')}`")
+                elif sel_src == "onnuri":
+                    if parsed.get("phone_last4"):
+                        _lines.append(f"- 전화 뒤4: `{parsed.get('phone_last4')}`")
+                if parsed.get("tx_status"):
+                    _lines.append(f"- 상태: `{parsed.get('tx_status')}`")
+                st.markdown("\n".join(_lines))
+            with col_r:
+                if existing.get("_within_file"):
+                    st.markdown("*파일 내 자기중복 (첫 등장)*")
+                elif existing.get("_race_condition"):
+                    st.markdown("*동시 업로드 경합으로 다른 세션이 먼저 저장*")
+                else:
+                    st.markdown("*기존 DB 행*")
+                _lines2 = [
+                    f"- id: `{existing.get('id') or '-'}`",
+                    f"- 날짜: `{existing.get('tx_date') or '-'}`",
+                    f"- 시각: `{existing.get('tx_time') or '-'}`",
+                    f"- 금액: `{int(existing.get('amount') or 0):,}` 원",
+                    f"- 승인번호: `{existing.get('approval_code') or '-'}`",
+                ]
+                if sel_src == "card":
+                    _lines2.append(f"- 카드사: `{existing.get('card_company') or '-'}`")
+                elif sel_src == "onnuri":
+                    if existing.get("phone_last4"):
+                        _lines2.append(f"- 전화 뒤4: `{existing.get('phone_last4')}`")
+                if existing.get("created_at"):
+                    _lines2.append(f"- 최초 등록: `{str(existing.get('created_at'))[:19]}`")
+                if existing.get("batch_id"):
+                    _lines2.append(f"- 최초 배치 id: `{existing.get('batch_id')}`")
+                st.markdown("\n".join(_lines2))
+
+            with st.form(f"ext_pay_conflict_form_{sel_db}_{sel_src}_{uid}"):
+                action = st.radio(
+                    "처리 방법",
+                    options=["skip 유지", "별개 거래로 강제 등록"],
+                    horizontal=True,
+                    key=f"ext_pay_conflict_action_{sel_db}_{sel_src}_{uid}",
+                )
+                new_tt_raw = st.text_input(
+                    "정확한 거래시각 (별개 등록 시 필수)",
+                    value="",
+                    placeholder="13:27:39 또는 132739",
+                    help="콜론 없이 6자리 숫자만 입력해도 자동으로 HH:MM:SS 로 변환됩니다.",
+                    key=f"ext_pay_conflict_time_{sel_db}_{sel_src}_{uid}",
+                )
+                if new_tt_raw and new_tt_raw.strip():
+                    _norm, _terr = _ext_pay_normalize_time_input(new_tt_raw)
+                    if _norm:
+                        st.caption(f"→ 저장될 시각: `{_norm}`")
+                    elif _terr:
+                        st.caption(f"⚠︎ {_terr}")
+                submitted = st.form_submit_button("저장", type="primary")
+                if submitted:
+                    _cur = st.session_state.get(key) or []
+                    if action == "skip 유지":
+                        st.session_state[key] = [
+                            x for x in _cur if (x.get("parsed") or {}).get("_fp") != orig_fp
+                        ]
+                        flash("중복행을 skip 유지로 처리했습니다.")
+                        st.rerun()
+                    else:
+                        ok, err = _ext_pay_reinsert_with_time_override(
+                            sel_db, sel_src, parsed.get("_batch_id"),
+                            parsed, new_tt_raw, me_uname,
+                        )
+                        if not ok:
+                            st.error(err or "저장 실패")
+                        else:
+                            st.session_state[key] = [
+                                x for x in _cur if (x.get("parsed") or {}).get("_fp") != orig_fp
+                            ]
+                            try:
+                                _match_fn(sel_db, new_from, me_uname)
+                            except Exception:
+                                pass
+                            flash("별개 거래로 강제 등록되었습니다. 자동 매칭을 재실행했습니다.")
+                            st.rerun()
+            st.markdown("---")
+
+        if st.button("모두 skip 유지 (패널 닫기)", key=f"ext_pay_conflict_clear_{sel_db}_{sel_src}"):
+            st.session_state.pop(key, None)
+            st.rerun()
 
 
 def _render_ext_pay_manual_match_ui(
