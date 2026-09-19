@@ -5971,6 +5971,7 @@ def _ext_pay_list_matches_df(
         row_dict = {
             "row_id": int(r.get("id") or 0),
             "공식일자": str(r.get("tx_date") or "")[:10],
+            "공식시각": str(r.get("tx_time") or "").strip(),
             "ERP일자": erp_date_disp,
             "뒤4": r.get("phone_last4") or "",
             "승인번호": _appr_disp,
@@ -6020,6 +6021,7 @@ def _ext_pay_list_matches_df(
         row_dict = {
             "row_id": 0,  # ERP-only 는 row_id 없음
             "공식일자": "",
+            "공식시각": "",
             "ERP일자": p.get("payment_date") or "",
             "뒤4": p.get("phone_last4") or "",
             "승인번호": _ext_pay_norm_approval6(p.get("approval_code")) or (p.get("approval_code") or ""),
@@ -32009,6 +32011,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     _hidden = {
         _flag_col, "row_id",
         "_payment_id", "_order_id", "_customer_id", "_amount_int", "_payment_method",
+        "공식시각",
     }
     _all_cols = [c for c in df_show.columns if c not in _hidden]
     _show = df_show[_all_cols]
@@ -32647,12 +32650,24 @@ def _render_ext_pay_manual_match_ui(
         )
         _options: list[tuple[int, str]] = []
         for _r in _target.to_dict("records"):
-            _label_parts = [
-                str(_r.get("공식일자") or ""),
-                _r.get("카드사") or _r.get("승인번호") or _r.get("뒤4") or "",
-                f"{_r.get('공식금액') or ''}원",
-                f"[{_r.get('결과') or ''}]",
-            ]
+            if sel_src == "onnuri":
+                _phone = str(_r.get("뒤4") or "").strip()
+                if _phone and not _phone.startswith("*"):
+                    _phone = f"****-{_phone}"
+                _label_parts = [
+                    str(_r.get("공식일자") or "").strip(),
+                    str(_r.get("공식시각") or "").strip(),
+                    str(_r.get("구매자") or "").strip(),
+                    _phone,
+                    (f"{_r.get('공식금액')}원" if str(_r.get("공식금액") or "").strip() else ""),
+                ]
+            else:
+                _label_parts = [
+                    str(_r.get("공식일자") or ""),
+                    _r.get("카드사") or _r.get("승인번호") or _r.get("뒤4") or "",
+                    f"{_r.get('공식금액') or ''}원",
+                    f"[{_r.get('결과') or ''}]",
+                ]
             _label_parts = [p for p in _label_parts if str(p).strip()]
             _options.append((int(_r["row_id"]), " · ".join(_label_parts)))
         if not _options:
