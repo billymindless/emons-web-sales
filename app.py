@@ -5214,6 +5214,91 @@ def _ext_pay_manual_link(
         return False, f"매칭 저장 실패: {e}"
 
 
+def _ext_pay_manual_link_split(
+    db_filename: str, source: str, row_id: int, payment_ids: list[int],
+    matched_by: str | None, note: str | None = None,
+) -> tuple[bool, str | None]:
+    """공식 파일 1행에 여러 ERP 결제(합=공식금액)를 수동 분할 매칭.
+    - result_code='split_matched', 대표 payment_id 는 결제 id 최소값
+    - 참여 payment_id 전체는 note 에 `[split_pids:...]` 로 인코딩 (자동 매칭 규칙과 동일)
+    - 순서 · 개수 검증만 하고 실제 금액 합 = 공식 행 amount 검증은 UI 층에서 이미 수행."""
+    if not db_filename or not row_id:
+        return False, "필수 파라미터 누락"
+    pids = sorted({int(p) for p in (payment_ids or []) if p is not None})
+    if len(pids) < 2:
+        return False, "분할 매칭은 결제 2건 이상 필요"
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return False, err or "Supabase 연결 불가"
+
+    # 대표 결제로 order_id / customer_id 채우기
+    try:
+        pr = (
+            sc.table("app_payments")
+            .select("id, order_id")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .in_("id", pids)
+            .execute()
+        )
+        pay_rows = pr.data or []
+    except Exception as e:
+        return False, f"결제 조회 실패: {e}"
+    if len(pay_rows) < len(pids):
+        return False, "일부 결제 id 를 찾을 수 없습니다."
+    _by_id = {int(p["id"]): p for p in pay_rows}
+    head_pid = pids[0]
+    head_pay = _by_id[head_pid]
+    order_id = head_pay.get("order_id")
+    customer_id = None
+    if order_id is not None:
+        try:
+            _or = (
+                sc.table("app_orders")
+                .select("customer_id")
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .eq("id", int(order_id))
+                .limit(1)
+                .execute()
+            )
+            if _or.data and _or.data[0].get("customer_id") is not None:
+                customer_id = int(_or.data[0]["customer_id"])
+        except Exception:
+            pass
+
+    _base_note = (note or "").strip() or "관리자 분할 수동 매칭"
+    _tag = _ext_pay_encode_split_pids(pids)
+    _note = f"{_base_note} · {_tag}"
+    payload = {
+        "db_filename": db_filename,
+        "source": source,
+        "row_id": int(row_id),
+        "payment_id": int(head_pid),
+        "order_id": int(order_id) if order_id is not None else None,
+        "customer_id": customer_id,
+        "result_code": "split_matched",
+        "note": _note,
+        "matched_by": (matched_by or "").strip() or None,
+    }
+    try:
+        existing = (
+            sc.table("app_external_pay_matches")
+            .select("id")
+            .eq("db_filename", db_filename)
+            .eq("row_id", int(row_id))
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            sc.table("app_external_pay_matches").update(payload).eq(
+                "db_filename", db_filename
+            ).eq("row_id", int(row_id)).execute()
+        else:
+            sc.table("app_external_pay_matches").insert(payload).execute()
+        return True, None
+    except Exception as e:
+        return False, f"분할 매칭 저장 실패: {e}"
+
+
 def _ext_pay_unlink_row(db_filename: str, source: str, row_id: int) -> tuple[bool, str | None]:
     """공식 행의 매칭을 해제. 자동 매칭이 잘못 붙었을 때 관리자가 되돌리는 용도."""
     if not db_filename or not row_id:
@@ -32006,6 +32091,9 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         f"매칭 대상: 해당 매장의 {_src_side} 결제 전체(신규고객 한정 아님)"
     )
 
+    # AI 유사 매칭 제안 (온누리 파일럿) — 수동 매칭 전 관리자 검토
+    _render_ext_pay_ai_similar_match(sel_db, sel_src, df, me_uname)
+
     # 수동 매칭 (자동매칭 실패 행 → ERP 결제 지정)
     _render_ext_pay_manual_match_ui(sel_db, sel_src, df, new_from, me_uname)
 
@@ -32148,6 +32236,339 @@ def _render_ext_pay_conflict_panel(
         if st.button("모두 skip 유지 (패널 닫기)", key=f"ext_pay_conflict_clear_{sel_db}_{sel_src}"):
             st.session_state.pop(key, None)
             st.rerun()
+
+
+def _render_ext_pay_ai_similar_match(
+    sel_db: str, sel_src: str, df: "pd.DataFrame", me_uname: str,
+) -> None:
+    """Gemini 로 미매칭 공식 행 ↔ 미매칭 ERP 결제 사이 유사 매칭 후보를 제안.
+
+    - 온누리 파일럿. 자동 확정 없음. 관리자가 개별 승인 · 거절.
+    - 승인 시 `_ext_pay_manual_link` (pair) 또는 `_ext_pay_manual_link_split` (split) 실행.
+    - 승인/거절 모두 `app_import_ai_feedback` 에 `extpay_pair_{source}` / `extpay_split_{source}` /
+      `extpay_flag_{source}` kind 로 저장 (원가 대사 피드백과 kind 로 분리).
+    """
+    if df is None or getattr(df, "empty", True):
+        return
+    if sel_src != "onnuri":
+        # 파일럿은 온누리부터. 다른 소스는 노출하지 않는다.
+        return
+    try:
+        import ext_pay_ai_reconcile as _epai
+    except ImportError:
+        return
+
+    # 미매칭 후보 유무 사전 체크
+    _has_off = df["결과"].isin(_epai.UNMATCHED_OFFICIAL_CODES).any() if "결과" in df.columns else False
+    _has_erp = (df["결과"] == "erp_only").any() if "결과" in df.columns else False
+    if not (_has_off or _has_erp):
+        return
+
+    # Gemini 키
+    try:
+        _gkey = str((st.secrets.get("gemini") or {}).get("api_key") or "") or os.environ.get(
+            "GEMINI_API_KEY", "",
+        )
+    except Exception:
+        _gkey = os.environ.get("GEMINI_API_KEY", "")
+
+    _src_ko = _epai.src_label(sel_src)
+    with st.expander(
+        f"🤖 Gemini 유사 매칭 제안 ({_src_ko} · 베타)", expanded=False,
+    ):
+        st.caption(
+            "자동매칭이 실패한 공식 행과 모모 미매칭 결제를 승인번호·뒤4자리·날짜·이름 조각으로 "
+            "묶어 후보만 제안합니다. 자동 저장하지 않으니 관리자가 각 항목을 확인해 승인/거절하세요. "
+            "승인/거절 기록은 다음 실행에 few-shot 예시로 재사용됩니다."
+        )
+        _disabled = not bool(_gkey.strip())
+        if _disabled:
+            st.info("GEMINI_API_KEY 가 없어 제안 실행이 비활성화되어 있습니다.")
+        _sug_key = f"extpay_ai_sug_{sel_db}_{sel_src}"
+        cA, cB = st.columns([2, 1])
+        with cA:
+            if st.button(
+                "🚀 유사 매칭 제안 생성",
+                key=f"extpay_ai_run_{sel_db}_{sel_src}",
+                disabled=_disabled,
+                help="공식 미매칭 60건 · 모모 미매칭 60건 상한. 이름/전화번호는 마스킹되어 전송됩니다.",
+            ):
+                sc_ai, _ = get_supabase_client()
+                _ctx = _epai.build_ai_context(df, sel_src)
+                _fb = _epai.load_feedback(sc_ai, sel_db, sel_src) if sc_ai else []
+                with st.spinner("Gemini 호출 중..."):
+                    _sug = _epai.suggest_matches_with_gemini(
+                        api_key=_gkey, source=sel_src, context=_ctx, feedback=_fb,
+                    )
+                st.session_state[_sug_key] = _sug
+        with cB:
+            if st.button(
+                "결과 초기화",
+                key=f"extpay_ai_clear_{sel_db}_{sel_src}",
+                help="현재 세션의 제안 결과를 지웁니다.",
+            ):
+                st.session_state.pop(_sug_key, None)
+                st.rerun()
+
+        _sug = st.session_state.get(_sug_key)
+        if not _sug:
+            return
+        if _sug.get("error"):
+            st.warning(f"Gemini: {_sug.get('error')}")
+
+        # dataframe 조회 색인 (row_id / payment_id → 표시용 라벨)
+        _row_lookup: dict[int, dict] = {}
+        _pay_lookup: dict[int, dict] = {}
+        for _rec in df.to_dict("records"):
+            try:
+                _rid = int(_rec.get("row_id") or 0)
+            except (TypeError, ValueError):
+                _rid = 0
+            try:
+                _pid = int(_rec.get("_payment_id")) if _rec.get("_payment_id") is not None else 0
+            except (TypeError, ValueError):
+                _pid = 0
+            if _rid > 0 and _rid not in _row_lookup:
+                _row_lookup[_rid] = _rec
+            if _pid > 0 and _pid not in _pay_lookup:
+                _pay_lookup[_pid] = _rec
+
+        def _row_label(rid: int) -> str:
+            _r = _row_lookup.get(rid) or {}
+            parts = [
+                str(_r.get("공식일자") or ""),
+                _r.get("승인번호") or _r.get("뒤4") or "",
+                f"{_r.get('공식금액') or ''}원",
+                _r.get("구매자") or "",
+            ]
+            return " · ".join([str(p) for p in parts if str(p).strip()]) or f"row {rid}"
+
+        def _pay_label(pid: int) -> str:
+            _r = _pay_lookup.get(pid) or {}
+            parts = [
+                str(_r.get("ERP일자") or ""),
+                f"{int(_r.get('_amount_int') or _r.get('ERP금액') or 0):,}원",
+                _r.get("_payment_method") or "",
+                _r.get("고객명") or "",
+                _r.get("담당매니저") or "",
+            ]
+            return " · ".join([str(p) for p in parts if str(p).strip()]) or f"pay {pid}"
+
+        # 저장 후 결과 세션에서 해당 항목 제거 (중복 클릭 방지)
+        def _drop_pair(rid: int, pid: int) -> None:
+            _cur = st.session_state.get(_sug_key) or {}
+            _cur["pairs"] = [
+                x for x in (_cur.get("pairs") or [])
+                if not (int(x.get("row_id") or 0) == rid and int(x.get("payment_id") or 0) == pid)
+            ]
+            st.session_state[_sug_key] = _cur
+
+        def _drop_split(rid: int) -> None:
+            _cur = st.session_state.get(_sug_key) or {}
+            _cur["splits"] = [
+                x for x in (_cur.get("splits") or [])
+                if int(x.get("row_id") or 0) != rid
+            ]
+            st.session_state[_sug_key] = _cur
+
+        def _drop_flag(idx: int) -> None:
+            _cur = st.session_state.get(_sug_key) or {}
+            _flags = list(_cur.get("flags") or [])
+            if 0 <= idx < len(_flags):
+                _flags.pop(idx)
+            _cur["flags"] = _flags
+            st.session_state[_sug_key] = _cur
+
+        _sc_fb, _ = get_supabase_client()
+
+        pairs = _sug.get("pairs") or []
+        splits = _sug.get("splits") or []
+        flags = _sug.get("flags") or []
+        if not (pairs or splits or flags):
+            st.caption("현재 조건으로는 제안이 없습니다.")
+            return
+
+        # ── pair 제안
+        if pairs:
+            st.markdown(f"**1:1 매칭 후보 ({len(pairs)}건)**")
+        for _p in pairs:
+            _rid = int(_p.get("row_id") or 0)
+            _pid = int(_p.get("payment_id") or 0)
+            _conf = float(_p.get("confidence") or 0)
+            _reason = str(_p.get("reason") or "")
+            with st.container(border=True):
+                st.markdown(
+                    f"**공식** {_row_label(_rid)}  \n"
+                    f"**모모** {_pay_label(_pid)}  \n"
+                    f"신뢰도 `{_conf:.2f}` · 근거: {_reason or '-'}"
+                )
+                c1, c2, _ = st.columns([1, 1, 3])
+                with c1:
+                    if st.button(
+                        "✅ 승인 매칭",
+                        key=f"extpay_ai_pair_ok_{sel_db}_{sel_src}_{_rid}_{_pid}",
+                    ):
+                        ok, err = _ext_pay_manual_link(
+                            sel_db, sel_src, _rid, _pid,
+                            matched_by=me_uname,
+                            note=f"AI 제안 승인 (conf {_conf:.2f}) {_reason}"[:180],
+                        )
+                        if not ok:
+                            st.error(err or "매칭 저장 실패")
+                        else:
+                            _epai.save_feedback(
+                                _sc_fb, sel_db, "extpay_pair", sel_src,
+                                {
+                                    "row_id": _rid, "payment_id": _pid,
+                                    "confidence": _conf, "reason": _reason,
+                                    "row_label": _row_label(_rid),
+                                    "pay_label": _pay_label(_pid),
+                                },
+                                "accepted", me_uname,
+                            )
+                            _drop_pair(_rid, _pid)
+                            st.success("매칭 저장 완료")
+                            st.rerun()
+                with c2:
+                    if st.button(
+                        "❌ 거절",
+                        key=f"extpay_ai_pair_no_{sel_db}_{sel_src}_{_rid}_{_pid}",
+                    ):
+                        _epai.save_feedback(
+                            _sc_fb, sel_db, "extpay_pair", sel_src,
+                            {
+                                "row_id": _rid, "payment_id": _pid,
+                                "confidence": _conf, "reason": _reason,
+                                "row_label": _row_label(_rid),
+                                "pay_label": _pay_label(_pid),
+                            },
+                            "rejected", me_uname,
+                        )
+                        _drop_pair(_rid, _pid)
+                        st.rerun()
+
+        # ── split 제안
+        if splits:
+            st.markdown(f"**분할 결제 후보 ({len(splits)}건)**")
+        for _s in splits:
+            _rid = int(_s.get("row_id") or 0)
+            _pids = [int(x) for x in (_s.get("payment_ids") or []) if x]
+            _conf = float(_s.get("confidence") or 0)
+            _reason = str(_s.get("reason") or "")
+            _row_amt = int(((_row_lookup.get(_rid) or {}).get("공식금액") or 0) or 0)
+            _pay_sum = 0
+            for _pid in _pids:
+                _pr = _pay_lookup.get(_pid) or {}
+                try:
+                    _pay_sum += int(_pr.get("_amount_int") or _pr.get("ERP금액") or 0)
+                except (TypeError, ValueError):
+                    continue
+            _mismatch = _row_amt and _pay_sum and _row_amt != _pay_sum
+            with st.container(border=True):
+                st.markdown(
+                    f"**공식** {_row_label(_rid)} (금액 {_row_amt:,}원)  \n"
+                    f"**모모 합** {_pay_sum:,}원 · {len(_pids)}건  \n"
+                    + "\n".join([f"  · {_pay_label(p)}" for p in _pids])
+                    + f"\n\n신뢰도 `{_conf:.2f}` · 근거: {_reason or '-'}"
+                )
+                if _mismatch:
+                    st.warning(
+                        f"공식 금액({_row_amt:,})과 모모 합({_pay_sum:,})이 다릅니다. 승인 전 확인 필요."
+                    )
+                c1, c2, _ = st.columns([1, 1, 3])
+                with c1:
+                    if st.button(
+                        "✅ 승인 분할매칭",
+                        key=f"extpay_ai_split_ok_{sel_db}_{sel_src}_{_rid}",
+                        disabled=bool(_mismatch),
+                    ):
+                        ok, err = _ext_pay_manual_link_split(
+                            sel_db, sel_src, _rid, _pids,
+                            matched_by=me_uname,
+                            note=f"AI 분할 승인 (conf {_conf:.2f}) {_reason}"[:180],
+                        )
+                        if not ok:
+                            st.error(err or "분할 매칭 저장 실패")
+                        else:
+                            _epai.save_feedback(
+                                _sc_fb, sel_db, "extpay_split", sel_src,
+                                {
+                                    "row_id": _rid, "payment_ids": _pids,
+                                    "confidence": _conf, "reason": _reason,
+                                    "row_amount": _row_amt, "pay_sum": _pay_sum,
+                                },
+                                "accepted", me_uname,
+                            )
+                            _drop_split(_rid)
+                            st.success("분할 매칭 저장 완료")
+                            st.rerun()
+                with c2:
+                    if st.button(
+                        "❌ 거절",
+                        key=f"extpay_ai_split_no_{sel_db}_{sel_src}_{_rid}",
+                    ):
+                        _epai.save_feedback(
+                            _sc_fb, sel_db, "extpay_split", sel_src,
+                            {
+                                "row_id": _rid, "payment_ids": _pids,
+                                "confidence": _conf, "reason": _reason,
+                                "row_amount": _row_amt, "pay_sum": _pay_sum,
+                            },
+                            "rejected", me_uname,
+                        )
+                        _drop_split(_rid)
+                        st.rerun()
+
+        # ── flags (검토 대상 · 자동 저장 없음)
+        if flags:
+            st.markdown(f"**검토 플래그 ({len(flags)}건)**")
+        for _i, _f in enumerate(flags):
+            _rid = _f.get("row_id")
+            _pid = _f.get("payment_id")
+            _ftype = str(_f.get("type") or "")
+            _fconf = float(_f.get("confidence") or 0)
+            _freason = str(_f.get("reason") or "")
+            _lbls: list[str] = []
+            if _rid:
+                _lbls.append(f"공식: {_row_label(int(_rid))}")
+            if _pid:
+                _lbls.append(f"모모: {_pay_label(int(_pid))}")
+            with st.container(border=True):
+                st.markdown(
+                    "  \n".join(_lbls) if _lbls else "(대상 미지정)",
+                )
+                st.caption(f"유형 `{_ftype}` · 신뢰 `{_fconf:.2f}` · 사유: {_freason or '-'}")
+                c1, c2, _ = st.columns([1, 1, 3])
+                with c1:
+                    if st.button(
+                        "확인함",
+                        key=f"extpay_ai_flag_ok_{sel_db}_{sel_src}_{_i}",
+                    ):
+                        _epai.save_feedback(
+                            _sc_fb, sel_db, "extpay_flag", sel_src,
+                            {
+                                "row_id": _rid, "payment_id": _pid,
+                                "type": _ftype, "confidence": _fconf, "reason": _freason,
+                            },
+                            "accepted", me_uname,
+                        )
+                        _drop_flag(_i)
+                        st.rerun()
+                with c2:
+                    if st.button(
+                        "무시",
+                        key=f"extpay_ai_flag_no_{sel_db}_{sel_src}_{_i}",
+                    ):
+                        _epai.save_feedback(
+                            _sc_fb, sel_db, "extpay_flag", sel_src,
+                            {
+                                "row_id": _rid, "payment_id": _pid,
+                                "type": _ftype, "confidence": _fconf, "reason": _freason,
+                            },
+                            "rejected", me_uname,
+                        )
+                        _drop_flag(_i)
+                        st.rerun()
 
 
 def _render_ext_pay_manual_match_ui(
