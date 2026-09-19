@@ -5166,15 +5166,19 @@ def _ext_pay_new_customer_order_ids(sc, db_filename: str, order_rows: list[dict]
 
 def _ext_pay_unmatched_erp_pays(
     sc, db_filename: str, source: str, erp_from: date, used_payment_ids: set[int],
+    erp_to: date | None = None,
 ) -> list[dict]:
     """공식 파일에 매칭되지 않은 ERP 결제 (erp_only).
     - onnuri/ulsanpay: 신규고객 매출로 한정 (기존 정책 유지)
-    - card/mainpay: 전체 고객 (신규 필터 없음)"""
+    - card/mainpay: 전체 고객 (신규 필터 없음)
+    - erp_to: 지정 시 payment_date <= erp_to 로 상한 필터 적용."""
     try:
         def _filt(q):
             q = q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).gt("amount", 0)
             if erp_from is not None:
                 q = q.gte("payment_date", erp_from.isoformat())
+            if erp_to is not None:
+                q = q.lte("payment_date", erp_to.isoformat())
             return q
         pays = _ext_pay_select_paged(
             sc, "app_payments",
@@ -5285,10 +5289,13 @@ def _ext_pay_unmatched_erp_pays(
 
 def _ext_pay_list_matches_df(
     db_filename: str, source: str, verify_from: date | None, erp_from: date | None = None,
+    verify_to: date | None = None, erp_to: date | None = None,
 ) -> "pd.DataFrame":
     """관리자 UI 표시용: 공식 행 + 매칭 결과 + ERP-only 행 DataFrame.
-    verify_from 이 None 이면 공식 행은 날짜 필터 없이 해당 매장·출처 전체.
-    erp_from 은 ERP-only 조회 시작일(미지정 시 verify_from 또는 기본 시작일)."""
+    verify_from 이 None 이면 공식 행은 하한 필터 없이 해당 매장·출처 전체.
+    verify_to 가 지정되면 tx_date <= verify_to 상한 적용.
+    erp_from 은 ERP-only 조회 시작일(미지정 시 verify_from 또는 기본 시작일).
+    erp_to 가 지정되면 payment_date <= erp_to 상한 적용."""
     sc, err = get_supabase_client()
     if err or not sc:
         return pd.DataFrame()
@@ -5302,6 +5309,8 @@ def _ext_pay_list_matches_df(
             q = q.eq("db_filename", db_filename).eq("source", source)
             if verify_from is not None:
                 q = q.gte("tx_date", verify_from.isoformat())
+            if verify_to is not None:
+                q = q.lte("tx_date", verify_to.isoformat())
             return q
         _sel = (
             "id, tx_date, tx_time, phone_last4, amount, tx_status, settle_status, "
@@ -5359,7 +5368,7 @@ def _ext_pay_list_matches_df(
                 pass
 
     erp_only_pays = _ext_pay_unmatched_erp_pays(
-        sc, db_filename, source, erp_only_from, set(payment_ids),
+        sc, db_filename, source, erp_only_from, set(payment_ids), erp_to=erp_to,
     )
     for p in erp_only_pays:
         cid = p.get("customer_id")
@@ -30809,7 +30818,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         st.caption("이 매장에 저장된 업로드 이력이 없습니다. (테이블 미생성 또는 아직 업로드 없음)")
 
     cur_from = _ext_pay_load_settings(sel_db)
-    c1, c2 = st.columns([2, 1])
+    _today = date.today()
+    c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
         new_from = st.date_input(
             "검증 시작일",
@@ -30818,6 +30828,19 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             help="이 날짜 이전의 결제·공식 행은 매칭 대상에서 제외됩니다.",
         )
     with c2:
+        _to_default = st.session_state.get(f"extpay_to_{sel_db}") or _today
+        if isinstance(_to_default, str):
+            try:
+                _to_default = date.fromisoformat(_to_default)
+            except ValueError:
+                _to_default = _today
+        new_to = st.date_input(
+            "검증 종료일",
+            value=_to_default,
+            key=f"extpay_to_{sel_db}",
+            help="이 날짜 이후의 결제·공식 행은 매칭 결과 표에서 제외됩니다. (세션 한정, 저장 안 됨)",
+        )
+    with c3:
         if st.button("시작일 저장", key=f"extpay_from_save_{sel_db}"):
             ok, err = _ext_pay_save_settings(sel_db, new_from, me_uname)
             if ok:
@@ -30825,6 +30848,9 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
                 st.rerun()
             else:
                 st.error(f"저장 실패: {err}")
+
+    if new_to < new_from:
+        st.warning("검증 종료일이 시작일보다 빠릅니다. 종료일을 다시 확인해 주세요.")
 
     st.markdown("---")
 
@@ -30949,13 +30975,17 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         )
     saved_n = _ext_pay_count_rows(sel_db, sel_src)
     df = _ext_pay_list_matches_df(
-        sel_db, sel_src, None if show_all_saved else new_from, erp_from=new_from,
+        sel_db, sel_src,
+        None if show_all_saved else new_from,
+        erp_from=new_from,
+        verify_to=new_to,
+        erp_to=new_to,
     )
     if df.empty:
         if saved_n > 0:
             st.warning(
                 f"이 출처로 **{saved_n}건이 저장**되어 있습니다. "
-                "검증 시작일을 더 이르게 하거나 '시작일 이전 저장분도 보기'를 켜 주세요."
+                "검증 시작일/종료일을 넓히거나 '시작일 이전 저장분도 보기'를 켜 주세요."
             )
         elif batches:
             st.warning(
@@ -30965,7 +30995,34 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         else:
             st.caption("아직 매칭 결과가 없습니다. 파일을 업로드하면 여기에 표시됩니다.")
         return
-    st.caption(f"표시 {len(df)}건 · DB 저장 {saved_n}건 ({src_labels.get(sel_src, sel_src)})")
+    st.caption(
+        f"표시 {len(df)}건 · DB 저장 {saved_n}건 ({src_labels.get(sel_src, sel_src)}) "
+        f"· 기간: {new_from.isoformat()} ~ {new_to.isoformat()}"
+    )
+
+    # 소스별 라벨 (헤더·결과라벨 리네임에 사용)
+    _src_side = {
+        "onnuri": "온누리",
+        "ulsanpay": "울산페이",
+        "card": "카드",
+        "mainpay": "메인페이",
+    }[sel_src]
+
+    # 기간 합계 · 차액 (공식 vs 모모)
+    def _amt_to_int(v) -> int:
+        try:
+            s = str(v or "").replace(",", "").strip()
+            return int(s) if s else 0
+        except (TypeError, ValueError):
+            return 0
+    _official_total = int(df["공식금액"].map(_amt_to_int).sum()) if "공식금액" in df.columns else 0
+    _erp_total = int(df["ERP금액"].map(_amt_to_int).sum()) if "ERP금액" in df.columns else 0
+    _diff = _official_total - _erp_total
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f"{_src_side} 합계", f"{_official_total:,}원")
+    m2.metric("모모입력 합계", f"{_erp_total:,}원")
+    m3.metric(f"차액 ({_src_side}−모모)", f"{_diff:,}원")
+
     if sel_src == "ulsanpay" and "뒤4" in df.columns:
         df = df.drop(columns=["뒤4", "구매자", "정산"], errors="ignore")
     elif sel_src == "onnuri" and "승인번호" in df.columns:
@@ -30985,13 +31042,36 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             st.success("표시할 알림이 없습니다. (모두 정상 매칭)")
             _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
             return
+    # 결과 코드 → 한글 라벨 (표시용, 원본 df 는 유지)
+    _result_map = {
+        "matched_ok": "금액일치",
+        "amount_mismatch": "금액 다름",
+        "official_only": f"{_src_side}에만 존재",
+        "erp_only": "모모에만 존재",
+        "official_canceled": f"{_src_side} 취소·모모 잔존",
+        "erp_canceled_official_paid": f"모모 취소·{_src_side} 결제",
+        "ambiguous": "다중 매치",
+        "manual_matched": "수동 매칭",
+        "미매칭": "미매칭",
+    }
+    # 헤더 리네임 (ERP일자→모모입력일, ERP금액→모모입력금액, 공식상태→<소스명>)
+    _rename_map = {
+        "ERP일자": "모모입력일",
+        "ERP금액": "모모입력금액",
+        "공식상태": _src_side,
+    }
+    df_show = df.copy()
+    if "결과" in df_show.columns:
+        df_show["결과"] = df_show["결과"].map(lambda v: _result_map.get(v, v))
+    df_show = df_show.rename(columns=_rename_map)
+
     _flag_col = "_fabricated"
     _hidden = {_flag_col, "row_id"}
-    _all_cols = [c for c in df.columns if c not in _hidden]
-    _show = df[_all_cols]
+    _all_cols = [c for c in df_show.columns if c not in _hidden]
+    _show = df_show[_all_cols]
     _red = (
-        df[_flag_col].reindex(_show.index).fillna(False).astype(bool)
-        if _flag_col in df.columns
+        df_show[_flag_col].reindex(_show.index).fillna(False).astype(bool)
+        if _flag_col in df_show.columns
         else pd.Series(False, index=_show.index)
     )
 
@@ -31002,12 +31082,12 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
 
     _col_w = {
         "공식일자": 110,
-        "ERP일자": 110,
+        "모모입력일": 110,
         "승인번호": 90,
         "뒤4": 70,
         "공식금액": 100,
-        "ERP금액": 110,
-        "공식상태": 90,
+        "모모입력금액": 120,
+        _src_side: 90,
         "정산": 80,
         "구매자": 90,
         "결과": 180,
@@ -31026,9 +31106,9 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         hide_index=True,
         column_config=_cfg,
     )
-    _dl = df[_all_cols].copy()
-    if _flag_col in df.columns:
-        _dl["가공번호의심"] = df[_flag_col].map(lambda v: "Y" if bool(v) else "")
+    _dl = df_show[_all_cols].copy()
+    if _flag_col in df_show.columns:
+        _dl["가공번호의심"] = df_show[_flag_col].map(lambda v: "Y" if bool(v) else "")
     if "승인번호" in _dl.columns:
         _dl["승인번호"] = _dl["승인번호"].map(
             lambda v: _ext_pay_norm_approval6(v) if str(v or "").strip() else ""
@@ -31056,14 +31136,14 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         key=f"extpay_xlsx_{sel_db}_{sel_src}",
     )
     st.caption(
-        "빨간 행: 공식 파일에 승인번호가 없고 ERP에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
-        "동일 승인번호의 공식 취소와 ERP 취소는 날짜가 달라도 상계되어 matched_ok 로 표시됩니다. "
-        "결제 금액·수단·승인번호를 바꾸면 해당 건은 자동 재매칭됩니다. "
-        "결과 코드: matched_ok=정상 · manual_matched=관리자 수동 매칭 · "
-        "official_only=공식만 있음(미입력) · erp_only=ERP만 있음(공식 파일 없음) · "
-        "amount_mismatch=공식파일에 있으나 금액 다름(오입력 의심) · "
-        "official_canceled=공식 취소인데 ERP 잔존(임의취소 의심) · "
-        "erp_canceled_official_paid=ERP 취소인데 공식 결제완료 · ambiguous=시간까지 봐도 특정 불가 · 미매칭=아직 매칭 미실행"
+        f"빨간 행: 공식 파일에 승인번호가 없고 모모에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
+        f"동일 승인번호의 {_src_side} 취소와 모모 취소는 날짜가 달라도 상계되어 '금액일치'로 표시됩니다. "
+        f"결제 금액·수단·승인번호를 바꾸면 해당 건은 자동 재매칭됩니다. "
+        f"결과: 금액일치=정상 · 금액 다름={_src_side}·모모 금액 상이(오입력 의심) · "
+        f"{_src_side}에만 존재={_src_side}만 있음(모모 미입력) · 모모에만 존재=모모만 있음({_src_side} 파일 없음) · "
+        f"{_src_side} 취소·모모 잔존={_src_side}은 취소인데 모모 잔존(임의취소 의심) · "
+        f"모모 취소·{_src_side} 결제=모모는 취소인데 {_src_side} 결제완료 · "
+        f"다중 매치=동일 승인·금액이 여럿이라 특정 불가 · 수동 매칭=관리자가 직접 붙임 · 미매칭=아직 매칭 미실행"
     )
 
     # 수동 매칭 (자동매칭 실패 행 → ERP 결제 지정)
