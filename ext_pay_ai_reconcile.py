@@ -344,44 +344,73 @@ def suggest_matches_with_gemini(
             "responseMimeType": "application/json",
         },
     }
-    # 일시 오류(5xx · 429) 는 백오프 후 재시도, 다른 모델로도 폴백
+    # 일시 오류(5xx · 429) 는 백오프 후 재시도, 4xx 는 즉시 다음 모델로 폴백
     import time as _time
-    _models = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash")
+    # 오버라이드: st.secrets["gemini"]["extpay_models"] 리스트가 있으면 우선. 없으면 기본 폴백.
+    _override: list[str] = []
+    try:
+        import streamlit as _st  # type: ignore
+        _cfg = (_st.secrets.get("gemini") or {}).get("extpay_models") or []
+        if isinstance(_cfg, (list, tuple)):
+            _override = [str(x).strip() for x in _cfg if str(x).strip()]
+    except Exception:
+        pass
+    _models = tuple(_override) or (
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-001",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+    )
     _retry_status = {429, 500, 502, 503, 504}
     _sleeps = (1.0, 2.0, 4.0)
     last_err: str | None = None
+    last_status_codes: list[int] = []
     resp = None
     for _model in _models:
         _url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{_model}:generateContent?key={key}"
         )
+        _final_resp = None
         for _attempt in range(len(_sleeps) + 1):
             try:
-                resp = httpx.post(_url, json=body, timeout=timeout)
+                _cur = httpx.post(_url, json=body, timeout=timeout)
             except Exception as e:  # 연결 오류 등도 재시도
                 last_err = f"{_model}: {e}"
                 if _attempt < len(_sleeps):
                     _time.sleep(_sleeps[_attempt])
                     continue
-                resp = None
+                _final_resp = None
                 break
-            if resp.status_code in _retry_status and _attempt < len(_sleeps):
-                last_err = f"{_model}: HTTP {resp.status_code}"
+            if _cur.status_code in _retry_status and _attempt < len(_sleeps):
+                last_err = f"{_model}: HTTP {_cur.status_code}"
                 _time.sleep(_sleeps[_attempt])
                 continue
+            _final_resp = _cur
             break
-        if resp is not None and resp.status_code == 200:
-            break
-        if resp is not None:
-            last_err = f"{_model}: HTTP {resp.status_code}"
+        if _final_resp is not None:
+            last_status_codes.append(_final_resp.status_code)
+            if _final_resp.status_code == 200:
+                resp = _final_resp
+                break
+            last_err = f"{_model}: HTTP {_final_resp.status_code}"
         # 다음 모델로 폴백
-        resp = None
-    if resp is None or resp.status_code != 200:
-        out["error"] = (
-            f"Gemini 서버 일시 오류로 제안을 받지 못했습니다 ({last_err or 'unknown'}). "
-            f"잠시 후 다시 시도해 주세요."
-        )
+    if resp is None:
+        # 모든 시도가 404 · 400 이면 모델 접근 권한/이름 문제 → 다른 안내
+        _access_bad = last_status_codes and all(c in (400, 404) for c in last_status_codes)
+        if _access_bad:
+            out["error"] = (
+                "이 API 키로 사용 가능한 Gemini 모델을 찾지 못했습니다 "
+                f"(마지막 오류: {last_err or 'HTTP 404'}). "
+                "관리자에게 GEMINI_API_KEY 유효성 또는 접근 가능한 모델 목록을 확인해 주세요. "
+                "필요 시 `st.secrets['gemini']['extpay_models']` 에 사용 가능한 모델 이름을 나열할 수 있습니다."
+            )
+        else:
+            out["error"] = (
+                f"Gemini 서버 일시 오류로 제안을 받지 못했습니다 ({last_err or 'unknown'}). "
+                "잠시 후 다시 시도해 주세요."
+            )
         return out
     try:
         data = resp.json()
