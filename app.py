@@ -30090,8 +30090,24 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         new_method = " · ".join(x["method"] for x in new_lines if x["method"]) or ""
         new_onnuri = " · ".join(x["onnuri"] for x in new_lines if x["onnuri"]) or ""
 
-        reason = st.text_area("변경 사유 *", key=f"pcr_reason_{order_id}", height=70,
-                              placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제")
+        _rsn_c1, _rsn_c2, _rsn_c3 = st.columns([3, 1.5, 1.5])
+        with _rsn_c1:
+            reason = st.text_area(
+                "변경 사유 *", key=f"pcr_reason_{order_id}", height=90,
+                placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제",
+            )
+        with _rsn_c2:
+            refund_bank = st.text_input(
+                "환불 계좌 (은행·예금주) *",
+                key=f"pcr_refund_bank_{order_id}",
+                placeholder="예: 국민은행 홍길동",
+            )
+        with _rsn_c3:
+            refund_account = st.text_input(
+                "계좌번호 *",
+                key=f"pcr_refund_account_{order_id}",
+                placeholder="예: 123-45-678901",
+            )
 
         emp_options = _pcr_assignee_options(store_id, role, me_uname)
         emp_username_to_label = {u: lbl for u, lbl in emp_options}
@@ -30120,8 +30136,12 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         for _de in dup_errs:
             st.error(_de)
 
+        _refund_bank_ok = bool((refund_bank or "").strip())
+        _refund_account_ok = bool((refund_account or "").strip())
         can_submit = (
             bool((reason or "").strip())
+            and _refund_bank_ok
+            and _refund_account_ok
             and bool(orig.get("method") or orig.get("amount"))
             and bool(pcr_assignees)
             and sel_pid is not None
@@ -30132,8 +30152,12 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 st.caption("취소·변경할 결제를 위 대상 결제 목록에서 먼저 선택하세요.")
             elif not pcr_assignees:
                 st.caption("담당자를 1명 이상 지정해야 요청할 수 있습니다.")
-            elif not (reason or "").strip() or not (orig.get("method") or orig.get("amount")):
-                st.caption("원본 확인과 사유 입력이 있어야 요청할 수 있습니다.")
+            elif not (reason or "").strip():
+                st.caption("변경 사유를 입력해야 요청할 수 있습니다.")
+            elif not _refund_bank_ok or not _refund_account_ok:
+                st.caption("환불 계좌(은행·예금주)와 계좌번호를 모두 입력해야 합니다.")
+            elif not (orig.get("method") or orig.get("amount")):
+                st.caption("원본 결제 정보를 확인해 주세요.")
         if st.button("📤 요청 등록 (기존 결제 취소 + 신규 결제 자동 저장)",
                      key=f"pcr_submit_{order_id}",
                      type="primary", disabled=not can_submit):
@@ -30145,15 +30169,18 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
 
             # ── 검증 태스크를 먼저 생성 (결제 반영 전에 담당자 지정·결재 건이 있어야 함) ──
             _valid_lines = [x for x in new_lines if int(x.get("amount") or 0) > 0 and x.get("method")]
+            _reason_parts: list[str] = [
+                f"[환불계좌] {refund_bank.strip()} / {refund_account.strip()}",
+            ]
             if len(_valid_lines) > 1:
                 _split_detail = " / ".join(
                     f"{x['method']} {int(x['amount']):,}원"
                     + (f"({x['onnuri']})" if x.get("onnuri") else "")
                     for x in _valid_lines
                 )
-                _task_reason = f"[분할결제] {_split_detail}\n{reason}"
-            else:
-                _task_reason = reason
+                _reason_parts.append(f"[분할결제] {_split_detail}")
+            _reason_parts.append(reason)
+            _task_reason = "\n".join(_reason_parts)
             task_id, err = _tb.create_payment_change_task(
                 sale_id=order_id,
                 payment_id=sel_pid,
