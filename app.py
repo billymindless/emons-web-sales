@@ -6034,7 +6034,7 @@ def _ext_pay_list_matches_df(
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
-            "메모": "공식 파일에 없음",
+            "메모": f"{_ext_pay_ledger_label(source)}에 없음",
             "_fabricated": source == "ulsanpay" and bool(erp_ap),
             "_payment_id": (
                 int(p["payment_id"]) if p.get("payment_id") is not None else None
@@ -11117,8 +11117,10 @@ def _render_hq_cost_explain_request(
         st.rerun()
 
 
-def _render_hq_cost_explain_thread(task: dict, key_base: str, me_uname: str) -> None:
-    """생성된 소명 업무의 상태·댓글·답신 입력. 사내 업무 메뉴와 병행 사용 가능."""
+def _render_hq_cost_explain_thread(
+    task: dict, key_base: str, me_uname: str, *, request_noun: str = "소명 요청",
+) -> None:
+    """생성된 확인/소명 업무의 상태·댓글·답신 입력. 사내 업무 메뉴와 병행 사용 가능."""
     try:
         import task_board as _tb  # noqa: WPS433
     except Exception:
@@ -11129,7 +11131,7 @@ def _render_hq_cost_explain_thread(task: dict, key_base: str, me_uname: str) -> 
     status_code = str(task.get("status") or "")
     status_label = _tb.TASK_STATUS_LABELS.get(status_code, status_code or "-")
     st.info(
-        f"이 행은 이미 사내 업무 **#{tid}** 로 소명 요청되었습니다. 상태: **{status_label}**"
+        f"이 행은 이미 사내 업무 **#{tid}** 로 {request_noun}되었습니다. 상태: **{status_label}**"
     )
     st.caption(
         f"제목: {task.get('title') or ''} · "
@@ -11230,7 +11232,10 @@ def _render_hq_cost_explain_thread(task: dict, key_base: str, me_uname: str) -> 
             st.rerun()
     with _bc2:
         if status_code and status_code != "done":
-            if st.button("소명 완료로 종료", key=f"{key_base}::close"):
+            if st.button(
+                f"{request_noun.replace(' 요청', '')} 완료로 종료",
+                key=f"{key_base}::close",
+            ):
                 ok, cerr = _tb.update_status(tid, "done", me_uname)
                 if ok:
                     _tb.clear_task_caches()
@@ -11249,19 +11254,47 @@ _EXT_PAY_EXPLAIN_TAG_PREFIX = "ext-pay-reconcile"
 _EXT_PAY_SRC_LABEL_KO = {
     "onnuri": "온누리",
     "ulsanpay": "울산페이",
-    "card": "카드",
+    "card": "신용카드",
     "mainpay": "메인페이",
 }
 
-_EXT_PAY_RECONCILE_REASON = {
-    "erp_only": "모모에는 결제가 있으나 공식 파일에 대응 건이 없음 (공식 등록 누락 또는 입력 오류 의심)",
-    "erp_canceled_official_paid": "공식은 취소인데 모모 결제가 결제완료로 남아 있음 (모모 취소 처리 누락 의심)",
-    "official_canceled": "공식은 취소인데 모모에 대응 결제가 잔존함 (임의취소·환불 처리 확인 필요)",
-    "ambiguous": "동일 승인·금액 공식 후보가 여러 건이라 매칭 확정 불가 (실물 영수증·상세 정보 확인 필요)",
-    "amount_mismatch": "공식 파일 금액과 모모 결제 금액이 상이 (정정 입력 필요)",
-    "official_only": "공식 파일에는 있으나 모모 매출이 등록되지 않음 (매출 입력 누락 확인 필요)",
-    "미매칭": "자동 매칭이 아직 실행되지 않음 (매칭 실행 필요)",
-}
+
+def _ext_pay_src_label(source: str) -> str:
+    return _EXT_PAY_SRC_LABEL_KO.get(source, source)
+
+
+def _ext_pay_ledger_label(source: str) -> str:
+    """공식 업로드 쪽 표시명. 예: 울산페이 원장."""
+    return f"{_ext_pay_src_label(source)} 원장"
+
+
+def _ext_pay_result_label(code: str, source: str) -> str:
+    src = _ext_pay_src_label(source)
+    return {
+        "matched_ok": "금액일치",
+        "amount_mismatch": "금액 다름",
+        "official_only": f"{src}만 있음",
+        "erp_only": "모모만 있음",
+        "official_canceled": f"{src} 취소·모모 잔존",
+        "erp_canceled_official_paid": f"모모 취소·{src} 결제",
+        "ambiguous": "다중 매치",
+        "manual_matched": "수동 매칭",
+        "split_matched": "분할 합산 일치",
+        "미매칭": "미매칭",
+    }.get(code, code)
+
+
+def _ext_pay_reconcile_reason(code: str, source: str) -> str:
+    ledger = _ext_pay_ledger_label(source)
+    return {
+        "erp_only": f"모모에는 결제가 있으나 {ledger}에 대응 건이 없음 ({ledger} 등록 누락 또는 입력 오류 의심)",
+        "erp_canceled_official_paid": f"{ledger}은 결제완료인데 모모는 취소되어 있음 (모모 취소 처리 확인 필요)",
+        "official_canceled": f"{ledger}은 취소인데 모모에 대응 결제가 남아 있음 (임의취소·환불 처리 확인 필요)",
+        "ambiguous": f"동일 승인·금액 {ledger} 후보가 여러 건이라 맞추기 확정 불가 (실물 영수증·상세 정보 확인 필요)",
+        "amount_mismatch": f"{ledger} 금액과 모모원장 금액이 다름 (정정 입력 필요)",
+        "official_only": f"{ledger}에는 있으나 모모 매출이 등록되지 않음 (매출 입력 누락 확인 필요)",
+        "미매칭": "자동 맞추기가 아직 실행되지 않음 (맞추기 실행 필요)",
+    }.get(code, "결제 대조 확인 필요")
 
 # 소명 요청 대상 result_code
 _EXT_PAY_RECONCILE_TARGET_CODES = frozenset({
@@ -11398,16 +11431,18 @@ def _render_ext_pay_reconcile_request(
 
     payment_id = target.get("payment_id")
     row_id = target.get("row_id")
-    src_label = target.get("src_label") or _EXT_PAY_SRC_LABEL_KO.get(source, source)
+    src_label = target.get("src_label") or _ext_pay_src_label(source)
+    ledger = _ext_pay_ledger_label(source)
     cust = (target.get("customer_name") or "(고객명 없음)").strip()
     phone = target.get("phone") or "-"
     date_s = target.get("date") or "-"
     amount = int(target.get("amount") or 0)
     result_code = str(target.get("result_code") or "").strip()
+    result_label = _ext_pay_result_label(result_code, source)
     method = target.get("method") or "-"
     off_status = target.get("official_status") or "-"
-    reason = _EXT_PAY_RECONCILE_REASON.get(result_code, "결제 대사 확인 필요")
-    # 공식 파일 원장 식별 정보 (담당자가 원장 검색 시 활용)
+    reason = _ext_pay_reconcile_reason(result_code, source)
+    # 원장 식별 정보 (담당자가 원장 검색 시 활용)
     off_date = target.get("official_date") or "-"
     off_buyer = target.get("official_buyer_masked") or ""
     off_last4 = target.get("official_phone_last4") or ""
@@ -11432,23 +11467,22 @@ def _render_ext_pay_reconcile_request(
     )
 
     st.markdown("---")
-    st.markdown("### 판매·입력담당 소명 요청 (사내 업무)")
+    st.markdown("### 판매·입력담당 확인 요청 (사내 업무)")
 
     _c1, _c2, _c3 = st.columns(3)
     _c1.metric(f"{src_label} 결제일", date_s or "-")
     _c2.metric("금액", f"{amount:,}원")
-    _c3.metric("결과 코드", result_code or "-")
+    _c3.metric("결과", result_label or "-")
 
     st.caption(
         f"고객 **{cust}** · 전화 {phone} · 매장 {_store_label} · 결제수단 {method} · "
-        f"공식상태 {off_status}"
+        f"{src_label} 상태 {off_status}"
     )
-    # 공식 파일 원장 정보 (온누리·울산페이 등에서 담당자가 원장에서 찾을 때 필요)
     _off_bits: list[str] = []
     if off_date and off_date != "-":
-        _off_bits.append(f"공식일자 {off_date}")
+        _off_bits.append(f"{ledger}일 {off_date}")
     if off_amount_disp:
-        _off_bits.append(f"공식금액 {off_amount_disp}원")
+        _off_bits.append(f"{ledger} {off_amount_disp}원")
     if off_buyer:
         _off_bits.append(f"구매자 {off_buyer}")
     if off_last4:
@@ -11458,11 +11492,13 @@ def _render_ext_pay_reconcile_request(
     if settle_disp:
         _off_bits.append(f"정산 {settle_disp}")
     if _off_bits:
-        st.caption("📄 공식 파일 원장: " + " · ".join(_off_bits))
+        st.caption(f"📄 {ledger}: " + " · ".join(_off_bits))
     st.info(f"자동 사유: {reason}")
 
     if existing:
-        _render_hq_cost_explain_thread(existing, key_base, me_uname)
+        _render_hq_cost_explain_thread(
+            existing, key_base, me_uname, request_noun="확인 요청",
+        )
         return
 
     # 판매담당 자동 매칭 (주문 employee_names → username)
@@ -11493,7 +11529,7 @@ def _render_ext_pay_reconcile_request(
     _title_who = cust if cust and cust != "(고객명 없음)" else (
         f"구매자 {off_buyer}" if off_buyer else "(고객명 없음)"
     )
-    _default_title = f"[결제대사] {_title_who} · {date_s} · {src_label} {amount:,}원"
+    _default_title = f"[결제 대조] {_title_who} · {date_s} · {src_label} {amount:,}원"
     title = st.text_input("제목", value=_default_title, key=f"{key_base}::title")
 
     _default_memo = (
@@ -11516,7 +11552,7 @@ def _render_ext_pay_reconcile_request(
     )
     _render_upload_preview(files)
 
-    if st.button("소명 요청 보내기", type="primary", key=f"{key_base}::send"):
+    if st.button("확인 요청 보내기", type="primary", key=f"{key_base}::send"):
         if not (title or "").strip():
             st.error("제목을 입력해 주세요.")
             return
@@ -11527,12 +11563,11 @@ def _render_ext_pay_reconcile_request(
             st.error("담당자를 최소 1명 지정해 주세요.")
             return
 
-        # 공식 파일 원장 식별 정보 라인 (담당자가 원장에서 검색할 때 활용)
         _off_lines: list[str] = []
         if off_date and off_date != "-":
-            _off_lines.append(f"  · 공식일자: {off_date}")
+            _off_lines.append(f"  · {ledger}일: {off_date}")
         if off_amount_disp:
-            _off_lines.append(f"  · 공식금액: {off_amount_disp}원")
+            _off_lines.append(f"  · {ledger}: {off_amount_disp}원")
         if off_buyer:
             _off_lines.append(f"  · 구매자(마스킹): {off_buyer}")
         if off_last4:
@@ -11541,7 +11576,7 @@ def _render_ext_pay_reconcile_request(
             _off_lines.append(f"  · 승인번호: {off_approval}")
         if settle_disp:
             _off_lines.append(f"  · 정산상태: {settle_disp}")
-        _off_block = ("공식 파일 원장 정보:\n" + "\n".join(_off_lines) + "\n") if _off_lines else ""
+        _off_block = (f"{ledger} 정보:\n" + "\n".join(_off_lines) + "\n") if _off_lines else ""
 
         _body = (
             f"매장: {_store_label}\n"
@@ -11549,10 +11584,10 @@ def _render_ext_pay_reconcile_request(
             f"전화: {phone}\n"
             f"결제일: {date_s}\n"
             f"결제수단: {method}\n"
-            f"공식 소스: {src_label}\n"
-            f"공식 상태: {off_status}\n"
+            f"원장: {ledger}\n"
+            f"{src_label} 상태: {off_status}\n"
             f"금액: {amount:,}원\n"
-            f"결과 코드: {result_code}\n"
+            f"결과: {result_label}\n"
             f"자동 사유: {reason}\n"
             f"판매담당: {', '.join(row_emps) if row_emps else '-'}\n\n"
             f"{_off_block}"
@@ -11607,34 +11642,26 @@ def _render_ext_pay_reconcile_section(
 ) -> None:
     """결과 표에서 미매칭 ERP 결제(모모) 대상을 골라 사내 업무 소명 요청."""
     targets = _ext_pay_reconcile_targets_from_df(df, source)
-    src_label = _EXT_PAY_SRC_LABEL_KO.get(source, source)
+    src_label = _ext_pay_src_label(source)
+    ledger = _ext_pay_ledger_label(source)
     with st.expander(
-        f"📬 매출·입력담당 소명 요청 (미매칭 {len(targets)}건)",
+        f"📬 매출·입력담당 확인 요청 (미매칭 {len(targets)}건)",
         expanded=False,
     ):
         st.caption(
-            "매칭이 안 되는 모모 결제(공식 없음·공식 취소·다중 후보·금액 불일치) 또는 공식만 있는 건을 "
-            "매출·입력담당에게 사내 업무로 요청합니다. 사유는 결과 코드에 따라 자동 입력됩니다."
+            f"맞추기가 안 되는 모모 결제({ledger} 없음·{ledger} 취소·다중 후보·금액 불일치) 또는 "
+            f"{src_label}만 있는 건을 매출·입력담당에게 사내 업무로 요청합니다. 사유는 결과에 따라 자동 입력됩니다."
         )
         if not targets:
-            st.success("현재 표시된 범위에는 소명 요청 대상이 없습니다.")
+            st.success("현재 표시된 범위에는 확인 요청 대상이 없습니다.")
             return
 
-        # 결과 코드별 필터
         _all_codes = sorted({t["result_code"] for t in targets})
-        _label_map = {
-            "erp_only": "모모에만 존재",
-            "erp_canceled_official_paid": f"모모 취소·{src_label} 결제",
-            "official_canceled": f"{src_label} 취소·모모 잔존",
-            "ambiguous": "다중 매치",
-            "amount_mismatch": "금액 다름",
-            "official_only": f"{src_label}에만 존재",
-        }
         sel_codes = st.multiselect(
-            "결과 코드 필터",
+            "결과 필터",
             options=_all_codes,
             default=_all_codes,
-            format_func=lambda c: f"{_label_map.get(c, c)} ({c})",
+            format_func=lambda c: _ext_pay_result_label(c, source),
             key=f"extpay_reconcile_codes_{db_filename}_{source}",
         )
         _visible = [t for t in targets if t["result_code"] in set(sel_codes)]
@@ -11645,7 +11672,7 @@ def _render_ext_pay_reconcile_section(
         # 이미 요청된 건 라벨링 (선택 시 스레드 자동 표시)
         _opt_labels: list[tuple[str, str]] = []
         for t in _visible:
-            _rc_kr = _label_map.get(t["result_code"], t["result_code"])
+            _rc_kr = _ext_pay_result_label(t["result_code"], source)
             _emp = f" · {t['employee_names']}" if t["employee_names"] else ""
             _ident_short = t["ident"]
 
@@ -31942,12 +31969,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     )
 
     # 소스별 라벨 (헤더·결과라벨 리네임에 사용)
-    _src_side = {
-        "onnuri": "온누리",
-        "ulsanpay": "울산페이",
-        "card": "카드",
-        "mainpay": "메인페이",
-    }[sel_src]
+    _src_side = _ext_pay_src_label(sel_src)
+    _ledger = _ext_pay_ledger_label(sel_src)
 
     # 기간 합계 · 차액 (공식 vs 모모)
     def _amt_to_int(v) -> int:
@@ -31960,8 +31983,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     _erp_total = int(df["ERP금액"].map(_amt_to_int).sum()) if "ERP금액" in df.columns else 0
     _diff = _official_total - _erp_total
     m1, m2, m3 = st.columns(3)
-    m1.metric(f"{_src_side} 합계", f"{_official_total:,}원")
-    m2.metric("모모입력 합계", f"{_erp_total:,}원")
+    m1.metric(f"{_ledger} 합계", f"{_official_total:,}원")
+    m2.metric("모모원장 합계", f"{_erp_total:,}원")
     m3.metric(f"차액 ({_src_side}−모모)", f"{_diff:,}원")
 
     if sel_src == "ulsanpay" and "뒤4" in df.columns:
@@ -31987,8 +32010,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     _result_map = {
         "matched_ok": "금액일치",
         "amount_mismatch": "금액 다름",
-        "official_only": f"{_src_side}에만 존재",
-        "erp_only": "모모에만 존재",
+        "official_only": f"{_src_side}만 있음",
+        "erp_only": "모모만 있음",
         "official_canceled": f"{_src_side} 취소·모모 잔존",
         "erp_canceled_official_paid": f"모모 취소·{_src_side} 결제",
         "ambiguous": "다중 매치",
@@ -31996,10 +32019,12 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         "split_matched": "분할 합산 일치",
         "미매칭": "미매칭",
     }
-    # 헤더 리네임 (ERP일자→모모입력일, ERP금액→모모입력금액, 공식상태→<소스명>)
+    # 헤더 리네임 (공식→원장, ERP→모모원장)
     _rename_map = {
-        "ERP일자": "모모입력일",
-        "ERP금액": "모모입력금액",
+        "공식일자": f"{_src_side}원장일",
+        "공식금액": f"{_src_side}원장",
+        "ERP일자": "모모원장일",
+        "ERP금액": "모모원장",
         "공식상태": _src_side,
     }
     df_show = df.copy()
@@ -32027,12 +32052,12 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         return [""] * len(row)
 
     _col_w = {
-        "공식일자": 110,
-        "모모입력일": 110,
+        f"{_src_side}원장일": 110,
+        "모모원장일": 110,
         "승인번호": 90,
         "뒤4": 70,
-        "공식금액": 100,
-        "모모입력금액": 120,
+        f"{_src_side}원장": 110,
+        "모모원장": 110,
         _src_side: 90,
         "정산": 80,
         "구매자": 90,
@@ -32077,21 +32102,21 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     st.download_button(
         "📥 엑셀 다운로드",
         data=_buf.getvalue(),
-        file_name=f"외부결제대사_{_src_fn}_{sel_db}_{datetime.now(tz=KST).strftime('%Y%m%d_%H%M')}.xlsx",
+        file_name=f"결제대조_{_src_fn}_{sel_db}_{datetime.now(tz=KST).strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"extpay_xlsx_{sel_db}_{sel_src}",
     )
     st.caption(
-        f"빨간 행: 공식 파일에 승인번호가 없고 모모에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
+        f"빨간 행: {_ledger}에 승인번호가 없고 모모만 번호가 있는 건(가공 번호·임의 매칭 의심). "
         f"동일 승인번호의 {_src_side} 취소와 모모 취소는 날짜가 달라도 상계되어 '금액일치'로 표시됩니다. "
         f"결제 금액·수단·승인번호를 바꾸면 해당 건은 자동 재매칭됩니다. "
-        f"결과: 금액일치=정상 · 분할 합산 일치=모모 결제 여러 건 합이 {_src_side} 1건과 일치 · "
-        f"금액 다름={_src_side}·모모 금액 상이(오입력 의심) · "
-        f"{_src_side}에만 존재={_src_side}만 있음(모모 미입력) · 모모에만 존재=모모만 있음({_src_side} 파일 없음) · "
-        f"{_src_side} 취소·모모 잔존={_src_side}은 취소인데 모모 잔존(임의취소 의심) · "
-        f"모모 취소·{_src_side} 결제=모모는 취소인데 {_src_side} 결제완료 · "
-        f"다중 매치=동일 승인·금액이 여럿이라 특정 불가 · 수동 매칭=관리자가 직접 붙임 · 미매칭=아직 매칭 미실행 · "
-        f"매칭 대상: 해당 매장의 {_src_side} 결제 전체(신규고객 한정 아님)"
+        f"결과: 금액일치=정상 · 분할 합산 일치=모모 결제 여러 건 합이 {_ledger} 1건과 일치 · "
+        f"금액 다름={_ledger}·모모원장 금액 상이(오입력 의심) · "
+        f"{_src_side}만 있음=모모 미입력 · 모모만 있음={_ledger} 없음 · "
+        f"{_src_side} 취소·모모 잔존={_ledger}은 취소인데 모모 잔존(임의취소 의심) · "
+        f"모모 취소·{_src_side} 결제=모모는 취소인데 {_ledger} 결제완료 · "
+        f"다중 매치=동일 승인·금액이 여럿이라 특정 불가 · 수동 매칭=관리자가 직접 붙임 · 미매칭=아직 맞추기 미실행 · "
+        f"맞추기 대상: 해당 매장의 {_src_side} 결제 전체(신규고객 한정 아님)"
     )
 
     # AI 유사 매칭 제안 (온누리 파일럿) — 수동 매칭 전 관리자 검토
@@ -32279,8 +32304,9 @@ def _render_ext_pay_ai_similar_match(
         f"🤖 Gemini 유사 매칭 제안 ({_src_ko} · 베타)", expanded=False,
     ):
         st.caption(
-            "자동매칭이 실패한 공식 행과 모모 미매칭 결제를 승인번호·뒤4자리·날짜·이름 조각으로 "
-            "묶어 후보만 제안합니다. 자동 저장하지 않으니 관리자가 각 항목을 확인해 승인/거절하세요. "
+            f"자동 맞추기가 실패한 {_epai.src_label(sel_src)} 원장 행과 모모만 있는 결제를 "
+            "승인번호·뒤4자리·날짜·이름 조각으로 묶어 후보만 제안합니다. "
+            "자동 저장하지 않으니 관리자가 각 항목을 확인해 승인/거절하세요. "
             "승인/거절 기록은 다음 실행에 few-shot 예시로 재사용됩니다."
         )
         _disabled = not bool(_gkey.strip())
@@ -32642,10 +32668,11 @@ def _render_ext_pay_manual_match_ui(
     _target = df[df["결과"].isin(_unmatched_codes) & (df["row_id"] > 0)]
     if _target.empty:
         return
-    with st.expander(f"🔧 공식 행 수동 매칭 ({len(_target)}건 대기)", expanded=False):
+    _ledger = _ext_pay_ledger_label(sel_src)
+    with st.expander(f"🔧 {_ledger} 수동 맞추기 ({len(_target)}건 대기)", expanded=False):
         st.caption(
-            "자동매칭이 실패한 공식 파일 행을 특정 ERP 결제에 직접 붙일 수 있습니다. "
-            "결과에 `manual_matched` 로 저장되며, 재실행해도 유지됩니다."
+            f"자동 맞추기가 실패한 {_ledger} 행을 특정 모모 결제에 직접 붙일 수 있습니다. "
+            "결과는 수동 매칭으로 저장되며, 재실행해도 유지됩니다."
         )
         _options: list[tuple[int, str]] = []
         for _r in _target.to_dict("records"):
@@ -32665,14 +32692,14 @@ def _render_ext_pay_manual_match_ui(
                     str(_r.get("공식일자") or ""),
                     _r.get("카드사") or _r.get("승인번호") or _r.get("뒤4") or "",
                     f"{_r.get('공식금액') or ''}원",
-                    f"[{_r.get('결과') or ''}]",
+                    f"[{_ext_pay_result_label(str(_r.get('결과') or ''), sel_src)}]",
                 ]
             _label_parts = [p for p in _label_parts if str(p).strip()]
             _options.append((int(_r["row_id"]), " · ".join(_label_parts)))
         if not _options:
             return
         _sel_row = st.selectbox(
-            "매칭할 공식 파일 행",
+            f"맞출 {_ledger} 행",
             options=[o[0] for o in _options],
             format_func=lambda k: dict(_options).get(k, str(k)),
             key=f"extpay_manual_row_{sel_db}_{sel_src}",
@@ -32866,14 +32893,14 @@ def _render_ext_pay_manual_and_erp_only(
 ) -> None:
     """검증 시작일 이후 어떤 공식 행과도 매칭되지 않은 ERP 결제 리스트.
     현금(수금)·계좌이체·아직 파일 미업로드된 결제 등을 한 화면에서 수기 확인 처리."""
-    with st.expander("💵 ERP-only (공식 파일 대응이 없는 결제) — 수기 확인", expanded=False):
+    with st.expander("💵 모모 only (원장에 없는 결제) — 수기 확인", expanded=False):
         st.caption(
-            "매장의 검증 시작일 이후 결제 중 어떤 공식 파일과도 매칭되지 않은 항목입니다. "
-            "현금 수금·계좌이체 등 파일 자체가 없는 결제는 아래에서 '수기 확인' 을 스탬프하면 정상 처리됩니다."
+            "매장의 검증 시작일 이후 결제 중 어떤 원장과도 맞춰지지 않은 항목입니다. "
+            "현금 수금·계좌이체 등 원장 자체가 없는 결제는 아래에서 '수기 확인' 을 스탬프하면 정상 처리됩니다."
         )
         _rows = _ext_pay_list_unmatched_erp_all_methods(sel_db, new_from)
         if not _rows:
-            st.success("모든 ERP 결제가 매칭 또는 수기 확인되었습니다.")
+            st.success("모든 모모 결제가 맞추기 또는 수기 확인되었습니다.")
             return
         _method_labels = sorted({r.get("payment_method") or "-" for r in _rows})
         c_m, c_c, c_n = st.columns([2, 1, 1])
@@ -33182,16 +33209,16 @@ def render_admin_settings():
 
     st.divider()
 
-    # ── 8. 온누리 / 울산페이 / 카드매출 외부파일 대사 ─────────────
-    st.subheader("8. 🧾 온누리 / 울산페이 / 카드매출 외부파일 대사")
+    # ── 8. 온누리 / 울산페이 / 카드매출 결제 대조 ─────────────
+    st.subheader("8. 🧾 온누리 / 울산페이 / 카드매출 결제 대조")
     st.caption(
-        "가맹점 포털·PG 에서 받은 **공식 결제내역**을 업로드하면 ERP 결제와 대조해 "
+        "가맹점 포털·PG 에서 받은 **원장**을 업로드하면 모모 결제와 대조해 "
         "미입력·허위입력·결제 후 임의취소를 찾습니다. "
         "온누리: **날짜 · 전화 뒤 4자리 · 금액** / 울산페이: **승인번호 6자리 · 결제금액** / "
-        "카드: **매입일자 · 카드사 · 매입금액** / 메인페이: **매입일자 · 승인번호 · 결제금액**. "
-        "같은 파일을 다시 올려도 **지문(fingerprint) 기반 중복 방지** 되며, 파일이 없는 현금 수금 등은 **수기 확인** 으로 처리할 수 있습니다."
+        "신용카드: **매입일자 · 카드사 · 매입금액** / 메인페이: **매입일자 · 승인번호 · 결제금액**. "
+        "같은 파일을 다시 올려도 **지문(fingerprint) 기반 중복 방지** 되며, 원장이 없는 현금 수금 등은 **수기 확인** 으로 처리할 수 있습니다."
     )
-    with st.expander("외부파일 업로드 / 매칭 결과", expanded=False):
+    with st.expander("원장 업로드 / 맞추기 결과", expanded=False):
         _render_external_pay_admin_section(role, me_uname)
 
     st.divider()
@@ -34468,7 +34495,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "온누리(전자) 결제 식별자는 **승인번호가 아니라 구매자 전화번호 뒤 4자리**입니다.\n\n"
             "가맹점 포털의 **디지털 온누리 매출내역** 파일 `구매자전화번호` 열 "
             "(예: `010****2414`)의 **2414** 를 그대로 입력하세요.\n\n"
-            "외부파일 대사는 **결제일 + 전화번호 뒤 4자리 + 결제금액** 으로 매칭합니다. "
+            "결제 대조는 **결제일 + 전화번호 뒤 4자리 + 결제금액** 으로 맞춥니다. "
             "같은 날·같은 뒤 4자리·같은 금액이 두 건이면(부부 등) "
             "매출내역의 **거래시간**(예: `18:15:29`)을 추가로 입력하세요. "
             "영수증의 승인번호를 넣으면 검증파일과 맞지 않습니다."
