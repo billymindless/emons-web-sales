@@ -367,56 +367,59 @@ def suggest_matches_with_gemini(
             _override = [str(x).strip() for x in _cfg if str(x).strip()]
     except Exception:
         pass
+    # 이 API 키로 generateContent 가 확인된 현재 모델.
+    # gemini-2.5-flash / gemini-1.5-* 는 목록에 남아도 신규 키에서 404 가 난다.
     _models = tuple(_override) or (
         "gemini-flash-latest",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash-001",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash",
+        "gemini-3.5-flash",
+        "gemini-flash-lite-latest",
+        "gemini-3.6-flash",
+        "gemini-3.8-flash",
     )
     _retry_status = {429, 500, 502, 503, 504}
-    _sleeps = (1.0, 2.0, 4.0)
     last_err: str | None = None
     last_status_codes: list[int] = []
     resp = None
-    for _model in _models:
-        _url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{_model}:generateContent?key={key}"
-        )
-        _final_resp = None
-        for _attempt in range(len(_sleeps) + 1):
+    _stop_all = False
+    # 1라운드: 모델만 빠르게 순회. 503 이어도 같은 모델에서 오래 기다리지 않고 다음으로.
+    # 2라운드: 전부 실패하면 2초 후 한 번 더.
+    for _round in (0, 1):
+        if _round == 1:
+            _time.sleep(2.0)
+        for _model in _models:
+            _url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{_model}:generateContent?key={key}"
+            )
             try:
                 _cur = httpx.post(_url, json=body, timeout=timeout)
-            except Exception as e:  # 연결 오류 등도 재시도
+            except Exception as e:
                 last_err = f"{_model}: {e}"
-                if _attempt < len(_sleeps):
-                    _time.sleep(_sleeps[_attempt])
-                    continue
-                _final_resp = None
-                break
-            if _cur.status_code in _retry_status and _attempt < len(_sleeps):
-                last_err = f"{_model}: HTTP {_cur.status_code}"
-                _time.sleep(_sleeps[_attempt])
                 continue
-            _final_resp = _cur
-            break
-        if _final_resp is not None:
-            last_status_codes.append(_final_resp.status_code)
-            if _final_resp.status_code == 200:
-                resp = _final_resp
+            last_status_codes.append(_cur.status_code)
+            if _cur.status_code == 200:
+                resp = _cur
                 break
-            last_err = f"{_model}: HTTP {_final_resp.status_code}"
-        # 다음 모델로 폴백
+            last_err = f"{_model}: HTTP {_cur.status_code}"
+            if _cur.status_code in (401, 403):
+                last_err = f"{_model}: HTTP {_cur.status_code} (API 키 권한 오류)"
+                _stop_all = True
+                break
+        if resp is not None or _stop_all:
+            break
     if resp is None:
-        # 모든 시도가 404 · 400 이면 모델 접근 권한/이름 문제 → 다른 안내
         _access_bad = last_status_codes and all(c in (400, 404) for c in last_status_codes)
-        if _access_bad:
+        _auth_bad = last_status_codes and any(c in (401, 403) for c in last_status_codes)
+        if _auth_bad:
+            out["error"] = (
+                f"Gemini API 키 권한이 거부되었습니다 ({last_err}). "
+                ".streamlit/secrets.toml 의 [gemini] api_key 를 확인해 주세요."
+            )
+        elif _access_bad:
             out["error"] = (
                 "이 API 키로 사용 가능한 Gemini 모델을 찾지 못했습니다 "
                 f"(마지막 오류: {last_err or 'HTTP 404'}). "
-                "관리자에게 GEMINI_API_KEY 유효성 또는 접근 가능한 모델 목록을 확인해 주세요. "
-                "필요 시 `st.secrets['gemini']['extpay_models']` 에 사용 가능한 모델 이름을 나열할 수 있습니다."
+                "필요 시 `st.secrets['gemini']['extpay_models']` 에 모델 이름을 지정할 수 있습니다."
             )
         else:
             out["error"] = (
