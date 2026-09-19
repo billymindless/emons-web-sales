@@ -29763,6 +29763,88 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
             st.rerun()
 
 
+def _pcr_approval_key(method: str, raw: str) -> str:
+    """결제변경 승인번호 비교키. 카드사명·빈 값은 빈 문자열."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    meth = str(method or "")
+    if "지역화폐" in meth:
+        n = _ext_pay_norm_approval6(s)
+        return f"ulsan:{n}" if n else ""
+    if "온누리" in meth:
+        head = s.split("-", 1)[0].strip()
+        digits = re.sub(r"\D", "", head)
+        return f"onnuri:{digits}" if len(digits) >= 4 else ""
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 4:
+        return f"code:{digits}"
+    return ""
+
+
+def _pcr_existing_approval_keys(pay_list) -> dict[str, str]:
+    """주문 기존 결제의 승인번호 키 → 표시 문구."""
+    out: dict[str, str] = {}
+    if pay_list is None:
+        return out
+    try:
+        rows = pay_list.to_dict("records") if hasattr(pay_list, "to_dict") else list(pay_list)
+    except Exception:
+        return out
+    for r in rows:
+        meth = str(r.get("payment_method") or "")
+        pid = r.get("id")
+        amt = r.get("amount")
+        for raw in (r.get("onnuri_approval_code"), r.get("card_company")):
+            key = _pcr_approval_key(meth, raw)
+            if not key:
+                continue
+            try:
+                amt_s = f"{int(float(amt or 0)):,}원"
+            except Exception:
+                amt_s = "-"
+            out[key] = f"결제 #{pid} {meth} {amt_s} / {str(raw).strip()}"
+    return out
+
+
+def _pcr_duplicate_approval_errors(pay_list, new_lines: list[dict]) -> list[str]:
+    """신규 라인의 승인번호가 기존 결제 또는 다른 신규 라인과 겹치면 오류 문구."""
+    existing = _pcr_existing_approval_keys(pay_list)
+    seen: dict[str, int] = {}
+    errs: list[str] = []
+    for i, line in enumerate(new_lines or []):
+        raw = str(line.get("onnuri") or "").strip()
+        if not raw:
+            continue
+        meth = str(line.get("method") or "")
+        key = _pcr_approval_key(meth, raw)
+        if not key:
+            continue
+        if key in existing:
+            errs.append(f"금액 #{i + 1} 승인번호 {raw} — 이미 있음 ({existing[key]})")
+        if key in seen:
+            errs.append(f"금액 #{i + 1} 승인번호 {raw} — 이번 입력 #{seen[key] + 1}과 중복")
+        else:
+            seen[key] = i
+    return errs
+
+
+def _pcr_assignee_options(store_id, role: str, exclude_uname: str) -> list[tuple[str, str]]:
+    """결제변경 담당자 후보: 같은 매장 직원 + 매장관리자 + superadmin."""
+    emp_options = _internal_work_employee_options(store_id, role, cross_store=False)
+    seen = {u for u, _ in emp_options}
+    users = _get_supabase_users_list() or []
+    umap = {u.get("username"): u for u in users if u.get("username")}
+    for uname in _payment_change_verifier_usernames(store_id, role, exclude_uname):
+        if not uname or uname in seen:
+            continue
+        u = umap.get(uname) or {}
+        label = (u.get("name") or uname) + (f"  ({u.get('role')})" if u.get("role") else "")
+        emp_options.append((uname, label))
+        seen.add(uname)
+    return [(u, lbl) for u, lbl in emp_options if u and u != exclude_uname]
+
+
 def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                                         customer_name: str, pay_list):
     """매출관리 결제 섹션에 들어가는 '사내 결제변경 검증 요청' 격리 위젯.
@@ -30007,6 +30089,15 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         reason = st.text_area("변경 사유 *", key=f"pcr_reason_{order_id}", height=70,
                               placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제")
 
+        emp_options = _pcr_assignee_options(store_id, role, me_uname)
+        emp_username_to_label = {u: lbl for u, lbl in emp_options}
+        pcr_assignees = st.multiselect(
+            "담당자 *",
+            options=[u for u, _ in emp_options],
+            format_func=lambda u: emp_username_to_label.get(u, u),
+            key=f"pcr_assignees_{order_id}",
+        )
+
         # 증빙 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
         ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0))
         files = _file_input_with_paste(
@@ -30021,19 +30112,57 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             if float(orig.get("amount") or 0) > 0 and new_amount > float(orig.get("amount") or 0):
                 st.warning("⚠️ 변경 후 금액이 원본 결제 금액보다 큽니다. 환불/취소 금액을 다시 확인하세요.")
 
-        can_submit = bool((reason or "").strip()) and bool(orig.get("method") or orig.get("amount"))
+        dup_errs = _pcr_duplicate_approval_errors(pay_list, new_lines)
+        for _de in dup_errs:
+            st.error(_de)
+
+        can_submit = (
+            bool((reason or "").strip())
+            and bool(orig.get("method") or orig.get("amount"))
+            and bool(pcr_assignees)
+            and not dup_errs
+        )
         if not can_submit:
-            st.caption("원본 확인과 사유 입력이 있어야 요청할 수 있습니다.")
+            if not pcr_assignees:
+                st.caption("담당자를 1명 이상 지정해야 요청할 수 있습니다.")
+            elif not (reason or "").strip() or not (orig.get("method") or orig.get("amount")):
+                st.caption("원본 확인과 사유 입력이 있어야 요청할 수 있습니다.")
         if st.button("📤 요청 등록 (기존 결제 취소 + 신규 결제 자동 저장)",
                      key=f"pcr_submit_{order_id}",
                      type="primary", disabled=not can_submit):
-            # 검증자(담당자): 같은 매장 관리자 + superadmin (요청자 본인 제외)
-            verifier_unames = _payment_change_verifier_usernames(store_id, role, me_uname)
             new_payment = {
                 "amount": new_amount,
                 "method": (new_method or "").strip(),
                 "onnuri": (new_onnuri or "").strip(),
             }
+
+            # ── 검증 태스크를 먼저 생성 (결제 반영 전에 담당자 지정·결재 건이 있어야 함) ──
+            _valid_lines = [x for x in new_lines if int(x.get("amount") or 0) > 0 and x.get("method")]
+            if len(_valid_lines) > 1:
+                _split_detail = " / ".join(
+                    f"{x['method']} {int(x['amount']):,}원"
+                    + (f"({x['onnuri']})" if x.get("onnuri") else "")
+                    for x in _valid_lines
+                )
+                _task_reason = f"[분할결제] {_split_detail}\n{reason}"
+            else:
+                _task_reason = reason
+            task_id, err = _tb.create_payment_change_task(
+                sale_id=order_id,
+                payment_id=sel_pid,
+                customer_name=customer_name,
+                change_type=change_type,
+                original_payment=orig,
+                new_payment=new_payment,
+                reason=_task_reason,
+                created_by=me_uname,
+                store_name=store_name,
+                db_filename=db_filename,
+                assignees=list(pcr_assignees),
+            )
+            if not task_id:
+                st.error(f"요청 등록 실패: {err}")
+                st.stop()
 
             # ── 결제 자동 반영: 원본 취소행(음수) + 신규 결제행(양수) ──
             # 원본 결제행에서 card_company / onnuri_approval_code 를 보존해 취소 audit 를 남긴다.
@@ -30155,68 +30284,39 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     payment_ops_errors.append(f"잔금 재계산 실패: {_mg_ex}")
                 clear_data_cache()
 
-            # ── 검증 태스크 생성 ──
-            # 분할 결제인 경우 라인 상세를 사유 앞에 덧붙여 검증자가 볼 수 있게 한다
-            _valid_lines = [x for x in new_lines if int(x.get("amount") or 0) > 0 and x.get("method")]
-            if len(_valid_lines) > 1:
-                _split_detail = " / ".join(
-                    f"{x['method']} {int(x['amount']):,}원"
-                    + (f"({x['onnuri']})" if x.get("onnuri") else "")
-                    for x in _valid_lines
-                )
-                _task_reason = f"[분할결제] {_split_detail}\n{reason}"
-            else:
-                _task_reason = reason
-            task_id, err = _tb.create_payment_change_task(
-                sale_id=order_id,
-                payment_id=sel_pid,
-                customer_name=customer_name,
-                change_type=change_type,
-                original_payment=orig,
-                new_payment=new_payment,
-                reason=_task_reason,
-                created_by=me_uname,
-                store_name=store_name,
-                db_filename=db_filename,
-                assignees=verifier_unames,
-            )
-            if task_id:
-                # 증빙 첨부 업로드
-                att_errors = []
-                for f in files or []:
-                    try:
-                        f.seek(0)
-                    except Exception:
-                        pass
-                    _row, ferr = _tb.attach_file(task_id=task_id, comment_id=None,
-                                                 uploaded_file=f, uploaded_by=me_uname)
-                    if ferr:
-                        att_errors.append(f"{f.name}: {ferr}")
-                # 결제ID 를 활동 로그에 남긴다
+            # 증빙 첨부 업로드
+            att_errors = []
+            for f in files or []:
                 try:
-                    _tb.log_activity(task_id, me_uname, "payment_change_applied", {
-                        "cancel_payment_id": cancel_pay_id,
-                        "new_payment_id": new_pay_id,
-                        "new_payment_ids": new_pay_ids,
-                        "errors": payment_ops_errors[:5],
-                    })
+                    f.seek(0)
                 except Exception:
                     pass
-                st.session_state[f"pcr_files_ver_{order_id}"] = ver + 1
-                st.session_state[toggle_key] = False
-                if att_errors:
-                    st.warning("검증 요청은 등록됐지만 일부 첨부 실패: " + "; ".join(att_errors))
-                if payment_ops_errors:
-                    st.warning("일부 결제 자동 처리 실패: " + "; ".join(payment_ops_errors))
-                _pay_msg = ""
-                if cancel_pay_id:
-                    _pay_msg += f" · 취소행 #{cancel_pay_id}"
-                if new_pay_ids:
-                    _pay_msg += " · 신규결제 " + ", ".join(f"#{p}" for p in new_pay_ids)
-                flash(f"결제변경 요청 등록 완료 (검증 태스크 #{task_id}){_pay_msg}")
-                st.rerun()
-            else:
-                st.error(f"요청 등록 실패: {err}")
+                _row, ferr = _tb.attach_file(task_id=task_id, comment_id=None,
+                                             uploaded_file=f, uploaded_by=me_uname)
+                if ferr:
+                    att_errors.append(f"{f.name}: {ferr}")
+            try:
+                _tb.log_activity(task_id, me_uname, "payment_change_applied", {
+                    "cancel_payment_id": cancel_pay_id,
+                    "new_payment_id": new_pay_id,
+                    "new_payment_ids": new_pay_ids,
+                    "errors": payment_ops_errors[:5],
+                })
+            except Exception:
+                pass
+            st.session_state[f"pcr_files_ver_{order_id}"] = ver + 1
+            st.session_state[toggle_key] = False
+            if att_errors:
+                st.warning("검증 요청은 등록됐지만 일부 첨부 실패: " + "; ".join(att_errors))
+            if payment_ops_errors:
+                st.warning("일부 결제 자동 처리 실패: " + "; ".join(payment_ops_errors))
+            _pay_msg = ""
+            if cancel_pay_id:
+                _pay_msg += f" · 취소행 #{cancel_pay_id}"
+            if new_pay_ids:
+                _pay_msg += " · 신규결제 " + ", ".join(f"#{p}" for p in new_pay_ids)
+            flash(f"결제변경 요청 등록 완료 (검증 태스크 #{task_id}){_pay_msg}")
+            st.rerun()
 
 
 def _payment_change_verifier_usernames(store_id, role: str, exclude_uname: str) -> list[str]:
@@ -30333,6 +30433,8 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
         if st.button("등록", key=f"nt_submit_{_vk}", type="primary"):
             if not (title or "").strip():
                 st.error("제목을 입력해 주세요.")
+            elif not assignees:
+                st.error("담당자를 최소 1명 지정해 주세요.")
             else:
                 new_id, err = _tb.create_task(
                     title=title,

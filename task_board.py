@@ -1157,7 +1157,11 @@ def create_payment_change_task(
     assignees: list[str] | None = None,
 ) -> tuple[int | None, str | None]:
     """결제변경 검증 태스크 생성 + 메타 저장 + 검증자 알림.
-    결제 자동 반영(원본 취소행 + 신규 결제행)은 호출 측에서 이미 처리한 뒤 태스크만 생성한다."""
+    담당자(assignees)는 1명 이상 필수. 호출 측에서 결제 반영보다 태스크를 먼저 만든다."""
+    recipients = [u for u in (assignees or []) if u and str(u).strip() and u != created_by]
+    if not recipients:
+        return None, "담당자를 1명 이상 지정해 주세요."
+
     client, err = _client()
     if err or not client:
         return None, err or "Supabase 연결 불가"
@@ -1196,8 +1200,16 @@ def create_payment_change_task(
             "parent_task_id": None,
             "task_type": PAYMENT_CHANGE_TASK_TYPE,
             "verify_status": "pending",
+            "scope": "store",
         }
-        r = client.table("app_tasks").insert(row).execute()
+        try:
+            r = client.table("app_tasks").insert(row).execute()
+        except Exception as _ins_e:
+            if "scope" in str(_ins_e):
+                row.pop("scope", None)
+                r = client.table("app_tasks").insert(row).execute()
+            else:
+                raise
         task_id = int(r.data[0]["id"]) if r.data else None
         if not task_id:
             return None, "검증 태스크 생성 실패 (id 없음)"
@@ -1225,13 +1237,12 @@ def create_payment_change_task(
             log_activity(task_id, created_by, "pcr_meta_failed", {"error": str(e)[:200]})
 
         # 담당자(검증자) 등록 + 알림
-        recipients = [u for u in (assignees or []) if u and u != created_by]
         for idx, uname in enumerate(recipients):
             try:
                 client.table("app_task_assignees").insert({
                     "task_id": task_id,
                     "employee_username": uname,
-                    "role": "assignee",
+                    "role": "owner" if idx == 0 else "assignee",
                     "assigned_by": created_by,
                 }).execute()
             except Exception:
