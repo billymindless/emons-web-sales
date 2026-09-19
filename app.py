@@ -621,7 +621,6 @@ def _render_primary_nav(user: dict, role: str) -> None:
                 f" text-align:center; margin-bottom:5px;'>🔔 미확인 알림 {_noti_cnt}건</div>",
                 unsafe_allow_html=True,
             )
-            st.caption("알림을 누르면 해당 업무 상세로 이동합니다.")
             _recent_notis = _tb_noti.load_my_notifications_cached(_noti_uname, unread_only=True, limit=3)
             for _noti in _recent_notis:
                 _nid = _noti.get("id")
@@ -1626,7 +1625,6 @@ def _get_customers_by_ids_supabase(db_filename: str, customer_ids: list) -> dict
         return {row["id"]: row for row in (r.data or [])}
     except Exception:
         return {}
-
 
 
 def _format_number_comma(s):
@@ -6443,8 +6441,6 @@ def get_store_assigned_employee_names(db_filename: str) -> list[str]:
     return _get_supabase_store_assigned_employee_names(db_filename)
 
 
-
-
 def get_tenant_conn(db_filename: str):
     """
     [Connection Management] 매장(테넌트) 전용 DB 파일에 연결.
@@ -9701,7 +9697,6 @@ def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
 def _render_admin_delete_requests(db_filename: str):
     """관리자 전용: 직원이 보낸 주문 삭제 요청 목록을 표시하고 승인/반려 처리."""
     st.header("🗑️ 주문 삭제 요청 관리")
-    st.caption("직원이 보낸 주문 삭제 요청을 검토하고 승인 또는 반려합니다. 승인 시 주문과 결제 데이터가 영구 삭제됩니다.")
 
     reviewed_by = _current_username()
 
@@ -9941,12 +9936,6 @@ def _render_hq_cost_edit_panel(db_filename: str, report, cache_key: str) -> None
         return
 
     st.markdown("##### 원가 확정 / 소액 수정")
-    st.caption(
-        "**본사원가**와 **앱(모모) 원가** 중 맞는 쪽을 확정합니다. **판매가·매출·결제·전시 판매가는 바뀌지 않습니다.** "
-        "앱(모모) 전시원가를 고르면 그 값을 앱(모모) 원가(`cost_price`)로 옮기고 전시원가는 0이 됩니다. "
-        "차이가 1~20,000원이면 본사원가로 맞추는 소액 보정도 사용할 수 있습니다. "
-        "확정하면 결과는 **원가 일치**, 사유는 **관리자 강제매칭.** 으로 바뀝니다."
-    )
 
     _labels: list[str] = []
     for idx, row in editable:
@@ -10076,12 +10065,6 @@ def _render_hq_display_manual_match(report, cache_key: str) -> None:
         return
 
     st.markdown("##### 전시판매(매장분) 수동 매칭")
-    st.caption(
-        "본사 파일 **구분=매장분** 은 전시판매입니다. 본사원가에 전시품 원가가 있을 수 있어 "
-        "같은 전화(또는 이름)의 앱 주문 중 하나를 관리자가 고릅니다. "
-        "확정하면 결과는 **원가 일치**, 사유는 **관리자 강제매칭.** 입니다. "
-        "앱 주문·매출·결제는 변경하지 않습니다. **구분=회수** 는 대사에서 제외됩니다."
-    )
 
     _labels = []
     for _idx, row in pending:
@@ -11648,10 +11631,6 @@ def _render_ext_pay_reconcile_section(
         f"📬 매출·입력담당 확인 요청 (미매칭 {len(targets)}건)",
         expanded=False,
     ):
-        st.caption(
-            f"맞추기가 안 되는 모모 결제({ledger} 없음·{ledger} 취소·다중 후보·금액 불일치) 또는 "
-            f"{src_label}만 있는 건을 매출·입력담당에게 사내 업무로 요청합니다. 사유는 결과에 따라 자동 입력됩니다."
-        )
         if not targets:
             st.success("현재 표시된 범위에는 확인 요청 대상이 없습니다.")
             return
@@ -12752,10 +12731,6 @@ def render_margin_monitor():
     if "실질마진율(수수료포함,%)" in disp_fmt.columns:
         disp_fmt["실질마진율(수수료포함,%)"] = disp_fmt["실질마진율(수수료포함,%)"].apply(lambda x: f"{x:.1f}%")
     st.dataframe(disp_fmt, width="stretch")
-    st.caption(
-        "※ **마진율(%)** = (판매금액 − 일반원가 − 전시원가) ÷ 판매금액 × 100 (원가 기준, 수수료 미포함)  \n"
-        "※ **실질마진율** = actual_margin ÷ 판매금액 × 100 (수수료 차감 후 실질 마진, 참고용)"
-    )
 
     # 엑셀 다운로드
     buf = io.BytesIO()
@@ -13689,8 +13664,6 @@ def render_login():
                         else:
                             st.error(f"로그인 중 오류가 발생했습니다: {err_msg}")
 
-    st.caption("💡 로그인할 때 사용한 이메일은 이 기기(브라우저)에만 저장되며, 다음 로그인 시 자동으로 채워집니다.")
-    st.caption("🔒 한 번 로그인하면 이 브라우저에서 **30일간 자동 로그인**이 유지됩니다 (회사 PC 전용).")
 
     # 자동 로그인 + 이메일 자동 입력: localStorage 활용
     # 우선순위:
@@ -14388,10 +14361,6 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
     """
     st.markdown("---")
     st.subheader("🧩 다면 분석 (다중 조건 · 다중 차원)")
-    st.caption(
-        "여러 조건을 동시에 적용해서 지역·품목·이유 등 여러 차원으로 매출을 분해합니다. "
-        "지역 데이터는 카카오 지오코딩 기반이며, 아직 백필되지 않은 고객은 시군구/도로명 등이 비어 있을 수 있습니다."
-    )
 
     if merged is None or merged.empty:
         st.info("분석할 데이터가 없습니다.")
@@ -14856,7 +14825,7 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
                 key=f"{key_prefix}_mdim_csv",
             )
         else:
-            st.caption("피벗 결과 CSV 준비 버튼을 눌러 파일을 생성한 뒤 다운로드할 수 있습니다.")
+            pass
 
     # (2) 주문 세부 내역 CSV — 필터 적용된 주문 단위(중복 없음)
     _dd1, _dd2 = st.columns([1, 2])
@@ -14903,7 +14872,7 @@ def _render_multi_dim_analysis(merged: pd.DataFrame, key_prefix: str, store_map:
                 key=f"{key_prefix}_mdim_detail_csv",
             )
         else:
-            st.caption("주문 단위 원본(중복 없음). 매출액 합계가 상단 요약 카드와 일치하는지 검증에 사용하세요.")
+            pass
 
     # ── ⑥ 시각화 (결과 행 수가 많으면 opt-in) ─────────────────────
     _CHART_AUTO_LIMIT = 500
@@ -15452,16 +15421,9 @@ def _render_marketing_multi_period_comparison(
     st.subheader("③ 카테고리별 인기 품목 (Top 10)")
     _tax_map_c3 = _cached_taxonomy_map()
     if _src == "line":
-        st.caption(
-            "분석 소스=원장 라인: `app_order_items` → taxonomy 대분류별 **주문 수(distinct order_id)**. "
-            "헤더 금액을 품목에 분배하지 않습니다. 라인 없는 주문은 제외됩니다."
-        )
+        pass
     else:
-        st.caption(
-            "분석 소스=현장 헤더: `app_orders.category` 건수. "
-            "매입 원장 임포트로 들어온 원본 품목명이면 taxonomy 매핑으로 정규화하고, "
-            "모모 직접 등록처럼 이미 카테고리로 저장된 값은 그대로 사용합니다."
-        )
+        pass
 
     def _normalize_category_str(raw: str) -> str:
         raw = (raw or "").strip()
@@ -15513,10 +15475,6 @@ def _render_marketing_multi_period_comparison(
 
     # ---------- ③-2 카테고리 대분류 × 라인 품목명 Top N (임포트 매입 원장 기반) ----------
     st.subheader("③-2 카테고리 대분류 × 인기 라인 품목명 (Top 5)")
-    st.caption(
-        "매입 원장 임포트로 저장된 라인아이템(app_order_items)의 품목명을, "
-        "품목 분류 관리(Gemini) 로 매핑한 대분류별로 매출 상위 5개씩 나열합니다."
-    )
 
     def _order_id_col(_df: pd.DataFrame) -> str | None:
         for _c in ("id_x", "id", "order_id"):
@@ -15597,7 +15555,7 @@ def _render_marketing_multi_period_comparison(
             },
         )
         if len(_oids) > len(_oids_capped):
-            st.caption(f"※ 성능 상한: 상위 {len(_oids_capped):,}건만 조회 (전체 {len(_oids):,}건)")
+            pass
 
     c1, c2 = st.columns(2)
     with c1:
@@ -16014,10 +15972,6 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                 st.info(f"{_plot_emps[0]} 님의 매출 데이터가 없습니다.")
                 return
         elif _compare_sellers:
-            st.caption(
-                "판매자 비교: **" + " · ".join(_plot_emps)
-                + "** · 기준 월은 실선, 비교 월은 점선입니다. (공동 담당은 1/n, 전체직원은 매장 합계)"
-            )
             sales_df = _sales_src
         else:
             sales_df = _sales_src
@@ -16146,7 +16100,7 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
             ]
             _cmp_yms_use = list(_compare_yms[:4])
             if len(_compare_yms) > 4:
-                st.caption("판매자 비교에서는 비교 월을 4개까지 겹칩니다.")
+                pass
 
             def _emp_dow_avg(emp: str, ym: str) -> list[float]:
                 edf = _daily_sales_df_for_employee(_sales_src, emp)
@@ -16293,11 +16247,6 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                     _row[f"{cm} 대비"] = f"{_fmt_emp(_diff)} ({_pct})"
                 _tbl.append(_row)
             st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
-            st.caption(
-                "💡 실선 = 기준 월, 점선 = 비교 월. 같은 색이 같은 판매자입니다. "
-                "전체직원(어두운 선)은 매장 합계입니다. "
-                "요일 막대는 판매자·월을 나란히 비교합니다. 붉은 음영 = 주말·공휴일. 공동 담당은 1/n."
-            )
             return
 
         _base_plot = _to_plot(_base_raw)
@@ -16509,10 +16458,6 @@ def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", k
                     "비교월 전체 누적": _fmt(_all),
                 })
             st.dataframe(pd.DataFrame(_tbl), width="stretch", hide_index=True)
-        st.caption(
-            "💡 기준 월(굵은 실선·컬러 마커)이 전면에, 비교 월(회색 점선)이 배경으로 표시됩니다. "
-            "붉은 음영 = 주말·공휴일 구간."
-        )
     except Exception as _e_chart:
         st.caption(f"일별 매출 차트를 표시할 수 없습니다: {_e_chart}")
 
@@ -17149,18 +17094,6 @@ def _superadmin_tab2_hr_store_employees():
         _kpi_w = load_kpi_weights(_kpi_w_db, int(ey), int(em), all_stores=False)
         _kpi_w_scope_label = selected_store
     _kpi_w_ym = f"{int(ey):04d}-{int(em):02d}"
-    st.caption(
-        f"적용 가중치({_kpi_w_scope_label} · {_kpi_w_ym}): {_kpi_weights_caption(_kpi_w)}"
-        + ("  · 다월 조회 시 **종료월 가중치**를 사용합니다." if (sy, sm) != (ey, em) else "")
-    )
-    st.caption(
-        f"※ **매출 점수({float(_kpi_w['revenue']):g})·매출집계(순액)**: 기간 내 **판매일(transaction_date)** sales 순액(음수 포함) 1/n. "
-        f"**현금수금 점수({float(_kpi_w['cash']):g})·현금수금집계**: **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-        f"**마진 점수({float(_kpi_w['margin']):g})**: 동 기간 sales를 주문 비율로 배분. "
-        f"**전시품 점수({float(_kpi_w['display']):g})·전시품 판매액**: 옵션 A2 — **계약일(order_date)이 기간 내**인 주문의 **전시판매가 × 1/n** (주문당 1회). "
-        "다른 달 계약 + 단순 금액수정은 영향 없음. 다른 달 계약 + **이번 달에 총계약금액이 0원이 되면(전체 취소)** 전시판매가 차감. "
-        "주문 수정으로 전시판매가만 변경된 경우 변경 시점 월에 **차액(__dm_d)만 분리 반영**."
-    )
 
     # 3) 매출·마진·전시: sales transaction_date 구간 | 현금수금: payment_date·KPI 수납 버킷 (집계만)
     s_parts: list = []
@@ -17366,7 +17299,6 @@ def _render_notice_admin_section():
                 )
             elif my_stores:
                 picked_store_ids = [my_stores[0]["id"]]
-            st.caption("매장 관리자는 본인이 관리하는 매장에만 공지를 등록할 수 있습니다.")
 
         if st.form_submit_button("공지 등록"):
             if not (title and title.strip() and content and content.strip()):
@@ -17498,7 +17430,7 @@ def _render_notice_admin_section():
                     unsafe_allow_html=True,
                 )
             if not can_delete:
-                st.caption("전체매장 공지는 최고관리자만 삭제할 수 있습니다.")
+                pass
             elif st.button("삭제", key=f"notice_del_{row['id']}"):
                 _deleted = False
                 if _source == "supabase" and _use_supabase:
@@ -17735,7 +17667,6 @@ def _superadmin_tab_unpaid_report():
 
     st.markdown("---")
     st.subheader("잔금 결제 처리")
-    st.caption("아래 항목을 클릭하면 해당 고객의 잔금 결제를 바로 진행할 수 있습니다.")
     for i, r in enumerate(rows):
         label = f"[{r['매장명']}]  {r['고객명']}  |  잔금 {r['미수금액(잔금)']:,}원"
         with st.expander(label):
@@ -17988,9 +17919,6 @@ def _superadmin_tab5_store_accounts():
                                 else:
                                     st.error(f"폐점 처리 실패: {e}")
                 else:
-                    st.caption(
-                        "재개 시 이 매장이 다시 운영 화면에 노출됩니다. 기존 데이터는 그대로 유지되어 있으므로 이어서 사용 가능합니다."
-                    )
                     if st.button("🟢 이 매장 재개(활성화)", key=f"sa_reopen_btn_dlg_{sid}", type="primary"):
                         try:
                             client.table("app_stores").update({
@@ -18371,11 +18299,6 @@ def render_monthly_payment_report(is_superadmin: bool):
         st.dataframe(display_df, width='stretch')
 
         with st.expander("📒 매출 원장·마진 기여 내역 (감액·증액 대비)", expanded=False):
-            st.caption(
-                "매출 원장(sales) 각 행 금액이 주문 총액에서 차지하는 비율만큼, 해당 주문의 **현재** 실마진(actual_margin)을 배분한 값입니다. "
-                "감액(음수) 행은 마진기여액도 음수로 표시됩니다. (경영 대시보드 월별 직원 판매 평가의 마진 배분과 동일.) "
-                "주문총액·주문실마진은 조회 시점 스냅샷이며, 과거 특정일의 마진 ‘변경분’이 아니라 본 행이 현재 잔고 기준으로 마진 합계에 더하거나 빼는 몫입니다."
-            )
             if sales_margin_excel_df.empty:
                 st.info("선택 기간에 매출 원장 데이터가 없거나, 주문 정보를 불러오지 못했습니다.")
             else:
@@ -18860,7 +18783,6 @@ def render_monthly_payment_report(is_superadmin: bool):
                 _sum_row["판매건수"] = f"{_sum_row['판매건수']:g}건"
             disp_inline = pd.concat([disp_inline, pd.DataFrame([_sum_row])], ignore_index=True)
             st.dataframe(disp_inline, width='stretch')
-            st.caption("※ transaction_date(판매/변경 시점) 기준. 원가·수수료는 주문 기준 1/n 배분액입니다.")
         else:
             # 3-b. 8일 이상: 요약 테이블 표시 + 상세는 다운로드 안내
             disp_df = summary.copy()
@@ -18870,7 +18792,6 @@ def render_monthly_payment_report(is_superadmin: bool):
             disp_df["판매건수"] = disp_df["판매건수"].apply(lambda x: f"{x:g}건")
             st.write("📌 **실적 요약**")
             st.dataframe(disp_df, width='stretch')
-            st.caption("※ transaction_date(판매/변경 시점) 기준. 원가·수수료는 주문 기준 1/n 배분액입니다.")
             st.info("📥 원가·수수료·마진 상세내역은 엑셀 다운로드 → [상세내역] 시트에서 확인하세요.")
 
         # 4. 엑셀 다운로드 (다중 시트: 요약 + 상세 분리, 원가·수수료·마진 포함)
@@ -19771,12 +19692,6 @@ def _erp_render_attendance_excel_export(current_db: str, role: str, me_name: str
     - 시트: '월별 요약'(목표/계획/카운터누적/잔여/누락시프트합), '일자별 상세'."""
     _is_admin = role in ("store_admin", "superadmin")
     with st.expander("📥 근무시간 상세 엑셀 다운로드 (카운터 검증용)", expanded=False):
-        st.caption(
-            "일자별로 정기 시프트·근태 로그와 카운터에 실제 반영된 시간을 나란히 보여줍니다. "
-            "집계 정책: 정상·지각·조퇴·연차·반차 로그가 있는 날은 로그가 시프트를 대체하고 "
-            "('시프트대체(h)' 열), 추가근무·회의·행사·시차·포상시간 로그는 시프트에 가산됩니다 — "
-            "캘린더 표시와 동일합니다."
-        )
         emp_db_map: dict = {}
         for _dbf in all_dbs:
             for _e in _erp_get_employee_names_for_store(_dbf):
@@ -20077,7 +19992,6 @@ def _erp_check_cross_store_conflicts(
                     f"[{loc}] {str(rec.get('shift_start',''))[:5]}~{str(rec.get('shift_end',''))[:5]} 와 겹칩니다."
                 )
     return conflicts
-
 
 
     """
@@ -21630,7 +21544,6 @@ def _erp_tab_admin_settings(current_db: str, me_name: str, today: date):
         return
 
     st.subheader("⚙️ 관리자 메뉴")
-    st.caption("매장 관리자 전용 설정 화면입니다. 저장 시 대시보드 · 잔여 근무시간 카드에 즉시 반영됩니다.")
 
     # 연도 선택기 (대시보드와 독립: 관리자가 이번 해와 내년 목표를 함께 관리할 수 있게 함)
     _year_opts = list(range(today.year - 1, today.year + 2))
@@ -21653,11 +21566,6 @@ def _erp_tab_admin_settings(current_db: str, me_name: str, today: date):
     # ── 연간 집계 시작일 설정 ─────────────────────────────────────
     st.divider()
     st.markdown("##### 📅 연간 집계 시작일 설정")
-    st.caption(
-        "집계 시작일을 설정하면 해당 날짜부터 연말(12/31)까지의 근무만 집계됩니다. "
-        "예) 2026년 = 2026-06-01 → 6월~12월만 집계. "
-        "미설정 시 1월 1일부터 집계됩니다."
-    )
     _ytargets_all = _erp_list_yearly_targets(current_db, _ytarget_year)
     _ytarget_map = {r.get("employee_name"): r for r in _ytargets_all}
     _employees_yt = _erp_get_employee_names_for_store(current_db)
@@ -21737,7 +21645,6 @@ def _erp_tab_admin_settings(current_db: str, me_name: str, today: date):
     # ── 직원별 월 목표 근무시간 설정 ─────────────────────────────
     st.divider()
     st.markdown("##### ⚙️ 직원별 월 목표 근무시간 설정 (연간 기준 자동 계산)")
-    st.caption("월 목표를 설정하면 연간 목표(×12)가 자동으로 계산됩니다. 잔여 근무시간 카드에 즉시 반영됩니다.")
     _emp_settings_all = _erp_employee_settings_cached(current_db)
     _emp_map_all = {r.get("employee_name"): r for r in _emp_settings_all}
     _employees_for_setting = _erp_get_employee_names_for_store(current_db)
@@ -21836,7 +21743,6 @@ def _erp_tab_admin_settings(current_db: str, me_name: str, today: date):
     # ── 매장 전체 직원 현황 (이번달 시프트 + 연간 누계) ─────────────
     st.divider()
     st.markdown(f"##### 👥 {_ytarget_year}년 매장 전체 직원 현황 (이번달 시프트 + 연간 누계)")
-    st.caption("'이번달 근무일·근무(h)·휴무'는 이번달 시프트 기준, '공통 필요·차감·실제·잔여'는 선택한 연도 전체 누계입니다.")
     _adm_today = today
     _adm_last_day = calendar.monthrange(_adm_today.year, _adm_today.month)[1]
     _adm_m_start = date(_adm_today.year, _adm_today.month, 1)
@@ -21923,8 +21829,6 @@ def _erp_tab_admin_settings(current_db: str, me_name: str, today: date):
 
 def _erp_tab_shift_plan(current_db: str, me_name: str):
     st.subheader("📅 정기근무일정 (본인 일정 등록)")
-    st.caption("출근일은 ✅ 체크하고, 휴무일은 체크 해제하세요. 시간은 매장 기본값이 자동 입력되며, 필요 시 수정 가능합니다.")
-    st.caption("ⓘ 매장 표준 시간보다 길게 근무한 경우 저장 후 '연장근무 신청' 확인 박스가 표시됩니다. (짧게 근무한 경우 별도 신청 절차 없음)")
     role = (st.session_state.get("current_user") or {}).get("role") or "user"
 
     # 직전 저장에서 발생한 연장근무 후보 확인 UI (본인 한정)
@@ -22120,7 +22024,7 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
     with sbtn_c1:
         submitted = st.button("💾 내 일정 저장", type="primary", key="erp_shift_save")
     with sbtn_c2:
-        st.caption("체크된 날짜는 등록·덮어쓰기되고, 체크 해제된 날짜의 기존 일정은 삭제됩니다. 저장 후 완료 알림이 표시됩니다.")
+        pass
 
     if submitted:
         # 타 매장 중복 시간대 사전 검사
@@ -22250,7 +22154,6 @@ def _erp_tab_shift_plan(current_db: str, me_name: str):
         st.rerun()
 
 
-
 # ---------- 탭 2: 최소 근무 인원 규칙 설정 (store_admin) ----------
 
 def _erp_tab_staffing_rules(current_db: str, me_name: str):
@@ -22263,7 +22166,6 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
 
     # ── 기본 근무시간 (주중 / 주말·공휴일) ─────────────────────
     st.markdown("##### 🕘 기본 근무시간 설정")
-    st.caption("매장 표준 출퇴근 시각을 주중 / 주말·공휴일로 나누어 설정합니다. 근태 입력 폼에 자동 적용됩니다.")
     cur_hours = _erp_get_store_hours(current_db)
     existing_hours = _erp_store_hours_cached(current_db)
     with st.form(f"erp_store_hours_form_{_kp}", clear_on_submit=False):
@@ -22305,7 +22207,6 @@ def _erp_tab_staffing_rules(current_db: str, me_name: str):
         st.info("기타(외부/행사) 매장은 최소 근무 인원 규칙을 설정하지 않습니다.")
     else:
         st.markdown("##### 🧑‍🤝‍🧑 시간대별 최소 근무 인원 (요일별)")
-        st.caption("주중(월~금)과 주말·공휴일(토·일)로 나누어 시간대별 최소·적정 근무 인원을 설정합니다. 근무 일정 저장 시 자동으로 검증됩니다.")
 
         # 캐시된 조회 사용 (매 위젯 조작마다 Supabase 호출 방지)
         rules = _erp_staffing_rules_cached(current_db)
@@ -22753,7 +22654,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     import calendar as _cal
 
     st.markdown("### 2️⃣ 월별 근무 캘린더")
-    st.caption("매장·직원을 선택해 누가 언제 어디서 일하는지 한눈에 확인할 수 있습니다.")
     # 빠른 수정/삭제 직후 부분 재실행으로 전달된 완료 알림 (전체 rerun 아님 → 탭 유지)
     _cal_flash = st.session_state.pop("_erp_cal_flash", None)
     if _cal_flash:
@@ -23299,7 +23199,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     # ── 당일 일정 (칸을 누르면 여기가 바뀜) ──────────────────
     _dow_names = ["월", "화", "수", "목", "금", "토", "일"]
     _sel_dow = _dow_names[_sel_day.weekday()]
-    st.caption("날짜를 누르면 아래에 일정이 표시됩니다.")
     st.markdown(f"**{_sel_day.month}월 {_sel_day.day}일 ({_sel_dow}) 일정**")
     _day_shifts = list(shifts_by_date.get(_sel_iso, []))
     _day_logs = list(logs_by_date.get(_sel_iso, []))
@@ -23429,7 +23328,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 st.info("이번 달 등록된 본인 정기 근무일이 없습니다. "
                         "정기 근무일정은 [정기근무일정] 탭에서 먼저 등록해 주세요.")
             else:
-                st.caption("아래에서 근무일을 선택하고 [편집] 버튼을 누르면 팝업 창에서 바로 수정할 수 있습니다.")
                 _qe_options: list[tuple[int, str]] = []
                 for _s in _editable_shifts:
                     _sid = int(_s.get("id") or 0)
@@ -23457,7 +23355,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         st.session_state["erp_shift_edit_id"] = _qe_pick_id
                         st.rerun(scope="fragment")
         with st.expander("➕➖ 추가근무·휴가신청 (팝업)", expanded=False):
-            st.caption("추가근무·휴가 등 신청을 팝업 창에서 바로 등록할 수 있습니다.")
             if st.button("📤 신청 등록 팝업 열기", key="erp_calendar_adj_btn", type="primary"):
                 st.session_state["my_new_date"] = _sel_day
                 if _adj_dialog is not None:
@@ -23644,11 +23541,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
     # ── 🔍 인력 기준 룰 진단 ────────
     if shortage_dates or overstaff_dates:
         with st.expander("🔍 인력 기준 룰 진단 — 화면 표시와 실제 DB row 비교", expanded=False):
-            st.caption(
-                "캘린더에 인원부족/과다근무가 표시되는데 룰 설정값과 안 맞는다면, "
-                "DB에 옛 row가 남아있거나 같은 (요일·슬롯)에 row가 중복 저장됐을 수 있습니다. "
-                "아래 raw row가 사이드바 룰 화면에 그대로 반영되어 있는지 비교해보세요."
-            )
             _DOW_LBL_FULL = ["월(0)", "화(1)", "수(2)", "목(3)", "금(4)", "토(5)", "일(6)"]
             _diag_rows = []
             for (dbf2, dow2), rules_list in sorted(rules_by_store_dow.items()):
@@ -23766,11 +23658,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 # ── 🔬 부족/과다 사유 상세: 카운트에 합산된 직원 목록
                 st.markdown("---")
                 st.markdown("#### 🔬 부족/과다 사유 상세 — 매장별 합산된 직원")
-                st.caption(
-                    "카운팅은 **근무지(work_location_name) 우선** 기준입니다. "
-                    "work_location_name 이 비어있으면 직원의 소속 매장(_dbf)으로 합산되고, "
-                    "외부 행사(등록 매장이 아닌 곳)면 어떤 매장에도 합산되지 않습니다."
-                )
                 _flag_rows = []
                 for (d_iso2, sn2), shifts_list in sorted(contributing_emps.items()):
                     label = "부족" if (d_iso2, sn2) in shortage_details else "과다"
@@ -23807,18 +23694,12 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                         ["날짜", "매장(카운트 대상)", "직원"], kind="stable"
                     )
                     st.dataframe(df_flag, width="stretch", hide_index=True)
-                    st.caption(
-                        "🔎 박성진 등 특정 직원이 보이지 않는다면: 그 직원의 시프트의 "
-                        "**`work_location_name`이 다른 매장 또는 외부 행사로 지정**되어 해당 매장에 합산되지 않은 것입니다. "
-                        "근무지를 비우거나 올바른 매장명으로 수정하면 카운트에 포함됩니다."
-                    )
             else:
                 st.info("등록된 룰이 없습니다.")
 
     # ── ✏️ 등록된 근무일 목록 수정 / 삭제 (관리자 전용) ────────
     st.divider()
     with st.expander("✏️ 등록된 근무일 수정 / 삭제", expanded=False):
-        st.caption("**근무매장**(실제 근무한 매장)을 선택하면 해당 매장에서 일한 모든 직원(소속+파견)의 이번 달 근무일이 나옵니다. 외부 행사는 '기타 (외부/행사)' 선택.")
         # 이 섹션 자체 매장 선택 (상단 필터와 독립). '기타 (외부/행사)'는 내 매장 db에 저장.
         _qe_store_opts = all_store_names + ["기타 (외부/행사)"]
         _qe_default_store = sel_store if sel_store in all_store_names else (
@@ -24211,10 +24092,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
 
     # ── ✨ 추가근무·회의 로그 수정 / 삭제 ──────────────────────────────
     with st.expander("✨ 추가근무·회의 로그 검색 / 수정 / 삭제", expanded=False):
-        st.caption(
-            "캘린더에 표시되는 추가근무·회의 기록(app_attendance_logs)을 직접 수정·삭제합니다. "
-            "여기서 수정해도 원본 신청서(app_work_adjustments)는 변경되지 않습니다."
-        )
         _ot_c1, _ot_c2, _ot_c3 = st.columns([1.2, 1.2, 1.6])
         with _ot_c1:
             _ot_emp_opts = ["(전체 직원)"] + sorted(set(all_emps))
@@ -24419,7 +24296,6 @@ def _erp_tab_calendar(current_db: str, role: str, me_name: str, today: date):
                 for wt, c in _ERP_BADGE_COLORS.items()
             ]
             st.markdown(" ".join(wt_parts), unsafe_allow_html=True)
-        st.caption("컬러 바 = 근무 계획(shift) / 보라 = 외부 행사·박람회 / 배지 = 실제 근태 기록 / 파란 테두리 = 오늘 / 빨간 테두리 = 최소 인원 미달")
 
 
 # ---------- (구) 탭 4 (v2.1 리팩터에서 제거됨) ----------
@@ -24435,7 +24311,6 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
 
     if role in ("store_admin", "superadmin"):
         st.markdown("##### 🗓️ 주말 회의 시차 일괄 등록 (관리자)")
-        st.caption("주말 회의 참석 직원 전체에게 시차적립을 일괄 INSERT 합니다.")
         with st.form("erp_weekend_meeting_form", clear_on_submit=True):
             mc = st.columns([1, 1, 2])
             with mc[0]:
@@ -24519,7 +24394,6 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
 
     st.divider()
     st.markdown("##### 📝 추가근무 보상 신청")
-    st.caption("목표 근무시간 초과분에 대해 보상 방식을 선택할 수 있습니다. 시차/연차는 자동 반영, 급여 청구는 관리자 승인 필요.")
 
     # 본인 잔여(시차/연차) 표시 — 선택 가이드
     _me_for_balance = me_name if role == "user" else None
@@ -24716,7 +24590,6 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
 
         st.divider()
         st.markdown("##### 🗓️ 주말·공휴일 연차/반차 승인 대기 목록 (관리자)")
-        st.caption("직원이 주말·공휴일에 연차 또는 반차를 기록하면 여기에 표시됩니다. 승인하면 연차 차감이 확정됩니다.")
         all_att_logs = _erp_fetch_table("app_attendance_logs", {"home_db_filename": current_db})
         leave_pending = [
             r for r in all_att_logs
@@ -24755,7 +24628,6 @@ def _erp_tab_comptime_overtime(current_db: str, role: str, me_name: str):
         # ── 급여 청구 승인 대기 ──────────────────────────────────
         st.divider()
         st.markdown("##### 💸 급여 청구 승인 대기 목록 (관리자)")
-        st.caption("직원이 추가근무 보상을 '급여 청구'로 신청한 건입니다. 승인하면 급여에 반영하실 수 있습니다.")
         _all_claims = _erp_overtime_claims_cached(current_db, status="pending")
         _pay_claims = [c for c in _all_claims if c.get("compensation_type") == "payment"]
         if not _pay_claims:
@@ -24970,7 +24842,6 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
     # ── 직원 포상시간 부여 (관리자) ────────────────────────────
     st.divider()
     st.markdown("##### 🏅 직원 포상시간 부여")
-    st.caption("관리자가 직원에게 보상으로 주는 시간입니다. 부여 즉시 직원의 월 근무 카운터에서 자동으로 차감됩니다(일한 것처럼 인정).")
 
     with st.form("erp_bonus_hours_form", clear_on_submit=True):
         bc1, bc2, bc3 = st.columns([2, 1, 1])
@@ -25040,7 +24911,6 @@ def _erp_tab_leave_grants(current_db: str, me_name: str):
 def render_send_message():
     """Solapi를 통해 친구톡 또는 SMS를 수동으로 발송하는 UI."""
     st.title("💬 메시지 발송")
-    st.caption("Solapi를 통해 카카오 친구톡 또는 SMS를 수동으로 발송합니다.")
 
     try:
         from solapi_sender import send_friendtalk, send_sms, check_solapi_config  # noqa: WPS433
@@ -25148,7 +25018,6 @@ def render_voc_dashboard():
     import plotly.express as _px
 
     st.title("📊 고객의 소리(VOC) 분석")
-    st.caption("채널톡 상담 종료 시 AI(Gemini 1.5 Flash)가 자동 분석한 VOC 인사이트입니다.")
 
     supa, _err = get_supabase_client()
     if _err or not supa:
@@ -25188,7 +25057,6 @@ def render_voc_dashboard():
     # ── 데이터 없음 처리 ────────────────────────────────────────
     if not _rows:
         st.info("해당 기간에 분석된 VOC 데이터가 없습니다.")
-        st.caption("채널톡에서 상담이 종료되면 자동으로 분석됩니다. 또는 아래 과거 데이터 일괄 임포트를 사용하세요.")
     else:
         import pandas as _pd_voc
         _df = _pd_voc.DataFrame(_rows)
@@ -25449,7 +25317,6 @@ def render_document_library():
             )
 
     st.header("📁 자료실")
-    st.caption("업무 자료를 게시판 형태로 관리합니다.")
 
     client, err = get_supabase_client()
     if err or not client:
@@ -26409,7 +26276,6 @@ def _erp_tab_monthly_summary(current_db: str, today: date):
         })
 
     df_summary = pd.DataFrame(summary_rows)
-    st.caption("화면에는 직원별 전체 근무 합계가 표시됩니다. 매장별 세부 내역은 엑셀 다운로드에서 확인하세요.")
     st.dataframe(df_summary, width="stretch", hide_index=True)
 
     buf = io.BytesIO()
@@ -26633,10 +26499,6 @@ def _erp_tab_period_targets(current_db: str, me_name: str):
         return
 
     st.subheader("⏰ 근무시간 설정")
-    st.caption(
-        "직원별로 임의 기간(예: 2026-06~2026-12, 1275h)의 필수 근무시간 목표를 입력합니다. "
-        "대시보드 「공통 필요근무시간」에 1순위로 반영됩니다."
-    )
 
     today = _today_kst()
 
@@ -26677,8 +26539,6 @@ def _erp_tab_period_targets(current_db: str, me_name: str):
 def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
     """매장관리자: 직원 신청 승인/반려 큐 (본인 신청 자가 승인 포함)."""
     st.subheader("📥 신청 승인")
-    st.caption("직원이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청을 검토합니다. 승인 시 해당 직원의 월·연 잔여 시간에 즉시 반영됩니다.")
-    st.caption("ⓘ 매장 관리자 본인이 올린 신청도 이 큐에서 직접 승인/반려할 수 있습니다.")
 
     pending = _erp_list_pending_adjustments(current_db)
     # 근무지 표기용 매장 → 이름 매핑 (한 번만 조회)
@@ -26775,10 +26635,6 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
     # ── 승인 완료 내역 (취소 가능) ─────────────────────────────────────
     st.divider()
     with st.expander("✅ 승인 완료 내역 확인 및 취소", expanded=False):
-        st.caption(
-            "승인된 내역을 취소하면 신청 상태가 '대기'로 돌아가고, "
-            "캘린더(app_attendance_logs)에 자동 반영된 근무 기록도 함께 삭제됩니다."
-        )
         try:
             _appr_client, _appr_err = get_supabase_client()
             if _appr_err or not _appr_client:
@@ -26846,10 +26702,6 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
     # ── 기존 승인 내역 캘린더 재동기화 ────────────────────────────────
     st.divider()
     with st.expander("🔄 기존 승인 내역 캘린더 재동기화", expanded=False):
-        st.caption(
-            "과거에 승인된 신청(추가근무·회의·조기퇴근·여름휴가·포상·장기근속·특이사항) 중 "
-            "캘린더(app_attendance_logs)에 반영되지 않았거나 시간대가 비어 있는 항목을 일괄 동기화·보강합니다."
-        )
         _sync_year = st.number_input("대상 연도", min_value=2020, max_value=2100,
                                      value=_today_kst().year, step=1, key="sync_year")
         if st.button("🔄 동기화 실행", key="sync_approved_btn"):
@@ -26971,11 +26823,6 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
 
     # ── 시간대 누락 승인건 시작·종료 시각 보강 (캘린더 배지에 실제 시각 표시) ──
     with st.expander("🩹 시간대 누락 승인건 보강 (추가근무·회의 시각 입력)", expanded=False):
-        st.caption(
-            "구버전에서 시간대 컬럼 없이 승인된 추가근무·회의 신청은 캘린더에서 "
-            "'+Xh' 형태로만 표시됩니다. 각 행의 시작 시각만 확인·수정하면 종료 시각은 "
-            "'시작 + 신청분' 으로 자동 계산됩니다. **[일괄 저장]** 으로 한 번에 처리할 수 있습니다."
-        )
 
         def _bf_hhmm_to_s(v: str) -> str | None:
             v = (v or "").strip()
@@ -27132,7 +26979,7 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
                     _batch_btn = st.button("🗂️ 일괄 저장 (표시된 건 모두)", type="primary",
                                            key="bf_batch_save")
                 with _batch_col2:
-                    st.caption("각 행의 시작 시각과 자동/수동 종료 시각으로 신청서·로그를 일괄 정정합니다.")
+                    pass
 
                 if _batch_btn:
                     _bok, _bfail = 0, []
@@ -27204,9 +27051,6 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
 
     # ── 진단: 특정 날짜·직원의 로그·신청 상태 확인 ─────────────────────
     with st.expander("🔎 캘린더 반영 진단 (특정 날짜·직원)", expanded=False):
-        st.caption(
-            "캘린더에 추가근무·회의가 안 나올 때, 실제 DB 에 어떻게 저장되어 있는지 확인합니다."
-        )
         _diag_c1, _diag_c2 = st.columns([2, 2])
         with _diag_c1:
             _diag_stores = _get_supabase_stores_list() or []               # 활성 매장 (캘린더 표시 기준)
@@ -27337,7 +27181,6 @@ def _erp_tab_adjustment_approvals(current_db: str, me_name: str):
 
     # ── 전체 신청 내역 엑셀 내보내기 ──────────────────────────────────
     with st.expander("📊 전체 신청 내역 엑셀 다운로드", expanded=True):
-        st.caption("추가근무·휴무·포상·회의·여름휴가 등 모든 신청 내역을 직원/기간/유형/상태별로 필터링해 내보냅니다.")
 
         # 직원 목록 (전체 매장)
         _xls_stores = _get_supabase_stores_list() or []
@@ -27497,7 +27340,6 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
 
     with st.form("my_new_adj_form", clear_on_submit=True):
         if _needs_timeslot:
-            st.caption("📌 추가근무·회의는 실제 시간대를 입력하면 캘린더에 자동 반영됩니다.")
             ts1, ts2, ts3, ts4 = st.columns([1.2, 1, 1, 2])
             with ts1:
                 new_date = st.date_input("날짜", value=_adj_date_default, key="my_new_date")
@@ -27517,7 +27359,6 @@ def _erp_render_my_adj_form(current_db: str, role: str, me_name: str, today: dat
             )
             new_reason = st.text_input("사유", placeholder="사유를 입력해 주세요 (선택)", key="my_new_reason")
         elif _is_early_leave:
-            st.caption("📌 조기퇴근은 실제 퇴근 시각만 입력하면 근무일정 종료시각과의 차이가 자동으로 계산됩니다.")
             el1, el2 = st.columns([1.2, 1])
             with el1:
                 new_date = st.date_input("퇴근일", value=_adj_date_default, key="my_new_date")
@@ -27865,7 +27706,6 @@ def _erp_render_my_adj_history(current_db: str, me_name: str, today: date) -> No
 def _erp_render_attendance_log_admin(current_db: str, me_name: str, today: date) -> None:
     """관리자 전용: 근태 기록 검색 / 삭제 UI."""
     with st.expander("🗑️ 근태 기록 검색 / 삭제 (관리자 전용)", expanded=False):
-        st.caption("특정 직원·기간의 근태 기록을 조회하고 잘못 입력된 기록을 삭제할 수 있습니다.")
         _del_emp_opts = _erp_get_employee_names_for_store(current_db) or [me_name]
         _dc1, _dc2, _dc3 = st.columns([2, 1, 1])
         with _dc1:
@@ -28012,12 +27852,6 @@ def _erp_render_superadmin_view(today: date):
 
     with sa_tabs[3]:
         st.markdown("##### 🧑‍💼 전 매장 매장관리자 근태 신청 승인 (superadmin 백업)")
-        st.caption(
-            "매장 관리자 본인이 올린 +(추가근무·회의)/-(휴무·포상·여름휴가) 신청입니다. "
-            "매장 관리자는 [신청 승인] 큐에서 본인 신청도 직접 승인 가능하며, "
-            "여기서는 superadmin 이 대신 승인·반려할 수 있는 백업 경로입니다. "
-            "승인 시 캘린더(app_attendance_logs)에 자동 반영됩니다."
-        )
         sa_adj_pending = []
         for _, sr in stores_df.iterrows():
             dbf = sr["db_filename"]
@@ -29387,7 +29221,6 @@ def _render_task_gantt(tasks: list[dict], assignees_map: dict):
         ),
     )
 
-    st.caption("💡 차트를 좌우로 드래그하거나, 하단/브라우저 가로 스크롤로 6개월 이상 일정을 확인할 수 있습니다. 완료된 업무는 크로스 해치(╳) 패턴으로 표시됩니다.")
     # width="content" → 위에서 강제한 width(일자×32px)로 그려져 브라우저 가로 스크롤 활성화
     st.plotly_chart(fig, width="content")
 
@@ -29963,11 +29796,6 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
 
     with st.container(border=True):
         st.markdown("##### 💳 결제변경 검증 요청 작성")
-        st.caption(
-            "요청 등록 시 **원본 결제가 자동으로 취소 등록(음수 결제행)** 되고 "
-            "**아래 입력한 신규 결제가 즉시 저장** 됩니다. 한 번의 등록으로 취소·재결제가 함께 반영됩니다. "
-            "관리자 승인은 사후 검증(실제 반환 입금이 필요한 경우의 결재)용입니다."
-        )
 
         # 원본은 현재 결제행이 아니라 최신 결제변경 이력에서 가져온다 (사후 검증 버그 방지)
         _hist = _load_latest_payment_history_for_pcr(db_filename, int(order_id))
@@ -31515,7 +31343,7 @@ def render_deposit_management():
                     else:
                         st.error(f"실패: {err}")
             else:
-                st.caption("특정 매장을 선택하면 해당 매장 매출과 연결할 수 있습니다.")
+                pass
 
             # 미분류 → 매장 지정
             if not target.get("store_name") or is_superadmin:
@@ -31768,7 +31596,6 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     batches = _ext_pay_list_batches(sel_db, limit=20)
     if batches:
         st.markdown("##### 업로드 이력 (모든 관리자 공통)")
-        st.caption("한 명이 올린 파일은 같은 매장을 보면 다른 관리자에게도 동일하게 보입니다.")
         st.dataframe(
             pd.DataFrame([{
                 "시각": str(b.get("uploaded_at") or "")[:19],
@@ -31840,21 +31667,11 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         "card":     _ext_pay_match_card,
         "mainpay":  _ext_pay_match_mainpay,
     }
-    _uploader_hint = {
-        "onnuri":   ("온누리 매출내역 파일 (.xlsx / .csv)",
-                     "가맹점 포털에서 다운로드한 파일을 그대로 올리면 됩니다. 같은 파일을 다시 올려도 지문(fingerprint) 기반 중복 방지됩니다."),
-        "ulsanpay": ("울산페이 거래내역서 (.xlsx / .csv)",
-                     "가맹점 포털에서 받은 거래내역서를 그대로 올리면 됩니다. 결제금액·승인번호 6자리로 매칭합니다."),
-        "card":     ("카드매출내역 (신용/체크카드) (.xlsx / .csv)",
-                     "PG/여신금융협회에서 받은 카드매출내역을 그대로 올리면 됩니다. 매입일자·카드사·매입금액으로 ERP 신용/체크카드 결제와 대조합니다."),
-        "mainpay":  ("메인페이 매출내역 (.xlsx / .csv)",
-                     "메인페이 정산자료를 그대로 올리면 됩니다. 매입일자·승인번호·결제금액으로 ERP 메인페이 결제와 대조합니다."),
-    }
-    _caption_by = {
-        "onnuri":   "식별자: **결제일 + 전화번호 뒤 4자리 + 금액** (겹치면 거래시간).",
-        "ulsanpay": "식별자: **승인번호 6자리** · 금액: **결제금액** (거래금액 아님). ERP 지역화폐 승인과 대조합니다.",
-        "card":     "식별자: **매입일자(±2일) + 카드사 + 매입금액**. 승인번호는 있으면 후보 좁힘 서브키.",
-        "mainpay":  "식별자: **금액 + 매입일자(±2일)**. 승인번호는 있으면 유일 후보 확정에 사용.",
+    _uploader_label_by = {
+        "onnuri":   "온누리 매출내역 파일 (.xlsx / .csv)",
+        "ulsanpay": "울산페이 거래내역서 (.xlsx / .csv)",
+        "card":     "카드매출내역 (신용/체크카드) (.xlsx / .csv)",
+        "mainpay":  "메인페이 매출내역 (.xlsx / .csv)",
     }
     _empty_hint_by = {
         "onnuri":   "파싱된 행이 없습니다. 파일 컬럼(거래일자·결제금액 등)을 확인해 주세요.",
@@ -31871,13 +31688,10 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         key=f"extpay_src_{sel_db}",
     )
 
-    st.caption(_caption_by.get(sel_src, ""))
-    _uploader_label, _uploader_help = _uploader_hint[sel_src]
     up = st.file_uploader(
-        _uploader_label,
+        _uploader_label_by[sel_src],
         type=["xlsx", "csv"],
         key=f"extpay_upload_{sel_db}_{sel_src}",
-        help=_uploader_help,
     )
     _parse_fn = _parse_fn_by[sel_src]
     _match_fn = _match_fn_by[sel_src]
@@ -31961,7 +31775,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
                 "라디오에서 올린 출처를 선택해 주세요."
             )
         else:
-            st.caption("아직 매칭 결과가 없습니다. 파일을 업로드하면 여기에 표시됩니다.")
+            pass
         return
     st.caption(
         f"표시 {len(df)}건 · DB 저장 {saved_n}건 ({src_labels.get(sel_src, sel_src)}) "
@@ -32106,18 +31920,6 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"extpay_xlsx_{sel_db}_{sel_src}",
     )
-    st.caption(
-        f"빨간 행: {_ledger}에 승인번호가 없고 모모만 번호가 있는 건(가공 번호·임의 매칭 의심). "
-        f"동일 승인번호의 {_src_side} 취소와 모모 취소는 날짜가 달라도 상계되어 '금액일치'로 표시됩니다. "
-        f"결제 금액·수단·승인번호를 바꾸면 해당 건은 자동 재매칭됩니다. "
-        f"결과: 금액일치=정상 · 분할 합산 일치=모모 결제 여러 건 합이 {_ledger} 1건과 일치 · "
-        f"금액 다름={_ledger}·모모원장 금액 상이(오입력 의심) · "
-        f"{_src_side}만 있음=모모 미입력 · 모모만 있음={_ledger} 없음 · "
-        f"{_src_side} 취소·모모 잔존={_ledger}은 취소인데 모모 잔존(임의취소 의심) · "
-        f"모모 취소·{_src_side} 결제=모모는 취소인데 {_ledger} 결제완료 · "
-        f"다중 매치=동일 승인·금액이 여럿이라 특정 불가 · 수동 매칭=관리자가 직접 붙임 · 미매칭=아직 맞추기 미실행 · "
-        f"맞추기 대상: 해당 매장의 {_src_side} 결제 전체(신규고객 한정 아님)"
-    )
 
     # AI 유사 매칭 제안 (온누리 파일럿) — 수동 매칭 전 관리자 검토
     _render_ext_pay_ai_similar_match(sel_db, sel_src, df, me_uname)
@@ -32157,11 +31959,6 @@ def _render_ext_pay_conflict_panel(
         f"⚠︎ 중복 skip 된 행 상세 ({len(conflicts)}건) — 별개 거래면 거래시각 재입력하여 등록",
         expanded=True,
     ):
-        st.caption(
-            "이번 업로드에서 지문(날짜·시각·금액·승인번호 조합)이 기존 저장 행과 겹쳐 skip 된 행입니다. "
-            "정말 다른 거래인 경우 원장에서 정확한 거래시각(초 단위)을 확인하여 아래 입력창에 넣고 "
-            "[별개 거래로 강제 등록] 을 눌러 주세요. 콜론 없이 `132739` 처럼 6자리 숫자만 입력해도 자동으로 `13:27:39` 형식으로 변환됩니다."
-        )
         for idx, c in enumerate(list(conflicts)):
             parsed = c.get("parsed") or {}
             existing = c.get("existing") or {}
@@ -32894,10 +32691,6 @@ def _render_ext_pay_manual_and_erp_only(
     """검증 시작일 이후 어떤 공식 행과도 매칭되지 않은 ERP 결제 리스트.
     현금(수금)·계좌이체·아직 파일 미업로드된 결제 등을 한 화면에서 수기 확인 처리."""
     with st.expander("💵 모모 only (원장에 없는 결제) — 수기 확인", expanded=False):
-        st.caption(
-            "매장의 검증 시작일 이후 결제 중 어떤 원장과도 맞춰지지 않은 항목입니다. "
-            "현금 수금·계좌이체 등 원장 자체가 없는 결제는 아래에서 '수기 확인' 을 스탬프하면 정상 처리됩니다."
-        )
         _rows = _ext_pay_list_unmatched_erp_all_methods(sel_db, new_from)
         if not _rows:
             st.success("모든 모모 결제가 맞추기 또는 수기 확인되었습니다.")
@@ -33034,7 +32827,6 @@ def render_admin_settings():
         return
 
     st.header("⚙️ 관리자 설정")
-    st.caption("ERP 운영에 필요한 설정을 관리합니다. 항목은 추후 확장됩니다.")
 
     # ── 1. 직원 마스터 (구 매장 관리자 메뉴) ─────────────────────
     st.subheader("1. 직원 마스터 (Employees)")
@@ -33128,10 +32920,6 @@ def render_admin_settings():
     # ── 6. 계좌-매장 매핑 (입금 SMS 자동 분류) ─────────────────────
     import deposit_board as _dep  # noqa: WPS433
     st.subheader("6. 🏦 계좌-매장 매핑 (입금 문자 자동 분류)")
-    st.caption(
-        "기업은행 입금 문자의 계좌(예: 392***16401011)에서 **끝 8자리**(16401011)로 매장을 자동 분류합니다. "
-        "각 매장 계좌의 끝 8자리를 등록해 주세요."
-    )
 
     accounts = _dep.load_bank_accounts_cached()
     if accounts:
@@ -33199,11 +32987,6 @@ def render_admin_settings():
 
     # ── 7. 직원 평가 가중치 (월별/매장별 · 전체 통합) ─────────────────
     st.subheader("7. 🎯 직원 평가 가중치 (월별)")
-    st.caption(
-        "매출 / 마진 / 전시품 / 현금수금 점수의 **가중치**를 매장별 또는 **전체 매장 통합**으로 "
-        "**연월(YYYY-MM) 단위**로 설정합니다. 저장이 없는 달은 기본값 **70 / 15 / 5 / 10**을 사용합니다. "
-        "과거 월 조회는 그 달에 저장된 값이 그대로 적용됩니다."
-    )
     with st.expander("가중치 편집 / 목록", expanded=False):
         _render_kpi_weights_admin_section(role, me_uname)
 
@@ -33211,13 +32994,6 @@ def render_admin_settings():
 
     # ── 8. 온누리 / 울산페이 / 카드매출 결제 대조 ─────────────
     st.subheader("8. 🧾 온누리 / 울산페이 / 카드매출 결제 대조")
-    st.caption(
-        "가맹점 포털·PG 에서 받은 **원장**을 업로드하면 모모 결제와 대조해 "
-        "미입력·허위입력·결제 후 임의취소를 찾습니다. "
-        "온누리: **날짜 · 전화 뒤 4자리 · 금액** / 울산페이: **승인번호 6자리 · 결제금액** / "
-        "신용카드: **매입일자 · 카드사 · 매입금액** / 메인페이: **매입일자 · 승인번호 · 결제금액**. "
-        "같은 파일을 다시 올려도 **지문(fingerprint) 기반 중복 방지** 되며, 원장이 없는 현금 수금 등은 **수기 확인** 으로 처리할 수 있습니다."
-    )
     with st.expander("원장 업로드 / 맞추기 결과", expanded=False):
         _render_external_pay_admin_section(role, me_uname)
 
@@ -33225,7 +33001,6 @@ def render_admin_settings():
 
     # ── 9. 🔐 비밀번호 변경 ──────────────────────────────────────
     st.subheader("9. 🔐 비밀번호 변경")
-    st.caption("현재 로그인 계정의 비밀번호를 변경합니다. 변경 후 다음 로그인부터 새 비밀번호를 사용하세요.")
     with st.form("admin_settings_change_pw_form", clear_on_submit=True):
         _cpw_new = st.text_input("새 비밀번호", type="password", key="as_new_pw")
         _cpw_confirm = st.text_input("새 비밀번호 확인", type="password", key="as_new_pw_confirm")
@@ -33814,7 +33589,6 @@ def render_employee_management():
                     # ----- 이메일(로그인 ID) 변경 -----
                     with st.form(f"emp_email_update_form_{edit_user_id}"):
                         st.markdown("**이메일(로그인 ID) 변경**")
-                        st.caption("현재 이메일 → 새 이메일로 변경합니다. Supabase Auth + app_users 양쪽 모두 반영됩니다.")
                         st.text_input("현재 이메일", value=(row[1] or row[0] or "").strip(), disabled=True, key=f"emp_cur_email_display_{edit_user_id}")
                         new_email_input = st.text_input("새 이메일", placeholder="새 이메일 주소를 입력하세요", key=f"emp_new_email_input_{edit_user_id}")
                         if st.form_submit_button("이메일 변경"):
@@ -34536,11 +34310,6 @@ def _render_building_alias_admin():
     AI 세일즈 리포트 「아파트/건물 Top」 집계에 반영한다.
     """
     st.markdown("### 🏢 건물명 별칭(alias) 관리")
-    st.caption(
-        "신규 입주 아파트처럼 도로명 주소가 없어 자동 지오코딩이 안 된 고객을, "
-        "주소 키워드로 정식 건물명에 통합 매핑합니다. "
-        "예: 주소에 '달천이파크'가 포함된 고객 매출을 모두 '달천이파크1차아파트'로 집계."
-    )
 
     role = st.session_state.get("user", {}).get("role", "user")
 
@@ -34767,10 +34536,6 @@ def _render_ai_sales_reports_new(srs):
         st.metric("마진율", f"{kpi['margin_rate'] * 100:.1f}%")
     with k5:
         st.metric("실수납액", f"{kpi['payments_amount']:,}원")
-    st.caption(
-        "순매출은 **판매일(order_date)** 기준 · **계약 시점 total_amount + sales 원장 조정·반품**을 반영합니다. "
-        "실수납액은 **결제일(payment_date)** 기준이라 선수금·잔금 때문에 순매출과 다를 수 있습니다."
-    )
 
     def _fmt_krw_col(df: pd.DataFrame, cols: list) -> pd.DataFrame:
         """지정 컬럼을 '1,234,567원' 형식 문자열로 변환 (천 단위 쉼표)."""
@@ -35084,7 +34849,6 @@ def render_faq_page():
         key="faq_keyword_search",
         label_visibility="collapsed",
     )
-    st.caption("🔎 위 칸에 검색어를 입력하면 제목·내용·연관 키워드에서 찾습니다.")
     matched = _faq_filter_items(_q)
     if not matched:
         st.info("검색 결과가 없습니다. 다른 키워드를 입력해 보세요.")
@@ -35162,10 +34926,6 @@ def render_store_admin_employees():
 
     # ---------- 매출 정합성 점검 (sales 누락 자동 복구) ----------
     with st.expander("1-1. 🔧 매출 정합성 점검 (sales 누락 자동 복구)", expanded=False):
-        st.caption(
-            "주문(app_orders)은 저장됐지만 매출(sales)에 기록되지 않은 누락 건을 찾아 "
-            "자동으로 복구합니다. KPI·월매출에 반영되지 않은 주문을 발견했을 때 사용하세요."
-        )
         if st.button("정합성 점검 실행", key="reconcile_sales_btn"):
             with st.spinner("점검 중... 매장의 모든 주문과 sales 레코드를 비교합니다."):
                 _rec = _reconcile_missing_sales(db_filename)
@@ -35487,7 +35247,6 @@ def _customer_search_fragment_impl(db_filename: str):
             st.session_state["phone2"] = _format_phone_hyphen(r0.get("phone2") or "") or ""
             st.session_state["address_manual"] = r0.get("address") or st.session_state.get("address_manual", "")
 
-        st.caption("고객을 선택하면 아래 입력란에 이름·전화번호·주소가 자동 입력됩니다.")
         st.selectbox(
             "검색 결과에서 고객 선택 *",
             cust_options,
@@ -35527,7 +35286,6 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
 
     # ── 위약금 등록 ──
     with tab_penalty:
-        st.caption("계약 취소 시 수령한 위약금을 별도 주문으로 등록합니다. 원가는 0원으로 처리됩니다.")
         p_col1, p_col2 = st.columns(2)
         with p_col1:
             p_cust_name = st.text_input("고객 이름 *", key="sp_penalty_name")
@@ -36050,10 +35808,6 @@ def render_new_sales():
         if "display_cost_amount" not in st.session_state:
             st.session_state["display_cost_amount"] = "0"
         st.markdown("**전시품 판매 (본사 ERP 원가 대사 제외 · 전체 매출에는 포함)**")
-        st.caption(
-            "일반제품 원가 칸에 전시품 원가를 넣지 마세요. 본사 ERP 출고에는 전시품 원가가 없어 대사 결과가 어긋납니다. "
-            "전시 판매가는 `total_amount` 에 포함되어 전체 매출·직원 KPI 에는 그대로 반영됩니다."
-        )
         st.text_input(
             "전시품 판매가 *", key="display_sales_amount",
             on_change=lambda: st.session_state.__setitem__(
@@ -37608,22 +37362,6 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
         return
 
     with st.expander("📦 매입 원장 통합 임포트 (주문 + 라인 아이템)"):
-        st.caption(
-            "매입 원장 엑셀 하나로 **고객 · 매출 주문 · 라인 아이템** 을 한 번에 저장합니다. "
-            "\n\n**필수 컬럼**: 등록일 · 고객명 · 전화1 · 품명 · 출고가"
-            "\n\n**옵션 컬럼**: 출고번호 · 배송일 · 판매자(대) · 전화2 · 주소1 · 주소2 · 주문구분 · 수량 · 부가세 · 합계 · 품번 · 품목비고"
-            "\n\n**식별 규칙**: 전화1 이 있으면 전화 기반으로 매칭·통합, "
-            "전화1 이 비어있으면 **고객명 기반** (예: 매장 전시 라인, 고객명이 매장명으로 표기) 으로 별도 신규 고객이 생성됩니다."
-            "\n\n**그룹핑 규칙**: `출고번호` 컬럼이 있으면 `(식별, 등록일, 출고번호)` 3튜플, "
-            "없으면 `(식별, 등록일)` 2튜플로 하나의 매출 주문을 묶습니다. "
-            "\n\n**매칭 규칙**: 앱에 이미 등록된 주문은 `(고객, 등록일)` 후보가 "
-            "**1건이면 자동 매칭**, 2건 이상이면 아래에서 **수동 선택** 합니다. "
-            "**회수** 주문구분 라인은 자동 스킵됩니다. "
-            "\n\n**잔금 처리**: 신규 주문(모모에 없던 건)은 **판매가 전액 완납 결제**로 저장되어 미수 목록에 잡히지 않습니다. "
-            "**2026년 4월 이전** 매입원장 임포트 매출은 전부 **입금완료**로 간주하며 미수금에 포함하지 않습니다. "
-            "이미 앱에 등록된 주문에 매칭될 때는 **판매금액·원가·잔금·기존 결제**를 절대 덮어쓰지 않고 **라인 아이템만 추가**합니다."
-            "\n\n**사전 준비**: `app_order_items` 테이블이 필요합니다 — `SUPABASE_APP_ORDER_ITEMS.sql` 을 먼저 실행하세요."
-        )
         _store_name = _get_current_store_name_for_customers(db_filename)
         if not _store_name:
             st.error("현재 매장 정보를 확인할 수 없습니다. 사이드바에서 매장을 먼저 선택해 주세요.")
@@ -37631,11 +37369,6 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
         st.info(f"저장 대상 매장: **{_store_name}** (`{db_filename}`)")
 
         st.markdown("##### 2026년 4월 이전 임포트 매출 → 입금완료 보정")
-        st.caption(
-            "이미 임포트된 주문 중 `엑셀_매입원장` 이고 계약일이 **2026-04-01 이전**인 건은 "
-            "결제가 없어도 미수로 잡지 않습니다. 아래 버튼은 누락된 완납 결제를 채워 "
-            "미수금 레포트·대시보드 숫자가 일치하게 합니다. 일반(모모) 주문은 변경하지 않습니다."
-        )
         if st.button("💳 2026년 4월 이전 임포트 매출 입금완료 처리", key=f"legacy_import_paid_backfill::{db_filename}"):
             client, _err = get_supabase_client()
             if not client:
@@ -37836,10 +37569,7 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
             _cc2.metric("대상 매장에 이미 존재", f"{ct_scan.already_in_target:,}")
             _cc3.metric("이관 예정 (dry-run)", f"{_would_migrate:,}")
             if _would_migrate > 0:
-                st.caption(
-                    f"채널톡 매장에서 대상 매장으로 {_would_migrate}건을 이관하면 매칭율이 개선될 수 있습니다. "
-                    "임포트 확정 시 자동 이관을 원하면 아래 체크박스를 켜세요."
-                )
+                pass
             if ct_scan.errors:
                 for _e in ct_scan.errors[:3]:
                     st.warning(_e)
@@ -38018,11 +37748,6 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
         # ── no_match: 고객은 있지만 창 안 후보 0건. 수동 결정 (기본 = 미결정 스킵) ──
         if preview.no_match_count > 0:
             st.markdown("#### 3-3. 미매칭 그룹 (앱 주문 후보 없음)")
-            st.caption(
-                f"고객은 앱에 있지만 등록일 ±{lps.MATCH_WINDOW_DAYS}일 창에 후보 주문이 없는 그룹입니다 "
-                f"({preview.no_match_count}건). 기본값은 **미결정(스킵)** 이며, 사용자가 직접 "
-                "이 고객의 다른 최근 주문에 붙이거나 '신규 주문으로 등록' 을 선택하면 임포트됩니다."
-            )
             _nomatches = [g for g in preview.groups if g.match_status == "no_match"]
             for _ug in _nomatches[:100]:
                 gk = f"{_ug.phone1_digits}::{_ug.order_date}::{_ug.ship_number}"
@@ -38172,7 +37897,6 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                 phones_set = {g.phone1_digits for g in preview.groups if g.phone1_digits and g.match_status in ("to_create", "to_attach")}
                 with st.spinner("채널톡_자동가입 매장 phone 이관 중…"):
                     mg = lps.migrate_channeltalk_phones(client, _store_name, phones_set, dry_run=False)
-                st.caption(f"채널톡 이관 완료: {mg.migrated}건 이관 / {mg.already_in_target}건 이미 존재.")
                 if mg.errors:
                     for _e in mg.errors[:3]:
                         st.warning(_e)
@@ -38479,10 +38203,6 @@ def render_product_taxonomy_admin() -> None:
         return
 
     st.header("품목 분류 관리 (Gemini 자동 분류)")
-    st.caption(
-        "매입 원장에서 임포트된 라인 아이템의 품목명(product_name)을 대분류 카테고리 1개로 매핑합니다. "
-        "다면분석 · 마케팅 인사이트 · AI 리포트가 이 매핑을 참조합니다."
-    )
 
     client, err = get_supabase_client()
     if err or client is None:
@@ -38590,7 +38310,6 @@ def render_product_taxonomy_admin() -> None:
             _g_res = st.session_state.get("pta_gemini_result") or {}
             if _g_res:
                 st.markdown("#### Gemini 결과 (확인 후 저장)")
-                st.caption("잘못 분류된 항목은 **대분류** 셀을 클릭하면 나오는 드롭다운에서 직접 수정한 뒤 [Gemini 결과 저장] 을 누르면 수정한 값이 저장됩니다.")
                 res_df = pd.DataFrame([
                     {"product_name": k, "category": v["category"], "confidence": v.get("confidence")}
                     for k, v in _g_res.items()
@@ -38655,19 +38374,6 @@ def render_product_taxonomy_admin() -> None:
     # ======================== 브랜드/키워드 사전 ========================
     with tab_rules:
         st.subheader("브랜드/키워드 사전")
-        st.caption(
-            "품목명에 **키워드가 포함되면 Gemini 호출 없이 즉시 해당 카테고리로 확정**하는 규칙입니다. "
-            "'디망스'처럼 가구 종류 단어가 없는 브랜드/모델명을 등록해 두면, 사이즈·색상 코드가 붙어 "
-            "문자열이 조금씩 달라도 부분일치로 전부 자동 분류됩니다. 우선순위 숫자가 작을수록 먼저 검사됩니다. "
-            "\n\n**우선순위 500 기준**: 500 미만 규칙은 내장 종류 키워드(소파·식탁 등)보다 **먼저**, "
-            "500 이상 규칙은 내장 규칙 **뒤에** 검사됩니다. 여러 카테고리에 걸치는 브랜드는 "
-            "포괄 규칙을 900 으로 등록하세요 — 예: `디망스` → 침대 (900) 만 등록해도 "
-            "'디망스소파' 는 내장 '소파' 규칙으로 올바르게 분류되고, 종류 단어가 없는 '디망스Q-1500' 만 침대로 갑니다. "
-            "\n\n**AND 조합**: 키워드에 `+` 를 쓰면 모든 단어가 포함될 때만 매칭됩니다. "
-            "예: `노블앙+1100` → SSDS침대 (우선순위 10), `노블앙` → 침대 (우선순위 900) 로 등록하면 "
-            "'노블앙 매트리스(1100)' 은 SSDS침대, '노블앙Q-1500' 은 침대로 분류됩니다. "
-            "\n\n**사전 준비**: `SUPABASE_APP_PRODUCT_KEYWORD_RULES.sql` 을 Supabase SQL Editor 에서 먼저 실행하세요."
-        )
 
         with st.form(key="pta_kw_add_form", clear_on_submit=True):
             _kf1, _kf2, _kf3 = st.columns([2, 1, 1])
@@ -39656,10 +39362,6 @@ def render_customer_balance():
                                                         )
                                                         st.divider()
                                                         st.markdown("##### 🗑️ 마이너스(상계) 전표 삭제")
-                                                        st.caption(
-                                                            "상계 전표를 삭제하면 결제 합계에서 해당 상계분이 빠져 잔금·마진에 반영됩니다. "
-                                                            "원 양수 결제와의 짝이 맞는지 확인한 뒤 삭제하세요."
-                                                        )
                                                         _neg_dd_confirm_key = f"pay_neg_del_confirm_{prow['id']}"
                                                         st.checkbox(
                                                             f"결제 ID {int(prow['id'])} (상계 {float(prow.get('amount') or 0):,.0f}원) 삭제 동의",
@@ -40101,7 +39803,6 @@ def render_customer_balance():
                                                 if float(prow.get("amount") or 0) >= 0:
                                                     st.divider()
                                                     st.markdown("##### 🗑️ 잘못 입력한 결제 직접 삭제")
-                                                    st.caption("중복 입력 등 실수로 잘못 입력된 결제를 상계 전표 없이 완전 삭제합니다.")
                                                     _dd_confirm_key = f"pay_direct_del_confirm_{prow['id']}"
                                                     st.checkbox(
                                                         f"결제 ID {int(prow['id'])} ({prow.get('payment_method', '-')} / {float(prow.get('amount') or 0):,.0f}원) 완전 삭제 동의",
@@ -40398,10 +40099,6 @@ def render_customer_balance():
                                                 )
                                                 st.divider()
                                                 st.markdown("##### 🗑️ 마이너스(상계) 전표 삭제")
-                                                st.caption(
-                                                    "상계 전표를 삭제하면 결제 합계에서 해당 상계분이 빠져 잔금·마진에 반영됩니다. "
-                                                    "원 양수 결제와의 짝이 맞는지 확인한 뒤 삭제하세요."
-                                                )
                                                 _op_neg_confirm = f"op_neg_del_confirm_{prow['id']}"
                                                 st.checkbox(
                                                     f"결제 ID {int(prow['id'])} (상계 {_prow_amt:,.0f}원) 삭제 동의",
@@ -40891,16 +40588,6 @@ def _render_kpi_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame", db_fil
                         "종합 점수": st.column_config.NumberColumn("종합 점수", format="%.1f", width="small"),
                     },
                 )
-                st.caption(
-                    f"※ **종합 점수** = {_kpi_weights_caption(_kpi_w_store)} "
-                    f"(⚙️ 관리자 설정 → 직원 평가 가중치, 적용 월 {int(sel_y):04d}-{int(sel_m):02d}). "
-                    f"**매출 점수({float(_kpi_w_store['revenue']):g})·매출집계(순액)**: 해당 월 **판매일(transaction_date)** 기준 sales 금액(감액 등 음수 포함) 1/n. "
-                    f"**현금수금 점수({float(_kpi_w_store['cash']):g})·현금수금집계**: 해당 월 **결제일(payment_date)** 기준, **수수료 없는 수납**만(이체·온누리·지역화폐·현금 등). 신용·체크·**메인페이** 제외 1/n. "
-                    f"**마진 점수({float(_kpi_w_store['margin']):g})**: sales 해당 월 행을 주문 total 대비 비율로 배분(음수 매출 반영). total_amount=0이면 note|__dm 마진 차액 반영. "
-                    f"**전시품 점수({float(_kpi_w_store['display']):g})·전시품 판매액**: 옵션 A2 — **계약일(order_date) in 해당 월** 주문의 **전시판매가 × 1/n**(주문당 1회). "
-                    "다른 달 계약 + 단순 금액수정은 0 (영향 없음). 다른 달 계약 + 해당월 **총계약금액이 0원(전체 취소)**이 되면 전시판매가 차감. "
-                    "주문 수정으로 전시판매가만 변경 시 변경 시점 월에 **차액(__dm_d)만 분리 반영**(KPI에서 마이너스 가능)."
-                )
             else:
                 st.info("선택한 월에 직원이 배정된 평가 데이터(매출·현금수금·마진·전시)가 없습니다.")
         else:
@@ -40919,10 +40606,6 @@ def render_display_sales_audit():
     role = user.get("role") or "user"
 
     st.subheader("🎁 전시품 판매 검증")
-    st.caption(
-        "기간을 정하면 KPI '전시품 판매액(5점)' 점수와 동일한 옵션 A2 분배의 주문별 명세·직원별 합계를 보여줍니다. "
-        "각 행에 옵션 A2 케이스(a/b/c/d)가 표시되어 왜 그 금액으로 잡혔는지 직접 검증할 수 있습니다."
-    )
 
     if role == "superadmin":
         stores = get_supabase_stores_dataframe_cached()
@@ -41147,16 +40830,6 @@ def render_display_sales_audit():
             disabled=df_emp.empty,
             width="stretch",
         )
-
-    with st.expander("📖 옵션 A2 케이스 가이드"):
-        st.markdown(
-            "- **(a) 정상 신규**: 계약일이 조회 기간 내 → 전시판매가 × 1/n 분배.\n"
-            "- **(a) 같은 달 전체취소**: 같은 달 계약 + 같은 달 총금액 0원이 됨 → 전시판매가 × 1/n 차감.\n"
-            "- **(b) 다른 달 계약 + 전체취소**: 이전 달 계약된 건이 이번 달에 총금액 0원이 됨 → 전시판매가 × 1/n 차감.\n"
-            "- **(c) 다른 달 계약 + 단순수정**: 단순 금액 수정만 발생 → 영향 없음 (0원).\n"
-            "- **(d) 전시판매가 변경분**: 주문 수정 시 전시판매가만 변경된 경우 변경 시점 월에 그 차액(`__dm_d`) × 1/n 만 분리 반영. KPI에서 마이너스도 가능."
-        )
-
 
 @st.fragment
 def _render_dashboard_todos_only(db_filename: str):
@@ -41779,7 +41452,6 @@ def render_dashboard():
                 for col in ("총액", "결제합계", "실잔금"):
                     show_df[col] = show_df[col].apply(_fmt_num)
                 st.dataframe(show_df, width='stretch')
-                st.caption("결제 금액을 수정하려면 **고객 및 잔금 관리** → 고객 선택 → **결제 내역 조회 및 취소** / **잔금 추가 결제**에서 해당 주문을 수정하세요.")
 
             _bc1, _bc2 = st.columns(2)
             with _bc1:
@@ -41998,10 +41670,6 @@ def render_dashboard():
                     .apply(_daily2_color_neg, subset=_money_cols)
                 )
                 st.dataframe(_styler, width='stretch')
-                st.caption(
-                    f"※ 기준일: {today.strftime('%Y-%m-%d')} · 판매일(transaction_date) 기준 · 복수 담당자 시 1/n 배분"
-                    + (" · 빨간색 = 마이너스(상계) 금액" if _has_neg else "")
-                )
             else:
                 st.info(f"오늘({today.strftime('%Y-%m-%d')}) 직원이 배정된 판매 데이터가 없습니다.")
         else:
@@ -42051,7 +41719,6 @@ def render_dashboard():
         st.metric(
             "해당 기간 총 계약 금액",
             f"{period_sales_net:,.0f}원",
-            help="sales 테이블 transaction_date·amount 합계(증액·감액 음수 반영). '3. 월별 직원 평가' 매출 점수(70)는 동일 월 sales 순액 1/n 배분이며, 현금수금집계는 payment_date·수납 수단 버킷으로 별도 집계된 참고 금액입니다.",
         )
         st.metric("해당 기간 총 미수금", f"{total_unpaid_period:,.0f}원")
     else:
