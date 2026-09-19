@@ -29886,13 +29886,17 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
 
         sel_pid = None
         if pay_options:
-            sel_pid = st.selectbox(
-                "대상 결제(참조)",
-                options=list(pay_options.keys()),
-                format_func=lambda p: pay_options.get(p, str(p)),
+            _pid_sentinel = "__pcr_pick__"
+            _pid_labels = {_pid_sentinel: "— 취소·변경할 결제를 선택하세요 —"}
+            _pid_labels.update({k: v for k, v in pay_options.items()})
+            _pid_choice = st.selectbox(
+                "대상 결제(참조) *",
+                options=[_pid_sentinel] + list(pay_options.keys()),
+                format_func=lambda p: _pid_labels.get(p, str(p)),
                 key=f"pcr_pid_{order_id}",
-                help="현재 결제 목록은 변경 후 상태일 수 있습니다. 원본 수단/금액은 아래 이력을 우선합니다.",
+                help="어떤 결제를 취소·변경할지 반드시 명시적으로 골라야 합니다. 자동 선택하지 않습니다.",
             )
+            sel_pid = None if _pid_choice == _pid_sentinel else _pid_choice
 
         orig = {}
         _orig_from_history = bool(_hist_orig.get("method") or _hist_orig.get("amount"))
@@ -30120,10 +30124,13 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             bool((reason or "").strip())
             and bool(orig.get("method") or orig.get("amount"))
             and bool(pcr_assignees)
+            and sel_pid is not None
             and not dup_errs
         )
         if not can_submit:
-            if not pcr_assignees:
+            if sel_pid is None:
+                st.caption("취소·변경할 결제를 위 대상 결제 목록에서 먼저 선택하세요.")
+            elif not pcr_assignees:
                 st.caption("담당자를 1명 이상 지정해야 요청할 수 있습니다.")
             elif not (reason or "").strip() or not (orig.get("method") or orig.get("amount")):
                 st.caption("원본 확인과 사유 입력이 있어야 요청할 수 있습니다.")
