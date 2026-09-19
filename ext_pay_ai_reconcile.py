@@ -337,10 +337,6 @@ def suggest_matches_with_gemini(
         "\"reason\":str,\"confidence\":0-1}]}\n"
         f"데이터: {json.dumps(payload, ensure_ascii=False)[:12000]}"
     )
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-flash-latest:generateContent?key=" + key
-    )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -348,9 +344,46 @@ def suggest_matches_with_gemini(
             "responseMimeType": "application/json",
         },
     }
+    # 일시 오류(5xx · 429) 는 백오프 후 재시도, 다른 모델로도 폴백
+    import time as _time
+    _models = ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash")
+    _retry_status = {429, 500, 502, 503, 504}
+    _sleeps = (1.0, 2.0, 4.0)
+    last_err: str | None = None
+    resp = None
+    for _model in _models:
+        _url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{_model}:generateContent?key={key}"
+        )
+        for _attempt in range(len(_sleeps) + 1):
+            try:
+                resp = httpx.post(_url, json=body, timeout=timeout)
+            except Exception as e:  # 연결 오류 등도 재시도
+                last_err = f"{_model}: {e}"
+                if _attempt < len(_sleeps):
+                    _time.sleep(_sleeps[_attempt])
+                    continue
+                resp = None
+                break
+            if resp.status_code in _retry_status and _attempt < len(_sleeps):
+                last_err = f"{_model}: HTTP {resp.status_code}"
+                _time.sleep(_sleeps[_attempt])
+                continue
+            break
+        if resp is not None and resp.status_code == 200:
+            break
+        if resp is not None:
+            last_err = f"{_model}: HTTP {resp.status_code}"
+        # 다음 모델로 폴백
+        resp = None
+    if resp is None or resp.status_code != 200:
+        out["error"] = (
+            f"Gemini 서버 일시 오류로 제안을 받지 못했습니다 ({last_err or 'unknown'}). "
+            f"잠시 후 다시 시도해 주세요."
+        )
+        return out
     try:
-        resp = httpx.post(url, json=body, timeout=timeout)
-        resp.raise_for_status()
         data = resp.json()
         text = (
             (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [{}])[0]

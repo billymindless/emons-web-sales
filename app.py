@@ -32385,7 +32385,8 @@ def _render_ext_pay_ai_similar_match(
         splits = _sug.get("splits") or []
         flags = _sug.get("flags") or []
         if not (pairs or splits or flags):
-            st.caption("현재 조건으로는 제안이 없습니다.")
+            if not _sug.get("error"):
+                st.caption("현재 조건으로는 제안이 없습니다.")
             return
 
         # ── pair 제안
