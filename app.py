@@ -32246,15 +32246,14 @@ def _render_ext_pay_ai_similar_match(
 ) -> None:
     """Gemini 로 미매칭 공식 행 ↔ 미매칭 ERP 결제 사이 유사 매칭 후보를 제안.
 
-    - 온누리 파일럿. 자동 확정 없음. 관리자가 개별 승인 · 거절.
+    - 온누리·울산페이. 자동 확정 없음. 관리자가 개별 승인 · 거절.
     - 승인 시 `_ext_pay_manual_link` (pair) 또는 `_ext_pay_manual_link_split` (split) 실행.
     - 승인/거절 모두 `app_import_ai_feedback` 에 `extpay_pair_{source}` / `extpay_split_{source}` /
       `extpay_flag_{source}` kind 로 저장 (원가 대사 피드백과 kind 로 분리).
     """
     if df is None or getattr(df, "empty", True):
         return
-    if sel_src != "onnuri":
-        # 파일럿은 온누리부터. 다른 소스는 노출하지 않는다.
+    if sel_src not in ("onnuri", "ulsanpay"):
         return
     try:
         import ext_pay_ai_reconcile as _epai

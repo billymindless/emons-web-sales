@@ -313,16 +313,28 @@ def suggest_matches_with_gemini(
         "matched_examples": context.get("matched_examples") or [],
         "learned_examples": feedback or [],
     }
+    if source == "ulsanpay":
+        _priority = (
+            "판단 근거 우선순위(울산페이):\n"
+            "1) 승인번호(approval) 6자리 정확 일치(선행 0 포함·제거 모두 동일로 본다)\n"
+            "2) 결제금액 일치\n"
+            "3) 결제일과 tx_date 가 같거나 ±2일 이내\n"
+            "4) 구매자 마스킹 이름과 모모 고객 마스킹 이름의 성·끝글자 조각 일치\n"
+            "5) 같은 order 내 여러 결제 합이 공식 금액과 일치하면 splits 로 제안\n"
+        )
+    else:
+        _priority = (
+            "판단 근거 우선순위:\n"
+            "1) 승인번호(approval) 정확 일치\n"
+            "2) 전화 뒤4자리(last4) 일치\n"
+            "3) 결제일과 tx_date 가 같거나 ±2일 이내\n"
+            "4) 구매자 마스킹 이름과 모모 고객 마스킹 이름의 성·끝글자 조각 일치\n"
+            "5) 같은 order 내 여러 결제 합이 공식 금액과 일치하면 splits 로 제안\n"
+        )
     prompt = (
         f"너는 가구 매장의 외부결제 대사 보조다({src_label}). JSON만 반환한다.\n"
         "목표: 공식 파일 미매칭 행(unmatched_official)과 모모 미매칭 결제(erp_only)를 "
-        "가장 자연스럽게 잇는 후보를 제안한다.\n"
-        "판단 근거 우선순위:\n"
-        "1) 승인번호(approval) 정확 일치\n"
-        "2) 전화 뒤4자리(last4) 일치\n"
-        "3) 결제일과 tx_date 가 같거나 ±2일 이내\n"
-        "4) 구매자 마스킹 이름과 모모 고객 마스킹 이름의 성·끝글자 조각 일치\n"
-        "5) 같은 order 내 여러 결제 합이 공식 금액과 일치하면 splits 로 제안\n"
+        f"가장 자연스럽게 잇는 후보를 제안한다.\n{_priority}"
         "규칙:\n"
         "- confidence < 0.5 는 절대 포함하지 마라.\n"
         "- 동일 payment_id 를 여러 pair 에 넣지 마라.\n"
