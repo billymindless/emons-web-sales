@@ -3796,6 +3796,79 @@ def _ext_pay_reinsert_with_time_override(
     return True, None
 
 
+# 분할결제 참여 payment_id 를 note 에 인코딩/디코딩하는 sentinel 유틸
+_EXT_PAY_SPLIT_PIDS_RE = re.compile(r"\[split_pids:([0-9,\s]+)\]")
+
+
+def _ext_pay_encode_split_pids(pids: list[int]) -> str:
+    _clean = sorted({int(x) for x in pids if x is not None})
+    return f"[split_pids:{','.join(str(x) for x in _clean)}]"
+
+
+def _ext_pay_extract_split_pids(note: str | None) -> list[int]:
+    if not note:
+        return []
+    m = _EXT_PAY_SPLIT_PIDS_RE.search(str(note))
+    if not m:
+        return []
+    out: list[int] = []
+    for tok in m.group(1).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(tok))
+        except ValueError:
+            continue
+    return out
+
+
+def _ext_pay_strip_split_pids_note(note: str | None) -> str:
+    if not note:
+        return ""
+    s = _EXT_PAY_SPLIT_PIDS_RE.sub("", str(note))
+    # 앞뒤 sentinel 결합용 " · " 정리
+    s = re.sub(r"\s*·\s*·\s*", " · ", s)
+    return s.strip(" ·")
+
+
+def _ext_pay_find_split_combo(pays: list[dict], target: int, max_size: int = 6) -> list[dict] | None:
+    """양수 결제 목록에서 부분집합 합이 target 과 같은 조합이 유일하면 반환. 아니면 None.
+
+    - 크기 2 이상, max_size 이하만 고려.
+    - target 이 양의 정수여야 한다."""
+    if target <= 0:
+        return None
+    # 결제가 너무 많으면 조합 폭발 방지
+    valid: list[dict] = []
+    for p in pays:
+        try:
+            amt = int(p.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amt <= 0 or amt > target:
+            continue
+        valid.append(p)
+    if len(valid) < 2:
+        return None
+    if len(valid) > 12:
+        # 상한 초과 시 안전상 포기 (실측상 3건 이내)
+        return None
+    from itertools import combinations
+    found: list[list[dict]] = []
+    upper = min(len(valid), max_size)
+    for k in range(2, upper + 1):
+        for combo in combinations(valid, k):
+            total = sum(int(p["amount"]) for p in combo)
+            if total == target:
+                found.append(list(combo))
+                if len(found) > 1:
+                    return None
+    if len(found) == 1:
+        return found[0]
+    return None
+
+
 def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str | None) -> tuple[dict, str | None]:
     """공식 온누리 행 ↔ ERP 결제 자동 매칭. UNIQUE(row_id)로 재매칭 방지.
     반환: (counts_by_result, error_or_None)."""
@@ -3872,48 +3945,29 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
         except Exception as e:
             return {}, f"주문 조회 실패: {e}"
 
-    # 이미 매칭된 payment_id 제외
+    # 이미 매칭된 payment_id 제외 (분할결제 참여 payment_id 도 note 에서 추출해 포함)
     try:
         mp = (
             sc.table("app_external_pay_matches")
-            .select("payment_id")
+            .select("payment_id, note")
             .eq("db_filename", db_filename)
             .eq("source", "onnuri")
             .execute()
         )
-        used_payment_ids = {int(m["payment_id"]) for m in (mp.data or []) if m.get("payment_id") is not None}
+        used_payment_ids: set[int] = set()
+        for m in (mp.data or []):
+            if m.get("payment_id") is not None:
+                try:
+                    used_payment_ids.add(int(m["payment_id"]))
+                except (TypeError, ValueError):
+                    pass
+            for _pid in _ext_pay_extract_split_pids(m.get("note")):
+                used_payment_ids.add(_pid)
     except Exception:
         used_payment_ids = set()
 
-    # 신규고객 판정: entry_source='new_customer_sale' 또는 verify_from 이전 매출이 없는 고객
-    # 후보 좁힘: 우선 entry_source가 명시된 건. entry_source가 비었으면 아래 헬퍼로 확인.
-    def _is_new_customer_sale(order_row: dict) -> bool:
-        if not order_row:
-            return False
-        src = (order_row.get("entry_source") or "").strip()
-        if src == "new_customer_sale":
-            return True
-        # 스탬프가 없는 과거 주문: verify_from 이후이면서 그 고객의 첫 주문이면 신규고객 매출로 간주
-        cid = order_row.get("customer_id")
-        if not cid:
-            return False
-        try:
-            _r = (
-                sc.table("app_orders")
-                .select("id, order_date")
-                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
-                .eq("customer_id", int(cid))
-                .order("order_date")
-                .limit(1)
-                .execute()
-            )
-            first = (_r.data or [{}])[0]
-            first_id = first.get("id")
-            return first_id is not None and int(first_id) == int(order_row["id"])
-        except Exception:
-            return False
-
-    # 필터: 신규고객 매출 + 이미 매칭 안 됨
+    # 후보: 해당 매장의 온누리(전자) 양수 결제 중 아직 매칭되지 않은 것 (전체 고객)
+    # 신규고객 한정은 실측상 회복 가능 매치를 놓치므로 카드/메인페이와 동일하게 전체로 확장.
     candidate_pays: list[dict] = []
     for p in pays:
         try:
@@ -3922,10 +3976,13 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
             continue
         if pid in used_payment_ids:
             continue
+        try:
+            if int(p.get("amount") or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
         o = orders_map.get(int(p["order_id"])) if p.get("order_id") is not None else None
         if not o:
-            continue
-        if not _is_new_customer_sale(o):
             continue
         candidate_pays.append({**p, "_order": o})
 
@@ -3998,13 +4055,15 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
         if date_note:
             note_parts.append(date_note)
 
+        split_pids: list[int] = []
         if len(candidates) == 0:
             if is_cancel:
                 result_code = "official_canceled"
                 note_parts.append("공식 취소·ERP에 대응 결제 없음")
             else:
-                amt_alts: list[dict] = []
-                if last4:
+                # 분할결제 시도: 같은 날 + 같은 끝4 미사용 결제 부분집합의 합 = 공식 금액
+                split_pool: list[dict] = []
+                if last4 and amt > 0:
                     for _p in candidate_pays:
                         try:
                             _pid = int(_p["id"])
@@ -4016,18 +4075,41 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
                             continue
                         if str(_p.get("payment_date") or "")[:10] != tx_date:
                             continue
-                        try:
-                            _pa = int(_p.get("amount") or 0)
-                        except (TypeError, ValueError):
-                            continue
-                        if abs(_pa) != abs(amt):
-                            amt_alts.append(_p)
-                if len(amt_alts) == 1:
-                    matched_pay = amt_alts[0]
-                    result_code = "amount_mismatch"
-                    note_parts.append("공식파일에 있으나 금액 다름")
+                        split_pool.append(_p)
+                combo = _ext_pay_find_split_combo(split_pool, amt) if len(split_pool) >= 2 else None
+                if combo:
+                    combo_sorted = sorted(combo, key=lambda x: int(x.get("amount") or 0), reverse=True)
+                    matched_pay = combo_sorted[0]
+                    split_pids = [int(_p["id"]) for _p in combo_sorted]
+                    result_code = "split_matched"
+                    parts_str = "+".join(f"{int(_p['amount']):,}" for _p in combo_sorted)
+                    note_parts.append(f"분할 {len(combo_sorted)}건 합 {amt:,} ({parts_str})")
                 else:
-                    result_code = "official_only"
+                    amt_alts: list[dict] = []
+                    if last4:
+                        for _p in candidate_pays:
+                            try:
+                                _pid = int(_p["id"])
+                            except (TypeError, ValueError, KeyError):
+                                continue
+                            if _pid in used_payment_ids:
+                                continue
+                            if _phone_last4_for(_p) != last4:
+                                continue
+                            if str(_p.get("payment_date") or "")[:10] != tx_date:
+                                continue
+                            try:
+                                _pa = int(_p.get("amount") or 0)
+                            except (TypeError, ValueError):
+                                continue
+                            if abs(_pa) != abs(amt):
+                                amt_alts.append(_p)
+                    if len(amt_alts) == 1:
+                        matched_pay = amt_alts[0]
+                        result_code = "amount_mismatch"
+                        note_parts.append("공식파일에 있으나 금액 다름")
+                    else:
+                        result_code = "official_only"
         elif len(candidates) == 1:
             matched_pay = candidates[0]
             if is_cancel:
@@ -4081,6 +4163,10 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
             _o = matched_pay["_order"] or {}
             cust_id = int(_o["customer_id"]) if _o.get("customer_id") is not None else None
 
+        note_body = " · ".join(note_parts) or None
+        if split_pids:
+            _tag = _ext_pay_encode_split_pids(split_pids)
+            note_body = f"{note_body} · {_tag}" if note_body else _tag
         inserts.append({
             "db_filename": db_filename,
             "source": "onnuri",
@@ -4089,15 +4175,18 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
             "order_id": order_id,
             "customer_id": cust_id,
             "result_code": result_code,
-            "note": " · ".join(note_parts) or None,
+            "note": note_body,
             "matched_by": (matched_by or "").strip() or None,
         })
         counts[result_code] = counts.get(result_code, 0) + 1
+        # 분할결제: 참여 payment_id 를 모두 소모 (대표 외 나머지도 erp_only 노출 방지)
+        _to_consume = set(split_pids) if split_pids else set()
         if pay_id is not None:
-            used_payment_ids.add(pay_id)
-            # 인덱스에서 이 결제 제거 (재사용 방지)
+            _to_consume.add(pay_id)
+        if _to_consume:
+            used_payment_ids.update(_to_consume)
             for k, lst in list(idx.items()):
-                idx[k] = [x for x in lst if int(x["id"]) != pay_id]
+                idx[k] = [x for x in lst if int(x["id"]) not in _to_consume]
 
     # ERP-only 감지: 남은 candidate_pays 중 매칭에 쓰이지 않은 것
     leftover_pays = [p for p in candidate_pays if int(p["id"]) not in used_payment_ids]
@@ -4195,37 +4284,21 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
         def _filt_mp(q):
             return q.eq("db_filename", db_filename).eq("source", "ulsanpay")
         mp = _ext_pay_select_paged(
-            sc, "app_external_pay_matches", "payment_id", _filt_mp, order_col="id",
+            sc, "app_external_pay_matches", "payment_id, note", _filt_mp, order_col="id",
         )
-        used_payment_ids = {int(m["payment_id"]) for m in mp if m.get("payment_id") is not None}
+        used_payment_ids: set[int] = set()
+        for m in mp:
+            if m.get("payment_id") is not None:
+                try:
+                    used_payment_ids.add(int(m["payment_id"]))
+                except (TypeError, ValueError):
+                    pass
+            for _pid in _ext_pay_extract_split_pids(m.get("note")):
+                used_payment_ids.add(_pid)
     except Exception:
         used_payment_ids = set()
 
-    def _is_new_customer_sale(order_row: dict) -> bool:
-        if not order_row:
-            return False
-        src = (order_row.get("entry_source") or "").strip()
-        if src == "new_customer_sale":
-            return True
-        cid = order_row.get("customer_id")
-        if not cid:
-            return False
-        try:
-            _r = (
-                sc.table("app_orders")
-                .select("id, order_date")
-                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
-                .eq("customer_id", int(cid))
-                .order("order_date")
-                .limit(1)
-                .execute()
-            )
-            first = (_r.data or [{}])[0]
-            first_id = first.get("id")
-            return first_id is not None and int(first_id) == int(order_row["id"])
-        except Exception:
-            return False
-
+    # 후보: 해당 매장의 지역화폐 양수 결제 중 아직 매칭되지 않은 것 (전체 고객)
     candidate_pays: list[dict] = []
     for p in pays:
         try:
@@ -4234,8 +4307,13 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
             continue
         if pid in used_payment_ids:
             continue
+        try:
+            if int(p.get("amount") or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
         o = orders_map.get(int(p["order_id"])) if p.get("order_id") is not None else None
-        if not o or not _is_new_customer_sale(o):
+        if not o:
             continue
         candidate_pays.append({**p, "_order": o})
 
@@ -4276,6 +4354,7 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
         result_code = None
         matched_pay: dict | None = None
         note_parts: list[str] = []
+        split_pids: list[int] = []
 
         if not appr:
             result_code = "official_only"
@@ -4285,32 +4364,62 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
                 result_code = "official_canceled"
                 note_parts.append("공식 취소·ERP에 대응 결제 없음")
             else:
-                amt_alts = []
-                if appr:
+                # 분할결제 시도: 같은 승인번호(alt 포함) 미사용 결제 부분집합 합 = 공식 절대금액
+                split_pool: list[dict] = []
+                if appr and match_amt > 0:
+                    _seen_sp: set[int] = set()
                     for _p in candidate_pays:
                         try:
                             _pid = int(_p["id"])
                         except (TypeError, ValueError, KeyError):
                             continue
-                        if _pid in used_payment_ids:
+                        if _pid in used_payment_ids or _pid in _seen_sp:
                             continue
                         if not _ext_pay_approvals_equal(_p.get("card_company"), appr):
                             continue
                         try:
-                            _pa = abs(int(_p.get("amount") or 0))
+                            _pa = int(_p.get("amount") or 0)
                         except (TypeError, ValueError):
                             continue
-                        if _pa != match_amt and _pa > 0:
-                            amt_alts.append(_p)
-                if len(amt_alts) == 1:
-                    matched_pay = amt_alts[0]
-                    result_code = "amount_mismatch"
-                    note_parts.append("공식파일에 있으나 금액 다름")
-                    _dn = _ext_pay_date_gap_note(r.get("tx_date"), matched_pay.get("payment_date"))
-                    if _dn:
-                        note_parts.append(_dn)
+                        if _pa <= 0:
+                            continue
+                        _seen_sp.add(_pid)
+                        split_pool.append(_p)
+                combo = _ext_pay_find_split_combo(split_pool, match_amt) if len(split_pool) >= 2 else None
+                if combo:
+                    combo_sorted = sorted(combo, key=lambda x: int(x.get("amount") or 0), reverse=True)
+                    matched_pay = combo_sorted[0]
+                    split_pids = [int(_p["id"]) for _p in combo_sorted]
+                    result_code = "split_matched"
+                    parts_str = "+".join(f"{int(_p['amount']):,}" for _p in combo_sorted)
+                    note_parts.append(f"분할 {len(combo_sorted)}건 합 {match_amt:,} ({parts_str})")
                 else:
-                    result_code = "official_only"
+                    amt_alts = []
+                    if appr:
+                        for _p in candidate_pays:
+                            try:
+                                _pid = int(_p["id"])
+                            except (TypeError, ValueError, KeyError):
+                                continue
+                            if _pid in used_payment_ids:
+                                continue
+                            if not _ext_pay_approvals_equal(_p.get("card_company"), appr):
+                                continue
+                            try:
+                                _pa = abs(int(_p.get("amount") or 0))
+                            except (TypeError, ValueError):
+                                continue
+                            if _pa != match_amt and _pa > 0:
+                                amt_alts.append(_p)
+                    if len(amt_alts) == 1:
+                        matched_pay = amt_alts[0]
+                        result_code = "amount_mismatch"
+                        note_parts.append("공식파일에 있으나 금액 다름")
+                        _dn = _ext_pay_date_gap_note(r.get("tx_date"), matched_pay.get("payment_date"))
+                        if _dn:
+                            note_parts.append(_dn)
+                    else:
+                        result_code = "official_only"
         elif len(candidates) == 1:
             matched_pay = candidates[0]
             erp_date = str(matched_pay.get("payment_date") or "")[:10]
@@ -4332,9 +4441,53 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
                 else:
                     result_code = "matched_ok"
         else:
-            matched_pay = sorted(candidates, key=lambda x: int(x["id"]))[0]
-            result_code = "ambiguous"
-            note_parts.append(f"동일 승인번호·금액 후보 {len(candidates)}건")
+            # 다중 후보: 정확 승인번호 일치 우선 → 그래도 다수면 파일 일자와 최근접 1건
+            _exact = [
+                p for p in candidates
+                if _ext_pay_norm_approval6(p.get("card_company")) == appr
+            ]
+            _final = _exact if _exact else list(candidates)
+            if len(_final) > 1:
+                _fd = _ext_pay_as_date(r.get("tx_date"))
+                if _fd is not None:
+                    def _gap(p):
+                        pd_ = _ext_pay_as_date(p.get("payment_date"))
+                        return abs((pd_ - _fd).days) if pd_ else 10 ** 9
+                    _min_gap = min(_gap(p) for p in _final)
+                    _tie = [p for p in _final if _gap(p) == _min_gap]
+                    if len(_tie) == 1:
+                        _final = _tie
+            if len(_final) == 1:
+                matched_pay = _final[0]
+                erp_date = str(matched_pay.get("payment_date") or "")[:10]
+                file_date = str(r.get("tx_date") or "")[:10]
+                _dn = _ext_pay_date_gap_note(file_date, erp_date)
+                if _dn:
+                    note_parts.append(_dn)
+                if is_cancel:
+                    if int(matched_pay["order_id"]) in neg_orders:
+                        result_code = "matched_ok"
+                        note_parts.append("공식 취소 · ERP도 취소 흔적")
+                    else:
+                        result_code = "official_canceled"
+                        note_parts.append("공식 취소인데 ERP는 잔존")
+                else:
+                    if int(matched_pay["order_id"]) in neg_orders:
+                        result_code = "erp_canceled_official_paid"
+                        note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                    else:
+                        result_code = "matched_ok"
+                        if _exact and len(candidates) > 1:
+                            note_parts.append("정확 승인 일치로 확정")
+                        elif len(candidates) > 1:
+                            note_parts.append("최근접 일자로 확정")
+            else:
+                # 확정 불가: 오탐 방지 위해 payment_id 미지정
+                matched_pay = None
+                result_code = "ambiguous"
+                note_parts.append(
+                    f"동일 승인번호·금액 후보 {len(candidates)}건 · 정확 일치·일자 최근접으로도 확정 불가"
+                )
 
         pay_id = int(matched_pay["id"]) if matched_pay else None
         order_id = int(matched_pay["order_id"]) if matched_pay and matched_pay.get("order_id") is not None else None
@@ -4343,6 +4496,10 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
             _o = matched_pay["_order"] or {}
             cust_id = int(_o["customer_id"]) if _o.get("customer_id") is not None else None
 
+        note_body = " · ".join(note_parts) or None
+        if split_pids:
+            _tag = _ext_pay_encode_split_pids(split_pids)
+            note_body = f"{note_body} · {_tag}" if note_body else _tag
         inserts.append({
             "db_filename": db_filename,
             "source": "ulsanpay",
@@ -4351,14 +4508,17 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
             "order_id": order_id,
             "customer_id": cust_id,
             "result_code": result_code,
-            "note": " · ".join(note_parts) or None,
+            "note": note_body,
             "matched_by": (matched_by or "").strip() or None,
         })
         counts[result_code] = counts.get(result_code, 0) + 1
+        _to_consume = set(split_pids) if split_pids else set()
         if pay_id is not None:
-            used_payment_ids.add(pay_id)
+            _to_consume.add(pay_id)
+        if _to_consume:
+            used_payment_ids.update(_to_consume)
             for k, lst in list(idx.items()):
-                idx[k] = [x for x in lst if int(x["id"]) != pay_id]
+                idx[k] = [x for x in lst if int(x["id"]) not in _to_consume]
 
     leftover_pays = [p for p in candidate_pays if int(p["id"]) not in used_payment_ids]
     counts["erp_only"] = counts.get("erp_only", 0) + len(leftover_pays)
@@ -5169,8 +5329,7 @@ def _ext_pay_unmatched_erp_pays(
     erp_to: date | None = None,
 ) -> list[dict]:
     """공식 파일에 매칭되지 않은 ERP 결제 (erp_only).
-    - onnuri/ulsanpay: 신규고객 매출로 한정 (기존 정책 유지)
-    - card/mainpay: 전체 고객 (신규 필터 없음)
+    - 모든 source (onnuri/ulsanpay/card/mainpay): 해당 수단의 양수 결제 전체 (신규고객 필터 없음)
     - erp_to: 지정 시 payment_date <= erp_to 로 상한 필터 적용."""
     try:
         def _filt(q):
@@ -5235,11 +5394,8 @@ def _ext_pay_unmatched_erp_pays(
                 orders_map[int(row["id"])] = row
         except Exception:
             continue
-    # 카드/메인페이는 전체 고객 대상 (신규 필터 우회)
-    if source in ("card", "mainpay"):
-        new_oids = {int(o.get("id")) for o in orders_map.values() if o.get("id") is not None}
-    else:
-        new_oids = _ext_pay_new_customer_order_ids(sc, db_filename, list(orders_map.values()))
+    # 모든 source에서 신규고객 필터 제거: 해당 수단 결제 전체를 대상으로 한다.
+    new_oids = {int(o.get("id")) for o in orders_map.values() if o.get("id") is not None}
 
     out: list[dict] = []
     for p in leftover:
@@ -5287,6 +5443,81 @@ def _ext_pay_unmatched_erp_pays(
     return out
 
 
+# 재매칭 대상으로 볼 미결 result_code (matched_ok/manual_matched/split_matched/erp_canceled_official_paid 제외)
+_EXT_PAY_OPEN_RESULT_CODES = (
+    "official_only",
+    "ambiguous",
+    "amount_mismatch",
+    "official_canceled",
+)
+
+
+def _ext_pay_rematch_open_rows(
+    sc, db_filename: str, source: str, verify_from: date | None,
+) -> tuple[dict, str | None]:
+    """온누리·울산페이 미결 매칭(공식만/ambiguous/금액불일치/공식취소)만 삭제 후 재매칭.
+
+    - matched_ok / manual_matched / split_matched / erp_canceled_official_paid 는 유지.
+    - verify_from 이 지정되면 해당 시점 이후의 공식 행(row_id)에 대해서만 삭제한다."""
+    if source not in ("onnuri", "ulsanpay"):
+        return {}, None
+    if sc is None:
+        return {}, "Supabase 연결 불가"
+
+    # verify_from 이후 row_id 후보 조회 (지정된 경우에만 상한 없이)
+    row_ids_scope: list[int] = []
+    if verify_from is not None:
+        try:
+            def _filt_rows(q):
+                return (
+                    q.eq("db_filename", db_filename)
+                    .eq("source", source)
+                    .gte("tx_date", verify_from.isoformat())
+                )
+            rr = _ext_pay_select_paged(
+                sc, "app_external_pay_rows", "id", _filt_rows, order_col="id",
+            )
+            row_ids_scope = [int(r["id"]) for r in rr if r.get("id") is not None]
+        except Exception as e:
+            return {}, f"공식 행 조회 실패: {e}"
+        if not row_ids_scope:
+            # 이 기간에 공식 행이 없으면 매칭 함수만 호출해 신규 배치 처리 여지 남김
+            row_ids_scope = []
+
+    # 미결 매칭 삭제
+    try:
+        if verify_from is None:
+            (
+                sc.table("app_external_pay_matches")
+                .delete()
+                .eq("db_filename", db_filename)
+                .eq("source", source)
+                .in_("result_code", list(_EXT_PAY_OPEN_RESULT_CODES))
+                .execute()
+            )
+        else:
+            for chunk in (row_ids_scope[i : i + 200] for i in range(0, len(row_ids_scope), 200)):
+                if not chunk:
+                    continue
+                (
+                    sc.table("app_external_pay_matches")
+                    .delete()
+                    .eq("db_filename", db_filename)
+                    .eq("source", source)
+                    .in_("result_code", list(_EXT_PAY_OPEN_RESULT_CODES))
+                    .in_("row_id", chunk)
+                    .execute()
+                )
+    except Exception as e:
+        return {}, f"미결 매칭 삭제 실패: {e}"
+
+    # 재매칭 실행
+    vf = verify_from or EXT_PAY_DEFAULT_VERIFY_FROM
+    if source == "onnuri":
+        return _ext_pay_match_onnuri(db_filename, vf, matched_by=None)
+    return _ext_pay_match_ulsanpay(db_filename, vf, matched_by=None)
+
+
 def _ext_pay_list_matches_df(
     db_filename: str, source: str, verify_from: date | None, erp_from: date | None = None,
     verify_to: date | None = None, erp_to: date | None = None,
@@ -5303,6 +5534,9 @@ def _ext_pay_list_matches_df(
     if source == "ulsanpay":
         _ext_pay_offset_ulsan_cancels(sc, db_filename)
         _ext_pay_rematch_ulsan_zeropad(sc, db_filename)
+    # 온누리·울산페이는 미결 매칭만 삭제 후 재매칭 (matched_ok/manual_matched/split_matched 유지)
+    if source in ("onnuri", "ulsanpay"):
+        _ext_pay_rematch_open_rows(sc, db_filename, source, verify_from)
     _ext_pay_relink_amount_and_near_date(sc, db_filename, source, erp_from=erp_only_from)
     try:
         def _filt_rows(q):
@@ -5347,6 +5581,9 @@ def _ext_pay_list_matches_df(
     cust_ids: list[int] = []
     order_ids: list[int] = []
     payment_ids: list[int] = []
+    # 분할결제 참여 payment_id (대표 외) 를 erp_only 노출에서 제외하기 위해 별도로 수집
+    split_extra_pids: set[int] = set()
+    split_pids_by_row: dict[int, list[int]] = {}
     for m in m_by_row.values():
         cid = m.get("customer_id")
         if cid is not None:
@@ -5366,6 +5603,16 @@ def _ext_pay_list_matches_df(
                 payment_ids.append(int(pid))
             except (TypeError, ValueError):
                 pass
+        _sp = _ext_pay_extract_split_pids(m.get("note"))
+        if _sp:
+            try:
+                _row_id = int(m.get("row_id"))
+                split_pids_by_row[_row_id] = _sp
+            except (TypeError, ValueError):
+                pass
+            for _x in _sp:
+                split_extra_pids.add(_x)
+                payment_ids.append(_x)
 
     erp_only_pays = _ext_pay_unmatched_erp_pays(
         sc, db_filename, source, erp_only_from, set(payment_ids), erp_to=erp_to,
@@ -5477,9 +5724,17 @@ def _ext_pay_list_matches_df(
         official_amt = int(r.get("amount") or 0)
         ap = _ext_pay_norm_approval6(r.get("approval_code"))
         erp_pairs = pays_by_approval.get(ap) if (m.get("result_code") == "ambiguous" and ap) else None
+        _split_pids_row = split_pids_by_row.get(int(r.get("id") or 0)) or []
         if erp_pairs:
             erp_amt_disp = " / ".join(f"{a:,}" for a, _ in erp_pairs)
             erp_date_disp = " / ".join(d for _, d in erp_pairs if d)
+        elif _split_pids_row:
+            # 분할결제: 참여 결제들의 합계·개별 금액·대표 일자
+            _sp_amts = [pay_amt_by_id.get(_x, 0) for _x in _split_pids_row]
+            _sp_total = sum(_sp_amts)
+            _parts_str = "+".join(f"{a:,}" for a in _sp_amts if a)
+            erp_amt_disp = f"{_sp_total:,} ({_parts_str})" if _parts_str else f"{_sp_total:,}"
+            erp_date_disp = pay_date_by_id.get(pid_int, "") if pid_int is not None else ""
         elif pid_int is not None:
             erp_amt_disp = f"{pay_amt_by_id[pid_int]:,}" if pid_int in pay_amt_by_id else ""
             erp_date_disp = pay_date_by_id.get(pid_int) or ""
@@ -5506,7 +5761,7 @@ def _ext_pay_list_matches_df(
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
-            "메모": m.get("note") or "",
+            "메모": _ext_pay_strip_split_pids_note(m.get("note")),
             "_fabricated": source == "ulsanpay" and (not ap) and bool(erp_ap),
         }
         if source == "card":
@@ -31052,6 +31307,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         "erp_canceled_official_paid": f"모모 취소·{_src_side} 결제",
         "ambiguous": "다중 매치",
         "manual_matched": "수동 매칭",
+        "split_matched": "분할 합산 일치",
         "미매칭": "미매칭",
     }
     # 헤더 리네임 (ERP일자→모모입력일, ERP금액→모모입력금액, 공식상태→<소스명>)
@@ -31139,11 +31395,13 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         f"빨간 행: 공식 파일에 승인번호가 없고 모모에만 번호가 있는 건(가공 번호·임의 매칭 의심). "
         f"동일 승인번호의 {_src_side} 취소와 모모 취소는 날짜가 달라도 상계되어 '금액일치'로 표시됩니다. "
         f"결제 금액·수단·승인번호를 바꾸면 해당 건은 자동 재매칭됩니다. "
-        f"결과: 금액일치=정상 · 금액 다름={_src_side}·모모 금액 상이(오입력 의심) · "
+        f"결과: 금액일치=정상 · 분할 합산 일치=모모 결제 여러 건 합이 {_src_side} 1건과 일치 · "
+        f"금액 다름={_src_side}·모모 금액 상이(오입력 의심) · "
         f"{_src_side}에만 존재={_src_side}만 있음(모모 미입력) · 모모에만 존재=모모만 있음({_src_side} 파일 없음) · "
         f"{_src_side} 취소·모모 잔존={_src_side}은 취소인데 모모 잔존(임의취소 의심) · "
         f"모모 취소·{_src_side} 결제=모모는 취소인데 {_src_side} 결제완료 · "
-        f"다중 매치=동일 승인·금액이 여럿이라 특정 불가 · 수동 매칭=관리자가 직접 붙임 · 미매칭=아직 매칭 미실행"
+        f"다중 매치=동일 승인·금액이 여럿이라 특정 불가 · 수동 매칭=관리자가 직접 붙임 · 미매칭=아직 매칭 미실행 · "
+        f"매칭 대상: 해당 매장의 {_src_side} 결제 전체(신규고객 한정 아님)"
     )
 
     # 수동 매칭 (자동매칭 실패 행 → ERP 결제 지정)
