@@ -32354,6 +32354,60 @@ def _render_ext_pay_ai_similar_match(
             ]
             return " · ".join([str(p) for p in parts if str(p).strip()]) or f"pay {pid}"
 
+        def _name_matches_masked(buyer_masked: str, pay_name: str) -> bool:
+            """공식 마스킹 이름(예 '장*국') 이 모모 이름 문자열에 포함되는지 판정."""
+            _bm = (buyer_masked or "").strip()
+            _pn = (pay_name or "").strip()
+            if not _bm or not _pn:
+                return True
+            if "*" not in _bm:
+                return _bm in _pn or _pn in _bm
+            _parts = _bm.split("*")
+            _head = _parts[0]
+            _tail = _parts[-1]
+            for _one in re.split(r"[\s·,/]+", _pn):
+                _one = _one.strip()
+                if not _one:
+                    continue
+                if _head and not _one.startswith(_head):
+                    continue
+                if _tail and not _one.endswith(_tail):
+                    continue
+                return True
+            return False
+
+        def _compute_pair_diffs(row_id: int, payment_id: int) -> list[str]:
+            _off = _row_lookup.get(row_id) or {}
+            _pay = _pay_lookup.get(payment_id) or {}
+            diffs: list[str] = []
+            _od = str(_off.get("공식일자") or "").strip()
+            _pd = str(_pay.get("ERP일자") or "").strip()
+            if _od and _pd and _od != _pd:
+                diffs.append(f"날짜 다름 ({_od} ≠ {_pd})")
+            try:
+                _oa = int(str(_off.get("공식금액") or "0").replace(",", ""))
+            except ValueError:
+                _oa = 0
+            try:
+                _pa = int(_pay.get("_amount_int") or 0)
+            except (TypeError, ValueError):
+                _pa = 0
+            if _oa and _pa and _oa != _pa:
+                diffs.append(f"금액 다름 ({_oa:,} ≠ {_pa:,})")
+            _o4 = str(_off.get("뒤4") or "").strip()
+            _p4 = str(_pay.get("뒤4") or "").strip()
+            if _o4 and _p4 and _o4 != _p4:
+                diffs.append(f"뒤4 다름 ({_o4} ≠ {_p4})")
+            _oap = str(_off.get("승인번호") or "").strip()
+            _pap = str(_pay.get("승인번호") or "").strip()
+            if _oap and _pap and _oap != _pap:
+                diffs.append(f"승인번호 다름 ({_oap} ≠ {_pap})")
+            _obuy = str(_off.get("구매자") or "").strip()
+            _pname = str(_pay.get("고객명") or "").strip()
+            if _obuy and _pname and not _name_matches_masked(_obuy, _pname):
+                diffs.append(f"이름 다름 ({_obuy} ≠ {_pname})")
+            return diffs
+
         # 저장 후 결과 세션에서 해당 항목 제거 (중복 클릭 방지)
         def _drop_pair(rid: int, pid: int) -> None:
             _cur = st.session_state.get(_sug_key) or {}
@@ -32397,12 +32451,15 @@ def _render_ext_pay_ai_similar_match(
             _pid = int(_p.get("payment_id") or 0)
             _conf = float(_p.get("confidence") or 0)
             _reason = str(_p.get("reason") or "")
+            _diffs = _compute_pair_diffs(_rid, _pid)
             with st.container(border=True):
                 st.markdown(
                     f"**공식** {_row_label(_rid)}  \n"
                     f"**모모** {_pay_label(_pid)}  \n"
                     f"신뢰도 `{_conf:.2f}` · 근거: {_reason or '-'}"
                 )
+                if _diffs:
+                    st.warning("차이점: " + " · ".join(_diffs))
                 c1, c2, _ = st.columns([1, 1, 3])
                 with c1:
                     if st.button(
