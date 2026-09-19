@@ -39452,8 +39452,15 @@ def render_customer_balance():
 
                             # ── 섹션 2: 결제 내역 조회 및 수정 ──
                             st.divider()
-                            st.markdown("#### 💳 결제 내역 조회 및 수정")
-                            st.caption("신용카드 → 현금 등 수단 변경 시: 해당 결제를 취소(금액 0 입력)한 뒤 아래 '잔금 추가 결제'에서 새 수단으로 등록하세요.")
+                            _pay_hdr_c1, _pay_hdr_c2 = st.columns([6, 1])
+                            with _pay_hdr_c1:
+                                st.markdown("#### 💳 결제 내역 조회 및 수정")
+                                st.caption("신용카드 → 현금 등 수단 변경 시: 해당 결제를 취소(금액 0 입력)한 뒤 아래 '잔금 추가 결제'에서 새 수단으로 등록하세요.")
+                            with _pay_hdr_c2:
+                                if st.button("🔄 새로고침", key=f"pay_refresh_{cid}",
+                                             help="결제 목록·잔금을 서버에서 다시 불러옵니다."):
+                                    _invalidate_payments()
+                                    st.rerun()
                             customer_name_for_receipt = (customers[customers["id"] == cid].iloc[0]["name"] or "고객").strip()
                             for _order_id_pay in orders["id"].tolist():
                                 if _supabase_orders_payments_available():
