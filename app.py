@@ -5640,6 +5640,8 @@ def _ext_pay_list_matches_df(
     pay_amt_by_id: dict[int, int] = {}
     pay_date_by_id: dict[int, str] = {}
     pay_ap_by_id: dict[int, str] = {}
+    pay_method_by_id: dict[int, str] = {}
+    pay_order_by_id: dict[int, int] = {}
     pays_by_approval: dict[str, list[tuple[int, str]]] = {}
     uniq_pids = sorted(set(payment_ids))
     if uniq_pids:
@@ -5647,7 +5649,7 @@ def _ext_pay_list_matches_df(
             for chunk in (uniq_pids[i : i + 200] for i in range(0, len(uniq_pids), 200)):
                 pr = (
                     sc.table("app_payments")
-                    .select("id, amount, payment_date, card_company, payment_method")
+                    .select("id, order_id, amount, payment_date, card_company, payment_method")
                     .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
                     .in_("id", chunk)
                     .execute()
@@ -5663,10 +5665,18 @@ def _ext_pay_list_matches_df(
                         pay_amt_by_id[pid] = 0
                     pay_date_by_id[pid] = str(p.get("payment_date") or "")[:10]
                     pay_ap_by_id[pid] = _ext_pay_norm_approval6(p.get("card_company"))
+                    pay_method_by_id[pid] = str(p.get("payment_method") or "")
+                    if p.get("order_id") is not None:
+                        try:
+                            pay_order_by_id[pid] = int(p["order_id"])
+                        except (TypeError, ValueError):
+                            pass
         except Exception:
             pay_amt_by_id = {}
             pay_date_by_id = {}
             pay_ap_by_id = {}
+            pay_method_by_id = {}
+            pay_order_by_id = {}
 
     # 동일 승인번호 후보(ambiguous) — 해당 승인번호의 ERP 금액·일자를 모두 모아 표시
     amb_approvals = []
@@ -5763,6 +5773,15 @@ def _ext_pay_list_matches_df(
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
             "메모": _ext_pay_strip_split_pids_note(m.get("note")),
             "_fabricated": source == "ulsanpay" and (not ap) and bool(erp_ap),
+            "_payment_id": pid_int,
+            "_order_id": oid_int,
+            "_customer_id": cid_int,
+            "_amount_int": (
+                pay_amt_by_id.get(pid_int, 0) if pid_int is not None else official_amt
+            ),
+            "_payment_method": (
+                pay_method_by_id.get(pid_int, "") if pid_int is not None else ""
+            ),
         }
         if source == "card":
             row_dict["카드사"] = r.get("card_company") or ""
@@ -5803,6 +5822,13 @@ def _ext_pay_list_matches_df(
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
             "메모": "공식 파일에 없음",
             "_fabricated": source == "ulsanpay" and bool(erp_ap),
+            "_payment_id": (
+                int(p["payment_id"]) if p.get("payment_id") is not None else None
+            ),
+            "_order_id": oid_int,
+            "_customer_id": cid_int,
+            "_amount_int": amt,
+            "_payment_method": str(p.get("payment_method") or ""),
         }
         if source == "card":
             row_dict["카드사"] = _card_company_norm(p.get("card_company")) or ""
@@ -10998,6 +11024,384 @@ def _render_hq_cost_explain_thread(task: dict, key_base: str, me_uname: str) -> 
                     st.rerun()
                 else:
                     st.error(f"상태 변경 실패: {cerr}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 외부결제 대사 미매칭 → 사내 업무 소명 요청 (원가 소명 요청과 동일 방식)
+# ─────────────────────────────────────────────────────────────────────
+
+_EXT_PAY_EXPLAIN_TAG_PREFIX = "ext-pay-reconcile"
+
+_EXT_PAY_SRC_LABEL_KO = {
+    "onnuri": "온누리",
+    "ulsanpay": "울산페이",
+    "card": "카드",
+    "mainpay": "메인페이",
+}
+
+_EXT_PAY_RECONCILE_REASON = {
+    "erp_only": "모모에는 결제가 있으나 공식 파일에 대응 건이 없음 (공식 등록 누락 또는 입력 오류 의심)",
+    "erp_canceled_official_paid": "공식은 취소인데 모모 결제가 결제완료로 남아 있음 (모모 취소 처리 누락 의심)",
+    "official_canceled": "공식은 취소인데 모모에 대응 결제가 잔존함 (임의취소·환불 처리 확인 필요)",
+    "ambiguous": "동일 승인·금액 공식 후보가 여러 건이라 매칭 확정 불가 (실물 영수증·상세 정보 확인 필요)",
+    "amount_mismatch": "공식 파일 금액과 모모 결제 금액이 상이 (정정 입력 필요)",
+    "official_only": "공식 파일에는 있으나 모모 매출이 등록되지 않음 (매출 입력 누락 확인 필요)",
+    "미매칭": "자동 매칭이 아직 실행되지 않음 (매칭 실행 필요)",
+}
+
+# 소명 요청 대상 result_code
+_EXT_PAY_RECONCILE_TARGET_CODES = frozenset({
+    "erp_only",
+    "erp_canceled_official_paid",
+    "official_canceled",
+    "ambiguous",
+    "amount_mismatch",
+    "official_only",
+})
+
+
+def _ext_pay_explain_row_tag(*, payment_id: int | None, row_id: int | None) -> str:
+    """소명 요청 업무 태그(식별 조각). payment_id 우선, 없으면 공식 row_id."""
+    if payment_id:
+        return f"pid-{int(payment_id)}"
+    if row_id:
+        return f"row-{int(row_id)}"
+    return "unknown"
+
+
+def _ext_pay_explain_row_tags(
+    db_filename: str, source: str, *, payment_id: int | None, row_id: int | None,
+) -> list[str]:
+    return [
+        _EXT_PAY_EXPLAIN_TAG_PREFIX,
+        f"db-{db_filename}",
+        f"src-{source}",
+        _ext_pay_explain_row_tag(payment_id=payment_id, row_id=row_id),
+    ]
+
+
+def _ext_pay_find_explain_task(
+    db_filename: str, source: str, *, payment_id: int | None, row_id: int | None,
+) -> dict | None:
+    """이 결제·행에 대해 이미 생성된 소명 업무를 찾는다. 태그 문자열에 식별 조각 포함 시 매칭."""
+    try:
+        import task_board as _tb  # noqa: WPS433
+    except Exception:
+        return None
+    tag = _ext_pay_explain_row_tag(payment_id=payment_id, row_id=row_id)
+    if tag == "unknown":
+        return None
+    try:
+        tasks = _tb.load_tasks_cached(store_name=None, include_done=True)
+    except Exception:
+        return None
+    src_tag = f"src-{source}"
+    for t in tasks or []:
+        tags = str(t.get("tags") or "")
+        if (
+            _EXT_PAY_EXPLAIN_TAG_PREFIX in tags
+            and tag in tags
+            and src_tag in tags
+            and (t.get("db_filename") or "") == db_filename
+        ):
+            return t
+    return None
+
+
+def _ext_pay_reconcile_targets_from_df(
+    df: "pd.DataFrame", source: str,
+) -> list[dict]:
+    """`_ext_pay_list_matches_df` 결과에서 소명 요청 대상 행을 추출한다."""
+    if df is None or df.empty:
+        return []
+    out: list[dict] = []
+    for _, row in df.iterrows():
+        code = str(row.get("결과") or "").strip()
+        if code not in _EXT_PAY_RECONCILE_TARGET_CODES:
+            continue
+        try:
+            pid = int(row.get("_payment_id")) if row.get("_payment_id") is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        try:
+            rid = int(row.get("row_id")) if row.get("row_id") not in (None, 0) else None
+        except (TypeError, ValueError):
+            rid = None
+        try:
+            oid = int(row.get("_order_id")) if row.get("_order_id") is not None else None
+        except (TypeError, ValueError):
+            oid = None
+        try:
+            cid = int(row.get("_customer_id")) if row.get("_customer_id") is not None else None
+        except (TypeError, ValueError):
+            cid = None
+        try:
+            amt = int(row.get("_amount_int") or 0)
+        except (TypeError, ValueError):
+            amt = 0
+        date_erp = str(row.get("ERP일자") or "").strip()
+        date_off = str(row.get("공식일자") or "").strip()
+        # 대표 일자: 모모 결제일 우선, 없으면 공식일자
+        date_disp = (date_erp.split(" ")[0] if date_erp else "") or date_off
+        method = str(row.get("_payment_method") or "").strip()
+        if not method:
+            method = _EXT_PAY_SRC_LABEL_KO.get(source, source)
+        out.append({
+            "ident": _ext_pay_explain_row_tag(payment_id=pid, row_id=rid),
+            "payment_id": pid,
+            "row_id": rid,
+            "order_id": oid,
+            "customer_id": cid,
+            "customer_name": str(row.get("고객명") or "").strip(),
+            "phone": str(row.get("고객전화") or "").strip(),
+            "employee_names": str(row.get("담당매니저") or "").strip(),
+            "date": date_disp,
+            "amount": amt,
+            "method": method,
+            "result_code": code,
+            "src_label": _EXT_PAY_SRC_LABEL_KO.get(source, source),
+            "official_status": str(row.get("공식상태") or "").strip(),
+        })
+    return out
+
+
+def _render_ext_pay_reconcile_request(
+    db_filename: str, source: str, target: dict, key_base: str,
+) -> None:
+    """미매칭 ERP 결제(모모) 1건에 대한 소명 요청 폼. 원가 매칭 소명 요청과 동일 방식."""
+    try:
+        import task_board as _tb  # noqa: WPS433
+    except Exception as _tb_e:
+        st.caption(f"사내 업무 모듈을 불러오지 못했습니다: {_tb_e}")
+        return
+
+    payment_id = target.get("payment_id")
+    row_id = target.get("row_id")
+    src_label = target.get("src_label") or _EXT_PAY_SRC_LABEL_KO.get(source, source)
+    cust = (target.get("customer_name") or "(고객명 없음)").strip()
+    phone = target.get("phone") or "-"
+    date_s = target.get("date") or "-"
+    amount = int(target.get("amount") or 0)
+    result_code = str(target.get("result_code") or "").strip()
+    method = target.get("method") or "-"
+    off_status = target.get("official_status") or "-"
+    reason = _EXT_PAY_RECONCILE_REASON.get(result_code, "결제 대사 확인 필요")
+
+    _store_label = _get_store_name_by_db(db_filename) or db_filename
+    if _store_label.endswith(".db"):
+        _store_label = {
+            "store_1.db": "울산 삼산점",
+            "store_2.db": "울산 학성점",
+        }.get(db_filename, _store_label)
+
+    current_user = st.session_state.get("current_user") or {}
+    role = (current_user.get("role") or "user").strip()
+    me_uname = _current_username()
+    store_id = current_user.get("store_id") or st.session_state.get("current_store_id")
+
+    existing = _ext_pay_find_explain_task(
+        db_filename, source, payment_id=payment_id, row_id=row_id,
+    )
+
+    st.markdown("---")
+    st.markdown("### 판매·입력담당 소명 요청 (사내 업무)")
+
+    _c1, _c2, _c3 = st.columns(3)
+    _c1.metric(f"{src_label} 결제일", date_s or "-")
+    _c2.metric("금액", f"{amount:,}원")
+    _c3.metric("결과 코드", result_code or "-")
+
+    st.caption(
+        f"고객 **{cust}** · 전화 {phone} · 매장 {_store_label} · 결제수단 {method} · "
+        f"공식상태 {off_status}"
+    )
+    st.info(f"자동 사유: {reason}")
+
+    if existing:
+        _render_hq_cost_explain_thread(existing, key_base, me_uname)
+        return
+
+    # 판매담당 자동 매칭 (주문 employee_names → username)
+    row_emps = _hq_split_names(target.get("employee_names") or "")
+    matched_users, unmatched_names = _hq_resolve_assignees_from_names(row_emps, store_id, role)
+
+    emp_options = _internal_work_employee_options(store_id, role, cross_store=True)
+    emp_uname_to_label = {u: lbl for u, lbl in emp_options}
+    all_unames = [u for u, _ in emp_options]
+
+    default_assignees = [u for u in matched_users if u in emp_uname_to_label]
+
+    assignees = st.multiselect(
+        "담당자 (자동 매칭됨 · 수정 가능)",
+        options=all_unames,
+        default=default_assignees,
+        format_func=lambda u: emp_uname_to_label.get(u, u),
+        key=f"{key_base}::assignees",
+    )
+    if unmatched_names:
+        st.caption(
+            f"자동 매칭 실패 담당자: {', '.join(unmatched_names)} — 위 목록에서 직접 선택해 주세요."
+        )
+    if not row_emps and not default_assignees:
+        st.caption("주문 담당자 정보가 없어 자동 매칭할 수 없습니다. 직접 지정해 주세요.")
+
+    _default_title = f"[결제대사] {cust} · {date_s} · {src_label} {amount:,}원"
+    title = st.text_input("제목", value=_default_title, key=f"{key_base}::title")
+
+    _default_memo = (
+        f"사유: {reason}\n"
+        f"원인 확인 후 정정 또는 결제 정보 회신 바랍니다."
+    )
+    memo = st.text_area(
+        "요청 메모 (필수)",
+        value=_default_memo,
+        height=110,
+        key=f"{key_base}::memo",
+    )
+
+    ver_key = f"{key_base}::files_ver"
+    ver = int(st.session_state.get(ver_key, 0))
+    files = _file_input_with_paste(
+        "이미지·문서 첨부 (Ctrl+V 로 화면 캡처 붙여넣기 가능)",
+        accept_multiple_files=True,
+        key=f"{key_base}::files::{ver}",
+    )
+    _render_upload_preview(files)
+
+    if st.button("소명 요청 보내기", type="primary", key=f"{key_base}::send"):
+        if not (title or "").strip():
+            st.error("제목을 입력해 주세요.")
+            return
+        if not (memo or "").strip():
+            st.error("요청 메모를 입력해 주세요.")
+            return
+        if not assignees:
+            st.error("담당자를 최소 1명 지정해 주세요.")
+            return
+
+        _body = (
+            f"매장: {_store_label}\n"
+            f"고객: {cust}\n"
+            f"전화: {phone}\n"
+            f"결제일: {date_s}\n"
+            f"결제수단: {method}\n"
+            f"공식 소스: {src_label}\n"
+            f"공식 상태: {off_status}\n"
+            f"금액: {amount:,}원\n"
+            f"결과 코드: {result_code}\n"
+            f"자동 사유: {reason}\n"
+            f"판매담당: {', '.join(row_emps) if row_emps else '-'}\n\n"
+            f"요청 메모:\n{memo.strip()}"
+        )
+        tags = ",".join(
+            _ext_pay_explain_row_tags(
+                db_filename, source, payment_id=payment_id, row_id=row_id,
+            )
+        )
+        new_id, err = _tb.create_task(
+            title=title.strip(),
+            description=_body,
+            created_by=me_uname,
+            store_name=_store_label,
+            db_filename=db_filename,
+            parent_task_id=None,
+            start_date=None,
+            due_date=None,
+            priority="normal",
+            assignees=list(assignees),
+            category=None,
+            tags=tags,
+            is_pinned=False,
+            scope="store",
+        )
+        if err or not new_id:
+            st.error(f"업무 생성 실패: {err or '알 수 없는 오류'}")
+            return
+        att_errs: list[str] = []
+        for _f in (files or []):
+            try:
+                _f.seek(0)
+            except Exception:
+                pass
+            _, ferr = _tb.attach_file(
+                task_id=int(new_id), comment_id=None,
+                uploaded_file=_f, uploaded_by=me_uname,
+            )
+            if ferr:
+                att_errs.append(f"{getattr(_f, 'name', 'file')}: {ferr}")
+        st.session_state[ver_key] = ver + 1
+        if att_errs:
+            st.warning("일부 첨부 실패: " + "; ".join(att_errs))
+        _tb.clear_task_caches()
+        st.success(f"업무 #{new_id} 생성 완료. 담당자에게 알림이 발송되었습니다.")
+        st.rerun()
+
+
+def _render_ext_pay_reconcile_section(
+    db_filename: str, source: str, df: "pd.DataFrame",
+) -> None:
+    """결과 표에서 미매칭 ERP 결제(모모) 대상을 골라 사내 업무 소명 요청."""
+    targets = _ext_pay_reconcile_targets_from_df(df, source)
+    src_label = _EXT_PAY_SRC_LABEL_KO.get(source, source)
+    with st.expander(
+        f"📬 매출·입력담당 소명 요청 (미매칭 {len(targets)}건)",
+        expanded=False,
+    ):
+        st.caption(
+            "매칭이 안 되는 모모 결제(공식 없음·공식 취소·다중 후보·금액 불일치) 또는 공식만 있는 건을 "
+            "매출·입력담당에게 사내 업무로 요청합니다. 사유는 결과 코드에 따라 자동 입력됩니다."
+        )
+        if not targets:
+            st.success("현재 표시된 범위에는 소명 요청 대상이 없습니다.")
+            return
+
+        # 결과 코드별 필터
+        _all_codes = sorted({t["result_code"] for t in targets})
+        _label_map = {
+            "erp_only": "모모에만 존재",
+            "erp_canceled_official_paid": f"모모 취소·{src_label} 결제",
+            "official_canceled": f"{src_label} 취소·모모 잔존",
+            "ambiguous": "다중 매치",
+            "amount_mismatch": "금액 다름",
+            "official_only": f"{src_label}에만 존재",
+        }
+        sel_codes = st.multiselect(
+            "결과 코드 필터",
+            options=_all_codes,
+            default=_all_codes,
+            format_func=lambda c: f"{_label_map.get(c, c)} ({c})",
+            key=f"extpay_reconcile_codes_{db_filename}_{source}",
+        )
+        _visible = [t for t in targets if t["result_code"] in set(sel_codes)]
+        if not _visible:
+            st.info("선택한 결과 코드에 해당하는 항목이 없습니다.")
+            return
+
+        # 이미 요청된 건 라벨링 (선택 시 스레드 자동 표시)
+        _opt_labels: list[tuple[str, str]] = []
+        for t in _visible:
+            _rc_kr = _label_map.get(t["result_code"], t["result_code"])
+            _who = t["customer_name"] or "(고객명 없음)"
+            _emp = f" · {t['employee_names']}" if t["employee_names"] else ""
+            _ident_short = t["ident"]
+            _opt_labels.append((
+                t["ident"],
+                f"{t['date'] or '-'} · {t['amount']:,}원 · {t['method']} · "
+                f"{_who}{_emp} · [{_rc_kr}] · #{_ident_short}",
+            ))
+
+        ident_key = f"extpay_reconcile_sel_{db_filename}_{source}"
+        sel_ident = st.selectbox(
+            "요청할 결제 선택",
+            options=[o[0] for o in _opt_labels],
+            format_func=lambda k: dict(_opt_labels).get(k, k),
+            key=ident_key,
+        )
+        _sel = next((t for t in _visible if t["ident"] == sel_ident), None)
+        if _sel is None:
+            return
+        _key_base = f"extpay_reconcile::{db_filename}::{source}::{_sel['ident']}"
+        _render_ext_pay_reconcile_request(db_filename, source, _sel, _key_base)
 
 
 def _render_hq_edit_row_action(
@@ -31322,7 +31726,10 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     df_show = df_show.rename(columns=_rename_map)
 
     _flag_col = "_fabricated"
-    _hidden = {_flag_col, "row_id"}
+    _hidden = {
+        _flag_col, "row_id",
+        "_payment_id", "_order_id", "_customer_id", "_amount_int", "_payment_method",
+    }
     _all_cols = [c for c in df_show.columns if c not in _hidden]
     _show = df_show[_all_cols]
     _red = (
@@ -31406,6 +31813,9 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
 
     # 수동 매칭 (자동매칭 실패 행 → ERP 결제 지정)
     _render_ext_pay_manual_match_ui(sel_db, sel_src, df, new_from, me_uname)
+
+    # 매출·입력담당 소명 요청 (미매칭 ERP 결제 → 사내 업무 / 원가 소명 요청과 동일 방식)
+    _render_ext_pay_reconcile_section(sel_db, sel_src, df)
 
     # ERP-only 수기 확인 (현금 수금 등 공식파일 자체가 없는 결제)
     _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
