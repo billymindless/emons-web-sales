@@ -30010,7 +30010,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         # 증빙 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
         ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0))
         files = _file_input_with_paste(
-            "📎 증빙 사진/파일 첨부 * (과거 결제본·신규 오프라인 결제본 등)",
+            "📎 증빙 사진/파일 첨부 (선택)",
             accept_multiple_files=True,
             key=f"pcr_files_{order_id}_{ver}",
         )
@@ -30021,9 +30021,9 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             if float(orig.get("amount") or 0) > 0 and new_amount > float(orig.get("amount") or 0):
                 st.warning("⚠️ 변경 후 금액이 원본 결제 금액보다 큽니다. 환불/취소 금액을 다시 확인하세요.")
 
-        can_submit = bool((reason or "").strip()) and bool(files) and bool(orig.get("method") or orig.get("amount"))
+        can_submit = bool((reason or "").strip()) and bool(orig.get("method") or orig.get("amount"))
         if not can_submit:
-            st.caption("원본 확인, 사유 입력, 증빙 첨부가 모두 있어야 요청할 수 있습니다.")
+            st.caption("원본 확인과 사유 입력이 있어야 요청할 수 있습니다.")
         if st.button("📤 요청 등록 (기존 결제 취소 + 신규 결제 자동 저장)",
                      key=f"pcr_submit_{order_id}",
                      type="primary", disabled=not can_submit):
