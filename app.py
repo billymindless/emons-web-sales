@@ -11161,6 +11161,13 @@ def _ext_pay_reconcile_targets_from_df(
             "result_code": code,
             "src_label": _EXT_PAY_SRC_LABEL_KO.get(source, source),
             "official_status": str(row.get("공식상태") or "").strip(),
+            # 공식 파일 원장 식별 정보 (온누리 등에서 담당자가 원장 찾을 때 사용)
+            "official_date": date_off,
+            "official_buyer_masked": str(row.get("구매자") or "").strip(),
+            "official_phone_last4": str(row.get("뒤4") or "").strip(),
+            "official_approval": str(row.get("승인번호") or "").strip(),
+            "official_amount_disp": str(row.get("공식금액") or "").strip(),
+            "settle_status": str(row.get("정산") or "").strip(),
         })
     return out
 
@@ -11186,6 +11193,13 @@ def _render_ext_pay_reconcile_request(
     method = target.get("method") or "-"
     off_status = target.get("official_status") or "-"
     reason = _EXT_PAY_RECONCILE_REASON.get(result_code, "결제 대사 확인 필요")
+    # 공식 파일 원장 식별 정보 (담당자가 원장 검색 시 활용)
+    off_date = target.get("official_date") or "-"
+    off_buyer = target.get("official_buyer_masked") or ""
+    off_last4 = target.get("official_phone_last4") or ""
+    off_approval = target.get("official_approval") or ""
+    off_amount_disp = target.get("official_amount_disp") or ""
+    settle_disp = target.get("settle_status") or ""
 
     _store_label = _get_store_name_by_db(db_filename) or db_filename
     if _store_label.endswith(".db"):
@@ -11215,6 +11229,22 @@ def _render_ext_pay_reconcile_request(
         f"고객 **{cust}** · 전화 {phone} · 매장 {_store_label} · 결제수단 {method} · "
         f"공식상태 {off_status}"
     )
+    # 공식 파일 원장 정보 (온누리·울산페이 등에서 담당자가 원장에서 찾을 때 필요)
+    _off_bits: list[str] = []
+    if off_date and off_date != "-":
+        _off_bits.append(f"공식일자 {off_date}")
+    if off_amount_disp:
+        _off_bits.append(f"공식금액 {off_amount_disp}원")
+    if off_buyer:
+        _off_bits.append(f"구매자 {off_buyer}")
+    if off_last4:
+        _off_bits.append(f"뒤4 {off_last4}")
+    if off_approval:
+        _off_bits.append(f"승인번호 {off_approval}")
+    if settle_disp:
+        _off_bits.append(f"정산 {settle_disp}")
+    if _off_bits:
+        st.caption("📄 공식 파일 원장: " + " · ".join(_off_bits))
     st.info(f"자동 사유: {reason}")
 
     if existing:
@@ -11245,7 +11275,11 @@ def _render_ext_pay_reconcile_request(
     if not row_emps and not default_assignees:
         st.caption("주문 담당자 정보가 없어 자동 매칭할 수 없습니다. 직접 지정해 주세요.")
 
-    _default_title = f"[결제대사] {cust} · {date_s} · {src_label} {amount:,}원"
+    # 고객명이 비어 있으면 공식 파일 구매자 마스킹 이름을 제목에 fallback
+    _title_who = cust if cust and cust != "(고객명 없음)" else (
+        f"구매자 {off_buyer}" if off_buyer else "(고객명 없음)"
+    )
+    _default_title = f"[결제대사] {_title_who} · {date_s} · {src_label} {amount:,}원"
     title = st.text_input("제목", value=_default_title, key=f"{key_base}::title")
 
     _default_memo = (
@@ -11279,6 +11313,22 @@ def _render_ext_pay_reconcile_request(
             st.error("담당자를 최소 1명 지정해 주세요.")
             return
 
+        # 공식 파일 원장 식별 정보 라인 (담당자가 원장에서 검색할 때 활용)
+        _off_lines: list[str] = []
+        if off_date and off_date != "-":
+            _off_lines.append(f"  · 공식일자: {off_date}")
+        if off_amount_disp:
+            _off_lines.append(f"  · 공식금액: {off_amount_disp}원")
+        if off_buyer:
+            _off_lines.append(f"  · 구매자(마스킹): {off_buyer}")
+        if off_last4:
+            _off_lines.append(f"  · 전화 뒤4자리: {off_last4}")
+        if off_approval:
+            _off_lines.append(f"  · 승인번호: {off_approval}")
+        if settle_disp:
+            _off_lines.append(f"  · 정산상태: {settle_disp}")
+        _off_block = ("공식 파일 원장 정보:\n" + "\n".join(_off_lines) + "\n") if _off_lines else ""
+
         _body = (
             f"매장: {_store_label}\n"
             f"고객: {cust}\n"
@@ -11291,6 +11341,7 @@ def _render_ext_pay_reconcile_request(
             f"결과 코드: {result_code}\n"
             f"자동 사유: {reason}\n"
             f"판매담당: {', '.join(row_emps) if row_emps else '-'}\n\n"
+            f"{_off_block}"
             f"요청 메모:\n{memo.strip()}"
         )
         tags = ",".join(
@@ -11381,13 +11432,30 @@ def _render_ext_pay_reconcile_section(
         _opt_labels: list[tuple[str, str]] = []
         for t in _visible:
             _rc_kr = _label_map.get(t["result_code"], t["result_code"])
-            _who = t["customer_name"] or "(고객명 없음)"
             _emp = f" · {t['employee_names']}" if t["employee_names"] else ""
             _ident_short = t["ident"]
+
+            # 고객 식별자: ERP 매칭 고객명 우선, 없으면 공식 파일의 구매자 마스킹+뒤4+승인번호
+            _bits: list[str] = []
+            if t["customer_name"]:
+                _bits.append(t["customer_name"])
+            elif t.get("official_buyer_masked"):
+                _bits.append(f"구매자 {t['official_buyer_masked']}")
+            else:
+                _bits.append("(고객명 없음)")
+            _extra: list[str] = []
+            if t.get("official_phone_last4"):
+                _extra.append(f"뒤4 {t['official_phone_last4']}")
+            if t.get("official_approval") and source != "card":
+                _extra.append(f"승인 {t['official_approval']}")
+            if _extra:
+                _bits.append(" · ".join(_extra))
+            _who_bit = " · ".join(_bits)
+
             _opt_labels.append((
                 t["ident"],
                 f"{t['date'] or '-'} · {t['amount']:,}원 · {t['method']} · "
-                f"{_who}{_emp} · [{_rc_kr}] · #{_ident_short}",
+                f"{_who_bit}{_emp} · [{_rc_kr}] · #{_ident_short}",
             ))
 
         ident_key = f"extpay_reconcile_sel_{db_filename}_{source}"
