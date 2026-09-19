@@ -4016,8 +4016,66 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
     counts: dict[str, int] = {}
     inserts: list[dict] = []
 
+    # 1차 패스(정확 매칭 우선): 취소 아닌 공식 행 중 (tx_date, last4, amount) 후보가 1건이면
+    # 먼저 확정하고 인덱스에서 소진한다. 이후 amt_alts/nearby 확장 매칭이 정확 매칭 대상 결제를
+    # 빼앗아 다른 공식 행이 official_only 로 밀리는 문제를 방지한다.
+    _pass1_locked: set[int] = set()
+    # (B) 같은 주문 fallback 확장: last4 → 이번 세션에서 매칭된 order_id 집합.
+    # 담당자가 두 번째 결제의 last4 를 다른 값으로 입력해도, 같은 order 내 amount 유일 일치로 복구한다.
+    _pass1_orders_by_last4: dict[str, set[int]] = {}
+    for _r in todo:
+        try:
+            _row_id = int(_r["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if _ext_pay_is_cancel_status(_r.get("tx_status")):
+            continue
+        _tx_date = str(_r.get("tx_date") or "")[:10]
+        _last4 = _r.get("phone_last4") or ""
+        try:
+            _amt = int(_r.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if _amt <= 0 or not _last4:
+            continue
+        _cands = idx.get((_tx_date, _last4, _amt), [])
+        if len(_cands) != 1:
+            continue
+        _pay = _cands[0]
+        try:
+            _pid = int(_pay["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        _order_id = int(_pay["order_id"]) if _pay.get("order_id") is not None else None
+        _co = _pay["_order"] or {}
+        _cid = int(_co["customer_id"]) if _co.get("customer_id") is not None else None
+        # ERP 취소 흔적이 있으면 1차 확정 대신 2차에서 상세 분기
+        if _order_id is not None and _order_id in neg_orders:
+            continue
+        inserts.append({
+            "db_filename": db_filename,
+            "source": "onnuri",
+            "row_id": _row_id,
+            "payment_id": _pid,
+            "order_id": _order_id,
+            "customer_id": _cid,
+            "result_code": "matched_ok",
+            "note": None,
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        counts["matched_ok"] = counts.get("matched_ok", 0) + 1
+        used_payment_ids.add(_pid)
+        for _k, _lst in list(idx.items()):
+            idx[_k] = [x for x in _lst if int(x["id"]) != _pid]
+        _pass1_locked.add(_row_id)
+        if _last4 and _order_id is not None:
+            _pass1_orders_by_last4.setdefault(_last4, set()).add(_order_id)
+
+    # 2차 패스: 나머지 공식 행에 대해 nearby/split/시각/같은주문/amt_alts/ambiguous 처리
     for r in todo:
         row_id = int(r["id"])
+        if row_id in _pass1_locked:
+            continue
         tx_date = str(r.get("tx_date") or "")[:10]
         last4 = (r.get("phone_last4") or "")
         amt = int(r.get("amount") or 0)
@@ -4085,31 +4143,100 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
                     parts_str = "+".join(f"{int(_p['amount']):,}" for _p in combo_sorted)
                     note_parts.append(f"분할 {len(combo_sorted)}건 합 {amt:,} ({parts_str})")
                 else:
-                    amt_alts: list[dict] = []
-                    if last4:
+                    # (C) 시각 fallback: 공식 tx_time 이 있고 결제 저장 시각과 정확 일치·유일하면 matched_ok
+                    _want_t = _onnuri_parse_time_input(r.get("tx_time"))
+                    _time_hits: list[dict] = []
+                    if _want_t and amt > 0:
+                        _seen_th: set[int] = set()
                         for _p in candidate_pays:
                             try:
                                 _pid = int(_p["id"])
                             except (TypeError, ValueError, KeyError):
                                 continue
-                            if _pid in used_payment_ids:
-                                continue
-                            if _phone_last4_for(_p) != last4:
+                            if _pid in used_payment_ids or _pid in _seen_th:
                                 continue
                             if str(_p.get("payment_date") or "")[:10] != tx_date:
                                 continue
                             try:
-                                _pa = int(_p.get("amount") or 0)
+                                if int(_p.get("amount") or 0) != amt:
+                                    continue
                             except (TypeError, ValueError):
                                 continue
-                            if abs(_pa) != abs(amt):
-                                amt_alts.append(_p)
-                    if len(amt_alts) == 1:
-                        matched_pay = amt_alts[0]
-                        result_code = "amount_mismatch"
-                        note_parts.append("공식파일에 있으나 금액 다름")
+                            if _onnuri_time_from_code(_p.get("onnuri_approval_code")) != _want_t:
+                                continue
+                            _seen_th.add(_pid)
+                            _time_hits.append(_p)
+                    if len(_time_hits) == 1:
+                        matched_pay = _time_hits[0]
+                        result_code = "matched_ok"
+                        note_parts.append("거래시각 정확 일치로 복구 (last4 상이)")
                     else:
-                        result_code = "official_only"
+                        amt_alts: list[dict] = []
+                        if last4:
+                            for _p in candidate_pays:
+                                try:
+                                    _pid = int(_p["id"])
+                                except (TypeError, ValueError, KeyError):
+                                    continue
+                                if _pid in used_payment_ids:
+                                    continue
+                                if _phone_last4_for(_p) != last4:
+                                    continue
+                                if str(_p.get("payment_date") or "")[:10] != tx_date:
+                                    continue
+                                try:
+                                    _pa = int(_p.get("amount") or 0)
+                                except (TypeError, ValueError):
+                                    continue
+                                if abs(_pa) != abs(amt):
+                                    amt_alts.append(_p)
+                        # (B) 같은 주문 fallback: amt_alts 결제의 order 또는 Pass 1 에서
+                        # 같은 last4 로 매칭된 order 내 amount 정확 일치가 유일하면 matched_ok
+                        same_order_hit: dict | None = None
+                        if amt > 0:
+                            _alt_oids: set[int] = set()
+                            for _p in amt_alts:
+                                if _p.get("order_id") is not None:
+                                    try:
+                                        _alt_oids.add(int(_p["order_id"]))
+                                    except (TypeError, ValueError):
+                                        pass
+                            if last4:
+                                _alt_oids.update(_pass1_orders_by_last4.get(last4, set()))
+                            if _alt_oids:
+                                _same_order_pool: list[dict] = []
+                                _seen_so: set[int] = set()
+                                for _p in candidate_pays:
+                                    try:
+                                        _pid = int(_p["id"])
+                                    except (TypeError, ValueError, KeyError):
+                                        continue
+                                    if _pid in used_payment_ids or _pid in _seen_so:
+                                        continue
+                                    try:
+                                        if int(_p.get("order_id")) not in _alt_oids:
+                                            continue
+                                    except (TypeError, ValueError):
+                                        continue
+                                    try:
+                                        if int(_p.get("amount") or 0) != amt:
+                                            continue
+                                    except (TypeError, ValueError):
+                                        continue
+                                    _seen_so.add(_pid)
+                                    _same_order_pool.append(_p)
+                                if len(_same_order_pool) == 1:
+                                    same_order_hit = _same_order_pool[0]
+                        if same_order_hit is not None:
+                            matched_pay = same_order_hit
+                            result_code = "matched_ok"
+                            note_parts.append("동일 주문 fallback (last4 상이) 매칭")
+                        elif len(amt_alts) == 1:
+                            matched_pay = amt_alts[0]
+                            result_code = "amount_mismatch"
+                            note_parts.append("공식파일에 있으나 금액 다름")
+                        else:
+                            result_code = "official_only"
         elif len(candidates) == 1:
             matched_pay = candidates[0]
             if is_cancel:
