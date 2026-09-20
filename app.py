@@ -2950,6 +2950,98 @@ def _ext_pay_rematch_ulsan_zeropad(sc, db_filename: str) -> int:
     return updated
 
 
+def _ext_pay_propagate_business_to_payments(db_filename: str, source: str) -> int:
+    """매칭된 결제행에 배치의 business_name 을 상속.
+
+    - app_external_pay_matches → row_id → app_external_pay_rows.batch_id → app_external_pay_batches.business_name
+      경로로 각 payment_id 의 business_name 을 계산해 app_payments.business_name 이 NULL 인 건만 채운다.
+    - split_pids 노트에 나열된 참여 payment_id 에도 동일하게 상속.
+    - business_name 컬럼이 없는 스키마에서는 조용히 skip.
+    반환: 업데이트된 payments 수 (근사).
+    """
+    if not db_filename or source not in ("ulsanpay", "onnuri", "card", "mainpay"):
+        return 0
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return 0
+    try:
+        mr = (
+            sc.table("app_external_pay_matches")
+            .select("row_id, payment_id, note")
+            .eq("db_filename", db_filename)
+            .eq("source", source)
+            .execute()
+        )
+        matches = mr.data or []
+    except Exception:
+        return 0
+    if not matches:
+        return 0
+    row_ids = sorted({int(m["row_id"]) for m in matches if m.get("row_id") is not None})
+    if not row_ids:
+        return 0
+    row_to_batch: dict[int, int] = {}
+    try:
+        for chunk in (row_ids[i : i + 200] for i in range(0, len(row_ids), 200)):
+            r = sc.table("app_external_pay_rows").select("id, batch_id").in_("id", chunk).execute()
+            for x in (r.data or []):
+                if x.get("id") is not None and x.get("batch_id") is not None:
+                    row_to_batch[int(x["id"])] = int(x["batch_id"])
+    except Exception:
+        return 0
+    batch_ids = sorted(set(row_to_batch.values()))
+    if not batch_ids:
+        return 0
+    batch_to_biz: dict[int, str] = {}
+    try:
+        for chunk in (batch_ids[i : i + 200] for i in range(0, len(batch_ids), 200)):
+            r = sc.table("app_external_pay_batches").select("id, business_name").in_("id", chunk).execute()
+            for x in (r.data or []):
+                bn = str(x.get("business_name") or "").strip()
+                if x.get("id") is not None and bn:
+                    batch_to_biz[int(x["id"])] = bn
+    except Exception as _e:
+        # business_name 컬럼 없음 등
+        return 0
+    if not batch_to_biz:
+        return 0
+    pay_to_biz: dict[int, str] = {}
+    for m in matches:
+        pid = m.get("payment_id")
+        rid = m.get("row_id")
+        if pid is None or rid is None:
+            continue
+        biz = batch_to_biz.get(row_to_batch.get(int(rid), -1))
+        if not biz:
+            continue
+        try:
+            pay_to_biz[int(pid)] = biz
+        except (TypeError, ValueError):
+            pass
+        try:
+            for sp in _ext_pay_extract_split_pids(m.get("note")):
+                pay_to_biz.setdefault(int(sp), biz)
+        except Exception:
+            pass
+    if not pay_to_biz:
+        return 0
+    updated = 0
+    for pid, biz in pay_to_biz.items():
+        try:
+            sc.table("app_payments").update({"business_name": biz}) \
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename) \
+                .eq("id", int(pid)) \
+                .is_("business_name", "null") \
+                .execute()
+            updated += 1
+        except Exception as _e:
+            _msg = str(_e)
+            if "business_name" in _msg and ("does not exist" in _msg or "PGRST204" in _msg):
+                return 0
+            continue
+    return updated
+
+
 def _ext_pay_relink_amount_and_near_date(
     sc, db_filename: str, source: str, erp_from: date | None = None,
 ) -> int:
@@ -3545,11 +3637,14 @@ def _ext_pay_dryrun_conflicts(
 def _ext_pay_insert_batch_and_rows(
     db_filename: str, source: str, file_name: str, rows: list[dict],
     verify_from: date, uploaded_by: str | None,
+    business_name: str | None = None,
 ) -> tuple[int, int, int, str | None, list[dict]]:
     """배치·행 저장. verify_from 이전은 skip, fingerprint 중복은 conflicts 로 분리 반환.
 
     반환: (inserted, skipped_before_date, skipped_duplicate, error_or_None, conflicts)
-      conflicts 각 항목 = {"parsed": <파싱행 + _fp + _batch_id + _source>, "existing": <DB 행 dict>}
+      conflicts 각 항목 = {"parsed": <파싱행 + _fp + _batch_id + _source + _business_name>, "existing": <DB 행 dict>}
+
+    business_name: 사업자 목록에서 선택된 값 (매장이 다중 사업자일 때 매칭 결과에 상속)
     """
     sc, err = get_supabase_client()
     if err or not sc:
@@ -3573,25 +3668,40 @@ def _ext_pay_insert_batch_and_rows(
     inserted = 0
     first_row_err: str | None = None
     batch_id: int | None = None
+    # 배치 저장: business_name 컬럼이 없는 스키마에서는 자동 제거 후 재시도
+    _batch_payload = {
+        "db_filename": db_filename,
+        "source": source,
+        "file_name": file_name or None,
+        "parsed_count": int(parsed_count),
+        "uploaded_by": (uploaded_by or "").strip() or None,
+    }
+    if business_name and str(business_name).strip():
+        _batch_payload["business_name"] = str(business_name).strip()
     try:
-        br = sc.table("app_external_pay_batches").insert({
-            "db_filename": db_filename,
-            "source": source,
-            "file_name": file_name or None,
-            "parsed_count": int(parsed_count),
-            "uploaded_by": (uploaded_by or "").strip() or None,
-        }).execute()
+        br = sc.table("app_external_pay_batches").insert(_batch_payload).execute()
         if br.data and len(br.data) > 0 and br.data[0].get("id") is not None:
             batch_id = int(br.data[0]["id"])
     except Exception as e:
-        return 0, before_date, 0, f"배치 저장 실패: {e}", []
+        _msg = str(e)
+        if "business_name" in _msg and ("does not exist" in _msg or "PGRST204" in _msg):
+            _batch_payload.pop("business_name", None)
+            try:
+                br = sc.table("app_external_pay_batches").insert(_batch_payload).execute()
+                if br.data and len(br.data) > 0 and br.data[0].get("id") is not None:
+                    batch_id = int(br.data[0]["id"])
+            except Exception as e2:
+                return 0, before_date, 0, f"배치 저장 실패: {e2}", []
+        else:
+            return 0, before_date, 0, f"배치 저장 실패: {e}", []
 
-    # conflict 항목에 배치·소스 정보 부여 (재등록 UI 에서 참조)
+    # conflict 항목에 배치·소스·사업자 정보 부여 (재등록 UI 에서 참조)
     for c in conflicts:
         c["parsed"]["_batch_id"] = batch_id
         c["parsed"]["_source"] = source
         c["parsed"]["_db_filename"] = db_filename
         c["parsed"]["_file_name"] = file_name or None
+        c["parsed"]["_business_name"] = business_name or None
 
     for r in fresh:
         fp = r.get("_fp") or _ext_pay_fingerprint(
@@ -4330,6 +4440,7 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
                     continue
 
     _ext_pay_relink_amount_and_near_date(sc, db_filename, "onnuri")
+    _ext_pay_propagate_business_to_payments(db_filename, "onnuri")
     return counts, None
 
 
@@ -4661,6 +4772,7 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
     _ext_pay_offset_ulsan_cancels(sc, db_filename)
     _ext_pay_rematch_ulsan_zeropad(sc, db_filename)
     _ext_pay_relink_amount_and_near_date(sc, db_filename, "ulsanpay")
+    _ext_pay_propagate_business_to_payments(db_filename, "ulsanpay")
     return counts, None
 
 
@@ -4916,6 +5028,7 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
                     continue
 
     _ext_pay_relink_amount_and_near_date(sc, db_filename, "card")
+    _ext_pay_propagate_business_to_payments(db_filename, "card")
     return counts, None
 
 
@@ -5120,6 +5233,7 @@ def _ext_pay_match_mainpay(db_filename: str, verify_from: date, matched_by: str 
                     continue
 
     _ext_pay_relink_amount_and_near_date(sc, db_filename, "mainpay")
+    _ext_pay_propagate_business_to_payments(db_filename, "mainpay")
     return counts, None
 
 
@@ -5207,6 +5321,11 @@ def _ext_pay_manual_link(
             ).eq("row_id", int(row_id)).execute()
         else:
             sc.table("app_external_pay_matches").insert(payload).execute()
+        # 배치의 business_name 을 결제행에 상속
+        try:
+            _ext_pay_propagate_business_to_payments(db_filename, source)
+        except Exception:
+            pass
         return True, None
     except Exception as e:
         return False, f"매칭 저장 실패: {e}"
@@ -5292,6 +5411,11 @@ def _ext_pay_manual_link_split(
             ).eq("row_id", int(row_id)).execute()
         else:
             sc.table("app_external_pay_matches").insert(payload).execute()
+        # 배치의 business_name 을 결제행 (대표 + 분할 참여) 에 상속
+        try:
+            _ext_pay_propagate_business_to_payments(db_filename, source)
+        except Exception:
+            pass
         return True, None
     except Exception as e:
         return False, f"분할 매칭 저장 실패: {e}"
@@ -6428,6 +6552,34 @@ def _get_store_name_by_db(db_filename: str) -> str:
         return db_filename or "알 수 없음"
 
 
+@st.cache_data(ttl=300)
+def _get_store_businesses(db_filename: str) -> list[str]:
+    """매장의 사업자 목록(app_stores.businesses). 컬럼 미존재 시 빈 리스트.
+    5분 캐시 (사업자 목록은 자주 바뀌지 않음).
+    """
+    if not db_filename:
+        return []
+    client, err = get_supabase_client()
+    if err or not client:
+        return []
+    try:
+        r = client.table("app_stores").select("businesses").eq("db_filename", db_filename).maybe_single().execute()
+        data = r.data if isinstance(r.data, dict) else None
+        val = (data or {}).get("businesses")
+        if isinstance(val, list):
+            return [str(x).strip() for x in val if str(x or "").strip()]
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val) if val.strip().startswith("[") else [val]
+                if isinstance(parsed, list):
+                    return [str(x).strip() for x in parsed if str(x or "").strip()]
+            except Exception:
+                return [x.strip() for x in val.split(",") if x.strip()]
+        return []
+    except Exception:
+        return []
+
+
 def get_store_assigned_employee_names(db_filename: str) -> list[str]:
     """
     해당 매장(db_filename)에 배정된 직원(로그인 계정)의 표시명 목록.
@@ -7524,32 +7676,43 @@ def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | Non
 @st.cache_data(ttl=600)
 def _load_payments_supabase(db_filename: str, order_id: int | None = None) -> pd.DataFrame:
     """app_payments 조회. order_id 지정 시 해당 주문만. 10분 캐시 — 저장/삭제 후 clear_data_cache()로 즉시 갱신.
-    PostgREST 기본 행 상한(1000) 초과 시 누락 방지를 위해 페이지네이션으로 전체 조회."""
+    PostgREST 기본 행 상한(1000) 초과 시 누락 방지를 위해 페이지네이션으로 전체 조회.
+    business_name 컬럼이 없는 스키마에서는 자동으로 제외하고 재조회."""
     if not db_filename:
         return pd.DataFrame()
     client, err = get_supabase_client()
     if err or not client:
         return pd.DataFrame()
-    try:
-        _PAGE = 1000
-        all_rows: list = []
-        offset = 0
-        while True:
-            q = client.table("app_payments").select(
-                "id, order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at"
-            ).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
-            if order_id is not None:
-                q = q.eq("order_id", order_id)
-            q = q.order("id").range(offset, offset + _PAGE - 1)
-            r = q.execute()
-            rows = (r.data or []) if hasattr(r, "data") else []
-            all_rows.extend(rows)
-            if len(rows) < _PAGE:
-                break
-            offset += _PAGE
-        return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+    _cols_with_biz = (
+        "id, order_id, payment_date, amount, payment_method, card_company, "
+        "fee_amount, onnuri_approval_code, business_name, created_by, created_at"
+    )
+    _cols_no_biz = (
+        "id, order_id, payment_date, amount, payment_method, card_company, "
+        "fee_amount, onnuri_approval_code, created_by, created_at"
+    )
+    for cols in (_cols_with_biz, _cols_no_biz):
+        try:
+            _PAGE = 1000
+            all_rows: list = []
+            offset = 0
+            while True:
+                q = client.table("app_payments").select(cols).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                if order_id is not None:
+                    q = q.eq("order_id", order_id)
+                q = q.order("id").range(offset, offset + _PAGE - 1)
+                r = q.execute()
+                rows = (r.data or []) if hasattr(r, "data") else []
+                all_rows.extend(rows)
+                if len(rows) < _PAGE:
+                    break
+                offset += _PAGE
+            return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+        except Exception as _e:
+            if cols == _cols_with_biz and "business_name" in str(_e):
+                continue
+            return pd.DataFrame()
+    return pd.DataFrame()
 
 
 def _get_current_store_name_for_customers(db_filename: str) -> str:
@@ -7810,7 +7973,11 @@ def _cached_employee_monthly_max(db_filename: str, employee_names: str, year: in
 
 
 def _insert_order_supabase(db_filename: str, payload: dict) -> int | None:
-    """app_orders에 1건 INSERT. payload에 db_filename 없으면 자동 설정. 반환: 새 id 또는 None."""
+    """app_orders에 1건 INSERT. payload에 db_filename 없으면 자동 설정. 반환: 새 id 또는 None.
+
+    스키마에 존재하지 않는 신규 컬럼(payment_change_planned 등)이 payload에 포함되어
+    'column does not exist' 오류가 나면 해당 키만 제거하고 재시도한다.
+    """
     if not db_filename:
         return None
     client, err = get_supabase_client()
@@ -7818,13 +7985,20 @@ def _insert_order_supabase(db_filename: str, payload: dict) -> int | None:
         return None
     payload = dict(payload)
     payload[ORDERS_PAYMENTS_TENANT_COL] = db_filename
-    try:
-        r = client.table("app_orders").insert(payload).execute()
-        if r.data and len(r.data) > 0 and "id" in r.data[0]:
-            return int(r.data[0]["id"])
-        return None
-    except Exception:
-        return None
+    for _attempt in range(4):
+        try:
+            r = client.table("app_orders").insert(payload).execute()
+            if r.data and len(r.data) > 0 and "id" in r.data[0]:
+                return int(r.data[0]["id"])
+            return None
+        except Exception as _e:
+            msg = str(_e)
+            m = re.search(r"column [^ ]*?\.?\"?([a-zA-Z_][a-zA-Z0-9_]*)\"? does not exist", msg)
+            if m and m.group(1) in payload:
+                payload.pop(m.group(1), None)
+                continue
+            return None
+    return None
 
 
 def _update_order_supabase(db_filename: str, order_id: int, updates: dict) -> bool:
@@ -17827,9 +18001,32 @@ def _superadmin_tab5_store_accounts():
 
                 # ── 매장 정보 수정 ───────────────────────────
                 st.markdown("#### 📋 매장 정보 수정")
+                # 기존 사업자 목록 로드 (JSONB / TEXT[] 모두 대응)
+                _current_biz = []
+                try:
+                    _biz_val = s.get("businesses") if hasattr(s, "get") else None
+                except Exception:
+                    _biz_val = None
+                if isinstance(_biz_val, list):
+                    _current_biz = [str(x).strip() for x in _biz_val if str(x or "").strip()]
+                elif isinstance(_biz_val, str):
+                    try:
+                        _parsed = json.loads(_biz_val) if _biz_val.strip().startswith("[") else [_biz_val]
+                        if isinstance(_parsed, list):
+                            _current_biz = [str(x).strip() for x in _parsed if str(x or "").strip()]
+                    except Exception:
+                        _current_biz = [x.strip() for x in _biz_val.split(",") if x.strip()]
                 with st.form(f"store_edit_form_{sid}"):
                     edit_name = st.text_input("매장명", value=s["store_name"], key=f"sa_edit_name_{sid}")
                     edit_db = st.text_input("DB 파일명", value=s["db_filename"], key=f"sa_edit_db_{sid}")
+                    st.markdown("**사업자 목록** (매장이 여러 사업자를 운영할 때 등록. 외부 결제 업로드 시 이 목록에서 선택합니다.)")
+                    edit_biz_raw = st.text_area(
+                        "사업자 목록 (줄바꿈으로 구분)",
+                        value="\n".join(_current_biz),
+                        placeholder="예: 에몬스울산전시장\n에몬스리빙울산",
+                        key=f"sa_edit_biz_{sid}",
+                        height=100,
+                    )
                     _sc1, _sc2 = st.columns([1, 1])
                     with _sc1:
                         _save = st.form_submit_button("💾 저장", type="primary", width="stretch")
@@ -17837,11 +18034,27 @@ def _superadmin_tab5_store_accounts():
                         _close_dlg = st.form_submit_button("닫기", width="stretch")
                     if _save:
                         if edit_name and edit_name.strip() and edit_db and edit_db.strip():
+                            _biz_list_new = [ln.strip() for ln in (edit_biz_raw or "").splitlines() if ln.strip()]
+                            _base_payload = {
+                                "store_name": edit_name.strip(),
+                                "db_filename": edit_db.strip(),
+                            }
+                            _payload_with_biz = dict(_base_payload)
+                            _payload_with_biz["businesses"] = _biz_list_new
                             try:
-                                client.table("app_stores").update({
-                                    "store_name": edit_name.strip(),
-                                    "db_filename": edit_db.strip(),
-                                }).eq("id", sid).execute()
+                                try:
+                                    client.table("app_stores").update(_payload_with_biz).eq("id", sid).execute()
+                                except Exception as _e_biz:
+                                    _emsg = str(_e_biz)
+                                    if "businesses" in _emsg and ("does not exist" in _emsg or "PGRST204" in _emsg):
+                                        # 컬럼 미존재 → businesses 제외 재시도 + 사용자 안내
+                                        client.table("app_stores").update(_base_payload).eq("id", sid).execute()
+                                        st.warning(
+                                            "app_stores.businesses 컬럼이 없어 사업자 목록은 저장되지 않았습니다. "
+                                            "SUPABASE_PCR_PLANNED.sql 을 먼저 실행해 주세요."
+                                        )
+                                    else:
+                                        raise
                                 clear_data_cache()
                                 st.session_state.pop("sa_editing_store_id", None)
                                 flash("매장 정보가 저장되었습니다.")
@@ -31945,8 +32158,32 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     _src_key = sel_src
     _empty_hint = _empty_hint_by[sel_src]
 
+    # 사업자 선택 (다중 사업자 매장 대응) — 매장 설정에 사업자 목록이 있으면 필수, 없으면 skip
+    _biz_list = _get_store_businesses(sel_db)
+    sel_business = None
+    if _biz_list:
+        _biz_options = ["— 사업자를 선택하세요 —"] + _biz_list
+        _biz_choice = st.selectbox(
+            "사업자 (필수)",
+            options=_biz_options,
+            index=0,
+            key=f"extpay_biz_{sel_db}_{_src_key}",
+            help="이 파일에 담긴 결제가 어느 사업자로 정산됐는지 선택합니다. 매칭된 결제행에 상속됩니다.",
+        )
+        sel_business = None if _biz_choice == _biz_options[0] else _biz_choice
+    else:
+        st.caption("ℹ️ 매장 설정에 사업자 목록이 등록되어 있지 않습니다. 사업자 구분이 필요하다면 매장 관리에서 목록을 먼저 등록하세요.")
+
     if up is not None:
-        if st.button("업로드 & 자동 매칭", type="primary", key=f"extpay_run_{sel_db}_{_src_key}"):
+        _biz_required_block = bool(_biz_list) and not sel_business
+        if _biz_required_block:
+            st.warning("사업자 목록에서 사업자를 먼저 선택해 주세요.")
+        if st.button(
+            "업로드 & 자동 매칭",
+            type="primary",
+            key=f"extpay_run_{sel_db}_{_src_key}",
+            disabled=_biz_required_block,
+        ):
             with st.spinner("파일을 읽고 매칭하는 중..."):
                 parsed, perr = _parse_fn(up)
             if perr:
@@ -31954,8 +32191,11 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             elif not parsed:
                 st.warning(_empty_hint)
             else:
+                # 이 업로드 세션의 사업자명을 매칭 함수가 참조하도록 세션에 저장
+                st.session_state[f"_ext_pay_upload_business_{sel_db}_{_src_key}"] = sel_business or ""
                 inserted, skipped_before, skipped_dup, ierr, conflicts = _ext_pay_insert_batch_and_rows(
                     sel_db, _src_key, getattr(up, "name", "") or "", parsed, new_from, me_uname,
+                    business_name=sel_business,
                 )
                 if ierr:
                     st.error(ierr)
@@ -36135,6 +36375,16 @@ def render_new_sales():
     )
     purchase_reason = purchase_reason_sel or ""
 
+    # ----- 결제변경 예정 여부 (필수) — 향후 결제변경/문자안내 대상 추적용 -----
+    pcr_planned_sel = st.radio(
+        "결제변경 예정 * (필수, 1개 선택)",
+        options=["예정", "아니오"],
+        key="pcr_planned_radio",
+        horizontal=True,
+        index=None,
+        help="현재 결제로 확정이 아니라 이후 온누리/지역화폐 등으로 결제 수단 변경 예정이면 '예정'. 문자 안내·후속 관리 대상이 됩니다.",
+    )
+
     # ----- 다중(복합) 결제 수단: 기본 4개, 최대 20개 (플러스 버튼으로 추가) -----
     MAX_PAYMENT_SLOTS = 20
     DEFAULT_PAYMENT_SLOTS = 4
@@ -36297,6 +36547,10 @@ def render_new_sales():
         # 구매 이유 필수
         if not purchase_reason_sel:
             st.error("구매 이유(필수)를 선택하세요.")
+            st.stop()
+        # 결제변경 예정 여부 필수
+        if not pcr_planned_sel:
+            st.error("결제변경 예정 여부(필수)를 선택하세요.")
             st.stop()
         # 담당 직원 필수 — 미선택 시 KPI/직원평가에서 영구 누락되므로 저장 차단
         if not selected_employees:
@@ -36490,6 +36744,7 @@ def render_new_sales():
                 "display_sales_amount": display_sales_int,
                 "display_cost_amount": display_cost_int,
                 "balance_status": "미납",
+                "payment_change_planned": "yes" if pcr_planned_sel == "예정" else "no",
             }
             if is_new_customer:
                 order_payload["entry_source"] = "new_customer_sale"
@@ -38802,6 +39057,309 @@ def render_product_taxonomy_admin() -> None:
                 st.rerun()
 
 
+def _pcr_load_planned_orders(db_filename: str, planned_state: str) -> pd.DataFrame:
+    """결제변경 예정/완료 주문 목록을 고객 정보와 함께 조회.
+
+    planned_state: 'yes' | 'done' | 'all'  (all 은 yes/done 모두 포함)
+    스키마에 payment_change_planned 컬럼이 없으면 빈 DataFrame 반환.
+    """
+    if not db_filename:
+        return pd.DataFrame()
+    if not _supabase_orders_payments_available():
+        return pd.DataFrame()
+    sc, _ = get_supabase_client()
+    if not sc:
+        return pd.DataFrame()
+    try:
+        q = (
+            sc.table("app_orders")
+            .select("id, customer_id, order_date, delivery_date, category, total_amount, payment_change_planned, payment_change_completed_at, payment_change_completed_by")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+        )
+        if planned_state == "yes":
+            q = q.eq("payment_change_planned", "yes")
+        elif planned_state == "done":
+            q = q.eq("payment_change_planned", "done")
+        else:  # all
+            q = q.in_("payment_change_planned", ["yes", "done"])
+        r = q.order("order_date", desc=True).limit(1000).execute()
+        orders = pd.DataFrame(r.data or [])
+    except Exception as e:
+        msg = str(e)
+        if "payment_change_planned" in msg and "does not exist" in msg:
+            return pd.DataFrame()
+        return pd.DataFrame()
+    if orders.empty:
+        return orders
+    # 고객 정보 조인
+    try:
+        cids = [int(c) for c in orders["customer_id"].dropna().astype(int).unique().tolist()]
+    except Exception:
+        cids = []
+    cust_map = _get_customers_by_ids_supabase(db_filename, cids) if cids else {}
+
+    def _cinfo(cid, k):
+        try:
+            return cust_map.get(int(cid), {}).get(k) or ""
+        except Exception:
+            return ""
+
+    orders["name"] = orders["customer_id"].map(lambda c: _cinfo(c, "name"))
+    orders["phone1"] = orders["customer_id"].map(lambda c: _cinfo(c, "phone1"))
+    orders["phone2"] = orders["customer_id"].map(lambda c: _cinfo(c, "phone2"))
+    orders["address"] = orders["customer_id"].map(lambda c: _cinfo(c, "address"))
+    return orders
+
+
+def _pcr_mark_order_done_manual(db_filename: str, order_id: int, actor: str) -> tuple[bool, str | None]:
+    """관리자 수동으로 payment_change_planned='yes' -> 'done' 처리."""
+    if not db_filename or not order_id:
+        return False, "invalid_args"
+    if not _supabase_orders_payments_available():
+        return False, "supabase_unavailable"
+    sc, _ = get_supabase_client()
+    if not sc:
+        return False, "no_client"
+    try:
+        r = (
+            sc.table("app_orders")
+            .update({
+                "payment_change_planned": "done",
+                "payment_change_completed_at": datetime.now(tz=KST).strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "payment_change_completed_by": actor or "",
+            })
+            .eq("id", int(order_id))
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .eq("payment_change_planned", "yes")
+            .execute()
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _pcr_revert_order_planned(db_filename: str, order_id: int) -> tuple[bool, str | None]:
+    """superadmin 실수 복구용: done -> yes 되돌리기."""
+    if not db_filename or not order_id:
+        return False, "invalid_args"
+    if not _supabase_orders_payments_available():
+        return False, "supabase_unavailable"
+    sc, _ = get_supabase_client()
+    if not sc:
+        return False, "no_client"
+    try:
+        sc.table("app_orders").update({
+            "payment_change_planned": "yes",
+            "payment_change_completed_at": None,
+            "payment_change_completed_by": None,
+        }).eq("id", int(order_id)).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _pcr_log_notification(db_filename: str, customer_id: int, order_id: int, phone: str, kind: str, status: str, body: str, sent_by: str) -> None:
+    """친구톡/SMS 발송 이력을 app_notifications 에 남긴다. 실패해도 조용히 skip."""
+    if not _supabase_orders_payments_available():
+        return
+    sc, _ = get_supabase_client()
+    if not sc:
+        return
+    try:
+        sc.table("app_notifications").insert({
+            "store_name": _get_store_name_by_db(db_filename),
+            "customer_id": int(customer_id) if customer_id else None,
+            "order_id": int(order_id) if order_id else None,
+            "phone": phone or "",
+            "type": "pcr_reminder",
+            "channel": kind,  # 'friendtalk' / 'sms'
+            "status": status,
+            "body": (body or "")[:500],
+            "sent_by": sent_by or "",
+            "created_at": datetime.now(tz=KST).strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }).execute()
+    except Exception:
+        pass
+
+
+def _render_pcr_planned_tab(db_filename: str, role: str, current_user: dict) -> None:
+    """탭 5: 결제변경 예정 관리 — 필터, 배지, 수동 완료, 친구톡 일괄 발송."""
+    st.subheader("🟡 결제변경 예정 관리")
+    st.caption(
+        "주문 등록 시 '결제변경 예정' 으로 표시된 주문을 별도 관리합니다. "
+        "선택한 고객에게 결제변경 안내 친구톡을 일괄 발송하거나, 결제변경 완료 시 상태를 전환할 수 있습니다."
+    )
+
+    filter_choice = st.radio(
+        "결제변경 상태 필터",
+        options=["예정", "완료", "전체(예정+완료)"],
+        index=0,
+        horizontal=True,
+        key="pcr_filter_choice",
+    )
+    state_map = {"예정": "yes", "완료": "done", "전체(예정+완료)": "all"}
+    planned_state = state_map[filter_choice]
+
+    orders = _pcr_load_planned_orders(db_filename, planned_state)
+    if orders.empty:
+        st.info("해당 상태의 결제변경 예정/완료 주문이 없습니다.")
+        st.caption("스키마에 payment_change_planned 컬럼이 없으면 목록이 항상 비어 있습니다. SUPABASE_PCR_PLANNED.sql 을 먼저 실행해 주세요.")
+        return
+
+    # 고객 기준 배지 카운트
+    yes_cnt = int((orders["payment_change_planned"] == "yes").sum())
+    done_cnt = int((orders["payment_change_planned"] == "done").sum())
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown(f"🟡 **결제변경 예정** {yes_cnt}건")
+    with col_b:
+        st.markdown(f"🟢 **결제변경 완료** {done_cnt}건")
+    st.divider()
+
+    # 표시용 DataFrame + 체크박스 (친구톡 대상)
+    disp = orders.copy()
+    disp["선택"] = False
+    disp["상태"] = disp["payment_change_planned"].map({"yes": "🟡 예정", "done": "🟢 완료"}).fillna("-")
+    disp["주문일"] = disp["order_date"].astype(str).str[:10]
+    disp["배송일"] = disp["delivery_date"].astype(str).str[:10].where(disp["delivery_date"].notna(), "-")
+    disp["구매금액"] = disp["total_amount"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "-")
+    disp["완료일시"] = disp["payment_change_completed_at"].astype(str).str[:16].where(disp["payment_change_completed_at"].notna(), "-")
+
+    show_cols = ["선택", "id", "상태", "name", "phone1", "주문일", "배송일", "category", "구매금액", "완료일시", "payment_change_completed_by"]
+    show_cols = [c for c in show_cols if c in disp.columns]
+    disp = disp[show_cols].rename(columns={
+        "id": "주문ID", "name": "고객명", "phone1": "전화번호",
+        "category": "품목", "payment_change_completed_by": "완료처리자",
+    })
+
+    edited = st.data_editor(
+        disp,
+        width='stretch',
+        hide_index=True,
+        key=f"pcr_editor_{planned_state}",
+        disabled=[c for c in disp.columns if c != "선택"],
+        column_config={"선택": st.column_config.CheckboxColumn("선택", help="친구톡 발송 대상 체크")},
+    )
+    selected_rows = edited[edited["선택"] == True] if not edited.empty else pd.DataFrame()
+    selected_order_ids = selected_rows["주문ID"].tolist() if not selected_rows.empty else []
+    st.caption(f"선택된 주문: **{len(selected_order_ids)}건**")
+
+    # ── 친구톡 일괄 발송 UI ─────────────────────────────
+    with st.expander("📢 선택 고객에게 결제변경 안내 친구톡 일괄 발송", expanded=False):
+        st.info("최대 1회 발송 상한: **50건**. 발송 결과는 app_notifications 에 이력이 남습니다.")
+        default_body = (
+            "[에몬스] 안녕하세요, #{고객명}님.\n"
+            "구매 시 안내드렸던 결제변경(온누리/지역화폐/카드 등) 진행 부탁드립니다.\n"
+            "매장으로 방문 또는 회신 주시면 도움드리겠습니다.\n"
+            "감사합니다."
+        )
+        msg_body = st.text_area(
+            "메시지 본문 (#{고객명} 은 자동 치환)",
+            value=st.session_state.get("pcr_bulk_body", default_body),
+            height=160,
+            key="pcr_bulk_body",
+        )
+        confirm = st.checkbox("발송 대상·본문을 확인했으며 발송에 동의합니다.", key="pcr_bulk_confirm")
+        send_btn = st.button("📤 친구톡 일괄 발송 실행", type="primary", disabled=(len(selected_order_ids) == 0 or not confirm), key="pcr_bulk_send_btn")
+
+        if send_btn:
+            if len(selected_order_ids) > 50:
+                st.error("1회 발송은 최대 50건까지만 가능합니다. 대상을 줄여 다시 시도해 주세요.")
+                st.stop()
+            try:
+                from solapi_sender import send_friendtalk, send_sms  # noqa: WPS433
+            except Exception as _ie:
+                st.error(f"solapi_sender 로드 실패: {_ie}")
+                st.stop()
+            actor = current_user.get("username", "") if current_user else ""
+            sent_ok = 0
+            failed = 0
+            skipped = 0
+            for _oid in selected_order_ids:
+                _row = orders[orders["id"] == int(_oid)]
+                if _row.empty:
+                    continue
+                _r = _row.iloc[0]
+                phone = str(_r.get("phone1") or "").strip()
+                name = str(_r.get("name") or "고객")
+                if not phone:
+                    skipped += 1
+                    _pcr_log_notification(db_filename, int(_r.get("customer_id") or 0), int(_oid), "", "friendtalk", "skipped_no_phone", msg_body, actor)
+                    continue
+                personalized = (msg_body or "").replace("#{고객명}", name)
+                try:
+                    res = send_friendtalk(to_phone=phone, body=personalized, disable_sms_fallback=True)
+                except Exception as _e:
+                    res = {"status": "failed", "error": str(_e)}
+                _status = str(res.get("status") or "unknown")
+                if _status == "sent":
+                    sent_ok += 1
+                    _pcr_log_notification(db_filename, int(_r.get("customer_id") or 0), int(_oid), phone, "friendtalk", "sent", personalized, actor)
+                elif _status in ("not_friend", "out_of_hours", "failed"):
+                    # SMS fallback
+                    try:
+                        sres = send_sms(to_phone=phone, body=personalized)
+                        if str(sres.get("status") or "") == "sent":
+                            sent_ok += 1
+                            _pcr_log_notification(db_filename, int(_r.get("customer_id") or 0), int(_oid), phone, "sms", "sent_fallback", personalized, actor)
+                        else:
+                            failed += 1
+                            _pcr_log_notification(db_filename, int(_r.get("customer_id") or 0), int(_oid), phone, "sms", f"failed:{sres.get('error') or ''}", personalized, actor)
+                    except Exception as _e:
+                        failed += 1
+                        _pcr_log_notification(db_filename, int(_r.get("customer_id") or 0), int(_oid), phone, "sms", f"exception:{_e}", personalized, actor)
+                else:
+                    skipped += 1
+                    _pcr_log_notification(db_filename, int(_r.get("customer_id") or 0), int(_oid), phone, "friendtalk", _status, personalized, actor)
+            st.success(f"발송 완료 · 성공 {sent_ok}건 / 실패 {failed}건 / 건너뜀 {skipped}건")
+
+    st.divider()
+
+    # ── 개별 완료 처리 · 되돌리기 ─────────────────────────────
+    st.markdown("### 개별 처리")
+    _is_admin = role in ("superadmin", "manager", "store_admin", "admin")
+    if not _is_admin:
+        st.caption("완료/되돌리기 처리는 관리자(매장 관리자 이상) 권한이 필요합니다.")
+    actor = current_user.get("username", "") if current_user else ""
+
+    for _, r in orders.iterrows():
+        _oid = int(r["id"])
+        _state = str(r.get("payment_change_planned") or "")
+        _label_state = "🟡 예정" if _state == "yes" else ("🟢 완료" if _state == "done" else _state)
+        _name = str(r.get("name") or "-")
+        _phone = str(r.get("phone1") or "-")
+        _amt = int(r.get("total_amount") or 0)
+        _od = str(r.get("order_date") or "")[:10]
+        _completed_at = str(r.get("payment_change_completed_at") or "")[:16].replace("T", " ")
+        _completed_by = str(r.get("payment_change_completed_by") or "")
+        with st.expander(f"{_label_state} · #{_oid} · {_name} ({_phone}) · 주문일 {_od} · 구매 {_amt:,}원", expanded=False):
+            if _state == "done":
+                st.success(f"결제변경 완료 · 처리시각 {_completed_at} · 처리자 {_completed_by or '-'}")
+            else:
+                st.info("결제변경 예정 상태입니다.")
+            if _is_admin and _state == "yes":
+                if st.button(f"🟢 결제변경 완료 처리", key=f"pcr_done_btn_{_oid}"):
+                    ok, err = _pcr_mark_order_done_manual(db_filename, _oid, actor)
+                    if ok:
+                        st.toast(f"✅ #{_oid} 결제변경 완료로 전환됨", icon="✅")
+                        # 활동 로그
+                        try:
+                            _insert_payment_history(None, _oid, _name, "결제변경완료수동", {}, {"actor": actor}, "관리자 수동 완료 처리", db_filename=db_filename)
+                        except Exception:
+                            pass
+                        st.rerun()
+                    else:
+                        st.error(f"실패: {err}")
+            if role == "superadmin" and _state == "done":
+                if st.button(f"↩️ 예정 상태로 되돌리기 (superadmin)", key=f"pcr_revert_btn_{_oid}"):
+                    ok, err = _pcr_revert_order_planned(db_filename, _oid)
+                    if ok:
+                        st.toast(f"↩️ #{_oid} 예정 상태로 되돌림", icon="↩️")
+                        st.rerun()
+                    else:
+                        st.error(f"실패: {err}")
+
+
 def render_customer_balance():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -38810,11 +39368,12 @@ def render_customer_balance():
     st.header("고객 및 잔금 관리")
     current_user = st.session_state.get("current_user") or {}
     role = current_user.get("role", "user")
-    tab_gen, tab_d10, tab_overdue, tab_anomaly = st.tabs([
+    tab_gen, tab_d10, tab_overdue, tab_anomaly, tab_pcr = st.tabs([
         "1. 일반 고객 및 데이터 수정 (General)",
         "2. 미수금 (배송일 D-10 이내)",
         "3. 🚨 배송일 후 미결금액",
-        "4. 🔴 초과결제 항목"
+        "4. 🔴 초과결제 항목",
+        "5. 🟡 결제변경 예정 관리",
     ])
     today = _today_kst()
 
@@ -39523,7 +40082,10 @@ def render_customer_balance():
                                 if _supabase_orders_payments_available():
                                     pay_list = _load_payments_supabase(db_filename, _order_id_pay)
                                     if not pay_list.empty:
-                                        pay_list = pay_list[["id", "payment_date", "amount", "payment_method", "card_company", "onnuri_approval_code", "fee_amount"]]
+                                        _keep_cols = ["id", "payment_date", "amount", "payment_method", "card_company", "onnuri_approval_code", "fee_amount"]
+                                        if "business_name" in pay_list.columns:
+                                            _keep_cols.append("business_name")
+                                        pay_list = pay_list[_keep_cols]
                                     else:
                                         pay_list = pd.DataFrame()
                                 else:
@@ -39581,8 +40143,11 @@ def render_customer_balance():
                                         card_method_mask = pay_display["payment_method"].isin(("신용카드", "체크카드"))
                                         pay_display.loc[empty_card & card_method_mask, "card_company"] = "(카드사 미입력)"
                                         pay_display.loc[empty_card & ~card_method_mask, "card_company"] = pay_display.loc[empty_card & ~card_method_mask, "payment_method"].fillna("-")
-                                        pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료"})
-                                        st.dataframe(pay_display[["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료", "복합결제"]], width='stretch')
+                                        pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료", "business_name": "사업자"})
+                                        _pay_cols_show = ["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료", "복합결제"]
+                                        if "사업자" in pay_display.columns:
+                                            _pay_cols_show.insert(-1, "사업자")
+                                        st.dataframe(pay_display[_pay_cols_show], width='stretch')
                                         # 사내 결제변경 검증 요청 (격리된 기능 — 기존 결제 저장 로직과 무관)
                                         _render_payment_change_verify_entry(
                                             db_filename, int(_order_id_pay),
@@ -40544,6 +41109,10 @@ def render_customer_balance():
                         st.session_state[_alert_key2] = True
                         _sn_b = _get_store_name_by_db(db_filename)
                         _insert_admin_alert(_sn_b, "overpaid_summary", f"[{_sn_b}] 초과결제 이상 항목 {len(_overpaid_disp)}건 / 합계 {int(_overpaid_disp['초과금액'].sum()):,}원 즉시 확인 필요")
+
+    # ---------- 탭 5: 🟡 결제변경 예정 관리 ----------
+    with tab_pcr:
+        _render_pcr_planned_tab(db_filename, role, current_user)
 
 
 # ========== 탭 0: 경영 대시보드 (로그인 후 첫 화면) ==========

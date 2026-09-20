@@ -1284,6 +1284,23 @@ def resolve_payment_change(task_id: int, verifier: str, note: str | None = None)
         }).eq("id", task_id).execute()
         log_activity(task_id, verifier, "payment_change_resolved", {"note": (note or "")[:200]})
 
+        # 자동 완료: 관련 주문의 payment_change_planned 을 'yes' → 'done' 으로 전환
+        try:
+            pcr = client.table("app_payment_change_requests").select("sale_id").eq("task_id", task_id).maybe_single().execute()
+            sale_id = (pcr.data or {}).get("sale_id") if isinstance(pcr.data, dict) else None
+            if sale_id:
+                try:
+                    client.table("app_orders").update({
+                        "payment_change_planned": "done",
+                        "payment_change_completed_at": _now_iso(),
+                        "payment_change_completed_by": verifier,
+                    }).eq("id", int(sale_id)).eq("payment_change_planned", "yes").execute()
+                except Exception:
+                    # 컬럼 미존재 스키마에서는 조용히 skip
+                    pass
+        except Exception:
+            pass
+
         # 요청자에게 완료 알림
         try:
             t_r = client.table("app_tasks").select("created_by, title").eq("id", task_id).maybe_single().execute()
