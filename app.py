@@ -30105,9 +30105,14 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         with _add_c2:
             _orig_amt_disp = int(float(orig.get("amount") or 0))
             _diff = _total_new - _orig_amt_disp
-            _sign = "일치" if _diff == 0 else (f"부족 {-_diff:,}원" if _diff < 0 else f"초과 {_diff:,}원")
+            if _diff == 0:
+                _note = "일치 (완납)"
+            elif _diff < 0:
+                _note = f"잔액 {-_diff:,}원 미수로 남김 (부분 결제변경)"
+            else:
+                _note = f"초과 {_diff:,}원"
             st.markdown(
-                f"합계 **{_total_new:,}원** · 원본 {_orig_amt_disp:,}원 · **{_sign}**"
+                f"합계 **{_total_new:,}원** · 원본 {_orig_amt_disp:,}원 · {_note}"
             )
         # 하위 호환: 요약용 대표값 (단건 로직·요약 문자열에 사용)
         new_amount = _total_new
@@ -30151,11 +30156,6 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             key=f"pcr_files_{order_id}_{ver}",
         )
         _render_upload_preview(files)
-
-        # 부정 방지: 환불/취소 금액이 원본 초과 시 경고
-        if change_type in ("refund", "cancel_card", "cancel_transfer") and orig:
-            if float(orig.get("amount") or 0) > 0 and new_amount > float(orig.get("amount") or 0):
-                st.warning("⚠️ 변경 후 금액이 원본 결제 금액보다 큽니다. 환불/취소 금액을 다시 확인하세요.")
 
         dup_errs = _pcr_duplicate_approval_errors(pay_list, new_lines)
         for _de in dup_errs:
