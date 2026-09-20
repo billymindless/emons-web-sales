@@ -30007,10 +30007,12 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         _new_count = max(1, int(st.session_state[_count_key]))
 
         # 각 라인 세션 초기값: 첫 라인만 이력·현재행 기본값을 상속, 이후 라인은 0/기본 수단
+        _today = date.today()
         for _i in range(_new_count):
             _ak = f"pcr_amt_{order_id}_{_i}"
             _mk = f"pcr_meth_{order_id}_{_i}"
             _ok = f"pcr_onnuri_{order_id}_{_i}"
+            _dk = f"pcr_date_{order_id}_{_i}"
             if _ak not in st.session_state:
                 if _i == 0:
                     st.session_state[_ak] = int(float(_default_new.get("amount") or orig.get("amount") or 0))
@@ -30026,30 +30028,51 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     st.session_state[_mk] = PAYMENT_METHOD_OPTIONS[0] if PAYMENT_METHOD_OPTIONS else ""
             if _ok not in st.session_state:
                 st.session_state[_ok] = str(_default_new.get("onnuri") or "") if _i == 0 else ""
+            if _dk not in st.session_state:
+                st.session_state[_dk] = _today
 
         st.markdown("**변경 후 결제** (여러 수단으로 나눠 결제한 경우 라인 추가)")
 
         new_lines: list[dict] = []
         for _i in range(_new_count):
-            lc1, lc2, lc3, lc4 = st.columns([2, 2, 2, 0.6])
+            lc1, lc2, lc3, lc4, lc5 = st.columns([1.4, 1.4, 1.6, 1.4, 0.4])
             with lc1:
-                _amt_i = st.number_input(
-                    f"금액 #{_i + 1}", min_value=0, step=1000,
-                    key=f"pcr_amt_{order_id}_{_i}",
+                _date_i = st.date_input(
+                    f"결제날짜 #{_i + 1}",
+                    key=f"pcr_date_{order_id}_{_i}",
+                    format="YYYY-MM-DD",
                 )
             with lc2:
                 _meth_i = st.selectbox(
-                    f"수단 #{_i + 1}", options=PAYMENT_METHOD_OPTIONS,
+                    f"결제수단 #{_i + 1}", options=PAYMENT_METHOD_OPTIONS,
                     key=f"pcr_meth_{order_id}_{_i}",
                 )
             with lc3:
+                _meth_norm = str(_meth_i or "")
+                _needs_card = ("신용카드" in _meth_norm) or ("체크카드" in _meth_norm)
+                _needs_approval = ("온누리" in _meth_norm) or ("지역화폐" in _meth_norm)
+                if _needs_card:
+                    _code_label = f"결제카드사 #{_i + 1}"
+                    _code_ph = "예: NH농협카드"
+                elif _needs_approval:
+                    _code_label = f"승인번호 #{_i + 1}"
+                    _code_ph = "지역화폐 6자리 / 온누리 뒤4 또는 4자-HHMMSS"
+                else:
+                    _code_label = f"참고번호 #{_i + 1}"
+                    _code_ph = "(선택)"
                 _code_i = st.text_input(
-                    f"승인번호 #{_i + 1}",
+                    _code_label,
                     key=f"pcr_onnuri_{order_id}_{_i}",
-                    max_chars=12,
-                    placeholder="지역화폐 6자리 / 온누리 뒤4 또는 4자-HHMMSS",
+                    max_chars=20,
+                    placeholder=_code_ph,
+                    disabled=not (_needs_card or _needs_approval),
                 )
             with lc4:
+                _amt_i = st.number_input(
+                    f"결제금액 #{_i + 1}", min_value=0, step=1000,
+                    key=f"pcr_amt_{order_id}_{_i}",
+                )
+            with lc5:
                 st.write("")
                 st.write("")
                 if _new_count > 1 and st.button(
@@ -30059,14 +30082,15 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 ):
                     # 뒤 라인 값을 앞으로 당겨 재배치 후 count 감소
                     for _j in range(_i, _new_count - 1):
-                        for _suf in ("amt", "meth", "onnuri"):
+                        for _suf in ("amt", "meth", "onnuri", "date"):
                             _src = st.session_state.get(f"pcr_{_suf}_{order_id}_{_j + 1}")
                             st.session_state[f"pcr_{_suf}_{order_id}_{_j}"] = _src
-                    for _suf in ("amt", "meth", "onnuri"):
+                    for _suf in ("amt", "meth", "onnuri", "date"):
                         st.session_state.pop(f"pcr_{_suf}_{order_id}_{_new_count - 1}", None)
                     st.session_state[_count_key] = _new_count - 1
                     st.rerun()
             new_lines.append({
+                "date": _date_i,
                 "amount": int(_amt_i or 0),
                 "method": (_meth_i or "").strip(),
                 "onnuri": (_code_i or "").strip(),
@@ -30112,10 +30136,11 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         emp_options = _pcr_assignee_options(store_id, role, me_uname)
         emp_username_to_label = {u: lbl for u, lbl in emp_options}
         pcr_assignees = st.multiselect(
-            "담당자 *",
+            "결제자 *",
             options=[u for u, _ in emp_options],
             format_func=lambda u: emp_username_to_label.get(u, u),
             key=f"pcr_assignees_{order_id}",
+            help="결제 변경을 확인·처리할 결제자를 지정합니다.",
         )
 
         # 증빙 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
@@ -30151,7 +30176,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             if sel_pid is None:
                 st.caption("취소·변경할 결제를 위 대상 결제 목록에서 먼저 선택하세요.")
             elif not pcr_assignees:
-                st.caption("담당자를 1명 이상 지정해야 요청할 수 있습니다.")
+                st.caption("결제자를 1명 이상 지정해야 요청할 수 있습니다.")
             elif not (reason or "").strip():
                 st.caption("변경 사유를 입력해야 요청할 수 있습니다.")
             elif not _refund_bank_ok or not _refund_account_ok:
@@ -30273,9 +30298,14 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     _new_onnuri_code = _new_code or None
                 elif _new_code:
                     _new_card_company = _new_code
+                _line_date = _line.get("date")
+                try:
+                    _line_date_str = _line_date.isoformat() if hasattr(_line_date, "isoformat") else _today_str
+                except Exception:
+                    _line_date_str = _today_str
                 _new_payload = {
                     "order_id": int(order_id),
-                    "payment_date": _today_str,
+                    "payment_date": _line_date_str,
                     "amount": _new_amt,
                     "payment_method": _new_method,
                     "card_company": _new_card_company,
