@@ -31298,14 +31298,19 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                 disabled=not can_edit,
             )
 
+        _is_pcr_task = task.get("task_type") == _tb.PAYMENT_CHANGE_TASK_TYPE
         new_status = st.selectbox(
             "상태",
             options=_tb.TASK_STATUSES,
             index=_tb.TASK_STATUSES.index(task.get("status", "requested")),
             format_func=lambda s: f"{_tb.TASK_STATUS_EMOJI.get(s, '')} {_tb.TASK_STATUS_LABELS.get(s, s)}",
             key=f"et_status_{tid}",
-            disabled=not can_edit,
+            disabled=(not can_edit) or _is_pcr_task,
+            help=("결제변경 검증 태스크는 위의 '✅ 검증 완료' 버튼으로만 완료 처리해 주세요. "
+                  "일반 상태 변경으로는 미결 배너가 사라지지 않습니다.") if _is_pcr_task else None,
         )
+        if _is_pcr_task:
+            st.caption("ℹ️ 결제변경 검증 태스크는 상단의 **✅ 검증 완료** 버튼으로만 완료 처리됩니다.")
 
         _cu = st.session_state.get("current_user") or {}
         _sid = _cu.get("store_id") or st.session_state.get("current_store_id")
@@ -31336,7 +31341,9 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
         save_clicked = col_btn1.form_submit_button("저장", disabled=not can_edit, type="primary")
         if save_clicked:
             # 변경된 필드 산출
-            if new_status != task.get("status"):
+            # 결제변경 검증 태스크는 verify_status 워크플로우가 별도이므로 일반 status 전이 금지
+            # (사용자가 '완료'로 바꿔도 verify_status='pending' 이 남아 배너에서 미결로 잡히던 문제 방지)
+            if new_status != task.get("status") and not _is_pcr_task:
                 _tb.update_status(tid, new_status, me_uname)
             field_patch: dict = {}
             if new_title != task.get("title"):
