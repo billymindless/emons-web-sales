@@ -8506,6 +8506,18 @@ def _onnuri_should_ask_time(
     )
 
 
+def _format_time_hhmmss(s) -> str:
+    """숫자만 추출 후 HH:MM:SS 형식으로 자동 삽입 (콜론)."""
+    if s is None:
+        return ""
+    digits = re.sub(r"\D", "", str(s))[:6]
+    if len(digits) <= 2:
+        return digits
+    if len(digits) <= 4:
+        return f"{digits[:2]}:{digits[2:]}"
+    return f"{digits[:2]}:{digits[2:4]}:{digits[4:]}"
+
+
 def _onnuri_time_input(key: str, *, visible: bool, label: str) -> None:
     if not visible:
         return
@@ -8514,7 +8526,10 @@ def _onnuri_time_input(key: str, *, visible: bool, label: str) -> None:
         key=key,
         max_chars=8,
         placeholder="18:15:29",
-        help="디지털 온누리 매출내역의 거래시간입니다. 뒤 4자리·금액·날짜가 겹치면 이 시간으로 구분합니다.",
+        help="디지털 온누리 매출내역의 거래시간입니다. 뒤 4자리·금액·날짜가 겹치면 이 시간으로 구분합니다. 숫자만 입력하면 자동으로 콜론이 삽입됩니다.",
+        on_change=lambda k=key: st.session_state.__setitem__(
+            k, _format_time_hhmmss(st.session_state.get(k, ""))
+        ),
     )
 
 
