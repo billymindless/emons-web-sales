@@ -13476,6 +13476,91 @@ def _inject_js_localStorage_redirect_with_auth():
     return
 
 
+def _inject_money_input_live_format():
+    """결제금액 라벨(예: '결제금액 #1') text_input 에 클라이언트 사이드 실시간 천단위 콤마 포맷 부착.
+
+    파이썬 on_change 콜백은 blur 마다 rerun 을 유발해 화면 점멸/지연이 크므로 사용하지 않고,
+    브라우저에서 `input` 이벤트로 즉시 콤마 삽입 + React 네이티브 setter 로 Streamlit 상태 동기화.
+
+    - MutationObserver 로 라인 추가·rerun 후에도 새 input 에 자동 재바인딩
+    - 커서 위치는 신규 콤마 삽입 오프셋만큼 자동 보정
+    """
+    components.html(
+        """
+        <script>
+        (function(){
+            try {
+                var pdoc = window.parent.document;
+                var pwin = window.parent;
+                var nativeSetter = Object.getOwnPropertyDescriptor(pwin.HTMLInputElement.prototype, 'value').set;
+
+                function fmt(digits) {
+                    var d = String(digits).replace(/\\D/g, '');
+                    if (!d) return '';
+                    // 앞자리 0 방지 (단, 단일 '0' 은 유지)
+                    d = d.replace(/^0+(?=\\d)/, '');
+                    return parseInt(d, 10).toLocaleString('en-US');
+                }
+
+                function bind(input) {
+                    if (input.dataset.moneyBound === '1') return;
+                    input.dataset.moneyBound = '1';
+                    input.setAttribute('inputmode', 'numeric');
+                    input.addEventListener('input', function(e){
+                        var t = e.target;
+                        var oldVal = t.value;
+                        var oldStart = t.selectionStart || 0;
+                        var oldCommasBefore = (oldVal.slice(0, oldStart).match(/,/g) || []).length;
+                        var newVal = fmt(oldVal);
+                        if (newVal === oldVal) return;
+                        nativeSetter.call(t, newVal);
+                        t.dispatchEvent(new Event('input', { bubbles: true }));
+                        // 커서 위치 보정: 새 문자열에서 원래 위치까지의 숫자 수를 유지
+                        try {
+                            var digitsBefore = oldVal.slice(0, oldStart).replace(/\\D/g, '').length;
+                            var newPos = 0, seen = 0;
+                            while (newPos < newVal.length && seen < digitsBefore) {
+                                if (/\\d/.test(newVal[newPos])) seen++;
+                                newPos++;
+                            }
+                            t.setSelectionRange(newPos, newPos);
+                        } catch(err) {}
+                    });
+                    // 최초 바인딩 시점의 값이 raw 숫자만 있으면 즉시 포맷 적용
+                    if (input.value && /^[0-9]+$/.test(input.value)) {
+                        var v = fmt(input.value);
+                        if (v !== input.value) {
+                            nativeSetter.call(input, v);
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                        }
+                    }
+                }
+
+                function scan() {
+                    var labels = pdoc.querySelectorAll('label');
+                    labels.forEach(function(lbl){
+                        var txt = (lbl.textContent || '').trim();
+                        if (!txt.startsWith('결제금액')) return;
+                        var wrap = lbl.closest('[data-testid="stTextInput"]') || lbl.parentElement;
+                        if (!wrap) return;
+                        var inp = wrap.querySelector('input[type="text"]');
+                        if (inp) bind(inp);
+                    });
+                }
+
+                scan();
+                var obs = new MutationObserver(function(){ scan(); });
+                obs.observe(pdoc.body, { childList: true, subtree: true });
+            } catch(e) {
+                console.warn('[money-live-format] init 실패:', e);
+            }
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
 def _inject_js_clear_auth_on_logout():
     """유일한 삭제 경로 1: 유저가 로그아웃 버튼을 클릭했을 때만 호출됨.
     components.html(iframe) 안에서 window.parent로 부모 접근."""
@@ -30528,12 +30613,11 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 )
             with lc4:
                 _amt_key_i = f"pcr_amt_{order_id}_{_i}"
+                # 실시간 콤마 포맷은 클라이언트 사이드 JS(_inject_money_input_live_format)에서 처리.
+                # 파이썬 on_change 는 blur 마다 rerun 을 유발해 화면 점멸/지연의 원인이라 제거.
                 st.text_input(
                     f"결제금액 #{_i + 1}",
                     key=_amt_key_i,
-                    on_change=lambda k=_amt_key_i: st.session_state.__setitem__(
-                        k, _format_number_comma(st.session_state.get(k, ""))
-                    ),
                     placeholder="0",
                 )
                 _amt_i = _parse_comma_to_int(st.session_state.get(_amt_key_i, "0"))
@@ -30579,6 +30663,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             st.markdown(
                 f"합계 **{_total_new:,}원** · 원본 {_orig_amt_disp:,}원 · {_note}"
             )
+        # 결제금액 입력에 클라이언트 사이드 실시간 콤마 포맷 부착 (rerun 없이 브라우저에서 즉시 처리)
+        _inject_money_input_live_format()
         # 하위 호환: 요약용 대표값 (단건 로직·요약 문자열에 사용)
         new_amount = _total_new
         new_method = " · ".join(x["method"] for x in new_lines if x["method"]) or ""
