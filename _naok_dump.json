@@ -1,0 +1,151 @@
+[
+  {
+    "customers": [
+      {
+        "id": 8072,
+        "name": "나옥운",
+        "phone1": "010-9194-3729",
+        "store_name": "울산삼산점"
+      },
+      {
+        "id": 7805,
+        "name": "나옥운",
+        "phone1": "010-9194-3729",
+        "store_name": "울산삼산점"
+      }
+    ]
+  },
+  {
+    "cust_id": 8072,
+    "cust_name": "나옥운",
+    "order": {
+      "id": 10350,
+      "order_date": "2026-08-28",
+      "total_amount": 389480,
+      "balance_status": "완납",
+      "import_source": null,
+      "db_filename": "store_1.db",
+      "payment_change_planned": null,
+      "cost_price": 0
+    },
+    "payments": [
+      {
+        "id": 14546,
+        "payment_date": "2026-08-28",
+        "amount": 389480,
+        "payment_method": "온누리",
+        "card_company": null,
+        "onnuri_approval_code": null,
+        "created_at": "2026-09-21T06:48:48.461882+00:00",
+        "created_by": "zinybobby@naver.com",
+        "business_name": null
+      }
+    ],
+    "sum_payments": 389480,
+    "computed_balance": 0,
+    "history": []
+  },
+  {
+    "cust_id": 7805,
+    "cust_name": "나옥운",
+    "order": {
+      "id": 10101,
+      "order_date": "2026-08-28",
+      "total_amount": 2223000.0,
+      "balance_status": "미납",
+      "import_source": null,
+      "db_filename": "store_1.db",
+      "payment_change_planned": null,
+      "cost_price": 1890900.0
+    },
+    "payments": [
+      {
+        "id": 13555,
+        "payment_date": "2026-08-28",
+        "amount": 3614000,
+        "payment_method": "계좌이체",
+        "card_company": null,
+        "onnuri_approval_code": null,
+        "created_at": "2026-08-28T06:57:49.714474+00:00",
+        "created_by": "zinybobby@naver.com",
+        "business_name": null
+      },
+      {
+        "id": 14541,
+        "payment_date": "2026-09-20",
+        "amount": -3614000,
+        "payment_method": "계좌이체",
+        "card_company": null,
+        "onnuri_approval_code": null,
+        "created_at": "2026-09-21T06:21:17.904543+00:00",
+        "created_by": "zinybobby@naver.com",
+        "business_name": null
+      },
+      {
+        "id": 14545,
+        "payment_date": "2026-09-20",
+        "amount": 2223000,
+        "payment_method": "온누리",
+        "card_company": null,
+        "onnuri_approval_code": "3729",
+        "created_at": "2026-09-21T06:46:31.927706+00:00",
+        "created_by": "zinybobby@naver.com",
+        "business_name": null
+      }
+    ],
+    "sum_payments": 2223000,
+    "computed_balance": 0,
+    "history": [
+      {
+        "id": 3379,
+        "action_type": "잔금결제",
+        "changed_at": "2026-09-21T06:46:33.915117+00:00",
+        "reason": "",
+        "old_payment_data": {
+          "order_id": 10101,
+          "balance_before": 2223000.0,
+          "paid_total_before": 0.0
+        },
+        "new_payment_data": {
+          "order_id": 10101,
+          "payments": [
+            {
+              "amount": 2223000,
+              "method": "온누리",
+              "card_company": null
+            }
+          ],
+          "added_amount": 2223000,
+          "balance_after": 0.0,
+          "paid_total_after": 2223000.0
+        },
+        "changed_by": "zinybobby@naver.com"
+      },
+      {
+        "id": 3378,
+        "action_type": "결제취소",
+        "changed_at": "2026-09-21T06:21:18.636123+00:00",
+        "reason": "결제변경완료",
+        "old_payment_data": {
+          "payment": {
+            "amount": 3614000.0,
+            "method": "계좌이체",
+            "payment_id": 13555,
+            "card_company": null,
+            "onnuri_approval_code": null
+          },
+          "order_id": 10101,
+          "balance_before": -1391000.0,
+          "paid_total_before": 3614000.0
+        },
+        "new_payment_data": {
+          "payment": {},
+          "order_id": 10101,
+          "balance_after": 2223000.0,
+          "paid_total_after": 3614000.0
+        },
+        "changed_by": "zinybobby@naver.com"
+      }
+    ]
+  }
+]

@@ -8249,6 +8249,12 @@ def _insert_payment_supabase(
         r = client.table("app_payments").insert(payload).execute()
         if r.data and len(r.data) > 0 and "id" in r.data[0]:
             new_id = int(r.data[0]["id"])
+            # 결제행 캐시 무효화 — 후속 _sum_payments_by_order_supabase / _recalc 가 stale data 를 읽어
+            # balance_status 를 잘못 저장하는 문제(2026-09-21) 방지.
+            try:
+                _load_payments_supabase.clear()
+            except Exception:
+                pass
             if _ext_pay_source_from_method(payload.get("payment_method")):
                 _ext_pay_rematch_after_payment_change(
                     db_filename, payment_id=new_id, old_pay=None, new_pay=payload,
@@ -8307,6 +8313,11 @@ def _update_payment_supabase(db_filename: str, payment_id: int, updates: dict) -
         client.table("app_payments").update(updates).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", payment_id).execute()
     except Exception:
         return False
+    # 결제행 캐시 무효화 — 후속 recalc 가 stale data 를 읽지 않도록.
+    try:
+        _load_payments_supabase.clear()
+    except Exception:
+        pass
     if old_pay is not None and _ext_pay_match_fields_changed(old_pay, updates):
         merged = dict(old_pay)
         merged.update(updates)
@@ -8328,6 +8339,11 @@ def _delete_payment_supabase(db_filename: str, payment_id: int) -> bool:
         client.table("app_payments").delete().eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).eq("id", payment_id).execute()
     except Exception:
         return False
+    # 결제행 캐시 무효화 — 후속 recalc 가 stale data 를 읽지 않도록.
+    try:
+        _load_payments_supabase.clear()
+    except Exception:
+        pass
     if old_pay is not None and _ext_pay_source_from_method(old_pay.get("payment_method")):
         _ext_pay_rematch_after_payment_change(
             db_filename, payment_id=int(payment_id), old_pay=old_pay, new_pay=None,
