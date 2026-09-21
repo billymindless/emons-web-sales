@@ -30457,9 +30457,11 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             _dk = f"pcr_date_{order_id}_{_i}"
             if _ak not in st.session_state:
                 if _i == 0:
-                    st.session_state[_ak] = int(float(_default_new.get("amount") or orig.get("amount") or 0))
+                    _init_amt = int(float(_default_new.get("amount") or orig.get("amount") or 0))
                 else:
-                    st.session_state[_ak] = 0
+                    _init_amt = 0
+                # 천단위 콤마 포맷 문자열로 저장 (text_input + on_change 포매팅 패턴)
+                st.session_state[_ak] = _format_number_comma(str(_init_amt)) if _init_amt else ""
             if _mk not in st.session_state:
                 if _i == 0:
                     _dm = str(_default_new.get("method") or "")
@@ -30510,10 +30512,16 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     disabled=not (_needs_card or _needs_approval),
                 )
             with lc4:
-                _amt_i = st.number_input(
-                    f"결제금액 #{_i + 1}", min_value=0, step=1000,
-                    key=f"pcr_amt_{order_id}_{_i}",
+                _amt_key_i = f"pcr_amt_{order_id}_{_i}"
+                st.text_input(
+                    f"결제금액 #{_i + 1}",
+                    key=_amt_key_i,
+                    on_change=lambda k=_amt_key_i: st.session_state.__setitem__(
+                        k, _format_number_comma(st.session_state.get(k, ""))
+                    ),
+                    placeholder="0",
                 )
+                _amt_i = _parse_comma_to_int(st.session_state.get(_amt_key_i, "0"))
             with lc5:
                 st.write("")
                 st.write("")
