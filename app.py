@@ -7254,6 +7254,185 @@ def _pcr_display_meta_from_history(meta: dict) -> tuple[dict, str | None]:
     return display, note
 
 
+def _pcr_check_external_verification(db_filename: str, payment_id: int | None) -> tuple[bool, str]:
+    """payment_id 가 외부 결제 파일(온누리/지역화폐/카드/메인페이) 업로드와 매칭되었는지 확인.
+
+    반환: (verified, source_or_reason)
+      - verified True 이면 source = 'onnuri' / 'ulsanpay' / 'card' / 'mainpay'
+      - verified False 이면 source = '' (매칭 없음)
+    분할 매칭(split_matched) 참여 payment_id 도 verified True 로 판정.
+    """
+    if not db_filename or not payment_id:
+        return False, ""
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return False, ""
+    _positive = ("matched", "manual_matched", "split_matched")
+    try:
+        r = (
+            sc.table("app_external_pay_matches")
+            .select("source, result_code, note")
+            .eq("db_filename", db_filename)
+            .eq("payment_id", int(payment_id))
+            .limit(3)
+            .execute()
+        )
+        for row in (r.data or []):
+            if str(row.get("result_code") or "") in _positive:
+                return True, str(row.get("source") or "")
+    except Exception:
+        return False, ""
+    # 분할 매칭 참여자 (payment_id 는 대표 pid 만, 나머지는 note 에 encoded)
+    try:
+        r2 = (
+            sc.table("app_external_pay_matches")
+            .select("source, note")
+            .eq("db_filename", db_filename)
+            .eq("result_code", "split_matched")
+            .execute()
+        )
+        for m in (r2.data or []):
+            pids = _ext_pay_extract_split_pids(m.get("note"))
+            if int(payment_id) in pids:
+                return True, str(m.get("source") or "")
+    except Exception:
+        pass
+    return False, ""
+
+
+def _pcr_load_new_payment_ids_from_activity(task_id: int | None) -> list[int]:
+    """결제변경 태스크의 payment_change_applied 활동로그에서 신규 결제 IDs 추출."""
+    if not task_id:
+        return []
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return []
+    try:
+        r = (
+            sc.table("app_task_activity")
+            .select("action, payload, created_at")
+            .eq("task_id", int(task_id))
+            .eq("action", "payment_change_applied")
+            .order("created_at", desc=True)
+            .limit(5)
+            .execute()
+        )
+        for act in (r.data or []):
+            payload = act.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            if not isinstance(payload, dict):
+                continue
+            raw = payload.get("new_payment_ids")
+            if not raw and payload.get("new_payment_id"):
+                raw = [payload.get("new_payment_id")]
+            out: list[int] = []
+            for x in (raw or []):
+                try:
+                    if x is None:
+                        continue
+                    out.append(int(x))
+                except (TypeError, ValueError):
+                    continue
+            if out:
+                return out
+    except Exception:
+        return []
+    return []
+
+
+def _pcr_load_payment_date(db_filename: str, payment_id: int | None) -> str:
+    """payment_id 에 해당하는 결제행의 payment_date (YYYY-MM-DD) 조회. 없으면 '-'."""
+    if not db_filename or not payment_id:
+        return "-"
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return "-"
+    try:
+        r = (
+            sc.table("app_payments")
+            .select("payment_date")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .eq("id", int(payment_id))
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            return str(r.data[0].get("payment_date") or "-")[:10]
+    except Exception:
+        return "-"
+    return "-"
+
+
+def _pcr_build_verify_context(meta: dict) -> dict:
+    """결제변경 검증 표에 추가로 보여줄 원본/변경 결제의 결제일자·외부검증 상태.
+
+    반환 dict 구조:
+      {
+        "original_date": "YYYY-MM-DD" or "-",
+        "new_date": "YYYY-MM-DD" or "-" (여러 라인이면 " / " 로 결합),
+        "original_verified": (verified: bool, label: str),
+        "new_verified": (verified: bool | None, label: str),  # None = 부분검증
+      }
+    """
+    out = {
+        "original_date": "-",
+        "new_date": "-",
+        "original_verified": (False, "❌ 미검증"),
+        "new_verified": (False, "❌ 미검증"),
+    }
+    if not isinstance(meta, dict):
+        return out
+    db_filename = str(meta.get("db_filename") or "")
+    if not db_filename:
+        return out
+
+    # 원본 결제
+    orig_pid = meta.get("payment_id")
+    try:
+        orig_pid_i = int(orig_pid) if orig_pid not in (None, "") else None
+    except (TypeError, ValueError):
+        orig_pid_i = None
+    if orig_pid_i:
+        out["original_date"] = _pcr_load_payment_date(db_filename, orig_pid_i)
+        _v, _src = _pcr_check_external_verification(db_filename, orig_pid_i)
+        _src_disp = f" ({_src})" if _src else ""
+        out["original_verified"] = (True, f"✅ 검증됨{_src_disp}") if _v else (False, "❌ 미검증")
+    else:
+        out["original_verified"] = (False, "-")
+
+    # 변경 결제 (여러 라인 가능)
+    task_id = meta.get("task_id")
+    new_pids = _pcr_load_new_payment_ids_from_activity(task_id)
+    if new_pids:
+        _dates = []
+        _sources: list[str] = []
+        _any_unverified = False
+        for pid in new_pids:
+            _dates.append(_pcr_load_payment_date(db_filename, pid))
+            _v, _src = _pcr_check_external_verification(db_filename, pid)
+            if _v:
+                if _src:
+                    _sources.append(_src)
+            else:
+                _any_unverified = True
+        _dates_clean = [d for d in _dates if d and d != "-"]
+        out["new_date"] = " / ".join(_dates_clean) if _dates_clean else "-"
+        _src_disp = f" ({' / '.join(sorted(set(_sources)))})" if _sources else ""
+        if _sources and not _any_unverified:
+            out["new_verified"] = (True, f"✅ 검증됨{_src_disp}")
+        elif _sources and _any_unverified:
+            out["new_verified"] = (None, f"⚠️ 부분검증{_src_disp}")
+        else:
+            out["new_verified"] = (False, "❌ 미검증")
+    else:
+        out["new_verified"] = (False, "❌ 미검증")
+    return out
+
+
 def _dashboard_cancel_reduce_totals_from_ph(
     ph_df: pd.DataFrame, today: date, month_start: date, month_end: date
 ) -> dict[str, float]:
@@ -30965,13 +31144,24 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
         if hist_note:
             st.info(hist_note)
 
-        # 원본 vs 변경 비교 표
+        # 외부 결제파일 검증 상태 + 결제일자 조회 (원본/변경 각각)
+        _vctx = _pcr_build_verify_context(meta)
+        _orig_verified_label = _vctx["original_verified"][1]
+        _new_verified_label = _vctx["new_verified"][1]
+
+        # 원본 vs 변경 비교 표 — 결제일자·외부검증 컬럼 추가
         comp = pd.DataFrame([
             {"항목": "금액", "원본": _fmt_amt(display_meta.get("original_amount")), "변경 후": _fmt_amt(display_meta.get("new_amount"))},
             {"항목": "결제수단", "원본": display_meta.get("original_method") or "-", "변경 후": display_meta.get("new_method") or "-"},
+            {"항목": "결제일자", "원본": _vctx.get("original_date") or "-", "변경 후": _vctx.get("new_date") or "-"},
             {"항목": "온누리/승인번호", "원본": display_meta.get("original_onnuri") or "-", "변경 후": display_meta.get("new_onnuri") or "-"},
+            {"항목": "외부검증 (파일 매칭)", "원본": _orig_verified_label, "변경 후": _new_verified_label},
         ])
         st.dataframe(comp, width='stretch', hide_index=True)
+        st.caption(
+            "외부검증: 온누리/지역화폐/카드/메인페이 파일이 업로드되어 매칭된 결제행에만 ✅ 표시됩니다. "
+            "미검증 항목은 해당 결제수단 파일을 업로드하면 자동 매칭 후 상태가 갱신됩니다."
+        )
 
         m1, m2 = st.columns(2)
         m1.caption(f"고객: {meta.get('customer_name') or '-'}  ·  주문ID: {meta.get('sale_id')}  ·  결제ID: {meta.get('payment_id') or '신규'}")
@@ -36507,7 +36697,9 @@ def render_new_sales():
         st.session_state.pop("margin_anomaly_reason", None)
 
     # 결제 합계가 0원이면 사유 필수 입력 (계약금 0원 등록 방지·근거 확보)
-    if total_payment_int <= 0:
+    # 단, 판매가(final_sales)가 아직 0인 빈 폼 상태에서는 경고를 띄우지 않는다.
+    # (등록 완료 후 폼 세션이 초기화되어 rerun 되면 판매가·결제 모두 0이 되어 경고가 잘못 표시되는 문제 방지)
+    if final_sales > 0 and total_payment_int <= 0:
         st.warning(
             "⚠️ 결제 합계가 **0원**입니다. 등록하려면 아래에 사유(5자 이상)를 반드시 입력하세요."
         )
