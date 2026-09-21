@@ -29716,8 +29716,45 @@ def _open_attachment_lightbox(
     }
 
 
+def _lightbox_rotate_left_cb() -> None:
+    """회전(왼쪽) on_click 콜백 — 캐시된 상태 기반으로 트리거 키 재세팅."""
+    cache = st.session_state.get("_att_lb_cache")
+    if isinstance(cache, dict):
+        new_state = dict(cache)
+        new_state["angle"] = (int(new_state.get("angle") or 0) - 90) % 360
+        st.session_state["att_lightbox"] = new_state
+
+
+def _lightbox_rotate_right_cb() -> None:
+    cache = st.session_state.get("_att_lb_cache")
+    if isinstance(cache, dict):
+        new_state = dict(cache)
+        new_state["angle"] = (int(new_state.get("angle") or 0) + 90) % 360
+        st.session_state["att_lightbox"] = new_state
+
+
+def _lightbox_rotate_reset_cb() -> None:
+    cache = st.session_state.get("_att_lb_cache")
+    if isinstance(cache, dict):
+        new_state = dict(cache)
+        new_state["angle"] = 0
+        st.session_state["att_lightbox"] = new_state
+
+
+def _lightbox_close_cb() -> None:
+    """닫기 콜백 — 캐시도 함께 제거해 후속 회전 액션이 재열지 못하도록."""
+    st.session_state.pop("att_lightbox", None)
+    st.session_state.pop("_att_lb_cache", None)
+
+
 def _maybe_render_attachment_lightbox() -> None:
-    """열려 있는 첨부 라이트박스를 렌더. 좌/우 90° 회전·원본·닫기 지원."""
+    """열려 있는 첨부 라이트박스를 렌더. 좌/우 90° 회전·원본·닫기 지원.
+
+    상태 관리:
+      - `att_lightbox`: 이번 rerun 에 다이얼로그를 열어야 한다는 "트리거" 키. 렌더 직후 pop.
+      - `_att_lb_cache`: 회전 콜백이 참조할 최신 상태 캐시. 닫기·재오픈 시 초기화.
+    ESC/X 로 닫히면 트리거는 이미 pop 되어 있어 후속 rerun(사내업무 완료·F5 등)에서 자동 재열림이 발생하지 않는다.
+    """
     lb = st.session_state.get("att_lightbox")
     if not isinstance(lb, dict):
         return
@@ -29726,9 +29763,9 @@ def _maybe_render_attachment_lightbox() -> None:
         img_bytes = _fetch_attachment_bytes_cached(str(lb["storage_path"]))
         if img_bytes:
             lb["bytes"] = img_bytes
-            st.session_state["att_lightbox"] = lb
     if not img_bytes:
         st.session_state.pop("att_lightbox", None)
+        st.session_state.pop("_att_lb_cache", None)
         return
 
     title = str(lb.get("name") or "첨부 이미지")
@@ -29740,24 +29777,15 @@ def _maybe_render_attachment_lightbox() -> None:
         st.image(shown, width="stretch")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            if st.button("↺ 왼쪽 90°", key="att_lb_rot_left", help="반시계 방향 90°"):
-                lb["angle"] = (angle - 90) % 360
-                st.session_state["att_lightbox"] = lb
-                st.rerun()
+            st.button("↺ 왼쪽 90°", key="att_lb_rot_left", help="반시계 방향 90°",
+                      on_click=_lightbox_rotate_left_cb)
         with c2:
-            if st.button("↻ 오른쪽 90°", key="att_lb_rot_right", help="시계 방향 90°", type="primary"):
-                lb["angle"] = (angle + 90) % 360
-                st.session_state["att_lightbox"] = lb
-                st.rerun()
+            st.button("↻ 오른쪽 90°", key="att_lb_rot_right", help="시계 방향 90°",
+                      type="primary", on_click=_lightbox_rotate_right_cb)
         with c3:
-            if st.button("⟲ 원본", key="att_lb_rot_reset"):
-                lb["angle"] = 0
-                st.session_state["att_lightbox"] = lb
-                st.rerun()
+            st.button("⟲ 원본", key="att_lb_rot_reset", on_click=_lightbox_rotate_reset_cb)
         with c4:
-            if st.button("닫기", key="att_lb_close"):
-                st.session_state.pop("att_lightbox", None)
-                st.rerun()
+            st.button("닫기", key="att_lb_close", on_click=_lightbox_close_cb)
         _base, _ext = os.path.splitext(title)
         _dl_name = f"{_base or 'image'}_rot{angle}{_ext or '.jpg'}"
         st.download_button(
@@ -29767,6 +29795,9 @@ def _maybe_render_attachment_lightbox() -> None:
             mime="image/jpeg" if _dl_name.lower().endswith((".jpg", ".jpeg")) else "image/png",
             key="att_lb_download",
         )
+
+    # 회전 콜백이 참조할 최신 상태 캐시. 렌더 전에 미리 저장.
+    st.session_state["_att_lb_cache"] = dict(lb)
 
     if hasattr(st, "dialog"):
         try:
@@ -29780,11 +29811,14 @@ def _maybe_render_attachment_lightbox() -> None:
                 _lightbox_body()
 
             _dlg()
+            # 이번 rerun 렌더 완료 → 트리거 키 pop. ESC/X 로 닫혀도 후속 rerun 에서 재열림 방지.
+            st.session_state.pop("att_lightbox", None)
             return
         except Exception:
             pass
     with st.expander(f"🔍 {title}", expanded=True):
         _lightbox_body()
+    st.session_state.pop("att_lightbox", None)
 
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg")
