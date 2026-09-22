@@ -29379,7 +29379,7 @@ def render_internal_work():
         _pending_pcr = _tb.load_pending_payment_verifications(store_name, role)
         if _pending_pcr:
             st.warning(
-                f"💳 결제변경 미결 검증 {len(_pending_pcr)}건 — 아래 업무 목록에서 증빙 확인 후 '검증 완료' 처리해 주세요."
+                f"💳 결제변경 미결 검증 {len(_pending_pcr)}건 — 아래 업무 목록에서 증빙 확인 후 상태를 '완료'로 변경해 주세요."
             )
     except Exception:
         pass
@@ -31288,7 +31288,7 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 st.caption(f"📝 {preview}")
 
             if _auto_expand:
-                st.success("🔔 알림에서 연 업무입니다 — 아래에서 증빙 확인 후 검증 완료/반려를 처리하세요.")
+                st.success("🔔 알림에서 연 업무입니다 — 증빙 확인 후 상태를 '완료'로 변경하거나 반려를 처리하세요.")
             # Streamlit 1.54 expander 는 접혀 있어도 body 코드가 실행되어 태스크 상세의
             # DB 라운드트립이 카드 수만큼 발생한다. 세션 스테이트로 '펼침 상태' 를 명시적으로
             # 추적해 접힘 상태에서는 _render_task_detail 을 아예 호출하지 않는다. (Phase B-1)
@@ -31447,30 +31447,18 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
             if state.get("verify_note"):
                 st.caption(f"비고: {state.get('verify_note')}")
         else:
-            can_resolve = (role in ("store_admin", "superadmin")) and (not is_creator)
-            if not can_resolve:
-                if is_creator:
-                    st.caption("본인이 요청한 건은 직접 검증 완료할 수 없습니다. (셀프 검증 방지)")
-                else:
-                    st.caption("검증 완료 처리는 매장관리자/최고관리자만 가능합니다.")
-            else:
-                with st.form(f"pcr_resolve_{tid}"):
-                    note = st.text_input("검증 비고 (선택)", key=f"pcr_note_{tid}",
-                                         placeholder="예: 증빙 확인 완료, 카드 취소 영수증 일치")
-                    btn_ok, btn_rj, _ = st.columns([1, 1, 3])
-                    with btn_ok:
-                        submit_ok = st.form_submit_button("✅ 검증 완료", type="primary")
-                    with btn_rj:
-                        submit_rj = st.form_submit_button("❌ 반려")
-                    if submit_ok:
-                        ok, err = _tb.resolve_payment_change(tid, me_uname, note)
-                        if ok:
-                            flash("결제변경 검증이 완료 처리되었습니다.")
-                            st.rerun()
-                        else:
-                            st.error(f"처리 실패: {err}")
+            # ✅ 검증 완료 별도 버튼은 제거됨.
+            # 이제 아래 업무 상세의 '상태 → 완료' + 저장 만으로 검증 완료 처리된다
+            # (task_board.update_status 가 결제변경 태스크의 verify_status 를 함께 갱신).
+            # 반려는 별도 버튼으로 유지: 상태를 on_hold 로 두고 verify_status='rejected' 만 마킹해
+            # 결제변경 미결 배너에서 제외한다.
+            _rj_can = (role in ("store_admin", "superadmin")) and (not is_creator)
+            if _rj_can:
+                with st.form(f"pcr_reject_{tid}"):
+                    _rj_note = st.text_input("반려 사유 (선택)", key=f"pcr_rj_note_{tid}",
+                                             placeholder="예: 증빙 불일치, 원본 확인 필요")
+                    submit_rj = st.form_submit_button("❌ 반려")
                     if submit_rj:
-                        # 반려: verify_status 유지(미결), task status → rejected + 요청자 알림
                         try:
                             _rj_client, _ = get_supabase_client()
                             if _rj_client:
@@ -31483,11 +31471,10 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                                     "verify_status": "rejected",
                                     "verified_by": me_uname,
                                     "verified_at": _tb._now_iso() if hasattr(_tb, "_now_iso") else None,
-                                    "verify_note": (note or "").strip() or None,
+                                    "verify_note": (_rj_note or "").strip() or None,
                                 }).eq("id", tid).execute()
                                 _tb.log_activity(tid, me_uname, "payment_change_rejected",
-                                                 {"note": (note or "")[:200]})
-                                # 요청자에게 반려 알림
+                                                 {"note": (_rj_note or "")[:200]})
                                 if _rj_creator and _rj_creator != me_uname:
                                     _tb.notify_recipients(
                                         task_id=tid,
@@ -31500,7 +31487,7 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                                             "actor": me_uname,
                                             "link": _tb._task_link(tid) if hasattr(_tb, "_task_link") else "",
                                         },
-                                        in_app_message=f"결제변경 검증 반려: {_rj_title}" + (f" | 사유: {note}" if note else ""),
+                                        in_app_message=f"결제변경 검증 반려: {_rj_title}" + (f" | 사유: {_rj_note}" if _rj_note else ""),
                                     )
                                 _tb.clear_task_caches()
                         except Exception as _rj_ex:
@@ -31552,12 +31539,12 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
             index=_tb.TASK_STATUSES.index(task.get("status", "requested")),
             format_func=lambda s: f"{_tb.TASK_STATUS_EMOJI.get(s, '')} {_tb.TASK_STATUS_LABELS.get(s, s)}",
             key=f"et_status_{tid}",
-            disabled=(not can_edit) or _is_pcr_task,
-            help=("결제변경 검증 태스크는 위의 '✅ 검증 완료' 버튼으로만 완료 처리해 주세요. "
-                  "일반 상태 변경으로는 미결 배너가 사라지지 않습니다.") if _is_pcr_task else None,
+            disabled=not can_edit,
+            help=("상태를 '완료'로 변경 후 저장하면 결제변경 검증도 함께 완결됩니다."
+                  if _is_pcr_task else None),
         )
         if _is_pcr_task:
-            st.caption("ℹ️ 결제변경 검증 태스크는 상단의 **✅ 검증 완료** 버튼으로만 완료 처리됩니다.")
+            st.caption("ℹ️ 상태를 **완료**로 변경하고 **저장**하면 결제변경 검증이 자동으로 마무리됩니다.")
 
         _cu = st.session_state.get("current_user") or {}
         _sid = _cu.get("store_id") or st.session_state.get("current_store_id")
@@ -31587,10 +31574,10 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
         col_btn1, col_btn2 = st.columns(2)
         save_clicked = col_btn1.form_submit_button("저장", disabled=not can_edit, type="primary")
         if save_clicked:
-            # 변경된 필드 산출
-            # 결제변경 검증 태스크는 verify_status 워크플로우가 별도이므로 일반 status 전이 금지
-            # (사용자가 '완료'로 바꿔도 verify_status='pending' 이 남아 배너에서 미결로 잡히던 문제 방지)
-            if new_status != task.get("status") and not _is_pcr_task:
+            # 변경된 필드 산출.
+            # 결제변경 검증 태스크의 경우 update_status 내부에서 verify_status='resolved' + payment_change_planned='done'
+            # 을 함께 처리하므로 일반 status 변경만으로 검증 완결된다.
+            if new_status != task.get("status"):
                 _tb.update_status(tid, new_status, me_uname)
             field_patch: dict = {}
             if new_title != task.get("title"):

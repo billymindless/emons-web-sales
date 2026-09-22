@@ -530,15 +530,43 @@ def update_status(task_id: int, new_status: str, actor: str) -> tuple[bool, str 
     if err or not client:
         return False, err
     try:
-        # 기존 상태 조회
-        cur = client.table("app_tasks").select("status, title").eq("id", task_id).single().execute()
+        # 기존 상태 조회 (결제변경 태스크 여부 함께 확인)
+        cur = client.table("app_tasks").select("status, title, task_type").eq("id", task_id).single().execute()
         cur_status = (cur.data or {}).get("status")
         title = (cur.data or {}).get("title", "")
+        cur_task_type = (cur.data or {}).get("task_type")
+        is_pcr_task = cur_task_type == PAYMENT_CHANGE_TASK_TYPE
+
         patch: dict = {"status": new_status, "updated_at": _now_iso()}
         if new_status == "done":
             patch["closed_at"] = _now_iso()
+            # 결제변경 태스크가 완료로 전이되면 검증 워크플로우도 함께 마무리한다.
+            # (기존 '✅ 검증 완료' 별도 버튼 제거 후 일반 상태 변경만으로 완결되도록 통합)
+            if is_pcr_task:
+                patch["verify_status"] = "resolved"
+                patch["verified_by"] = actor
+                patch["verified_at"] = _now_iso()
         client.table("app_tasks").update(patch).eq("id", task_id).execute()
         log_activity(task_id, actor, "status_changed", {"from": cur_status, "to": new_status})
+
+        # 결제변경 태스크 + done → 관련 주문의 payment_change_planned='yes' → 'done' 자동 전환
+        if is_pcr_task and new_status == "done":
+            try:
+                pcr = client.table("app_payment_change_requests").select("sale_id").eq("task_id", task_id).maybe_single().execute()
+                sale_id = (pcr.data or {}).get("sale_id") if isinstance(pcr.data, dict) else None
+                if sale_id:
+                    try:
+                        client.table("app_orders").update({
+                            "payment_change_planned": "done",
+                            "payment_change_completed_at": _now_iso(),
+                            "payment_change_completed_by": actor,
+                        }).eq("id", int(sale_id)).eq("payment_change_planned", "yes").execute()
+                    except Exception:
+                        # 컬럼 미존재 스키마에서는 조용히 skip
+                        pass
+            except Exception:
+                pass
+
         # 알림: 전 담당자 + 작성자
         recipients = _all_stakeholders(task_id, exclude=actor)
         notify_recipients(
