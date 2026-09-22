@@ -30989,7 +30989,34 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             except Exception:
                 pass
             st.session_state[f"pcr_files_ver_{order_id}"] = ver + 1
-            st.session_state[toggle_key] = False
+            # 결제변경 요청 창(패널)은 그대로 열어둔 채 폼 위젯 값만 초기화 →
+            # 사용자가 등록 직후에도 '처음처럼' 빈 폼이 있는 결제변경 창으로 돌아오게 한다.
+            # (기존: toggle_key=False 로 패널을 닫아 사용자가 다시 열어야 했음)
+            _reset_keys = [
+                f"pcr_pid_{order_id}",
+                f"pcr_manual_orig_{order_id}",
+                f"pcr_orig_amt_{order_id}",
+                f"pcr_orig_meth_{order_id}",
+                f"pcr_orig_onnuri_{order_id}",
+                f"pcr_type_{order_id}",
+                f"pcr_reason_{order_id}",
+                f"pcr_refund_bank_{order_id}",
+                f"pcr_refund_account_{order_id}",
+                f"pcr_assignees_{order_id}",
+            ]
+            _line_count_now = int(st.session_state.get(f"pcr_new_count_{order_id}", 1) or 1)
+            for _li in range(_line_count_now):
+                _reset_keys.extend([
+                    f"pcr_amt_{order_id}_{_li}",
+                    f"pcr_meth_{order_id}_{_li}",
+                    f"pcr_onnuri_{order_id}_{_li}",
+                    f"pcr_date_{order_id}_{_li}",
+                ])
+            for _rk in _reset_keys:
+                st.session_state.pop(_rk, None)
+            st.session_state[f"pcr_new_count_{order_id}"] = 1
+            # 상위 expander(📝 주문 수정 & 결제 관리) 가 rerun 후에도 다시 펼쳐지도록 표시 (일회성 플래그)
+            st.session_state["_gen_pcr_keep_open"] = True
             if att_errors:
                 st.warning("검증 요청은 등록됐지만 일부 첨부 실패: " + "; ".join(att_errors))
             if payment_ops_errors:
@@ -40048,7 +40075,9 @@ def render_customer_balance():
                         if hist_oid:
                             _render_order_audit_trail(db_filename, int(hist_oid))
 
-                    with st.expander("📝 주문 수정 & 결제 관리", expanded=False):
+                    # 결제변경 요청 등록 직후에는 rerun 되어도 자동으로 다시 펼쳐지도록 (일회성 플래그)
+                    _pcr_force_open = bool(st.session_state.pop("_gen_pcr_keep_open", False))
+                    with st.expander("📝 주문 수정 & 결제 관리", expanded=_pcr_force_open):
                         cust_row = customers_unique[customers_unique["id"] == cid].iloc[0]
                         edit_prefix = f"edit_c{cid}"
                         _db_name = str(cust_row.get("name") or "")
