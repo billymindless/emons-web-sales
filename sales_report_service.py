@@ -46,6 +46,50 @@ def _extract_region_from_address(address: Any) -> str | None:
     return None
 
 
+# 신규 입주 단지는 카카오 road_address.building_name 이 비어 있는 경우가 많다.
+# 주소 원문에 단지명이 있으면 그걸로 아파트/건물 집계에 복원한다.
+_BUILDING_HINT_RE = re.compile(
+    r"(아파트|오피스텔|타워|빌라|단지|캐슬|자이|푸르지오|래미안|힐스테이트|"
+    r"이편한세상|더샵|우미린|아이파크|롯데|시그니처|팰리스|파크|하이츠|센트럴)"
+)
+_BUILDING_INLINE_RE = re.compile(r"([가-힣A-Za-z0-9]+(?:아파트|오피스텔|타워))")
+
+# 카카오 미부여 + 괄호 표기가 들쑥날쑥한 신규 단지. 관리자 alias 가 있으면 그쪽이 우선.
+DEFAULT_BUILDING_ALIASES: dict[str, str] = {
+    "다운2지구우미린더시그니처": "울산다운2지구우미린더시그니처아파트",
+    "울산다운2지구우미린": "울산다운2지구우미린더시그니처아파트",
+    "다운서사로 198": "울산다운2지구우미린더시그니처아파트",
+    "다운서사로198": "울산다운2지구우미린더시그니처아파트",
+}
+
+
+def _extract_building_from_address(address: Any) -> str | None:
+    """주소 원문에서 단지/건물명 추출.
+
+    신규 아파트는 카카오 building_name 이 NULL 인 경우가 많고, 현장 주소는
+    ``다운서사로 198 (울산다운2지구우미린더시그니처아파트)`` 처럼 괄호에
+    단지명을 넣는다. group_by_building 이 빈 building_name 행을 버리므로
+    이 fallback 이 없으면 AI 리포트 아파트 집계에서 통째로 빠진다.
+    """
+    if not isinstance(address, str):
+        return None
+    s = address.strip()
+    if not s:
+        return None
+    for text in reversed(re.findall(r"\(([^)]+)\)", s)):
+        name = (text or "").strip()
+        if len(name) < 4:
+            continue
+        if _BUILDING_HINT_RE.search(name):
+            return name
+    m = _BUILDING_INLINE_RE.search(s)
+    if m:
+        name = (m.group(1) or "").strip()
+        if len(name) >= 4:
+            return name
+    return None
+
+
 # ────────────────────────────────────────────────────────────────
 # 라벨 정규화 맵 (app.py 의 마케팅 인사이트 로직과 일관성 유지)
 # ────────────────────────────────────────────────────────────────
@@ -381,27 +425,26 @@ def _fetch_building_aliases(store_names: list[str]) -> dict[str, str]:
     테이블이 없거나 매장별 매핑이 하나도 없으면 빈 dict 반환 (조용히 무시).
     """
     if not store_names:
-        return {}
+        return dict(DEFAULT_BUILDING_ALIASES)
     client = _get_client()
-    if client is None:
-        return {}
-    try:
-        r = (
-            client.table("app_building_aliases")
-            .select("keyword, building_name")
-            .in_("store_name", store_names)
-            .execute()
-        )
-        rows = (r.data or []) if hasattr(r, "data") else []
-    except Exception as _e:
-        logger.info("_fetch_building_aliases skipped (table missing or query failed): %s", _e)
-        return {}
-    result: dict[str, str] = {}
+    rows: list[dict] = []
+    if client is not None:
+        try:
+            r = (
+                client.table("app_building_aliases")
+                .select("keyword, building_name")
+                .in_("store_name", store_names)
+                .execute()
+            )
+            rows = (r.data or []) if hasattr(r, "data") else []
+        except Exception as _e:
+            logger.info("_fetch_building_aliases skipped (table missing or query failed): %s", _e)
+    result: dict[str, str] = dict(DEFAULT_BUILDING_ALIASES)
     for row in rows:
         _kw = (row.get("keyword") or "").strip()
         _bn = (row.get("building_name") or "").strip()
         if _kw and _bn:
-            result[_kw] = _bn
+            result[_kw] = _bn  # 관리자 매핑이 기본 alias 보다 우선
     return result
 
 
@@ -624,6 +667,9 @@ def group_by_building(
     df = orders.merge(cust, on="customer_id", how="left")
     df["building_name"] = df["building_name"].fillna("").astype(str).str.strip()
 
+    if aliases is None:
+        aliases = dict(DEFAULT_BUILDING_ALIASES)
+
     if aliases and "address" in df.columns:
         # address 와 building_name 을 합쳐 검색 대상 텍스트 구성
         _addr = df["address"].fillna("").astype(str)
@@ -639,6 +685,13 @@ def group_by_building(
             if hit.any():
                 df.loc[hit, "building_name"] = canonical
                 already_mapped = already_mapped | hit
+
+    # 카카오 building_name 이 비어 있어도 주소 괄호/원문에 단지명이 있으면 복원
+    if "address" in df.columns:
+        _extracted = df["address"].map(_extract_building_from_address)
+        _use_extracted = (df["building_name"] == "") & _extracted.notna()
+        if _use_extracted.any():
+            df.loc[_use_extracted, "building_name"] = _extracted[_use_extracted]
 
     if "latitude" in df.columns and "longitude" in df.columns:
         _lat = pd.to_numeric(df["latitude"], errors="coerce")
