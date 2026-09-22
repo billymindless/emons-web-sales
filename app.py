@@ -30496,9 +30496,28 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             )
             sel_pid = None if _pid_choice == _pid_sentinel else _pid_choice
 
+        # 원본 결정 (Option A):
+        # - 우선순위 1: dropdown 에서 사용자가 명시적으로 선택한 결제(pay_list) 를 원본으로 사용
+        # - 우선순위 2: 미선택 시에만 최신 결제변경 이력(_hist_orig) 을 원본으로 폴백
+        # 이력이 오염되어 있어도 사용자의 dropdown 선택이 항상 우선하도록 뒤집었다.
         orig = {}
-        _orig_from_history = bool(_hist_orig.get("method") or _hist_orig.get("amount"))
-        if _orig_from_history:
+        _orig_from_paylist = False
+        if sel_pid is not None:
+            try:
+                _r = pay_list[pay_list["id"] == sel_pid].iloc[0]
+                _cc = str(_r.get("card_company") or "").strip()
+                _cc = "" if _cc in ("None", "nan", "none") else _cc
+                orig = {
+                    "amount": float(_r.get("amount") or 0),
+                    "method": _r.get("payment_method") or "",
+                    "onnuri": _r.get("onnuri_approval_code") or _cc or "",
+                }
+                _orig_from_paylist = True
+            except Exception:
+                orig = {}
+
+        _orig_has_history = bool(_hist_orig.get("method") or _hist_orig.get("amount"))
+        if not _orig_from_paylist and _orig_has_history:
             orig = {
                 "amount": float(_hist_orig.get("amount") or 0),
                 "method": str(_hist_orig.get("method") or "").strip(),
@@ -30510,8 +30529,11 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     sel_pid = int(_hp)
                 except (TypeError, ValueError):
                     pass
+
+        # 이력이 있으면 참고 배너 표시 — pay_list 우선 채택 시 참고용 캡션, 이력 채택 시 원본 안내
+        if _orig_has_history:
             try:
-                _oa = f"{int(float(orig.get('amount') or 0)):,}원"
+                _oa = f"{int(float(_hist_orig.get('amount') or 0)):,}원"
             except Exception:
                 _oa = "-"
             _na = "-"
@@ -30520,29 +30542,20 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     _na = f"{int(float(_hist_new.get('amount') or 0)):,}원"
                 except Exception:
                     _na = "-"
-            st.info(
-                f"원본(이력): {_oa} / {orig.get('method') or '-'} "
-                f"{('· ' + orig['onnuri']) if orig.get('onnuri') else ''}  →  "
-                f"변경 후(이력): {_na} / {_hist_new.get('method') or '-'} "
-                f"{('· ' + str(_hist_new.get('onnuri'))) if _hist_new.get('onnuri') else ''}"
+            _hist_from = (
+                f"{_oa} / {_hist_orig.get('method') or '-'}"
+                f"{(' · ' + _hist_orig['onnuri']) if _hist_orig.get('onnuri') else ''}"
             )
-        elif sel_pid is not None:
-            try:
-                _r = pay_list[pay_list["id"] == sel_pid].iloc[0]
-                _cc = str(_r.get("card_company") or "").strip()
-                _cc = "" if _cc in ("None", "nan", "none") else _cc
-                orig = {
-                    "amount": float(_r.get("amount") or 0),
-                    "method": _r.get("payment_method") or "",
-                    "onnuri": _r.get("onnuri_approval_code") or _cc or "",
-                }
-            except Exception:
-                orig = {}
-            st.warning(
-                "이 주문의 결제변경 이력을 찾지 못했습니다. "
-                "현재 결제행을 원본으로 사용하므로, 이미 수단이 바뀐 행이면 원본이 잘못될 수 있습니다. "
-                "아래에서 원본을 직접 확인·수정하세요."
+            _hist_to = (
+                f"{_na} / {_hist_new.get('method') or '-'}"
+                f"{(' · ' + str(_hist_new.get('onnuri'))) if _hist_new.get('onnuri') else ''}"
             )
+            if _orig_from_paylist:
+                # pay_list 를 원본으로 채택한 경우 이력은 참고용
+                st.caption(f"📋 참고 이력: {_hist_from} → {_hist_to}")
+            else:
+                # 이력을 원본으로 채택한 경우 명확히 표시
+                st.info(f"원본(이력): {_hist_from}  →  변경 후(이력): {_hist_to}")
 
         _manual_orig = st.checkbox("원본 수동 수정", key=f"pcr_manual_orig_{order_id}",
                                    help="이력/현재행 원본이 틀리면 직접 수정합니다.")
