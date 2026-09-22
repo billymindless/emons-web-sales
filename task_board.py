@@ -259,6 +259,7 @@ def load_task_by_id(task_id: int) -> dict | None:
     return None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_my_assigned_tasks(me_username: str, include_done: bool = False) -> list[dict]:
     """내가 담당자로 지정된 업무 (결제변경 검증 등). 매장명 불일치여도 목록에 보이게 한다."""
     if not me_username:
@@ -409,12 +410,16 @@ def clear_task_caches():
     """업무·알림·템플릿 관련 모든 캐시를 무효화."""
     load_tasks_cached.clear()
     load_my_confidential_tasks_cached.clear()
+    load_my_assigned_tasks.clear()
     load_task_assignees_cached.clear()
     load_task_comments_cached.clear()
     load_task_attachments_cached.clear()
     load_task_activity_cached.clear()
     load_my_notifications_cached.clear()
     count_unread_notifications.clear()
+    load_payment_change_meta.clear()
+    load_payment_verify_state.clear()
+    load_pending_payment_verifications.clear()
 
 
 def clear_template_cache():
@@ -1325,6 +1330,7 @@ def resolve_payment_change(task_id: int, verifier: str, note: str | None = None)
         return False, str(e)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_payment_change_meta(task_id: int) -> dict | None:
     """task_id로 결제변경 메타 1건 조회."""
     client, err = _client()
@@ -1337,6 +1343,7 @@ def load_payment_change_meta(task_id: int) -> dict | None:
         return None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_payment_verify_state(task_id: int) -> dict:
     """app_tasks의 검증 상태 컬럼만 조회 (컬럼 미존재 환경에서도 안전)."""
     client, err = _client()
@@ -1351,6 +1358,7 @@ def load_payment_verify_state(task_id: int) -> dict:
         return {}
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_pending_payment_verifications(store_name: str | None, role: str) -> list[dict]:
     """미결(pending) 결제변경 검증 태스크 목록. superadmin이면 전 매장."""
     client, err = _client()

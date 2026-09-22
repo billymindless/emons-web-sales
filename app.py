@@ -7175,6 +7175,7 @@ def _ph_blob_to_pcr_fields(blob: dict) -> dict:
     }
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _load_latest_payment_history_for_pcr(db_filename: str, sale_id: int) -> dict | None:
     """주문별 최신 결제변경/취소 이력 1건. original/new는 PCR 필드 형태."""
     if not db_filename or not sale_id:
@@ -7254,6 +7255,7 @@ def _pcr_display_meta_from_history(meta: dict) -> tuple[dict, str | None]:
     return display, note
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _pcr_check_external_verification(db_filename: str, payment_id: int | None) -> tuple[bool, str]:
     """payment_id 가 외부 결제 파일(온누리/지역화폐/카드/메인페이) 업로드와 매칭되었는지 확인.
 
@@ -7300,6 +7302,7 @@ def _pcr_check_external_verification(db_filename: str, payment_id: int | None) -
     return False, ""
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _pcr_load_new_payment_ids_from_activity(task_id: int | None) -> list[int]:
     """결제변경 태스크의 payment_change_applied 활동로그에서 신규 결제 IDs 추출."""
     if not task_id:
@@ -7344,6 +7347,7 @@ def _pcr_load_new_payment_ids_from_activity(task_id: int | None) -> list[int]:
     return []
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _pcr_load_payment_date(db_filename: str, payment_id: int | None) -> str:
     """payment_id 에 해당하는 결제행의 payment_date (YYYY-MM-DD) 조회. 없으면 '-'."""
     if not db_filename or not payment_id:
@@ -7378,6 +7382,11 @@ def _pcr_build_verify_context(meta: dict) -> dict:
         "new_verified": (verified: bool | None, label: str),  # None = 부분검증
       }
     """
+    with _PcrPerfTimer("_pcr_build_verify_context"):
+        return _pcr_build_verify_context_impl(meta)
+
+
+def _pcr_build_verify_context_impl(meta: dict) -> dict:
     out = {
         "original_date": "-",
         "new_date": "-",
@@ -7603,6 +7612,44 @@ def clear_data_cache():
             pass
 
 
+class _PcrPerfTimer:
+    """사내업무·결제변경 성능 계측용 컨텍스트 매니저.
+
+    사용법:
+        with _PcrPerfTimer("render_internal_work"):
+            ...
+
+    기본값 OFF. 사용자가 세션에서 `st.session_state["_pcr_perf_debug"] = True` 로 켜면
+    print 로 소요시간을 남긴다 (Streamlit 서버 로그/터미널에서 확인 가능).
+    측정 완료 후 세션 플래그를 지우면 오버헤드 0.
+    """
+
+    __slots__ = ("_label", "_t0", "_enabled")
+
+    def __init__(self, label: str):
+        self._label = label
+        self._t0 = 0.0
+        try:
+            self._enabled = bool(st.session_state.get("_pcr_perf_debug", False))
+        except Exception:
+            self._enabled = False
+
+    def __enter__(self):
+        if self._enabled:
+            self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self._enabled:
+            return False
+        try:
+            elapsed_ms = (time.perf_counter() - self._t0) * 1000.0
+            print(f"[PCR-PERF] {self._label}: {elapsed_ms:.1f} ms", flush=True)
+        except Exception:
+            pass
+        return False
+
+
 def _invalidate_orders() -> None:
     """주문 CRUD 후 호출. 주문 · 매출 · 결제 통합 캐시 무효화."""
     for _name in ("_load_orders_supabase", "load_orders_cached", "load_sales_cached",
@@ -7619,10 +7666,15 @@ def _invalidate_orders() -> None:
 
 
 def _invalidate_payments() -> None:
-    """결제 CRUD 후 호출. 결제 · 결제내역 · 매출(잔금 반영) 캐시 무효화."""
+    """결제 CRUD 후 호출. 결제 · 결제내역 · 매출(잔금 반영) · PCR 검증 컨텍스트 캐시 무효화."""
     for _name in ("_load_payments_supabase", "load_payments_cached",
                   "load_payment_history_dashboard_cached",
-                  "load_sales_cached", "load_orders_cached", "_load_orders_supabase"):
+                  "load_sales_cached", "load_orders_cached", "_load_orders_supabase",
+                  # PCR 검증 관련 헬퍼도 결제 CRUD 시 함께 무효화
+                  "_load_latest_payment_history_for_pcr",
+                  "_pcr_load_payment_date",
+                  "_pcr_check_external_verification",
+                  "_pcr_load_new_payment_ids_from_activity"):
         _fn = globals().get(_name)
         if _fn is None:
             continue
@@ -30387,11 +30439,18 @@ def _pcr_assignee_options(store_id, role: str, exclude_uname: str) -> list[tuple
     return [(u, lbl) for u, lbl in emp_options if u and u != exclude_uname]
 
 
+@st.fragment
 def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                                         customer_name: str, pay_list):
     """매출관리 결제 섹션에 들어가는 '사내 결제변경 검증 요청' 격리 위젯.
     기존 결제 저장/상계 로직과 완전히 분리. 결제는 이미 매출관리에서 즉시 반영된 상태이고,
-    여기서는 사후 검증용 사내 업무 태스크만 생성한다."""
+    여기서는 사후 검증용 사내 업무 태스크만 생성한다.
+
+    Phase D-1: @st.fragment 로 감싸 폼 내 위젯 조작(결제 라인 추가, selectbox, radio 등) 시
+    매출관리 페이지 전체가 rerun 되지 않고 이 폼만 다시 그려지도록 한다.
+    최종 '결제 상신' 성공 후에는 상위 매출 목록/결제 내역 갱신을 위해 st.rerun() 을
+    호출해 전체 앱을 rerun 시킨다 (fragment 내부의 plain st.rerun() 은 전체 앱 rerun).
+    """
     import task_board as _tb  # noqa: WPS433
 
     toggle_key = f"pcr_open_{order_id}"
@@ -31220,21 +31279,35 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
 
             if _auto_expand:
                 st.success("🔔 알림에서 연 업무입니다 — 아래에서 증빙 확인 후 검증 완료/반려를 처리하세요.")
-            # Streamlit 1.54 expander 는 key 인자를 지원하지 않음 → expanded 만 사용
-            with st.expander(
-                f"📋 자세히 보기 / 수정 · 하위업무 {sub_count}개",
-                expanded=_auto_expand,
-            ):
-                _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
-                if children:
-                    st.markdown("---")
-                    st.markdown(f"**↳ 하위업무 {len(children)}**")
-                    for child in children:
-                        _render_task_card(
-                            child, by_parent, assignees_map,
-                            me_uname, role, store_name, current_db,
-                            depth=depth + 1, expand_task_id=expand_task_id,
-                        )
+            # Streamlit 1.54 expander 는 접혀 있어도 body 코드가 실행되어 태스크 상세의
+            # DB 라운드트립이 카드 수만큼 발생한다. 세션 스테이트로 '펼침 상태' 를 명시적으로
+            # 추적해 접힘 상태에서는 _render_task_detail 을 아예 호출하지 않는다. (Phase B-1)
+            _open_key = f"task_open_{tid}"
+            if _auto_expand:
+                st.session_state[_open_key] = True
+            else:
+                st.session_state.setdefault(_open_key, False)
+            _is_open = bool(st.session_state.get(_open_key, False))
+            _toggle_label = (
+                f"📋 접기 · 하위업무 {sub_count}개"
+                if _is_open else
+                f"📋 자세히 보기 / 수정 · 하위업무 {sub_count}개"
+            )
+            if st.button(_toggle_label, key=f"task_toggle_{tid}", width='stretch'):
+                st.session_state[_open_key] = not _is_open
+                _is_open = not _is_open
+            if _is_open:
+                with st.container(border=True):
+                    _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
+                    if children:
+                        st.markdown("---")
+                        st.markdown(f"**↳ 하위업무 {len(children)}**")
+                        for child in children:
+                            _render_task_card(
+                                child, by_parent, assignees_map,
+                                me_uname, role, store_name, current_db,
+                                depth=depth + 1, expand_task_id=expand_task_id,
+                            )
     else:
         # ── 하위업무 행 (컴팩트) ─────────────────────────────
         indent = "&nbsp;" * (4 * (depth - 1))
@@ -31250,23 +31323,43 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
             c2.markdown(f"{indent}↳ **{_pin}{_lock}#{tid} {title}**", unsafe_allow_html=True)
             c3.caption(f"👤 {assignee_names}")
             c4.caption(f"📅 {due}")
-            with st.expander("자세히 보기 / 수정", expanded=_auto_expand):
-                _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
-                if children:
-                    st.markdown("---")
-                    st.markdown(f"**↳ 하위업무 {len(children)}**")
-                    for child in children:
-                        _render_task_card(
-                            child, by_parent, assignees_map,
-                            me_uname, role, store_name, current_db,
-                            depth=depth + 1, expand_task_id=expand_task_id,
-                        )
+            # 하위업무도 동일하게 세션 스테이트 기반 lazy 렌더 게이팅 (Phase B-1)
+            _open_key_sub = f"task_open_{tid}"
+            if _auto_expand:
+                st.session_state[_open_key_sub] = True
+            else:
+                st.session_state.setdefault(_open_key_sub, False)
+            _is_open_sub = bool(st.session_state.get(_open_key_sub, False))
+            _toggle_label_sub = "접기" if _is_open_sub else "자세히 보기 / 수정"
+            if st.button(_toggle_label_sub, key=f"task_toggle_sub_{tid}"):
+                st.session_state[_open_key_sub] = not _is_open_sub
+                _is_open_sub = not _is_open_sub
+            if _is_open_sub:
+                with st.container(border=True):
+                    _render_task_detail(task, assignees, me_uname, role, store_name, current_db)
+                    if children:
+                        st.markdown("---")
+                        st.markdown(f"**↳ 하위업무 {len(children)}**")
+                        for child in children:
+                            _render_task_card(
+                                child, by_parent, assignees_map,
+                                me_uname, role, store_name, current_db,
+                                depth=depth + 1, expand_task_id=expand_task_id,
+                            )
 
 
-def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_creator: bool):
+def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_creator: bool,
+                                        task_type: str | None = None):
     """결제변경 검증 태스크면 원본/변경 메타 + 검증 상태 + 완료 결재 버튼을 표시.
-    메타가 없으면(일반 업무) 아무것도 그리지 않음."""
+    메타가 없으면(일반 업무) 아무것도 그리지 않음.
+
+    성능: task_type 이 결제변경 태스크 유형이 아니면 DB 조회 전에 즉시 리턴한다.
+    (Phase B-2 — 태스크 카드 다수 렌더 시 무조건 발생하던 load_payment_change_meta 쿼리 제거)
+    """
     import task_board as _tb  # noqa: WPS433
+
+    if task_type is not None and task_type != _tb.PAYMENT_CHANGE_TASK_TYPE:
+        return
 
     meta = _tb.load_payment_change_meta(tid)
     if not meta:
@@ -31418,7 +31511,8 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     is_confidential = task.get("category") == _tb.CONFIDENTIAL_CATEGORY
 
     # 결제변경 검증 전용 카드 (메타가 있으면 표시)
-    _render_payment_change_verify_panel(tid, me_uname, role, is_creator)
+    _render_payment_change_verify_panel(tid, me_uname, role, is_creator,
+                                        task_type=task.get("task_type"))
 
     # 상세 필드 편집
     with st.form(f"task_edit_{tid}"):
