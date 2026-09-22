@@ -30205,9 +30205,9 @@ def _file_input_with_paste(
         type=type,
         key=upload_key,
         help=help,
+        label_visibility="collapsed",
     )
 
-    st.caption("이미지는 이 화면에서 **Ctrl+V**로 바로 첨부됩니다. 제목·내용에 텍스트를 붙여넣는 것은 그대로입니다.")
     _inject_window_paste_listener(paste_key)
 
     paste_val = None
@@ -30220,8 +30220,6 @@ def _file_input_with_paste(
             )
         except Exception:
             paste_val = None
-    elif paste_hint:
-        st.caption("클립보드 붙여넣기 칸을 불러오지 못했습니다. 파일 선택으로만 첨부할 수 있습니다.")
 
     pasted_list: list = list(st.session_state.get(state_key, []))
     if isinstance(paste_val, dict) and paste_val.get("b64"):
@@ -30245,9 +30243,8 @@ def _file_input_with_paste(
                     st.session_state[state_key] = pasted_list
 
     if pasted_list:
-        _c1, _c2 = st.columns([5, 1])
-        _c1.caption(f"클립보드 붙여넣기 이미지 {len(pasted_list)}개")
-        if _c2.button("붙여넣기 지우기", key=f"{key}__clear_paste"):
+        if st.button(f"✕ 붙여넣기 {len(pasted_list)}개 지우기",
+                     key=f"{key}__clear_paste"):
             st.session_state[state_key] = []
             st.rerun()
 
@@ -30268,7 +30265,6 @@ def _render_upload_preview(files: list, cols_per_row: int = 4):
     """업로드 직전 파일들의 썸네일/메타 표시. 이미지는 미리보기, 그 외는 아이콘."""
     if not files:
         return
-    st.caption(f"📁 첨부 미리보기 ({len(files)}개)")
     cols = st.columns(min(len(files), cols_per_row) or 1)
     for i, f in enumerate(files):
         with cols[i % len(cols)]:
@@ -30309,7 +30305,7 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
         st.error(_prev_err)
 
     files = _file_input_with_paste(
-        "📎 파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
+        "첨부",
         accept_multiple_files=True,
         key=files_key,
     )
@@ -30320,9 +30316,10 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
             "내용",
             key=f"{key_prefix}_body",
             height=80,
-            placeholder="내용을 입력하세요. (첨부만 등록하려면 비워둬도 됩니다)",
+            placeholder="댓글 입력",
+            label_visibility="collapsed",
         )
-        label = "↪ 답글 등록" if parent_cid else "💬 댓글 등록"
+        label = "↪ 답글" if parent_cid else "등록"
         if st.form_submit_button(label, type="primary"):
             if not (body or "").strip() and not files:
                 st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
@@ -31051,7 +31048,7 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
         # 파일 첨부 — 설명 바로 아래, 즉시 미리보기
         nt_files_key = f"nt_files_{nt_ver}"
         nt_files = _file_input_with_paste(
-            "📎 파일 첨부 (선택, 이미지·문서 등 모든 종류 다중 가능)",
+            "첨부",
             accept_multiple_files=True,
             key=nt_files_key,
         )
@@ -31616,17 +31613,16 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
             atts_for_task.append(a)
 
     # 업무 본문 파일 첨부 업로드 (task 레벨, comment_id=None)
-    st.markdown("**📎 업무 첨부**")
     _task_file_ver_key = f"task_files_ver_{tid}"
     _task_file_ver = int(st.session_state.get(_task_file_ver_key, 0))
     _task_files = _file_input_with_paste(
-        "파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
+        "업무 첨부",
         accept_multiple_files=True,
         key=f"task_files_{tid}_{_task_file_ver}",
     )
     _render_upload_preview(_task_files)
     if _task_files and can_edit:
-        if st.button("📤 첨부 업로드", key=f"task_upload_btn_{tid}", type="primary"):
+        if st.button("📤 업로드", key=f"task_upload_btn_{tid}", type="primary"):
             _att_errs = []
             for _f in _task_files:
                 try:
@@ -31650,12 +31646,9 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
         for i, a in enumerate(atts_for_task):
             with cols[i % 3]:
                 _render_attachment_inline(a, key_suffix=f"task{tid}")
-    elif not _task_files:
-        st.caption("아직 업무에 첨부된 파일이 없습니다.")
     st.markdown("---")
 
     # 댓글 트리
-    st.markdown("**💬 댓글**")
     comments = _tb.load_task_comments_cached(tid)
     cm_by_parent: dict = {}
     for cm in comments:
@@ -31671,42 +31664,45 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
         else:
             holder = st.container()
         with holder:
-            with st.container(border=True):
-                head = f"**{_uname_to_display(cm.get('author'))}** · {str(cm.get('created_at',''))[:19]}"
-                if depth > 0:
-                    head += "  ·  ↪ 답글"
-                st.caption(head)
-                st.write(cm.get("body", ""))
+            _head_html = (
+                f"<div style='margin:6px 0 2px 0;'>"
+                f"<span style='font-weight:600;'>{_uname_to_display(cm.get('author'))}</span>"
+                f"&nbsp;<span style='color:#94a3b8; font-size:0.85rem;'>"
+                f"{str(cm.get('created_at',''))[:19]}</span></div>"
+            )
+            st.markdown(_head_html, unsafe_allow_html=True)
+            st.write(cm.get("body", ""))
 
-                # 이 댓글에 달린 첨부
-                cm_atts = atts_by_comment.get(cm_id, [])
-                if cm_atts:
-                    n_cols = min(len(cm_atts), 3)
-                    a_cols = st.columns(n_cols)
-                    for i, a in enumerate(cm_atts):
-                        with a_cols[i % n_cols]:
-                            _render_attachment_inline(a, key_suffix=f"cm{cm_id}")
+            # 이 댓글에 달린 첨부
+            cm_atts = atts_by_comment.get(cm_id, [])
+            if cm_atts:
+                n_cols = min(len(cm_atts), 3)
+                a_cols = st.columns(n_cols)
+                for i, a in enumerate(cm_atts):
+                    with a_cols[i % n_cols]:
+                        _render_attachment_inline(a, key_suffix=f"cm{cm_id}")
 
-                # 답글 작성 폼
-                with st.expander("↪ 답글 달기", expanded=False):
-                    _render_comment_input(
-                        tid, me_uname,
-                        parent_cid=cm_id,
-                        key_prefix=f"reply_{tid}_{cm_id}",
-                    )
+            # 답글 토글 (기본 접힘)
+            _reply_key = f"reply_open_{tid}_{cm_id}"
+            st.session_state.setdefault(_reply_key, False)
+            if st.button("↪ 답글", key=f"reply_btn_{tid}_{cm_id}"):
+                st.session_state[_reply_key] = not st.session_state[_reply_key]
+            if st.session_state.get(_reply_key):
+                _render_comment_input(
+                    tid, me_uname,
+                    parent_cid=cm_id,
+                    key_prefix=f"reply_{tid}_{cm_id}",
+                )
 
         # 자식 댓글 (재귀)
         for child in cm_by_parent.get(cm_id, []):
             _render_cm(child, depth + 1)
 
     root_comments = cm_by_parent.get(None, [])
-    if not root_comments:
-        st.caption("아직 댓글이 없습니다. 아래에서 첫 댓글을 남겨 보세요.")
     for r in root_comments:
         _render_cm(r, 0)
 
     # 새 댓글 작성 (최상위)
-    st.markdown("**✍ 새 댓글 작성**")
     _render_comment_input(tid, me_uname, parent_cid=None, key_prefix=f"new_{tid}")
 
     # 활동 로그
@@ -31802,7 +31798,7 @@ def _render_post_comment_input(post_id: int, me_uname: str, parent_cid: int | No
         st.error(_prev_err)
 
     files = _file_input_with_paste(
-        "📎 파일 첨부 (이미지·문서·압축 등 모든 종류, 다중 가능)",
+        "첨부",
         accept_multiple_files=True,
         key=files_key,
     )
@@ -31813,7 +31809,8 @@ def _render_post_comment_input(post_id: int, me_uname: str, parent_cid: int | No
             "내용",
             key=f"{key_prefix}_body",
             height=80,
-            placeholder="내용을 입력하세요. (첨부만 등록하려면 비워둬도 됩니다)",
+            placeholder="댓글 입력",
+            label_visibility="collapsed",
         )
         label = "↪ 답글 등록" if parent_cid else "💬 댓글 등록"
         if st.form_submit_button(label, type="primary"):
@@ -31970,13 +31967,13 @@ def _render_post_card(post: dict, me_uname: str, role: str):
             _post_file_ver_key = f"post_files_ver_{pid}"
             _post_file_ver = int(st.session_state.get(_post_file_ver_key, 0))
             _post_files = _file_input_with_paste(
-                "📎 게시물에 파일 첨부 (다중 가능)",
+                "첨부",
                 accept_multiple_files=True,
                 key=f"post_files_{pid}_{_post_file_ver}",
             )
             _render_upload_preview(_post_files)
             if _post_files:
-                if st.button("📤 첨부 업로드", key=f"post_upload_btn_{pid}", type="primary"):
+                if st.button("📤 업로드", key=f"post_upload_btn_{pid}", type="primary"):
                     _errs = []
                     for _f in _post_files:
                         try:
@@ -31995,7 +31992,6 @@ def _render_post_card(post: dict, me_uname: str, role: str):
                     st.rerun()
 
             st.markdown("---")
-            st.markdown("**💬 댓글**")
             comments = _pb.load_post_comments_cached(pid)
             cm_by_parent: dict = {}
             for cm in comments:
@@ -32011,34 +32007,37 @@ def _render_post_card(post: dict, me_uname: str, role: str):
                 else:
                     holder = st.container()
                 with holder:
-                    with st.container(border=True):
-                        head = f"**{_uname_to_display(cm.get('author'))}** · {str(cm.get('created_at',''))[:19]}"
-                        if depth > 0:
-                            head += "  ·  ↪ 답글"
-                        st.caption(head)
-                        st.write(cm.get("body", ""))
-                        cm_atts = atts_by_comment.get(cm_id, [])
-                        if cm_atts:
-                            n_cols = min(len(cm_atts), 3)
-                            a_cols = st.columns(n_cols)
-                            for i, a in enumerate(cm_atts):
-                                with a_cols[i % n_cols]:
-                                    _render_attachment_inline(a, key_suffix=f"pcm{cm_id}")
-                        with st.expander("↪ 답글 달기", expanded=False):
-                            _render_post_comment_input(
-                                pid, me_uname, parent_cid=cm_id,
-                                key_prefix=f"preply_{pid}_{cm_id}",
-                            )
+                    _head_html = (
+                        f"<div style='margin:6px 0 2px 0;'>"
+                        f"<span style='font-weight:600;'>{_uname_to_display(cm.get('author'))}</span>"
+                        f"&nbsp;<span style='color:#94a3b8; font-size:0.85rem;'>"
+                        f"{str(cm.get('created_at',''))[:19]}</span></div>"
+                    )
+                    st.markdown(_head_html, unsafe_allow_html=True)
+                    st.write(cm.get("body", ""))
+                    cm_atts = atts_by_comment.get(cm_id, [])
+                    if cm_atts:
+                        n_cols = min(len(cm_atts), 3)
+                        a_cols = st.columns(n_cols)
+                        for i, a in enumerate(cm_atts):
+                            with a_cols[i % n_cols]:
+                                _render_attachment_inline(a, key_suffix=f"pcm{cm_id}")
+                    _preply_key = f"preply_open_{pid}_{cm_id}"
+                    st.session_state.setdefault(_preply_key, False)
+                    if st.button("↪ 답글", key=f"preply_btn_{pid}_{cm_id}"):
+                        st.session_state[_preply_key] = not st.session_state[_preply_key]
+                    if st.session_state.get(_preply_key):
+                        _render_post_comment_input(
+                            pid, me_uname, parent_cid=cm_id,
+                            key_prefix=f"preply_{pid}_{cm_id}",
+                        )
                 for child in cm_by_parent.get(cm_id, []):
                     _render_cm(child, depth + 1)
 
             root_comments = cm_by_parent.get(None, [])
-            if not root_comments:
-                st.caption("아직 댓글이 없습니다. 아래에서 첫 댓글을 남겨 보세요.")
             for r in root_comments:
                 _render_cm(r, 0)
 
-            st.markdown("**✍ 새 댓글 작성**")
             _render_post_comment_input(pid, me_uname, parent_cid=None, key_prefix=f"pnew_{pid}")
 
 
@@ -34151,7 +34150,7 @@ def _render_new_post_form(me_uname: str, store_name: str | None, role: str, stor
     # 파일 첨부 — 내용 바로 아래, 즉시 미리보기
     np_files_key = f"np_files_{np_ver}"
     np_files = _file_input_with_paste(
-        "📎 파일 첨부 (선택, 이미지·문서 등 모든 종류 다중 가능)",
+        "첨부",
         accept_multiple_files=True,
         key=np_files_key,
     )
