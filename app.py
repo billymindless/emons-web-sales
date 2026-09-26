@@ -33301,7 +33301,15 @@ def _render_ext_pay_ai_similar_match(
             _pids = [int(x) for x in (_s.get("payment_ids") or []) if x]
             _conf = float(_s.get("confidence") or 0)
             _reason = str(_s.get("reason") or "")
-            _row_amt = int(((_row_lookup.get(_rid) or {}).get("공식금액") or 0) or 0)
+            try:
+                _row_amt = int(
+                    str(((_row_lookup.get(_rid) or {}).get("공식금액") or "0"))
+                    .replace(",", "")
+                    .strip()
+                    or 0
+                )
+            except (TypeError, ValueError):
+                _row_amt = 0
             _pay_sum = 0
             for _pid in _pids:
                 _pr = _pay_lookup.get(_pid) or {}
