@@ -78,24 +78,31 @@ st.set_page_config(
 )
 
 
-def _inject_favicon():
-    """웹 탭 아이콘(favicon) 및 iOS 홈화면 추가용 apple-touch-icon을 <head>에 주입.
-    assets/apple-touch-icon.png 가 있으면 data URL로 넣고, 없으면 무시."""
+@st.cache_resource(show_spinner=False)
+def _favicon_html() -> str | None:
+    """assets/apple-touch-icon.png 파일을 base64 인코딩한 <link> 태그 HTML.
+    파일 없으면 None. 프로세스당 1회만 파일 IO + base64 수행."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "apple-touch-icon.png")
     if not os.path.exists(path):
-        return
+        return None
     try:
         with open(path, "rb") as f:
             raw = f.read()
     except Exception:
-        return
+        return None
     b64 = base64.b64encode(raw).decode("utf-8")
     data_url = f"data:image/png;base64,{b64}"
-    st.markdown(
+    return (
         f'<link rel="icon" href="{html.escape(data_url)}" type="image/png">'
-        f'<link rel="apple-touch-icon" href="{html.escape(data_url)}">',
-        unsafe_allow_html=True,
+        f'<link rel="apple-touch-icon" href="{html.escape(data_url)}">'
     )
+
+
+def _inject_favicon():
+    """웹 탭 아이콘(favicon) 및 iOS 홈화면 추가용 apple-touch-icon을 <head>에 주입."""
+    fh = _favicon_html()
+    if fh:
+        st.markdown(fh, unsafe_allow_html=True)
 
 
 def _inject_mobile_css():
@@ -473,7 +480,8 @@ def _render_nav_favorites(uname: str, labels: list, idx_key: str, radio_key: str
                 st.session_state[idx_key] = labels.index(label)
                 st.session_state[radio_key] = label
                 st.session_state.pop("active_admin_page", None)
-                st.rerun()
+                # 사이드바에서 세션 상태 변경 후 별도 st.rerun 없이도
+                # 아래쪽 main() 라우팅이 이번 rerun 안에서 새 인덱스를 읽는다.
 
     if st.session_state.get(edit_key):
         with st.container(border=True):
@@ -504,9 +512,10 @@ def _render_erp_icon_rail(role: str) -> None:
     st.markdown("<div class='erp-rail-title'>ERP</div>", unsafe_allow_html=True)
 
     def _go(page: str):
+        # 사이드바 버튼에서 세션 상태만 세팅. 하단 main() 라우팅이
+        # 같은 rerun 안에서 즉시 새 페이지를 렌더 → 추가 st.rerun 생략(2회 실행 방지).
         st.session_state["active_admin_page"] = page
         st.session_state.pop("mm_queried", None)
-        st.rerun()
 
     if st.button("🏠", key="rail_home", help="홈 (대시보드)", width="stretch"):
         st.session_state.pop("active_admin_page", None)
@@ -514,7 +523,7 @@ def _render_erp_icon_rail(role: str) -> None:
         st.session_state["superadmin_menu_idx"] = 0
         for _k in ("nav_radio_main_tab_idx", "nav_radio_superadmin_menu_idx"):
             st.session_state.pop(_k, None)
-        st.rerun()
+        # 사이드바 세팅 후 st.rerun 생략 — main() 라우팅이 이번 rerun 안에서 처리.
     if st.button("🗓️", key="rail_erp", help="근태 관리", width="stretch"):
         _go("erp_attendance")
     if st.button("📧", key="rail_mail", help="메일 관리", width="stretch"):
@@ -550,7 +559,7 @@ def _render_erp_icon_rail(role: str) -> None:
     if st.button("⭐", key="rail_fav", help="자주 쓰는 메뉴 설정", width="stretch"):
         _ek = f"fav_edit_mode_{_fav_idx_key}"
         st.session_state[_ek] = not st.session_state.get(_ek, False)
-        st.rerun()
+        # 즐겨찾기 편집 토글 — 아래 c_nav → _render_primary_nav 가 이번 rerun 안에서 새 상태를 읽음.
     if st.button("🚪", key="rail_logout", help="로그아웃", width="stretch"):
         try:
             client, _ = get_supabase_client()
@@ -715,7 +724,7 @@ def _render_primary_nav(user: dict, role: str) -> None:
 
 def _render_left_dual_nav(user: dict, role: str) -> None:
     """좌측 듀얼 사이드바 렌더: [로고] + [ERP 아이콘 레일 | 세일즈 메뉴]."""
-    with st.sidebar:
+    with st.sidebar, _PcrPerfTimer("sidebar.render"):
         raw_logo_html = _common_logo_html(
             _resolve_logo_path(), fallback_id="emons-logo-fallback-sidebar",
         )
@@ -739,6 +748,9 @@ def _render_left_dual_nav(user: dict, role: str) -> None:
             _render_erp_icon_rail(role)
         with c_nav:
             _render_primary_nav(user, role)
+        # 관리자·매장관리자 전용: 성능 측정 토글/결과
+        if role in ("store_admin", "superadmin"):
+            _render_perf_debug_panel()
 
 
 # ========== Supabase 연결 (st.secrets 기반) ==========
@@ -6289,6 +6301,20 @@ def _resolve_logo_path():
     return None
 
 
+@st.cache_resource(show_spinner=False)
+def _logo_data_url_cached(logo_path: str) -> str | None:
+    """로고 파일 → data URL. 프로세스당 1회만 IO + base64. 실패 시 None."""
+    try:
+        with open(logo_path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return None
+    ext = os.path.splitext(logo_path)[1].lower()
+    mime = "image/svg+xml" if ext == ".svg" else "image/png"
+    b64 = base64.b64encode(raw).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
 def _common_logo_html(
     logo_path: str | None,
     fallback_id: str = "emons-logo-fallback",
@@ -6297,6 +6323,7 @@ def _common_logo_html(
     """
     로고 공통 블록: 좌측 상단 고정, onError 시 빨간 에러 메시지 표시.
     login / sidebar 동일하게 사용. logo_path가 None이면 이미지 없이 에러 메시지만 노출.
+    파일 IO + base64 는 `_logo_data_url_cached` 로 프로세스당 1회.
     """
     container_style = (
         "display:flex; justify-content:flex-start; align-items:center; "
@@ -6314,19 +6341,13 @@ def _common_logo_html(
             f'<span style="color:#c00; font-size:0.8rem; font-weight:600;">{html.escape(LOGO_FALLBACK_MSG)}</span>'
             "</div>"
         )
-    try:
-        with open(logo_path, "rb") as f:
-            raw = f.read()
-    except Exception:
+    src = _logo_data_url_cached(logo_path)
+    if src is None:
         return (
             f'<div style="{container_style}">'
             f'<span style="color:#c00; font-size:0.8rem; font-weight:600;">{html.escape(LOGO_FALLBACK_MSG)}</span>'
             "</div>"
         )
-    ext = os.path.splitext(logo_path)[1].lower()
-    mime = "image/svg+xml" if ext == ".svg" else "image/png"
-    b64 = base64.b64encode(raw).decode("utf-8")
-    src = f"data:{mime};base64,{b64}"
     onerror_js = (
         f"this.onerror=null; this.style.display='none';"
         f"var e=document.getElementById('{html.escape(fallback_id)}');"
@@ -6749,44 +6770,107 @@ def _load_orders_as_sales(
                 return rows[:row_limit]
         return rows
 
+    # 2단계 최적화: 기간이 지정되면 orders 는 order_date 로, sales 는 transaction_date 로
+    # 서버 필터해 페이로드를 대폭 축소. 기간 외 order 에 발생한 기간 내 sales 조정도
+    # 놓치지 않도록, 매장 order id 만 별도 조회 후 in_() 로 sales 를 서버 필터한다.
+    _has_range = bool(start_date or end_date)
     try:
-        order_rows = _page_query(
-            lambda: client.table("app_orders")
-            .select("id, order_date, total_amount, employee_names")
-            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
-            .order("id", desc=True),
-        )
+        if _has_range:
+            # (a) 매장 전체 order id 만 가볍게 조회 — 기간 내 sales 조정 대상 파악용.
+            _id_rows = _page_query(
+                lambda: client.table("app_orders")
+                .select("id")
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .order("id", desc=True),
+            )
+            _all_oids = [int(r["id"]) for r in _id_rows if r.get("id") is not None]
+            # (b) 기간 내 order_date 를 가진 주문만 상세 조회 — 원장 없는 fallback + seed 후보.
+            def _period_orders_q():
+                q = client.table("app_orders").select(
+                    "id, order_date, total_amount, employee_names"
+                ).eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                if start_date:
+                    q = q.gte("order_date", start_date)
+                if end_date:
+                    q = q.lte("order_date", end_date)
+                return q.order("id", desc=True)
+            order_rows = _page_query(_period_orders_q)
+        else:
+            order_rows = _page_query(
+                lambda: client.table("app_orders")
+                .select("id, order_date, total_amount, employee_names")
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .order("id", desc=True),
+            )
+            _all_oids = [int(r["id"]) for r in order_rows if r.get("id") is not None]
     except Exception as e:
         if "supabase_error" not in st.session_state:
             st.session_state["supabase_error"] = str(e)
         return _empty
-    if not order_rows:
-        return _empty
     st.session_state.pop("supabase_error", None)
 
-    orders_df = pd.DataFrame(order_rows)
-    _oids = [int(x) for x in pd.to_numeric(orders_df["id"], errors="coerce").dropna().astype(int).tolist()]
-    _emp_by_oid = {}
-    if "employee_names" in orders_df.columns:
+    # 상세 order 가 비어 있어도 기간 내 sales 조정만 있을 수 있으므로 계속 진행.
+    orders_df = pd.DataFrame(order_rows) if order_rows else pd.DataFrame(columns=["id", "order_date", "total_amount", "employee_names"])
+    _oids_detail = [int(x) for x in pd.to_numeric(orders_df["id"], errors="coerce").dropna().astype(int).tolist()] if not orders_df.empty else []
+    _emp_by_oid: dict[int, object] = {}
+    if not orders_df.empty and "employee_names" in orders_df.columns:
         for _, _or in orders_df.iterrows():
             try:
                 _emp_by_oid[int(_or["id"])] = _or.get("employee_names")
             except (TypeError, ValueError):
                 continue
 
+    # sales 서버 필터: 매장 전체 order id 를 chunk 로 in_() + transaction_date 범위.
     sales_rows: list = []
-    if _oids:
+    _oids_for_sales = _all_oids if _has_range else _oids_detail
+    if _oids_for_sales:
         _CHUNK = 200
         _SALES_COLS = "transaction_date, amount, order_id, employee_names, note"
+
+        def _sales_q_for_batch(batch):
+            q = client.table("sales").select(_SALES_COLS).in_("order_id", batch)
+            if start_date:
+                q = q.gte("transaction_date", start_date)
+            if end_date:
+                q = q.lte("transaction_date", end_date)
+            return q.order("id")
         try:
-            for i in range(0, len(_oids), _CHUNK):
-                batch = _oids[i:i + _CHUNK]
-                sales_rows.extend(_page_query(
-                    lambda b=batch: client.table("sales").select(_SALES_COLS).in_("order_id", b).order("id"),
-                ))
+            for i in range(0, len(_oids_for_sales), _CHUNK):
+                batch = _oids_for_sales[i:i + _CHUNK]
+                sales_rows.extend(_page_query(lambda b=batch: _sales_q_for_batch(b)))
         except Exception as e:
             logging.getLogger(__name__).warning("sales ledger fetch failed: %s", e)
             sales_rows = []
+
+    # 기간 외 order 에 걸린 기간 내 sales 조정 → 해당 order 상세를 추가 조회해
+    # seed 계산·employee 매핑에 활용.
+    if _has_range and sales_rows:
+        _oids_in_sales = {int(r.get("order_id")) for r in sales_rows if r.get("order_id") is not None}
+        _oids_missing = list(_oids_in_sales - set(_oids_detail))
+        if _oids_missing:
+            _CHUNK_O = 200
+            try:
+                for i in range(0, len(_oids_missing), _CHUNK_O):
+                    batch = _oids_missing[i:i + _CHUNK_O]
+                    _extra = _page_query(
+                        lambda b=batch: client.table("app_orders")
+                        .select("id, order_date, total_amount, employee_names")
+                        .in_("id", b)
+                        .order("id"),
+                    )
+                    if _extra:
+                        _extra_df = pd.DataFrame(_extra)
+                        orders_df = pd.concat([orders_df, _extra_df], ignore_index=True)
+                        for _, _or in _extra_df.iterrows():
+                            try:
+                                _emp_by_oid[int(_or["id"])] = _or.get("employee_names")
+                            except (TypeError, ValueError):
+                                continue
+            except Exception as e:
+                logging.getLogger(__name__).warning("extra orders fetch failed: %s", e)
+
+    if orders_df.empty and not sales_rows:
+        return _empty
 
     parts: list[pd.DataFrame] = []
     oids_with_sales: set[int] = set()
@@ -7575,6 +7659,8 @@ def clear_data_cache():
         # 세일즈 (주문·결제·매출·PH)
         "_load_orders_supabase",
         "_load_payments_supabase",
+        "_load_orders_by_customer_ids_supabase",
+        "_load_payments_by_order_ids_supabase",
         "load_orders_cached",
         "load_payments_cached",
         "load_sales_cached",
@@ -7591,6 +7677,7 @@ def clear_data_cache():
         "_get_supabase_store_by_db_filename",
         "_get_store_name_by_db",
         "_get_supabase_store_assigned_employee_names",
+        "_store_display_name_by_id",
         # 직원·사용자
         "_get_supabase_users_list",
         "_get_supabase_user_store_ids",
@@ -7613,14 +7700,14 @@ def clear_data_cache():
 
 
 class _PcrPerfTimer:
-    """사내업무·결제변경 성능 계측용 컨텍스트 매니저.
+    """성능 계측용 컨텍스트 매니저.
 
     사용법:
         with _PcrPerfTimer("render_internal_work"):
             ...
 
-    기본값 OFF. 사용자가 세션에서 `st.session_state["_pcr_perf_debug"] = True` 로 켜면
-    print 로 소요시간을 남긴다 (Streamlit 서버 로그/터미널에서 확인 가능).
+    기본값 OFF. `st.session_state["_pcr_perf_debug"] = True` 로 켜면
+    stdout print + `st.session_state["_perf_marks"]` 에 기록.
     측정 완료 후 세션 플래그를 지우면 오버헤드 0.
     """
 
@@ -7645,14 +7732,54 @@ class _PcrPerfTimer:
         try:
             elapsed_ms = (time.perf_counter() - self._t0) * 1000.0
             print(f"[PCR-PERF] {self._label}: {elapsed_ms:.1f} ms", flush=True)
+            marks = st.session_state.get("_perf_marks") or []
+            marks.append((self._label, elapsed_ms))
+            # 최근 200개만 유지 — 세션 메모리 폭주 방지
+            if len(marks) > 200:
+                marks = marks[-200:]
+            st.session_state["_perf_marks"] = marks
         except Exception:
             pass
         return False
 
 
+def _perf_reset_marks() -> None:
+    """이번 rerun 마크만 남기고 초기화 — main() 진입 시 호출."""
+    try:
+        if st.session_state.get("_pcr_perf_debug"):
+            st.session_state["_perf_marks"] = []
+    except Exception:
+        pass
+
+
+def _render_perf_debug_panel() -> None:
+    """관리자용 성능 측정 결과 패널. 사이드바 하단에서 호출."""
+    try:
+        enabled = bool(st.session_state.get("_pcr_perf_debug", False))
+    except Exception:
+        enabled = False
+    with st.expander("⏱️ 성능 측정", expanded=False):
+        new_val = st.toggle("측정 켜기", value=enabled, key="_perf_debug_toggle")
+        if new_val != enabled:
+            st.session_state["_pcr_perf_debug"] = new_val
+            st.rerun()
+        if not new_val:
+            st.caption("켜면 다음 렌더부터 구간별 ms 를 기록합니다.")
+            return
+        marks = st.session_state.get("_perf_marks") or []
+        if not marks:
+            st.caption("이번 렌더 기록 없음. 페이지를 조작해 보세요.")
+            return
+        total = sum(ms for _, ms in marks)
+        st.caption(f"이번 렌더 총 {total:.0f} ms · {len(marks)} 구간")
+        for label, ms in marks[-30:]:
+            st.write(f"`{ms:6.1f}` ms — {label}")
+
+
 def _invalidate_orders() -> None:
     """주문 CRUD 후 호출. 주문 · 매출 · 결제 통합 캐시 무효화."""
-    for _name in ("_load_orders_supabase", "load_orders_cached", "load_sales_cached",
+    for _name in ("_load_orders_supabase", "_load_orders_by_customer_ids_supabase",
+                  "load_orders_cached", "load_sales_cached",
                   "load_sales_with_employees_cached",
                   "_cached_store_aov_30d", "_cached_employee_monthly_max",
                   "_count_orders_on_date"):
@@ -7667,9 +7794,11 @@ def _invalidate_orders() -> None:
 
 def _invalidate_payments() -> None:
     """결제 CRUD 후 호출. 결제 · 결제내역 · 매출(잔금 반영) · PCR 검증 컨텍스트 캐시 무효화."""
-    for _name in ("_load_payments_supabase", "load_payments_cached",
+    for _name in ("_load_payments_supabase", "_load_payments_by_order_ids_supabase",
+                  "load_payments_cached",
                   "load_payment_history_dashboard_cached",
                   "load_sales_cached", "load_orders_cached", "_load_orders_supabase",
+                  "_load_orders_by_customer_ids_supabase",
                   # PCR 검증 관련 헬퍼도 결제 CRUD 시 함께 무효화
                   "_load_latest_payment_history_for_pcr",
                   "_pcr_load_payment_date",
@@ -7899,6 +8028,89 @@ def _load_orders_supabase(db_filename: str, columns: str = "*", limit: int | Non
             if limit is not None and len(all_rows) >= limit:
                 all_rows = all_rows[:limit]
                 break
+        return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_orders_by_customer_ids_supabase(
+    db_filename: str, customer_ids_key: tuple, columns: str,
+) -> pd.DataFrame:
+    """특정 고객 id 집합에 속한 주문만 서버에서 필터링. `customer_ids_key`는 정렬·중복제거된 tuple.
+    render_customer_balance 고객 선택 경로가 매장 전체 주문을 긁지 않게 한다.
+    각 chunk 내에서 PostgREST 1000행 상한을 넘어도 누락 없도록 페이지네이션."""
+    if not db_filename or not customer_ids_key:
+        return pd.DataFrame()
+    client, err = get_supabase_client()
+    if err or not client:
+        return pd.DataFrame()
+    _CHUNK = 200
+    _PAGE = 1000
+    all_rows: list = []
+    try:
+        ids = list(customer_ids_key)
+        for i in range(0, len(ids), _CHUNK):
+            chunk = ids[i:i + _CHUNK]
+            offset = 0
+            while True:
+                r = (
+                    client.table("app_orders")
+                    .select(columns)
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                    .in_("customer_id", chunk)
+                    .order("id")
+                    .range(offset, offset + _PAGE - 1)
+                    .execute()
+                )
+                page = r.data or []
+                all_rows.extend(page)
+                if len(page) < _PAGE:
+                    break
+                offset += _PAGE
+        return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_payments_by_order_ids_supabase(
+    db_filename: str, order_ids_key: tuple,
+) -> pd.DataFrame:
+    """특정 주문 id 집합의 결제만 서버에서 필터링. `order_ids_key`는 정렬·중복제거된 tuple.
+    각 chunk 내에서 PostgREST 1000행 상한을 넘어도 누락 없도록 페이지네이션."""
+    if not db_filename or not order_ids_key:
+        return pd.DataFrame()
+    client, err = get_supabase_client()
+    if err or not client:
+        return pd.DataFrame()
+    _CHUNK = 200
+    _PAGE = 1000
+    _cols = (
+        "id, order_id, payment_date, amount, payment_method, card_company, "
+        "fee_amount, onnuri_approval_code, created_by, created_at"
+    )
+    all_rows: list = []
+    try:
+        ids = list(order_ids_key)
+        for i in range(0, len(ids), _CHUNK):
+            chunk = ids[i:i + _CHUNK]
+            offset = 0
+            while True:
+                r = (
+                    client.table("app_payments")
+                    .select(_cols)
+                    .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                    .in_("order_id", chunk)
+                    .order("id")
+                    .range(offset, offset + _PAGE - 1)
+                    .execute()
+                )
+                page = r.data or []
+                all_rows.extend(page)
+                if len(page) < _PAGE:
+                    break
+                offset += _PAGE
         return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
@@ -10138,7 +10350,8 @@ def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
                 conn.commit()
             finally:
                 conn.close()
-        clear_data_cache()
+        # 결제 도메인만 무효화 — 매장/직원 캐시 유지. (주문·결제·매출 캐시 포함)
+        _invalidate_payments()
         return True, None
     except Exception as e:
         return False, str(e)
@@ -14258,13 +14471,9 @@ def render_login():
 
 # ========== 최고 관리자 (Superadmin) 전용: 공지 조회 ==========
 
-def get_store_display_name(user):
-    """로그인 사용자에 따른 사이드바용 매장명. superadmin이면 본사, 아니면 Supabase app_stores에서 조회."""
-    if user.get("role") == "superadmin":
-        return "🏢 에몬스울산본점"
-    store_id = user.get("store_id")
-    if not store_id:
-        return "🏢 매장"
+@st.cache_data(ttl=3600, show_spinner=False)
+def _store_display_name_by_id(store_id: int) -> str:
+    """매장 id → 사이드바 표시명. 1시간 캐시. 매장 이름 변경 시 clear_data_cache() 로 갱신."""
     client, err = get_supabase_client()
     if err or not client:
         return "🏢 매장"
@@ -14272,6 +14481,20 @@ def get_store_display_name(user):
         r = client.table("app_stores").select("store_name").eq("id", int(store_id)).maybe_single().execute()
         data = r.data if isinstance(r.data, dict) else (r.data[0] if r.data and len(r.data) else None)
         return f"🏢 {data['store_name']}" if data and data.get("store_name") else "🏢 매장"
+    except Exception:
+        return "🏢 매장"
+
+
+def get_store_display_name(user):
+    """로그인 사용자에 따른 사이드바용 매장명. superadmin이면 본사, 아니면 Supabase app_stores에서 조회.
+    매 사이드바 렌더마다 호출되므로 store_id 단위로 1시간 캐시(_store_display_name_by_id)."""
+    if user.get("role") == "superadmin":
+        return "🏢 에몬스울산본점"
+    store_id = user.get("store_id")
+    if not store_id:
+        return "🏢 매장"
+    try:
+        return _store_display_name_by_id(int(store_id))
     except Exception:
         return "🏢 매장"
 
@@ -30980,7 +31203,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     _recalc_order_actual_margin_supabase(db_filename, int(order_id))
                 except Exception as _mg_ex:
                     payment_ops_errors.append(f"잔금 재계산 실패: {_mg_ex}")
-                clear_data_cache()
+                # 결제 도메인 캐시만 무효화 — 매장/직원/고객 캐시는 유지해 재렌더 가속.
+                _invalidate_payments()
 
             # 증빙 첨부 업로드
             att_errors = []
@@ -36348,7 +36572,8 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                     "created_by": _current_username(),
                                 })
                                 _recalc_order_actual_margin_supabase(db_filename, oid)
-                                clear_data_cache()
+                                # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+                                _invalidate_payments()
                                 flash(f"위약금 {p_amt_int:,}원 등록이 완료되었습니다. (주문 #{oid})")
                                 for k in ["sp_penalty_name", "sp_penalty_phone", "sp_penalty_amount", "sp_penalty_reason", "sp_penalty_card"]:
                                     st.session_state.pop(k, None)
@@ -36607,9 +36832,17 @@ def render_new_sales():
                 ]["id"].tolist() or [quick_cid]
 
                 if _supabase_orders_payments_available():
-                    all_orders_q = _load_orders_supabase(db_filename, "id, customer_id, order_date, total_amount, import_source", limit=None)
-                    q_orders = all_orders_q[all_orders_q["customer_id"].isin(all_cids)].copy() if (not all_orders_q.empty and "customer_id" in all_orders_q.columns) else pd.DataFrame()
-                    q_payments = _load_payments_supabase(db_filename)
+                    # 선택된 고객의 주문/결제만 서버 필터로 로드 — 매장 전체 스캔 회피.
+                    _q_cust_key = tuple(sorted({int(x) for x in all_cids if x is not None}))
+                    q_orders = _load_orders_by_customer_ids_supabase(
+                        db_filename, _q_cust_key,
+                        "id, customer_id, order_date, total_amount, import_source",
+                    )
+                    if not q_orders.empty and "id" in q_orders.columns:
+                        _q_oids_key = tuple(sorted({int(x) for x in q_orders["id"].tolist() if x is not None}))
+                        q_payments = _load_payments_by_order_ids_supabase(db_filename, _q_oids_key)
+                    else:
+                        q_payments = pd.DataFrame()
                 else:
                     conn_qo = get_tenant_conn(db_filename)
                     if conn_qo:
@@ -37838,7 +38071,8 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
             except Exception as e:
                 errors.append(f"주문 #{oid}: {e}")
 
-        clear_data_cache()
+        # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지. (주문·매출 캐시 포함)
+        _invalidate_payments()
         if errors:
             for err in errors:
                 st.error(err)
@@ -38185,7 +38419,8 @@ def _customer_balance_payment_ui(
         conn.commit()
         conn.close()
 
-    clear_data_cache()
+    # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+    _invalidate_payments()
     st.toast("등록되었습니다. 잔금이 0원이면 리스트에서 사라집니다.", icon="✅")
     st.session_state[_pay_done_key] = {"amount": added_total}
     # 다음 입력을 위해 이 프리픽스의 위젯 키를 정리
@@ -38513,7 +38748,8 @@ def _render_legacy_purchase_bulk_import(db_filename: str) -> None:
                     client, db_filename=db_filename, created_by=_created_by, progress_cb=_paid_cb,
                 )
                 _pbar.progress(1.0, text="완료")
-                clear_data_cache()
+                # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+                _invalidate_payments()
                 st.success(
                     f"대상 {_bres.scanned:,}건 조회 · 완납 결제 {_bres.payments_inserted:,}건 추가 · "
                     f"완납 상태 {_bres.status_updated:,}건 갱신 · 이미 완납 {_bres.skipped_already_paid:,}건"
@@ -40164,13 +40400,22 @@ def render_customer_balance():
                     pass  # customer_channel 미설치 환경에서도 UI가 깨지지 않도록
 
                 if _supabase_orders_payments_available():
-                    all_orders = _load_orders_supabase(
-                        db_filename,
-                        "id, customer_id, order_date, delivery_date, category, cost_price, total_amount, actual_margin, display_sales_amount, display_cost_amount, visit_reason, purchase_reason, employee_names, import_source",
-                        limit=None,
+                    # 선택된 고객의 주문만 서버에서 필터링 — 매장 전체 스캔 회피.
+                    _cust_cols = (
+                        "id, customer_id, order_date, delivery_date, category, cost_price, "
+                        "total_amount, actual_margin, display_sales_amount, display_cost_amount, "
+                        "visit_reason, purchase_reason, employee_names, import_source"
                     )
-                    orders = all_orders[all_orders["customer_id"].isin(all_cids)].copy() if not all_orders.empty and "customer_id" in all_orders.columns else pd.DataFrame()
-                    payments = _load_payments_supabase(db_filename)
+                    _cust_ids_key = tuple(sorted({int(x) for x in all_cids if x is not None}))
+                    orders = _load_orders_by_customer_ids_supabase(
+                        db_filename, _cust_ids_key, _cust_cols,
+                    )
+                    # 이 고객 주문의 결제만 서버 필터로 로드.
+                    if not orders.empty and "id" in orders.columns:
+                        _oids_key = tuple(sorted({int(x) for x in orders["id"].tolist() if x is not None}))
+                        payments = _load_payments_by_order_ids_supabase(db_filename, _oids_key)
+                    else:
+                        payments = pd.DataFrame()
                 else:
                     conn = get_tenant_conn(db_filename)
                     try:
@@ -40869,7 +41114,8 @@ def render_customer_balance():
                                                                             "마이너스(상계) 전표 삭제",
                                                                             db_filename=db_filename,
                                                                         )
-                                                                        clear_data_cache()
+                                                                        # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+                                                                        _invalidate_payments()
                                                                         flash(f"상계 전표(결제 ID {_neg_pid}) 삭제가 완료되었습니다.")
                                                                         st.rerun()
                                                                     else:
@@ -41323,7 +41569,8 @@ def render_customer_balance():
                                                                             )
                                                                     except Exception:
                                                                         pass
-                                                                    clear_data_cache()
+                                                                    # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+                                                                    _invalidate_payments()
                                                                     flash("결제 변경이 완료되었습니다.")
                                                                     st.session_state["_pay_edit_done_msg"] = (
                                                                         f"결제 ID {int(prow['id'])} {action} 완료되었습니다."
@@ -41376,7 +41623,8 @@ def render_customer_balance():
                                                                         "잘못 입력 직접 삭제",
                                                                         db_filename=db_filename,
                                                                     )
-                                                                    clear_data_cache()
+                                                                    # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+                                                                    _invalidate_payments()
                                                                     flash(f"결제 ID {_dd_pid} 삭제가 완료되었습니다.")
                                                                     st.rerun()
                                                                 else:
@@ -41696,7 +41944,8 @@ def render_customer_balance():
                                                                     "마이너스(상계) 전표 삭제",
                                                                     db_filename=db_filename,
                                                                 )
-                                                                clear_data_cache()
+                                                                # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+                                                                _invalidate_payments()
                                                                 flash(f"상계 전표(결제 ID {_op_neg_pid}) 삭제가 완료되었습니다.")
                                                                 st.rerun()
                                                             else:
@@ -41863,7 +42112,8 @@ def render_customer_balance():
                                                         except Exception:
                                                             pass
                                                         st.toast(f"✅ 결제 ID {prow['id']} {_action_op} 완료", icon="✅")
-                                                        clear_data_cache()
+                                                        # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+                                                        _invalidate_payments()
                                                         st.session_state["_pay_edit_done_msg"] = (
                                                             f"결제 ID {int(prow['id'])} {_action_op} 완료되었습니다."
                                                         )
@@ -43071,7 +43321,8 @@ def render_dashboard():
                                     _ok += 1
                                 except Exception as _pay_e:
                                     _fail_msgs.append(f"주문ID {_row.get('id')}: {_pay_e}")
-                            clear_data_cache()
+                            # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
+                            _invalidate_payments()
                             if _fail_msgs:
                                 for _fm in _fail_msgs[:10]:
                                     st.warning(_fm)
@@ -43087,7 +43338,8 @@ def render_dashboard():
                     try:
                         for oid in suspicious_other["id"].tolist():
                             _recalc_order_actual_margin_supabase(db_filename, int(oid))
-                        clear_data_cache()
+                        # 결제 도메인(주문·매출 캐시 포함)만 무효화 — 매장/직원/고객 캐시 유지.
+                        _invalidate_payments()
                         st.toast(f"✅ {len(suspicious_other)}건 보정했습니다. 잔금 상태가 결제 합계에 맞게 갱신되었습니다.", icon="✅")
                         st.rerun()
                     except Exception as e:
@@ -43333,14 +43585,16 @@ def _init_system_once():
 
 
 def main():
-    _init_system_once()
-    ensure_session()
-    _inject_mobile_css()
-    _inject_favicon()
-    _inject_branding_css()
-    _inject_dual_nav_css()
-    _consume_flash()
-    _consume_pay_edit_done_dialog()
+    _perf_reset_marks()
+    with _PcrPerfTimer("main.preamble"):
+        _init_system_once()
+        ensure_session()
+        _inject_mobile_css()
+        _inject_favicon()
+        _inject_branding_css()
+        _inject_dual_nav_css()
+        _consume_flash()
+        _consume_pay_edit_done_dialog()
 
     # ========== 자동 로그인 복구 (30일 토큰) ==========
     # 우선순위:

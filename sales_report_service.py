@@ -191,6 +191,28 @@ def _get_client():
         return None
 
 
+def _paginate(query_factory, page_size: int = 1000) -> list:
+    """PostgREST 1000행 제한 회피용 페이지네이션.
+
+    query_factory: 매 호출마다 새 query 객체를 반환하는 callable
+    (Supabase-py 는 query 를 재사용할 수 없기 때문에 factory 패턴 사용).
+    """
+    rows: list = []
+    offset = 0
+    while True:
+        try:
+            r = query_factory().range(offset, offset + page_size - 1).execute()
+        except Exception as _e:
+            logger.warning("_paginate query failed at offset=%d: %s", offset, _e)
+            break
+        page = (r.data or []) if hasattr(r, "data") else []
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
 def _fetch_orders(store_keys: list[str], start: date, end: date) -> pd.DataFrame:
     """app_orders 조회. order_date(판매일/계약일) 기준 기간 필터.
 
@@ -207,12 +229,11 @@ def _fetch_orders(store_keys: list[str], start: date, end: date) -> pd.DataFrame
             "purchase_reason, actual_margin, display_sales_amount, "
             "display_cost_amount, balance_status")
     try:
-        q = client.table("app_orders").select(cols)\
-            .in_("db_filename", store_keys)\
-            .gte("order_date", start.isoformat())\
-            .lte("order_date", end.isoformat())
-        r = q.execute()
-        rows = (r.data or []) if hasattr(r, "data") else []
+        rows = _paginate(lambda: client.table("app_orders").select(cols)
+                         .in_("db_filename", store_keys)
+                         .gte("order_date", start.isoformat())
+                         .lte("order_date", end.isoformat())
+                         .order("id"))
         return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
@@ -317,15 +338,16 @@ def _fetch_sales(store_keys: list[str], start: date, end: date) -> pd.DataFrame:
         return pd.DataFrame()
     tenant_col = _sales_tenant_column()
     try:
-        q = client.table("sales").select(
-            "transaction_date, amount, order_id, note, employee_names"
-        )
-        if tenant_col:
-            q = q.in_(tenant_col, store_keys)
-        q = q.gte("transaction_date", start.isoformat())
-        q = q.lte("transaction_date", end.isoformat())
-        r = q.execute()
-        rows = (r.data or []) if hasattr(r, "data") else []
+        def _sales_q_factory():
+            q = client.table("sales").select(
+                "transaction_date, amount, order_id, note, employee_names"
+            )
+            if tenant_col:
+                q = q.in_(tenant_col, store_keys)
+            q = q.gte("transaction_date", start.isoformat())
+            q = q.lte("transaction_date", end.isoformat())
+            return q.order("id")
+        rows = _paginate(_sales_q_factory)
     except Exception as _e:
         logger.warning("_fetch_sales query failed: %s", _e)
         return pd.DataFrame()
@@ -347,14 +369,12 @@ def _fetch_payments(store_keys: list[str], start: date, end: date) -> pd.DataFra
     if client is None or not store_keys:
         return pd.DataFrame()
     try:
-        q = client.table("app_payments").select(
+        rows = _paginate(lambda: client.table("app_payments").select(
             "id, order_id, db_filename, payment_date, amount, payment_method, card_company"
-        )\
-            .in_("db_filename", store_keys)\
-            .gte("payment_date", start.isoformat())\
-            .lte("payment_date", end.isoformat())
-        r = q.execute()
-        rows = (r.data or []) if hasattr(r, "data") else []
+        ).in_("db_filename", store_keys)
+         .gte("payment_date", start.isoformat())
+         .lte("payment_date", end.isoformat())
+         .order("id"))
         return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()

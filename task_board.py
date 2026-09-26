@@ -366,7 +366,7 @@ def load_task_activity_cached(task_id: int) -> list[dict]:
         return []
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_my_notifications_cached(username: str, unread_only: bool = False, limit: int = 30) -> list[dict]:
     client, err = _client()
     if err or not client or not username:
@@ -381,7 +381,7 @@ def load_my_notifications_cached(username: str, unread_only: bool = False, limit
         return []
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def count_unread_notifications(username: str) -> int:
     client, err = _client()
     if err or not client or not username:
