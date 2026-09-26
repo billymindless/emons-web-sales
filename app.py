@@ -41782,7 +41782,50 @@ def render_customer_balance():
                                                             else _today_kst().isoformat()
                                                         )
                                                         _old_payment_op = {"payment_id": int(prow["id"]), "amount": _old_amt_op, "method": _prow_method, "card_company": prow.get("card_company")}
-                                                        if _supabase_orders_payments_available():
+
+                                                        def _norm_code_op(v) -> str:
+                                                            s = "" if v is None else str(v).strip()
+                                                            return "" if s in ("None", "nan", "none") else s
+
+                                                        _op_code_only = (
+                                                            new_amount_op > 0
+                                                            and int(new_amount_op) == int(round(_old_amt_op))
+                                                            and new_method_op == prow.get("payment_method")
+                                                            and _pay_op_date_str == str(prow.get("payment_date") or "")[:10]
+                                                            and _norm_code_op(new_card_op) != _norm_code_op(prow.get("card_company"))
+                                                        )
+                                                        if _op_code_only:
+                                                            # 금액·수단·날짜 동일 + 승인번호(카드사)만 변경 → 상계 없이 원 결제 행만 수정
+                                                            _op_new_code = _norm_code_op(new_card_op) or None
+                                                            if _supabase_orders_payments_available():
+                                                                _old_paid_op, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
+                                                                _op_code_ok = _update_payment_supabase(db_filename, int(prow["id"]), {"card_company": _op_new_code})
+                                                            else:
+                                                                _old_paid_op = 0
+                                                                _op_code_ok = False
+                                                                _conn_op = get_tenant_conn(db_filename)
+                                                                if _conn_op:
+                                                                    try:
+                                                                        _old_paid_op = _conn_op.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_op_oid,)).fetchone()[0] or 0
+                                                                        _conn_op.execute("UPDATE Payments SET card_company = ? WHERE id = ?", (_op_new_code, int(prow["id"])))
+                                                                        _conn_op.commit()
+                                                                        _op_code_ok = True
+                                                                    finally:
+                                                                        _conn_op.close()
+                                                            if not _op_code_ok:
+                                                                st.error("승인번호 변경을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+                                                                st.stop()
+                                                            _action_op = "승인번호변경"
+                                                            _cid_op = _get_order_customer_id_supabase(db_filename, _op_oid) if _supabase_orders_payments_available() else None
+                                                            _cname_op = _get_customer_name_supabase(db_filename, _cid_op) if _cid_op else ""
+                                                            _insert_payment_history(
+                                                                None, _op_oid, _cname_op, _action_op,
+                                                                {"order_id": int(_op_oid), "paid_total_before": _old_paid_op, "balance_before": _op_balance, "payment": _old_payment_op},
+                                                                {"order_id": int(_op_oid), "paid_total_after": _old_paid_op, "balance_after": _op_balance,
+                                                                 "payment": {"payment_id": int(prow["id"]), "amount": _old_amt_op, "method": new_method_op, "card_company": _op_new_code}},
+                                                                del_reason_op, db_filename=db_filename,
+                                                            )
+                                                        elif _supabase_orders_payments_available():
                                                             _old_paid_op, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
                                                             _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _pay_op_date_str, "amount": -_old_amt_op, "payment_method": _prow_method, "card_company": prow.get("card_company"), "fee_amount": -_old_fee_op})
                                                             if new_amount_op == 0:
