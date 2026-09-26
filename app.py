@@ -40916,8 +40916,21 @@ def render_customer_balance():
                                                                 key=_edit_last4_key,
                                                             )
                                                             _ed_last4 = re.sub(r"\D", "", str(st.session_state.get(_edit_last4_key, "") or ""))
-                                                            _ed_amt_preview = int(float(prow.get("amount") or 0))
-                                                            _ed_date_preview = str(prow.get("payment_date") or "")[:10]
+                                                            # 입력칸 표시 여부도 제출 검증과 같은 값(변경 후 금액·날짜)으로 판단
+                                                            _ed_old_amt = int(float(prow.get("amount") or 0))
+                                                            _ed_amt_raw = st.session_state.get(f"pay_edit_amt_{prow['id']}")
+                                                            if _ed_amt_raw is None:
+                                                                _ed_amt_preview = _ed_old_amt
+                                                            elif st.session_state.get(f"pay_edit_mode_{prow['id']}") == "증감액 입력 (+증액, -감액)":
+                                                                _ed_amt_preview = max(0, _ed_old_amt + _parse_signed_comma_to_int(_ed_amt_raw))
+                                                            else:
+                                                                _ed_amt_preview = _parse_comma_to_int(_ed_amt_raw)
+                                                            _ed_date_val = st.session_state.get(f"pay_edit_date_{prow['id']}")
+                                                            _ed_date_preview = (
+                                                                _ed_date_val.isoformat()
+                                                                if isinstance(_ed_date_val, date)
+                                                                else str(prow.get("payment_date") or "")[:10]
+                                                            )
                                                             _ed_need_t = bool(_onnuri_time_from_code(_cur_onnuri)) or _onnuri_should_ask_time(
                                                                 db_filename, _ed_last4, _ed_amt_preview, _ed_date_preview,
                                                                 exclude_payment_id=int(prow["id"]),
@@ -41074,7 +41087,76 @@ def render_customer_balance():
                                                                 old_fee_val = float(prow["fee_amount"] or 0)
                                                                 _pay_edit_committed = False
 
-                                                                if _supabase_orders_payments_available():
+                                                                def _norm_code(v) -> str:
+                                                                    s = "" if v is None else str(v).strip()
+                                                                    return "" if s in ("None", "nan", "none") else s
+
+                                                                _old_date_str = str(prow.get("payment_date") or "")[:10]
+                                                                _code_only_change = (
+                                                                    new_amount > 0
+                                                                    and int(new_amount) == int(round(old_amt_val))
+                                                                    and new_method == prow["payment_method"]
+                                                                    and _pay_edit_date_str == _old_date_str
+                                                                    and (
+                                                                        _norm_code(new_card_company) != _norm_code(prow.get("card_company"))
+                                                                        or _norm_code(new_onnuri_code) != _norm_code(prow.get("onnuri_approval_code"))
+                                                                    )
+                                                                )
+
+                                                                if _code_only_change:
+                                                                    # 금액·수단·날짜 동일 + 승인번호만 변경 → 상계 없이 원 결제 행만 수정
+                                                                    _code_updates = {
+                                                                        "card_company": _norm_code(new_card_company) or None,
+                                                                        "onnuri_approval_code": _norm_code(new_onnuri_code) or None,
+                                                                    }
+                                                                    if _supabase_orders_payments_available():
+                                                                        old_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
+                                                                        _code_ok = _update_payment_supabase(db_filename, int(prow["id"]), _code_updates)
+                                                                        cid_ph = _get_order_customer_id_supabase(db_filename, _order_id_pay) if _code_ok else None
+                                                                    else:
+                                                                        conn = get_tenant_conn(db_filename)
+                                                                        try:
+                                                                            old_paid_total = conn.execute(
+                                                                                "SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,)
+                                                                            ).fetchone()[0] or 0
+                                                                            conn.execute(
+                                                                                "UPDATE Payments SET card_company = ?, onnuri_approval_code = ? WHERE id = ?",
+                                                                                (_code_updates["card_company"], _code_updates["onnuri_approval_code"], int(prow["id"])),
+                                                                            )
+                                                                            _cid_row = conn.execute("SELECT customer_id FROM Orders WHERE id = ?", (_order_id_pay,)).fetchone()
+                                                                            conn.commit()
+                                                                            _code_ok = True
+                                                                            cid_ph = _cid_row[0] if _cid_row else None
+                                                                        except Exception as _code_e:
+                                                                            st.error(f"승인번호 변경 저장 오류: {_code_e}")
+                                                                            _code_ok = False
+                                                                            cid_ph = None
+                                                                        finally:
+                                                                            conn.close()
+                                                                    if not _code_ok:
+                                                                        st.error("승인번호 변경을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+                                                                    else:
+                                                                        action = "승인번호변경"
+                                                                        customer_name_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
+                                                                        new_payment = {
+                                                                            "payment_id": int(prow["id"]),
+                                                                            "amount": old_amt_val,
+                                                                            "method": new_method,
+                                                                            "card_company": _code_updates["card_company"],
+                                                                            "onnuri_approval_code": _code_updates["onnuri_approval_code"],
+                                                                        }
+                                                                        _ph_err = _insert_payment_history(
+                                                                            None, _order_id_pay, customer_name_ph, action,
+                                                                            {"order_id": int(_order_id_pay), "paid_total_before": old_paid_total, "balance_before": old_balance, "payment": old_payment},
+                                                                            {"order_id": int(_order_id_pay), "paid_total_after": old_paid_total, "balance_after": old_balance, "payment": new_payment},
+                                                                            del_reason,
+                                                                            receipt_image_path=receipt_path_saved,
+                                                                            db_filename=db_filename,
+                                                                        )
+                                                                        if _ph_err:
+                                                                            st.warning(f"⚠️ 이력 저장 오류: {_ph_err}")
+                                                                        _pay_edit_committed = True
+                                                                elif _supabase_orders_payments_available():
                                                                     old_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
 
                                                                     # 1. 마이너스(-) 상계 전표 INSERT (계좌이체 등 card_company가 pandas NaN이면 JSON 오류 → _insert_payment_supabase에서 None 처리)
