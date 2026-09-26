@@ -9147,6 +9147,20 @@ def flash(message: str, level: str = "success"):
     st.session_state["_flash_msgs"] = msgs
 
 
+@st.dialog("수정 완료")
+def _pay_edit_done_dialog(message: str):
+    st.success(message)
+    if st.button("확인", key="_pay_edit_done_ok", type="primary"):
+        st.rerun()
+
+
+def _consume_pay_edit_done_dialog():
+    """결제 수정 저장 → rerun 후 한 번 확인 팝업 표시 (스크롤 위치와 무관하게 보이도록)."""
+    msg = st.session_state.pop("_pay_edit_done_msg", None)
+    if msg:
+        _pay_edit_done_dialog(msg)
+
+
 def _consume_flash():
     """페이지 진입 시 한 번 호출. 저장된 flash 메시지를 모두 표시하고 제거."""
     msgs = st.session_state.pop("_flash_msgs", None) or []
@@ -41311,6 +41325,9 @@ def render_customer_balance():
                                                                         pass
                                                                     clear_data_cache()
                                                                     flash("결제 변경이 완료되었습니다.")
+                                                                    st.session_state["_pay_edit_done_msg"] = (
+                                                                        f"결제 ID {int(prow['id'])} {action} 완료되었습니다."
+                                                                    )
                                                                     st.rerun()
 
                                                 # ── 잘못 입력 직접 삭제 (2열 밖 전체 너비 — 오른쪽 컬럼에 가려지지 않도록) ──
@@ -41804,6 +41821,9 @@ def render_customer_balance():
                                                             pass
                                                         st.toast(f"✅ 결제 ID {prow['id']} {_action_op} 완료", icon="✅")
                                                         clear_data_cache()
+                                                        st.session_state["_pay_edit_done_msg"] = (
+                                                            f"결제 ID {int(prow['id'])} {_action_op} 완료되었습니다."
+                                                        )
                                                         st.rerun()
                     # 알림 자동 기록 (세션당 1회)
                     _alert_key2 = f"_anomaly_alert_overpaid_{db_filename}"
@@ -43277,6 +43297,7 @@ def main():
     _inject_branding_css()
     _inject_dual_nav_css()
     _consume_flash()
+    _consume_pay_edit_done_dialog()
 
     # ========== 자동 로그인 복구 (30일 토큰) ==========
     # 우선순위:
