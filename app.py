@@ -35198,7 +35198,7 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
         "visible_role": "admin_only",
         "keywords": (
             "분배 결제 복수 주문 분개 나누기 여러 주문 동일 고객 배분 합계 실입금액 일치 "
-            "분배 결제 일괄 등록 잔금 복수"
+            "분배 결제 일괄 등록 잔금 복수 초과 이관 초과이관 음수 마이너스"
         ),
         "body": (
             "**복수 주문 분배 결제**는 한 명의 고객이 잔금이 남은 주문이 **2건 이상**일 때, "
@@ -35219,7 +35219,16 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "(결변·카드취소 목적이면 그대로 등록 가능).\n\n"
             "**예시**\n\n"
             "- 고객이 온누리상품권 **100만원**을 납부했고, A주문 잔금 70만·B주문 잔금 30만인 경우\n"
-            "  → 실제 입금액: **1,000,000** / A 배분: **700,000** / B 배분: **300,000** → ✅ 일치 → 등록 가능"
+            "  → 실제 입금액: **1,000,000** / A 배분: **700,000** / B 배분: **300,000** → ✅ 일치 → 등록 가능\n\n"
+            "**초과 → 미수 이관 (신규 입금 없이)**\n\n"
+            "- 한 고객의 주문 중 하나가 **초과(잔금 음수)**이고 다른 하나가 **미수(잔금 양수)** 일 때, "
+            "초과분을 미수 주문으로 옮길 수 있습니다.\n"
+            "- 초과 행에는 잔금란에 **초과 금액**이 표시되며, 배분 입력란은 비어 있습니다. "
+            "여기에 `-` 부호를 붙여 이관할 금액(예: `-17,000`) 을 입력합니다. "
+            "미수 행에는 양수(예: `17,000`) 를 입력합니다.\n"
+            "- 실제 입금액은 **0** 을 입력합니다 (신규 결제가 없기 때문). "
+            "배분 합계도 `+17,000 + (-17,000) = 0` 이 되어 실입금과 일치하면 등록됩니다.\n"
+            "- 이 경우 이관 행은 결제 수단/승인번호를 붙이지 않고, `분배결제(초과이관)` 이력으로 남습니다."
         ),
     },
     {
@@ -37480,17 +37489,53 @@ def _recalc_order_actual_margin(conn, order_id: int, db_filename: str | None = N
     )
 
 
+def _parse_signed_comma_to_int(s) -> int:
+    """부호 유지 콤마 → int. '-17,000' → -17000, '+17,000' → 17000, '17,000' → 17000.
+
+    `_parse_comma_to_int` 는 부호를 버리므로, 초과 주문 배분 입력 전용으로 로컬에서 사용한다.
+    """
+    if s is None:
+        return 0
+    raw = str(s).strip()
+    if not raw:
+        return 0
+    sign = 1
+    if raw[0] == "-":
+        sign = -1
+        raw = raw[1:]
+    elif raw[0] == "+":
+        raw = raw[1:]
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return 0
+    return sign * int(digits)
+
+
 def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key_prefix: str = "split"):
     """동일 고객의 복수 주문에 단일 결제 금액을 분배 등록하는 UI.
-    orders_df: 잔금이 있는 주문들의 DataFrame (columns: id, balance, order_date, category, total_amount).
-    한 번의 결제 수단/금액 입력으로 여러 주문에 자동 분배 저장."""
+    orders_df: 잔금(양수) 또는 초과(음수) 상태의 주문 DataFrame (columns: id, balance, order_date, category, total_amount).
+    한 번의 결제 수단/금액 입력으로 여러 주문에 자동 분배 저장.
+
+    초과 주문(balance < 0)이 섞여 있으면 그 행에 한해 음수 배분(초과이관) 입력을 허용해
+    별도 결제변경 절차 없이 초과분을 다른 미수 주문으로 옮길 수 있다. 미수 주문 로직·저장
+    포맷·API 는 그대로 두고, 초과 행에만 signed 파서가 붙는다.
+    """
     if orders_df is None or len(orders_df) < 2:
         return
 
-    st.markdown("#### 💳 복수 주문 분배 결제")
-    st.caption("한 번의 결제(카드·온누리 등)로 여러 주문에 금액을 나누어 등록합니다.")
+    # 미수/초과 분리 — 초과이관 분기 판단·라벨링에 사용
+    _has_overpaid = (orders_df["balance"] < 0).any()
 
-    # 총 잔금 표시
+    st.markdown("#### 💳 복수 주문 분배 결제")
+    if _has_overpaid:
+        st.caption(
+            "한 번의 결제(카드·온누리 등)로 여러 주문에 금액을 나누어 등록합니다. "
+            "초과된 주문에는 음수(예: `-17,000`) 배분을 넣어 미수 주문으로 이관할 수 있습니다."
+        )
+    else:
+        st.caption("한 번의 결제(카드·온누리 등)로 여러 주문에 금액을 나누어 등록합니다.")
+
+    # 총 잔금 표시 (미수 - 초과)
     total_balance = float(orders_df["balance"].sum())
     st.metric("전체 주문 합산 잔금", f"{total_balance:,.0f}원")
 
@@ -37501,8 +37546,13 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
     st.text_input(
         "실제 입금액 ★ (고객이 실제 납부한 총 금액)",
         key=_actual_paid_key,
-        placeholder="예: 1,000,000",
-        help="각 주문 배분 금액의 합계와 반드시 일치해야 등록됩니다.",
+        placeholder=("예: 0 (초과이관만 하는 경우)" if _has_overpaid else "예: 1,000,000"),
+        help=(
+            "각 주문 배분 금액의 합계와 반드시 일치해야 등록됩니다. "
+            "초과이관만 하는 경우(신규 입금 없음) 0 을 입력하세요."
+            if _has_overpaid
+            else "각 주문 배분 금액의 합계와 반드시 일치해야 등록됩니다."
+        ),
         on_change=lambda: st.session_state.__setitem__(_actual_paid_key, _format_number_comma(st.session_state.get(_actual_paid_key, ""))),
     )
 
@@ -37551,9 +37601,15 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         st.session_state.pop(f"{key_prefix}_onnuri", None)
 
     st.markdown("**주문별 배분 금액 입력**")
-    st.caption("각 주문에 배분할 금액을 입력하세요. 합계가 실제 수령 금액과 일치해야 합니다.")
+    if _has_overpaid:
+        st.caption("각 주문에 배분할 금액을 입력하세요. 합계가 실제 수령 금액과 일치해야 합니다. "
+                   "초과 상태(잔금 음수) 주문에는 `-` 부호를 붙여 이관 금액(예: `-17,000`)을 입력합니다.")
+    else:
+        st.caption("각 주문에 배분할 금액을 입력하세요. 합계가 실제 수령 금액과 일치해야 합니다.")
 
+    # 초과 행은 signed 파서, 미수 행은 기존 unsigned 파서 그대로.
     alloc_keys = {}
+    alloc_signed = {}  # oid → True 이면 초과 이관 대상 (음수 허용)
     for _, orow in orders_df.iterrows():
         oid = int(orow["id"])
         bal = float(orow.get("balance") or 0)
@@ -37561,43 +37617,78 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         od = orow.get("order_date", "")
         od_str = str(od)[:10] if od else "-"
         ak = f"{key_prefix}_alloc_{oid}"
+        _is_over = bal < 0
         if ak not in st.session_state:
-            st.session_state[ak] = _format_number_comma(str(int(bal)))
+            # 미수: 잔금 전액 pre-fill (기존 동작).
+            # 초과: 실수로 초과가 더 늘어나지 않도록 0 pre-fill — 사용자가 명시적으로 -금액을 입력.
+            if _is_over:
+                st.session_state[ak] = ""
+            else:
+                st.session_state[ak] = _format_number_comma(str(int(bal)))
         alloc_keys[oid] = ak
+        alloc_signed[oid] = _is_over
         col_info, col_input = st.columns([2, 1])
         with col_info:
-            st.write(f"주문 #{oid} | {cat} | {od_str} | 잔금 **{bal:,.0f}원**")
-        with col_input:
-            st.text_input(
-                f"배분 금액",
-                key=ak,
-                label_visibility="collapsed",
-                on_change=lambda k=ak: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))),
+            _bal_label = (
+                f"초과 **{abs(bal):,.0f}원**" if _is_over else f"잔금 **{bal:,.0f}원**"
             )
+            st.write(f"주문 #{oid} | {cat} | {od_str} | {_bal_label}")
+        with col_input:
+            if _is_over:
+                st.text_input(
+                    f"배분 금액",
+                    key=ak,
+                    label_visibility="collapsed",
+                    placeholder="예: -17,000 (이관)",
+                    on_change=lambda k=ak: st.session_state.__setitem__(k, _format_signed_number_comma(st.session_state.get(k, ""))),
+                )
+            else:
+                st.text_input(
+                    f"배분 금액",
+                    key=ak,
+                    label_visibility="collapsed",
+                    on_change=lambda k=ak: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))),
+                )
+
+    def _read_alloc(oid: int) -> int:
+        _ak = alloc_keys[oid]
+        _v = st.session_state.get(_ak, "0")
+        return _parse_signed_comma_to_int(_v) if alloc_signed.get(oid) else _parse_comma_to_int(_v)
 
     # 배분 합계 ↔ 실입금액 일치 검증 (실시간 표시)
-    alloc_total = sum(_parse_comma_to_int(st.session_state.get(ak, "0")) for ak in alloc_keys.values())
+    alloc_total = sum(_read_alloc(_oid) for _oid in alloc_keys.keys())
     actual_paid_int = _parse_comma_to_int(st.session_state.get(_actual_paid_key, "0"))
+    is_transfer_mode = _has_overpaid and any(_read_alloc(_oid) < 0 for _oid in alloc_keys.keys())
 
-    if alloc_total > 0:
-        if actual_paid_int > 0:
-            _diff = alloc_total - actual_paid_int
-            if _diff == 0:
-                st.success(f"✅ 배분 합계 **{alloc_total:,.0f}원** = 실입금액 **{actual_paid_int:,.0f}원** (일치)")
-            elif _diff > 0:
-                st.error(f"❌ 배분 합계({alloc_total:,}원)가 실입금액({actual_paid_int:,}원)보다 **{_diff:,}원 초과**합니다.")
-            else:
-                st.error(f"❌ 배분 합계({alloc_total:,}원)가 실입금액({actual_paid_int:,}원)보다 **{-_diff:,}원 부족**합니다.")
+    # 실입금 0 (초과이관만) 케이스도 허용 — 합계 == 실입금이면 OK
+    if alloc_total != 0 or actual_paid_int != 0:
+        _diff = alloc_total - actual_paid_int
+        if _diff == 0:
+            st.success(f"✅ 배분 합계 **{alloc_total:,.0f}원** = 실입금액 **{actual_paid_int:,.0f}원** (일치)")
+        elif _diff > 0:
+            st.error(f"❌ 배분 합계({alloc_total:,}원)가 실입금액({actual_paid_int:,}원)보다 **{_diff:,}원 초과**합니다.")
         else:
-            st.info(f"배분 합계: **{alloc_total:,.0f}원** | ← 위의 실제 입금액을 입력하세요.")
+            st.error(f"❌ 배분 합계({alloc_total:,}원)가 실입금액({actual_paid_int:,}원)보다 **{-_diff:,}원 부족**합니다.")
 
-    # 주문별 잔금 초과 배분 경고
+    # 주문별 잔금 초과 배분 경고 / 이관 한도 초과 검증
     for _, _orow_chk in orders_df.iterrows():
         _oid_chk = int(_orow_chk["id"])
         _bal_chk = float(_orow_chk.get("balance") or 0)
         _ak_chk = alloc_keys.get(_oid_chk)
-        if _ak_chk:
-            _alloc_chk = _parse_comma_to_int(st.session_state.get(_ak_chk, "0"))
+        if not _ak_chk:
+            continue
+        _alloc_chk = _read_alloc(_oid_chk)
+        if _bal_chk < 0:
+            # 초과 주문: 양수 배분 금지, 음수 배분은 |배분| ≤ |초과잔금| 이어야 함
+            if _alloc_chk > 0:
+                st.warning(f"⚠️ 주문 #{_oid_chk} 는 초과 상태입니다. 이관하려면 음수(`-` 부호)를 입력하세요.")
+            elif _alloc_chk < 0 and abs(_alloc_chk) > abs(_bal_chk):
+                st.error(
+                    f"❌ 주문 #{_oid_chk}: 이관 금액({_alloc_chk:,}원)이 초과잔금({_bal_chk:,.0f}원)을 넘습니다. "
+                    f"최대 {int(_bal_chk):,}원까지 입력할 수 있습니다."
+                )
+        else:
+            # 미수 주문: 잔금 초과 배분은 기존과 동일하게 경고만
             if _alloc_chk > 0 and _alloc_chk > _bal_chk:
                 _over_chk = _alloc_chk - _bal_chk
                 st.warning(f"⚠️ 주문 #{_oid_chk}: 배분 금액({_alloc_chk:,}원)이 잔금({_bal_chk:,.0f}원)보다 **{_over_chk:,}원 초과**합니다.")
@@ -37608,19 +37699,39 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         if not split_reason or len(split_reason.strip()) < 5:
             st.warning("사유를 5자 이상 입력하세요.")
             return
-        if alloc_total <= 0:
-            st.warning("배분 금액을 1원 이상 입력하세요.")
+        # 전체가 0(합계+실입금 모두 0) 이면 아무것도 하지 않음
+        _nonzero_allocs = [(_oid, _read_alloc(_oid)) for _oid in alloc_keys.keys() if _read_alloc(_oid) != 0]
+        if not _nonzero_allocs and actual_paid_int == 0:
+            st.warning("배분 금액 또는 실제 입금액을 입력하세요.")
             return
-        if actual_paid_int <= 0:
-            st.error("실제 입금액을 입력하세요.")
-            return
+        if is_transfer_mode:
+            # 초과이관 분기: 실입금 0 허용, 합계 == 실입금만 요구.
+            # 이관 한도 초과는 위의 실시간 검증에서 이미 표시되므로 여기서도 하드 가드.
+            for _oid_g, _alloc_g in _nonzero_allocs:
+                _bal_g = float(orders_df[orders_df["id"] == _oid_g].iloc[0].get("balance") or 0)
+                if _bal_g < 0 and _alloc_g < 0 and abs(_alloc_g) > abs(_bal_g):
+                    st.error(f"주문 #{_oid_g}: 이관 금액({_alloc_g:,}원)이 초과잔금({int(_bal_g):,}원)을 넘습니다.")
+                    return
+                if _bal_g < 0 and _alloc_g > 0:
+                    st.error(f"주문 #{_oid_g} 는 초과 상태입니다. 이관하려면 음수(`-` 부호)를 입력하세요.")
+                    return
+        else:
+            # 기존 양수 경로: 실입금·배분 합계 모두 > 0
+            if alloc_total <= 0:
+                st.warning("배분 금액을 1원 이상 입력하세요.")
+                return
+            if actual_paid_int <= 0:
+                st.error("실제 입금액을 입력하세요.")
+                return
         if alloc_total != actual_paid_int:
             st.error(f"배분 합계({alloc_total:,}원)와 실제 입금액({actual_paid_int:,}원)이 일치하지 않습니다. 각 주문 배분 금액 또는 실제 입금액을 수정하세요.")
             return
 
         onnuri_code = None
         pay_date_str = split_date.isoformat() if hasattr(split_date, "isoformat") else _today_kst().isoformat()
-        if is_onnuri_split:
+        # 온누리/지역화폐 중복 검사는 실입금(신규 결제) 이 있을 때만 유효.
+        # 이관만 하는 경우 신규 온누리·지역화폐 승인번호가 들어올 이유가 없다.
+        if is_onnuri_split and actual_paid_int > 0:
             last4_raw = (st.session_state.get(_onnuri_last4_key, "") or "").strip()
             last4_digits = re.sub(r"\D", "", last4_raw)
             _need_t = _onnuri_should_ask_time(db_filename, last4_digits, actual_paid_int, pay_date_str)
@@ -37638,7 +37749,7 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                     + " 결제가 이미 있습니다."
                 )
                 return
-        if split_method == "지역화폐":
+        if split_method == "지역화폐" and actual_paid_int > 0:
             _appr = re.sub(r"\D", "", str(split_card or ""))
             _ulsan_at = _ulsan_approval_already_used(db_filename, _appr)
             if _ulsan_at:
@@ -37650,16 +37761,20 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
 
         errors = []
         success_count = 0
+        transfer_count = 0
 
-        for oid, ak in alloc_keys.items():
-            alloc_amt = _parse_comma_to_int(st.session_state.get(ak, "0"))
-            if alloc_amt <= 0:
-                continue
+        for oid, alloc_amt in _nonzero_allocs:
             orow_match = orders_df[orders_df["id"] == oid]
             if orow_match.empty:
                 continue
             bal = float(orow_match.iloc[0].get("balance") or 0)
-            fee = _payment_fee_amount(split_method, alloc_amt)
+            _is_transfer_row = alloc_amt < 0
+            # 수수료: 양수 결제만 계산. 음수(이관) 행은 수수료 없음.
+            fee = _payment_fee_amount(split_method, alloc_amt) if alloc_amt > 0 else 0.0
+            # 이관 행에는 신규 결제 메타(승인번호 등) 를 붙이지 않는다 — audit 오염 방지.
+            _row_method = (split_method or None) if alloc_amt > 0 else None
+            _row_card = split_card if alloc_amt > 0 else None
+            _row_onnuri = onnuri_code if alloc_amt > 0 else None
             try:
                 if _supabase_orders_payments_available():
                     old_paid, _ = _sum_payments_by_order_supabase(db_filename, oid)
@@ -37667,20 +37782,21 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                         "order_id": oid,
                         "payment_date": pay_date_str,
                         "amount": alloc_amt,
-                        "payment_method": split_method or None,
-                        "card_company": split_card,
+                        "payment_method": _row_method,
+                        "card_company": _row_card,
                         "fee_amount": fee,
-                        "onnuri_approval_code": onnuri_code,
+                        "onnuri_approval_code": _row_onnuri,
                         "created_by": _current_username(),
                     })
                     _recalc_order_actual_margin_supabase(db_filename, oid)
                     new_paid = old_paid + alloc_amt
                     cid_ph = _get_order_customer_id_supabase(db_filename, oid)
                     cname_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
+                    _action = "분배결제(초과이관)" if _is_transfer_row else "분배결제(복수주문)"
                     _insert_payment_history(
-                        None, oid, cname_ph, "분배결제(복수주문)",
+                        None, oid, cname_ph, _action,
                         {"order_id": oid, "balance_before": bal, "paid_total_before": old_paid},
-                        {"order_id": oid, "added_amount": alloc_amt, "method": split_method, "balance_after": bal - alloc_amt, "paid_total_after": new_paid},
+                        {"order_id": oid, "added_amount": alloc_amt, "method": _row_method, "balance_after": bal - alloc_amt, "paid_total_after": new_paid},
                         split_reason, db_filename=db_filename,
                     )
                 else:
@@ -37688,12 +37804,15 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                     old_paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id=?", (oid,)).fetchone()[0] or 0
                     conn.execute(
                         "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,datetime('now', '+9 hours'))",
-                        (oid, pay_date_str, alloc_amt, split_method or None, split_card, fee, onnuri_code, _current_username()),
+                        (oid, pay_date_str, alloc_amt, _row_method, _row_card, fee, _row_onnuri, _current_username()),
                     )
                     _recalc_order_actual_margin(conn, oid, db_filename)
                     conn.commit()
                     conn.close()
-                success_count += 1
+                if _is_transfer_row:
+                    transfer_count += 1
+                else:
+                    success_count += 1
             except Exception as e:
                 errors.append(f"주문 #{oid}: {e}")
 
@@ -37701,8 +37820,14 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         if errors:
             for err in errors:
                 st.error(err)
-        if success_count > 0:
-            st.toast(f"✅ {success_count}건 분배 결제 등록 완료!", icon="✅")
+        _total_done = success_count + transfer_count
+        if _total_done > 0:
+            if transfer_count > 0 and success_count > 0:
+                st.toast(f"✅ 분배 {success_count}건 · 이관 {transfer_count}건 등록 완료!", icon="✅")
+            elif transfer_count > 0:
+                st.toast(f"✅ 초과이관 {transfer_count}건 등록 완료!", icon="✅")
+            else:
+                st.toast(f"✅ {success_count}건 분배 결제 등록 완료!", icon="✅")
             st.rerun()
 
 
@@ -41162,9 +41287,16 @@ def render_customer_balance():
                     else:
                         # 복수 주문 분배 결제 UI — 매장관리자/최고관리자만 노출
                         _split_role = (st.session_state.get("current_user") or {}).get("role") or "user"
-                        if len(orders_with_balance) >= 2 and _split_role in ("store_admin", "superadmin"):
+                        # 미수(balance > 0) 는 언제나, 초과(balance < 0) 는 미수가 최소 1건 있을 때만 목록에 넣는다.
+                        # 이렇게 하면 미수+초과 조합에서도 분배결제 창이 뜨고, 초과 주문에 음수 배분(초과이관) 을 넣을 수 있다.
+                        _orders_overpay_only = orders[orders["balance"] < 0]
+                        _split_df = pd.concat(
+                            [orders_with_balance, _orders_overpay_only],
+                            ignore_index=True,
+                        ) if len(orders_with_balance) >= 1 else orders_with_balance
+                        if len(orders_with_balance) >= 1 and len(_split_df) >= 2 and _split_role in ("store_admin", "superadmin"):
                             with st.expander("💳 복수 주문 분배 결제 (한 번의 결제로 여러 주문에 배분)", expanded=False):
-                                _multi_order_split_payment_ui(db_filename, orders_with_balance.reset_index(drop=True), key_prefix=f"split_{selected_cid}")
+                                _multi_order_split_payment_ui(db_filename, _split_df.reset_index(drop=True), key_prefix=f"split_{selected_cid}")
 
                         st.markdown("---")
                         st.caption("개별 주문 단건 결제")
