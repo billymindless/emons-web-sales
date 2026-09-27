@@ -41352,6 +41352,24 @@ def render_customer_balance():
                                                                     return "" if s in ("None", "nan", "none") else s
 
                                                                 _old_date_str = str(prow.get("payment_date") or "")[:10]
+
+                                                                # ── 변경 사항 없음 가드 ──
+                                                                # 5개 필드(금액·수단·날짜·카드사·온누리승인번호)가 모두 원본과 동일하면
+                                                                # 저장을 차단해 불필요한 상계쌍 생성을 예방한다.
+                                                                _no_change = (
+                                                                    int(new_amount) == int(round(old_amt_val))
+                                                                    and new_method == prow["payment_method"]
+                                                                    and _pay_edit_date_str == _old_date_str
+                                                                    and _norm_code(new_card_company) == _norm_code(prow.get("card_company"))
+                                                                    and _norm_code(new_onnuri_code) == _norm_code(prow.get("onnuri_approval_code"))
+                                                                )
+                                                                if _no_change:
+                                                                    st.warning(
+                                                                        "변경 사항이 없습니다. 금액·수단·날짜·카드사·승인번호 중 "
+                                                                        "하나 이상을 수정한 후 다시 저장하세요."
+                                                                    )
+                                                                    st.stop()
+
                                                                 _code_only_change = (
                                                                     new_amount > 0
                                                                     and int(new_amount) == int(round(old_amt_val))
@@ -42035,6 +42053,21 @@ def render_customer_balance():
                                                         def _norm_code_op(v) -> str:
                                                             s = "" if v is None else str(v).strip()
                                                             return "" if s in ("None", "nan", "none") else s
+
+                                                        # ── 변경 사항 없음 가드 ──
+                                                        # 4개 필드(금액·수단·날짜·카드사) 모두 원본과 동일하면 저장 차단.
+                                                        _op_no_change = (
+                                                            int(new_amount_op) == int(round(_old_amt_op))
+                                                            and new_method_op == prow.get("payment_method")
+                                                            and _pay_op_date_str == str(prow.get("payment_date") or "")[:10]
+                                                            and _norm_code_op(new_card_op) == _norm_code_op(prow.get("card_company"))
+                                                        )
+                                                        if _op_no_change:
+                                                            st.warning(
+                                                                "변경 사항이 없습니다. 금액·수단·날짜·카드사 중 "
+                                                                "하나 이상을 수정한 후 다시 저장하세요."
+                                                            )
+                                                            st.stop()
 
                                                         _op_code_only = (
                                                             new_amount_op > 0
