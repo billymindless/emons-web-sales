@@ -32914,6 +32914,18 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
                 if ierr:
                     st.error(ierr)
                 else:
+                    _conflicts_key = f"extpay_conflicts_{sel_db}_{_src_key}"
+                    # ── 완전 중복 파일 자동 감지 ──
+                    # 신규 적재 0건 + 중복 skip > 0 → 이미 업로드된 파일. 매칭·상세 패널 모두 스킵.
+                    if inserted == 0 and skipped_dup > 0:
+                        st.session_state.pop(_conflicts_key, None)
+                        _msg_parts = [
+                            f"이미 업로드된 파일입니다 (중복 {skipped_dup}건 모두 skip)",
+                        ]
+                        if skipped_before > 0:
+                            _msg_parts.append(f"시작일 이전 skip {skipped_before}건")
+                        flash(" · ".join(_msg_parts))
+                        st.rerun()
                     counts, merr = _match_fn(sel_db, new_from, me_uname)
                     if merr:
                         st.error(f"매칭 실패: {merr}")
@@ -32927,7 +32939,6 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
                             _msg_parts.append(
                                 " · ".join(f"{k} {v}" for k, v in counts.items())
                             )
-                        _conflicts_key = f"extpay_conflicts_{sel_db}_{_src_key}"
                         if conflicts:
                             st.session_state[_conflicts_key] = conflicts
                             _msg_parts.append(
@@ -33160,6 +33171,25 @@ def _render_ext_pay_conflict_panel(
         f"⚠︎ 중복 skip 된 행 상세 ({len(conflicts)}건) — 별개 거래면 거래시각 재입력하여 등록",
         expanded=True,
     ):
+        # ── 상단 전체 skip 버튼 (스크롤 없이 즉시 닫기) ──
+        _top_cols = st.columns([3, 1])
+        with _top_cols[0]:
+            st.caption(
+                f"⚡ 전체 {len(conflicts)}건을 한 번에 skip 처리하려면 오른쪽 버튼을 눌러주세요. "
+                "별개 거래로 강제 등록이 필요한 건만 아래에서 개별 처리하면 됩니다."
+            )
+        with _top_cols[1]:
+            if st.button(
+                f"🗑️ 전체 {len(conflicts)}건 skip",
+                key=f"ext_pay_conflict_clear_top_{sel_db}_{sel_src}",
+                type="primary",
+                width="stretch",
+            ):
+                st.session_state.pop(key, None)
+                flash(f"중복 {len(conflicts)}건을 모두 skip 처리했습니다.")
+                st.rerun()
+        st.markdown("---")
+
         for idx, c in enumerate(list(conflicts)):
             parsed = c.get("parsed") or {}
             existing = c.get("existing") or {}
@@ -33259,8 +33289,12 @@ def _render_ext_pay_conflict_panel(
                             st.rerun()
             st.markdown("---")
 
-        if st.button("모두 skip 유지 (패널 닫기)", key=f"ext_pay_conflict_clear_{sel_db}_{sel_src}"):
+        if st.button(
+            f"🗑️ 전체 {len(conflicts)}건 skip (패널 닫기)",
+            key=f"ext_pay_conflict_clear_{sel_db}_{sel_src}",
+        ):
             st.session_state.pop(key, None)
+            flash(f"중복 {len(conflicts)}건을 모두 skip 처리했습니다.")
             st.rerun()
 
 
