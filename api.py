@@ -1716,6 +1716,25 @@ async def channel_talk_webhook(request: Request) -> JSONResponse:
         if event in ("chat.created", "chat.opened"):
             return await _handle_chat_created(payload)
 
+        # ── Meet(통화) 종료 감지 → app_call_records 인제스트 ──────────
+        # 채널톡은 콜 종료 자체 이벤트가 없어 "Message" 이벤트 안의 시스템 메시지로 판단.
+        # 실패해도 웹훅은 200 으로 종결 (재시도 폭주 방지). 폴링 경로가 회수함.
+        try:
+            import channel_call_service  # noqa: WPS433
+
+            hit = channel_call_service.detect_meet_message(payload)
+            if hit:
+                _uc_id, _msg_id = hit
+                loop = asyncio.get_event_loop()
+                loop.create_task(
+                    asyncio.to_thread(
+                        channel_call_service.ingest_meet, _uc_id, _msg_id, source="webhook"
+                    )
+                )
+                return JSONResponse({"ok": True, "meet_ingest_queued": True})
+        except Exception as _me:
+            logger.warning("meet detection/ingest schedule failed: %s", _me)
+
         if event != "chat.closed":
             return JSONResponse({"ok": True, "skipped": True})
 
@@ -2380,7 +2399,73 @@ async def health() -> JSONResponse:
         "solapi_secret_set": bool(os.environ.get("SOLAPI_WEBHOOK_SECRET")),
         "imweb_webhook_configured": bool(IMWEB_WEBHOOK_TOKEN),
         "momo_app_url_set": bool(MOMO_APP_URL and MOMO_APP_URL != "https://emons.streamlit.app"),
+        "channel_call_configured": bool(
+            os.environ.get("CHANNEL_TALK_ACCESS_KEY")
+            and os.environ.get("CHANNEL_TALK_ACCESS_SECRET")
+        ),
     })
+
+
+# ──────────────────────────────────────────────
+# 채널톡 콜 → 앱 상담일지 (10분 주기 외부 cron)
+# 계획서: docs/plans/채널톡_콜_상담일지_c5e969b5.plan.md
+#
+# 인증: Authorization: Bearer <CALL_POLL_TOKEN>  (미설정이면 CRON_SECRET 폴백)
+# ──────────────────────────────────────────────
+
+def _verify_call_poll_token(authorization: str | None) -> None:
+    """Bearer <CALL_POLL_TOKEN> 검증. CALL_POLL_TOKEN 미설정 시 CRON_SECRET 로 폴백. 둘 다 없으면 401."""
+    expected = (os.environ.get("CALL_POLL_TOKEN") or os.environ.get("CRON_SECRET") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=401, detail="CALL_POLL_TOKEN not configured")
+    got = (authorization or "").strip()
+    if not got.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer")
+    if not hmac.compare_digest(got.split(" ", 1)[1].strip(), expected):
+        raise HTTPException(status_code=401, detail="invalid token")
+
+
+@app.post("/internal/calls/poll", summary="채널톡 콜 → app_call_records 백업 폴링 (Bearer 필요)")
+async def internal_calls_poll(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """
+    지난 N분 통화 로그 조회 후, DB 에 없는 것만 새로 인제스트. idempotent.
+    Body(선택): { "minutes": 15 }  기본 15분.
+    외부 cron 이 10분 주기로 호출 (Render 무료 슬립 대비 15분 창).
+    """
+    _verify_call_poll_token(authorization)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        minutes = int(body.get("minutes") or 15)
+    except Exception:
+        minutes = 15
+    minutes = max(1, min(minutes, 240))  # 1분 ~ 4시간
+
+    try:
+        import channel_call_service  # noqa: WPS433
+    except Exception as e:
+        logger.error("channel_call_service import failed: %s", e, exc_info=True)
+        return JSONResponse({"ok": False, "error": f"import failed: {e}"}, status_code=500)
+
+    if not channel_call_service.is_configured():
+        return JSONResponse(
+            {"ok": False, "error": "CHANNEL_TALK_ACCESS_KEY/SECRET not configured"},
+            status_code=500,
+        )
+
+    try:
+        # 동기 함수이므로 스레드에서 실행 (이벤트 루프 블로킹 방지)
+        result = await asyncio.to_thread(channel_call_service.poll_recent_calls, minutes)
+    except Exception as e:
+        logger.error("channel calls poll failed: %s", e, exc_info=True)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+    return JSONResponse({"ok": True, "minutes": minutes, **result})
 
 
 # ──────────────────────────────────────────────

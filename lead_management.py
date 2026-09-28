@@ -1333,6 +1333,28 @@ def _render_lead_filters_and_table(leads_raw: list[dict], emp_map: dict[int, str
 def render_lead_management() -> None:
     """3. 리드고객 관리 메인 페이지."""
 
+    # ── 서브탭: 리드 목록 / 통화 상담 ─────────────
+    # 계획서: docs/plans/채널톡_콜_상담일지_c5e969b5.plan.md
+    _view_key = "lead_records_view"
+    _views = ["리드 목록", "통화 상담"]
+    if _view_key not in st.session_state or st.session_state[_view_key] not in _views:
+        st.session_state[_view_key] = _views[0]
+    _sel_view = st.segmented_control(
+        "메뉴", _views, key=_view_key, label_visibility="collapsed",
+    ) or _views[0]
+
+    if _sel_view == "통화 상담":
+        _user = st.session_state.get("current_user") or {}
+        _role = _user.get("role") or "user"
+        _me_name = str(_user.get("name") or _user.get("username") or "")
+        _current_db = st.session_state.get("current_db")
+        try:
+            from call_records_ui import render_call_records_tab  # noqa: WPS433
+            render_call_records_tab(_current_db, _role, _me_name)
+        except Exception as _ce:
+            st.error(f"통화 상담 화면을 불러오지 못했습니다: {_ce}")
+        return
+
     # ── 페이지 헤더 ────────────────────────────
     _hc1, _hc2, _hc3, _hc4, _hc5 = st.columns([3.2, 1.1, 1.3, 1.3, 1.3])
     with _hc1:
