@@ -3095,6 +3095,83 @@ def _ext_pay_relink_amount_and_near_date(
         sc, db_filename, source, min(from_candidates), used,
     )
     updated = 0
+
+    # 온누리 pre-pass: (tx_date, phone_last4, amount) 이 정확히 일치하는 leftover 결제가
+    # 유일하면 matched_ok 로 먼저 확정한다. main loop 의 diff_amt 가 같은 결제를 다른
+    # 행(같은 last4·다른 금액)에 amount_mismatch 로 붙여버리는 문제를 방지한다.
+    # phone_last4 는 스탬프(phone_last4) 와 phone1 폴백(phone_last4_alt) 둘 다 인정.
+    if source == "onnuri" and leftover:
+        def _p_last4s_pre(p: dict) -> set[str]:
+            s: set[str] = set()
+            _v1 = str(p.get("phone_last4") or "").strip()
+            if _v1:
+                s.add(_v1)
+            _v2 = str(p.get("phone_last4_alt") or "").strip()
+            if _v2:
+                s.add(_v2)
+            return s
+        for r in rows:
+            try:
+                _rid = int(r["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            _m = m_by_row.get(_rid)
+            if _m and (_m.get("result_code") or "") not in ("official_only", "미매칭"):
+                continue
+            if _ext_pay_is_cancel_status(r.get("tx_status")):
+                continue
+            try:
+                _oamt = abs(int(r.get("amount") or 0))
+            except (TypeError, ValueError):
+                continue
+            _l4 = str(r.get("phone_last4") or "")
+            if not _l4:
+                continue
+            _fd = str(r.get("tx_date") or "")[:10]
+            _exact = [
+                p for p in leftover
+                if _l4 in _p_last4s_pre(p)
+                and str(p.get("payment_date") or "")[:10] == _fd
+                and abs(int(p.get("amount") or 0)) == _oamt
+            ]
+            if len(_exact) != 1:
+                continue
+            _hit = _exact[0]
+            _payload = {
+                "result_code": "matched_ok",
+                "note": None,
+                "payment_id": _hit.get("payment_id"),
+                "order_id": _hit.get("order_id"),
+                "customer_id": _hit.get("customer_id"),
+            }
+            try:
+                if _m:
+                    sc.table("app_external_pay_matches").update(_payload).eq(
+                        "db_filename", db_filename
+                    ).eq("row_id", _rid).execute()
+                else:
+                    sc.table("app_external_pay_matches").insert({
+                        "db_filename": db_filename,
+                        "source": source,
+                        "row_id": _rid,
+                        **_payload,
+                        "matched_by": "relink",
+                    }).execute()
+                updated += 1
+                # main loop 이 이 행을 건너뛰도록 in-memory m_by_row 도 갱신
+                m_by_row[_rid] = {
+                    **(_m or {}),
+                    "row_id": _rid,
+                    "source": source,
+                    **_payload,
+                }
+                _pid = _hit.get("payment_id")
+                if _pid is not None:
+                    used.add(int(_pid))
+                    leftover = [p for p in leftover if p.get("payment_id") != _pid]
+            except Exception:
+                continue
+
     for r in rows:
         try:
             rid = int(r["id"])
@@ -3206,9 +3283,28 @@ def _ext_pay_relink_amount_and_near_date(
             last4 = str(r.get("phone_last4") or "")
             if not last4:
                 continue
+
+            def _p_last4s(p: dict) -> set[str]:
+                # leftover 에는 스탬프 last4 (phone_last4) 와 phone1 폴백 (phone_last4_alt) 이 함께 있음.
+                s: set[str] = set()
+                _v1 = str(p.get("phone_last4") or "").strip()
+                if _v1:
+                    s.add(_v1)
+                _v2 = str(p.get("phone_last4_alt") or "").strip()
+                if _v2:
+                    s.add(_v2)
+                return s
+
+            # (A) 공식금액과 정확히 같은 amount + 같은 날짜: matched_ok 후보 우선
+            same_amt_same_date = [
+                p for p in leftover
+                if last4 in _p_last4s(p)
+                and str(p.get("payment_date") or "")[:10] == file_date
+                and abs(int(p.get("amount") or 0)) == oamt
+            ]
             near = []
             for p in leftover:
-                if (p.get("phone_last4") or "") != last4:
+                if last4 not in _p_last4s(p):
                     continue
                 if abs(int(p.get("amount") or 0)) != oamt:
                     continue
@@ -3222,11 +3318,14 @@ def _ext_pay_relink_amount_and_near_date(
                     near.append((p, _dn))
             diff_amt = [
                 p for p in leftover
-                if (p.get("phone_last4") or "") == last4
+                if last4 in _p_last4s(p)
                 and str(p.get("payment_date") or "")[:10] == file_date
                 and abs(int(p.get("amount") or 0)) != oamt
             ]
-            if len(near) == 1:
+            if len(same_amt_same_date) == 1:
+                hit = same_amt_same_date[0]
+                code = "matched_ok"
+            elif len(near) == 1:
                 hit, _dn = near[0]
                 code = "matched_ok"
                 if _dn:
@@ -5756,6 +5855,27 @@ def _ext_pay_unmatched_erp_pays(
     # 모든 source에서 신규고객 필터 제거: 해당 수단 결제 전체를 대상으로 한다.
     new_oids = {int(o.get("id")) for o in orders_map.values() if o.get("id") is not None}
 
+    # 온누리 leftover 는 relink 에서 phone_last4 비교를 하므로 고객 phone1 폴백 last4 도
+    # 함께 실어서 스탬프에 다른 값이 들어간 건도 매칭 가능하도록 한다.
+    cust_phone_map: dict[int, str] = {}
+    if source == "onnuri":
+        _cust_ids: list[int] = []
+        for _o in orders_map.values():
+            _cid = _o.get("customer_id")
+            if _cid is None:
+                continue
+            try:
+                _cust_ids.append(int(_cid))
+            except (TypeError, ValueError):
+                continue
+        _cust_ids = sorted(set(_cust_ids))
+        if _cust_ids:
+            _cm = _get_customers_by_ids_supabase(db_filename, _cust_ids) or {}
+            for _cid, _c in _cm.items():
+                _digits = _ext_pay_digits_only((_c or {}).get("phone1"))
+                if _digits and len(_digits) >= 4:
+                    cust_phone_map[int(_cid)] = _digits[-4:]
+
     out: list[dict] = []
     for p in leftover:
         try:
@@ -5774,6 +5894,7 @@ def _ext_pay_unmatched_erp_pays(
         except (TypeError, ValueError):
             amt = 0
         card_company = None
+        phone4_alt = ""
         if source == "ulsanpay":
             approval = _ext_pay_norm_approval6(p.get("card_company"))
             phone4 = ""
@@ -5788,6 +5909,9 @@ def _ext_pay_unmatched_erp_pays(
         else:
             approval = ""
             phone4 = _onnuri_last4_from_code(p.get("onnuri_approval_code"))
+            # 담당자가 스탬프에 다른 값을 넣은 건도 phone1 last4 로 relink 가능하도록 폴백 저장
+            if cid is not None:
+                phone4_alt = cust_phone_map.get(int(cid), "")
         out.append({
             "payment_id": int(p["id"]),
             "order_id": oid,
@@ -5796,6 +5920,7 @@ def _ext_pay_unmatched_erp_pays(
             "amount": amt,
             "approval_code": approval,
             "phone_last4": phone4,
+            "phone_last4_alt": phone4_alt,
             "card_company": card_company,
             "payment_method": str(p.get("payment_method") or ""),
         })
@@ -32966,7 +33091,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     _render_ext_pay_conflict_panel(sel_db, sel_src, new_from, me_uname)
 
     st.markdown("##### 검증 결과")
-    f1, f2 = st.columns(2)
+    f1, f2, f3 = st.columns([2, 2, 1])
     with f1:
         only_alerts = st.checkbox(
             "미결·취소 의심만 보기",
@@ -32980,6 +33105,35 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             key=f"extpay_show_all_{sel_db}_{sel_src}",
             help="다른 관리자가 올린 건을 시작일 필터에 가리지 않고 봅니다.",
         )
+    with f3:
+        if st.button(
+            "🔄 재검증/재매칭",
+            key=f"extpay_rematch_{sel_db}_{sel_src}",
+            help="기존 미결 매칭(공식만 있음·금액 다름·다중 매치·공식 취소)만 삭제 후, 최신 매칭 로직으로 다시 매칭합니다. matched_ok·수동 매칭·분할 합산 매칭은 유지됩니다.",
+        ):
+            _sc, _sc_err = get_supabase_client()
+            if _sc_err or not _sc:
+                st.error(f"Supabase 연결 실패: {_sc_err}")
+            elif sel_src not in ("onnuri", "ulsanpay"):
+                st.info("이 출처는 자동 재매칭 대상이 아닙니다. (온누리·울산페이 전용)")
+            else:
+                with st.spinner("재매칭 중..."):
+                    _counts, _rerr = _ext_pay_rematch_open_rows(
+                        _sc, sel_db, sel_src, verify_from=None
+                    )
+                if _rerr:
+                    st.error(f"재매칭 실패: {_rerr}")
+                else:
+                    _msg = (
+                        " · ".join(f"{k} {v}" for k, v in (_counts or {}).items())
+                        or "변경 없음"
+                    )
+                    flash(f"재매칭 완료: {_msg}")
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.rerun()
     saved_n = _ext_pay_count_rows(sel_db, sel_src)
     df = _ext_pay_list_matches_df(
         sel_db, sel_src,
