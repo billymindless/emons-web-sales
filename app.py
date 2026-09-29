@@ -4113,25 +4113,38 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
     # ERP 취소 판정 힌트: 같은 order_id에 같은 수단(온누리)의 음수 결제가 있으면 취소 흔적
     neg_orders = {int(p["order_id"]) for p in pays if p.get("order_id") is not None and (p.get("amount") or 0) < 0}
 
-    def _phone_last4_for(pay: dict) -> str | None:
-        # 1) 신규매출 입력 시 저장한 전화번호 뒤 4자리 (onnuri_approval_code 재사용)
+    def _phone_last4s_for(pay: dict) -> set[str]:
+        """ERP 결제의 가능한 phone_last4 후보 집합을 반환.
+
+        - onnuri_approval_code 에 스탬프된 뒤 4자리 (담당자 입력 값)
+        - 결제 order 의 고객 phone1 뒤 4자리 (폴백)
+        두 값을 모두 포함시켜, 담당자가 스탬프에 다른 값(예: 승인번호 뒷자리)을 넣었어도
+        고객 phone1 로 정확 매칭이 가능하도록 한다. 시각이 함께 스탬프되는 신규 건은
+        폴백이 없어도 정확 매칭되므로 부작용이 없다.
+        """
+        result: set[str] = set()
         stored = _onnuri_last4_from_code(pay.get("onnuri_approval_code"))
         if stored:
-            return stored
-        # 2) 스탬프 이전 건: 고객 phone1 폴백
+            result.add(stored)
         oid = pay["_order"].get("customer_id")
-        if oid is None:
-            return None
-        c = cust_map.get(int(oid)) or {}
-        digits = _ext_pay_digits_only(c.get("phone1"))
-        return digits[-4:] if digits else None
+        if oid is not None:
+            c = cust_map.get(int(oid)) or {}
+            digits = _ext_pay_digits_only(c.get("phone1"))
+            if digits and len(digits) >= 4:
+                result.add(digits[-4:])
+        return result
 
     # 매칭 인덱스: (tx_date, phone_last4, amount) → [pay, ...]
+    # 각 결제를 가능한 모든 last4 후보(스탬프·phone1) 밑에 등록해, 담당자가 스탬프에
+    # last4 를 다르게 저장했어도 phone1 폴백으로 정확 매칭이 가능하도록 한다.
     idx: dict[tuple, list[dict]] = {}
     for p in candidate_pays:
-        last4 = _phone_last4_for(p)
-        key = (str(p.get("payment_date") or "")[:10], last4 or "", int(p.get("amount") or 0))
-        idx.setdefault(key, []).append(p)
+        last4_set = _phone_last4s_for(p) or {""}
+        pay_date = str(p.get("payment_date") or "")[:10]
+        amount = int(p.get("amount") or 0)
+        for l4 in last4_set:
+            key = (pay_date, l4, amount)
+            idx.setdefault(key, []).append(p)
 
     counts: dict[str, int] = {}
     inserts: list[dict] = []
@@ -4249,7 +4262,7 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
                             continue
                         if _pid in used_payment_ids:
                             continue
-                        if _phone_last4_for(_p) != last4:
+                        if last4 not in _phone_last4s_for(_p):
                             continue
                         if str(_p.get("payment_date") or "")[:10] != tx_date:
                             continue
@@ -4300,7 +4313,7 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
                                     continue
                                 if _pid in used_payment_ids:
                                     continue
-                                if _phone_last4_for(_p) != last4:
+                                if last4 not in _phone_last4s_for(_p):
                                     continue
                                 if str(_p.get("payment_date") or "")[:10] != tx_date:
                                     continue
