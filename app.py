@@ -36719,10 +36719,12 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                 )
             )
         p_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key="sp_penalty_method")
+        p_card_appr = None
         if p_method in _CARD_WITH_COMPANY:
             p_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key="sp_penalty_card")
+            p_card_appr = st.text_input("카드 승인번호 8자리 *", key="sp_penalty_card_appr", max_chars=8)
         elif p_method == "메인페이":
-            p_card = st.text_input("메인페이 승인번호 4자리", key="sp_penalty_card", max_chars=4)
+            p_card = st.text_input("메인페이 승인번호 8자리", key="sp_penalty_card", max_chars=8)
         elif p_method == "지역화폐":
             p_card = st.text_input("지역화폐 승인번호", key="sp_penalty_card")
         else:
@@ -36763,6 +36765,9 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                 "purchase_reason": "위약금",
                             })
                             if oid:
+                                _p_appr_val = None
+                                if p_method in _CARD_WITH_COMPANY:
+                                    _p_appr_val = re.sub(r"\D", "", (p_card_appr or "").strip()) or None
                                 _insert_payment_supabase(db_filename, {
                                     "order_id": oid,
                                     "payment_date": p_date_str,
@@ -36770,13 +36775,14 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                     "payment_method": p_method or None,
                                     "card_company": p_card,
                                     "fee_amount": fee,
+                                    "onnuri_approval_code": _p_appr_val,
                                     "created_by": _current_username(),
                                 })
                                 _recalc_order_actual_margin_supabase(db_filename, oid)
                                 # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지.
                                 _invalidate_payments()
                                 flash(f"위약금 {p_amt_int:,}원 등록이 완료되었습니다. (주문 #{oid})")
-                                for k in ["sp_penalty_name", "sp_penalty_phone", "sp_penalty_amount", "sp_penalty_reason", "sp_penalty_card"]:
+                                for k in ["sp_penalty_name", "sp_penalty_phone", "sp_penalty_amount", "sp_penalty_reason", "sp_penalty_card", "sp_penalty_card_appr"]:
                                     st.session_state.pop(k, None)
                                 st.rerun()
                             else:
@@ -36829,10 +36835,12 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                 )
             )
         e_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key="sp_emp_method")
+        e_card_appr = None
         if e_method in _CARD_WITH_COMPANY:
             e_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key="sp_emp_card")
+            e_card_appr = st.text_input("카드 승인번호 8자리 *", key="sp_emp_card_appr", max_chars=8)
         elif e_method == "메인페이":
-            e_card = st.text_input("메인페이 승인번호 4자리", key="sp_emp_card", max_chars=4)
+            e_card = st.text_input("메인페이 승인번호 8자리", key="sp_emp_card", max_chars=8)
         elif e_method == "지역화폐":
             e_card = st.text_input("지역화폐 승인번호", key="sp_emp_card")
         else:
@@ -36865,6 +36873,9 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                 "purchase_reason": "직원구매",
                             })
                             if oid:
+                                _e_appr_val = None
+                                if e_method in _CARD_WITH_COMPANY:
+                                    _e_appr_val = re.sub(r"\D", "", (e_card_appr or "").strip()) or None
                                 _insert_payment_supabase(db_filename, {
                                     "order_id": oid,
                                     "payment_date": e_date_str,
@@ -36872,12 +36883,13 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                     "payment_method": e_method or None,
                                     "card_company": e_card,
                                     "fee_amount": fee,
+                                    "onnuri_approval_code": _e_appr_val,
                                     "created_by": _current_username(),
                                 })
                                 _recalc_order_actual_margin_supabase(db_filename, oid)
                                 clear_data_cache()
                                 flash(f"직원 구매 {e_cost_int:,}원 등록이 완료되었습니다. (주문 #{oid})")
-                                for k in ["sp_emp_cost", "sp_emp_card"]:
+                                for k in ["sp_emp_cost", "sp_emp_card", "sp_emp_card_appr"]:
                                     st.session_state.pop(k, None)
                                 st.rerun()
                             else:
@@ -36895,15 +36907,18 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                 (cid, e_emp_sel, e_date_str, e_date_str, f"직원구매_{e_category}", e_cost_int, e_cost_int, "직원구매", "직원구매", "미납"),
                             )
                             oid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                            _e_appr_val_sql = None
+                            if e_method in _CARD_WITH_COMPANY:
+                                _e_appr_val_sql = re.sub(r"\D", "", (e_card_appr or "").strip()) or None
                             conn.execute(
-                                "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, created_by, created_at) VALUES (?,?,?,?,?,?,?,datetime('now', '+9 hours'))",
-                                (oid, e_date_str, e_cost_int, e_method or None, e_card, fee, _current_username()),
+                                "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,datetime('now', '+9 hours'))",
+                                (oid, e_date_str, e_cost_int, e_method or None, e_card, fee, _e_appr_val_sql, _current_username()),
                             )
                             _recalc_order_actual_margin(conn, oid, db_filename)
                             conn.commit()
                             clear_data_cache()
                             flash(f"직원 구매 {e_cost_int:,}원 등록이 완료되었습니다.")
-                            for k in ["sp_emp_cost", "sp_emp_card"]:
+                            for k in ["sp_emp_cost", "sp_emp_card", "sp_emp_card_appr"]:
                                 st.session_state.pop(k, None)
                             st.rerun()
                         finally:
@@ -37360,8 +37375,9 @@ def render_new_sales():
         with c2:
             if method in _CARD_WITH_COMPANY:
                 card_company = st.selectbox(f"카드사 #{i+1} *", options=CARD_COMPANY_OPTIONS, key=card_key)
+                st.text_input(f"카드 승인번호 8자리 #{i+1} *", key=f"pay_card_appr_{i}", max_chars=8)
             elif method == "메인페이":
-                st.text_input(f"메인페이 승인번호 4자리 #{i+1} *", key=card_key, max_chars=4)
+                st.text_input(f"메인페이 승인번호 8자리 #{i+1} *", key=card_key, max_chars=8)
                 card_company = st.session_state.get(card_key)
             elif method == "지역화폐":
                 st.text_input(f"지역화폐 승인번호 6자리 #{i+1} *", key=card_key, max_chars=6)
@@ -37560,10 +37576,14 @@ def render_new_sales():
                 if not _cc:
                     st.error(f"결제 #{i+1} {method} 카드사를 선택하세요.")
                     st.stop()
+                _card_appr = re.sub(r"\D", "", (st.session_state.get(f"pay_card_appr_{i}", "") or "").strip())
+                if len(_card_appr) != 8:
+                    st.error(f"결제 #{i+1} {method} 승인번호 8자리를 정확히 입력하세요.")
+                    st.stop()
             elif method == "메인페이":
                 _appr = re.sub(r"\D", "", (st.session_state.get(f"pay_card_{i}", "") or "").strip())
-                if len(_appr) != 4:
-                    st.error(f"결제 #{i+1} 메인페이 승인번호 4자리를 정확히 입력하세요.")
+                if len(_appr) != 8:
+                    st.error(f"결제 #{i+1} 메인페이 승인번호 8자리를 정확히 입력하세요.")
                     st.stop()
             elif method == "지역화폐":
                 _appr = re.sub(r"\D", "", (st.session_state.get(f"pay_card_{i}", "") or "").strip())
@@ -37706,7 +37726,11 @@ def render_new_sales():
                 fee = _payment_fee_amount(method, amt)
                 total_fees += fee
                 total_paid_initial += amt
-                onnuri_code = _new_onnuri_codes.get(i)
+                # 승인번호: 온누리는 last4+시각, 신용/체크카드는 8자리 승인번호
+                if method in _CARD_WITH_COMPANY:
+                    _appr_code = re.sub(r"\D", "", str(st.session_state.get(f"pay_card_appr_{i}", "") or "").strip()) or None
+                else:
+                    _appr_code = _new_onnuri_codes.get(i)
                 _insert_payment_supabase(db_filename, {
                     "order_id": order_id,
                     "payment_date": order_date.isoformat(),
@@ -37714,7 +37738,7 @@ def render_new_sales():
                     "payment_method": method or None,
                     "card_company": card_company,
                     "fee_amount": fee,
-                    "onnuri_approval_code": onnuri_code,
+                    "onnuri_approval_code": _appr_code,
                     "created_by": _current_username(),
                 })
             actual_margin = basic_margin_save - total_fees  # 실질 마진 = 판매가 - 원가 - 수수료
@@ -37838,15 +37862,19 @@ def render_new_sales():
                     if amt <= 0:
                         continue
                     method = st.session_state.get(f"pay_method_{i}", "")
-                    card_company = st.session_state.get(f"pay_card_{i}", None) if method in ("신용카드", "메인페이") else None
+                    card_company = st.session_state.get(f"pay_card_{i}", None) if method in (*_CARD_WITH_COMPANY, "메인페이", "지역화폐") else None
                     fee = _payment_fee_amount(method, amt)
                     total_fees += fee
                     total_paid_initial += amt
-                    onnuri_code = _new_onnuri_codes.get(i)
+                    # 승인번호: 신용/체크카드는 8자리 승인번호, 그 외는 온누리 코드
+                    if method in _CARD_WITH_COMPANY:
+                        _appr_code_sql = re.sub(r"\D", "", str(st.session_state.get(f"pay_card_appr_{i}", "") or "").strip()) or None
+                    else:
+                        _appr_code_sql = _new_onnuri_codes.get(i)
                     conn.execute("""
                         INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+9 hours'))
-                    """, (order_id, order_date.isoformat(), amt, method or None, card_company, fee, onnuri_code, _current_username()))
+                    """, (order_id, order_date.isoformat(), amt, method or None, card_company, fee, _appr_code_sql, _current_username()))
                 actual_margin = basic_margin_save - total_fees
                 conn.execute("UPDATE Orders SET actual_margin = ? WHERE id = ?", (actual_margin, order_id))
                 remaining = final_sales_save - total_paid_initial
@@ -38026,8 +38054,9 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
     _CARD_WITH_COMPANY_SPLIT = ("신용카드", "체크카드")
     if split_method in _CARD_WITH_COMPANY_SPLIT:
         split_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
+        st.text_input("카드 승인번호 8자리 *", key=f"{key_prefix}_card_appr", max_chars=8)
     elif split_method == "메인페이":
-        split_card = st.text_input("메인페이 승인번호 4자리", key=f"{key_prefix}_card", max_chars=4)
+        split_card = st.text_input("메인페이 승인번호 8자리", key=f"{key_prefix}_card", max_chars=8)
     elif split_method == "지역화폐":
         split_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card")
     else:
@@ -38219,6 +38248,14 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         success_count = 0
         transfer_count = 0
 
+        # 신용/체크카드 승인번호 8자리 (분배결제 공용)
+        _split_card_appr_val = None
+        if split_method in _CARD_WITH_COMPANY_SPLIT:
+            _split_card_appr_val = re.sub(r"\D", "", str(st.session_state.get(f"{key_prefix}_card_appr", "") or "").strip()) or None
+            if not _split_card_appr_val or len(_split_card_appr_val) != 8:
+                st.error(f"{split_method} 승인번호 8자리를 정확히 입력하세요.")
+                return
+
         for oid, alloc_amt in _nonzero_allocs:
             orow_match = orders_df[orders_df["id"] == oid]
             if orow_match.empty:
@@ -38230,7 +38267,11 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
             # 이관 행에는 신규 결제 메타(승인번호 등) 를 붙이지 않는다 — audit 오염 방지.
             _row_method = (split_method or None) if alloc_amt > 0 else None
             _row_card = split_card if alloc_amt > 0 else None
-            _row_onnuri = onnuri_code if alloc_amt > 0 else None
+            # 승인번호: 신용/체크카드는 8자리, 그 외는 온누리 코드
+            if alloc_amt > 0 and split_method in _CARD_WITH_COMPANY_SPLIT:
+                _row_onnuri = _split_card_appr_val
+            else:
+                _row_onnuri = onnuri_code if alloc_amt > 0 else None
             try:
                 if _supabase_orders_payments_available():
                     old_paid, _ = _sum_payments_by_order_supabase(db_filename, oid)
@@ -38355,8 +38396,9 @@ def _customer_balance_payment_ui(
         with _r2:
             if method in _CARD_WITH_COMPANY:
                 card_company = st.selectbox(f"카드사 #{i+1} *", options=CARD_COMPANY_OPTIONS, key=c_key)
+                st.text_input(f"카드 승인번호 8자리 #{i+1} *", key=_slot_key("card_appr", i), max_chars=8)
             elif method == "메인페이":
-                st.text_input(f"메인페이 승인번호 4자리 #{i+1} *", key=c_key, max_chars=4)
+                st.text_input(f"메인페이 승인번호 8자리 #{i+1} *", key=c_key, max_chars=8)
                 card_company = st.session_state.get(c_key)
             elif method == "지역화폐":
                 st.text_input(f"지역화폐 승인번호 #{i+1} *", key=c_key)
@@ -38459,10 +38501,14 @@ def _customer_balance_payment_ui(
             if not (str(s["card_company"] or "").strip()):
                 st.error(f"결제 #{idx1} {method} 카드사를 선택하세요.")
                 return
+            _card_appr_slot = re.sub(r"\D", "", str(st.session_state.get(_slot_key("card_appr", s["index"]), "") or "").strip())
+            if len(_card_appr_slot) != 8:
+                st.error(f"결제 #{idx1} {method} 승인번호 8자리를 정확히 입력하세요.")
+                return
         elif method == "메인페이":
             _digits = re.sub(r"\D", "", str(s["card_company"] or ""))
-            if len(_digits) != 4:
-                st.error(f"결제 #{idx1} 메인페이 승인번호 4자리를 정확히 입력하세요.")
+            if len(_digits) != 8:
+                st.error(f"결제 #{idx1} 메인페이 승인번호 8자리를 정확히 입력하세요.")
                 return
         elif method == "지역화폐":
             _digits = re.sub(r"\D", "", str(s["card_company"] or ""))
@@ -38544,6 +38590,11 @@ def _customer_balance_payment_ui(
         new_balance = balance - added_total
         for s in active:
             fee = _payment_fee_amount(s["method"], int(s["amount"]))
+            # 승인번호: 신용/체크카드는 8자리, 그 외는 온누리 코드
+            if s["method"] in _CARD_WITH_COMPANY:
+                _s_appr = re.sub(r"\D", "", str(st.session_state.get(_slot_key("card_appr", s["index"]), "") or "").strip()) or None
+            else:
+                _s_appr = onnuri_codes.get(s["index"])
             _insert_payment_supabase(db_filename, {
                 "order_id": order_id,
                 "payment_date": pay_date_str,
@@ -38551,7 +38602,7 @@ def _customer_balance_payment_ui(
                 "payment_method": s["method"] or None,
                 "card_company": s["card_company"],
                 "fee_amount": fee,
-                "onnuri_approval_code": onnuri_codes.get(s["index"]),
+                "onnuri_approval_code": _s_appr,
                 "created_by": _current_username(),
             })
         _recalc_order_actual_margin_supabase(db_filename, order_id)
@@ -38588,6 +38639,11 @@ def _customer_balance_payment_ui(
         new_balance = balance - added_total
         for s in active:
             fee = _payment_fee_amount(s["method"], int(s["amount"]))
+            # 승인번호: 신용/체크카드는 8자리, 그 외는 온누리 코드
+            if s["method"] in _CARD_WITH_COMPANY:
+                _s_appr_sql = re.sub(r"\D", "", str(st.session_state.get(_slot_key("card_appr", s["index"]), "") or "").strip()) or None
+            else:
+                _s_appr_sql = onnuri_codes.get(s["index"])
             conn.execute(
                 """
                 INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at)
@@ -38596,7 +38652,7 @@ def _customer_balance_payment_ui(
                 (
                     order_id, pay_date_str, int(s["amount"]),
                     s["method"] or None, s["card_company"], fee,
-                    onnuri_codes.get(s["index"]), _current_username(),
+                    _s_appr_sql, _current_username(),
                 ),
             )
         _recalc_order_actual_margin(conn, order_id, db_filename)
@@ -41344,12 +41400,19 @@ def render_customer_balance():
                                                                 index=_card_idx,
                                                                 key=f"pay_edit_card_{prow['id']}",
                                                             )
+                                                            _cur_card_appr = prow.get("onnuri_approval_code") or ""
+                                                            new_card_appr = st.text_input(
+                                                                "카드 승인번호 8자리 *",
+                                                                value=_cur_card_appr,
+                                                                max_chars=8,
+                                                                key=f"pay_edit_card_appr_{prow['id']}",
+                                                            )
                                                         elif new_method == "메인페이":
                                                             _cur_appr = prow.get("card_company") or ""
                                                             new_card_company = st.text_input(
-                                                                "메인페이 승인번호 4자리 *",
+                                                                "메인페이 승인번호 8자리 *",
                                                                 value=_cur_appr,
-                                                                max_chars=4,
+                                                                max_chars=8,
                                                                 key=f"pay_edit_card_{prow['id']}",
                                                             )
                                                         elif new_method == "지역화폐":
@@ -41501,8 +41564,10 @@ def render_customer_balance():
                                                                 st.warning("사유를 5자 이상 입력하세요.")
                                                             elif new_method in _CARD_WITH_COMPANY and not (new_card_company or "").strip():
                                                                 st.warning(f"{new_method} 카드사를 선택하세요.")
-                                                            elif new_method == "메인페이" and len(re.sub(r"\D", "", (new_card_company or ""))) != 4:
-                                                                st.warning("메인페이 승인번호 4자리를 정확히 입력하세요.")
+                                                            elif new_method in _CARD_WITH_COMPANY and len(re.sub(r"\D", "", (new_card_appr or "").strip())) != 8:
+                                                                st.warning(f"{new_method} 승인번호 8자리를 정확히 입력하세요.")
+                                                            elif new_method == "메인페이" and len(re.sub(r"\D", "", (new_card_company or ""))) != 8:
+                                                                st.warning("메인페이 승인번호 8자리를 정확히 입력하세요.")
                                                             elif new_method == "지역화폐" and len(re.sub(r"\D", "", (new_card_company or "").strip())) != 6:
                                                                 st.warning("지역화폐 승인번호 6자리를 정확히 입력하세요.")
                                                             elif new_method == "지역화폐" and new_amount > 0 and (
@@ -41554,15 +41619,22 @@ def render_customer_balance():
 
                                                                 _old_date_str = str(prow.get("payment_date") or "")[:10]
 
+                                                                # 신용/체크카드 승인번호는 새 필드(new_card_appr)에서, 온누리는 기존 new_onnuri_code에서
+                                                                # 취합해 하나의 approval_code 값으로 통합한다(컬럼: onnuri_approval_code 재활용).
+                                                                if new_method in _CARD_WITH_COMPANY:
+                                                                    _final_appr_code = re.sub(r"\D", "", str(new_card_appr or "").strip()) or None
+                                                                else:
+                                                                    _final_appr_code = new_onnuri_code
+
                                                                 # ── 변경 사항 없음 가드 ──
-                                                                # 5개 필드(금액·수단·날짜·카드사·온누리승인번호)가 모두 원본과 동일하면
+                                                                # 5개 필드(금액·수단·날짜·카드사·승인번호)가 모두 원본과 동일하면
                                                                 # 저장을 차단해 불필요한 상계쌍 생성을 예방한다.
                                                                 _no_change = (
                                                                     int(new_amount) == int(round(old_amt_val))
                                                                     and new_method == prow["payment_method"]
                                                                     and _pay_edit_date_str == _old_date_str
                                                                     and _norm_code(new_card_company) == _norm_code(prow.get("card_company"))
-                                                                    and _norm_code(new_onnuri_code) == _norm_code(prow.get("onnuri_approval_code"))
+                                                                    and _norm_code(_final_appr_code) == _norm_code(prow.get("onnuri_approval_code"))
                                                                 )
                                                                 if _no_change:
                                                                     st.warning(
@@ -41578,7 +41650,7 @@ def render_customer_balance():
                                                                     and _pay_edit_date_str == _old_date_str
                                                                     and (
                                                                         _norm_code(new_card_company) != _norm_code(prow.get("card_company"))
-                                                                        or _norm_code(new_onnuri_code) != _norm_code(prow.get("onnuri_approval_code"))
+                                                                        or _norm_code(_final_appr_code) != _norm_code(prow.get("onnuri_approval_code"))
                                                                     )
                                                                 )
 
@@ -41586,7 +41658,7 @@ def render_customer_balance():
                                                                     # 금액·수단·날짜 동일 + 승인번호만 변경 → 상계 없이 원 결제 행만 수정
                                                                     _code_updates = {
                                                                         "card_company": _norm_code(new_card_company) or None,
-                                                                        "onnuri_approval_code": _norm_code(new_onnuri_code) or None,
+                                                                        "onnuri_approval_code": _norm_code(_final_appr_code) or None,
                                                                     }
                                                                     if _supabase_orders_payments_available():
                                                                         old_paid_total, _ = _sum_payments_by_order_supabase(db_filename, _order_id_pay)
@@ -41681,7 +41753,7 @@ def render_customer_balance():
                                                                                 "payment_method": new_method,
                                                                                 "card_company": new_card_company,
                                                                                 "fee_amount": float(new_fee),
-                                                                                "onnuri_approval_code": new_onnuri_code,
+                                                                                "onnuri_approval_code": _final_appr_code,
                                                                                 "created_by": _current_username(),
                                                                             },
                                                                             _error_detail=_new_err,
@@ -41705,7 +41777,7 @@ def render_customer_balance():
                                                                                 "amount": float(new_amount),
                                                                                 "method": new_method,
                                                                                 "card_company": new_card_company,
-                                                                                "onnuri_approval_code": new_onnuri_code,
+                                                                                "onnuri_approval_code": _final_appr_code,
                                                                             }
                                                                             _pay_edit_committed = True
 
@@ -41738,10 +41810,10 @@ def render_customer_balance():
                                                                     cur = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
                                                                     old_paid_total = cur.fetchone()[0] or 0
     
-                                                                    # 1. 마이너스(-) 상계 전표 INSERT
+                                                                    # 1. 마이너스(-) 상계 전표 INSERT (원본 승인번호도 그대로 상계)
                                                                     conn.execute(
-                                                                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)",
-                                                                        (_order_id_pay, _pay_edit_date_str, -old_amt_val, prow["payment_method"], prow["card_company"], -old_fee_val)
+                                                                        "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                                                        (_order_id_pay, _pay_edit_date_str, -old_amt_val, prow["payment_method"], prow["card_company"], -old_fee_val, prow.get("onnuri_approval_code"))
                                                                     )
     
                                                                     if new_amount == 0:
@@ -41750,8 +41822,8 @@ def render_customer_balance():
                                                                     else:
                                                                         # 2. 새로운 결제(+) 전표 INSERT
                                                                         conn.execute(
-                                                                            "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)",
-                                                                            (_order_id_pay, _pay_edit_date_str, float(new_amount), new_method, new_card_company, float(new_fee))
+                                                                            "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                                                            (_order_id_pay, _pay_edit_date_str, float(new_amount), new_method, new_card_company, float(new_fee), _final_appr_code)
                                                                         )
                                                                         action = "결제변경"
                                                                         new_payment = {
@@ -41759,7 +41831,7 @@ def render_customer_balance():
                                                                             "amount": float(new_amount),
                                                                             "method": new_method,
                                                                             "card_company": new_card_company,
-                                                                            "onnuri_approval_code": new_onnuri_code,
+                                                                            "onnuri_approval_code": _final_appr_code,
                                                                         }
                                                                     _recalc_order_actual_margin(conn, _order_id_pay, db_filename)
                                                                     cur2 = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_order_id_pay,))
@@ -42184,12 +42256,21 @@ def render_customer_balance():
                                                     _cur_card_op = prow.get("card_company") or CARD_COMPANY_OPTIONS[0]
                                                     _card_idx_op = CARD_COMPANY_OPTIONS.index(_cur_card_op) if _cur_card_op in CARD_COMPANY_OPTIONS else 0
                                                     new_card_op = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, index=_card_idx_op, key=f"op_edit_card_{prow['id']}")
+                                                    new_card_appr_op = st.text_input(
+                                                        "카드 승인번호 8자리 *",
+                                                        value=prow.get("onnuri_approval_code") or "",
+                                                        max_chars=8,
+                                                        key=f"op_edit_card_appr_{prow['id']}",
+                                                    )
                                                 elif new_method_op == "메인페이":
-                                                    new_card_op = st.text_input("메인페이 승인번호 4자리", value=prow.get("card_company") or "", max_chars=4, key=f"op_edit_card_{prow['id']}")
+                                                    new_card_op = st.text_input("메인페이 승인번호 8자리", value=prow.get("card_company") or "", max_chars=8, key=f"op_edit_card_{prow['id']}")
+                                                    new_card_appr_op = None
                                                 elif new_method_op == "지역화폐":
                                                     new_card_op = st.text_input("지역화폐 승인번호", value=prow.get("card_company") or "", key=f"op_edit_card_{prow['id']}")
+                                                    new_card_appr_op = None
                                                 else:
                                                     new_card_op = None
+                                                    new_card_appr_op = None
                                                     st.empty()
                                                 _op_edit_date_key = f"op_edit_date_{prow['id']}"
                                                 try:
@@ -42240,6 +42321,8 @@ def render_customer_balance():
                                                 if st.button("수정 완료", key=f"op_pay_edit_{prow['id']}", type="primary"):
                                                     if not del_reason_op or len(del_reason_op.strip()) < 5:
                                                         st.warning("사유를 5자 이상 입력하세요.")
+                                                    elif new_method_op in _CARD_WITH_COMPANY and len(re.sub(r"\D", "", (new_card_appr_op or "").strip())) != 8:
+                                                        st.warning(f"{new_method_op} 승인번호 8자리를 정확히 입력하세요.")
                                                     else:
                                                         _old_amt_op = _prow_amt
                                                         _old_fee_op = float(prow.get("fee_amount") or 0)
@@ -42255,17 +42338,24 @@ def render_customer_balance():
                                                             s = "" if v is None else str(v).strip()
                                                             return "" if s in ("None", "nan", "none") else s
 
+                                                        # 신용/체크카드는 별도 승인번호 필드(new_card_appr_op) 사용
+                                                        if new_method_op in _CARD_WITH_COMPANY:
+                                                            _final_appr_code_op = re.sub(r"\D", "", str(new_card_appr_op or "").strip()) or None
+                                                        else:
+                                                            _final_appr_code_op = None
+
                                                         # ── 변경 사항 없음 가드 ──
-                                                        # 4개 필드(금액·수단·날짜·카드사) 모두 원본과 동일하면 저장 차단.
+                                                        # 5개 필드(금액·수단·날짜·카드사·승인번호) 모두 원본과 동일하면 저장 차단.
                                                         _op_no_change = (
                                                             int(new_amount_op) == int(round(_old_amt_op))
                                                             and new_method_op == prow.get("payment_method")
                                                             and _pay_op_date_str == str(prow.get("payment_date") or "")[:10]
                                                             and _norm_code_op(new_card_op) == _norm_code_op(prow.get("card_company"))
+                                                            and _norm_code_op(_final_appr_code_op) == _norm_code_op(prow.get("onnuri_approval_code"))
                                                         )
                                                         if _op_no_change:
                                                             st.warning(
-                                                                "변경 사항이 없습니다. 금액·수단·날짜·카드사 중 "
+                                                                "변경 사항이 없습니다. 금액·수단·날짜·카드사·승인번호 중 "
                                                                 "하나 이상을 수정한 후 다시 저장하세요."
                                                             )
                                                             st.stop()
@@ -42275,14 +42365,18 @@ def render_customer_balance():
                                                             and int(new_amount_op) == int(round(_old_amt_op))
                                                             and new_method_op == prow.get("payment_method")
                                                             and _pay_op_date_str == str(prow.get("payment_date") or "")[:10]
-                                                            and _norm_code_op(new_card_op) != _norm_code_op(prow.get("card_company"))
+                                                            and (
+                                                                _norm_code_op(new_card_op) != _norm_code_op(prow.get("card_company"))
+                                                                or _norm_code_op(_final_appr_code_op) != _norm_code_op(prow.get("onnuri_approval_code"))
+                                                            )
                                                         )
                                                         if _op_code_only:
                                                             # 금액·수단·날짜 동일 + 승인번호(카드사)만 변경 → 상계 없이 원 결제 행만 수정
                                                             _op_new_code = _norm_code_op(new_card_op) or None
+                                                            _op_new_appr = _norm_code_op(_final_appr_code_op) or None
                                                             if _supabase_orders_payments_available():
                                                                 _old_paid_op, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
-                                                                _op_code_ok = _update_payment_supabase(db_filename, int(prow["id"]), {"card_company": _op_new_code})
+                                                                _op_code_ok = _update_payment_supabase(db_filename, int(prow["id"]), {"card_company": _op_new_code, "onnuri_approval_code": _op_new_appr})
                                                             else:
                                                                 _old_paid_op = 0
                                                                 _op_code_ok = False
@@ -42290,7 +42384,7 @@ def render_customer_balance():
                                                                 if _conn_op:
                                                                     try:
                                                                         _old_paid_op = _conn_op.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_op_oid,)).fetchone()[0] or 0
-                                                                        _conn_op.execute("UPDATE Payments SET card_company = ? WHERE id = ?", (_op_new_code, int(prow["id"])))
+                                                                        _conn_op.execute("UPDATE Payments SET card_company = ?, onnuri_approval_code = ? WHERE id = ?", (_op_new_code, _op_new_appr, int(prow["id"])))
                                                                         _conn_op.commit()
                                                                         _op_code_ok = True
                                                                     finally:
@@ -42305,19 +42399,19 @@ def render_customer_balance():
                                                                 None, _op_oid, _cname_op, _action_op,
                                                                 {"order_id": int(_op_oid), "paid_total_before": _old_paid_op, "balance_before": _op_balance, "payment": _old_payment_op},
                                                                 {"order_id": int(_op_oid), "paid_total_after": _old_paid_op, "balance_after": _op_balance,
-                                                                 "payment": {"payment_id": int(prow["id"]), "amount": _old_amt_op, "method": new_method_op, "card_company": _op_new_code}},
+                                                                 "payment": {"payment_id": int(prow["id"]), "amount": _old_amt_op, "method": new_method_op, "card_company": _op_new_code, "onnuri_approval_code": _op_new_appr}},
                                                                 del_reason_op, db_filename=db_filename,
                                                             )
                                                         elif _supabase_orders_payments_available():
                                                             _old_paid_op, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
-                                                            _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _pay_op_date_str, "amount": -_old_amt_op, "payment_method": _prow_method, "card_company": prow.get("card_company"), "fee_amount": -_old_fee_op})
+                                                            _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _pay_op_date_str, "amount": -_old_amt_op, "payment_method": _prow_method, "card_company": prow.get("card_company"), "fee_amount": -_old_fee_op, "onnuri_approval_code": prow.get("onnuri_approval_code")})
                                                             if new_amount_op == 0:
                                                                 _action_op = "결제취소"
                                                                 _new_payment_op = {}
                                                             else:
-                                                                _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _pay_op_date_str, "amount": float(new_amount_op), "payment_method": new_method_op, "card_company": new_card_op, "fee_amount": float(_new_fee_op)})
+                                                                _insert_payment_supabase(db_filename, {"order_id": _op_oid, "payment_date": _pay_op_date_str, "amount": float(new_amount_op), "payment_method": new_method_op, "card_company": new_card_op, "fee_amount": float(_new_fee_op), "onnuri_approval_code": _final_appr_code_op})
                                                                 _action_op = "결제변경"
-                                                                _new_payment_op = {"payment_id": "신규생성(상계처리)", "amount": float(new_amount_op), "method": new_method_op, "card_company": new_card_op}
+                                                                _new_payment_op = {"payment_id": "신규생성(상계처리)", "amount": float(new_amount_op), "method": new_method_op, "card_company": new_card_op, "onnuri_approval_code": _final_appr_code_op}
                                                             _recalc_order_actual_margin_supabase(db_filename, _op_oid)
                                                             _new_paid_op, _ = _sum_payments_by_order_supabase(db_filename, _op_oid)
                                                             _new_bal_op = (_op_balance + _old_amt_op - float(new_amount_op)) if new_amount_op > 0 else _op_balance + _old_amt_op
@@ -42329,12 +42423,12 @@ def render_customer_balance():
                                                             if _conn_op:
                                                                 try:
                                                                     _old_paid_op = _conn_op.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id = ?", (_op_oid,)).fetchone()[0] or 0
-                                                                    _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)", (_op_oid, _pay_op_date_str, -_old_amt_op, _prow_method, prow.get("card_company"), -_old_fee_op))
+                                                                    _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code) VALUES (?, ?, ?, ?, ?, ?, ?)", (_op_oid, _pay_op_date_str, -_old_amt_op, _prow_method, prow.get("card_company"), -_old_fee_op, prow.get("onnuri_approval_code")))
                                                                     if new_amount_op == 0:
                                                                         _action_op = "결제취소"
                                                                         _new_payment_op = {}
                                                                     else:
-                                                                        _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount) VALUES (?, ?, ?, ?, ?, ?)", (_op_oid, _pay_op_date_str, float(new_amount_op), new_method_op, new_card_op, float(_new_fee_op)))
+                                                                        _conn_op.execute("INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code) VALUES (?, ?, ?, ?, ?, ?, ?)", (_op_oid, _pay_op_date_str, float(new_amount_op), new_method_op, new_card_op, float(_new_fee_op), _final_appr_code_op))
                                                                         _action_op = "결제변경"
                                                                         _new_payment_op = {}
                                                                     _conn_op.commit()
