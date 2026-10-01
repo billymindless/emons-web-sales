@@ -33340,6 +33340,311 @@ def _render_kpi_weights_admin_section(role: str, me_uname: str) -> None:
         st.dataframe(_tbl, width="stretch", hide_index=True)
 
 
+def _render_approval_edit_dialog_impl(db_filename: str, meta: dict) -> None:
+    """결제대사 결과표에서 선택한 결제 1건의 승인번호(또는 카드사 승인번호)만 수정하는 팝업.
+
+    - 입력: `onnuri_approval_code` (온누리) 또는 `card_company` (지역화폐·카드·메인페이) 1개 필드만.
+    - 음수 상계 전표·현금/계좌이체 등 승인번호 개념이 없는 수단은 비활성.
+    - 저장 시 `_update_payment_supabase` 가 자동으로 `_ext_pay_rematch_after_payment_change` 를
+      호출해 재매칭하므로, 결과표 결과(금액일치 등)가 자동 갱신된다.
+    - 금액·수단·결제일자는 절대 수정하지 않음(불변).
+    """
+    pid = int(meta.get("_payment_id") or 0)
+    if pid <= 0:
+        st.error("결제 ID 를 확인할 수 없습니다.")
+        if st.button("닫기", key=f"appr_dlg_close_bad_{pid}"):
+            st.session_state.pop("_extpay_appr_edit_target", None)
+            st.rerun()
+        return
+
+    # 현재 DB 값으로 refetch (df 의 _amount_int 는 표시용·캐시 가능성이 있어 저장 직전엔 refetch)
+    pay_row = _get_payment_row_supabase(db_filename, pid) or {}
+    cur_method = str(pay_row.get("payment_method") or meta.get("_payment_method") or "").strip()
+    try:
+        cur_amount = int(round(float(pay_row.get("amount") or meta.get("_amount_int") or 0)))
+    except (TypeError, ValueError):
+        cur_amount = int(meta.get("_amount_int") or 0)
+    cur_date_str = str(pay_row.get("payment_date") or "")[:10]
+    cur_onnuri = str(pay_row.get("onnuri_approval_code") or "").strip()
+    cur_card_company = str(pay_row.get("card_company") or "").strip()
+
+    def _norm_code(v) -> str:
+        s = "" if v is None else str(v).strip()
+        return "" if s in ("None", "nan", "none") else s
+
+    # ─ 요약 (읽기 전용) ──
+    _cust_name = str(meta.get("_customer_name") or "")
+    _buyer = str(meta.get("_buyer") or "")
+    _oid = meta.get("_order_id")
+
+    st.markdown("##### 결제 정보 (읽기 전용)")
+    r1c1, r1c2 = st.columns(2)
+    with r1c1:
+        st.caption(f"**모모 결제 ID**: {pid}")
+        st.caption(f"**주문 ID**: {_oid or '-'}")
+        st.caption(f"**결제일**: {cur_date_str or '-'}")
+        st.caption(f"**금액**: {cur_amount:,}원")
+    with r1c2:
+        st.caption(f"**수단**: {cur_method or '-'}")
+        st.caption(f"**고객명**: {_cust_name or '-'}")
+        if _buyer:
+            st.caption(f"**구매자(공식)**: {_buyer}")
+        st.caption(f"**결과**: {meta.get('_result_label') or '-'}")
+
+    st.divider()
+
+    # ─ 음수(상계) 전표 가드 ──
+    if cur_amount < 0:
+        st.warning("⚠️ 마이너스(상계) 전표는 승인번호를 수정할 수 없습니다. 정상 결제 행을 선택해 주세요.")
+        if st.button("닫기", key=f"appr_dlg_close_neg_{pid}"):
+            st.session_state.pop("_extpay_appr_edit_target", None)
+            st.rerun()
+        return
+
+    # ─ 수단별 입력 가드 ──
+    _is_onnuri_digital = ("온누리" in cur_method) and ("지류" not in cur_method)
+    _is_ulsan = (cur_method == "지역화폐")
+    _is_card = cur_method in _CARD_WITH_COMPANY
+    _is_mainpay = (cur_method == "메인페이")
+    _editable = _is_onnuri_digital or _is_ulsan or _is_card or _is_mainpay
+
+    if not _editable:
+        st.info(
+            f"'{cur_method}' 수단은 승인번호 개념이 없어 이 팝업에서 수정할 수 없습니다. "
+            "(수정 가능: 온누리(디지털) / 지역화폐 / 신용·체크카드 / 메인페이)"
+        )
+        if st.button("닫기", key=f"appr_dlg_close_noedit_{pid}"):
+            st.session_state.pop("_extpay_appr_edit_target", None)
+            st.rerun()
+        return
+
+    st.markdown("##### 승인번호 수정 (이 값만 저장됩니다)")
+
+    _new_onnuri_code: str | None = None
+    _new_card_company_input: str | None = None
+
+    if _is_onnuri_digital:
+        _cur_last4 = _onnuri_last4_from_code(cur_onnuri)
+        _cur_time = _onnuri_time_from_code(cur_onnuri) or ""
+        _cur_time_disp = _onnuri_format_time_display(_cur_time) if _cur_time else ""
+        st.caption(
+            f"현재 값: 뒤4 = `{_cur_last4 or '-'}` · 거래시각 = `{_cur_time_disp or '없음'}` "
+            f"(원본: `{cur_onnuri or '-'}`)"
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            _new_last4_raw = st.text_input(
+                "전화번호 뒤 4자리 *",
+                value=_cur_last4,
+                max_chars=4,
+                key=f"appr_dlg_last4_{pid}",
+                help="디지털 온누리 영수증 '구매자전화번호' 뒤 4자리와 동일하게 입력하세요.",
+            )
+        with c2:
+            _new_time_raw = st.text_input(
+                "거래시각 (선택)",
+                value=_cur_time_disp,
+                max_chars=8,
+                placeholder="18:15:29",
+                key=f"appr_dlg_time_{pid}",
+                help="같은 날·같은 뒤 4자리·같은 금액 결제가 또 있을 때 거래시각으로 구분합니다.",
+            )
+        _ident_preview, _ident_err = _onnuri_compose_ident(
+            _new_last4_raw, _new_time_raw, require_time=False,
+        )
+        if _ident_err:
+            st.caption(f"⚠️ {_ident_err}")
+        _new_onnuri_code = _ident_preview
+    elif _is_ulsan:
+        _cur_appr6 = _ext_pay_norm_approval6(cur_card_company)
+        st.caption(f"현재 값: 승인번호 = `{_cur_appr6 or '-'}` (원본: `{cur_card_company or '-'}`)")
+        _new_card_company_input = st.text_input(
+            "지역화폐 승인번호 6자리 *",
+            value=_cur_appr6,
+            max_chars=6,
+            key=f"appr_dlg_ulsan_{pid}",
+            help="숫자 6자리. 앞자리 0 포함.",
+        )
+    elif _is_card:
+        _cur_appr8 = re.sub(r"\D", "", str(cur_card_company or "").strip())
+        st.caption(f"현재 값: 승인번호 = `{_cur_appr8 or '-'}` (원본: `{cur_card_company or '-'}`)")
+        _new_card_company_input = st.text_input(
+            f"{cur_method} 승인번호 8자리 *",
+            value=_cur_appr8,
+            max_chars=8,
+            key=f"appr_dlg_card_{pid}",
+            help="숫자 8자리.",
+        )
+    elif _is_mainpay:
+        _cur_appr8 = re.sub(r"\D", "", str(cur_card_company or "").strip())
+        st.caption(f"현재 값: 승인번호 = `{_cur_appr8 or '-'}` (원본: `{cur_card_company or '-'}`)")
+        _new_card_company_input = st.text_input(
+            "메인페이 승인번호 8자리 *",
+            value=_cur_appr8,
+            max_chars=8,
+            key=f"appr_dlg_mainpay_{pid}",
+            help="숫자 8자리.",
+        )
+
+    _reason = st.text_input(
+        "변경 사유 (5자 이상) *",
+        key=f"appr_dlg_reason_{pid}",
+        placeholder="예: 공식 원장 승인번호와 불일치, 담당자 재확인 완료 등",
+    )
+
+    st.divider()
+    _b1, _b2 = st.columns([1, 1])
+    with _b1:
+        _clicked_save = st.button(
+            "💾 승인번호 저장", key=f"appr_dlg_save_{pid}",
+            type="primary", width="stretch",
+        )
+    with _b2:
+        if st.button("취소", key=f"appr_dlg_cancel_{pid}", width="stretch"):
+            st.session_state.pop("_extpay_appr_edit_target", None)
+            st.rerun()
+
+    if not _clicked_save:
+        return
+
+    # ── 입력 검증 ──
+    if not _reason or len(_reason.strip()) < 5:
+        st.warning("사유를 5자 이상 입력하세요.")
+        return
+
+    _payload: dict | None = None
+    if _is_onnuri_digital:
+        if not _new_onnuri_code:
+            st.warning("전화번호 뒤 4자리를 정확히 입력하세요.")
+            return
+        if _norm_code(_new_onnuri_code) == _norm_code(cur_onnuri):
+            st.warning("변경 사항이 없습니다. 뒤 4자리 또는 거래시각을 수정하세요.")
+            return
+        _tm = _onnuri_time_from_code(_new_onnuri_code)
+        _l4 = _onnuri_last4_from_code(_new_onnuri_code)
+        if _onnuri_ident_already_used(
+            db_filename, _l4, cur_amount, cur_date_str,
+            exclude_payment_id=pid, tx_time=_tm,
+        ):
+            if not _tm:
+                st.warning(
+                    "같은 날·같은 뒤 4자리·같은 금액 결제가 이미 존재합니다. "
+                    "거래시각(예: 18:15:29)을 추가 입력해 구분해 주세요."
+                )
+            else:
+                st.warning("같은 날·같은 뒤 4자리·같은 금액·같은 거래시각 결제가 이미 존재합니다.")
+            return
+        _payload = {"onnuri_approval_code": _new_onnuri_code}
+    elif _is_ulsan:
+        _norm = _ext_pay_norm_approval6(_new_card_company_input)
+        if len(_norm) != 6:
+            st.warning("지역화폐 승인번호 6자리를 정확히 입력하세요.")
+            return
+        if _norm_code(_norm) == _norm_code(cur_card_company):
+            st.warning("변경 사항이 없습니다.")
+            return
+        _conflict_store = _ulsan_approval_already_used(
+            db_filename, _norm, exclude_payment_id=pid,
+        )
+        if _conflict_store:
+            st.warning(
+                f"지역화폐 승인번호 `{_norm}` 가 이미 다른 결제에 등록되어 있습니다. "
+                f"(매장: {_conflict_store})"
+            )
+            return
+        _payload = {"card_company": _norm}
+    elif _is_card:
+        _norm = re.sub(r"\D", "", str(_new_card_company_input or "").strip())
+        if len(_norm) != 8:
+            st.warning(f"{cur_method} 승인번호 8자리를 정확히 입력하세요.")
+            return
+        if _norm_code(_norm) == _norm_code(cur_card_company):
+            st.warning("변경 사항이 없습니다.")
+            return
+        _payload = {"card_company": _norm}
+    elif _is_mainpay:
+        _norm = re.sub(r"\D", "", str(_new_card_company_input or "").strip())
+        if len(_norm) != 8:
+            st.warning("메인페이 승인번호 8자리를 정확히 입력하세요.")
+            return
+        if _norm_code(_norm) == _norm_code(cur_card_company):
+            st.warning("변경 사항이 없습니다.")
+            return
+        _payload = {"card_company": _norm}
+    if _payload is None:
+        st.error("저장할 값이 없습니다.")
+        return
+
+    # ── 저장 ──
+    _old_payment = {
+        "payment_id": pid,
+        "amount": cur_amount,
+        "method": cur_method,
+        "card_company": cur_card_company,
+        "onnuri_approval_code": cur_onnuri,
+        "payment_date": cur_date_str,
+    }
+    if _supabase_orders_payments_available():
+        _ok = _update_payment_supabase(db_filename, pid, _payload)
+        if not _ok:
+            st.error("승인번호 저장에 실패했습니다. 네트워크·DB 권한을 확인한 뒤 다시 시도해 주세요.")
+            return
+    else:
+        _conn = get_tenant_conn(db_filename)
+        if _conn is None:
+            st.error("DB 연결에 실패했습니다.")
+            return
+        try:
+            if "onnuri_approval_code" in _payload:
+                _conn.execute(
+                    "UPDATE Payments SET onnuri_approval_code = ? WHERE id = ?",
+                    (_payload["onnuri_approval_code"], pid),
+                )
+            else:
+                _conn.execute(
+                    "UPDATE Payments SET card_company = ? WHERE id = ?",
+                    (_payload["card_company"], pid),
+                )
+            _conn.commit()
+        except Exception as _e:
+            _conn.close()
+            st.error(f"저장 오류: {_e}")
+            return
+        _conn.close()
+
+    _new_payment = dict(_old_payment)
+    _new_payment.update({
+        "card_company": _payload.get("card_company", cur_card_company),
+        "onnuri_approval_code": _payload.get("onnuri_approval_code", cur_onnuri),
+    })
+    _cust_name_ph = _cust_name or ""
+    try:
+        _cid_for_name = meta.get("_customer_id")
+        if not _cid_for_name and meta.get("_order_id"):
+            _cid_for_name = _get_order_customer_id_supabase(db_filename, int(meta["_order_id"]))
+        if _cid_for_name and not _cust_name_ph:
+            _cust_name_ph = _get_customer_name_supabase(db_filename, int(_cid_for_name)) or ""
+    except Exception:
+        pass
+    _ph_err = _insert_payment_history(
+        None,
+        int(meta.get("_order_id") or 0),
+        _cust_name_ph,
+        "승인번호변경",
+        {"order_id": int(meta.get("_order_id") or 0), "payment": _old_payment},
+        {"order_id": int(meta.get("_order_id") or 0), "payment": _new_payment},
+        _reason.strip(),
+        db_filename=db_filename,
+    )
+    if _ph_err:
+        st.warning(f"⚠️ 이력 저장 오류: {_ph_err}")
+
+    _invalidate_payments()
+    st.session_state.pop("_extpay_appr_edit_target", None)
+    st.toast("✅ 승인번호가 저장되었습니다. 자동 재매칭이 진행됩니다.", icon="✅")
+    st.rerun()
+
+
 def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     """관리자 설정 8번: 온누리 / 울산페이 / 카드매출 외부파일 대사.
     - 검증 시작일 저장 (기본 2026-08-01)
@@ -33742,12 +34047,72 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         c: st.column_config.Column(c, width=_col_w.get(c, 120))
         for c in _all_cols
     }
-    st.dataframe(
+    _sel_key = f"extpay_result_sel_{sel_db}_{sel_src}"
+    _sel_event = st.dataframe(
         _show.style.apply(_hl_fabricated, axis=1),
         width="stretch",
         hide_index=True,
         column_config=_cfg,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=_sel_key,
     )
+    st.caption("💡 승인번호만 수정할 때는 결과표에서 해당 행의 체크박스를 클릭하면 수정 팝업이 자동으로 열립니다.")
+
+    # ── 행 선택 감지 → 승인번호 수정 팝업 target 설정 ──
+    _last_opened_key = f"_extpay_appr_last_opened_{sel_db}_{sel_src}"
+    try:
+        _sel_rows = list((_sel_event.selection.rows if _sel_event and hasattr(_sel_event, "selection") else []) or [])
+    except Exception:
+        _sel_rows = []
+    if _sel_rows:
+        _row_idx = int(_sel_rows[0])
+        if 0 <= _row_idx < len(df):
+            _meta_row = df.iloc[_row_idx]
+            try:
+                _pid_val = _meta_row.get("_payment_id") if hasattr(_meta_row, "get") else None
+                _pid = int(_pid_val) if _pid_val is not None and pd.notna(_pid_val) else 0
+            except (TypeError, ValueError):
+                _pid = 0
+            if _pid > 0:
+                _this_key = (_row_idx, _pid)
+                if st.session_state.get(_last_opened_key) != _this_key:
+                    st.session_state[_last_opened_key] = _this_key
+
+                    def _safe_int(v):
+                        try:
+                            return int(v) if v is not None and pd.notna(v) else None
+                        except (TypeError, ValueError):
+                            return None
+                    _result_code = str(_meta_row.get("결과") or "")
+                    _result_label = _result_map.get(_result_code, _result_code)
+                    st.session_state["_extpay_appr_edit_target"] = {
+                        "_src_key": (sel_db, sel_src),
+                        "_payment_id": _pid,
+                        "_order_id": _safe_int(_meta_row.get("_order_id")),
+                        "_customer_id": _safe_int(_meta_row.get("_customer_id")),
+                        "_payment_method": str(_meta_row.get("_payment_method") or ""),
+                        "_amount_int": _safe_int(_meta_row.get("_amount_int")) or 0,
+                        "_official_date": str(_meta_row.get("공식일자") or "")[:10],
+                        "_official_amount": str(_meta_row.get("공식금액") or ""),
+                        "_buyer": str(_meta_row.get("구매자") or ""),
+                        "_result_code": _result_code,
+                        "_result_label": _result_label,
+                        "_customer_name": str(_meta_row.get("고객명") or ""),
+                        "_src_label": _src_side,
+                    }
+    else:
+        # 선택 해제 → 다음 체크 시 다이얼로그 재오픈 허용
+        st.session_state.pop(_last_opened_key, None)
+
+    _appr_target = st.session_state.get("_extpay_appr_edit_target")
+    if _appr_target and _appr_target.get("_src_key") == (sel_db, sel_src) and _appr_target.get("_payment_id"):
+        _open_dialog(
+            f"승인번호 수정 · 결제 #{_appr_target['_payment_id']}",
+            lambda _t=_appr_target, _db=sel_db: _render_approval_edit_dialog_impl(_db, _t),
+            width="medium",
+        )
+
     _dl = df_show[_all_cols].copy()
     if _flag_col in df_show.columns:
         _dl["가공번호의심"] = df_show[_flag_col].map(lambda v: "Y" if bool(v) else "")
