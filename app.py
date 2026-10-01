@@ -30923,7 +30923,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 except (TypeError, ValueError):
                     pass
 
-        # 이력이 있으면 참고 배너 표시 — pay_list 우선 채택 시 참고용 캡션, 이력 채택 시 원본 안내
+        # 참고 이력 / 등록될 원본 — 스크롤 가능한 컨테이너 (긴 텍스트도 잘 보이게)
         if _orig_has_history:
             try:
                 _oa = f"{int(float(_hist_orig.get('amount') or 0)):,}원"
@@ -30943,51 +30943,36 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 f"{_na} / {_hist_new.get('method') or '-'}"
                 f"{(' · ' + str(_hist_new.get('onnuri'))) if _hist_new.get('onnuri') else ''}"
             )
-            if _orig_from_paylist:
-                # pay_list 를 원본으로 채택한 경우 이력은 참고용
-                st.caption(f"📋 참고 이력: {_hist_from} → {_hist_to}")
-            else:
-                # 이력을 원본으로 채택한 경우 명확히 표시
-                st.info(f"원본(이력): {_hist_from}  →  변경 후(이력): {_hist_to}")
-
-        _manual_orig = st.checkbox("원본 수동 수정", key=f"pcr_manual_orig_{order_id}",
-                                   help="이력/현재행 원본이 틀리면 직접 수정합니다.")
-        if _manual_orig:
-            oc1, oc2, oc3 = st.columns(3)
-            with oc1:
-                orig["amount"] = st.number_input(
-                    "원본 금액(원)", min_value=0, step=1000,
-                    value=int(float(orig.get("amount") or 0)),
-                    key=f"pcr_orig_amt_{order_id}",
-                )
-            with oc2:
-                _om = str(orig.get("method") or "")
-                _om_idx = PAYMENT_METHOD_OPTIONS.index(_om) if _om in PAYMENT_METHOD_OPTIONS else 0
-                orig["method"] = st.selectbox(
-                    "원본 수단", options=PAYMENT_METHOD_OPTIONS,
-                    index=_om_idx, key=f"pcr_orig_meth_{order_id}",
-                )
-            with oc3:
-                orig["onnuri"] = st.text_input(
-                    "원본 온누리/승인번호", value=str(orig.get("onnuri") or ""),
-                    key=f"pcr_orig_onnuri_{order_id}",
-                )
+            with st.container(height=80, border=True):
+                if _orig_from_paylist:
+                    st.markdown(f"📋 **참고 이력**  \n{_hist_from} → {_hist_to}")
+                else:
+                    st.markdown(
+                        f"⚠️ **원본(이력)**: {_hist_from}  \n"
+                        f"**변경 후(이력)**: {_hist_to}"
+                    )
         elif orig:
             try:
                 _oa2 = f"{int(float(orig.get('amount') or 0)):,}원"
             except Exception:
                 _oa2 = "-"
-            st.caption(
-                f"등록될 원본: {_oa2} / {orig.get('method') or '-'} "
-                f"{('· ' + str(orig.get('onnuri'))) if orig.get('onnuri') else ''}"
-            )
+            with st.container(height=60, border=True):
+                st.markdown(
+                    f"**등록될 원본**: {_oa2} / {orig.get('method') or '-'}"
+                    f"{(' · ' + str(orig.get('onnuri'))) if orig.get('onnuri') else ''}"
+                )
 
-        change_type = st.selectbox(
-            "변경 유형",
-            options=_tb.PAYMENT_CHANGE_TYPES,
-            format_func=lambda c: _tb.PAYMENT_CHANGE_TYPE_LABELS.get(c, c),
-            key=f"pcr_type_{order_id}",
-        )
+        # 원본 수동 수정이 켜져 있으면 세션 값으로 orig 를 상위에서 override (UI 는 하단 expander 에서 렌더)
+        if bool(st.session_state.get(f"pcr_manual_orig_{order_id}", False)):
+            _k_amt = f"pcr_orig_amt_{order_id}"
+            if _k_amt in st.session_state:
+                orig["amount"] = st.session_state[_k_amt]
+            _k_meth = f"pcr_orig_meth_{order_id}"
+            if _k_meth in st.session_state:
+                orig["method"] = st.session_state[_k_meth]
+            _k_on = f"pcr_orig_onnuri_{order_id}"
+            if _k_on in st.session_state:
+                orig["onnuri"] = st.session_state[_k_on]
 
         # 변경 후 기본값: 이력 new → 없으면 현재 선택 결제행
         _default_new = _hist_new if (_hist_new.get("method") or _hist_new.get("amount") not in (None, "")) else {}
@@ -31037,20 +31022,22 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             if _dk not in st.session_state:
                 st.session_state[_dk] = _today
 
-        st.markdown("**변경 후 결제** (여러 수단으로 나눠 결제한 경우 라인 추가)")
+        st.divider()
+        st.markdown("**변경 후 결제**")
+        st.caption("여러 수단으로 나눠 결제한 경우 ➕ 로 라인 추가")
 
         new_lines: list[dict] = []
         for _i in range(_new_count):
-            lc1, lc2, lc3, lc4, lc5 = st.columns([1.4, 1.4, 1.6, 1.4, 0.4])
+            lc1, lc2, lc3, lc4, lc5 = st.columns([1.1, 1.3, 1.6, 1.3, 0.3])
             with lc1:
                 _date_i = st.date_input(
-                    f"결제날짜 #{_i + 1}",
+                    f"날짜 #{_i + 1}",
                     key=f"pcr_date_{order_id}_{_i}",
                     format="YYYY-MM-DD",
                 )
             with lc2:
                 _meth_i = st.selectbox(
-                    f"결제수단 #{_i + 1}", options=PAYMENT_METHOD_OPTIONS,
+                    f"수단 #{_i + 1}", options=PAYMENT_METHOD_OPTIONS,
                     key=f"pcr_meth_{order_id}_{_i}",
                 )
             _meth_norm = str(_meth_i or "")
@@ -31082,7 +31069,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     )
                 else:
                     if _needs_card:
-                        _code_label = f"결제카드사 #{_i + 1}"
+                        _code_label = f"카드사 #{_i + 1}"
                         _code_ph = "예: NH농협카드"
                     elif _is_ulsan:
                         _code_label = f"지역화폐 승인번호 #{_i + 1}"
@@ -31099,7 +31086,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     )
             with lc4:
                 # 실시간 콤마 포맷은 클라이언트 사이드 JS(_inject_money_input_live_format)에서 처리.
-                # 파이썬 on_change 는 blur 마다 rerun 을 유발해 화면 점멸/지연의 원인이라 제거.
+                # 라벨은 반드시 '결제금액' prefix 유지 (JS binder 가 이 prefix 로 input 을 찾아 바인딩).
                 st.text_input(
                     f"결제금액 #{_i + 1}",
                     key=_amt_key_i,
@@ -31182,43 +31169,87 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         new_method = " · ".join(x["method"] for x in new_lines if x["method"]) or ""
         new_onnuri = " · ".join(x["onnuri"] for x in new_lines if x["onnuri"]) or ""
 
-        _rsn_c1, _rsn_c2, _rsn_c3 = st.columns([3, 1.5, 1.5])
-        with _rsn_c1:
-            reason = st.text_area(
-                "변경 사유 *", key=f"pcr_reason_{order_id}", height=90,
-                placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제",
-            )
-        with _rsn_c2:
-            refund_bank = st.text_input(
-                "환불 계좌 (은행·예금주) *",
-                key=f"pcr_refund_bank_{order_id}",
-                placeholder="예: 국민은행 홍길동",
-            )
-        with _rsn_c3:
-            refund_account = st.text_input(
-                "계좌번호 *",
-                key=f"pcr_refund_account_{order_id}",
-                placeholder="예: 123-45-678901",
-            )
-
-        emp_options = _pcr_assignee_options(store_id, role, me_uname)
-        emp_username_to_label = {u: lbl for u, lbl in emp_options}
-        pcr_assignees = st.multiselect(
-            "결제자 *",
-            options=[u for u, _ in emp_options],
-            format_func=lambda u: emp_username_to_label.get(u, u),
-            key=f"pcr_assignees_{order_id}",
-            help="결제 변경을 확인·처리할 결제자를 지정합니다.",
+        # ── 변경 사유 (전체폭, 높이 150 — 긴 텍스트 스크롤 확보) ──
+        st.divider()
+        reason = st.text_area(
+            "변경 사유 *", key=f"pcr_reason_{order_id}", height=150,
+            placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제",
         )
 
-        # 증빙 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
-        ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0))
-        files = _file_input_with_paste(
-            "📎 증빙 사진/파일 첨부 (선택)",
-            accept_multiple_files=True,
-            key=f"pcr_files_{order_id}_{ver}",
-        )
-        _render_upload_preview(files)
+        # ── 추가 항목 (환불 계좌 · 결제자 · 변경 유형 · 원본 수동 수정 · 증빙 첨부) ──
+        # 필수(*) 필드가 하나라도 비어 있으면 라벨에 ⚠️ 뱃지 + expander 자동 열림
+        _rb_val = str(st.session_state.get(f"pcr_refund_bank_{order_id}", "") or "").strip()
+        _ra_val = str(st.session_state.get(f"pcr_refund_account_{order_id}", "") or "").strip()
+        _asg_val = st.session_state.get(f"pcr_assignees_{order_id}") or []
+        _req_missing = (not _rb_val) or (not _ra_val) or (not _asg_val)
+        _exp_label = "➕ 추가 항목 (환불 계좌 · 결제자 · 변경 유형 · 증빙 등)"
+        if _req_missing:
+            _exp_label = "⚠️ 추가 항목 — 필수 미입력 (환불 계좌 · 결제자)"
+
+        with st.expander(_exp_label, expanded=_req_missing):
+            change_type = st.selectbox(
+                "변경 유형",
+                options=_tb.PAYMENT_CHANGE_TYPES,
+                format_func=lambda c: _tb.PAYMENT_CHANGE_TYPE_LABELS.get(c, c),
+                key=f"pcr_type_{order_id}",
+            )
+            _rc1, _rc2 = st.columns([1, 1])
+            with _rc1:
+                refund_bank = st.text_input(
+                    "환불 계좌 (은행·예금주) *",
+                    key=f"pcr_refund_bank_{order_id}",
+                    placeholder="예: 국민은행 홍길동",
+                )
+            with _rc2:
+                refund_account = st.text_input(
+                    "계좌번호 *",
+                    key=f"pcr_refund_account_{order_id}",
+                    placeholder="예: 123-45-678901",
+                )
+
+            emp_options = _pcr_assignee_options(store_id, role, me_uname)
+            emp_username_to_label = {u: lbl for u, lbl in emp_options}
+            pcr_assignees = st.multiselect(
+                "결제자 *",
+                options=[u for u, _ in emp_options],
+                format_func=lambda u: emp_username_to_label.get(u, u),
+                key=f"pcr_assignees_{order_id}",
+                help="결제 변경을 확인·처리할 결제자를 지정합니다.",
+            )
+
+            _manual_orig = st.checkbox(
+                "원본 수동 수정", key=f"pcr_manual_orig_{order_id}",
+                help="이력/현재행 원본이 틀리면 직접 수정합니다.",
+            )
+            if _manual_orig:
+                oc1, oc2, oc3 = st.columns(3)
+                with oc1:
+                    orig["amount"] = st.number_input(
+                        "원본 금액(원)", min_value=0, step=1000,
+                        value=int(float(orig.get("amount") or 0)),
+                        key=f"pcr_orig_amt_{order_id}",
+                    )
+                with oc2:
+                    _om = str(orig.get("method") or "")
+                    _om_idx = PAYMENT_METHOD_OPTIONS.index(_om) if _om in PAYMENT_METHOD_OPTIONS else 0
+                    orig["method"] = st.selectbox(
+                        "원본 수단", options=PAYMENT_METHOD_OPTIONS,
+                        index=_om_idx, key=f"pcr_orig_meth_{order_id}",
+                    )
+                with oc3:
+                    orig["onnuri"] = st.text_input(
+                        "원본 온누리/승인번호", value=str(orig.get("onnuri") or ""),
+                        key=f"pcr_orig_onnuri_{order_id}",
+                    )
+
+            # 증빙 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
+            ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0))
+            files = _file_input_with_paste(
+                "📎 증빙 사진/파일 첨부 (선택)",
+                accept_multiple_files=True,
+                key=f"pcr_files_{order_id}_{ver}",
+            )
+            _render_upload_preview(files)
 
         dup_errs = _pcr_duplicate_approval_errors(pay_list, new_lines)
         for _de in dup_errs:
@@ -31246,6 +31277,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 st.caption("환불 계좌(은행·예금주)와 계좌번호를 모두 입력해야 합니다.")
             elif not (orig.get("method") or orig.get("amount")):
                 st.caption("원본 결제 정보를 확인해 주세요.")
+        st.divider()
         if st.button("📤 요청 등록 (기존 결제 취소 + 신규 결제 자동 저장)",
                      key=f"pcr_submit_{order_id}",
                      type="primary", disabled=not can_submit):
