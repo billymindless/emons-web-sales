@@ -32213,14 +32213,6 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
             {"항목": "외부검증 (파일 매칭)", "원본": _orig_verified_label, "변경 후": _new_verified_label},
         ])
         st.dataframe(comp, width='stretch', hide_index=True)
-        st.caption(
-            "외부검증: 온누리/지역화폐/카드/메인페이 파일이 업로드되어 매칭된 결제행에만 ✅ 표시됩니다. "
-            "미검증 항목은 해당 결제수단 파일을 업로드하면 자동 매칭 후 상태가 갱신됩니다."
-        )
-
-        m1, m2 = st.columns(2)
-        m1.caption(f"고객: {meta.get('customer_name') or '-'}  ·  주문ID: {meta.get('sale_id')}  ·  결제ID: {meta.get('payment_id') or '신규'}")
-        m2.caption(f"요청자: {_uname_to_display(meta.get('created_by'))}")
         st.markdown(f"**사유:** {meta.get('reason') or '-'}")
 
         # 부정 방지 경고
