@@ -346,6 +346,7 @@ def _get_sales_tab_labels(role: str) -> list[str]:
             "12. FAQ (도움말)",
             "13. AI 세일즈 리포트",
             "14. 🗺️ 상권 퍼포먼스 맵",
+            "15. 💳 결제 대조",
         ]
     return [
         "1. 대시보드",
@@ -358,6 +359,7 @@ def _get_sales_tab_labels(role: str) -> list[str]:
         "8. 결제수단별 집계표",
         "9. 전시품 판매 검증",
         "10. FAQ (도움말)",
+        "11. 💳 결제 대조",
     ]
 
 
@@ -33645,13 +33647,13 @@ def _render_approval_edit_dialog_impl(db_filename: str, meta: dict) -> None:
     st.rerun()
 
 
-def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
-    """관리자 설정 8번: 온누리 / 울산페이 / 카드매출 외부파일 대사.
-    - 검증 시작일 저장 (기본 2026-08-01)
-    - 매장 선택 → 출처 선택 → 파일 업로드 → 파싱·중복 skip·자동 매칭
-    - 온누리: 날짜·전화 뒤4·금액 / 울산페이: 승인번호 6자리·결제금액
-    - 카드: 매입일자(±2일)·카드사·매입금액 / 메인페이: 매입일자·승인번호·금액
-    - 결과 표 (미결·취소 의심 필터) · 수동 매칭 · ERP-only 수기 확인"""
+def _render_external_pay_admin_section(
+    role: str, me_uname: str, *, allow_upload: bool = True,
+) -> None:
+    """온누리 / 울산페이 / 카드매출 외부파일 대사.
+    - `allow_upload=True` (기본): 업로드·시작일 저장·재매칭·수동/AI 매칭 등 전체 기능.
+    - `allow_upload=False`: 결과표 조회·승인번호 수정 팝업·금액 동일 쌍 빠른 수정·엑셀 다운로드만.
+    """
     is_super = role == "superadmin"
     current_db = st.session_state.get("current_db")
 
@@ -33689,23 +33691,24 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         "card": "신용/체크카드", "mainpay": "메인페이",
     }
     batches = _ext_pay_list_batches(sel_db, limit=20)
-    if batches:
-        st.markdown("##### 업로드 이력 (모든 관리자 공통)")
-        st.dataframe(
-            pd.DataFrame([{
-                "시각": str(b.get("uploaded_at") or "")[:19],
-                "출처": _src_label.get(b.get("source"), b.get("source")),
-                "파일": b.get("file_name") or "-",
-                "파싱": int(b.get("parsed_count") or 0),
-                "신규적재": int(b.get("inserted_count") or 0),
-                "skip": int(b.get("skipped_count") or 0),
-                "업로더": b.get("uploaded_by") or "-",
-            } for b in batches]),
-            width="stretch",
-            hide_index=True,
-        )
-    else:
-        st.caption("이 매장에 저장된 업로드 이력이 없습니다. (테이블 미생성 또는 아직 업로드 없음)")
+    if allow_upload:
+        if batches:
+            st.markdown("##### 업로드 이력 (모든 관리자 공통)")
+            st.dataframe(
+                pd.DataFrame([{
+                    "시각": str(b.get("uploaded_at") or "")[:19],
+                    "출처": _src_label.get(b.get("source"), b.get("source")),
+                    "파일": b.get("file_name") or "-",
+                    "파싱": int(b.get("parsed_count") or 0),
+                    "신규적재": int(b.get("inserted_count") or 0),
+                    "skip": int(b.get("skipped_count") or 0),
+                    "업로더": b.get("uploaded_by") or "-",
+                } for b in batches]),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.caption("이 매장에 저장된 업로드 이력이 없습니다. (테이블 미생성 또는 아직 업로드 없음)")
 
     cur_from = _ext_pay_load_settings(sel_db)
     _today = date.today()
@@ -33731,7 +33734,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             help="이 날짜 이후의 결제·공식 행은 매칭 결과 표에서 제외됩니다. (세션 한정, 저장 안 됨)",
         )
     with c3:
-        if st.button("시작일 저장", key=f"extpay_from_save_{sel_db}"):
+        if allow_upload and st.button("시작일 저장", key=f"extpay_from_save_{sel_db}"):
             ok, err = _ext_pay_save_settings(sel_db, new_from, me_uname)
             if ok:
                 flash(f"검증 시작일을 {new_from.isoformat()}로 저장했습니다.")
@@ -33783,95 +33786,101 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         key=f"extpay_src_{sel_db}",
     )
 
-    up = st.file_uploader(
-        _uploader_label_by[sel_src],
-        type=["xlsx", "csv"],
-        key=f"extpay_upload_{sel_db}_{sel_src}",
-    )
-    _parse_fn = _parse_fn_by[sel_src]
-    _match_fn = _match_fn_by[sel_src]
-    _src_key = sel_src
-    _empty_hint = _empty_hint_by[sel_src]
-
-    # 사업자 선택 (다중 사업자 매장 대응) — 매장 설정에 사업자 목록이 있으면 필수, 없으면 skip
-    _biz_list = _get_store_businesses(sel_db)
-    sel_business = None
-    if _biz_list:
-        _biz_options = ["— 사업자를 선택하세요 —"] + _biz_list
-        _biz_choice = st.selectbox(
-            "사업자 (필수)",
-            options=_biz_options,
-            index=0,
-            key=f"extpay_biz_{sel_db}_{_src_key}",
-            help="이 파일에 담긴 결제가 어느 사업자로 정산됐는지 선택합니다. 매칭된 결제행에 상속됩니다.",
+    if allow_upload:
+        up = st.file_uploader(
+            _uploader_label_by[sel_src],
+            type=["xlsx", "csv"],
+            key=f"extpay_upload_{sel_db}_{sel_src}",
         )
-        sel_business = None if _biz_choice == _biz_options[0] else _biz_choice
-    else:
-        st.caption("ℹ️ 매장 설정에 사업자 목록이 등록되어 있지 않습니다. 사업자 구분이 필요하다면 매장 관리에서 목록을 먼저 등록하세요.")
+        _parse_fn = _parse_fn_by[sel_src]
+        _match_fn = _match_fn_by[sel_src]
+        _src_key = sel_src
+        _empty_hint = _empty_hint_by[sel_src]
 
-    if up is not None:
-        _biz_required_block = bool(_biz_list) and not sel_business
-        if _biz_required_block:
-            st.warning("사업자 목록에서 사업자를 먼저 선택해 주세요.")
-        if st.button(
-            "업로드 & 자동 매칭",
-            type="primary",
-            key=f"extpay_run_{sel_db}_{_src_key}",
-            disabled=_biz_required_block,
-        ):
-            with st.spinner("파일을 읽고 매칭하는 중..."):
-                parsed, perr = _parse_fn(up)
-            if perr:
-                st.error(perr)
-            elif not parsed:
-                st.warning(_empty_hint)
-            else:
-                # 이 업로드 세션의 사업자명을 매칭 함수가 참조하도록 세션에 저장
-                st.session_state[f"_ext_pay_upload_business_{sel_db}_{_src_key}"] = sel_business or ""
-                inserted, skipped_before, skipped_dup, ierr, conflicts = _ext_pay_insert_batch_and_rows(
-                    sel_db, _src_key, getattr(up, "name", "") or "", parsed, new_from, me_uname,
-                    business_name=sel_business,
-                )
-                if ierr:
-                    st.error(ierr)
+        # 사업자 선택 (다중 사업자 매장 대응) — 매장 설정에 사업자 목록이 있으면 필수, 없으면 skip
+        _biz_list = _get_store_businesses(sel_db)
+        sel_business = None
+        if _biz_list:
+            _biz_options = ["— 사업자를 선택하세요 —"] + _biz_list
+            _biz_choice = st.selectbox(
+                "사업자 (필수)",
+                options=_biz_options,
+                index=0,
+                key=f"extpay_biz_{sel_db}_{_src_key}",
+                help="이 파일에 담긴 결제가 어느 사업자로 정산됐는지 선택합니다. 매칭된 결제행에 상속됩니다.",
+            )
+            sel_business = None if _biz_choice == _biz_options[0] else _biz_choice
+        else:
+            st.caption("ℹ️ 매장 설정에 사업자 목록이 등록되어 있지 않습니다. 사업자 구분이 필요하다면 매장 관리에서 목록을 먼저 등록하세요.")
+
+        if up is not None:
+            _biz_required_block = bool(_biz_list) and not sel_business
+            if _biz_required_block:
+                st.warning("사업자 목록에서 사업자를 먼저 선택해 주세요.")
+            if st.button(
+                "업로드 & 자동 매칭",
+                type="primary",
+                key=f"extpay_run_{sel_db}_{_src_key}",
+                disabled=_biz_required_block,
+            ):
+                with st.spinner("파일을 읽고 매칭하는 중..."):
+                    parsed, perr = _parse_fn(up)
+                if perr:
+                    st.error(perr)
+                elif not parsed:
+                    st.warning(_empty_hint)
                 else:
-                    _conflicts_key = f"extpay_conflicts_{sel_db}_{_src_key}"
-                    # ── 완전 중복 파일 자동 감지 ──
-                    # 신규 적재 0건 + 중복 skip > 0 → 이미 업로드된 파일. 매칭·상세 패널 모두 스킵.
-                    if inserted == 0 and skipped_dup > 0:
-                        st.session_state.pop(_conflicts_key, None)
-                        _msg_parts = [
-                            f"이미 업로드된 파일입니다 (중복 {skipped_dup}건 모두 skip)",
-                        ]
-                        if skipped_before > 0:
-                            _msg_parts.append(f"시작일 이전 skip {skipped_before}건")
-                        flash(" · ".join(_msg_parts))
-                        st.rerun()
-                    counts, merr = _match_fn(sel_db, new_from, me_uname)
-                    if merr:
-                        st.error(f"매칭 실패: {merr}")
+                    # 이 업로드 세션의 사업자명을 매칭 함수가 참조하도록 세션에 저장
+                    st.session_state[f"_ext_pay_upload_business_{sel_db}_{_src_key}"] = sel_business or ""
+                    inserted, skipped_before, skipped_dup, ierr, conflicts = _ext_pay_insert_batch_and_rows(
+                        sel_db, _src_key, getattr(up, "name", "") or "", parsed, new_from, me_uname,
+                        business_name=sel_business,
+                    )
+                    if ierr:
+                        st.error(ierr)
                     else:
-                        _msg_parts = [
-                            f"신규 {inserted}건 적재",
-                            f"중복 skip {skipped_dup}건",
-                            f"시작일 이전 skip {skipped_before}건",
-                        ]
-                        if counts:
-                            _msg_parts.append(
-                                " · ".join(f"{k} {v}" for k, v in counts.items())
-                            )
-                        if conflicts:
-                            st.session_state[_conflicts_key] = conflicts
-                            _msg_parts.append(
-                                f"중복 상세 {len(conflicts)}건 아래 패널에서 확인 후 별개 거래면 시각 재입력"
-                            )
-                        else:
+                        _conflicts_key = f"extpay_conflicts_{sel_db}_{_src_key}"
+                        # ── 완전 중복 파일 자동 감지 ──
+                        # 신규 적재 0건 + 중복 skip > 0 → 이미 업로드된 파일. 매칭·상세 패널 모두 스킵.
+                        if inserted == 0 and skipped_dup > 0:
                             st.session_state.pop(_conflicts_key, None)
-                        flash(" · ".join(_msg_parts))
-                        st.rerun()
+                            _msg_parts = [
+                                f"이미 업로드된 파일입니다 (중복 {skipped_dup}건 모두 skip)",
+                            ]
+                            if skipped_before > 0:
+                                _msg_parts.append(f"시작일 이전 skip {skipped_before}건")
+                            flash(" · ".join(_msg_parts))
+                            st.rerun()
+                        counts, merr = _match_fn(sel_db, new_from, me_uname)
+                        if merr:
+                            st.error(f"매칭 실패: {merr}")
+                        else:
+                            _msg_parts = [
+                                f"신규 {inserted}건 적재",
+                                f"중복 skip {skipped_dup}건",
+                                f"시작일 이전 skip {skipped_before}건",
+                            ]
+                            if counts:
+                                _msg_parts.append(
+                                    " · ".join(f"{k} {v}" for k, v in counts.items())
+                                )
+                            if conflicts:
+                                st.session_state[_conflicts_key] = conflicts
+                                _msg_parts.append(
+                                    f"중복 상세 {len(conflicts)}건 아래 패널에서 확인 후 별개 거래면 시각 재입력"
+                                )
+                            else:
+                                st.session_state.pop(_conflicts_key, None)
+                            flash(" · ".join(_msg_parts))
+                            st.rerun()
 
-    # 중복 skip 된 파일 행 상세 (지문 충돌) — 별개 거래로 강제 등록 가능
-    _render_ext_pay_conflict_panel(sel_db, sel_src, new_from, me_uname)
+        # 중복 skip 된 파일 행 상세 (지문 충돌) — 별개 거래로 강제 등록 가능
+        _render_ext_pay_conflict_panel(sel_db, sel_src, new_from, me_uname)
+    else:
+        st.caption(
+            "원장 파일 업로드와 재매칭은 매장 관리자 전용입니다. "
+            "여기서는 결과 조회와 승인번호 수정만 할 수 있습니다."
+        )
 
     st.markdown("##### 검증 결과")
     f1, f2, f3 = st.columns([2, 2, 1])
@@ -33889,7 +33898,7 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             help="다른 관리자가 올린 건을 시작일 필터에 가리지 않고 봅니다.",
         )
     with f3:
-        if st.button(
+        if allow_upload and st.button(
             "🔄 재검증/재매칭",
             key=f"extpay_rematch_{sel_db}_{sel_src}",
             help="기존 미결 매칭(공식만 있음·금액 다름·다중 매치·공식 취소)만 삭제 후, 최신 매칭 로직으로 다시 매칭합니다. matched_ok·수동 매칭·분할 합산 매칭은 유지됩니다.",
@@ -33980,7 +33989,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         df = df[df["결과"].isin(_alert_codes)]
         if df.empty:
             st.success("표시할 알림이 없습니다. (모두 정상 매칭)")
-            _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
+            if allow_upload:
+                _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
             return
     # 결과 코드 → 한글 라벨 (표시용, 원본 df 는 유지)
     _result_map = {
@@ -34171,17 +34181,18 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
 
     _render_ext_pay_quick_approval_fix(sel_db, sel_src, df, me_uname)
 
-    # AI 유사 매칭 제안 (온누리 파일럿) — 수동 매칭 전 관리자 검토
-    _render_ext_pay_ai_similar_match(sel_db, sel_src, df, me_uname)
+    if allow_upload:
+        # AI 유사 매칭 제안 (온누리 파일럿) — 수동 매칭 전 관리자 검토
+        _render_ext_pay_ai_similar_match(sel_db, sel_src, df, me_uname)
 
-    # 수동 매칭 (자동매칭 실패 행 → ERP 결제 지정)
-    _render_ext_pay_manual_match_ui(sel_db, sel_src, df, new_from, me_uname)
+        # 수동 매칭 (자동매칭 실패 행 → ERP 결제 지정)
+        _render_ext_pay_manual_match_ui(sel_db, sel_src, df, new_from, me_uname)
 
-    # 매출·입력담당 소명 요청 (미매칭 ERP 결제 → 사내 업무 / 원가 소명 요청과 동일 방식)
-    _render_ext_pay_reconcile_section(sel_db, sel_src, df)
+        # 매출·입력담당 소명 요청 (미매칭 ERP 결제 → 사내 업무 / 원가 소명 요청과 동일 방식)
+        _render_ext_pay_reconcile_section(sel_db, sel_src, df)
 
-    # ERP-only 수기 확인 (현금 수금 등 공식파일 자체가 없는 결제)
-    _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
+        # ERP-only 수기 확인 (현금 수금 등 공식파일 자체가 없는 결제)
+        _render_ext_pay_manual_and_erp_only(sel_db, sel_src, new_from, me_uname)
 
 
 def _render_ext_pay_conflict_panel(
@@ -35658,8 +35669,15 @@ def render_admin_settings():
 
     # ── 8. 온누리 / 울산페이 / 카드매출 결제 대조 ─────────────
     st.subheader("8. 🧾 온누리 / 울산페이 / 카드매출 결제 대조")
-    with st.expander("원장 업로드 / 맞추기 결과", expanded=False):
-        _render_external_pay_admin_section(role, me_uname)
+    if role == "superadmin":
+        with st.expander("원장 업로드 / 맞추기 결과", expanded=False):
+            _render_external_pay_admin_section(role, me_uname, allow_upload=True)
+    else:
+        st.info(
+            "결제 대조는 좌측 메뉴 **15. 💳 결제 대조** 에서 엽니다. "
+            "매장 관리자는 거기서 원장 업로드·재매칭 전 기능을 사용할 수 있고, "
+            "일반 직원은 결과 조회와 승인번호 수정만 할 수 있습니다."
+        )
 
     st.divider()
 
@@ -45541,8 +45559,16 @@ def main():
             render_dong_commercial_map()
         except Exception as _dme:
             st.error(f"상권 퍼포먼스 맵 모듈 로드 실패: {_dme}")
+    elif role == "store_admin" and idx == 14:
+        st.header("💳 온누리 / 울산페이 / 카드 결제 대조")
+        _me_uname = user.get("username") or ""
+        _render_external_pay_admin_section(role, _me_uname, allow_upload=True)
     elif role == "user" and idx == 9:
         render_faq_page()
+    elif role == "user" and idx == 10:
+        st.header("💳 온누리 / 울산페이 / 카드 결제 대조")
+        _me_uname = user.get("username") or ""
+        _render_external_pay_admin_section(role, _me_uname, allow_upload=False)
 
 
 if __name__ == "__main__":
