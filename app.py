@@ -7593,6 +7593,120 @@ def _pcr_load_payment_date(db_filename: str, payment_id: int | None) -> str:
     return "-"
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _pcr_bulk_payment_dates(db_filename: str, payment_ids: tuple[int, ...]) -> dict[int, str]:
+    """payment_id 리스트의 payment_date 를 IN 1회 쿼리로 조회. (pcr-bulk — N+1 제거)
+
+    반환: {payment_id: 'YYYY-MM-DD' or '-'}. 조회 실패 시 빈 dict.
+    """
+    out: dict[int, str] = {}
+    if not db_filename or not payment_ids:
+        return out
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return out
+    pids: list[int] = []
+    for p in payment_ids:
+        try:
+            if p:
+                pids.append(int(p))
+        except (TypeError, ValueError):
+            continue
+    if not pids:
+        return out
+    try:
+        r = (
+            sc.table("app_payments")
+            .select("id, payment_date")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .in_("id", pids)
+            .execute()
+        )
+        for row in (r.data or []):
+            pid = row.get("id")
+            if pid is None:
+                continue
+            try:
+                out[int(pid)] = str(row.get("payment_date") or "-")[:10]
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        return out
+    return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _pcr_bulk_verify(db_filename: str, payment_ids: tuple[int, ...]) -> dict[int, tuple[bool, str]]:
+    """payment_id 리스트의 외부검증 상태를 bulk 조회. (pcr-bulk — N+1 제거)
+
+    각 payment_id → (verified, source_or_reason).
+    - 직접 매칭: result_code in matched/manual_matched/split_matched 인 app_external_pay_matches 행이 있으면 verified.
+    - 분할 매칭 참여: 미매칭 pid 에 대해 split_matched 행의 note(split_pids) 포함 여부로 재확인.
+    _pcr_check_external_verification 과 동일한 판정 로직을 보존하며, 쿼리 수만 2건으로 축소한다.
+    """
+    out: dict[int, tuple[bool, str]] = {}
+    if not db_filename or not payment_ids:
+        return out
+    pids: list[int] = []
+    for p in payment_ids:
+        try:
+            if p:
+                pids.append(int(p))
+        except (TypeError, ValueError):
+            continue
+    if not pids:
+        return out
+    for p in pids:
+        out[p] = (False, "")
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return out
+    _positive = ("matched", "manual_matched", "split_matched")
+    try:
+        r1 = (
+            sc.table("app_external_pay_matches")
+            .select("source, result_code, payment_id")
+            .eq("db_filename", db_filename)
+            .in_("payment_id", pids)
+            .execute()
+        )
+        for row in (r1.data or []):
+            code = str(row.get("result_code") or "")
+            if code not in _positive:
+                continue
+            pid_raw = row.get("payment_id")
+            try:
+                pid_i = int(pid_raw)
+            except (TypeError, ValueError):
+                continue
+            if pid_i in out and not out[pid_i][0]:
+                out[pid_i] = (True, str(row.get("source") or ""))
+    except Exception:
+        pass
+    # 분할 매칭 참여 — 아직 미검증인 pid 가 있을 때만 split_matched 전체 스캔.
+    _unmatched = [p for p, (v, _) in out.items() if not v]
+    if _unmatched:
+        try:
+            r2 = (
+                sc.table("app_external_pay_matches")
+                .select("source, note")
+                .eq("db_filename", db_filename)
+                .eq("result_code", "split_matched")
+                .execute()
+            )
+            for m in (r2.data or []):
+                split_pids = set(_ext_pay_extract_split_pids(m.get("note")) or [])
+                if not split_pids:
+                    continue
+                src = str(m.get("source") or "")
+                for p in _unmatched:
+                    if p in split_pids and not out[p][0]:
+                        out[p] = (True, src)
+        except Exception:
+            pass
+    return out
+
+
 def _pcr_build_verify_context(meta: dict) -> dict:
     """결제변경 검증 표에 추가로 보여줄 원본/변경 결제의 결제일자·외부검증 상태.
 
@@ -7621,30 +7735,54 @@ def _pcr_build_verify_context_impl(meta: dict) -> dict:
     if not db_filename:
         return out
 
-    # 원본 결제
+    # 원본 결제 pid
     orig_pid = meta.get("payment_id")
     try:
         orig_pid_i = int(orig_pid) if orig_pid not in (None, "") else None
     except (TypeError, ValueError):
         orig_pid_i = None
+
+    # 변경 결제 pid 리스트 (여러 라인 가능)
+    task_id = meta.get("task_id")
+    new_pids = _pcr_load_new_payment_ids_from_activity(task_id) or []
+
+    # pcr-bulk: 원본 + 변경 pid 를 모아 payment_date / 외부검증을 IN 1회씩만 조회.
+    _all_pids: list[int] = []
     if orig_pid_i:
-        out["original_date"] = _pcr_load_payment_date(db_filename, orig_pid_i)
-        _v, _src = _pcr_check_external_verification(db_filename, orig_pid_i)
+        _all_pids.append(orig_pid_i)
+    for p in new_pids:
+        try:
+            pi = int(p)
+            if pi and pi not in _all_pids:
+                _all_pids.append(pi)
+        except (TypeError, ValueError):
+            continue
+
+    _pids_tuple = tuple(_all_pids)
+    _dates_map = _pcr_bulk_payment_dates(db_filename, _pids_tuple) if _pids_tuple else {}
+    _verify_map = _pcr_bulk_verify(db_filename, _pids_tuple) if _pids_tuple else {}
+
+    # 원본
+    if orig_pid_i:
+        out["original_date"] = _dates_map.get(orig_pid_i, "-") or "-"
+        _v, _src = _verify_map.get(orig_pid_i, (False, ""))
         _src_disp = f" ({_src})" if _src else ""
         out["original_verified"] = (True, f"✅ 검증됨{_src_disp}") if _v else (False, "❌ 미검증")
     else:
         out["original_verified"] = (False, "-")
 
-    # 변경 결제 (여러 라인 가능)
-    task_id = meta.get("task_id")
-    new_pids = _pcr_load_new_payment_ids_from_activity(task_id)
+    # 변경 결제
     if new_pids:
         _dates = []
         _sources: list[str] = []
         _any_unverified = False
         for pid in new_pids:
-            _dates.append(_pcr_load_payment_date(db_filename, pid))
-            _v, _src = _pcr_check_external_verification(db_filename, pid)
+            try:
+                pi = int(pid)
+            except (TypeError, ValueError):
+                continue
+            _dates.append(_dates_map.get(pi, "-") or "-")
+            _v, _src = _verify_map.get(pi, (False, ""))
             if _v:
                 if _src:
                     _sources.append(_src)
@@ -7821,6 +7959,8 @@ def clear_data_cache():
         "_get_supabase_user_store_ids",
         "_get_supabase_user_allowed_stores",
         "_get_supabase_employee_list_with_stores",
+        # 사내업무 직원 옵션 (list-query-dedupe) — 직원·매장 배정 변경 시 함께 무효화.
+        "_internal_work_employee_options",
         # 삭제 요청
         "_fetch_pending_delete_requests",
         # To-do
@@ -7941,7 +8081,10 @@ def _invalidate_payments() -> None:
                   "_load_latest_payment_history_for_pcr",
                   "_pcr_load_payment_date",
                   "_pcr_check_external_verification",
-                  "_pcr_load_new_payment_ids_from_activity"):
+                  "_pcr_load_new_payment_ids_from_activity",
+                  # pcr-bulk: 벌크 helper 도 결제/매칭 CRUD 시 함께 무효화.
+                  "_pcr_bulk_payment_dates",
+                  "_pcr_bulk_verify"):
         _fn = globals().get(_name)
         if _fn is None:
             continue
@@ -11896,7 +12039,10 @@ def _render_hq_cost_explain_request(
         st.session_state[ver_key] = ver + 1
         if att_errs:
             st.warning("일부 첨부 실패: " + "; ".join(att_errs))
-        _tb.clear_task_caches()
+        # cache-split: 신규 업무 + 첨부 — 리스트/알림/상세 캐시 보강.
+        _tb.clear_task_list_caches()
+        _tb.clear_notification_caches()
+        _tb.clear_task_detail_caches(new_id)
         st.success(f"업무 #{new_id} 생성 완료. 담당자에게 알림이 발송되었습니다.")
         st.rerun()
 
@@ -12011,7 +12157,9 @@ def _render_hq_cost_explain_thread(
             st.session_state[ver_key] = ver + 1
             if att_errs:
                 st.warning("일부 첨부 실패: " + "; ".join(att_errs))
-            _tb.clear_task_caches()
+            # cache-split: 답신 등록(댓글+첨부) — 상세·알림만.
+            _tb.clear_task_detail_caches(tid)
+            _tb.clear_notification_caches()
             st.success("답신을 등록했습니다.")
             st.rerun()
     with _bc2:
@@ -12022,7 +12170,7 @@ def _render_hq_cost_explain_thread(
             ):
                 ok, cerr = _tb.update_status(tid, "done", me_uname)
                 if ok:
-                    _tb.clear_task_caches()
+                    # cache-split: update_status 내부에서 이미 리스트/알림 clear — 중복 호출 제거.
                     st.success(f"업무 #{tid} 를 완료 처리했습니다.")
                     st.rerun()
                 else:
@@ -12416,7 +12564,10 @@ def _render_ext_pay_reconcile_request(
         st.session_state[ver_key] = ver + 1
         if att_errs:
             st.warning("일부 첨부 실패: " + "; ".join(att_errs))
-        _tb.clear_task_caches()
+        # cache-split: 신규 업무 + 첨부 — 리스트/알림/상세 캐시 보강.
+        _tb.clear_task_list_caches()
+        _tb.clear_notification_caches()
+        _tb.clear_task_detail_caches(new_id)
         st.success(f"업무 #{new_id} 생성 완료. 담당자에게 알림이 발송되었습니다.")
         st.rerun()
 
@@ -29679,8 +29830,10 @@ def _navigate_to_internal_task(task_id: int | None, *, noti_id: int | None = Non
             _tb.mark_notification_read(int(noti_id))
         except Exception:
             pass
+        # cache-split: 알림 읽음 처리 — mark_notification_read 내부에서 알림 캐시 이미 clear.
+        # 명시적 보강(멱등 — 외부 변경이 섞여도 다음 뱃지가 최신).
         try:
-            _tb.clear_task_caches()
+            _tb.clear_notification_caches()
         except Exception:
             pass
 
@@ -29694,6 +29847,52 @@ def _navigate_to_internal_task(task_id: int | None, *, noti_id: int | None = Non
         if tid:
             st.session_state["board_focus_task_id"] = tid
             st.session_state["board_expand_task_id"] = tid
+
+
+@st.fragment
+def _render_notifications_panel(me_uname: str):
+    """알림 리스트 fragment. 미확인/읽음/열기 버튼은 알림 내부 상태만 바뀌므로
+    기본값(fragment-scoped) rerun 으로 사내업무 목록 전체 rerun 을 막는다. (fragment-noti-gantt)
+
+    업무 상세로 이동하는 '열기' 버튼은 세션에 포커스 ID 를 심고 app 전체 rerun 이 필요하므로
+    `scope="app"` 로 상위까지 rerun 한다.
+    """
+    import task_board as _tb  # noqa: WPS433
+
+    unread_only = st.checkbox("미확인만 보기", value=True, key="noti_unread_only")
+    notis = _tb.load_my_notifications_cached(me_uname, unread_only=unread_only, limit=50)
+    if not notis:
+        st.caption("알림이 없습니다.")
+        return
+
+    cols = st.columns([1, 4, 2, 2, 1, 1])
+    cols[0].markdown("**상태**")
+    cols[1].markdown("**내용**")
+    cols[2].markdown("**유형**")
+    cols[3].markdown("**시각**")
+    cols[4].markdown("**업무**")
+    cols[5].markdown("")
+    for n in notis:
+        c = st.columns([1, 4, 2, 2, 1, 1])
+        c[0].write("✅" if n.get("is_read") else "🔵")
+        c[1].write(n.get("message", ""))
+        c[2].write(n.get("type", ""))
+        c[3].caption(str(n.get("sent_at", ""))[:19])
+        _n_tid = n.get("task_id")
+        if _n_tid:
+            if c[4].button("열기", key=f"noti_open_{n['id']}", help=f"업무 #{int(_n_tid)} 상세"):
+                _navigate_to_internal_task(int(_n_tid), noti_id=int(n["id"]))
+                # 상세 포커스로 업무판 전체 rerun 필요 → app scope.
+                st.rerun(scope="app")
+        else:
+            c[4].caption("-")
+        if not n.get("is_read"):
+            if c[5].button("읽음", key=f"noti_read_{n['id']}"):
+                _tb.mark_notification_read(int(n["id"]))
+                st.rerun()
+    if st.button("모두 읽음 처리", key="noti_mark_all"):
+        _tb.mark_all_read(me_uname)
+        st.rerun()
 
 
 def render_internal_work():
@@ -29721,13 +29920,14 @@ def render_internal_work():
     store_id = (current_user.get("store_id") or st.session_state.get("current_store_id"))
     current_db = st.session_state.get("current_db") or ""
     store_name: str | None = None
+    # list-query-dedupe: 매장명 단건 쿼리 대신 _get_supabase_stores_list_raw() 캐시(ttl 1h)에서 조회.
     if store_id:
         try:
-            _sc, _se = get_supabase_client()
-            if _sc and not _se:
-                _sr = _sc.table("app_stores").select("store_name").eq("id", int(store_id)).maybe_single().execute()
-                _sd = _sr.data if isinstance(_sr.data, dict) else None
-                store_name = (_sd or {}).get("store_name")
+            _sid_int = int(store_id)
+            for _s in _get_supabase_stores_list_raw() or []:
+                if int(_s.get("id") or 0) == _sid_int:
+                    store_name = _s.get("store_name")
+                    break
         except Exception:
             store_name = None
 
@@ -29746,18 +29946,38 @@ def render_internal_work():
     except Exception:
         pass
 
+    # empty-desc-vscroll: 설명 textarea 세로 스크롤·단어 줄바꿈 CSS — 페이지 당 1회 주입.
+    # label 이 '설명' 인 textarea 공통 — 사내업무 상세·하위업무·신규 등록 폼이 동일 UX.
+    # 긴 줄은 가로 스크롤이 아니라 아래로 내려가고, 공백 없는 긴 토큰도 강제 wrap.
+    st.markdown(
+        """
+        <style>
+        textarea[aria-label="설명"] {
+            overflow-x: hidden !important;
+            overflow-y: auto !important;
+            white-space: pre-wrap !important;
+            word-break: break-word !important;
+            overflow-wrap: anywhere !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.header("📋 사내 업무")
     st.caption("상위·하위 업무를 등록하고 담당자에게 인앱 알림 + 카카오 친구톡으로 즉시 통보합니다.")
 
     # 결제변경 미결 검증 뱃지 (관리자만 검증 가능)
+    # list-query-dedupe: 아래 '강제 포함' 블록과 1건으로 공유해 DB 왕복 중복 제거.
+    _pending_pcr: list[dict] = []
     try:
-        _pending_pcr = _tb.load_pending_payment_verifications(store_name, role)
+        _pending_pcr = _tb.load_pending_payment_verifications(store_name, role) or []
         if _pending_pcr:
             st.warning(
                 f"💳 결제변경 미결 검증 {len(_pending_pcr)}건 — 아래 업무 목록에서 증빙 확인 후 상태를 '완료'로 변경해 주세요."
             )
     except Exception:
-        pass
+        _pending_pcr = []
 
     # Storage 버킷 진단 (세션당 1회)
     _bucket_key = "_task_bucket_ok"
@@ -29790,40 +30010,23 @@ def render_internal_work():
 
     st.divider()
 
-    # 알림 패널
-    with st.expander(f"🔔 내 알림 ({_tb.count_unread_notifications(me_uname)} 미확인)", expanded=False):
-        unread_only = st.checkbox("미확인만 보기", value=True, key="noti_unread_only")
-        notis = _tb.load_my_notifications_cached(me_uname, unread_only=unread_only, limit=50)
-        if not notis:
-            st.caption("알림이 없습니다.")
-        else:
-            cols = st.columns([1, 4, 2, 2, 1, 1])
-            cols[0].markdown("**상태**")
-            cols[1].markdown("**내용**")
-            cols[2].markdown("**유형**")
-            cols[3].markdown("**시각**")
-            cols[4].markdown("**업무**")
-            cols[5].markdown("")
-            for n in notis:
-                c = st.columns([1, 4, 2, 2, 1, 1])
-                c[0].write("✅" if n.get("is_read") else "🔵")
-                c[1].write(n.get("message", ""))
-                c[2].write(n.get("type", ""))
-                c[3].caption(str(n.get("sent_at", ""))[:19])
-                _n_tid = n.get("task_id")
-                if _n_tid:
-                    if c[4].button("열기", key=f"noti_open_{n['id']}", help=f"업무 #{int(_n_tid)} 상세"):
-                        _navigate_to_internal_task(int(_n_tid), noti_id=int(n["id"]))
-                        st.rerun()
-                else:
-                    c[4].caption("-")
-                if not n.get("is_read"):
-                    if c[5].button("읽음", key=f"noti_read_{n['id']}"):
-                        _tb.mark_notification_read(int(n["id"]))
-                        st.rerun()
-            if st.button("모두 읽음 처리", key="noti_mark_all"):
-                _tb.mark_all_read(me_uname)
-                st.rerun()
+    # 알림 패널 — fragment + 접힘 시 body skip (fragment-noti-gantt)
+    # st.expander 는 접혀 있어도 body 가 실행돼 load_my_notifications_cached 가 매 rerun 호출된다.
+    # 세션 스테이트 토글 + 조건부 렌더로 접힘 상태에서는 DB/캐시 조회 자체를 생략한다.
+    _noti_open_key = "task_noti_panel_open"
+    st.session_state.setdefault(_noti_open_key, False)
+    _noti_is_open = bool(st.session_state.get(_noti_open_key, False))
+    _noti_unread_cnt = _tb.count_unread_notifications(me_uname)
+    _noti_label = (
+        f"🔽 알림 접기 ({_noti_unread_cnt} 미확인)"
+        if _noti_is_open else
+        f"🔔 내 알림 ({_noti_unread_cnt} 미확인)"
+    )
+    if st.button(_noti_label, key="task_noti_toggle", width='stretch'):
+        st.session_state[_noti_open_key] = not _noti_is_open
+        _noti_is_open = not _noti_is_open
+    if _noti_is_open:
+        _render_notifications_panel(me_uname)
 
     st.divider()
 
@@ -29873,13 +30076,18 @@ def render_internal_work():
                 _seen_ids.add(int(_at["id"]))
 
     # 결제변경 미결 검증도 강제 포함 (담당자 미지정·매장명 불일치 대비)
+    # list-query-dedupe: 상단 뱃지에서 가져온 _pending_pcr 를 재사용 — 중복 쿼리 제거.
+    # pending PCR id 가 이미 tasks 에 있으면 load_task_by_id 도 skip.
     try:
-        for _pcr in _tb.load_pending_payment_verifications(store_name, role):
+        _existing_ids = {int(t["id"]) for t in tasks}
+        for _pcr in _pending_pcr:
             _pid = int(_pcr["id"])
-            if _pid not in {int(t["id"]) for t in tasks}:
-                _full = _tb.load_task_by_id(_pid)
-                if _full:
-                    tasks.append(_full)
+            if _pid in _existing_ids:
+                continue
+            _full = _tb.load_task_by_id(_pid)
+            if _full:
+                tasks.append(_full)
+                _existing_ids.add(_pid)
     except Exception:
         pass
 
@@ -29964,7 +30172,20 @@ def render_internal_work():
                 depth=0, expand_task_id=_expand_tid or _focus_tid,
             )
     with tab_gantt:
-        _render_task_gantt(tasks, assignees_map)
+        # fragment-noti-gantt: st.tabs 는 숨겨진 탭의 body 도 매 rerun 실행한다.
+        # 사용자가 "간트차트 열기" 를 명시적으로 눌러야만 계산·렌더하도록 lazy 로 전환.
+        _gantt_shown_key = "task_gantt_shown"
+        st.session_state.setdefault(_gantt_shown_key, False)
+        if not st.session_state.get(_gantt_shown_key):
+            st.caption("클릭하면 간트차트를 로드합니다. (업무 수가 많으면 수 초 소요)")
+            if st.button("📊 간트차트 열기", key="task_gantt_open_btn"):
+                st.session_state[_gantt_shown_key] = True
+                st.rerun()
+        else:
+            if st.button("↩️ 간트 닫기", key="task_gantt_close_btn"):
+                st.session_state[_gantt_shown_key] = False
+                st.rerun()
+            _render_task_gantt(tasks, assignees_map)
 
     # 포커스/펼침은 1회성 — 다음 rerun 에서 일반 목록으로 복귀
     if _focus_tid is not None:
@@ -30950,7 +31171,50 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 except (TypeError, ValueError):
                     pass
 
-        # 참고 이력 / 등록될 원본 — 스크롤 가능한 컨테이너 (긴 텍스트도 잘 보이게)
+        def _pcr_fmt_pay_line(amt, method, onnuri) -> str:
+            try:
+                amt_s = f"{int(float(amt or 0)):,}원"
+            except Exception:
+                amt_s = "-"
+            bits = [amt_s, str(method or "-")]
+            if onnuri:
+                bits.append(str(onnuri))
+            return " / ".join(bits)
+
+        def _pcr_verify_label(pid) -> str:
+            try:
+                pid_i = int(pid) if pid not in (None, "", "신규생성(상계처리)") else None
+            except (TypeError, ValueError):
+                pid_i = None
+            if not pid_i:
+                return "❌ 미검증"
+            _v, _src = _pcr_check_external_verification(db_filename, pid_i)
+            return f"✅ 검증됨 ({_src})" if _v and _src else ("✅ 검증됨" if _v else "❌ 미검증")
+
+        # 원래 결제내역 + 변경 내용 + 미검증/검증 (Slack 본문 박스)
+        _desc_lines: list[str] = []
+        if orig:
+            try:
+                _sel_date = ""
+                if sel_pid is not None and pay_list is not None:
+                    _sr = pay_list[pay_list["id"] == sel_pid]
+                    if not _sr.empty:
+                        _sel_date = str(_sr.iloc[0].get("payment_date") or "")[:10]
+            except Exception:
+                _sel_date = ""
+            _orig_line = _pcr_fmt_pay_line(orig.get("amount"), orig.get("method"), orig.get("onnuri"))
+            _orig_v = _pcr_verify_label(sel_pid if sel_pid is not None else orig.get("payment_id"))
+            _desc_lines.append("<b>원래 결제내역</b>")
+            _desc_lines.append(html.escape(_orig_line))
+            _meta_bits = []
+            if sel_pid is not None:
+                _meta_bits.append(f"결제ID {int(sel_pid)}")
+            if _sel_date:
+                _meta_bits.append(f"결제일 {_sel_date}")
+            _meta_bits.append(_orig_v)
+            _desc_lines.append(
+                "<span style='color:#616061'>" + html.escape(" · ".join(_meta_bits)) + "</span>"
+            )
         if _orig_has_history:
             try:
                 _oa = f"{int(float(_hist_orig.get('amount') or 0)):,}원"
@@ -30964,38 +31228,24 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     _na = "-"
             _hist_from = (
                 f"{_oa} / {_hist_orig.get('method') or '-'}"
-                f"{(' · ' + _hist_orig['onnuri']) if _hist_orig.get('onnuri') else ''}"
+                f"{(' · ' + str(_hist_orig.get('onnuri'))) if _hist_orig.get('onnuri') else ''}"
             )
             _hist_to = (
                 f"{_na} / {_hist_new.get('method') or '-'}"
                 f"{(' · ' + str(_hist_new.get('onnuri'))) if _hist_new.get('onnuri') else ''}"
             )
-            _desc_html = (
-                f"<div class='pcr-slack-desc'>"
-                f"<b>결제변경 유형</b>  온누리/결제 변경<br/>"
-                f"<b>원본 결제</b>  {_hist_from}<br/>"
-                f"<b>변경 후</b>  {_hist_to}<br/>"
-                + (
-                    "<br/><span style='color:#616061'>참고 이력입니다. 대상 결제를 위에서 선택하면 원본이 바뀝니다.</span>"
-                    if _orig_from_paylist
-                    else "<br/><span style='color:#616061'>이력에서 가져온 원본입니다. 틀리면 추가 항목에서 수동 수정하세요.</span>"
-                )
-                + "</div>"
-            )
-            st.markdown(_desc_html, unsafe_allow_html=True)
-        elif orig:
-            try:
-                _oa2 = f"{int(float(orig.get('amount') or 0)):,}원"
-            except Exception:
-                _oa2 = "-"
-            _orig_line = (
-                f"{_oa2} / {orig.get('method') or '-'}"
-                f"{(' · ' + str(orig.get('onnuri'))) if orig.get('onnuri') else ''}"
-            )
+            _hv_from = _pcr_verify_label(_hist_orig.get("payment_id"))
+            _hv_to = _pcr_verify_label(_hist_new.get("payment_id") if _hist_new else None)
+            _act = str((_hist or {}).get("action_type") or "결제변경")
+            _hrs = str((_hist or {}).get("reason") or "").strip()
+            _desc_lines.append("<br/><b>변경 내용</b>")
+            _desc_lines.append(html.escape(f"{_act}  ·  원본: {_hist_from}  ·  {_hv_from}"))
+            _desc_lines.append(html.escape(f"변경 후: {_hist_to}  ·  {_hv_to}"))
+            if _hrs:
+                _desc_lines.append(html.escape(f"사유: {_hrs}"))
+        if _desc_lines:
             st.markdown(
-                f"<div class='pcr-slack-desc'>"
-                f"<b>등록될 원본</b>  {_orig_line}"
-                f"</div>",
+                "<div class='pcr-slack-desc'>" + "<br/>".join(_desc_lines) + "</div>",
                 unsafe_allow_html=True,
             )
 
@@ -31691,9 +31941,16 @@ def _render_new_task_form(me_uname: str, store_name: str | None, current_db: str
                     st.error(f"등록 실패: {err}")
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def _internal_work_employee_options(store_id, role: str, cross_store: bool = False) -> list[tuple[str, str]]:
     """현재 매장 직원 (superadmin은 전 직원). [(username, label)].
-    cross_store=True이고 관리자급(store_admin/superadmin)이면 전 직원 반환 (보안 업무 교차 지정용)."""
+    cross_store=True이고 관리자급(store_admin/superadmin)이면 전 직원 반환 (보안 업무 교차 지정용).
+
+    list-query-dedupe: 사내업무 상세·하위업무·신규 등록 폼이 각각 매번 리스트를 재계산하지 않도록
+    (store_id, role, cross_store) 조합을 키로 10분간 캐시한다. 내부에서 호출하는
+    _get_supabase_users_list / _get_supabase_user_store_ids 도 각자 캐시돼 있으므로
+    직원·매장 배정 변경 시 clear_data_cache() 로 함께 갱신된다.
+    """
     users = _get_supabase_users_list() or []
     _all_users = cross_store and role in ("store_admin", "superadmin")
     out: list[tuple[str, str]] = []
@@ -32025,16 +32282,28 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                                         },
                                         in_app_message=f"결제변경 검증 반려: {_rj_title}" + (f" | 사유: {_rj_note}" if _rj_note else ""),
                                     )
-                                _tb.clear_task_caches()
+                                # cache-split: 반려는 status/verify_status 변경 + 알림 → 리스트 + 알림만.
+                                _tb.clear_task_list_caches()
+                                _tb.clear_notification_caches()
                         except Exception as _rj_ex:
                             st.error(f"반려 처리 실패: {_rj_ex}")
                             st.stop()
                         flash("결제변경 검증이 반려 처리되었습니다.")
-                        st.rerun()
+                        # fragment-detail: 반려는 태스크 status/verify_status 를 바꾸므로 목록 배지 갱신 → app rerun.
+                        st.rerun(scope="app")
 
 
+@st.fragment
 def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                         role: str, store_name: str | None, current_db: str | None):
+    """태스크 자세히 보기 패널. @st.fragment 로 격리해 상세 내부 위젯 변경(파일 업로더,
+    댓글 입력 등) 시 사내업무 목록 전체가 rerun 되지 않도록 한다. (Phase D fragment-detail)
+
+    rerun 범위:
+    - 저장(제목/상태/담당자 등) → list 배지가 바뀌므로 `scope="app"` 로 상위까지 rerun.
+    - 하위업무 등록 → list 에 새 행이 추가되므로 `scope="app"`.
+    - 파일/댓글/활동은 상세 내부 상태만 바뀌므로 기본값(fragment-scoped) 유지.
+    """
     import task_board as _tb  # noqa: WPS433
 
     tid = int(task["id"])
@@ -32050,7 +32319,14 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     # 상세 필드 편집
     with st.form(f"task_edit_{tid}"):
         new_title = st.text_input("제목", value=task.get("title", ""), key=f"et_title_{tid}", disabled=not can_edit)
-        new_desc = st.text_area("설명", value=task.get("description") or "", key=f"et_desc_{tid}", height=100, disabled=not can_edit)
+        new_desc = st.text_area(
+            "설명",
+            value=task.get("description") or "",
+            key=f"et_desc_{tid}",
+            height=250,  # 약 10줄 — 스크롤 없이 대부분 내용 조망 가능
+            disabled=not can_edit,
+            placeholder="자유 메모 (결제변경 유형·금액·사유는 위 검증 패널에서 확인)",
+        )
         c1, c2, c3 = st.columns(3)
         with c1:
             _sd_default = date.fromisoformat(task["start_date"]) if task.get("start_date") else None
@@ -32133,9 +32409,28 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
             if set(new_assignees) != set(cur_users):
                 _tb.assign_users(tid, new_assignees, me_uname)
             flash("업무 정보가 저장되었습니다.")
-            st.rerun()
+            # fragment-detail: 저장은 목록 배지(제목/상태/담당자/마감)에 영향 → app 전체 rerun.
+            st.rerun(scope="app")
 
     st.markdown("---")
+
+    # staged-detail: 첨부·댓글·활동·하위업무 폼은 사용자가 명시적으로 열 때만 로드한다.
+    # 자세히 보기 첫 클릭 시 PCR 패널 + 편집 폼만 즉시 렌더하고 아래 섹션은 지연 로드.
+    # - load_task_attachments_cached / load_task_comments_cached / load_task_activity_cached
+    #   SQL 라운드트립 3건 + 하위업무 폼의 _internal_work_employee_options 조회를 모두 생략.
+    _detail_extra_key = f"task_detail_extra_open_{tid}"
+    st.session_state.setdefault(_detail_extra_key, False)
+    _extra_is_open = bool(st.session_state.get(_detail_extra_key, False))
+    _extra_label = (
+        "🔽 댓글·첨부·하위업무 접기"
+        if _extra_is_open else
+        "💬 댓글·첨부·하위업무 열기"
+    )
+    if st.button(_extra_label, key=f"task_detail_extra_toggle_{tid}", width='stretch'):
+        st.session_state[_detail_extra_key] = not _extra_is_open
+        _extra_is_open = not _extra_is_open
+    if not _extra_is_open:
+        return
 
     # 업무 직속 첨부 (어느 댓글에도 속하지 않는 task 레벨 파일)
     all_atts = _tb.load_task_attachments_cached(tid)
@@ -32300,7 +32595,8 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
                     )
                     if new_sub_id:
                         flash(f"하위 업무가 등록되었습니다. (#{new_sub_id})")
-                        st.rerun()
+                        # fragment-detail: 하위업무 추가는 목록에 새 행 → app 전체 rerun.
+                        st.rerun(scope="app")
                     else:
                         st.error(f"등록 실패: {sub_err}")
 

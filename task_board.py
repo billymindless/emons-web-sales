@@ -406,20 +406,42 @@ def load_templates_cached() -> dict[str, str]:
         return {}
 
 
-def clear_task_caches():
-    """업무·알림·템플릿 관련 모든 캐시를 무효화."""
+def clear_task_list_caches():
+    """업무 목록·배정·결제변경 미결/메타 등 리스트 뷰 캐시.
+    cache-split: 상태/제목/담당자/목록 멤버십이 바뀔 때 호출. 상세 전용(댓글/첨부/활동)과
+    알림 캐시는 건드리지 않아 다른 뷰 콜드 스타트를 유발하지 않는다.
+    """
     load_tasks_cached.clear()
     load_my_confidential_tasks_cached.clear()
     load_my_assigned_tasks.clear()
     load_task_assignees_cached.clear()
+    load_pending_payment_verifications.clear()
+    load_payment_change_meta.clear()
+    load_payment_verify_state.clear()
+
+
+def clear_task_detail_caches(task_id: int | None = None):
+    """상세 뷰 캐시(댓글/첨부/활동). task_id 는 향후 선택적 무효화 확장용(현재는 전역 clear).
+    cache-split: 댓글/첨부 등록처럼 상세만 바뀔 때 호출. 리스트 캐시는 유지된다.
+    """
     load_task_comments_cached.clear()
     load_task_attachments_cached.clear()
     load_task_activity_cached.clear()
+
+
+def clear_notification_caches():
+    """알림 리스트/카운터 캐시. cache-split: 알림 발송·읽음 처리 시 호출."""
     load_my_notifications_cached.clear()
     count_unread_notifications.clear()
-    load_payment_change_meta.clear()
-    load_payment_verify_state.clear()
-    load_pending_payment_verifications.clear()
+
+
+def clear_task_caches():
+    """하위호환 wrapper. 신규 코드는 clear_task_list_caches / clear_task_detail_caches /
+    clear_notification_caches 를 각각 호출해 과도한 캐시 무효화를 피한다.
+    """
+    clear_task_list_caches()
+    clear_task_detail_caches()
+    clear_notification_caches()
 
 
 def clear_template_cache():
@@ -517,7 +539,9 @@ def create_task(
             },
             in_app_message=f"신규 업무 배정: {row['title']}",
         )
-        clear_task_caches()
+        # cache-split: 신규 업무 — 리스트 + 알림만 무효화.
+        clear_task_list_caches()
+        clear_notification_caches()
         return new_id, None
     except Exception as e:
         return None, str(e)
@@ -582,7 +606,9 @@ def update_status(task_id: int, new_status: str, actor: str) -> tuple[bool, str 
             },
             in_app_message=f"상태 변경: {title} → {TASK_STATUS_LABELS.get(new_status, new_status)}",
         )
-        clear_task_caches()
+        # cache-split: 상태 변경 — 리스트 배지(상태) + PCR 미결 재계산 + 알림.
+        clear_task_list_caches()
+        clear_notification_caches()
         return True, None
     except Exception as e:
         return False, str(e)
@@ -607,7 +633,8 @@ def update_task_fields(task_id: int, actor: str, **fields) -> tuple[bool, str | 
     try:
         client.table("app_tasks").update(patch).eq("id", task_id).execute()
         log_activity(task_id, actor, "updated", patch)
-        clear_task_caches()
+        # cache-split: 필드 수정은 리스트 뷰(제목·마감·우선순위·태그 등)만 영향.
+        clear_task_list_caches()
         return True, None
     except Exception as e:
         return False, str(e)
@@ -622,7 +649,9 @@ def delete_task(task_id: int) -> tuple[bool, str | None]:
         # 하위업무의 parent 참조 해제 (CASCADE 미설정 환경 대비)
         client.table("app_tasks").update({"parent_task_id": None}).eq("parent_task_id", task_id).execute()
         client.table("app_tasks").delete().eq("id", task_id).execute()
-        clear_task_caches()
+        # cache-split: 삭제는 리스트에서 사라지므로 리스트 + 상세(고아 캐시 정리).
+        clear_task_list_caches()
+        clear_task_detail_caches(task_id)
         return True, None
     except Exception as e:
         return False, str(e)
@@ -673,7 +702,9 @@ def assign_users(task_id: int, usernames: list[str], actor: str) -> tuple[bool, 
                 )
             except Exception:
                 pass
-        clear_task_caches()
+        # cache-split: 담당자 변경은 리스트(assignees_map 표시) + 알림.
+        clear_task_list_caches()
+        clear_notification_caches()
         return True, None
     except Exception as e:
         return False, str(e)
@@ -707,7 +738,9 @@ def post_comment(task_id: int, author: str, body: str,
             template_vars={"title": title, "author": author, "preview": preview, "link": _task_link(task_id)},
             in_app_message=f"새 댓글: {title}",
         )
-        clear_task_caches()
+        # cache-split: 댓글은 상세 뷰(댓글 트리/활동) + 알림만 영향.
+        clear_task_detail_caches(task_id)
+        clear_notification_caches()
         return new_id, None
     except Exception as e:
         return None, str(e)
@@ -772,7 +805,8 @@ def attach_file(
 
         if task_id:
             log_activity(task_id, uploaded_by, "attached", {"name": original_name, "size": byte_size})
-        clear_task_caches()
+        # cache-split: 첨부는 상세 뷰(첨부 갤러리/활동) 전용 — 리스트/알림 캐시는 유지.
+        clear_task_detail_caches(task_id)
         return new_row, None
     except Exception as e:
         return None, str(e)
@@ -1212,19 +1246,15 @@ def create_payment_change_task(
             parts.append(f"온누리:{p.get('onnuri')}")
         return " / ".join(parts)
 
-    description = (
-        f"결제변경 유형: {change_label}\n"
-        f"고객: {customer_name or '-'}\n"
-        f"원본 결제: {_fmt(op)}\n"
-        f"변경 결제: {_fmt(npd)}\n"
-        f"사유: {reason or '-'}\n"
-        f"(요청 등록 시 원본 결제 취소행·신규 결제행이 자동 저장됨 — 본 태스크는 증빙 검증용)"
-    )
+    # empty-desc-vscroll: 유형·고객·원본/변경·사유는 결제변경 검증 패널에서 이미 노출되므로
+    # 자동 설명 생성 대신 설명란은 빈 값으로 저장 — 사용자가 자유 메모용으로 쓸 수 있게 한다.
+    # 기존에 저장된 자동 설명은 일괄 수정하지 않고 그대로 유지한다 (surgical change).
+    description = ""
 
     try:
         row = {
             "title": title,
-            "description": description,
+            "description": description or None,
             "status": "requested",
             "priority": "high",
             "created_by": created_by,
@@ -1294,7 +1324,9 @@ def create_payment_change_task(
             },
             in_app_message=f"결제변경 검증 요청: {title}",
         )
-        clear_task_caches()
+        # cache-split: 신규 결제변경 요청 — 리스트(PCR 미결/메타) + 알림 영향.
+        clear_task_list_caches()
+        clear_notification_caches()
         return task_id, None
     except Exception as e:
         return None, str(e)
@@ -1352,7 +1384,9 @@ def resolve_payment_change(task_id: int, verifier: str, note: str | None = None)
                 )
         except Exception:
             pass
-        clear_task_caches()
+        # cache-split: 검증 완료 — 리스트(status/verify_status) + 알림.
+        clear_task_list_caches()
+        clear_notification_caches()
         return True, None
     except Exception as e:
         return False, str(e)
