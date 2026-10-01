@@ -30730,7 +30730,11 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
 
 
 def _pcr_approval_key(method: str, raw: str) -> str:
-    """결제변경 승인번호 비교키. 카드사명·빈 값은 빈 문자열."""
+    """결제변경 승인번호 비교키. 카드사명·빈 값은 빈 문자열.
+
+    온누리: 뒤 4자리 + 거래시간(HHMMSS, 선택) 조합으로 중복 판정.
+    같은 뒤4·같은 금액이어도 거래시간이 다르면 서로 다른 결제로 간주한다.
+    """
     s = str(raw or "").strip()
     if not s:
         return ""
@@ -30739,9 +30743,11 @@ def _pcr_approval_key(method: str, raw: str) -> str:
         n = _ext_pay_norm_approval6(s)
         return f"ulsan:{n}" if n else ""
     if "온누리" in meth:
-        head = s.split("-", 1)[0].strip()
-        digits = re.sub(r"\D", "", head)
-        return f"onnuri:{digits}" if len(digits) >= 4 else ""
+        last4 = _onnuri_last4_from_code(s)
+        tx_time = _onnuri_time_from_code(s) or ""
+        if len(last4) == 4:
+            return f"onnuri:{last4}-{tx_time}"
+        return ""
     digits = re.sub(r"\D", "", s)
     if len(digits) >= 4:
         return f"code:{digits}"
@@ -30774,7 +30780,11 @@ def _pcr_existing_approval_keys(pay_list) -> dict[str, str]:
 
 
 def _pcr_duplicate_approval_errors(pay_list, new_lines: list[dict]) -> list[str]:
-    """신규 라인의 승인번호가 기존 결제 또는 다른 신규 라인과 겹치면 오류 문구."""
+    """신규 라인의 승인번호가 기존 결제 또는 다른 신규 라인과 겹치면 오류 문구.
+
+    온누리의 경우 뒤4만 입력하고 거래시간이 없을 때 중복이 걸리면
+    "거래시간을 입력해 주세요" 안내를 추가한다.
+    """
     existing = _pcr_existing_approval_keys(pay_list)
     seen: dict[str, int] = {}
     errs: list[str] = []
@@ -30786,8 +30796,16 @@ def _pcr_duplicate_approval_errors(pay_list, new_lines: list[dict]) -> list[str]
         key = _pcr_approval_key(meth, raw)
         if not key:
             continue
+        _is_onnuri = ("온누리" in meth) and ("지류" not in meth)
+        _has_time = bool(_onnuri_time_from_code(raw)) if _is_onnuri else True
         if key in existing:
-            errs.append(f"금액 #{i + 1} 승인번호 {raw} — 이미 있음 ({existing[key]})")
+            if _is_onnuri and not _has_time:
+                errs.append(
+                    f"금액 #{i + 1} 온누리 뒤4 {raw} — 같은 뒤4·금액이 이미 있음 "
+                    f"({existing[key]}). 거래시간을 입력해 구분해 주세요."
+                )
+            else:
+                errs.append(f"금액 #{i + 1} 승인번호 {raw} — 이미 있음 ({existing[key]})")
         if key in seen:
             errs.append(f"금액 #{i + 1} 승인번호 {raw} — 이번 입력 #{seen[key] + 1}과 중복")
         else:
@@ -31035,28 +31053,89 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     f"결제수단 #{_i + 1}", options=PAYMENT_METHOD_OPTIONS,
                     key=f"pcr_meth_{order_id}_{_i}",
                 )
+            _meth_norm = str(_meth_i or "")
+            _needs_card = ("신용카드" in _meth_norm) or ("체크카드" in _meth_norm)
+            _is_onnuri_e = ("온누리" in _meth_norm) and ("지류" not in _meth_norm)
+            _is_ulsan = ("지역화폐" in _meth_norm)
+            _needs_approval = _is_onnuri_e or _is_ulsan
+            _amt_key_i = f"pcr_amt_{order_id}_{_i}"
+            # 이전 rerun 의 amount(세션) 값으로 거래시간 필요 여부를 미리 판단한다.
+            _amt_prev = _parse_comma_to_int(st.session_state.get(_amt_key_i, "0"))
             with lc3:
-                _meth_norm = str(_meth_i or "")
-                _needs_card = ("신용카드" in _meth_norm) or ("체크카드" in _meth_norm)
-                _needs_approval = ("온누리" in _meth_norm) or ("지역화폐" in _meth_norm)
-                if _needs_card:
-                    _code_label = f"결제카드사 #{_i + 1}"
-                    _code_ph = "예: NH농협카드"
-                elif _needs_approval:
-                    _code_label = f"승인번호 #{_i + 1}"
-                    _code_ph = "지역화폐 6자리 / 온누리 뒤4 또는 4자-HHMMSS"
+                if _is_onnuri_e:
+                    # 온누리(전자): 뒤 4자리 + (중복 시) 거래시간 분리 입력
+                    _last4_key = f"pcr_onnuri_last4_{order_id}_{_i}"
+                    _time_key = f"pcr_onnuri_time_{order_id}_{_i}"
+                    # 세션 초기화: 기존 _ok(composed) 가 있으면 last4/time 으로 분해
+                    _ok_prev = str(st.session_state.get(f"pcr_onnuri_{order_id}_{_i}", "") or "")
+                    if _last4_key not in st.session_state:
+                        st.session_state[_last4_key] = _onnuri_last4_from_code(_ok_prev)
+                    if _time_key not in st.session_state:
+                        st.session_state[_time_key] = _onnuri_format_time_display(
+                            _onnuri_time_from_code(_ok_prev)
+                        )
+                    st.text_input(
+                        f"온누리 뒤4 #{_i + 1} *",
+                        key=_last4_key,
+                        max_chars=4,
+                        placeholder="4자리",
+                    )
+                    # 같은 폼 내 다른 라인과의 뒤4·금액 충돌 체크
+                    _ed_last4 = re.sub(r"\D", "", str(st.session_state.get(_last4_key, "") or ""))
+                    _ed_date_val = st.session_state.get(f"pcr_date_{order_id}_{_i}")
+                    _ed_date_str = (
+                        _ed_date_val.isoformat()
+                        if hasattr(_ed_date_val, "isoformat")
+                        else str(_ed_date_val or "")[:10]
+                    )
+                    _form_collide = False
+                    for _j in range(_new_count):
+                        if _j == _i:
+                            continue
+                        _mj = str(st.session_state.get(f"pcr_meth_{order_id}_{_j}", "") or "")
+                        if ("온누리" not in _mj) or ("지류" in _mj):
+                            continue
+                        _l4j = re.sub(r"\D", "", str(st.session_state.get(f"pcr_onnuri_last4_{order_id}_{_j}", "") or ""))
+                        _amj = _parse_comma_to_int(st.session_state.get(f"pcr_amt_{order_id}_{_j}", "0"))
+                        if _l4j and _l4j == _ed_last4 and _amj == _amt_prev:
+                            _form_collide = True
+                            break
+                    _need_time = _onnuri_should_ask_time(
+                        db_filename, _ed_last4, int(_amt_prev or 0), _ed_date_str,
+                        form_collides=_form_collide,
+                    )
+                    _onnuri_time_input(
+                        _time_key,
+                        visible=_need_time,
+                        label=f"온누리 거래시간 #{_i + 1} *",
+                    )
+                    # 최종 식별자 조립 (require_time=False — 하단 duplicate 검증에서 재확인)
+                    _composed, _ = _onnuri_compose_ident(
+                        st.session_state.get(_last4_key, ""),
+                        st.session_state.get(_time_key, ""),
+                        require_time=False,
+                    )
+                    _code_i = _composed or _ed_last4
+                    # 뒤 호환: _ok 세션에도 composed 값을 저장해 downstream 로직 보존
+                    st.session_state[f"pcr_onnuri_{order_id}_{_i}"] = _code_i
                 else:
-                    _code_label = f"참고번호 #{_i + 1}"
-                    _code_ph = "(선택)"
-                _code_i = st.text_input(
-                    _code_label,
-                    key=f"pcr_onnuri_{order_id}_{_i}",
-                    max_chars=20,
-                    placeholder=_code_ph,
-                    disabled=not (_needs_card or _needs_approval),
-                )
+                    if _needs_card:
+                        _code_label = f"결제카드사 #{_i + 1}"
+                        _code_ph = "예: NH농협카드"
+                    elif _is_ulsan:
+                        _code_label = f"지역화폐 승인번호 #{_i + 1}"
+                        _code_ph = "6자리"
+                    else:
+                        _code_label = f"참고번호 #{_i + 1}"
+                        _code_ph = "(선택)"
+                    _code_i = st.text_input(
+                        _code_label,
+                        key=f"pcr_onnuri_{order_id}_{_i}",
+                        max_chars=20,
+                        placeholder=_code_ph,
+                        disabled=not (_needs_card or _is_ulsan),
+                    )
             with lc4:
-                _amt_key_i = f"pcr_amt_{order_id}_{_i}"
                 # 실시간 콤마 포맷은 클라이언트 사이드 JS(_inject_money_input_live_format)에서 처리.
                 # 파이썬 on_change 는 blur 마다 rerun 을 유발해 화면 점멸/지연의 원인이라 제거.
                 st.text_input(
