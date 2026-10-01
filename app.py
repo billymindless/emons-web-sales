@@ -31061,12 +31061,12 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             _amt_key_i = f"pcr_amt_{order_id}_{_i}"
             # 이전 rerun 의 amount(세션) 값으로 거래시간 필요 여부를 미리 판단한다.
             _amt_prev = _parse_comma_to_int(st.session_state.get(_amt_key_i, "0"))
+            # 세션 키 미리 선언 (뒤에 거래시간 전용 행에서 사용)
+            _last4_key = f"pcr_onnuri_last4_{order_id}_{_i}"
+            _time_key = f"pcr_onnuri_time_{order_id}_{_i}"
             with lc3:
                 if _is_onnuri_e:
-                    # 온누리(전자): 뒤 4자리 + (중복 시) 거래시간 분리 입력
-                    _last4_key = f"pcr_onnuri_last4_{order_id}_{_i}"
-                    _time_key = f"pcr_onnuri_time_{order_id}_{_i}"
-                    # 세션 초기화: 기존 _ok(composed) 가 있으면 last4/time 으로 분해
+                    # 온누리(전자): 뒤 4자리만 lc3 에 — 거래시간은 아래 별도 행으로 분리
                     _ok_prev = str(st.session_state.get(f"pcr_onnuri_{order_id}_{_i}", "") or "")
                     if _last4_key not in st.session_state:
                         st.session_state[_last4_key] = _onnuri_last4_from_code(_ok_prev)
@@ -31080,23 +31080,6 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         max_chars=4,
                         placeholder="4자리",
                     )
-                    _ed_last4 = re.sub(r"\D", "", str(st.session_state.get(_last4_key, "") or ""))
-                    # 온누리 거래시간은 항상 노출 (중복이 아니어도 ERP·외부파일 매칭 정확도 향상)
-                    # 숫자만 입력하면 _format_time_hhmmss 로 HH:MM:SS 콜론 자동 삽입.
-                    _onnuri_time_input(
-                        _time_key,
-                        visible=True,
-                        label=f"온누리 거래시간 #{_i + 1}",
-                    )
-                    # 최종 식별자 조립 (require_time=False — 하단 duplicate 검증에서 재확인)
-                    _composed, _ = _onnuri_compose_ident(
-                        st.session_state.get(_last4_key, ""),
-                        st.session_state.get(_time_key, ""),
-                        require_time=False,
-                    )
-                    _code_i = _composed or _ed_last4
-                    # 뒤 호환: _ok 세션에도 composed 값을 저장해 downstream 로직 보존
-                    st.session_state[f"pcr_onnuri_{order_id}_{_i}"] = _code_i
                 else:
                     if _needs_card:
                         _code_label = f"결제카드사 #{_i + 1}"
@@ -31140,6 +31123,33 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         st.session_state.pop(f"pcr_{_suf}_{order_id}_{_new_count - 1}", None)
                     st.session_state[_count_key] = _new_count - 1
                     st.rerun()
+            # ── 온누리 거래시간 전용 행 (수단이 온누리(전자)일 때만 표시) ──
+            # lc3 폭이 좁아 숨겨 보이는 문제가 있어 전체 폭의 별도 row 로 분리.
+            if _is_onnuri_e:
+                _tc1, _tc2 = st.columns([1.6, 4.6])
+                with _tc1:
+                    _onnuri_time_input(
+                        _time_key,
+                        visible=True,
+                        label=f"⏰ 온누리 거래시간 #{_i + 1}",
+                    )
+                with _tc2:
+                    st.caption(
+                        "💡 디지털 온누리 매출내역의 거래시간을 입력하세요. "
+                        "숫자만 입력해도 `HH:MM:SS` 로 자동 변환됩니다. "
+                        "같은 날·같은 뒤4·같은 금액 결제가 있을 때 거래시간으로 구분됩니다."
+                    )
+                # 최종 식별자 조립 (뒤4 + 거래시간 → "8395-181529")
+                _composed, _ = _onnuri_compose_ident(
+                    st.session_state.get(_last4_key, ""),
+                    st.session_state.get(_time_key, ""),
+                    require_time=False,
+                )
+                _code_i = _composed or re.sub(
+                    r"\D", "", str(st.session_state.get(_last4_key, "") or "")
+                )
+                # 뒤 호환: _ok 세션에도 composed 값을 저장해 downstream 로직 보존
+                st.session_state[f"pcr_onnuri_{order_id}_{_i}"] = _code_i
             new_lines.append({
                 "date": _date_i,
                 "amount": int(_amt_i or 0),
