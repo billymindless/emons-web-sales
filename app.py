@@ -32041,10 +32041,13 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 f"&nbsp;<span style='font-size:0.8rem; color:#64748b;'>{_scope_badge}</span></div>",
                 unsafe_allow_html=True,
             )
-            m1, m2, m3 = st.columns([4, 3, 3])
+            _author_name = _uname_to_display(task.get("created_by")) or "-"
+            _task_store = (task.get("store_name") or "").strip() or "-"
+            m1, m2, m3, m4 = st.columns([3.2, 2.0, 2.6, 1.6])
             m1.markdown(f"👤 **담당** &nbsp; {assignee_names}")
-            m2.markdown(f"📅 **마감** &nbsp; {due}")
-            m3.caption(f"작성: {_uname_to_display(task.get('created_by'))}  ·  하위업무 {sub_count}")
+            m2.markdown(f"✍️ **작성** &nbsp; {_author_name}")
+            m3.markdown(f"🏪 **담당매장** &nbsp; {_task_store}")
+            m4.markdown(f"📅 **마감** &nbsp; {due}")
 
             _can_del = is_admin or (task.get("created_by") == me_uname)
             _btn_cols = st.columns([2, 2, 2, 6])
