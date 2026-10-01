@@ -34016,16 +34016,6 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
     }
     _all_cols = [c for c in df_show.columns if c not in _hidden]
     _show = df_show[_all_cols]
-    _red = (
-        df_show[_flag_col].reindex(_show.index).fillna(False).astype(bool)
-        if _flag_col in df_show.columns
-        else pd.Series(False, index=_show.index)
-    )
-
-    def _hl_fabricated(row):
-        if bool(_red.loc[row.name]):
-            return ["background-color: #ffe6e6; color: #b30000; font-weight: 600;"] * len(row)
-        return [""] * len(row)
 
     _col_w = {
         f"{_src_side}원장일": 110,
@@ -34047,9 +34037,22 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         c: st.column_config.Column(c, width=_col_w.get(c, 120))
         for c in _all_cols
     }
+    # Styler + on_select 는 Streamlit 1.54 에서 행 선택 이벤트가 전달되지 않는다.
+    # 가공 의심은 텍스트 열로만 표시하고, 선택 인덱스는 화면 순서(0..n-1)와 맞춘다.
+    _view = _show.reset_index(drop=True)
+    _df_pos = df.reset_index(drop=True)
+    if _flag_col in df_show.columns and bool(df_show[_flag_col].fillna(False).astype(bool).any()):
+        _view.insert(
+            0, "의심",
+            df_show[_flag_col].reset_index(drop=True).map(lambda v: "Y" if bool(v) else ""),
+        )
+        _cfg = {
+            "의심": st.column_config.TextColumn("의심", width=50, help="승인번호 가공 의심"),
+            **_cfg,
+        }
     _sel_key = f"extpay_result_sel_{sel_db}_{sel_src}"
     _sel_event = st.dataframe(
-        _show.style.apply(_hl_fabricated, axis=1),
+        _view,
         width="stretch",
         hide_index=True,
         column_config=_cfg,
@@ -34057,52 +34060,26 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         selection_mode="single-row",
         key=_sel_key,
     )
-    st.caption("💡 승인번호만 수정할 때는 결과표에서 해당 행의 체크박스를 클릭하면 수정 팝업이 자동으로 열립니다.")
+    st.caption("승인번호만 수정할 때는 결과표 왼쪽 선택 칸을 클릭하세요. 팝업이 바로 열립니다.")
 
-    # ── 행 선택 감지 → 승인번호 수정 팝업 target 설정 ──
     _last_opened_key = f"_extpay_appr_last_opened_{sel_db}_{sel_src}"
-    try:
-        _sel_rows = list((_sel_event.selection.rows if _sel_event and hasattr(_sel_event, "selection") else []) or [])
-    except Exception:
-        _sel_rows = []
+    _sel_rows = _ext_pay_selection_row_positions(_sel_event)
     if _sel_rows:
         _row_idx = int(_sel_rows[0])
-        if 0 <= _row_idx < len(df):
-            _meta_row = df.iloc[_row_idx]
-            try:
-                _pid_val = _meta_row.get("_payment_id") if hasattr(_meta_row, "get") else None
-                _pid = int(_pid_val) if _pid_val is not None and pd.notna(_pid_val) else 0
-            except (TypeError, ValueError):
-                _pid = 0
+        if 0 <= _row_idx < len(_df_pos):
+            _meta_row = _df_pos.iloc[_row_idx]
+            _pid = _ext_pay_cell_int(_meta_row.get("_payment_id"))
             if _pid > 0:
                 _this_key = (_row_idx, _pid)
                 if st.session_state.get(_last_opened_key) != _this_key:
                     st.session_state[_last_opened_key] = _this_key
-
-                    def _safe_int(v):
-                        try:
-                            return int(v) if v is not None and pd.notna(v) else None
-                        except (TypeError, ValueError):
-                            return None
-                    _result_code = str(_meta_row.get("결과") or "")
-                    _result_label = _result_map.get(_result_code, _result_code)
-                    st.session_state["_extpay_appr_edit_target"] = {
-                        "_src_key": (sel_db, sel_src),
-                        "_payment_id": _pid,
-                        "_order_id": _safe_int(_meta_row.get("_order_id")),
-                        "_customer_id": _safe_int(_meta_row.get("_customer_id")),
-                        "_payment_method": str(_meta_row.get("_payment_method") or ""),
-                        "_amount_int": _safe_int(_meta_row.get("_amount_int")) or 0,
-                        "_official_date": str(_meta_row.get("공식일자") or "")[:10],
-                        "_official_amount": str(_meta_row.get("공식금액") or ""),
-                        "_buyer": str(_meta_row.get("구매자") or ""),
-                        "_result_code": _result_code,
-                        "_result_label": _result_label,
-                        "_customer_name": str(_meta_row.get("고객명") or ""),
-                        "_src_label": _src_side,
-                    }
+                    _built = _ext_pay_build_appr_edit_target(
+                        _meta_row, sel_db=sel_db, sel_src=sel_src,
+                        result_map=_result_map, src_side=_src_side,
+                    )
+                    if _built:
+                        st.session_state["_extpay_appr_edit_target"] = _built
     else:
-        # 선택 해제 → 다음 체크 시 다이얼로그 재오픈 허용
         st.session_state.pop(_last_opened_key, None)
 
     _appr_target = st.session_state.get("_extpay_appr_edit_target")
@@ -34112,6 +34089,55 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
             lambda _t=_appr_target, _db=sel_db: _render_approval_edit_dialog_impl(_db, _t),
             width="medium",
         )
+
+    _fb_positions: list[int] = []
+    _fb_labels: dict[int, str] = {}
+    for _i in range(len(_df_pos)):
+        _r = _df_pos.iloc[_i]
+        _pid_fb = _ext_pay_cell_int(_r.get("_payment_id"))
+        if _pid_fb <= 0:
+            continue
+        _when = str(_r.get("공식일자") or _r.get("ERP일자") or "")[:10]
+        _amt = str(_r.get("공식금액") or _r.get("ERP금액") or "").strip()
+        _who = str(_r.get("고객명") or _r.get("구매자") or "").strip()
+        _code = str(_r.get("결과") or "")
+        _fb_positions.append(_i)
+        _fb_labels[_i] = (
+            f"#{_pid_fb} · {_when} · {_amt}원 · {_who or '-'} · "
+            f"{_result_map.get(_code, _code) or '-'}"
+        )
+    if _fb_positions:
+        _fb_c1, _fb_c2 = st.columns([4, 1])
+        with _fb_c1:
+            _fb_pick = st.selectbox(
+                "승인번호 수정할 결제",
+                options=_fb_positions,
+                format_func=lambda k: _fb_labels.get(k, str(k)),
+                index=None,
+                placeholder="결과표 선택이 안 되면 여기서 결제를 고르세요",
+                key=f"extpay_appr_pick_{sel_db}_{sel_src}",
+            )
+        with _fb_c2:
+            _fb_open = st.button(
+                "팝업 열기",
+                key=f"extpay_appr_open_btn_{sel_db}_{sel_src}",
+                width="stretch",
+                disabled=_fb_pick is None,
+            )
+        if _fb_open and _fb_pick is not None:
+            _built_fb = _ext_pay_build_appr_edit_target(
+                _df_pos.iloc[int(_fb_pick)],
+                sel_db=sel_db, sel_src=sel_src,
+                result_map=_result_map, src_side=_src_side,
+            )
+            if _built_fb:
+                if _sel_rows and 0 <= int(_sel_rows[0]) < len(_df_pos):
+                    _pid_sel = _ext_pay_cell_int(
+                        _df_pos.iloc[int(_sel_rows[0])].get("_payment_id")
+                    )
+                    st.session_state[_last_opened_key] = (int(_sel_rows[0]), _pid_sel)
+                st.session_state["_extpay_appr_edit_target"] = _built_fb
+                st.rerun()
 
     _dl = df_show[_all_cols].copy()
     if _flag_col in df_show.columns:
@@ -34142,6 +34168,8 @@ def _render_external_pay_admin_section(role: str, me_uname: str) -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"extpay_xlsx_{sel_db}_{sel_src}",
     )
+
+    _render_ext_pay_quick_approval_fix(sel_db, sel_src, df, me_uname)
 
     # AI 유사 매칭 제안 (온누리 파일럿) — 수동 매칭 전 관리자 검토
     _render_ext_pay_ai_similar_match(sel_db, sel_src, df, me_uname)
@@ -34306,6 +34334,389 @@ def _render_ext_pay_conflict_panel(
             st.session_state.pop(key, None)
             flash(f"중복 {len(conflicts)}건을 모두 skip 처리했습니다.")
             st.rerun()
+
+
+def _ext_pay_cell_int(v) -> int:
+    """DataFrame 셀을 정수로. 비어 있거나 NaN 이면 0."""
+    try:
+        if v is None or pd.isna(v):
+            return 0
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ext_pay_selection_row_positions(event) -> list[int]:
+    """st.dataframe on_select 반환값에서 화면 순서(0부터)를 꺼낸다."""
+    if event is None:
+        return []
+    sel = getattr(event, "selection", None)
+    if sel is None and isinstance(event, dict):
+        sel = event.get("selection")
+    if sel is None:
+        return []
+    rows = getattr(sel, "rows", None)
+    if rows is None and isinstance(sel, dict):
+        rows = sel.get("rows")
+    out: list[int] = []
+    for x in rows or []:
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ext_pay_build_appr_edit_target(
+    row, *, sel_db: str, sel_src: str, result_map: dict, src_side: str,
+) -> dict | None:
+    """결과표 1행 → 승인번호 수정 팝업용 메타. 결제 ID 가 없으면 None."""
+    getter = row.get if hasattr(row, "get") else (lambda k, _d=None: _d)
+    pid = _ext_pay_cell_int(getter("_payment_id"))
+    if pid <= 0:
+        return None
+
+    def _opt_int(key: str):
+        raw = getter(key)
+        try:
+            if raw is None or pd.isna(raw):
+                return None
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    code = str(getter("결과") or "")
+    return {
+        "_src_key": (sel_db, sel_src),
+        "_payment_id": pid,
+        "_order_id": _opt_int("_order_id"),
+        "_customer_id": _opt_int("_customer_id"),
+        "_payment_method": str(getter("_payment_method") or ""),
+        "_amount_int": _opt_int("_amount_int") or 0,
+        "_official_date": str(getter("공식일자") or "")[:10],
+        "_official_amount": str(getter("공식금액") or ""),
+        "_buyer": str(getter("구매자") or ""),
+        "_result_code": code,
+        "_result_label": result_map.get(code, code),
+        "_customer_name": str(getter("고객명") or ""),
+        "_src_label": src_side,
+    }
+
+
+def _ext_pay_amount_int_cell(v) -> int:
+    try:
+        s = str(v or "").replace(",", "").strip()
+        return int(s) if s else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ext_pay_parse_date_cell(v) -> date | None:
+    s = str(v or "").strip()[:10]
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _ext_pay_find_unique_amount_pairs(
+    df: "pd.DataFrame", sel_src: str, *, date_tol_days: int,
+) -> list[dict]:
+    """금액이 공식 1건·모모 1건이고 날짜 차이가 허용 이내인 쌍만 반환."""
+    if df is None or getattr(df, "empty", True):
+        return []
+    if sel_src not in ("onnuri", "ulsanpay"):
+        return []
+    off_codes = {"official_only", "미매칭", "amount_mismatch", "official_canceled"}
+    off_by: dict[int, list] = {}
+    erp_by: dict[int, list] = {}
+    for rec in df.to_dict("records"):
+        code = str(rec.get("결과") or "")
+        if code in off_codes:
+            amt = _ext_pay_amount_int_cell(rec.get("공식금액"))
+            if amt > 0:
+                off_by.setdefault(amt, []).append(rec)
+        elif code == "erp_only":
+            amt = _ext_pay_cell_int(rec.get("_amount_int"))
+            if amt > 0:
+                erp_by.setdefault(amt, []).append(rec)
+    out: list[dict] = []
+    for amt, offs in off_by.items():
+        erps = erp_by.get(amt) or []
+        if len(offs) != 1 or len(erps) != 1:
+            continue
+        off, erp = offs[0], erps[0]
+        d_off = _ext_pay_parse_date_cell(off.get("공식일자"))
+        d_erp = _ext_pay_parse_date_cell(erp.get("ERP일자"))
+        if d_off is None or d_erp is None:
+            continue
+        day_diff = abs((d_off - d_erp).days)
+        if day_diff > int(date_tol_days):
+            continue
+        out.append({"off": off, "erp": erp, "amount": amt, "day_diff": day_diff})
+    out.sort(key=lambda x: (x["day_diff"], -int(x["amount"])))
+    return out
+
+
+def _render_ext_pay_quick_approval_fix(
+    sel_db: str, sel_src: str, df: "pd.DataFrame", me_uname: str,
+) -> None:
+    """금액이 같고 승인번호만 다른 유일 쌍의 승인번호·시각을 표에서 바로 수정."""
+    if sel_src not in ("onnuri", "ulsanpay"):
+        return
+    if df is None or getattr(df, "empty", True):
+        return
+    _ledger = _ext_pay_ledger_label(sel_src)
+    _tol = st.slider(
+        "금액 동일 쌍 · 날짜 허용 ±일",
+        min_value=1,
+        max_value=30,
+        value=3,
+        key=f"extpay_quick_tol_{sel_db}_{sel_src}",
+        help="공식 일자와 모모 결제일의 차이가 이 값 이하이고, 같은 금액이 양쪽에 각 1건일 때만 후보로 올립니다.",
+    )
+    pairs = _ext_pay_find_unique_amount_pairs(df, sel_src, date_tol_days=int(_tol))
+    with st.expander(
+        f"금액 동일 · 승인번호만 다름 — 빠른 수정 ({len(pairs)}건)",
+        expanded=bool(pairs),
+    ):
+        _rep_key = f"extpay_quick_report_{sel_db}_{sel_src}"
+        _rep = st.session_state.pop(_rep_key, None)
+        if _rep:
+            if _rep.get("saved"):
+                st.success(f"저장 {len(_rep['saved'])}건")
+            if _rep.get("skipped"):
+                st.warning(
+                    "건너뜀 " + str(len(_rep["skipped"])) + "건\n\n"
+                    + "\n".join(f"- {x}" for x in _rep["skipped"])
+                )
+            if _rep.get("failed"):
+                st.error(
+                    "실패 " + str(len(_rep["failed"])) + "건\n\n"
+                    + "\n".join(f"- {x}" for x in _rep["failed"])
+                )
+        st.caption(
+            f"{_ledger}에만 있는 1건과 모모에만 있는 1건의 금액이 같고, "
+            f"날짜 차이가 ±{int(_tol)}일 이내인 쌍만 보여 줍니다. "
+            "1,000,000원처럼 같은 금액이 여러 건이면 여기 나오지 않습니다. "
+            f"실행 계정: {me_uname or '-'}."
+        )
+        if not pairs:
+            st.info("이 날짜 범위에는 금액이 양쪽에 각 1건인 쌍이 없습니다. 허용 일수를 넓혀 보세요.")
+            return
+
+        rows: list[dict] = []
+        for p in pairs:
+            off, erp = p["off"], p["erp"]
+            cancel = str(off.get("결과") or "") == "official_canceled" or (
+                "취소" in str(off.get("공식상태") or "")
+            )
+            note = "공식 취소 — 모모도 취소/환불 처리 필요" if cancel else ""
+            base = {
+                "사용": False,
+                "날짜차": int(p["day_diff"]),
+                "금액": int(p["amount"]),
+                "공식일자": str(off.get("공식일자") or "")[:10],
+                "구매자": str(off.get("구매자") or ""),
+                "공식상태": str(off.get("공식상태") or ""),
+                "결제ID": _ext_pay_cell_int(erp.get("_payment_id")),
+                "주문ID": _ext_pay_cell_int(erp.get("_order_id")),
+                "모모결제일": str(erp.get("ERP일자") or "")[:10],
+                "고객명": str(erp.get("고객명") or ""),
+                "비고": note,
+            }
+            if sel_src == "onnuri":
+                def _last4_cell(v) -> str:
+                    s = str(v or "").strip()
+                    if re.fullmatch(r"\d+\.0+", s):
+                        s = s.split(".", 1)[0]
+                    digits = re.sub(r"\D", "", s)
+                    return digits if len(digits) <= 4 else digits[-4:]
+
+                off_last4 = _last4_cell(off.get("뒤4"))
+                erp_last4 = _last4_cell(erp.get("뒤4"))
+                off_time = _onnuri_parse_time_input(off.get("공식시각")) or ""
+                same = bool(off_last4) and off_last4 == erp_last4
+                if same and not cancel:
+                    note = "승인번호(뒤4) 동일"
+                base.update({
+                    "사용": (not cancel) and (not same) and len(off_last4) == 4,
+                    "공식뒤4": off_last4,
+                    "공식시각": _onnuri_format_time_display(off_time) if off_time else "",
+                    "모모뒤4": erp_last4,
+                    "새뒤4": off_last4,
+                    "새시각": _onnuri_format_time_display(off_time) if off_time else "",
+                    "비고": note,
+                })
+            else:
+                off_ap = _ext_pay_norm_approval6(off.get("승인번호"))
+                erp_ap = _ext_pay_norm_approval6(erp.get("승인번호"))
+                same = bool(off_ap) and off_ap == erp_ap
+                if same and not cancel:
+                    note = "승인번호 동일"
+                base.update({
+                    "사용": (not cancel) and (not same) and len(off_ap) == 6,
+                    "공식승인번호": off_ap,
+                    "모모승인번호": erp_ap,
+                    "새승인번호": off_ap,
+                    "비고": note,
+                })
+            rows.append(base)
+
+        edit_df = pd.DataFrame(rows)
+        if sel_src == "onnuri":
+            editable = ["사용", "새뒤4", "새시각"]
+            col_order = [
+                "사용", "날짜차", "금액", "공식일자", "공식뒤4", "공식시각", "구매자", "공식상태",
+                "결제ID", "주문ID", "모모결제일", "모모뒤4", "고객명", "새뒤4", "새시각", "비고",
+            ]
+        else:
+            editable = ["사용", "새승인번호"]
+            col_order = [
+                "사용", "날짜차", "금액", "공식일자", "공식승인번호", "구매자", "공식상태",
+                "결제ID", "주문ID", "모모결제일", "모모승인번호", "고객명", "새승인번호", "비고",
+            ]
+        disabled = [c for c in col_order if c not in editable]
+        edited = st.data_editor(
+            edit_df[col_order],
+            column_order=col_order,
+            disabled=disabled,
+            hide_index=True,
+            width="stretch",
+            num_rows="fixed",
+            key=f"extpay_quick_fix_editor_{sel_db}_{sel_src}_{int(_tol)}",
+            column_config={
+                "사용": st.column_config.CheckboxColumn("사용", width=60),
+                "날짜차": st.column_config.NumberColumn("날짜차", width=70),
+                "금액": st.column_config.NumberColumn("금액", format="%d", width=110),
+                "새뒤4": st.column_config.TextColumn("새 뒤4", width=80, max_chars=4),
+                "새시각": st.column_config.TextColumn("새 시각", width=90, max_chars=8),
+                "새승인번호": st.column_config.TextColumn("새 승인번호", width=110, max_chars=6),
+                "결제ID": st.column_config.NumberColumn("결제ID", format="%d", width=80),
+                "주문ID": st.column_config.NumberColumn("주문ID", format="%d", width=80),
+            },
+        )
+        _reason_key = f"extpay_quick_reason_{sel_db}_{sel_src}"
+        if _reason_key not in st.session_state:
+            st.session_state[_reason_key] = "금액일치·승인번호 빠른 수정"
+        _reason = st.text_input("변경 사유 (5자 이상)", key=_reason_key)
+        _checked_n = int(edited["사용"].fillna(False).astype(bool).sum()) if "사용" in edited.columns else 0
+        if not st.button(
+            f"체크된 행만 저장 ({_checked_n}건)",
+            key=f"extpay_quick_save_{sel_db}_{sel_src}",
+            type="primary",
+            disabled=_checked_n <= 0,
+        ):
+            return
+        if not _reason or len(_reason.strip()) < 5:
+            st.warning("사유를 5자 이상 입력하세요.")
+            return
+
+        saved: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+        for rec in edited.to_dict("records"):
+            if not bool(rec.get("사용")):
+                continue
+            pid = _ext_pay_cell_int(rec.get("결제ID"))
+            label = f"결제 #{pid} · {int(rec.get('금액') or 0):,}원"
+            if pid <= 0:
+                skipped.append(f"{label}: 결제 ID 없음")
+                continue
+            pay_row = _get_payment_row_supabase(sel_db, pid) or {}
+            if not pay_row:
+                failed.append(f"{label}: 모모 결제를 찾지 못함")
+                continue
+            try:
+                cur_amount = int(round(float(pay_row.get("amount") or 0)))
+            except (TypeError, ValueError):
+                cur_amount = 0
+            if cur_amount < 0:
+                skipped.append(f"{label}: 마이너스 전표")
+                continue
+            cur_method = str(pay_row.get("payment_method") or "")
+            cur_date = str(pay_row.get("payment_date") or "")[:10]
+            cur_onnuri = str(pay_row.get("onnuri_approval_code") or "").strip()
+            cur_card = str(pay_row.get("card_company") or "").strip()
+            payload = None
+            if sel_src == "onnuri":
+                ident, err = _onnuri_compose_ident(
+                    str(rec.get("새뒤4") or ""), str(rec.get("새시각") or ""), require_time=False,
+                )
+                if err or not ident:
+                    skipped.append(f"{label}: {err or '뒤4 형식 오류'}")
+                    continue
+                if ident == cur_onnuri:
+                    skipped.append(f"{label}: 변경 없음")
+                    continue
+                tm = _onnuri_time_from_code(ident)
+                last4 = _onnuri_last4_from_code(ident)
+                if _onnuri_ident_already_used(
+                    sel_db, last4, cur_amount, cur_date,
+                    exclude_payment_id=pid, tx_time=tm,
+                ):
+                    skipped.append(f"{label}: 같은 날·뒤4·금액 중복")
+                    continue
+                payload = {"onnuri_approval_code": ident}
+            else:
+                norm6 = _ext_pay_norm_approval6(rec.get("새승인번호"))
+                if len(norm6) != 6:
+                    skipped.append(f"{label}: 승인번호 6자리 아님")
+                    continue
+                if norm6 == _ext_pay_norm_approval6(cur_card):
+                    skipped.append(f"{label}: 변경 없음")
+                    continue
+                conflict = _ulsan_approval_already_used(sel_db, norm6, exclude_payment_id=pid)
+                if conflict:
+                    skipped.append(f"{label}: 승인번호 중복 ({conflict})")
+                    continue
+                payload = {"card_company": norm6}
+            if not _update_payment_supabase(sel_db, pid, payload):
+                failed.append(f"{label}: 저장 실패")
+                continue
+            new_pay = {
+                "payment_id": pid,
+                "amount": cur_amount,
+                "method": cur_method,
+                "card_company": payload.get("card_company", cur_card),
+                "onnuri_approval_code": payload.get("onnuri_approval_code", cur_onnuri),
+                "payment_date": cur_date,
+            }
+            old_pay = {
+                "payment_id": pid,
+                "amount": cur_amount,
+                "method": cur_method,
+                "card_company": cur_card,
+                "onnuri_approval_code": cur_onnuri,
+                "payment_date": cur_date,
+            }
+            oid = _ext_pay_cell_int(rec.get("주문ID")) or _ext_pay_cell_int(pay_row.get("order_id"))
+            cust_name = str(rec.get("고객명") or "")
+            _ph_err = _insert_payment_history(
+                None, oid, cust_name, "승인번호변경",
+                {"order_id": oid, "payment": old_pay},
+                {"order_id": oid, "payment": new_pay},
+                _reason.strip(),
+                db_filename=sel_db,
+            )
+            if _ph_err:
+                saved.append(f"{label}: 승인번호는 저장됨, 이력 오류 {_ph_err}")
+            else:
+                saved.append(label)
+
+        if saved:
+            st.session_state[f"extpay_quick_report_{sel_db}_{sel_src}"] = {
+                "saved": saved, "skipped": skipped, "failed": failed,
+            }
+            _invalidate_payments()
+            st.toast(f"승인번호 {len(saved)}건 저장. 재매칭이 진행됩니다.", icon="✅")
+            st.rerun()
+        if skipped:
+            st.warning("건너뜀 " + str(len(skipped)) + "건\n\n" + "\n".join(f"- {x}" for x in skipped))
+        if failed:
+            st.error("실패 " + str(len(failed)) + "건\n\n" + "\n".join(f"- {x}" for x in failed))
 
 
 def _render_ext_pay_ai_similar_match(
