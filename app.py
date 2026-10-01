@@ -32041,13 +32041,32 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 f"&nbsp;<span style='font-size:0.8rem; color:#64748b;'>{_scope_badge}</span></div>",
                 unsafe_allow_html=True,
             )
-            _author_name = _uname_to_display(task.get("created_by")) or "-"
-            _task_store = (task.get("store_name") or "").strip() or "-"
-            m1, m2, m3, m4 = st.columns([3.2, 2.0, 2.6, 1.6])
-            m1.markdown(f"👤 **담당** &nbsp; {assignee_names}")
-            m2.markdown(f"✍️ **작성** &nbsp; {_author_name}")
-            m3.markdown(f"🏪 **담당매장** &nbsp; {_task_store}")
-            m4.markdown(f"📅 **마감** &nbsp; {due}")
+            _author_name = html.escape(_uname_to_display(task.get("created_by")) or "-")
+            _assignee_html = html.escape(assignee_names)
+            _task_store = html.escape((task.get("store_name") or "").strip() or "-")
+            _due_html = html.escape(str(due))
+            _meta_css = "font-size:1.05rem; line-height:1.45; color:#1A2A44;"
+            m1, m2, m3 = st.columns([4, 3, 2])
+            m1.markdown(
+                f"<div style='{_meta_css}'>👤 <b>담당</b>&nbsp; {_assignee_html}</div>",
+                unsafe_allow_html=True,
+            )
+            m2.markdown(
+                f"<div style='{_meta_css}'>✍️ <b>작성</b>&nbsp; {_author_name}</div>",
+                unsafe_allow_html=True,
+            )
+            m3.markdown(
+                f"<div style='{_meta_css}'>📅 <b>마감</b>&nbsp; {_due_html}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div style='margin:4px 0 8px 0; font-size:1.45rem; font-weight:800; "
+                f"line-height:1.3; color:#0f172a;'>"
+                f"🏪 담당매장&nbsp;"
+                f"<span style='display:inline-block; padding:2px 12px; border-radius:8px; "
+                f"background:#dbeafe; color:#1e3a8a;'>{_task_store}</span></div>",
+                unsafe_allow_html=True,
+            )
 
             _can_del = is_admin or (task.get("created_by") == me_uname)
             _btn_cols = st.columns([2, 2, 2, 6])
