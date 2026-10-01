@@ -16983,11 +16983,16 @@ def _daily_sales_df_for_employee(sales_df: "pd.DataFrame", employee: str) -> "pd
     return pd.DataFrame(rows)
 
 
+@st.fragment
 def _render_daily_sales_multi_compare(sales_df: "pd.DataFrame", today: "date", key_prefix: str):
     """일별 매출 추이 — 기준 월 1개(강조 실선) + 비교 월 최대 12개(회색 점선).
     판매자 2명 이상이면 같은 색·실선(기준)/점선(비교 월)과 요일 막대로 비교.
     주말/공휴일 vrect 배경 음영, 요일별 평균 바 차트 포함.
-    누적/일별 토글, Y축 단위(원/만원/백만원) 선택 지원."""
+    누적/일별 토글, Y축 단위(원/만원/백만원) 선택 지원.
+
+    dash-scope: @st.fragment 로 격리해 월 selectbox / 판매자 multiselect 변경 시 상위 대시보드
+    전체(=1번 KPI·2번 미수금·3번 직원 일일·5번 기간 통계)로 rerun 이 전파되지 않게 한다.
+    """
     import calendar as _cal
     try:
         if sales_df is None or sales_df.empty or "transaction_date" not in sales_df.columns or "amount" not in sales_df.columns:
@@ -17984,6 +17989,18 @@ def _superadmin_tab1_integrated_dashboard():
     st.divider()
 
     # ── 5. 기간별 통계 (총 계약 금액 / 총 미수금) ──────
+    # dash-scope: fragment 로 격리 → 날짜 변경 시 전 매장 iteration 이 반복되지 않음
+    _render_superadmin_period_stats(orders, sales_df, _dash_pay_sum, month_start, today)
+
+
+@st.fragment
+def _render_superadmin_period_stats(orders: "pd.DataFrame", sales_df: "pd.DataFrame",
+                                    dash_pay_sum: "pd.Series", month_start: "date", today: "date"):
+    """슈퍼관리자 통합 대시보드 5번 '기간별 통계' — fragment 로 격리.
+
+    dash-scope: 시작일/종료일 date_input 변경 시 상위 _superadmin_tab1_integrated_dashboard
+    가 재실행되지 않도록 격리한다 (전 매장 loop iteration 반복 비용 제거).
+    """
     st.subheader("5. 기간별 통계 (총 계약 금액 / 총 미수금)")
     try:
         _s_col, _e_col = st.columns(2)
@@ -18002,7 +18019,7 @@ def _superadmin_tab1_integrated_dashboard():
             _total_unpaid_period = 0.0
             if not _period_orders.empty and "id" in _period_orders.columns:
                 _po = _period_orders.copy()
-                _po["_paid"] = _po["id"].map(_dash_pay_sum).fillna(0)
+                _po["_paid"] = _po["id"].map(dash_pay_sum).fillna(0)
                 _po["_bal"] = _po["total_amount"].fillna(0) - _po["_paid"]
                 _po = _zero_pre_april_2026_import_balance(_po, "_bal")
                 _total_unpaid_period = float(_po["_bal"].clip(lower=0).sum())
@@ -37267,7 +37284,9 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                             )
                             _recalc_order_actual_margin(conn, oid, db_filename)
                             conn.commit()
-                            clear_data_cache()
+                            # dash-cache: 결제 도메인(주문·매출 포함)만 무효화, 신규 고객은 고객 캐시만.
+                            _invalidate_payments()
+                            _invalidate_customers()
                             flash(f"위약금 {p_amt_int:,}원 등록이 완료되었습니다.")
                             for k in ["sp_penalty_name", "sp_penalty_phone", "sp_penalty_amount", "sp_penalty_reason", "sp_penalty_card"]:
                                 st.session_state.pop(k, None)
@@ -37348,7 +37367,9 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                                     "created_by": _current_username(),
                                 })
                                 _recalc_order_actual_margin_supabase(db_filename, oid)
-                                clear_data_cache()
+                                # dash-cache: 결제 도메인(주문·매출 포함)만 무효화, 신규 직원 고객 캐시도.
+                                _invalidate_payments()
+                                _invalidate_customers()
                                 flash(f"직원 구매 {e_cost_int:,}원 등록이 완료되었습니다. (주문 #{oid})")
                                 for k in ["sp_emp_cost", "sp_emp_card", "sp_emp_card_appr"]:
                                     st.session_state.pop(k, None)
@@ -37377,7 +37398,9 @@ def _render_special_order_form(db_filename: str, employees: pd.DataFrame):
                             )
                             _recalc_order_actual_margin(conn, oid, db_filename)
                             conn.commit()
-                            clear_data_cache()
+                            # dash-cache: 결제 도메인(주문·매출 포함)만 무효화, 신규 직원 고객 캐시도.
+                            _invalidate_payments()
+                            _invalidate_customers()
                             flash(f"직원 구매 {e_cost_int:,}원 등록이 완료되었습니다.")
                             for k in ["sp_emp_cost", "sp_emp_card", "sp_emp_card_appr"]:
                                 st.session_state.pop(k, None)
@@ -37418,25 +37441,13 @@ def render_new_sales():
         )
     st.header("새로운 매출 등록")
     # 직원 목록: Supabase app_users/app_user_stores 우선 사용, 없으면 레거시 SQLite Employees 사용
+    # sales-employees: 전 직원 loop + 배정매장 N회 조회 → 매장 배정 직원 명부 1회 (TTL 1h) 로 교체.
+    #                 (name 만 사용되므로 id 는 placeholder 로 채워도 downstream 영향 없음)
     employees = pd.DataFrame(columns=["id", "name"])
     if _supabase_app_tables_available():
-        store_id = _get_supabase_store_by_db_filename(db_filename)
-        users = _get_supabase_users_list()
-        rows = []
-        for u in users:
-            uid = u.get("id")
-            role = u.get("role")
-            if role not in ("store_admin", "user"):
-                continue
-            store_ids = _get_supabase_user_store_ids(uid)
-            if store_id and store_id not in store_ids and u.get("store_id") != store_id:
-                continue
-            name = (u.get("name") or u.get("username") or "").strip()
-            if not name:
-                continue
-            rows.append({"id": uid, "name": name})
-        if rows:
-            employees = pd.DataFrame(rows)
+        _emp_names = get_store_assigned_employee_names(db_filename)
+        if _emp_names:
+            employees = pd.DataFrame({"id": list(range(len(_emp_names))), "name": _emp_names})
     else:
         conn = get_tenant_conn(db_filename)
         if conn:
@@ -37448,10 +37459,27 @@ def render_new_sales():
             finally:
                 conn.close()
     # ── 특수 등록 (위약금 / 직원구매) ──
+    # sales-fragment: Streamlit expander 는 접혀 있어도 body 를 매 rerun 마다 실행하기 때문에
+    # (widget 등록·레이아웃 계산 비용) 기본 매출등록 플로우에서 열기 전에는 폼 자체를
+    # 로드하지 않도록 session_state 플래그로 lazy 전환한다.
     with st.expander("⚡ 특수 등록 (위약금 / 직원 구매)", expanded=False):
-        _render_special_order_form(db_filename, employees)
+        if st.session_state.get("_sp_special_order_loaded"):
+            _render_special_order_form(db_filename, employees)
+        else:
+            st.caption("아래 '폼 로드' 버튼을 눌러 입력 폼을 활성화하세요. (매출 등록 속도 향상용 lazy load)")
+            if st.button("➡️ 폼 로드", key="_sp_special_order_load_btn"):
+                st.session_state["_sp_special_order_loaded"] = True
+                st.rerun(scope="fragment")
 
+    # sales-fragment: 잔금 빠른 등록도 접힌 상태에서는 고객 검색 input·결과 조회가
+    # 실행되지 않도록 session_state 플래그로 lazy 로드.
     with st.expander("💳 기존 주문 잔금 빠른 등록", expanded=False):
+      if not st.session_state.get("_sp_quick_balance_loaded"):
+        st.caption("아래 '폼 로드' 버튼을 눌러 검색 폼을 활성화하세요. (매출 등록 속도 향상용 lazy load)")
+        if st.button("➡️ 폼 로드", key="_sp_quick_balance_load_btn"):
+            st.session_state["_sp_quick_balance_loaded"] = True
+            st.rerun(scope="fragment")
+      else:
         st.caption("기존 주문의 잔금을 이 화면에서 바로 등록합니다. 결제 날짜 기본값은 계약일이며, 필요 시 변경할 수 있습니다.")
         quick_q = st.text_input(
             "고객 검색 (이름/전화번호)",
@@ -38214,7 +38242,10 @@ def render_new_sales():
             if _zero_pay_reason_saved:
                 _sales_note += f" | 결제0 사유: {_zero_pay_reason_saved}"
             _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), _sales_note, unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
-            clear_data_cache()
+            # dash-cache: 결제 도메인(주문·매출·결제·PCR 컨텍스트) 캐시만 무효화. 신규 고객이면 고객 캐시도.
+            _invalidate_payments()
+            if is_new_customer:
+                _invalidate_customers()
             _saving_msg.empty()
             st.success("매출등록이 완료되었습니다.")
             # 카카오 채널 구매 알림 자동 발송 (백그라운드 — 실패해도 주문 등록에 영향 없음)
@@ -38350,7 +38381,10 @@ def render_new_sales():
                     _sales_note += f" | 결제0 사유: {_zero_pay_reason_saved}"
                 _insert_sales_transaction(db_filename, order_id, order_date.isoformat(), float(final_sales_save), _sales_note, unpaid_balance=unpaid_balance, employee_names=employee_names_str or None)
                 conn.commit()
-                clear_data_cache()
+                # dash-cache: 결제 도메인(주문·매출·결제·PCR 컨텍스트) 캐시만 무효화. 신규 고객이면 고객 캐시도.
+                _invalidate_payments()
+                if is_new_customer:
+                    _invalidate_customers()
                 net_margin_rate_ctx = _compute_net_margin_rate(float(final_sales_save), float(final_cost_save), total_fees)
             finally:
                 conn.close()
@@ -41596,7 +41630,8 @@ def render_customer_balance():
                                         
                                     if conn:
                                         conn.close()
-                                    clear_data_cache()
+                                    # dash-cache: 주문 금액·원가 수정은 결제 도메인(주문·매출 포함)만 무효화.
+                                    _invalidate_payments()
                                     # 수정 후 재초기화 강제: 다음 렌더에서 DB 최신값으로 재로드
                                     st.session_state.pop(f"{edit_prefix}_oid", None)
 
@@ -41668,27 +41703,47 @@ def render_customer_balance():
                                     _invalidate_payments()
                                     st.rerun()
                             customer_name_for_receipt = (customers[customers["id"] == cid].iloc[0]["name"] or "고객").strip()
+                            # pcr-lazy: Supabase → 결제는 order_id IN 쿼리 한 번 (주문 N 개마다 1회씩 → 1회)
+                            _pay_all = pd.DataFrame()
+                            if _supabase_orders_payments_available():
+                                _pcr_oids_key = tuple(sorted({int(x) for x in orders["id"].tolist() if x is not None}))
+                                if _pcr_oids_key:
+                                    _pay_all = _load_payments_by_order_ids_supabase(db_filename, _pcr_oids_key)
+                            # SQLite 경로: 한 번만 전체 결제 로드 (고객의 주문 수만큼 각각 쿼리하는 비용 제거)
+                            _pay_all_sql = pd.DataFrame()
+                            if not _supabase_orders_payments_available():
+                                _conn_pay_all = get_tenant_conn(db_filename)
+                                if _conn_pay_all is not None:
+                                    try:
+                                        _oids_sql = [int(x) for x in orders["id"].tolist() if x is not None]
+                                        if _oids_sql:
+                                            _ph = ",".join("?" * len(_oids_sql))
+                                            _pay_all_sql = pd.read_sql(
+                                                f"SELECT id, order_id, payment_date, amount, payment_method, card_company, onnuri_approval_code, fee_amount FROM Payments WHERE order_id IN ({_ph}) ORDER BY id",
+                                                _conn_pay_all, params=tuple(_oids_sql),
+                                            )
+                                    except Exception:
+                                        _pay_all_sql = pd.DataFrame()
+                                    finally:
+                                        _conn_pay_all.close()
                             for _order_id_pay in orders["id"].tolist():
                                 if _supabase_orders_payments_available():
-                                    pay_list = _load_payments_supabase(db_filename, _order_id_pay)
+                                    if not _pay_all.empty and "order_id" in _pay_all.columns:
+                                        pay_list = _pay_all[_pay_all["order_id"].astype("Int64") == int(_order_id_pay)].copy()
+                                    else:
+                                        pay_list = pd.DataFrame()
                                     if not pay_list.empty:
                                         _keep_cols = ["id", "payment_date", "amount", "payment_method", "card_company", "onnuri_approval_code", "fee_amount"]
                                         if "business_name" in pay_list.columns:
                                             _keep_cols.append("business_name")
                                         pay_list = pay_list[_keep_cols]
+                                else:
+                                    if not _pay_all_sql.empty and "order_id" in _pay_all_sql.columns:
+                                        pay_list = _pay_all_sql[_pay_all_sql["order_id"].astype("Int64") == int(_order_id_pay)].copy()
                                     else:
                                         pay_list = pd.DataFrame()
-                                else:
-                                    _conn_pay = get_tenant_conn(db_filename)
-                                    try:
-                                        pay_list = pd.read_sql(
-                                            "SELECT id, payment_date, amount, payment_method, card_company, onnuri_approval_code, fee_amount FROM Payments WHERE order_id = ? ORDER BY id",
-                                            _conn_pay, params=(_order_id_pay,)
-                                        )
-                                    except Exception:
-                                        pay_list = pd.DataFrame()
-                                    finally:
-                                        _conn_pay.close()
+                                    if not pay_list.empty and "order_id" in pay_list.columns:
+                                        pay_list = pay_list.drop(columns=["order_id"])
                                 order_row = orders[orders["id"] == _order_id_pay].iloc[0]
                                 total_sales = float(order_row["total_amount"] or 0)
                                 current_balance = float(order_row["balance"] or 0)
@@ -41710,8 +41765,14 @@ def render_customer_balance():
                                     _is_combined = bool(_same_date_methods)
                                 _combined_badge = " 🔀 복합결제" if _is_combined else ""
                                 exp_label = f"주문 #{_order_id_pay} | 계약일 {ord_str} | 배송일 {dlv_str} | 총액 {total_sales:,.0f}원 | 잔금 {current_balance:,.0f}원{_combined_badge}"
-                                with st.expander(exp_label, expanded=(_order_id_pay == sel_oid)):
-                                    if pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0:
+                                _is_selected_order = (_order_id_pay == sel_oid)
+                                with st.expander(exp_label, expanded=_is_selected_order):
+                                    # pcr-lazy: 선택되지 않은 주문의 결제 테이블·수정 폼·결제변경 폼은 접힌 상태에서도
+                                    #           Streamlit 이 body 를 실행하기 때문에 비싸다. 선택된 주문만 상세 body
+                                    #           를 렌더하고, 나머지는 안내만 표시한다.
+                                    if not _is_selected_order:
+                                        st.caption("👆 위 '수정할 주문 선택'에서 이 주문을 고르면 결제 내역·수정 폼이 로드됩니다.")
+                                    elif pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0:
                                         st.info("해당 주문의 결제 내역이 없습니다.")
                                     else:
                                         pay_display = pay_list.copy()
@@ -42916,7 +42977,16 @@ def render_customer_balance():
 
     # ---------- 탭 5: 🟡 결제변경 예정 관리 ----------
     with tab_pcr:
-        _render_pcr_planned_tab(db_filename, role, current_user)
+        # pcr-lazy: Streamlit 탭은 보이지 않는 다른 탭의 body 도 매 rerun 마다 실행하기 때문에,
+        #           이 탭의 쿼리·필터 비용이 다른 탭(1·2·3·4) 조작에서도 반복된다.
+        #           이 탭을 처음 선택할 때만 로드하도록 session_state 플래그로 lazy 전환.
+        if st.session_state.get("_pcr_planned_tab_loaded"):
+            _render_pcr_planned_tab(db_filename, role, current_user)
+        else:
+            st.caption("아래 '열기' 버튼을 눌러 결제변경 예정 목록을 로드하세요. (고객·잔금 화면 속도 향상용 lazy load)")
+            if st.button("➡️ 결제변경 예정 목록 열기", key="_pcr_planned_tab_load_btn"):
+                st.session_state["_pcr_planned_tab_loaded"] = True
+                st.rerun()
 
 
 # ========== 탭 0: 경영 대시보드 (로그인 후 첫 화면) ==========
@@ -43457,6 +43527,205 @@ def render_display_sales_audit():
             disabled=df_emp.empty,
             width="stretch",
         )
+
+@st.fragment
+def _render_dashboard_unpaid_section(orders: "pd.DataFrame", customers: "pd.DataFrame",
+                                     dash_pay_sum: "pd.Series", today: "date"):
+    """대시보드 2번 '미수금 고객 현황' — fragment 로 격리.
+
+    dash-scope: 상위 render_dashboard 전체가 아니라 이 블록만 rerun 되게 하여
+    테이블 재렌더링·pandas merge/filter 비용이 섹션 외 위젯 조작으로 번지지 않도록 한다.
+    """
+    st.subheader("2. 미수금 고객 현황")
+    if len(orders) == 0:
+        st.info("아직 주문 데이터가 없습니다.")
+        return
+    orders = orders.copy()
+    orders["paid"] = orders["id"].map(dash_pay_sum).fillna(0)
+    orders["balance"] = orders["total_amount"] - orders["paid"]
+    orders = _zero_pre_april_2026_import_balance(orders, "balance")
+    orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
+    orders_with_cust = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
+    orders_with_cust = orders_with_cust.rename(columns={
+        "name": "고객명", "phone1": "전화번호", "delivery_date": "배송일",
+        "category": "품목", "employee_names": "담당자", "balance": "잔금",
+    })
+    cutoff = today + timedelta(days=10)
+    _bs = orders_with_cust["balance_status"].fillna("") if "balance_status" in orders_with_cust.columns else ""
+    mask_balance = (orders_with_cust["잔금"] > 0) & (~_bs.isin([BALANCE_STATUS_COMPLETE, BALANCE_STATUS_OVERPAID]))
+    unpaid_list = orders_with_cust.loc[mask_balance & (orders_with_cust["배송일"].notna())]
+    if pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
+        unpaid_list = unpaid_list[unpaid_list["배송일"].dt.date <= cutoff]
+    unpaid_list = unpaid_list[["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]].copy()
+    _overdue_mask = pd.Series(False, index=unpaid_list.index)
+    if len(unpaid_list) > 0 and pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
+        unpaid_list = unpaid_list.sort_values("배송일", ascending=True)
+        _overdue_mask = unpaid_list["배송일"].dt.date < today
+        unpaid_list["배송일"] = unpaid_list["배송일"].dt.strftime("%Y-%m-%d")
+    if len(unpaid_list) > 0:
+        unpaid_display = _format_df_display(unpaid_list, ["잔금"])
+        _n_overdue = int(_overdue_mask.fillna(False).sum())
+        st.dataframe(_style_overdue_unpaid_rows(unpaid_display, _overdue_mask), width='stretch')
+        if _n_overdue:
+            st.caption(f"🚨 배송일이 지났는데 잔금이 남은 {_n_overdue}건은 빨간 행입니다. 우선 회수해 주세요.")
+    else:
+        st.info("해당 조건의 미수금 고객이 없습니다. (배송일 10일 이내·잔금 있음)")
+
+
+@st.fragment
+def _render_dashboard_daily_employee_section(sales_df: "pd.DataFrame", orders: "pd.DataFrame",
+                                             today: "date"):
+    """대시보드 3번 '직원별 일일 판매 금액 및 마진율' — fragment 로 격리.
+
+    dash-scope: _kpi_employee_totals_from_sales_slice 집계·스타일 포매팅이 섹션 외
+    rerun 으로 반복되지 않게 한다.
+    """
+    st.subheader("3. 직원별 일일 판매 금액 및 마진율")
+    if sales_df.empty or "transaction_date" not in sales_df.columns:
+        st.info("판매 데이터가 없습니다.")
+        return
+    _daily_emp_sd = sales_df.copy()
+    _daily_emp_sd["transaction_date"] = pd.to_datetime(_daily_emp_sd["transaction_date"], errors="coerce")
+    _daily_emp_sd = _daily_emp_sd.dropna(subset=["transaction_date"])
+    _daily_emp_today = _daily_emp_sd[_daily_emp_sd["transaction_date"].dt.date == today]
+    if _daily_emp_today.empty:
+        st.info(f"오늘({today.strftime('%Y-%m-%d')}) 판매 데이터가 없습니다.")
+        return
+    _daily_amt_num = pd.to_numeric(_daily_emp_today["amount"], errors="coerce").fillna(0)
+    _daily_pos = _daily_emp_today[_daily_amt_num > 0]
+    _daily_neg = _daily_emp_today[_daily_amt_num < 0]
+    _df_net = _kpi_employee_totals_from_sales_slice(_daily_emp_today, orders)
+    _df_pos = (_kpi_employee_totals_from_sales_slice(_daily_pos, orders)
+               if not _daily_pos.empty else pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"]))
+    _df_neg_agg = (_kpi_employee_totals_from_sales_slice(_daily_neg, orders)
+                   if not _daily_neg.empty else pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"]))
+
+    def _daily2_filter_blank(df):
+        if df.empty or "employee" not in df.columns:
+            return df
+        return df[~df["employee"].map(_kpi_employee_names_cell_is_blank)].copy()
+
+    _df_net = _daily2_filter_blank(_df_net)
+    _df_pos = _daily2_filter_blank(_df_pos)
+    _df_neg_agg = _daily2_filter_blank(_df_neg_agg)
+
+    if _df_net.empty:
+        st.info(f"오늘({today.strftime('%Y-%m-%d')}) 직원이 배정된 판매 데이터가 없습니다.")
+        return
+
+    _merged = _df_net[["employee", "revenue", "margin"]].rename(
+        columns={"revenue": "순액", "margin": "당일 마진액"}
+    ).copy()
+    if not _df_pos.empty:
+        _merged = _merged.merge(
+            _df_pos[["employee", "revenue"]].rename(columns={"revenue": "당일 판매금액"}),
+            on="employee", how="left",
+        )
+    else:
+        _merged["당일 판매금액"] = 0.0
+    if not _df_neg_agg.empty:
+        _merged = _merged.merge(
+            _df_neg_agg[["employee", "revenue"]].rename(columns={"revenue": "상계금액"}),
+            on="employee", how="left",
+        )
+    else:
+        _merged["상계금액"] = 0.0
+    if "당일 판매금액" not in _merged.columns:
+        _merged["당일 판매금액"] = 0.0
+    if "상계금액" not in _merged.columns:
+        _merged["상계금액"] = 0.0
+    _merged["당일 판매금액"] = _merged["당일 판매금액"].fillna(0.0)
+    _merged["상계금액"] = _merged["상계금액"].fillna(0.0)
+    _merged["마진율(%)"] = _merged.apply(
+        lambda _r: round(_r["당일 마진액"] / _r["순액"] * 100, 1) if _r["순액"] != 0 else 0.0,
+        axis=1,
+    )
+    _merged = _merged.sort_values("순액", ascending=False).reset_index(drop=True)
+    _has_neg = (_merged["상계금액"] < 0).any()
+    if _has_neg:
+        _disp = _merged[["employee", "당일 판매금액", "상계금액", "순액", "당일 마진액", "마진율(%)"]].rename(
+            columns={"employee": "직원명"}
+        )
+        _money_cols = ["당일 판매금액", "상계금액", "순액", "당일 마진액"]
+    else:
+        _disp = _merged[["employee", "순액", "당일 마진액", "마진율(%)"]].rename(
+            columns={"employee": "직원명", "순액": "당일 판매금액"}
+        )
+        _money_cols = ["당일 판매금액", "당일 마진액"]
+
+    def _daily2_fmt_krw(x):
+        try:
+            v = float(x)
+            return f"{v:,.0f}원" if v != 0 else "-"
+        except (TypeError, ValueError):
+            return str(x)
+
+    def _daily2_fmt_pct(x):
+        try:
+            return f"{float(x):.1f}%"
+        except (TypeError, ValueError):
+            return str(x)
+
+    def _daily2_color_neg(col):
+        return [
+            "color: #d32f2f; font-weight: 600" if (isinstance(v, (int, float)) and v < 0) else ""
+            for v in col
+        ]
+
+    _fmt_dict = {c: _daily2_fmt_krw for c in _money_cols}
+    _fmt_dict["마진율(%)"] = _daily2_fmt_pct
+    _styler = (_disp.style.format(_fmt_dict).apply(_daily2_color_neg, subset=_money_cols))
+    st.dataframe(_styler, width='stretch')
+
+
+@st.fragment
+def _render_dashboard_period_stats_section(orders: "pd.DataFrame", payments: "pd.DataFrame",
+                                           sales_df: "pd.DataFrame", today: "date"):
+    """대시보드 5번 '기간별 통계' — fragment 로 격리.
+
+    dash-scope: 시작일/종료일 date_input 변경 시 섹션 바깥(1·2·3·4·To-Do)이 재렌더
+    되지 않도록 한다.
+    """
+    st.subheader("5. 기간별 통계 (총 계약 금액 / 총 미수금)")
+    if "stats_start" not in st.session_state:
+        st.session_state["stats_start"] = today.replace(day=1)
+    if "stats_end" not in st.session_state:
+        st.session_state["stats_end"] = today
+    col1, col2 = st.columns(2)
+    with col1:
+        stats_start = st.date_input("시작일", key="stats_start")
+    with col2:
+        stats_end = st.date_input("종료일", key="stats_end")
+    if len(orders) == 0:
+        st.metric("해당 기간 총 계약 금액", "0원")
+        st.metric("해당 기간 총 미수금", "0원")
+        return
+    _o = orders.copy()
+    _o["order_date"] = pd.to_datetime(_o["order_date"], errors="coerce")
+    period_orders = _o[(_o["order_date"].dt.date >= stats_start) & (_o["order_date"].dt.date <= stats_end)]
+    period_sales_net = 0.0
+    if not sales_df.empty and "transaction_date" in sales_df.columns and "amount" in sales_df.columns:
+        _sd_stat = sales_df.copy()
+        _sd_stat["transaction_date"] = pd.to_datetime(_sd_stat["transaction_date"], errors="coerce")
+        _sd_stat = _sd_stat.dropna(subset=["transaction_date"])
+        _m_stat = (_sd_stat["transaction_date"].dt.date >= stats_start) & (
+            _sd_stat["transaction_date"].dt.date <= stats_end
+        )
+        period_sales_net = float(_sd_stat.loc[_m_stat, "amount"].fillna(0).astype(float).sum())
+    if len(period_orders) > 0 and not payments.empty:
+        order_ids = period_orders["id"].tolist()
+        pay_df = payments[payments["order_id"].isin(order_ids)][["order_id", "amount"]].copy()
+        paid_per = pay_df.groupby("order_id")["amount"].sum() if len(pay_df) > 0 else pd.Series(dtype=float)
+        period_orders = period_orders.copy()
+        period_orders["_paid"] = period_orders["id"].map(paid_per).fillna(0)
+        period_orders["_bal"] = period_orders["total_amount"] - period_orders["_paid"]
+        period_orders = _zero_pre_april_2026_import_balance(period_orders, "_bal")
+        total_unpaid_period = float(period_orders["_bal"].clip(lower=0).sum())
+    else:
+        total_unpaid_period = 0.0
+    st.metric("해당 기간 총 계약 금액", f"{period_sales_net:,.0f}원")
+    st.metric("해당 기간 총 미수금", f"{total_unpaid_period:,.0f}원")
+
 
 @st.fragment
 def _render_dashboard_todos_only(db_filename: str):
@@ -44143,218 +44412,24 @@ def render_dashboard():
     st.divider()
 
     # ---------- 2. 미수금 고객 현황: 배송일이 10일 이내로 남았거나 지났고, 잔금 > 0 ----------
-    st.subheader("2. 미수금 고객 현황")
-    if len(orders) > 0:
-        pay_sum = _dash_pay_sum  # 위에서 이미 계산된 pay_sum 재사용
-        orders = orders.copy()
-        orders["paid"] = orders["id"].map(pay_sum).fillna(0)
-        orders["balance"] = orders["total_amount"] - orders["paid"]
-        orders = _zero_pre_april_2026_import_balance(orders, "balance")
-        orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
-        orders_with_cust = orders.merge(customers, left_on="customer_id", right_on="id", suffixes=("", "_c"))
-        orders_with_cust = orders_with_cust.rename(columns={"name": "고객명", "phone1": "전화번호", "delivery_date": "배송일", "category": "품목", "employee_names": "담당자", "balance": "잔금"})
-        # 배송일이 오늘 기준 10일 이내로 남았거나 이미 지난 경우 (delivery_date <= today+10)
-        cutoff = today + timedelta(days=10)
-        mask_date = orders_with_cust["배송일"].dt.date <= cutoff if pd.api.types.is_datetime64_any_dtype(orders_with_cust["배송일"]) else False
-        # 완납·이상결제 표시 주문은 (매입원장 임포트 완납 결제 미보정 상태 포함) 미수 목록에서 제외
-        _dash_bs = orders_with_cust["balance_status"].fillna("") if "balance_status" in orders_with_cust.columns else ""
-        mask_balance = (orders_with_cust["잔금"] > 0) & (~_dash_bs.isin([BALANCE_STATUS_COMPLETE, BALANCE_STATUS_OVERPAID]))
-        unpaid_list = orders_with_cust.loc[mask_balance & (orders_with_cust["배송일"].notna())]
-        if pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
-            unpaid_list = unpaid_list[unpaid_list["배송일"].dt.date <= cutoff]
-        display_cols = ["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]
-        unpaid_list = unpaid_list[["고객명", "전화번호", "배송일", "품목", "담당자", "잔금"]].copy()
-        _overdue_mask = pd.Series(False, index=unpaid_list.index)
-        if len(unpaid_list) > 0 and pd.api.types.is_datetime64_any_dtype(unpaid_list["배송일"]):
-            unpaid_list = unpaid_list.sort_values("배송일", ascending=True)
-            _overdue_mask = unpaid_list["배송일"].dt.date < today
-            unpaid_list["배송일"] = unpaid_list["배송일"].dt.strftime("%Y-%m-%d")
-        if len(unpaid_list) > 0:
-            unpaid_display = _format_df_display(unpaid_list, ["잔금"])
-            _n_overdue = int(_overdue_mask.fillna(False).sum())
-            st.dataframe(_style_overdue_unpaid_rows(unpaid_display, _overdue_mask), width='stretch')
-            if _n_overdue:
-                st.caption(f"🚨 배송일이 지났는데 잔금이 남은 {_n_overdue}건은 빨간 행입니다. 우선 회수해 주세요.")
-        else:
-            st.info("해당 조건의 미수금 고객이 없습니다. (배송일 10일 이내·잔금 있음)")
-    else:
-        st.info("아직 주문 데이터가 없습니다.")
+    # dash-scope: fragment 로 격리 → 미수금 표만 재계산되고 상위 대시보드로 rerun 전파 X
+    _render_dashboard_unpaid_section(orders, customers, _dash_pay_sum, today)
 
     st.divider()
 
     # ---------- 3. 직원별 일일 판매 금액 및 마진율 ----------
-    st.subheader("3. 직원별 일일 판매 금액 및 마진율")
-    if not sales_df.empty and "transaction_date" in sales_df.columns:
-        _daily_emp_sd = sales_df.copy()
-        _daily_emp_sd["transaction_date"] = pd.to_datetime(_daily_emp_sd["transaction_date"], errors="coerce")
-        _daily_emp_sd = _daily_emp_sd.dropna(subset=["transaction_date"])
-        _daily_emp_today = _daily_emp_sd[_daily_emp_sd["transaction_date"].dt.date == today]
-        if not _daily_emp_today.empty:
-            # 양수(판매) / 음수(상계) 분리
-            _daily_amt_num = pd.to_numeric(_daily_emp_today["amount"], errors="coerce").fillna(0)
-            _daily_pos = _daily_emp_today[_daily_amt_num > 0]
-            _daily_neg = _daily_emp_today[_daily_amt_num < 0]
-
-            # 직원별 순액·마진 집계 (마진율 계산 기준)
-            _df_net = _kpi_employee_totals_from_sales_slice(_daily_emp_today, orders)
-            # 직원별 양수(판매금액) 합계
-            _df_pos = (
-                _kpi_employee_totals_from_sales_slice(_daily_pos, orders)
-                if not _daily_pos.empty
-                else pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
-            )
-            # 직원별 음수(상계금액) 합계
-            _df_neg_agg = (
-                _kpi_employee_totals_from_sales_slice(_daily_neg, orders)
-                if not _daily_neg.empty
-                else pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
-            )
-
-            # 이름 없는 행 필터
-            def _daily2_filter_blank(df):
-                if df.empty or "employee" not in df.columns:
-                    return df
-                return df[~df["employee"].map(_kpi_employee_names_cell_is_blank)].copy()
-
-            _df_net = _daily2_filter_blank(_df_net)
-            _df_pos = _daily2_filter_blank(_df_pos)
-            _df_neg_agg = _daily2_filter_blank(_df_neg_agg)
-
-            if not _df_net.empty:
-                # 순액 기준 테이블
-                _merged = _df_net[["employee", "revenue", "margin"]].rename(
-                    columns={"revenue": "순액", "margin": "당일 마진액"}
-                ).copy()
-                # 양수(판매금액) 병합
-                if not _df_pos.empty:
-                    _merged = _merged.merge(
-                        _df_pos[["employee", "revenue"]].rename(columns={"revenue": "당일 판매금액"}),
-                        on="employee", how="left",
-                    )
-                else:
-                    _merged["당일 판매금액"] = 0.0
-                # 음수(상계금액) 병합
-                if not _df_neg_agg.empty:
-                    _merged = _merged.merge(
-                        _df_neg_agg[["employee", "revenue"]].rename(columns={"revenue": "상계금액"}),
-                        on="employee", how="left",
-                    )
-                else:
-                    _merged["상계금액"] = 0.0
-
-                if "당일 판매금액" not in _merged.columns:
-                    _merged["당일 판매금액"] = 0.0
-                if "상계금액" not in _merged.columns:
-                    _merged["상계금액"] = 0.0
-                _merged["당일 판매금액"] = _merged["당일 판매금액"].fillna(0.0)
-                _merged["상계금액"] = _merged["상계금액"].fillna(0.0)
-
-                _merged["마진율(%)"] = _merged.apply(
-                    lambda _r: round(_r["당일 마진액"] / _r["순액"] * 100, 1) if _r["순액"] != 0 else 0.0,
-                    axis=1,
-                )
-                _merged = _merged.sort_values("순액", ascending=False).reset_index(drop=True)
-
-                # 상계금액 열 유무 판단
-                _has_neg = (_merged["상계금액"] < 0).any()
-
-                if _has_neg:
-                    _disp = _merged[["employee", "당일 판매금액", "상계금액", "순액", "당일 마진액", "마진율(%)"]].rename(
-                        columns={"employee": "직원명"}
-                    )
-                    _money_cols = ["당일 판매금액", "상계금액", "순액", "당일 마진액"]
-                else:
-                    _disp = _merged[["employee", "순액", "당일 마진액", "마진율(%)"]].rename(
-                        columns={"employee": "직원명", "순액": "당일 판매금액"}
-                    )
-                    _money_cols = ["당일 판매금액", "당일 마진액"]
-
-                # 포맷 함수
-                def _daily2_fmt_krw(x):
-                    try:
-                        v = float(x)
-                        return f"{v:,.0f}원" if v != 0 else "-"
-                    except (TypeError, ValueError):
-                        return str(x)
-
-                def _daily2_fmt_pct(x):
-                    try:
-                        return f"{float(x):.1f}%"
-                    except (TypeError, ValueError):
-                        return str(x)
-
-                # 음수 빨간색 스타일 적용 (column 단위)
-                def _daily2_color_neg(col):
-                    return [
-                        "color: #d32f2f; font-weight: 600" if (isinstance(v, (int, float)) and v < 0) else ""
-                        for v in col
-                    ]
-
-                _fmt_dict = {c: _daily2_fmt_krw for c in _money_cols}
-                _fmt_dict["마진율(%)"] = _daily2_fmt_pct
-
-                _styler = (
-                    _disp.style
-                    .format(_fmt_dict)
-                    .apply(_daily2_color_neg, subset=_money_cols)
-                )
-                st.dataframe(_styler, width='stretch')
-            else:
-                st.info(f"오늘({today.strftime('%Y-%m-%d')}) 직원이 배정된 판매 데이터가 없습니다.")
-        else:
-            st.info(f"오늘({today.strftime('%Y-%m-%d')}) 판매 데이터가 없습니다.")
-    else:
-        st.info("판매 데이터가 없습니다.")
+    # dash-scope: fragment 로 격리 → 집계·포맷팅이 섹션 외 rerun 으로 반복되지 않음
+    _render_dashboard_daily_employee_section(sales_df, orders, today)
 
     # ---------- 4. 월별 직원 판매 현황 및 평가 (종합: 매출70+마진20+전시10, 현금수금집계는 참고 열) ----------
     # @st.fragment로 분리: 연/월 selectbox 변경 시 이 섹션만 rerun
     _render_kpi_section(sales_df, orders, db_filename)
 
     # ---------- 5. 관리자 통계: 기간별 총 계약 금액 / 총 미수금 ----------
-    st.subheader("5. 기간별 통계 (총 계약 금액 / 총 미수금)")
-    if "stats_start" not in st.session_state:
-        st.session_state["stats_start"] = today.replace(day=1)
-    if "stats_end" not in st.session_state:
-        st.session_state["stats_end"] = today
-    col1, col2 = st.columns(2)
-    with col1:
-        stats_start = st.date_input("시작일", key="stats_start")
-    with col2:
-        stats_end = st.date_input("종료일", key="stats_end")
-    if len(orders) > 0:
-        orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
-        period_orders = orders[(orders["order_date"].dt.date >= stats_start) & (orders["order_date"].dt.date <= stats_end)]
-        # sales(transaction_date) 구간의 amount 순합(감액 음수 포함) — 3번 매출 점수(70) 직원 배분 전 총액과 동일 기준, 현금수금집계(참고)와는 별개
-        period_sales_net = 0.0
-        if not sales_df.empty and "transaction_date" in sales_df.columns and "amount" in sales_df.columns:
-            _sd_stat = sales_df.copy()
-            _sd_stat["transaction_date"] = pd.to_datetime(_sd_stat["transaction_date"], errors="coerce")
-            _sd_stat = _sd_stat.dropna(subset=["transaction_date"])
-            _m_stat = (_sd_stat["transaction_date"].dt.date >= stats_start) & (
-                _sd_stat["transaction_date"].dt.date <= stats_end
-            )
-            period_sales_net = float(_sd_stat.loc[_m_stat, "amount"].fillna(0).astype(float).sum())
-        if len(period_orders) > 0 and not payments.empty:
-            order_ids = period_orders["id"].tolist()
-            pay_df = payments[payments["order_id"].isin(order_ids)][["order_id", "amount"]].copy()
-            paid_per = pay_df.groupby("order_id")["amount"].sum() if len(pay_df) > 0 else pd.Series(dtype=float)
-            period_orders = period_orders.copy()
-            period_orders["_paid"] = period_orders["id"].map(paid_per).fillna(0)
-            period_orders["_bal"] = period_orders["total_amount"] - period_orders["_paid"]
-            period_orders = _zero_pre_april_2026_import_balance(period_orders, "_bal")
-            total_unpaid_period = float(period_orders["_bal"].clip(lower=0).sum())
-        else:
-            total_unpaid_period = 0.0
-        st.metric(
-            "해당 기간 총 계약 금액",
-            f"{period_sales_net:,.0f}원",
-        )
-        st.metric("해당 기간 총 미수금", f"{total_unpaid_period:,.0f}원")
-    else:
-        st.metric("해당 기간 총 계약 금액", "0원")
-        st.metric("해당 기간 총 미수금", "0원")
+    # dash-scope: fragment 로 격리 → 시작일·종료일 변경이 섹션 외 rerun 을 트리거하지 않음
+    _render_dashboard_period_stats_section(orders, payments, sales_df, today)
 
-    # ---------- 5. To-Do 리스트 (직원 간 인수인계) ----------
+    # ---------- 6. To-Do 리스트 (직원 간 인수인계) ----------
     # @st.fragment로 분리: To-Do 등록·완료·삭제 시 이 섹션만 rerun (전체 대시보드 재로딩 없음)
     _render_dashboard_todos_only(db_filename)
 
