@@ -31080,34 +31080,13 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         max_chars=4,
                         placeholder="4자리",
                     )
-                    # 같은 폼 내 다른 라인과의 뒤4·금액 충돌 체크
                     _ed_last4 = re.sub(r"\D", "", str(st.session_state.get(_last4_key, "") or ""))
-                    _ed_date_val = st.session_state.get(f"pcr_date_{order_id}_{_i}")
-                    _ed_date_str = (
-                        _ed_date_val.isoformat()
-                        if hasattr(_ed_date_val, "isoformat")
-                        else str(_ed_date_val or "")[:10]
-                    )
-                    _form_collide = False
-                    for _j in range(_new_count):
-                        if _j == _i:
-                            continue
-                        _mj = str(st.session_state.get(f"pcr_meth_{order_id}_{_j}", "") or "")
-                        if ("온누리" not in _mj) or ("지류" in _mj):
-                            continue
-                        _l4j = re.sub(r"\D", "", str(st.session_state.get(f"pcr_onnuri_last4_{order_id}_{_j}", "") or ""))
-                        _amj = _parse_comma_to_int(st.session_state.get(f"pcr_amt_{order_id}_{_j}", "0"))
-                        if _l4j and _l4j == _ed_last4 and _amj == _amt_prev:
-                            _form_collide = True
-                            break
-                    _need_time = _onnuri_should_ask_time(
-                        db_filename, _ed_last4, int(_amt_prev or 0), _ed_date_str,
-                        form_collides=_form_collide,
-                    )
+                    # 온누리 거래시간은 항상 노출 (중복이 아니어도 ERP·외부파일 매칭 정확도 향상)
+                    # 숫자만 입력하면 _format_time_hhmmss 로 HH:MM:SS 콜론 자동 삽입.
                     _onnuri_time_input(
                         _time_key,
-                        visible=_need_time,
-                        label=f"온누리 거래시간 #{_i + 1} *",
+                        visible=True,
+                        label=f"온누리 거래시간 #{_i + 1}",
                     )
                     # 최종 식별자 조립 (require_time=False — 하단 duplicate 검증에서 재확인)
                     _composed, _ = _onnuri_compose_ident(
