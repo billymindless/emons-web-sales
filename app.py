@@ -30868,7 +30868,34 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         pay_options = {}
 
     with st.container(border=True):
-        st.markdown("##### 💳 결제변경 검증 요청 작성")
+        st.markdown(
+            """
+            <style>
+            .pcr-slack-title {
+                font-size: 1.35rem; font-weight: 700; color: #1D1C1D;
+                margin: 0 0 0.35rem 0; letter-spacing: -0.02em;
+            }
+            .pcr-slack-desc {
+                background: #E8F4FD; border: 1px solid #B8D4EE;
+                border-radius: 8px; padding: 14px 16px;
+                min-height: 240px; line-height: 1.65; font-size: 0.95rem;
+                color: #1D1C1D; white-space: pre-wrap;
+            }
+            .pcr-slack-desc b { color: #1264A3; font-weight: 600; }
+            textarea[aria-label="변경 사유 *"] {
+                min-height: 280px !important;
+                background: #E8F4FD !important;
+                border: 1px solid #B8D4EE !important;
+                border-radius: 8px !important;
+                font-size: 15px !important;
+                line-height: 1.6 !important;
+                padding: 12px 14px !important;
+            }
+            </style>
+            <div class="pcr-slack-title">결제변경 검증 요청</div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         # 원본은 현재 결제행이 아니라 최신 결제변경 이력에서 가져온다 (사후 검증 버그 방지)
         _hist = _load_latest_payment_history_for_pcr(db_filename, int(order_id))
@@ -30943,24 +30970,34 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 f"{_na} / {_hist_new.get('method') or '-'}"
                 f"{(' · ' + str(_hist_new.get('onnuri'))) if _hist_new.get('onnuri') else ''}"
             )
-            with st.container(height=80, border=True):
-                if _orig_from_paylist:
-                    st.markdown(f"📋 **참고 이력**  \n{_hist_from} → {_hist_to}")
-                else:
-                    st.markdown(
-                        f"⚠️ **원본(이력)**: {_hist_from}  \n"
-                        f"**변경 후(이력)**: {_hist_to}"
-                    )
+            _desc_html = (
+                f"<div class='pcr-slack-desc'>"
+                f"<b>결제변경 유형</b>  온누리/결제 변경<br/>"
+                f"<b>원본 결제</b>  {_hist_from}<br/>"
+                f"<b>변경 후</b>  {_hist_to}<br/>"
+                + (
+                    "<br/><span style='color:#616061'>참고 이력입니다. 대상 결제를 위에서 선택하면 원본이 바뀝니다.</span>"
+                    if _orig_from_paylist
+                    else "<br/><span style='color:#616061'>이력에서 가져온 원본입니다. 틀리면 추가 항목에서 수동 수정하세요.</span>"
+                )
+                + "</div>"
+            )
+            st.markdown(_desc_html, unsafe_allow_html=True)
         elif orig:
             try:
                 _oa2 = f"{int(float(orig.get('amount') or 0)):,}원"
             except Exception:
                 _oa2 = "-"
-            with st.container(height=60, border=True):
-                st.markdown(
-                    f"**등록될 원본**: {_oa2} / {orig.get('method') or '-'}"
-                    f"{(' · ' + str(orig.get('onnuri'))) if orig.get('onnuri') else ''}"
-                )
+            _orig_line = (
+                f"{_oa2} / {orig.get('method') or '-'}"
+                f"{(' · ' + str(orig.get('onnuri'))) if orig.get('onnuri') else ''}"
+            )
+            st.markdown(
+                f"<div class='pcr-slack-desc'>"
+                f"<b>등록될 원본</b>  {_orig_line}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
         # 원본 수동 수정이 켜져 있으면 세션 값으로 orig 를 상위에서 override (UI 는 하단 expander 에서 렌더)
         if bool(st.session_state.get(f"pcr_manual_orig_{order_id}", False)):
@@ -31121,11 +31158,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         label=f"⏰ 온누리 거래시간 #{_i + 1}",
                     )
                 with _tc2:
-                    st.caption(
-                        "💡 디지털 온누리 매출내역의 거래시간을 입력하세요. "
-                        "숫자만 입력해도 `HH:MM:SS` 로 자동 변환됩니다. "
-                        "같은 날·같은 뒤4·같은 금액 결제가 있을 때 거래시간으로 구분됩니다."
-                    )
+                    st.caption("숫자만 입력하면 HH:MM:SS 로 변환됩니다.")
                 # 최종 식별자 조립 (뒤4 + 거래시간 → "8395-181529")
                 _composed, _ = _onnuri_compose_ident(
                     st.session_state.get(_last4_key, ""),
@@ -31172,8 +31205,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         # ── 변경 사유 (전체폭, 높이 150 — 긴 텍스트 스크롤 확보) ──
         st.divider()
         reason = st.text_area(
-            "변경 사유 *", key=f"pcr_reason_{order_id}", height=150,
-            placeholder="예: 고객 요청으로 신용카드 결제 취소 후 계좌이체 재결제",
+            "변경 사유 *", key=f"pcr_reason_{order_id}", height=280,
+            placeholder="결제변경 유형, 고객, 원본 결제 등을 적어 주세요. (약 10줄)",
         )
 
         # ── 추가 항목 (환불 계좌 · 결제자 · 변경 유형 · 원본 수동 수정 · 증빙 첨부) ──
@@ -31182,9 +31215,9 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         _ra_val = str(st.session_state.get(f"pcr_refund_account_{order_id}", "") or "").strip()
         _asg_val = st.session_state.get(f"pcr_assignees_{order_id}") or []
         _req_missing = (not _rb_val) or (not _ra_val) or (not _asg_val)
-        _exp_label = "➕ 추가 항목 (환불 계좌 · 결제자 · 변경 유형 · 증빙 등)"
+        _exp_label = "+ 추가 항목 보기"
         if _req_missing:
-            _exp_label = "⚠️ 추가 항목 — 필수 미입력 (환불 계좌 · 결제자)"
+            _exp_label = "+ 추가 항목 보기  ·  필수 미입력 (환불 계좌 · 결제자)"
 
         with st.expander(_exp_label, expanded=_req_missing):
             change_type = st.selectbox(
