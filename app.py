@@ -32041,18 +32041,41 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                 f"&nbsp;<span style='font-size:0.8rem; color:#64748b;'>{_scope_badge}</span></div>",
                 unsafe_allow_html=True,
             )
+            def _task_clock(raw) -> str:
+                s = str(raw or "").strip()
+                if not s:
+                    return ""
+                try:
+                    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    return s[:16].replace("T", " ")
+
             _author_name = html.escape(_uname_to_display(task.get("created_by")) or "-")
             _assignee_html = html.escape(assignee_names)
             _task_store = html.escape((task.get("store_name") or "").strip() or "-")
             _due_html = html.escape(str(due))
+            _posted_at = html.escape(_task_clock(task.get("created_at")) or "-")
+            _done_html = ""
+            if status == "done":
+                _closed = _task_clock(task.get("closed_at") or task.get("updated_at"))
+                if _closed:
+                    _done_html = (
+                        f"<div style='font-size:1.05rem; line-height:1.45; color:#166534; font-weight:700;'>"
+                        f"✅ <b>완료</b>&nbsp; {html.escape(_closed)}</div>"
+                    )
             _meta_css = "font-size:1.05rem; line-height:1.45; color:#1A2A44;"
-            m1, m2, m3 = st.columns([4, 3, 2])
+            m1, m2, m3 = st.columns([4, 3.2, 2])
             m1.markdown(
                 f"<div style='{_meta_css}'>👤 <b>담당</b>&nbsp; {_assignee_html}</div>",
                 unsafe_allow_html=True,
             )
             m2.markdown(
-                f"<div style='{_meta_css}'>✍️ <b>작성</b>&nbsp; {_author_name}</div>",
+                f"<div style='{_meta_css}'>✍️ <b>작성</b>&nbsp; {_author_name}</div>"
+                f"<div style='{_meta_css}'>🕐 <b>올린 시각</b>&nbsp; {_posted_at}</div>"
+                f"{_done_html}",
                 unsafe_allow_html=True,
             )
             m3.markdown(
@@ -32096,11 +32119,6 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
                     if c_no.button("✖ 취소", key=f"task_del_no_{tid}"):
                         st.session_state.pop(_del_confirm_key, None)
                         st.rerun()
-
-            desc = (task.get("description") or "").strip()
-            if desc:
-                preview = desc if len(desc) <= 140 else desc[:137] + "..."
-                st.caption(f"📝 {preview}")
 
             if _auto_expand:
                 st.success("🔔 알림에서 연 업무입니다 — 증빙 확인 후 상태를 '완료'로 변경하거나 반려를 처리하세요.")
