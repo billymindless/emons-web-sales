@@ -12202,7 +12202,9 @@ def _ext_pay_ledger_label(source: str) -> str:
     return f"{_ext_pay_src_label(source)} 원장"
 
 
-def _ext_pay_result_label(code: str, source: str) -> str:
+def _ext_pay_result_label(code: str, source: str, *, has_payment: bool | None = None) -> str:
+    if code == "official_canceled" and has_payment is False:
+        return "공식취소·모모기록없음"
     src = _ext_pay_src_label(source)
     return {
         "matched_ok": "금액일치",
@@ -33964,13 +33966,20 @@ def _render_external_pay_admin_section(
             return int(s) if s else 0
         except (TypeError, ValueError):
             return 0
-    _official_total = int(df["공식금액"].map(_amt_to_int).sum()) if "공식금액" in df.columns else 0
+    def _official_in_total(row) -> int:
+        # 모모 결제가 없는 공식 취소는 원장 합계에서 뺀다.
+        if str(row.get("결과") or "") == "official_canceled" and _ext_pay_cell_int(row.get("_payment_id")) <= 0:
+            return 0
+        return _amt_to_int(row.get("공식금액"))
+
+    _official_total = int(df.apply(_official_in_total, axis=1).sum()) if "공식금액" in df.columns else 0
     _erp_total = int(df["ERP금액"].map(_amt_to_int).sum()) if "ERP금액" in df.columns else 0
     _diff = _official_total - _erp_total
     m1, m2, m3 = st.columns(3)
     m1.metric(f"{_ledger} 합계", f"{_official_total:,}원")
     m2.metric("모모원장 합계", f"{_erp_total:,}원")
     m3.metric(f"차액 ({_src_side}−모모)", f"{_diff:,}원")
+    st.caption("공식취소·모모기록없음 금액은 원장 합계에 포함하지 않습니다.")
 
     if sel_src == "ulsanpay" and "뒤4" in df.columns:
         df = df.drop(columns=["뒤4", "구매자", "정산"], errors="ignore")
@@ -34015,7 +34024,14 @@ def _render_external_pay_admin_section(
     }
     df_show = df.copy()
     if "결과" in df_show.columns:
-        df_show["결과"] = df_show["결과"].map(lambda v: _result_map.get(v, v))
+        def _result_text(row) -> str:
+            code = str(row.get("결과") or "")
+            has_pay = _ext_pay_cell_int(row.get("_payment_id")) > 0
+            if code == "official_canceled" and not has_pay:
+                return "공식취소·모모기록없음"
+            return _result_map.get(code, code)
+
+        df_show["결과"] = df_show.apply(_result_text, axis=1)
     df_show = df_show.rename(columns=_rename_map)
 
     _flag_col = "_fabricated"
