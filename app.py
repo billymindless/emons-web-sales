@@ -2181,7 +2181,10 @@ _ONNURI_HEADER_ALIASES = {
 
 
 def _ext_pay_norm_header(h: str) -> str:
-    return re.sub(r"\s+", "", str(h or "")).strip()
+    # 공백 제거 후 양 끝의 마침표·중점·콜론·언더스코어·대시 등 장식용 기호 제거
+    # (예: '매입일자.' → '매입일자', 'TID.' → 'TID')
+    s = re.sub(r"\s+", "", str(h or "")).strip()
+    return s.strip(".．・:：_-()[]")
 
 
 _ULSANPAY_HEADER_ALIASES = {
@@ -2213,11 +2216,14 @@ _CARD_HEADER_ALIASES = {
 
 # 메인페이 매출내역 헤더 별칭 (카드사·카드번호 없음, 승인번호+금액 기반)
 _MAINPAY_HEADER_ALIASES = {
-    "tx_date":       ("매입일자", "거래일시", "거래일자", "거래일", "결제일자", "결제일", "승인일자"),
+    "tx_date":       ("매입일자", "거래일시", "거래일자", "원거래일", "거래일", "결제일자", "결제일", "승인일자"),
     "tx_time":       ("거래일시", "거래시간", "결제시간", "시간"),
-    "amount":        ("결제금액", "승인금액", "매입금액", "거래금액"),
+    # 결제금액이 없는 매입사 양식에서는 신용금액을 금액으로 사용한다.
+    "amount":        ("결제금액", "신용금액", "승인금액", "매입금액", "거래금액"),
     "approval_code": ("승인번호", "승인 번호", "승인코드", "거래번호", "Approval"),
-    "tx_status":     ("거래구분", "매출구분", "승인구분", "거래상태", "결제상태", "상태", "구분"),
+    # 상태 계열. '취소여부'(Y/N) 는 별도 cancel_flag 로 받는다.
+    "tx_status":     ("상태", "거래구분", "매출구분", "승인구분", "거래상태", "결제상태", "구분"),
+    "cancel_flag":   ("취소여부", "취소여부(Y/N)"),
 }
 
 
@@ -2597,12 +2603,12 @@ def _ext_pay_parse_mainpay_file(uploaded_file) -> tuple[list[dict], str | None]:
     if err:
         return [], err
     df = _ext_pay_promote_header_row(
-        df, {"매입일자", "거래일시", "승인번호", "결제금액", "승인금액"}
+        df, {"매입일자", "거래일시", "원거래일", "거래일자", "승인번호", "결제금액", "신용금액", "승인금액"}
     )
     colmap = _ext_pay_map_columns(df.columns, _MAINPAY_HEADER_ALIASES)
     if "tx_date" not in colmap or "amount" not in colmap or "approval_code" not in colmap:
         return [], (
-            "필수 컬럼(매입일자, 승인번호, 결제금액)을 찾을 수 없습니다. "
+            "필수 컬럼(매입일자, 승인번호, 결제금액/신용금액)을 찾을 수 없습니다. "
             f"감지된 컬럼: {list(df.columns)}"
         )
 
@@ -2627,9 +2633,19 @@ def _ext_pay_parse_mainpay_file(uploaded_file) -> tuple[list[dict], str | None]:
         else:
             appr = appr_digits.zfill(8)
         tx_status = str(row.get(colmap["tx_status"]) or "").strip() if "tx_status" in colmap else ""
-        # 구분이 '취소' 류이면 금액 부호를 음수로 뒤집어 저장해, 매칭 시 음수 전표와 짝이 되게 한다.
-        if _ext_pay_is_cancel_status(tx_status) and int(amt) > 0:
+        cancel_flag = str(row.get(colmap["cancel_flag"]) or "").strip().upper() if "cancel_flag" in colmap else ""
+        # 매입사 양식의 '취소여부' Y/예/TRUE/1 도 취소로 본다.
+        is_cancel_row = (
+            _ext_pay_is_cancel_status(tx_status)
+            or cancel_flag in ("Y", "예", "TRUE", "1", "취소")
+            or int(amt) < 0
+        )
+        # 구분이 취소 류이면 금액 부호를 음수로 뒤집어 저장해, 매칭 시 음수 전표와 짝이 되게 한다.
+        if is_cancel_row and int(amt) > 0:
             amt = -int(amt)
+        # tx_status 가 공란이면 취소여부를 상태 문자열에 반영해 뒤쪽 _ext_pay_is_cancel_status 가 인식하게 한다.
+        if is_cancel_row and not _ext_pay_is_cancel_status(tx_status):
+            tx_status = (tx_status + " 취소").strip() if tx_status else "취소"
         raw = {k: (None if pd.isna(v) else str(v)) for k, v in row.items() if v is not None}
         out.append({
             "tx_date": tx_date,
