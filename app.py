@@ -4269,10 +4269,116 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
     counts: dict[str, int] = {}
     inserts: list[dict] = []
 
+    # 0차 패스(취소쌍 매칭): 같은 (날짜·뒤4·절대금액) 에 공식 결제완료 1건과 공식 결제취소 1건이
+    # 있고, 모모에도 같은 주문의 양수 결제 1건과 상계용 음수 결제 1건이 있으면 각각 짝지어 확정.
+    # 결제완료 → 양수 결제, 결제취소 → 음수 상계 결제. 이렇게 하지 않으면 취소 행이 양수 결제를
+    # 먼저 가져가고 결제완료 행이 official_only 로 밀리는 문제가 발생한다.
+    neg_pays_by_key: dict[tuple, list[dict]] = {}
+    for _p in pays:
+        try:
+            _pid = int(_p["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if _pid in used_payment_ids:
+            continue
+        try:
+            _amt = int(_p.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if _amt >= 0:
+            continue
+        _oid = _p.get("order_id")
+        if _oid is None:
+            continue
+        _pay_date = str(_p.get("payment_date") or "")[:10]
+        neg_pays_by_key.setdefault((int(_oid), -_amt, _pay_date), []).append(_p)
+
+    _pair_groups: dict[tuple, dict[str, list]] = {}
+    for _r in todo:
+        _l4 = _r.get("phone_last4") or ""
+        if not _l4:
+            continue
+        try:
+            _abs_amt = abs(int(_r.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        if _abs_amt <= 0:
+            continue
+        _tx_date = str(_r.get("tx_date") or "")[:10]
+        _key = (_tx_date, _l4, _abs_amt)
+        _bucket = _pair_groups.setdefault(_key, {"paid": [], "cancel": []})
+        if _ext_pay_is_cancel_status(_r.get("tx_status")):
+            _bucket["cancel"].append(_r)
+        else:
+            _bucket["paid"].append(_r)
+
+    _pass1_locked: set[int] = set()
+    for (_tx_date, _last4, _abs_amt), _bucket in _pair_groups.items():
+        if len(_bucket["paid"]) != 1 or len(_bucket["cancel"]) != 1:
+            continue
+        _pairs: list[tuple[dict, dict]] = []
+        for _pos in idx.get((_tx_date, _last4, _abs_amt), []):
+            try:
+                _pid_pos = int(_pos["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if _pid_pos in used_payment_ids:
+                continue
+            _oid = _pos.get("order_id")
+            if _oid is None:
+                continue
+            _pay_date = str(_pos.get("payment_date") or "")[:10]
+            for _neg in neg_pays_by_key.get((int(_oid), _abs_amt, _pay_date), []):
+                try:
+                    _pid_neg = int(_neg["id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if _pid_neg in used_payment_ids:
+                    continue
+                _pairs.append((_pos, _neg))
+        if len(_pairs) != 1:
+            continue
+        _pos_pay, _neg_pay = _pairs[0]
+        _pid_pos = int(_pos_pay["id"])
+        _pid_neg = int(_neg_pay["id"])
+        _oid = int(_pos_pay["order_id"]) if _pos_pay.get("order_id") is not None else None
+        _co = _pos_pay["_order"] or {}
+        _cid = int(_co["customer_id"]) if _co.get("customer_id") is not None else None
+        _paid_row = _bucket["paid"][0]
+        _cancel_row = _bucket["cancel"][0]
+        inserts.append({
+            "db_filename": db_filename,
+            "source": "onnuri",
+            "row_id": int(_paid_row["id"]),
+            "payment_id": _pid_pos,
+            "order_id": _oid,
+            "customer_id": _cid,
+            "result_code": "matched_ok",
+            "note": "공식 결제 · ERP 결제 (취소쌍)",
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        inserts.append({
+            "db_filename": db_filename,
+            "source": "onnuri",
+            "row_id": int(_cancel_row["id"]),
+            "payment_id": _pid_neg,
+            "order_id": _oid,
+            "customer_id": _cid,
+            "result_code": "matched_ok",
+            "note": "공식 취소 · ERP 상계 (취소쌍)",
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        counts["matched_ok"] = counts.get("matched_ok", 0) + 2
+        used_payment_ids.add(_pid_pos)
+        used_payment_ids.add(_pid_neg)
+        for _k, _lst in list(idx.items()):
+            idx[_k] = [x for x in _lst if int(x["id"]) != _pid_pos]
+        _pass1_locked.add(int(_paid_row["id"]))
+        _pass1_locked.add(int(_cancel_row["id"]))
+
     # 1차 패스(정확 매칭 우선): 취소 아닌 공식 행 중 (tx_date, last4, amount) 후보가 1건이면
     # 먼저 확정하고 인덱스에서 소진한다. 이후 amt_alts/nearby 확장 매칭이 정확 매칭 대상 결제를
     # 빼앗아 다른 공식 행이 official_only 로 밀리는 문제를 방지한다.
-    _pass1_locked: set[int] = set()
     # (B) 같은 주문 fallback 확장: last4 → 이번 세션에서 매칭된 order_id 집합.
     # 담당자가 두 번째 결제의 last4 를 다른 값으로 입력해도, 같은 order 내 amount 유일 일치로 복구한다.
     _pass1_orders_by_last4: dict[str, set[int]] = {}
@@ -4280,6 +4386,8 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
         try:
             _row_id = int(_r["id"])
         except (TypeError, ValueError, KeyError):
+            continue
+        if _row_id in _pass1_locked:
             continue
         if _ext_pay_is_cancel_status(_r.get("tx_status")):
             continue
