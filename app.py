@@ -2331,22 +2331,27 @@ def _ext_pay_parse_date(v) -> str | None:
     s = str(v).strip()
     if not s:
         return None
+    if s.lower() in ("nan", "none", "nat"):
+        return None
     s2 = re.sub(r"[./]", "-", s)
     s2 = s2.split(" ")[0]
-    try:
-        return datetime.fromisoformat(s2[:10]).date().isoformat()
-    except ValueError:
+    for fmt in ("%Y-%m-%d", "%y-%m-%d"):
         try:
-            return datetime.strptime(s2[:10], "%Y-%m-%d").date().isoformat()
+            return datetime.strptime(s2[:10], fmt).date().isoformat()
         except ValueError:
-            # YYYYMMDD 처럼 구분자가 없는 8자리 숫자 지원
-            digits = re.sub(r"\D", "", s)
-            if len(digits) >= 8:
-                try:
-                    return datetime.strptime(digits[:8], "%Y%m%d").date().isoformat()
-                except ValueError:
-                    return None
+            continue
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 8:
+        try:
+            return datetime.strptime(digits[:8], "%Y%m%d").date().isoformat()
+        except ValueError:
             return None
+    if len(digits) == 6:
+        try:
+            return datetime.strptime(digits, "%y%m%d").date().isoformat()
+        except ValueError:
+            return None
+    return None
 
 
 def _ext_pay_parse_time(v) -> str | None:
@@ -34750,28 +34755,6 @@ def _render_external_pay_admin_section(
                     st.error(perr)
                 elif not parsed and not card_parsed:
                     st.warning(_empty_hint)
-                    # 메인페이: 어떤 컬럼이 매칭됐는지 즉시 보여줘 원인 파악을 돕는다.
-                    if _src_key == "mainpay":
-                        try:
-                            up.seek(0)
-                        except Exception:
-                            pass
-                        try:
-                            _df_dbg, _derr = _ext_pay_read_uploaded_df(up)
-                            if _df_dbg is not None:
-                                _df_dbg = _ext_pay_promote_header_row(
-                                    _df_dbg,
-                                    {"매입일자", "거래일시", "원거래일", "거래일자", "승인번호",
-                                     "결제금액", "신용금액", "승인금액"},
-                                )
-                                _cm_dbg = _ext_pay_map_columns(_df_dbg.columns, _MAINPAY_HEADER_ALIASES)
-                                st.caption(f"감지 컬럼 매핑: {_cm_dbg}")
-                                st.caption(f"행 수: {len(_df_dbg)}")
-                                if len(_df_dbg) > 0:
-                                    _first = _df_dbg.head(3).to_dict(orient="records")
-                                    st.caption(f"상단 3행 샘플: {_first}")
-                        except Exception as _dbg_e:
-                            st.caption(f"디버그 샘플 조회 실패: {_dbg_e}")
                 else:
                     _msg_parts: list[str] = []
                     _upload_err: str | None = None
