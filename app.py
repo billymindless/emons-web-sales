@@ -6097,6 +6097,76 @@ def _ext_pay_rematch_open_rows(
             # 이 기간에 공식 행이 없으면 매칭 함수만 호출해 신규 배치 처리 여지 남김
             row_ids_scope = []
 
+    # 온누리: 취소 행이 양수 결제에 묶인 레거시 matched_ok 를 선 정리
+    # (기존 Pass-2 가 "ERP도 취소 흔적" 노트로 붙여둔 상태. 쌍 매칭 Pass-0 가 다시 올바르게 붙인다.)
+    if source == "onnuri":
+        try:
+            def _filt_cancels(q):
+                q = q.eq("db_filename", db_filename).eq("source", source).like("tx_status", "%취소%")
+                if verify_from is not None:
+                    q = q.gte("tx_date", verify_from.isoformat())
+                return q
+            cancel_rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows", "id", _filt_cancels, order_col="id",
+            )
+            cancel_ids = [int(r["id"]) for r in cancel_rows if r.get("id") is not None]
+            stale_row_ids: list[int] = []
+            for chunk in (cancel_ids[i : i + 200] for i in range(0, len(cancel_ids), 200)):
+                if not chunk:
+                    continue
+                ms = (
+                    sc.table("app_external_pay_matches")
+                    .select("row_id, payment_id")
+                    .eq("db_filename", db_filename)
+                    .eq("source", source)
+                    .eq("result_code", "matched_ok")
+                    .in_("row_id", chunk)
+                    .execute()
+                    .data
+                    or []
+                )
+                pay_ids = [int(m["payment_id"]) for m in ms if m.get("payment_id") is not None]
+                if not pay_ids:
+                    continue
+                pos_pay_ids: set[int] = set()
+                for pchunk in (pay_ids[i : i + 200] for i in range(0, len(pay_ids), 200)):
+                    pays = (
+                        sc.table("app_payments")
+                        .select("id, amount")
+                        .in_("id", pchunk)
+                        .execute()
+                        .data
+                        or []
+                    )
+                    for p in pays:
+                        try:
+                            if int(p.get("amount") or 0) > 0:
+                                pos_pay_ids.add(int(p["id"]))
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                for m in ms:
+                    try:
+                        pid = int(m["payment_id"]) if m.get("payment_id") is not None else None
+                        rid = int(m["row_id"]) if m.get("row_id") is not None else None
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if pid is not None and pid in pos_pay_ids and rid is not None:
+                        stale_row_ids.append(rid)
+            for chunk in (stale_row_ids[i : i + 200] for i in range(0, len(stale_row_ids), 200)):
+                if not chunk:
+                    continue
+                (
+                    sc.table("app_external_pay_matches")
+                    .delete()
+                    .eq("db_filename", db_filename)
+                    .eq("source", source)
+                    .eq("result_code", "matched_ok")
+                    .in_("row_id", chunk)
+                    .execute()
+                )
+        except Exception as e:
+            return {}, f"취소-양수 레거시 매칭 정리 실패: {e}"
+
     # 미결 매칭 삭제
     try:
         if verify_from is None:
