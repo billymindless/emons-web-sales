@@ -43949,10 +43949,8 @@ def render_customer_balance():
                                 with st.expander(exp_label, expanded=_is_selected_order):
                                     # pcr-lazy: 선택되지 않은 주문의 결제 테이블·수정 폼·결제변경 폼은 접힌 상태에서도
                                     #           Streamlit 이 body 를 실행하기 때문에 비싸다. 선택된 주문만 상세 body
-                                    #           를 렌더하고, 나머지는 안내만 표시한다.
-                                    if not _is_selected_order:
-                                        st.caption("👆 위 '수정할 주문 선택'에서 이 주문을 고르면 결제 내역·수정 폼이 로드됩니다.")
-                                    elif pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0:
+                                    #           를 렌더하고, 나머지는 결제 내역 표(읽기 전용)만 표시한다.
+                                    if pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0:
                                         st.info("해당 주문의 결제 내역이 없습니다.")
                                     else:
                                         pay_display = pay_list.copy()
@@ -43979,12 +43977,15 @@ def render_customer_balance():
                                         if "사업자" in pay_display.columns:
                                             _pay_cols_show.insert(-1, "사업자")
                                         st.dataframe(pay_display[_pay_cols_show], width='stretch')
-                                        # 사내 결제변경 검증 요청 (격리된 기능 — 기존 결제 저장 로직과 무관)
-                                        _render_payment_change_verify_entry(
-                                            db_filename, int(_order_id_pay),
-                                            customer_name_for_receipt, pay_list,
-                                        )
-                                        for _, prow in pay_list.iterrows():
+                                        if not _is_selected_order:
+                                            st.caption("👆 결제 수정·결제변경 요청은 위 '수정할 주문 선택'에서 이 주문을 고르면 표시됩니다.")
+                                        else:
+                                            # 사내 결제변경 검증 요청 (격리된 기능 — 기존 결제 저장 로직과 무관)
+                                            _render_payment_change_verify_entry(
+                                                db_filename, int(_order_id_pay),
+                                                customer_name_for_receipt, pay_list,
+                                            )
+                                        for _, prow in (pay_list if _is_selected_order else pay_list.iloc[0:0]).iterrows():
                                             _prow_cc = str(prow.get("card_company") or "").strip()
                                             _prow_cc = "" if _prow_cc in ("None", "nan", "none") else _prow_cc
                                             _prow_method_label = prow['payment_method'] or '-'
