@@ -2176,6 +2176,7 @@ _ONNURI_HEADER_ALIASES = {
     "settle_status": ("정산상태", "정산 상태"),
     "buyer_name":    ("구매자명", "구매자", "이름"),
     "approval_code": ("승인번호", "거래번호", "결제번호"),
+    "pay_method":    ("거래구분", "결제수단", "결제방법", "지불수단"),
 }
 
 
@@ -2424,6 +2425,7 @@ def _ext_pay_parse_onnuri_file(uploaded_file) -> tuple[list[dict], str | None]:
         settle_status = str(row.get(colmap["settle_status"]) or "").strip() if "settle_status" in colmap else ""
         buyer = str(row.get(colmap["buyer_name"]) or "").strip() if "buyer_name" in colmap else ""
         appr = str(row.get(colmap["approval_code"]) or "").strip() if "approval_code" in colmap else ""
+        pay_method = str(row.get(colmap["pay_method"]) or "").strip() if "pay_method" in colmap else ""
         raw = {k: (None if pd.isna(v) else str(v)) for k, v in row.items() if v is not None}
         out.append({
             "tx_date": tx_date,
@@ -2434,6 +2436,7 @@ def _ext_pay_parse_onnuri_file(uploaded_file) -> tuple[list[dict], str | None]:
             "settle_status": settle_status or None,
             "buyer_name_masked": buyer or None,
             "approval_code": appr or None,
+            "pay_method": pay_method or None,
             "raw": raw,
         })
     return out, None
@@ -2625,6 +2628,22 @@ def _ext_pay_parse_mainpay_file(uploaded_file) -> tuple[list[dict], str | None]:
             "raw": raw,
         })
     return out, None
+
+
+def _ext_pay_is_onnuri_card_pay(value) -> bool:
+    """온누리 원장의 거래구분이 카드결제인지. 공백은 무시한다."""
+    s = re.sub(r"\s+", "", str(value or ""))
+    return "카드결제" in s
+
+
+def _ext_pay_raw_pay_method(raw) -> str:
+    """저장된 raw_json 에서 거래구분·결제수단 값을 읽는다."""
+    if not isinstance(raw, dict):
+        return ""
+    for k, v in raw.items():
+        if _ext_pay_norm_header(k) in {"거래구분", "결제수단", "결제방법", "지불수단"}:
+            return str(v or "").strip()
+    return ""
 
 
 def _ext_pay_is_cancel_status(status: str | None) -> bool:
@@ -5046,13 +5065,13 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
         try:
             rows = _ext_pay_select_paged(
                 sc, "app_external_pay_rows",
-                "id, tx_date, tx_time, amount, tx_status, approval_code, card_company, card_kind",
+                "id, tx_date, tx_time, phone_last4, amount, tx_status, approval_code, card_company, card_kind",
                 _filt_rows, order_col="id",
             )
         except Exception:
             rows = _ext_pay_select_paged(
                 sc, "app_external_pay_rows",
-                "id, tx_date, tx_time, amount, tx_status, approval_code",
+                "id, tx_date, tx_time, phone_last4, amount, tx_status, approval_code",
                 _filt_rows, order_col="id",
             )
     except Exception as e:
@@ -5142,6 +5161,44 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
             continue
         idx.setdefault((cc, amt_k), []).append(p)
 
+    # 온누리 원장에서 넘어온 카드결제 행은 카드사가 없다.
+    # 날짜·전화번호 뒤 4자리·금액으로 신용/체크카드 결제와 맞춘다.
+    phone_idx: dict[tuple, list[dict]] = {}
+    _need_phone = any(
+        (not _card_company_norm(r.get("card_company"))) and str(r.get("phone_last4") or "").strip()
+        for r in todo
+    )
+    if _need_phone:
+        cust_ids = sorted({
+            int(p["_order"]["customer_id"])
+            for p in candidate_pays
+            if (p.get("_order") or {}).get("customer_id") is not None
+        })
+        cust_map: dict[int, dict] = {}
+        for _chunk in (cust_ids[i : i + 200] for i in range(0, len(cust_ids), 200)):
+            cust_map.update(_get_customers_by_ids_supabase(db_filename, list(_chunk)))
+        for p in candidate_pays:
+            try:
+                amt_k = abs(int(p.get("amount") or 0))
+            except (TypeError, ValueError):
+                continue
+            if amt_k <= 0:
+                continue
+            pay_date = str(p.get("payment_date") or "")[:10]
+            last4s: set[str] = set()
+            oid = (p.get("_order") or {}).get("customer_id")
+            c = cust_map.get(int(oid)) if oid is not None else None
+            if c:
+                for _col in ("phone1", "phone2"):
+                    digits = _ext_pay_digits_only(c.get(_col))
+                    if len(digits) >= 4:
+                        last4s.add(digits[-4:])
+            for last4 in last4s:
+                phone_idx.setdefault((pay_date, last4, amt_k), []).append(p)
+
+    # 카드사 있는 공식 행을 먼저 매칭해, 카드사 없는 행이 같은 결제를 먼저 가져가지 않게 한다.
+    todo.sort(key=lambda r: (0 if _card_company_norm(r.get("card_company")) else 1, int(r.get("id") or 0)))
+
     counts: dict[str, int] = {}
     inserts: list[dict] = []
 
@@ -5159,8 +5216,28 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
         note_parts: list[str] = []
         candidates: list[dict] = []
         if not cc:
-            result_code = "official_only"
-            note_parts.append("카드사 미상")
+            last4 = str(r.get("phone_last4") or "").strip()
+            phone_cands = []
+            if last4:
+                phone_cands = [
+                    p for p in phone_idx.get((file_date, last4, match_amt), [])
+                    if int(p["id"]) not in used_payment_ids
+                ]
+                if not is_cancel:
+                    phone_cands = [p for p in phone_cands if int(p.get("amount") or 0) > 0]
+                else:
+                    neg = [p for p in phone_cands if int(p.get("amount") or 0) < 0]
+                    if neg:
+                        phone_cands = neg
+            if len(phone_cands) == 1:
+                candidates = phone_cands
+                note_parts.append("온누리 원장 카드결제")
+            elif len(phone_cands) > 1:
+                result_code = "ambiguous"
+                note_parts.append(f"신용카드 후보 {len(phone_cands)}건")
+            else:
+                result_code = "official_only"
+                note_parts.append("신용카드 결제 없음" if last4 else "카드사 미상")
         else:
             candidates = list(idx.get((cc, match_amt), []))
 
@@ -6065,6 +6142,84 @@ _EXT_PAY_OPEN_RESULT_CODES = (
 )
 
 
+def _ext_pay_rehome_onnuri_card_rows(
+    sc, db_filename: str, verify_from: date | None,
+) -> tuple[int, str | None]:
+    """거래구분이 카드결제인 온누리 행을 신용카드 원장으로 옮기고 카드 매칭을 돌린다."""
+    try:
+        def _filt(q):
+            return q.eq("db_filename", db_filename).eq("source", "onnuri")
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            "id, tx_date, tx_time, phone_last4, amount, tx_status, approval_code, raw_json",
+            _filt, order_col="id",
+        )
+    except Exception as e:
+        return 0, f"카드결제 행 조회 실패: {e}"
+
+    moved = 0
+    for r in rows:
+        if not _ext_pay_is_onnuri_card_pay(_ext_pay_raw_pay_method(r.get("raw_json"))):
+            continue
+        try:
+            rid = int(r["id"])
+            amt = int(r.get("amount") or 0)
+        except (TypeError, ValueError, KeyError):
+            continue
+        fp = _ext_pay_fingerprint(
+            "card", db_filename, str(r.get("tx_date") or "")[:10], r.get("tx_time"),
+            r.get("phone_last4"), amt, r.get("tx_status"),
+            approval_code=r.get("approval_code"),
+        )
+        try:
+            sc.table("app_external_pay_rows").update({
+                "source": "card",
+                "fingerprint": fp,
+            }).eq("id", rid).eq("source", "onnuri").execute()
+        except Exception as e:
+            msg = str(e).lower()
+            if "duplicate" in msg or "unique" in msg or "23505" in msg:
+                try:
+                    (
+                        sc.table("app_external_pay_matches")
+                        .delete()
+                        .eq("db_filename", db_filename)
+                        .eq("row_id", rid)
+                        .execute()
+                    )
+                    (
+                        sc.table("app_external_pay_rows")
+                        .delete()
+                        .eq("id", rid)
+                        .eq("source", "onnuri")
+                        .execute()
+                    )
+                except Exception as e2:
+                    return moved, f"카드결제 중복 행 정리 실패: {e2}"
+                continue
+            return moved, f"카드결제 행 이전 실패: {e}"
+        try:
+            (
+                sc.table("app_external_pay_matches")
+                .delete()
+                .eq("db_filename", db_filename)
+                .eq("source", "onnuri")
+                .eq("row_id", rid)
+                .execute()
+            )
+        except Exception as e:
+            return moved, f"카드결제 기존 매칭 삭제 실패: {e}"
+        moved += 1
+
+    if moved <= 0:
+        return 0, None
+    vf = verify_from or EXT_PAY_DEFAULT_VERIFY_FROM
+    _counts, err = _ext_pay_match_card(db_filename, vf, matched_by=None)
+    if err:
+        return moved, err
+    return moved, None
+
+
 def _ext_pay_rematch_open_rows(
     sc, db_filename: str, source: str, verify_from: date | None,
 ) -> tuple[dict, str | None]:
@@ -6076,6 +6231,11 @@ def _ext_pay_rematch_open_rows(
         return {}, None
     if sc is None:
         return {}, "Supabase 연결 불가"
+
+    if source == "onnuri":
+        _moved, _rehome_err = _ext_pay_rehome_onnuri_card_rows(sc, db_filename, verify_from)
+        if _rehome_err:
+            return {}, _rehome_err
 
     # verify_from 이후 row_id 후보 조회 (지정된 경우에만 상한 없이)
     row_ids_scope: list[int] = []
@@ -34024,54 +34184,85 @@ def _render_external_pay_admin_section(
             ):
                 with st.spinner("파일을 읽고 매칭하는 중..."):
                     parsed, perr = _parse_fn(up)
+                card_parsed: list[dict] = []
+                if not perr and _src_key == "onnuri" and parsed:
+                    card_parsed = [r for r in parsed if _ext_pay_is_onnuri_card_pay(r.get("pay_method"))]
+                    parsed = [r for r in parsed if not _ext_pay_is_onnuri_card_pay(r.get("pay_method"))]
                 if perr:
                     st.error(perr)
-                elif not parsed:
+                elif not parsed and not card_parsed:
                     st.warning(_empty_hint)
                 else:
-                    # 이 업로드 세션의 사업자명을 매칭 함수가 참조하도록 세션에 저장
-                    st.session_state[f"_ext_pay_upload_business_{sel_db}_{_src_key}"] = sel_business or ""
-                    inserted, skipped_before, skipped_dup, ierr, conflicts = _ext_pay_insert_batch_and_rows(
-                        sel_db, _src_key, getattr(up, "name", "") or "", parsed, new_from, me_uname,
-                        business_name=sel_business,
-                    )
-                    if ierr:
-                        st.error(ierr)
-                    else:
-                        _conflicts_key = f"extpay_conflicts_{sel_db}_{_src_key}"
-                        # ── 완전 중복 파일 자동 감지 ──
-                        # 신규 적재 0건 + 중복 skip > 0 → 이미 업로드된 파일. 매칭·상세 패널 모두 스킵.
-                        if inserted == 0 and skipped_dup > 0:
+                    _msg_parts: list[str] = []
+                    _upload_err: str | None = None
+                    _conflicts_key = f"extpay_conflicts_{sel_db}_{_src_key}"
+                    conflicts: list[dict] = []
+                    if parsed:
+                        st.session_state[f"_ext_pay_upload_business_{sel_db}_{_src_key}"] = sel_business or ""
+                        inserted, skipped_before, skipped_dup, ierr, conflicts = _ext_pay_insert_batch_and_rows(
+                            sel_db, _src_key, getattr(up, "name", "") or "", parsed, new_from, me_uname,
+                            business_name=sel_business,
+                        )
+                        if ierr:
+                            _upload_err = ierr
+                        elif inserted == 0 and skipped_dup > 0 and not card_parsed:
                             st.session_state.pop(_conflicts_key, None)
-                            _msg_parts = [
+                            _dup_parts = [
                                 f"이미 업로드된 파일입니다 (중복 {skipped_dup}건 모두 skip)",
                             ]
                             if skipped_before > 0:
-                                _msg_parts.append(f"시작일 이전 skip {skipped_before}건")
-                            flash(" · ".join(_msg_parts))
+                                _dup_parts.append(f"시작일 이전 skip {skipped_before}건")
+                            flash(" · ".join(_dup_parts))
                             st.rerun()
-                        counts, merr = _match_fn(sel_db, new_from, me_uname)
-                        if merr:
-                            st.error(f"매칭 실패: {merr}")
                         else:
-                            _msg_parts = [
-                                f"신규 {inserted}건 적재",
-                                f"중복 skip {skipped_dup}건",
-                                f"시작일 이전 skip {skipped_before}건",
-                            ]
-                            if counts:
-                                _msg_parts.append(
-                                    " · ".join(f"{k} {v}" for k, v in counts.items())
-                                )
-                            if conflicts:
-                                st.session_state[_conflicts_key] = conflicts
-                                _msg_parts.append(
-                                    f"중복 상세 {len(conflicts)}건 아래 패널에서 확인 후 별개 거래면 시각 재입력"
-                                )
+                            counts, merr = _match_fn(sel_db, new_from, me_uname)
+                            if merr:
+                                _upload_err = f"매칭 실패: {merr}"
                             else:
-                                st.session_state.pop(_conflicts_key, None)
-                            flash(" · ".join(_msg_parts))
-                            st.rerun()
+                                _msg_parts.extend([
+                                    f"신규 {inserted}건 적재",
+                                    f"중복 skip {skipped_dup}건",
+                                    f"시작일 이전 skip {skipped_before}건",
+                                ])
+                                if counts:
+                                    _msg_parts.append(
+                                        " · ".join(f"{k} {v}" for k, v in counts.items())
+                                    )
+                    if _upload_err is None and card_parsed:
+                        st.session_state[f"_ext_pay_upload_business_{sel_db}_card"] = sel_business or ""
+                        c_inserted, c_before, c_dup, c_err, c_conflicts = _ext_pay_insert_batch_and_rows(
+                            sel_db, "card", getattr(up, "name", "") or "", card_parsed, new_from, me_uname,
+                            business_name=sel_business,
+                        )
+                        if c_err:
+                            _upload_err = c_err
+                        else:
+                            c_counts, c_merr = _ext_pay_match_card(sel_db, new_from, me_uname)
+                            if c_merr:
+                                _upload_err = f"신용카드 매칭 실패: {c_merr}"
+                            else:
+                                _msg_parts.append(
+                                    f"카드결제 {len(card_parsed)}건은 신용/체크카드로 매칭 "
+                                    f"(신규 {c_inserted} · 중복 {c_dup} · 시작일 이전 {c_before})"
+                                )
+                                if c_counts:
+                                    _msg_parts.append(
+                                        "카드 " + " · ".join(f"{k} {v}" for k, v in c_counts.items())
+                                    )
+                                if c_conflicts:
+                                    conflicts = list(conflicts) + list(c_conflicts)
+                    if _upload_err:
+                        st.error(_upload_err)
+                    else:
+                        if conflicts:
+                            st.session_state[_conflicts_key] = conflicts
+                            _msg_parts.append(
+                                f"중복 상세 {len(conflicts)}건 아래 패널에서 확인 후 별개 거래면 시각 재입력"
+                            )
+                        else:
+                            st.session_state.pop(_conflicts_key, None)
+                        flash(" · ".join(_msg_parts) or "처리 완료")
+                        st.rerun()
 
         # 중복 skip 된 파일 행 상세 (지문 충돌) — 별개 거래로 강제 등록 가능
         _render_ext_pay_conflict_panel(sel_db, sel_src, new_from, me_uname)
