@@ -2217,7 +2217,7 @@ _MAINPAY_HEADER_ALIASES = {
     "tx_time":       ("거래일시", "거래시간", "결제시간", "시간"),
     "amount":        ("결제금액", "승인금액", "매입금액", "거래금액"),
     "approval_code": ("승인번호", "승인 번호", "승인코드", "거래번호", "Approval"),
-    "tx_status":     ("거래상태", "결제상태", "상태", "구분"),
+    "tx_status":     ("거래구분", "매출구분", "승인구분", "거래상태", "결제상태", "상태", "구분"),
 }
 
 
@@ -2317,6 +2317,13 @@ def _ext_pay_parse_date(v) -> str | None:
         try:
             return datetime.strptime(s2[:10], "%Y-%m-%d").date().isoformat()
         except ValueError:
+            # YYYYMMDD 처럼 구분자가 없는 8자리 숫자 지원
+            digits = re.sub(r"\D", "", s)
+            if len(digits) >= 8:
+                try:
+                    return datetime.strptime(digits[:8], "%Y%m%d").date().isoformat()
+                except ValueError:
+                    return None
             return None
 
 
@@ -2611,10 +2618,18 @@ def _ext_pay_parse_mainpay_file(uploaded_file) -> tuple[list[dict], str | None]:
         amt = _ext_pay_parse_amount(row.get(colmap["amount"]))
         if amt is None:
             continue
-        appr = str(row.get(colmap["approval_code"]) or "").strip()
-        if not appr:
+        appr_digits = re.sub(r"\D", "", str(row.get(colmap["approval_code"]) or ""))
+        if not appr_digits:
             continue
+        # 모모 입력(8자리)과 맞추기 위해 앞자리 0을 보존한 8자리 승인번호를 사용한다.
+        if len(appr_digits) > 8:
+            appr = appr_digits[-8:]
+        else:
+            appr = appr_digits.zfill(8)
         tx_status = str(row.get(colmap["tx_status"]) or "").strip() if "tx_status" in colmap else ""
+        # 구분이 '취소' 류이면 금액 부호를 음수로 뒤집어 저장해, 매칭 시 음수 전표와 짝이 되게 한다.
+        if _ext_pay_is_cancel_status(tx_status) and int(amt) > 0:
+            amt = -int(amt)
         raw = {k: (None if pd.isna(v) else str(v)) for k, v in row.items() if v is not None}
         out.append({
             "tx_date": tx_date,
@@ -3296,13 +3311,13 @@ def _ext_pay_relink_amount_and_near_date(
                 code = "amount_mismatch"
                 notes.append("공식파일에 있으나 금액 다름")
         elif source == "mainpay":
-            # 메인페이: 승인번호 우선, 없거나 유일 후보 없으면 금액+근사일자
-            appr = str(r.get("approval_code") or "").strip()
+            # 메인페이: 승인번호(ERP card_company 8자리) 우선, 없거나 유일 후보 없으면 금액+근사일자
+            appr = _mainpay_approval_norm(r.get("approval_code"))
             fd = _ext_pay_as_date(file_date)
             same_ap = [
                 p for p in leftover
                 if appr
-                and str(p.get("approval_code") or "").strip() == appr
+                and _mainpay_approval_norm(p.get("card_company")) == appr
                 and abs(int(p.get("amount") or 0)) == oamt
             ]
             same_amt = [p for p in leftover if abs(int(p.get("amount") or 0)) == oamt]
@@ -5469,9 +5484,21 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
     return counts, None
 
 
+def _mainpay_approval_norm(v) -> str:
+    """메인페이 승인번호 8자리. 숫자만 남기고 길면 뒤 8, 짧으면 왼쪽 0 패딩."""
+    if v is None:
+        return ""
+    digits = re.sub(r"\D", "", str(v))
+    if not digits:
+        return ""
+    if len(digits) > 8:
+        return digits[-8:]
+    return digits.zfill(8)
+
+
 def _ext_pay_match_mainpay(db_filename: str, verify_from: date, matched_by: str | None) -> tuple[dict, str | None]:
     """공식 메인페이 행 ↔ ERP 메인페이 결제 매칭.
-    키: 절대금액 + (있으면) 승인번호. 신규고객 필터 없음."""
+    키: (승인번호 8자리, 절대금액). 승인번호가 같으면 결제 행은 양수 전표, 취소 행은 음수 전표에 각각 묶는다."""
     sc, err = get_supabase_client()
     if err or not sc:
         return {}, err or "Supabase 연결 불가"
@@ -5563,29 +5590,129 @@ def _ext_pay_match_mainpay(db_filename: str, verify_from: date, matched_by: str 
 
     neg_orders = {int(p["order_id"]) for p in pays if p.get("order_id") is not None and (p.get("amount") or 0) < 0}
 
-    # 인덱스: (절대금액)만
-    idx: dict[int, list[dict]] = {}
+    # 인덱스: 양수 전표 (abs_amt), 음수 전표 (abs_amt)
+    pos_by_amt: dict[int, list[dict]] = {}
+    neg_by_amt: dict[int, list[dict]] = {}
+    # 승인번호(8자리) + abs_amt 로 전표를 다시 색인한다.
+    pos_by_appr: dict[tuple[str, int], list[dict]] = {}
+    neg_by_appr: dict[tuple[str, int], list[dict]] = {}
     for p in candidate_pays:
         try:
-            amt_k = abs(int(p.get("amount") or 0))
+            amt = int(p.get("amount") or 0)
         except (TypeError, ValueError):
             continue
-        idx.setdefault(amt_k, []).append(p)
+        amt_k = abs(amt)
+        appr = _mainpay_approval_norm(p.get("card_company"))
+        if amt > 0:
+            pos_by_amt.setdefault(amt_k, []).append(p)
+            if appr:
+                pos_by_appr.setdefault((appr, amt_k), []).append(p)
+        elif amt < 0:
+            neg_by_amt.setdefault(amt_k, []).append(p)
+            if appr:
+                neg_by_appr.setdefault((appr, amt_k), []).append(p)
 
     counts: dict[str, int] = {}
     inserts: list[dict] = []
+    pair_locked: set[int] = set()
 
+    # Pass-0: 승인번호 쌍 매칭. 같은 (승인번호, 절대금액) 공식 결제 1건 + 공식 취소 1건,
+    # 모모 양수 1건 + 음수 1건이 같은 주문이면 양쪽 모두 matched_ok 로 잠근다.
+    group_by_key: dict[tuple[str, int], dict[str, list[dict]]] = {}
+    for r in todo:
+        appr = _mainpay_approval_norm(r.get("approval_code"))
+        if not appr:
+            continue
+        try:
+            amt = int(r.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amt == 0:
+            continue
+        key = (appr, abs(amt))
+        g = group_by_key.setdefault(key, {"paid": [], "cancel": []})
+        if _ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0:
+            g["cancel"].append(r)
+        else:
+            g["paid"].append(r)
+
+    for (appr, abs_amt), g in group_by_key.items():
+        if len(g["paid"]) != 1 or len(g["cancel"]) != 1:
+            continue
+        pos_cands = [p for p in pos_by_appr.get((appr, abs_amt), []) if int(p["id"]) not in used_payment_ids]
+        neg_cands = [p for p in neg_by_appr.get((appr, abs_amt), []) if int(p["id"]) not in used_payment_ids]
+        if len(pos_cands) != 1 or len(neg_cands) != 1:
+            continue
+        pos_pay = pos_cands[0]
+        neg_pay = neg_cands[0]
+        if pos_pay.get("order_id") is None or pos_pay.get("order_id") != neg_pay.get("order_id"):
+            continue
+        paid_row = g["paid"][0]
+        cancel_row = g["cancel"][0]
+        _o = pos_pay["_order"] or {}
+        _cust_id = int(_o["customer_id"]) if _o.get("customer_id") is not None else None
+        _oid = int(pos_pay["order_id"])
+        inserts.append({
+            "db_filename": db_filename, "source": "mainpay",
+            "row_id": int(paid_row["id"]), "payment_id": int(pos_pay["id"]),
+            "order_id": _oid, "customer_id": _cust_id,
+            "result_code": "matched_ok",
+            "note": "공식 결제 · ERP 결제 (승인번호 쌍)",
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        inserts.append({
+            "db_filename": db_filename, "source": "mainpay",
+            "row_id": int(cancel_row["id"]), "payment_id": int(neg_pay["id"]),
+            "order_id": _oid, "customer_id": _cust_id,
+            "result_code": "matched_ok",
+            "note": "공식 취소 · ERP 상계 (승인번호 쌍)",
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        counts["matched_ok"] = counts.get("matched_ok", 0) + 2
+        used_payment_ids.add(int(pos_pay["id"]))
+        used_payment_ids.add(int(neg_pay["id"]))
+        pair_locked.add(int(paid_row["id"]))
+        pair_locked.add(int(cancel_row["id"]))
+
+    def _drop_from(idx_map, pid: int):
+        for k, lst in list(idx_map.items()):
+            idx_map[k] = [x for x in lst if int(x["id"]) != pid]
+
+    # Pass-1: 승인번호 단건 매칭. 승인번호가 같은 전표 중 부호가 맞는 유일 후보를 쓴다.
+    # Pass-2: 승인번호가 없거나 매칭되지 않은 행은 절대금액 + 근사일자로 매칭.
     for r in todo:
         row_id = int(r["id"])
-        amt = int(r.get("amount") or 0)
+        if row_id in pair_locked:
+            continue
+        try:
+            amt = int(r.get("amount") or 0)
+        except (TypeError, ValueError):
+            amt = 0
         is_cancel = _ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0
         match_amt = abs(amt)
         file_date = str(r.get("tx_date") or "")[:10]
         fd = _ext_pay_as_date(file_date)
+        appr = _mainpay_approval_norm(r.get("approval_code"))
+        sign_idx = neg_by_amt if is_cancel else pos_by_amt
+        sign_appr_idx = neg_by_appr if is_cancel else pos_by_appr
+        opp_sign_idx = pos_by_amt if is_cancel else neg_by_amt
+
         result_code = None
         matched_pay: dict | None = None
         note_parts: list[str] = []
-        candidates = list(idx.get(match_amt, []))
+
+        candidates: list[dict] = []
+        if appr:
+            appr_cands = [p for p in sign_appr_idx.get((appr, match_amt), []) if int(p["id"]) not in used_payment_ids]
+            if appr_cands:
+                candidates = appr_cands
+        if not candidates:
+            amt_cands = [p for p in sign_idx.get(match_amt, []) if int(p["id"]) not in used_payment_ids]
+            # 승인번호가 있으면 다른 승인번호 전표는 후보로 쓰지 않는다. 오탐 방지.
+            if appr:
+                amt_cands = [p for p in amt_cands if not _mainpay_approval_norm(p.get("card_company"))
+                             or _mainpay_approval_norm(p.get("card_company")) == appr]
+            candidates = amt_cands
 
         if candidates:
             def _gap(p):
@@ -5613,14 +5740,12 @@ def _ext_pay_match_mainpay(db_filename: str, verify_from: date, matched_by: str 
                 if _dn:
                     note_parts.append(_dn)
                 if is_cancel:
-                    if int(matched_pay["order_id"]) in neg_orders:
-                        result_code = "matched_ok"
-                        note_parts.append("공식 취소 · ERP도 취소 흔적")
-                    else:
-                        result_code = "official_canceled"
-                        note_parts.append("공식 취소인데 ERP는 잔존")
+                    result_code = "matched_ok"
+                    note_parts.append("공식 취소 · ERP 상계")
                 else:
                     if int(matched_pay["order_id"]) in neg_orders:
+                        # 승인번호가 같으면 Pass-0 에서 이미 묶였어야 한다. 여기까지 왔다면
+                        # 쌍이 성립하지 못한 경우이므로 결제 흔적만 남긴다.
                         result_code = "erp_canceled_official_paid"
                         note_parts.append("공식 결제완료 · ERP는 취소 흔적")
                     else:
@@ -5653,10 +5778,12 @@ def _ext_pay_match_mainpay(db_filename: str, verify_from: date, matched_by: str 
         counts[result_code] = counts.get(result_code, 0) + 1
         if pay_id is not None:
             used_payment_ids.add(pay_id)
-            for k, lst in list(idx.items()):
-                idx[k] = [x for x in lst if int(x["id"]) != pay_id]
+            _drop_from(pos_by_amt, pay_id)
+            _drop_from(neg_by_amt, pay_id)
+            _drop_from(pos_by_appr, pay_id)
+            _drop_from(neg_by_appr, pay_id)
 
-    leftover_pays = [p for p in candidate_pays if int(p["id"]) not in used_payment_ids]
+    leftover_pays = [p for p in candidate_pays if int(p["id"]) not in used_payment_ids and int(p.get("amount") or 0) > 0]
     counts["erp_only"] = counts.get("erp_only", 0) + len(leftover_pays)
 
     for chunk in (inserts[i : i + 200] for i in range(0, len(inserts), 200)):
@@ -6330,11 +6457,12 @@ def _ext_pay_rehome_onnuri_card_rows(
 def _ext_pay_rematch_open_rows(
     sc, db_filename: str, source: str, verify_from: date | None,
 ) -> tuple[dict, str | None]:
-    """온누리·울산페이 미결 매칭(공식만/ambiguous/금액불일치/공식취소)만 삭제 후 재매칭.
+    """온누리·울산페이·메인페이 미결 매칭(공식만/ambiguous/금액불일치/공식취소)만 삭제 후 재매칭.
 
     - matched_ok / manual_matched / split_matched / erp_canceled_official_paid 는 유지.
+    - 온누리/메인페이는 취소 행이 양수 전표에 묶인 레거시 쌍과 잠긴 erp_canceled 를 선 정리.
     - verify_from 이 지정되면 해당 시점 이후의 공식 행(row_id)에 대해서만 삭제한다."""
-    if source not in ("onnuri", "ulsanpay"):
+    if source not in ("onnuri", "ulsanpay", "mainpay"):
         return {}, None
     if sc is None:
         return {}, "Supabase 연결 불가"
@@ -6480,6 +6608,116 @@ def _ext_pay_rematch_open_rows(
         except Exception as e:
             return {}, f"승인번호 쌍 재매칭 잠금 해제 실패: {e}"
 
+    # 메인페이: 승인번호 쌍 레거시 매칭 정리
+    if source == "mainpay":
+        try:
+            def _filt_mp_rows(q):
+                q = q.eq("db_filename", db_filename).eq("source", source)
+                if verify_from is not None:
+                    q = q.gte("tx_date", verify_from.isoformat())
+                return q
+            mp_rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows",
+                "id, amount, tx_status, approval_code",
+                _filt_mp_rows, order_col="id",
+            )
+            cancel_ids_mp: list[int] = []
+            cancel_keys_mp: set[tuple[str, int]] = set()
+            paid_ids_by_key_mp: dict[tuple[str, int], list[int]] = {}
+            for r in mp_rows:
+                try:
+                    rid = int(r["id"])
+                    amt = int(r.get("amount") or 0)
+                except (TypeError, ValueError, KeyError):
+                    continue
+                abs_amt = abs(amt)
+                if abs_amt <= 0:
+                    continue
+                appr = _mainpay_approval_norm(r.get("approval_code"))
+                if not appr:
+                    continue
+                key = (appr, abs_amt)
+                if _ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0:
+                    cancel_ids_mp.append(rid)
+                    cancel_keys_mp.add(key)
+                else:
+                    paid_ids_by_key_mp.setdefault(key, []).append(rid)
+
+            # 1) 취소 행이 양수 전표에 묶인 matched_ok 해제
+            stale_cancel_row_ids: list[int] = []
+            for chunk in (cancel_ids_mp[i : i + 200] for i in range(0, len(cancel_ids_mp), 200)):
+                if not chunk:
+                    continue
+                ms = (
+                    sc.table("app_external_pay_matches")
+                    .select("row_id, payment_id")
+                    .eq("db_filename", db_filename)
+                    .eq("source", source)
+                    .eq("result_code", "matched_ok")
+                    .in_("row_id", chunk)
+                    .execute()
+                    .data
+                    or []
+                )
+                pay_ids = [int(m["payment_id"]) for m in ms if m.get("payment_id") is not None]
+                if not pay_ids:
+                    continue
+                pos_pay_ids: set[int] = set()
+                for pchunk in (pay_ids[i : i + 200] for i in range(0, len(pay_ids), 200)):
+                    pays = (
+                        sc.table("app_payments")
+                        .select("id, amount")
+                        .in_("id", pchunk)
+                        .execute()
+                        .data
+                        or []
+                    )
+                    for p in pays:
+                        try:
+                            if int(p.get("amount") or 0) > 0:
+                                pos_pay_ids.add(int(p["id"]))
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                for m in ms:
+                    try:
+                        pid = int(m["payment_id"]) if m.get("payment_id") is not None else None
+                        rid = int(m["row_id"]) if m.get("row_id") is not None else None
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if pid is not None and pid in pos_pay_ids and rid is not None:
+                        stale_cancel_row_ids.append(rid)
+            for chunk in (stale_cancel_row_ids[i : i + 200] for i in range(0, len(stale_cancel_row_ids), 200)):
+                if not chunk:
+                    continue
+                (
+                    sc.table("app_external_pay_matches")
+                    .delete()
+                    .eq("db_filename", db_filename)
+                    .eq("source", source)
+                    .eq("result_code", "matched_ok")
+                    .in_("row_id", chunk)
+                    .execute()
+                )
+
+            # 2) 같은 (승인번호, 금액) 취소 행이 있으면 결제 행의 erp_canceled_official_paid 해제
+            release_ids_mp: list[int] = []
+            for key in cancel_keys_mp:
+                release_ids_mp.extend(paid_ids_by_key_mp.get(key, []))
+            for chunk in (release_ids_mp[i : i + 200] for i in range(0, len(release_ids_mp), 200)):
+                if not chunk:
+                    continue
+                (
+                    sc.table("app_external_pay_matches")
+                    .delete()
+                    .eq("db_filename", db_filename)
+                    .eq("source", source)
+                    .eq("result_code", "erp_canceled_official_paid")
+                    .in_("row_id", chunk)
+                    .execute()
+                )
+        except Exception as e:
+            return {}, f"메인페이 승인번호 쌍 재매칭 잠금 해제 실패: {e}"
+
     # 미결 매칭 삭제
     try:
         if verify_from is None:
@@ -6511,6 +6749,8 @@ def _ext_pay_rematch_open_rows(
     vf = verify_from or EXT_PAY_DEFAULT_VERIFY_FROM
     if source == "onnuri":
         return _ext_pay_match_onnuri(db_filename, vf, matched_by=None)
+    if source == "mainpay":
+        return _ext_pay_match_mainpay(db_filename, vf, matched_by=None)
     return _ext_pay_match_ulsanpay(db_filename, vf, matched_by=None)
 
 
@@ -6530,8 +6770,8 @@ def _ext_pay_list_matches_df(
     if source == "ulsanpay":
         _ext_pay_offset_ulsan_cancels(sc, db_filename)
         _ext_pay_rematch_ulsan_zeropad(sc, db_filename)
-    # 온누리·울산페이는 미결 매칭만 삭제 후 재매칭 (matched_ok/manual_matched/split_matched 유지)
-    if source in ("onnuri", "ulsanpay"):
+    # 온누리·울산페이·메인페이는 미결 매칭만 삭제 후 재매칭 (matched_ok/manual_matched/split_matched 유지)
+    if source in ("onnuri", "ulsanpay", "mainpay"):
         _ext_pay_rematch_open_rows(sc, db_filename, source, verify_from)
     _ext_pay_relink_amount_and_near_date(sc, db_filename, source, erp_from=erp_only_from)
     try:
@@ -34553,8 +34793,8 @@ def _render_external_pay_admin_section(
             _sc, _sc_err = get_supabase_client()
             if _sc_err or not _sc:
                 st.error(f"Supabase 연결 실패: {_sc_err}")
-            elif sel_src not in ("onnuri", "ulsanpay"):
-                st.info("이 출처는 자동 재매칭 대상이 아닙니다. (온누리·울산페이 전용)")
+            elif sel_src not in ("onnuri", "ulsanpay", "mainpay"):
+                st.info("이 출처는 자동 재매칭 대상이 아닙니다. (온누리·울산페이·메인페이 전용)")
             else:
                 with st.spinner("재매칭 중..."):
                     _counts, _rerr = _ext_pay_rematch_open_rows(
