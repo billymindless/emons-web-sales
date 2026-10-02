@@ -8552,6 +8552,84 @@ def _pcr_bulk_payment_dates(db_filename: str, payment_ids: tuple[int, ...]) -> d
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def _pcr_load_order_payments(db_filename: str, sale_id: int | None) -> list[dict]:
+    """주문(sale_id)의 결제 행. 결제변경 전/후 창용."""
+    if not db_filename or sale_id in (None, ""):
+        return []
+    try:
+        oid = int(sale_id)
+    except (TypeError, ValueError):
+        return []
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return []
+    try:
+        r = (
+            sc.table("app_payments")
+            .select("id, order_id, payment_date, amount, payment_method, card_company, onnuri_approval_code, created_at")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .eq("order_id", oid)
+            .order("id")
+            .execute()
+        )
+        return list(r.data or [])
+    except Exception as e:
+        st.warning(f"주문 결제 조회 실패: {e}")
+        return []
+
+
+def _pcr_pay_approval_and_time(pay: dict) -> tuple[str, str]:
+    """수단별 승인번호·거래시간. (승인표시, HH:MM:SS 또는 '')."""
+    method = str(pay.get("payment_method") or "")
+    cc = str(pay.get("card_company") or "").strip()
+    if cc in ("None", "nan", "none"):
+        cc = ""
+    on = str(pay.get("onnuri_approval_code") or "").strip()
+    if "온누리" in method and "지류" not in method:
+        return on or "-", _onnuri_format_time_display(_onnuri_time_from_code(on))
+    if method == "지역화폐":
+        return cc or "-", _onnuri_format_time_display(_onnuri_time_from_code(cc))
+    if method == "메인페이":
+        return cc or "-", ""
+    if method in ("신용카드", "체크카드"):
+        return on or "-", ""
+    return (on or cc or "-"), ""
+
+
+def _pcr_classify_order_pays(pays: list[dict], orig_pid: int | None) -> tuple[list[dict], list[dict], list[dict]]:
+    """원본 양수 / 원본 상계(음수) / 변경 후 양수."""
+    before: list[dict] = []
+    offsets: list[dict] = []
+    after: list[dict] = []
+    orig_i = None
+    if orig_pid not in (None, ""):
+        try:
+            orig_i = int(orig_pid)
+        except (TypeError, ValueError):
+            orig_i = None
+    for p in pays:
+        try:
+            pid = int(p.get("id"))
+            amt = int(round(float(p.get("amount") or 0)))
+        except (TypeError, ValueError):
+            continue
+        if orig_i is not None and pid == orig_i:
+            before.append(p)
+            continue
+        if orig_i is not None and amt < 0:
+            offsets.append(p)
+            continue
+        if orig_i is not None and amt > 0 and pid > orig_i:
+            after.append(p)
+            continue
+        if orig_i is None and amt > 0:
+            after.append(p)
+        elif orig_i is None and amt < 0:
+            offsets.append(p)
+    return before, offsets, after
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def _pcr_bulk_verify(db_filename: str, payment_ids: tuple[int, ...]) -> dict[int, tuple[bool, str]]:
     """payment_id 리스트의 외부검증 상태를 bulk 조회. (pcr-bulk — N+1 제거)
 
@@ -33354,43 +33432,103 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
         _orig_verified_label = _vctx["original_verified"][1]
         _new_verified_label = _vctx["new_verified"][1]
 
-        def _pcr_render_window(title: str, amount, method, pay_date, onnuri, verify_lines: list[str]) -> None:
-            with st.container(border=True):
-                st.caption(title)
-                st.markdown(f"**{_fmt_amt(amount)}**")
-                st.write(str(method or "-"))
-                extra = f"결제일 {pay_date or '-'}"
-                if onnuri:
-                    extra += f" · {onnuri}"
-                st.caption(extra)
-                for line in (verify_lines or ["❌ 미검증"]):
-                    st.info(line)
+        def _pcr_render_pay_block(pay: dict, match_rows: list[dict], *, fallback_label: str) -> None:
+            try:
+                amt = int(round(float(pay.get("amount") or 0)))
+            except (TypeError, ValueError):
+                amt = 0
+            method = str(pay.get("payment_method") or "-")
+            cc = str(pay.get("card_company") or "").strip()
+            if cc in ("None", "nan", "none"):
+                cc = ""
+            appr, tx_t = _pcr_pay_approval_and_time(pay)
+            pid = pay.get("id")
+            pdate = str(pay.get("payment_date") or "-")[:10]
+            st.markdown(f"**{_fmt_amt(amt)} · {method}**")
+            if method in ("신용카드", "체크카드") and cc:
+                st.caption(f"카드사 {cc}")
+            bits = [f"결제ID {pid}" if pid not in (None, "") else "", f"결제일 {pdate}"]
+            if appr and appr != "-":
+                bits.append(f"승인번호 {appr}")
+            if tx_t:
+                bits.append(f"거래시간 {tx_t}")
+            st.caption(" · ".join(b for b in bits if b))
+            for line in _pcr_format_match_lines(match_rows, verified_fallback=fallback_label):
+                st.info(line)
 
-        _orig_lines = _pcr_format_match_lines(
-            _vctx.get("original_matches") or [], verified_fallback=_orig_verified_label,
+        _order_pays = _pcr_load_order_payments(str(meta.get("db_filename") or ""), meta.get("sale_id"))
+        _before_pays, _offset_pays, _after_pays = _pcr_classify_order_pays(
+            _order_pays, meta.get("payment_id"),
         )
-        _new_lines = _pcr_format_match_lines(
-            _vctx.get("new_matches") or [], verified_fallback=_new_verified_label,
-        )
+        _all_detail_pids: list[int] = []
+        for _p in (*_before_pays, *_offset_pays, *_after_pays):
+            try:
+                _all_detail_pids.append(int(_p.get("id")))
+            except (TypeError, ValueError):
+                continue
+        _match_map = _pcr_bulk_match_details(
+            str(meta.get("db_filename") or ""), tuple(_all_detail_pids),
+        ) if _all_detail_pids else {}
+
         win_l, win_r = st.columns(2)
         with win_l:
-            _pcr_render_window(
-                "결제 전",
-                display_meta.get("original_amount"),
-                display_meta.get("original_method"),
-                _vctx.get("original_date"),
-                display_meta.get("original_onnuri"),
-                _orig_lines,
-            )
+            with st.container(border=True):
+                st.caption("결제 전")
+                if _before_pays:
+                    for _bp in _before_pays:
+                        try:
+                            _bpid = int(_bp.get("id"))
+                        except (TypeError, ValueError):
+                            _bpid = None
+                        _pcr_render_pay_block(
+                            _bp, _match_map.get(_bpid or 0, []),
+                            fallback_label=_orig_verified_label,
+                        )
+                else:
+                    st.markdown(f"**{_fmt_amt(display_meta.get('original_amount'))}**")
+                    st.write(str(display_meta.get("original_method") or "-"))
+                    st.caption(
+                        f"결제일 {_vctx.get('original_date') or '-'}"
+                        + (f" · 승인번호 {display_meta.get('original_onnuri')}" if display_meta.get("original_onnuri") else "")
+                    )
+                    st.info(_orig_verified_label)
+                for _op in _offset_pays:
+                    try:
+                        _oamt = int(round(float(_op.get("amount") or 0)))
+                    except (TypeError, ValueError):
+                        _oamt = 0
+                    st.caption(
+                        f"상계 {_fmt_amt(_oamt)} · {str(_op.get('payment_date') or '-')[:10]}"
+                        + (f" · 결제ID {_op.get('id')}" if _op.get("id") else "")
+                    )
         with win_r:
-            _pcr_render_window(
-                "결제 후",
-                display_meta.get("new_amount"),
-                display_meta.get("new_method"),
-                _vctx.get("new_date"),
-                display_meta.get("new_onnuri"),
-                _new_lines,
-            )
+            with st.container(border=True):
+                st.caption("결제 후 (실제 등록된 결제)")
+                if _after_pays:
+                    for i, _ap in enumerate(_after_pays):
+                        if i:
+                            st.divider()
+                        try:
+                            _apid = int(_ap.get("id"))
+                        except (TypeError, ValueError):
+                            _apid = None
+                        _pcr_render_pay_block(
+                            _ap, _match_map.get(_apid or 0, []),
+                            fallback_label=_new_verified_label,
+                        )
+                else:
+                    st.markdown(f"**{_fmt_amt(display_meta.get('new_amount'))}**")
+                    st.write(str(display_meta.get("new_method") or "-"))
+                    _meta_on = display_meta.get("new_onnuri")
+                    st.caption(
+                        f"결제일 {_vctx.get('new_date') or '-'}"
+                        + (f" · 승인번호 {_meta_on}" if _meta_on else "")
+                    )
+                    if not display_meta.get("new_amount") and not display_meta.get("new_method"):
+                        st.warning("모모에 변경 후 결제 행이 없습니다. 결제변경이 아직 반영되지 않았을 수 있습니다.")
+                    else:
+                        st.info(_new_verified_label)
+                        st.caption("요청 당시 입력값입니다. 실제 결제 행이 아직 없습니다.")
         st.markdown(f"**사유:** {meta.get('reason') or '-'}")
 
         # 부정 방지 경고
