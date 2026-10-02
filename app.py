@@ -2277,6 +2277,22 @@ def _ext_pay_map_columns(df_columns, aliases: dict | None = None) -> dict[str, s
     return out
 
 
+def _ext_pay_map_columns_all(df_columns, aliases: dict | None = None) -> dict[str, list[str]]:
+    """canonical key → 매칭된 실제 컬럼명 리스트(별칭 순서). 폴백 시 사용."""
+    alias_map = aliases or _ONNURI_HEADER_ALIASES
+    normalized = { _ext_pay_norm_header(c): c for c in df_columns }
+    out: dict[str, list[str]] = {}
+    for key, names in alias_map.items():
+        seen: list[str] = []
+        for a in names:
+            hit = normalized.get(_ext_pay_norm_header(a))
+            if hit is not None and hit not in seen:
+                seen.append(hit)
+        if seen:
+            out[key] = seen
+    return out
+
+
 def _ext_pay_digits_only(s) -> str:
     if s is None:
         return ""
@@ -2606,25 +2622,54 @@ def _ext_pay_parse_mainpay_file(uploaded_file) -> tuple[list[dict], str | None]:
         df, {"매입일자", "거래일시", "원거래일", "거래일자", "승인번호", "결제금액", "신용금액", "승인금액"}
     )
     colmap = _ext_pay_map_columns(df.columns, _MAINPAY_HEADER_ALIASES)
+    colmap_all = _ext_pay_map_columns_all(df.columns, _MAINPAY_HEADER_ALIASES)
     if "tx_date" not in colmap or "amount" not in colmap or "approval_code" not in colmap:
         return [], (
             "필수 컬럼(매입일자, 승인번호, 결제금액/신용금액)을 찾을 수 없습니다. "
             f"감지된 컬럼: {list(df.columns)}"
         )
 
+    date_cols = colmap_all.get("tx_date", [colmap["tx_date"]])
+    amount_cols = colmap_all.get("amount", [colmap["amount"]])
+    appr_cols = colmap_all.get("approval_code", [colmap["approval_code"]])
+    time_cols = colmap_all.get("tx_time", [])
+
     out: list[dict] = []
     for _, row in df.iterrows():
-        raw_dt = row.get(colmap["tx_date"])
-        tx_date = _ext_pay_parse_date(raw_dt)
+        # 매입일자가 비면 원거래일·거래일자 순으로 폴백
+        tx_date = None
+        tx_time = None
+        for c in date_cols:
+            tx_date = _ext_pay_parse_date(row.get(c))
+            if tx_date:
+                tx_time = _ext_pay_parse_time(row.get(c))
+                break
         if not tx_date:
             continue
-        tx_time = _ext_pay_parse_time(raw_dt)
-        if not tx_time and "tx_time" in colmap:
-            tx_time = _ext_pay_parse_time(row.get(colmap["tx_time"]))
-        amt = _ext_pay_parse_amount(row.get(colmap["amount"]))
+        if not tx_time:
+            for c in time_cols:
+                tx_time = _ext_pay_parse_time(row.get(c))
+                if tx_time:
+                    break
+        # 금액: 결제금액/신용금액/승인금액 순으로 0 이 아닌 첫 값
+        amt = None
+        for c in amount_cols:
+            cand = _ext_pay_parse_amount(row.get(c))
+            if cand is None:
+                continue
+            if amt is None:
+                amt = cand
+            if cand != 0:
+                amt = cand
+                break
         if amt is None:
             continue
-        appr_digits = re.sub(r"\D", "", str(row.get(colmap["approval_code"]) or ""))
+        # 승인번호: 비어 있으면 거래번호 폴백
+        appr_digits = ""
+        for c in appr_cols:
+            appr_digits = re.sub(r"\D", "", str(row.get(c) or ""))
+            if appr_digits:
+                break
         if not appr_digits:
             continue
         # 모모 입력(8자리)과 맞추기 위해 앞자리 0을 보존한 8자리 승인번호를 사용한다.
@@ -34705,6 +34750,28 @@ def _render_external_pay_admin_section(
                     st.error(perr)
                 elif not parsed and not card_parsed:
                     st.warning(_empty_hint)
+                    # 메인페이: 어떤 컬럼이 매칭됐는지 즉시 보여줘 원인 파악을 돕는다.
+                    if _src_key == "mainpay":
+                        try:
+                            up.seek(0)
+                        except Exception:
+                            pass
+                        try:
+                            _df_dbg, _derr = _ext_pay_read_uploaded_df(up)
+                            if _df_dbg is not None:
+                                _df_dbg = _ext_pay_promote_header_row(
+                                    _df_dbg,
+                                    {"매입일자", "거래일시", "원거래일", "거래일자", "승인번호",
+                                     "결제금액", "신용금액", "승인금액"},
+                                )
+                                _cm_dbg = _ext_pay_map_columns(_df_dbg.columns, _MAINPAY_HEADER_ALIASES)
+                                st.caption(f"감지 컬럼 매핑: {_cm_dbg}")
+                                st.caption(f"행 수: {len(_df_dbg)}")
+                                if len(_df_dbg) > 0:
+                                    _first = _df_dbg.head(3).to_dict(orient="records")
+                                    st.caption(f"상단 3행 샘플: {_first}")
+                        except Exception as _dbg_e:
+                            st.caption(f"디버그 샘플 조회 실패: {_dbg_e}")
                 else:
                     _msg_parts: list[str] = []
                     _upload_err: str | None = None
