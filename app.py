@@ -4293,6 +4293,8 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
     # 결제완료 → 양수 결제, 결제취소 → 음수 상계 결제. 이렇게 하지 않으면 취소 행이 양수 결제를
     # 먼저 가져가고 결제완료 행이 official_only 로 밀리는 문제가 발생한다.
     neg_pays_by_key: dict[tuple, list[dict]] = {}
+    # 승인번호 뒤4 · 절대금액 · 전표날짜. 자동 상계 전표는 취소일에 생기므로 결제 당일과 날짜가 다를 수 있다.
+    neg_by_appr: dict[tuple, list[dict]] = {}
     for _p in pays:
         try:
             _pid = int(_p["id"])
@@ -4311,6 +4313,9 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
             continue
         _pay_date = str(_p.get("payment_date") or "")[:10]
         neg_pays_by_key.setdefault((int(_oid), -_amt, _pay_date), []).append(_p)
+        _appr = _onnuri_last4_from_code(_p.get("onnuri_approval_code"))
+        if _appr:
+            neg_by_appr.setdefault((_appr, -_amt, _pay_date), []).append(_p)
 
     _pair_groups: dict[tuple, dict[str, list]] = {}
     for _r in todo:
@@ -4385,6 +4390,105 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
             "customer_id": _cid,
             "result_code": "matched_ok",
             "note": "공식 취소 · ERP 상계 (취소쌍)",
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        counts["matched_ok"] = counts.get("matched_ok", 0) + 2
+        used_payment_ids.add(_pid_pos)
+        used_payment_ids.add(_pid_neg)
+        for _k, _lst in list(idx.items()):
+            idx[_k] = [x for x in _lst if int(x["id"]) != _pid_pos]
+        _pass1_locked.add(int(_paid_row["id"]))
+        _pass1_locked.add(int(_cancel_row["id"]))
+
+    # 0b 패스: 승인번호(뒤4)와 금액이 같으면 결제완료·결제취소 날짜가 달라도 짝을 맺는다.
+    # 결제완료 날짜 = 양수 전표 날짜, 결제취소 날짜 = 자동 상계(마이너스) 전표 날짜.
+    # 두 전표는 같은 주문이고, 마이너스 전표의 승인번호 뒤4가 공식 행과 같아야 한다.
+    _cross: dict[tuple, dict[str, list]] = {}
+    for _r in todo:
+        try:
+            _rid = int(_r["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if _rid in _pass1_locked:
+            continue
+        _l4 = _r.get("phone_last4") or ""
+        if not _l4:
+            continue
+        try:
+            _abs_amt = abs(int(_r.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        if _abs_amt <= 0:
+            continue
+        _bucket = _cross.setdefault((_l4, _abs_amt), {"paid": [], "cancel": []})
+        if _ext_pay_is_cancel_status(_r.get("tx_status")):
+            _bucket["cancel"].append(_r)
+        else:
+            _bucket["paid"].append(_r)
+
+    for (_last4, _abs_amt), _bucket in _cross.items():
+        if not _bucket["paid"] or not _bucket["cancel"]:
+            continue
+        _found: list[tuple[dict, dict, dict, dict]] = []
+        for _cancel in _bucket["cancel"]:
+            _cdate = str(_cancel.get("tx_date") or "")[:10]
+            _negs = [
+                n for n in neg_by_appr.get((_last4, _abs_amt, _cdate), [])
+                if int(n["id"]) not in used_payment_ids
+            ]
+            if len(_negs) != 1:
+                continue
+            _neg = _negs[0]
+            try:
+                _oid = int(_neg["order_id"])
+            except (TypeError, ValueError):
+                continue
+            for _paid in _bucket["paid"]:
+                if int(_paid["id"]) in _pass1_locked:
+                    continue
+                _pdate = str(_paid.get("tx_date") or "")[:10]
+                _poss = []
+                for _pos in idx.get((_pdate, _last4, _abs_amt), []):
+                    try:
+                        _pid_pos = int(_pos["id"])
+                        _pos_oid = int(_pos["order_id"])
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if _pid_pos in used_payment_ids or _pos_oid != _oid:
+                        continue
+                    if _onnuri_last4_from_code(_pos.get("onnuri_approval_code")) != _last4:
+                        continue
+                    _poss.append(_pos)
+                if len(_poss) == 1:
+                    _found.append((_paid, _cancel, _poss[0], _neg))
+        if len(_found) != 1:
+            continue
+        _paid_row, _cancel_row, _pos_pay, _neg_pay = _found[0]
+        _pid_pos = int(_pos_pay["id"])
+        _pid_neg = int(_neg_pay["id"])
+        _oid = int(_pos_pay["order_id"])
+        _co = _pos_pay["_order"] or {}
+        _cid = int(_co["customer_id"]) if _co.get("customer_id") is not None else None
+        inserts.append({
+            "db_filename": db_filename,
+            "source": "onnuri",
+            "row_id": int(_paid_row["id"]),
+            "payment_id": _pid_pos,
+            "order_id": _oid,
+            "customer_id": _cid,
+            "result_code": "matched_ok",
+            "note": "공식 결제 · ERP 결제 (승인번호 쌍)",
+            "matched_by": (matched_by or "").strip() or None,
+        })
+        inserts.append({
+            "db_filename": db_filename,
+            "source": "onnuri",
+            "row_id": int(_cancel_row["id"]),
+            "payment_id": _pid_neg,
+            "order_id": _oid,
+            "customer_id": _cid,
+            "result_code": "matched_ok",
+            "note": "공식 취소 · ERP 상계 (승인번호 쌍)",
             "matched_by": (matched_by or "").strip() or None,
         })
         counts["matched_ok"] = counts.get("matched_ok", 0) + 2
@@ -6326,6 +6430,52 @@ def _ext_pay_rematch_open_rows(
                 )
         except Exception as e:
             return {}, f"취소-양수 레거시 매칭 정리 실패: {e}"
+
+        # 결제완료가 '모모 취소·온누리 결제'로 잠긴 채 승인번호 쌍을 다시 맺지 못하는 경우를 푼다.
+        # 같은 뒤4·금액의 결제취소 행이 있을 때만 erp_canceled_official_paid 를 지운다.
+        try:
+            def _filt_pair_rows(q):
+                q = q.eq("db_filename", db_filename).eq("source", source)
+                if verify_from is not None:
+                    q = q.gte("tx_date", verify_from.isoformat())
+                return q
+            pair_rows = _ext_pay_select_paged(
+                sc, "app_external_pay_rows",
+                "id, phone_last4, amount, tx_status",
+                _filt_pair_rows, order_col="id",
+            )
+            cancel_keys: set[tuple] = set()
+            paid_ids_by_key: dict[tuple, list[int]] = {}
+            for r in pair_rows:
+                l4 = str(r.get("phone_last4") or "")
+                try:
+                    abs_amt = abs(int(r.get("amount") or 0))
+                except (TypeError, ValueError):
+                    continue
+                if not l4 or abs_amt <= 0 or r.get("id") is None:
+                    continue
+                key = (l4, abs_amt)
+                if _ext_pay_is_cancel_status(r.get("tx_status")):
+                    cancel_keys.add(key)
+                else:
+                    paid_ids_by_key.setdefault(key, []).append(int(r["id"]))
+            release_ids = []
+            for key in cancel_keys:
+                release_ids.extend(paid_ids_by_key.get(key, []))
+            for chunk in (release_ids[i : i + 200] for i in range(0, len(release_ids), 200)):
+                if not chunk:
+                    continue
+                (
+                    sc.table("app_external_pay_matches")
+                    .delete()
+                    .eq("db_filename", db_filename)
+                    .eq("source", source)
+                    .eq("result_code", "erp_canceled_official_paid")
+                    .in_("row_id", chunk)
+                    .execute()
+                )
+        except Exception as e:
+            return {}, f"승인번호 쌍 재매칭 잠금 해제 실패: {e}"
 
     # 미결 매칭 삭제
     try:
