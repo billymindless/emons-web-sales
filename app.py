@@ -2633,6 +2633,25 @@ def _ext_pay_is_cancel_status(status: str | None) -> bool:
     return "취소" in str(status)
 
 
+def _ext_pay_cancel_without_momo(row) -> bool:
+    """공식 취소인데 모모 결제가 연결되지 않은 행.
+
+    온누리처럼 상태값이 결제취소인 경우, 울산페이처럼 금액만 음수인 경우 모두 해당.
+    모모 결제 ID 가 있으면 잔존·상계 건이므로 여기 넣지 않는다.
+    """
+    if _ext_pay_cell_int(row.get("_payment_id")) > 0:
+        return False
+    if str(row.get("결과") or "") == "official_canceled":
+        return True
+    if _ext_pay_is_cancel_status(row.get("공식상태")):
+        return True
+    try:
+        amt = int(str(row.get("공식금액") or "").replace(",", "").strip() or 0)
+    except (TypeError, ValueError):
+        amt = 0
+    return amt < 0
+
+
 def _ext_pay_norm_approval6(v) -> str:
     """울산페이 승인번호 6자리. 앞자리 0 유지. 5자리 이하는 왼쪽에 0을 채움.
     float 43927.0 이 '439270'으로 깨지지 않게 정수부만 사용."""
@@ -33967,8 +33986,7 @@ def _render_external_pay_admin_section(
         except (TypeError, ValueError):
             return 0
     def _official_in_total(row) -> int:
-        # 모모 결제가 없는 공식 취소는 원장 합계에서 뺀다.
-        if str(row.get("결과") or "") == "official_canceled" and _ext_pay_cell_int(row.get("_payment_id")) <= 0:
+        if _ext_pay_cancel_without_momo(row):
             return 0
         return _amt_to_int(row.get("공식금액"))
 
@@ -34026,8 +34044,7 @@ def _render_external_pay_admin_section(
     if "결과" in df_show.columns:
         def _result_text(row) -> str:
             code = str(row.get("결과") or "")
-            has_pay = _ext_pay_cell_int(row.get("_payment_id")) > 0
-            if code == "official_canceled" and not has_pay:
+            if _ext_pay_cancel_without_momo(row):
                 return "공식취소·모모기록없음"
             return _result_map.get(code, code)
 
