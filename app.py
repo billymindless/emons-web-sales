@@ -2686,6 +2686,9 @@ def _ext_pay_norm_approval6(v) -> str:
         s = str(v).replace("\u00a0", " ").replace("\u3000", " ")
         s = s.strip().strip("'\"`")
         s = re.sub(r"\s+", "", s)
+        # 432096-181529 처럼 거래시각이 붙으면 앞 승인번호만 비교한다.
+        if "-" in s:
+            s = s.split("-", 1)[0]
         if re.fullmatch(r"\d+\.0+", s):
             s = s.split(".", 1)[0]
         digits = re.sub(r"\D", "", s)
@@ -9572,7 +9575,7 @@ def _format_time_hhmmss(s) -> str:
     return f"{digits[:2]}:{digits[2:4]}:{digits[4:]}"
 
 
-def _onnuri_time_input(key: str, *, visible: bool, label: str) -> None:
+def _onnuri_time_input(key: str, *, visible: bool, label: str, help_text: str | None = None) -> None:
     if not visible:
         return
     st.text_input(
@@ -9580,7 +9583,7 @@ def _onnuri_time_input(key: str, *, visible: bool, label: str) -> None:
         key=key,
         max_chars=8,
         placeholder="18:15:29",
-        help="디지털 온누리 매출내역의 거래시간입니다. 뒤 4자리·금액·날짜가 겹치면 이 시간으로 구분합니다. 숫자만 입력하면 자동으로 콜론이 삽입됩니다.",
+        help=help_text or "디지털 온누리 매출내역의 거래시간입니다. 뒤 4자리·금액·날짜가 겹치면 이 시간으로 구분합니다. 숫자만 입력하면 자동으로 콜론이 삽입됩니다.",
         on_change=lambda k=key: st.session_state.__setitem__(
             k, _format_time_hhmmss(st.session_state.get(k, ""))
         ),
@@ -9614,11 +9617,14 @@ def _ulsan_approval_store_label(db_fn: str | None) -> str:
 
 def _ulsan_approval_already_used(
     db_filename: str, approval: str, *, exclude_payment_id: int | None = None,
+    tx_time: str | None = None,
 ) -> str | None:
-    """전 매장에서 동일 지역화폐 승인번호(양수 결제)가 있으면 매장명, 없으면 None."""
+    """전 매장에서 동일 지역화폐 승인번호(양수 결제)가 있으면 매장명, 없으면 None.
+    tx_time이 있으면 같은 거래시간만 중복으로 본다."""
     code = _ext_pay_norm_approval6(approval)
     if not code:
         return None
+    want_time = _onnuri_parse_time_input(tx_time) if tx_time else None
     if _supabase_orders_payments_available():
         sc, err = get_supabase_client()
         if err or not sc:
@@ -9645,6 +9651,8 @@ def _ulsan_approval_already_used(
                         continue
                     existing = row.get("card_company")
                     if existing and _ext_pay_approvals_equal(existing, code):
+                        if want_time and _onnuri_time_from_code(existing) != want_time:
+                            continue
                         return _ulsan_approval_store_label(row.get(ORDERS_PAYMENTS_TENANT_COL))
                 if len(rows) < page:
                     break
@@ -9665,10 +9673,95 @@ def _ulsan_approval_already_used(
             if exclude_payment_id is not None and int(rid) == int(exclude_payment_id):
                 continue
             if cc and _ext_pay_approvals_equal(cc, code):
+                if want_time and _onnuri_time_from_code(cc) != want_time:
+                    continue
                 return _ulsan_approval_store_label(db_filename)
         return None
     finally:
         conn.close()
+
+
+_ULSAN_TIME_HELP = "같은 승인번호가 있으면 거래시간 6자리(예: 18:15:29)로 구분합니다. 숫자만 입력하면 콜론이 들어갑니다."
+
+
+def _ulsan_should_ask_time(
+    db_filename: str, approval, *, form_collides: bool = False, exclude_payment_id: int | None = None,
+) -> bool:
+    """같은 6자리 승인번호가 폼 또는 기존 결제에 있으면 거래시간을 받는다."""
+    appr = _ext_pay_norm_approval6(str(approval or "").split("-", 1)[0])
+    if len(appr) != 6:
+        return False
+    if form_collides:
+        return True
+    return _ulsan_approval_already_used(db_filename, appr, exclude_payment_id=exclude_payment_id) is not None
+
+
+def _ulsan_same_form_collides(
+    *, this_index: int, approval, slot_count: int, appr_key_fn, method_key_fn, amt_key_fn=None,
+) -> bool:
+    appr = _ext_pay_norm_approval6(str(approval or "").split("-", 1)[0])
+    if len(appr) != 6:
+        return False
+    for j in range(slot_count):
+        if j == this_index:
+            continue
+        if st.session_state.get(method_key_fn(j)) != "지역화폐":
+            continue
+        if amt_key_fn is not None and _parse_comma_to_int(st.session_state.get(amt_key_fn(j), "0")) <= 0:
+            continue
+        other = _ext_pay_norm_approval6(str(st.session_state.get(appr_key_fn(j), "") or "").split("-", 1)[0])
+        if other == appr:
+            return True
+    return False
+
+
+def _ulsan_compose_code(approval_raw, time_raw, *, require_time: bool) -> tuple[str | None, str | None]:
+    """지역화폐 저장값. 거래시간이 있으면 '432096-181529'."""
+    raw = str(approval_raw or "").strip()
+    embedded = ""
+    if "-" in raw:
+        raw, embedded = raw.split("-", 1)
+    appr = _ext_pay_norm_approval6(raw)
+    if len(appr) != 6:
+        return None, "지역화폐 승인번호 6자리를 정확히 입력하세요."
+    src = str(time_raw or "").strip() or embedded.strip()
+    tx = _onnuri_parse_time_input(src) if src else None
+    if src and not tx:
+        return None, "거래시간은 18:15:29 형식으로 입력하세요."
+    if require_time and not tx:
+        return None, "같은 승인번호가 있어 거래시간(예: 18:15:29)이 필요합니다."
+    if tx:
+        return f"{appr}-{tx}", None
+    return appr, None
+
+
+def _ulsan_resolve_code(
+    db_filename: str, approval_raw, time_raw, *,
+    form_collides: bool = False, exclude_payment_id: int | None = None,
+) -> tuple[str | None, str | None]:
+    """저장할 승인번호와 오류. 승인번호가 겹치면 거래시간이 달라야 한다."""
+    need = _ulsan_should_ask_time(
+        db_filename, approval_raw, form_collides=form_collides, exclude_payment_id=exclude_payment_id,
+    )
+    code, err = _ulsan_compose_code(approval_raw, time_raw, require_time=need)
+    if err or not code:
+        return None, err or "지역화폐 승인번호 6자리를 정확히 입력하세요."
+    tx = _onnuri_time_from_code(code)
+    hit = _ulsan_approval_already_used(
+        db_filename, code, exclude_payment_id=exclude_payment_id, tx_time=tx,
+    )
+    if hit:
+        appr = _ext_pay_norm_approval6(code)
+        if tx:
+            return None, (
+                f"지역화폐 승인번호 {appr} · 거래시간 {_onnuri_format_time_display(tx)} 는 "
+                f"이미 등록된 결제입니다. (매장: {hit})"
+            )
+        return None, (
+            f"지역화폐 승인번호 {appr} 는 이미 등록된 결제입니다. "
+            f"(매장: {hit}) 거래시간(예: 18:15:29)을 입력해 구분해 주세요."
+        )
+    return code, None
 
 
 def _onnuri_ident_already_used(
@@ -33976,6 +34069,24 @@ def _render_approval_edit_dialog_impl(db_filename: str, meta: dict) -> None:
             key=f"appr_dlg_ulsan_{pid}",
             help="숫자 6자리. 앞자리 0 포함.",
         )
+        _ulsan_dlg_time_key = f"appr_dlg_ulsan_time_{pid}"
+        if _ulsan_dlg_time_key not in st.session_state:
+            st.session_state[_ulsan_dlg_time_key] = _onnuri_format_time_display(
+                _onnuri_time_from_code(cur_card_company)
+            )
+        _onnuri_time_input(
+            _ulsan_dlg_time_key,
+            visible=(
+                bool(_onnuri_time_from_code(cur_card_company))
+                or _ulsan_should_ask_time(
+                    db_filename,
+                    st.session_state.get(f"appr_dlg_ulsan_{pid}", _cur_appr6),
+                    exclude_payment_id=pid,
+                )
+            ),
+            label="지역화폐 거래시간 *",
+            help_text=_ULSAN_TIME_HELP,
+        )
     elif _is_card:
         _cur_appr8 = re.sub(r"\D", "", str(cur_card_company or "").strip())
         st.caption(f"현재 값: 승인번호 = `{_cur_appr8 or '-'}` (원본: `{cur_card_company or '-'}`)")
@@ -34047,23 +34158,19 @@ def _render_approval_edit_dialog_impl(db_filename: str, meta: dict) -> None:
             return
         _payload = {"onnuri_approval_code": _new_onnuri_code}
     elif _is_ulsan:
-        _norm = _ext_pay_norm_approval6(_new_card_company_input)
-        if len(_norm) != 6:
-            st.warning("지역화폐 승인번호 6자리를 정확히 입력하세요.")
+        _code, _uerr = _ulsan_resolve_code(
+            db_filename,
+            _new_card_company_input,
+            st.session_state.get(f"appr_dlg_ulsan_time_{pid}", ""),
+            exclude_payment_id=pid,
+        )
+        if _uerr:
+            st.warning(_uerr)
             return
-        if _norm_code(_norm) == _norm_code(cur_card_company):
+        if _norm_code(_code) == _norm_code(cur_card_company):
             st.warning("변경 사항이 없습니다.")
             return
-        _conflict_store = _ulsan_approval_already_used(
-            db_filename, _norm, exclude_payment_id=pid,
-        )
-        if _conflict_store:
-            st.warning(
-                f"지역화폐 승인번호 `{_norm}` 가 이미 다른 결제에 등록되어 있습니다. "
-                f"(매장: {_conflict_store})"
-            )
-            return
-        _payload = {"card_company": _norm}
+        _payload = {"card_company": _code}
     elif _is_card:
         _norm = re.sub(r"\D", "", str(_new_card_company_input or "").strip())
         if len(_norm) != 8:
@@ -35224,18 +35331,21 @@ def _render_ext_pay_quick_approval_fix(
                     continue
                 payload = {"onnuri_approval_code": ident}
             else:
-                norm6 = _ext_pay_norm_approval6(rec.get("새승인번호"))
-                if len(norm6) != 6:
+                _raw_new = rec.get("새승인번호")
+                _new_head = _ext_pay_norm_approval6(str(_raw_new or "").split("-", 1)[0])
+                _new_time = _onnuri_time_from_code(_raw_new) or ""
+                _cur_time = _onnuri_time_from_code(cur_card) or ""
+                if len(_new_head) != 6:
                     skipped.append(f"{label}: 승인번호 6자리 아님")
                     continue
-                if norm6 == _ext_pay_norm_approval6(cur_card):
+                if _new_head == _ext_pay_norm_approval6(cur_card) and _new_time == _cur_time:
                     skipped.append(f"{label}: 변경 없음")
                     continue
-                conflict = _ulsan_approval_already_used(sel_db, norm6, exclude_payment_id=pid)
-                if conflict:
-                    skipped.append(f"{label}: 승인번호 중복 ({conflict})")
+                _code, _uerr = _ulsan_resolve_code(sel_db, _raw_new, None, exclude_payment_id=pid)
+                if _uerr:
+                    skipped.append(f"{label}: {_uerr}")
                     continue
-                payload = {"card_company": norm6}
+                payload = {"card_company": _code}
             if not _update_payment_supabase(sel_db, pid, payload):
                 failed.append(f"{label}: 저장 실패")
                 continue
@@ -39223,6 +39333,21 @@ def render_new_sales():
             _ak = amt_key
             st.text_input(f"금액 #{i+1} *", key=_ak, on_change=lambda k=_ak: st.session_state.__setitem__(k, _format_number_comma(st.session_state.get(k, ""))))
         total_payment_int += _parse_comma_to_int(st.session_state.get(amt_key, "0"))
+        if method == "지역화폐":
+            _u_hit = _ulsan_same_form_collides(
+                this_index=i,
+                approval=st.session_state.get(card_key, ""),
+                slot_count=slot_count,
+                appr_key_fn=lambda j: f"pay_card_{j}",
+                method_key_fn=lambda j: f"pay_method_{j}",
+                amt_key_fn=lambda j: f"pay_amt_{j}",
+            )
+            _onnuri_time_input(
+                f"pay_ulsan_time_{i}",
+                visible=_ulsan_should_ask_time(db_filename, st.session_state.get(card_key, ""), form_collides=_u_hit),
+                label=f"지역화폐 거래시간 #{i+1} *",
+                help_text=_ULSAN_TIME_HELP,
+            )
         # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리. 온누리지류는 불필요.
         is_onnuri = method and ("온누리" in str(method)) and ("지류" not in str(method))
         last4_key = f"pay_onnuri_last4_{i}"
@@ -39428,6 +39553,7 @@ def render_new_sales():
         # 온누리(전자): 검증파일 구매자전화번호 뒤 4자리 필수. 겹치면 거래시간 필수.
         _pay_date_dup = order_date.isoformat() if hasattr(order_date, "isoformat") else str(order_date)
         _new_onnuri_codes: dict[int, str] = {}
+        _new_ulsan_codes: dict[int, str] = {}
         for i in range(slot_count):
             method = st.session_state.get(f"pay_method_{i}", "")
             amt = _parse_comma_to_int(st.session_state.get(f"pay_amt_{i}", "0"))
@@ -39454,7 +39580,7 @@ def render_new_sales():
                 st.stop()
             _new_onnuri_codes[i] = _code or last4_digits
         # 같은 폼·기존 DB 의 지역화폐 승인번호 / 온누리 식별자 중복 차단
-        _seen_ulsan: set[str] = set()
+        _seen_ulsan: set[tuple[str, str]] = set()
         _seen_onnuri: set[tuple[str, int, str]] = set()
         for i in range(slot_count):
             method = st.session_state.get(f"pay_method_{i}", "")
@@ -39462,18 +39588,30 @@ def render_new_sales():
             if amt <= 0 or not method:
                 continue
             if method == "지역화폐":
-                _appr = re.sub(r"\D", "", (st.session_state.get(f"pay_card_{i}", "") or "").strip())
-                if _appr in _seen_ulsan:
-                    st.error(f"결제 #{i+1}: 같은 등록 화면에 지역화폐 승인번호 {_appr} 가 중복됩니다.")
+                _raw_appr = st.session_state.get(f"pay_card_{i}", "")
+                _form_hit = _ulsan_same_form_collides(
+                    this_index=i, approval=_raw_appr, slot_count=slot_count,
+                    appr_key_fn=lambda j: f"pay_card_{j}",
+                    method_key_fn=lambda j: f"pay_method_{j}",
+                    amt_key_fn=lambda j: f"pay_amt_{j}",
+                )
+                _code, _uerr = _ulsan_resolve_code(
+                    db_filename, _raw_appr, st.session_state.get(f"pay_ulsan_time_{i}", ""),
+                    form_collides=_form_hit,
+                )
+                if _uerr:
+                    st.error(f"결제 #{i+1}: {_uerr}")
                     st.stop()
-                _ulsan_at = _ulsan_approval_already_used(db_filename, _appr)
-                if _ulsan_at:
+                _ukey = (_ext_pay_norm_approval6(_code), _onnuri_time_from_code(_code) or "")
+                if _ukey in _seen_ulsan:
                     st.error(
-                        f"결제 #{i+1}: 지역화폐 승인번호 {_appr} 는 이미 등록된 결제입니다. "
-                        f"(매장: {_ulsan_at}) 전 매장에서 같은 승인번호를 다시 입력할 수 없습니다."
+                        f"결제 #{i+1}: 같은 등록 화면에 지역화폐 승인번호 {_ukey[0]}"
+                        + (f" · 거래시간 {_onnuri_format_time_display(_ukey[1])}" if _ukey[1] else "")
+                        + " 가 중복됩니다. 거래시간을 다르게 입력하세요."
                     )
                     st.stop()
-                _seen_ulsan.add(_appr)
+                _seen_ulsan.add(_ukey)
+                _new_ulsan_codes[i] = _code
             elif "온누리" in str(method) and "지류" not in str(method):
                 _code = _new_onnuri_codes.get(i) or ""
                 _last4 = _onnuri_last4_from_code(_code)
@@ -39558,6 +39696,8 @@ def render_new_sales():
                     continue
                 method = st.session_state.get(f"pay_method_{i}", "")
                 card_company = st.session_state.get(f"pay_card_{i}", None) if method in (*_CARD_WITH_COMPANY, "메인페이", "지역화폐") else None
+                if method == "지역화폐":
+                    card_company = _new_ulsan_codes.get(i) or card_company
                 fee = _payment_fee_amount(method, amt)
                 total_fees += fee
                 total_paid_initial += amt
@@ -39701,6 +39841,8 @@ def render_new_sales():
                         continue
                     method = st.session_state.get(f"pay_method_{i}", "")
                     card_company = st.session_state.get(f"pay_card_{i}", None) if method in (*_CARD_WITH_COMPANY, "메인페이", "지역화폐") else None
+                    if method == "지역화폐":
+                        card_company = _new_ulsan_codes.get(i) or card_company
                     fee = _payment_fee_amount(method, amt)
                     total_fees += fee
                     total_paid_initial += amt
@@ -39899,7 +40041,13 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
     elif split_method == "메인페이":
         split_card = st.text_input("메인페이 승인번호 8자리", key=f"{key_prefix}_card", max_chars=8)
     elif split_method == "지역화폐":
-        split_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card")
+        split_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card", max_chars=6)
+        _onnuri_time_input(
+            f"{key_prefix}_ulsan_time",
+            visible=_ulsan_should_ask_time(db_filename, st.session_state.get(f"{key_prefix}_card", "")),
+            label="지역화폐 거래시간 *",
+            help_text=_ULSAN_TIME_HELP,
+        )
     else:
         split_card = None
         st.session_state.pop(f"{key_prefix}_card", None)
@@ -40076,14 +40224,13 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                 )
                 return
         if split_method == "지역화폐" and actual_paid_int > 0:
-            _appr = re.sub(r"\D", "", str(split_card or ""))
-            _ulsan_at = _ulsan_approval_already_used(db_filename, _appr)
-            if _ulsan_at:
-                st.error(
-                    f"지역화폐 승인번호 {_appr} 는 이미 등록된 결제입니다. "
-                    f"(매장: {_ulsan_at}) 전 매장에서 같은 승인번호를 다시 입력할 수 없습니다."
-                )
+            _code, _uerr = _ulsan_resolve_code(
+                db_filename, split_card, st.session_state.get(f"{key_prefix}_ulsan_time", ""),
+            )
+            if _uerr:
+                st.error(_uerr)
                 return
+            split_card = _code
 
         errors = []
         success_count = 0
@@ -40242,7 +40389,7 @@ def _customer_balance_payment_ui(
                 st.text_input(f"메인페이 승인번호 8자리 #{i+1} *", key=c_key, max_chars=8)
                 card_company = st.session_state.get(c_key)
             elif method == "지역화폐":
-                st.text_input(f"지역화폐 승인번호 #{i+1} *", key=c_key)
+                st.text_input(f"지역화폐 승인번호 #{i+1} *", key=c_key, max_chars=6)
                 card_company = st.session_state.get(c_key)
             else:
                 card_company = None
@@ -40256,6 +40403,23 @@ def _customer_balance_payment_ui(
             )
         amt_int = _parse_comma_to_int(st.session_state.get(a_key, "0"))
         total_amt_int += amt_int
+        if method == "지역화폐":
+            _u_hit = _ulsan_same_form_collides(
+                this_index=i,
+                approval=st.session_state.get(c_key, ""),
+                slot_count=slot_count,
+                appr_key_fn=lambda j, _sk=_slot_key: _sk("card", j),
+                method_key_fn=lambda j, _sk=_slot_key: _sk("method", j),
+                amt_key_fn=lambda j, _sk=_slot_key: _sk("amt", j),
+            )
+            _onnuri_time_input(
+                _slot_key("ulsan_time", i),
+                visible=_ulsan_should_ask_time(
+                    db_filename, st.session_state.get(c_key, ""), form_collides=_u_hit,
+                ),
+                label=f"지역화폐 거래시간 #{i+1} *",
+                help_text=_ULSAN_TIME_HELP,
+            )
 
         # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리
         is_onnuri = method and ("온누리" in str(method)) and ("지류" not in str(method))
@@ -40384,25 +40548,37 @@ def _customer_balance_payment_ui(
             return
         onnuri_codes[s["index"]] = _code
 
-    _seen_ulsan_add: set[str] = set()
+    _seen_ulsan_add: set[tuple[str, str]] = set()
     _seen_onnuri_add: set[tuple[str, int, str]] = set()
     for s in active:
         idx1 = s["index"] + 1
         method = s["method"] or ""
         amt = int(s["amount"])
         if method == "지역화폐":
-            _appr = re.sub(r"\D", "", str(s.get("card_company") or ""))
-            if _appr in _seen_ulsan_add:
-                st.error(f"결제 #{idx1}: 같은 화면에 지역화폐 승인번호 {_appr} 가 중복됩니다.")
+            _raw_appr = s.get("card_company")
+            _form_hit = _ulsan_same_form_collides(
+                this_index=s["index"], approval=_raw_appr, slot_count=slot_count,
+                appr_key_fn=lambda j, _sk=_slot_key: _sk("card", j),
+                method_key_fn=lambda j, _sk=_slot_key: _sk("method", j),
+                amt_key_fn=lambda j, _sk=_slot_key: _sk("amt", j),
+            )
+            _code, _uerr = _ulsan_resolve_code(
+                db_filename, _raw_appr, st.session_state.get(_slot_key("ulsan_time", s["index"]), ""),
+                form_collides=_form_hit,
+            )
+            if _uerr:
+                st.error(f"결제 #{idx1}: {_uerr}")
                 return
-            _ulsan_at = _ulsan_approval_already_used(db_filename, _appr)
-            if _ulsan_at:
+            _ukey = (_ext_pay_norm_approval6(_code), _onnuri_time_from_code(_code) or "")
+            if _ukey in _seen_ulsan_add:
                 st.error(
-                    f"결제 #{idx1}: 지역화폐 승인번호 {_appr} 는 이미 등록된 결제입니다. "
-                    f"(매장: {_ulsan_at}) 전 매장에서 같은 승인번호를 다시 입력할 수 없습니다."
+                    f"결제 #{idx1}: 같은 화면에 지역화폐 승인번호 {_ukey[0]}"
+                    + (f" · 거래시간 {_onnuri_format_time_display(_ukey[1])}" if _ukey[1] else "")
+                    + " 가 중복됩니다. 거래시간을 다르게 입력하세요."
                 )
                 return
-            _seen_ulsan_add.add(_appr)
+            _seen_ulsan_add.add(_ukey)
+            s["card_company"] = _code
         elif s.get("is_onnuri"):
             _code = onnuri_codes.get(s["index"]) or ""
             _last4 = _onnuri_last4_from_code(_code)
@@ -43285,11 +43461,31 @@ def render_customer_balance():
                                                             )
                                                         elif new_method == "지역화폐":
                                                             _cur_appr = prow.get("card_company") or ""
+                                                            _pay_ulsan_key = f"pay_edit_card_{prow['id']}"
+                                                            _pay_ulsan_time_key = f"pay_edit_ulsan_time_{prow['id']}"
+                                                            if _pay_ulsan_key not in st.session_state:
+                                                                st.session_state[_pay_ulsan_key] = _ext_pay_norm_approval6(_cur_appr)
+                                                            if _pay_ulsan_time_key not in st.session_state:
+                                                                st.session_state[_pay_ulsan_time_key] = _onnuri_format_time_display(
+                                                                    _onnuri_time_from_code(_cur_appr)
+                                                                )
                                                             new_card_company = st.text_input(
                                                                 "지역화폐 승인번호 6자리 *",
-                                                                value=_cur_appr,
                                                                 max_chars=6,
-                                                                key=f"pay_edit_card_{prow['id']}",
+                                                                key=_pay_ulsan_key,
+                                                            )
+                                                            _onnuri_time_input(
+                                                                _pay_ulsan_time_key,
+                                                                visible=(
+                                                                    bool(_onnuri_time_from_code(_cur_appr))
+                                                                    or _ulsan_should_ask_time(
+                                                                        db_filename,
+                                                                        st.session_state.get(_pay_ulsan_key, ""),
+                                                                        exclude_payment_id=int(prow["id"]),
+                                                                    )
+                                                                ),
+                                                                label="지역화폐 거래시간 *",
+                                                                help_text=_ULSAN_TIME_HELP,
                                                             )
                                                         elif "온누리" in str(new_method) and "지류" not in str(new_method):
                                                             _cur_onnuri = prow.get("onnuri_approval_code") or ""
@@ -43428,6 +43624,16 @@ def render_customer_balance():
                                                                         _onnuri_edit_err = (
                                                                             "이미 같은 온누리 뒤 4자리·금액·날짜·거래시간 결제가 있습니다."
                                                                         )
+                                                            _ulsan_edit_err = None
+                                                            if new_method == "지역화폐":
+                                                                _ucode, _ulsan_edit_err = _ulsan_resolve_code(
+                                                                    db_filename,
+                                                                    st.session_state.get(f"pay_edit_card_{prow['id']}", ""),
+                                                                    st.session_state.get(f"pay_edit_ulsan_time_{prow['id']}", ""),
+                                                                    exclude_payment_id=int(prow["id"]),
+                                                                )
+                                                                if not _ulsan_edit_err:
+                                                                    new_card_company = _ucode
                                                             if not del_reason or len(del_reason.strip()) < 5:
                                                                 st.warning("사유를 5자 이상 입력하세요.")
                                                             elif new_method in _CARD_WITH_COMPANY and not (new_card_company or "").strip():
@@ -43436,17 +43642,8 @@ def render_customer_balance():
                                                                 st.warning(f"{new_method} 승인번호 8자리를 정확히 입력하세요.")
                                                             elif new_method == "메인페이" and len(re.sub(r"\D", "", (new_card_company or ""))) != 8:
                                                                 st.warning("메인페이 승인번호 8자리를 정확히 입력하세요.")
-                                                            elif new_method == "지역화폐" and len(re.sub(r"\D", "", (new_card_company or "").strip())) != 6:
-                                                                st.warning("지역화폐 승인번호 6자리를 정확히 입력하세요.")
-                                                            elif new_method == "지역화폐" and new_amount > 0 and (
-                                                                _ulsan_at := _ulsan_approval_already_used(
-                                                                    db_filename, new_card_company, exclude_payment_id=int(prow["id"]),
-                                                                )
-                                                            ):
-                                                                st.warning(
-                                                                    f"지역화폐 승인번호가 이미 다른 결제에 등록되어 있습니다. "
-                                                                    f"(매장: {_ulsan_at})"
-                                                                )
+                                                            elif new_method == "지역화폐" and _ulsan_edit_err:
+                                                                st.warning(_ulsan_edit_err)
                                                             elif _onnuri_edit_err:
                                                                 st.warning(_onnuri_edit_err)
                                                             else:
@@ -44134,8 +44331,29 @@ def render_customer_balance():
                                                     new_card_op = st.text_input("메인페이 승인번호 8자리", value=prow.get("card_company") or "", max_chars=8, key=f"op_edit_card_{prow['id']}")
                                                     new_card_appr_op = None
                                                 elif new_method_op == "지역화폐":
-                                                    new_card_op = st.text_input("지역화폐 승인번호", value=prow.get("card_company") or "", key=f"op_edit_card_{prow['id']}")
+                                                    _op_ulsan_key = f"op_edit_card_{prow['id']}"
+                                                    _op_ulsan_time_key = f"op_edit_ulsan_time_{prow['id']}"
+                                                    if _op_ulsan_key not in st.session_state:
+                                                        st.session_state[_op_ulsan_key] = _ext_pay_norm_approval6(prow.get("card_company"))
+                                                    if _op_ulsan_time_key not in st.session_state:
+                                                        st.session_state[_op_ulsan_time_key] = _onnuri_format_time_display(
+                                                            _onnuri_time_from_code(prow.get("card_company"))
+                                                        )
+                                                    new_card_op = st.text_input("지역화폐 승인번호", max_chars=6, key=_op_ulsan_key)
                                                     new_card_appr_op = None
+                                                    _onnuri_time_input(
+                                                        _op_ulsan_time_key,
+                                                        visible=(
+                                                            bool(_onnuri_time_from_code(prow.get("card_company")))
+                                                            or _ulsan_should_ask_time(
+                                                                db_filename,
+                                                                st.session_state.get(_op_ulsan_key, ""),
+                                                                exclude_payment_id=int(prow["id"]),
+                                                            )
+                                                        ),
+                                                        label="지역화폐 거래시간 *",
+                                                        help_text=_ULSAN_TIME_HELP,
+                                                    )
                                                 else:
                                                     new_card_op = None
                                                     new_card_appr_op = None
@@ -44192,6 +44410,17 @@ def render_customer_balance():
                                                     elif new_method_op in _CARD_WITH_COMPANY and len(re.sub(r"\D", "", (new_card_appr_op or "").strip())) != 8:
                                                         st.warning(f"{new_method_op} 승인번호 8자리를 정확히 입력하세요.")
                                                     else:
+                                                        if new_method_op == "지역화폐" and new_amount_op > 0:
+                                                            _ucode, _uerr = _ulsan_resolve_code(
+                                                                db_filename,
+                                                                new_card_op,
+                                                                st.session_state.get(f"op_edit_ulsan_time_{prow['id']}", ""),
+                                                                exclude_payment_id=int(prow["id"]),
+                                                            )
+                                                            if _uerr:
+                                                                st.warning(_uerr)
+                                                                st.stop()
+                                                            new_card_op = _ucode
                                                         _old_amt_op = _prow_amt
                                                         _old_fee_op = float(prow.get("fee_amount") or 0)
                                                         _new_fee_op = _payment_fee_amount(new_method_op, new_amount_op) if new_amount_op > 0 else 0.0
