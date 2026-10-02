@@ -8295,6 +8295,104 @@ def _pcr_display_meta_from_history(meta: dict) -> tuple[dict, str | None]:
     return display, note
 
 
+def _pcr_guess_customer_name(title: str) -> str:
+    t = str(title or "").strip()
+    m = re.match(r"^\[결제변경 검증\]\s*(.+?)\s*·", t)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"^([가-힣]{2,5})", t)
+    return m.group(1) if m else ""
+
+
+def _pcr_task_looks_like_payment_change(task: dict | None) -> bool:
+    """일반 업무로 올라온 결제변경·취소 건도 전/후 창을 연다."""
+    if not isinstance(task, dict):
+        return False
+    blob = f"{task.get('title') or ''} {task.get('description') or ''}"
+    keys = ("결제변경", "결제 변경", "취소 후", "취소후", "환불", "카드취소", "입금")
+    return any(k in blob for k in keys)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_latest_payment_history_by_customer(db_filename: str, customer_name: str) -> dict | None:
+    """고객명으로 최신 결제변경/취소 이력 1건."""
+    if not db_filename or not customer_name:
+        return None
+    try:
+        if not _supabase_orders_payments_available():
+            return None
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return None
+        r = (
+            sc.table("app_payment_history")
+            .select("sale_id, action_type, old_payment_data, new_payment_data, changed_at, reason, customer_name")
+            .eq("db_filename", db_filename)
+            .ilike("customer_name", f"%{customer_name}%")
+            .in_("action_type", ["결제변경", "결제취소"])
+            .order("changed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        old_blob = _dashboard_parse_ph_payload(row.get("old_payment_data"))
+        new_blob = _dashboard_parse_ph_payload(row.get("new_payment_data"))
+        return {
+            "sale_id": row.get("sale_id"),
+            "action_type": row.get("action_type"),
+            "changed_at": row.get("changed_at"),
+            "reason": row.get("reason"),
+            "customer_name": row.get("customer_name"),
+            "original": _ph_blob_to_pcr_fields(old_blob),
+            "new": _ph_blob_to_pcr_fields(new_blob),
+        }
+    except Exception as e:
+        st.warning(f"결제변경 이력 조회 실패: {e}")
+        return None
+
+
+def _pcr_fallback_meta_from_task(task: dict) -> dict | None:
+    """PCR 메타가 없는 일반 업무에서 결제 전/후 창용 메타를 만든다."""
+    if not isinstance(task, dict):
+        return None
+    db_filename = str(task.get("db_filename") or "")
+    title = str(task.get("title") or "")
+    desc = str(task.get("description") or "")
+    name = _pcr_guess_customer_name(title)
+    hist = _load_latest_payment_history_by_customer(db_filename, name) if db_filename and name else None
+    orig = (hist or {}).get("original") or {}
+    new = (hist or {}).get("new") or {}
+    if not orig and not new:
+        amts = [int(x.replace(",", "")) for x in re.findall(r"\d{1,3}(?:,\d{3})+|\d{6,}", f"{title} {desc}")]
+        methods = re.findall(r"(신용카드|체크카드|신한카드|현대카드|국민카드|온누리|메인페이|지역화폐|계좌이체|현금)", f"{title} {desc}")
+        if not amts:
+            return None
+        orig = {"amount": amts[0], "method": (methods[0] if methods else ""), "onnuri": "", "payment_id": None}
+        if len(amts) > 1:
+            new = {"amount": amts[1], "method": (methods[1] if len(methods) > 1 else "입금"), "onnuri": "", "payment_id": None}
+    if not orig and not new:
+        return None
+    return {
+        "task_id": task.get("id"),
+        "db_filename": db_filename,
+        "sale_id": (hist or {}).get("sale_id"),
+        "payment_id": orig.get("payment_id"),
+        "customer_name": name or (hist or {}).get("customer_name"),
+        "change_type": "method_change",
+        "original_amount": orig.get("amount"),
+        "original_method": orig.get("method"),
+        "original_onnuri": orig.get("onnuri"),
+        "new_amount": new.get("amount"),
+        "new_method": new.get("method"),
+        "new_onnuri": new.get("onnuri"),
+        "reason": (hist or {}).get("reason") or desc.strip()[:200] or None,
+        "_fallback": True,
+    }
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _pcr_check_external_verification(db_filename: str, payment_id: int | None) -> tuple[bool, str]:
     """payment_id 가 외부 결제 파일(온누리/지역화폐/카드/메인페이) 업로드와 매칭되었는지 확인.
@@ -33202,19 +33300,21 @@ def _render_task_card(task: dict, by_parent: dict, assignees_map: dict,
 
 
 def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_creator: bool,
-                                        task_type: str | None = None):
-    """결제변경 검증 태스크면 원본/변경 메타 + 검증 상태 + 완료 결재 버튼을 표시.
-    메타가 없으면(일반 업무) 아무것도 그리지 않음.
-
-    성능: task_type 이 결제변경 태스크 유형이 아니면 DB 조회 전에 즉시 리턴한다.
-    (Phase B-2 — 태스크 카드 다수 렌더 시 무조건 발생하던 load_payment_change_meta 쿼리 제거)
+                                        task_type: str | None = None, task: dict | None = None):
+    """결제변경 전/후 창 + 원장 검증 결과를 표시.
+    PCR 메타가 없어도 제목/이력이 결제변경·취소면 창을 연다.
     """
     import task_board as _tb  # noqa: WPS433
 
-    if task_type is not None and task_type != _tb.PAYMENT_CHANGE_TASK_TYPE:
+    is_pcr_type = task_type == _tb.PAYMENT_CHANGE_TASK_TYPE
+    looks_like = _pcr_task_looks_like_payment_change(task)
+    # task_type=general 이어도 결제변경 글이면 메타를 찾고, 없으면 이력으로 창을 만든다.
+    if task_type is not None and not is_pcr_type and not looks_like:
         return
 
     meta = _tb.load_payment_change_meta(tid)
+    if not meta and (is_pcr_type or looks_like or task_type is None):
+        meta = _pcr_fallback_meta_from_task(task or {"id": tid})
     if not meta:
         return
 
@@ -33254,24 +33354,17 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
         _orig_verified_label = _vctx["original_verified"][1]
         _new_verified_label = _vctx["new_verified"][1]
 
-        def _pcr_window_html(title: str, amount, method, pay_date, onnuri, verify_lines: list[str]) -> str:
-            bits = [
-                f"<div style='font-size:0.78rem;font-weight:700;color:#1264A3;margin-bottom:6px;'>{html.escape(title)}</div>",
-                f"<div style='font-size:1.05rem;font-weight:700;'>{html.escape(_fmt_amt(amount))}</div>",
-                f"<div>{html.escape(str(method or '-'))}</div>",
-                f"<div style='color:#616061;font-size:0.88rem;'>결제일 {html.escape(str(pay_date or '-'))}"
-                + (f" · {html.escape(str(onnuri))}" if onnuri else "")
-                + "</div>",
-            ]
-            for line in (verify_lines or ["❌ 미검증"]):
-                bits.append(
-                    f"<div style='margin-top:8px;padding:6px 8px;border-radius:6px;"
-                    f"background:#F3F4F6;font-size:0.86rem;'>{html.escape(line)}</div>"
-                )
-            return (
-                "<div style='background:#E8F4FD;border:1px solid #B8D4EE;border-radius:8px;"
-                f"padding:14px 16px;min-height:160px;line-height:1.55;'>{''.join(bits)}</div>"
-            )
+        def _pcr_render_window(title: str, amount, method, pay_date, onnuri, verify_lines: list[str]) -> None:
+            with st.container(border=True):
+                st.caption(title)
+                st.markdown(f"**{_fmt_amt(amount)}**")
+                st.write(str(method or "-"))
+                extra = f"결제일 {pay_date or '-'}"
+                if onnuri:
+                    extra += f" · {onnuri}"
+                st.caption(extra)
+                for line in (verify_lines or ["❌ 미검증"]):
+                    st.info(line)
 
         _orig_lines = _pcr_format_match_lines(
             _vctx.get("original_matches") or [], verified_fallback=_orig_verified_label,
@@ -33281,28 +33374,22 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
         )
         win_l, win_r = st.columns(2)
         with win_l:
-            st.markdown(
-                _pcr_window_html(
-                    "결제 전",
-                    display_meta.get("original_amount"),
-                    display_meta.get("original_method"),
-                    _vctx.get("original_date"),
-                    display_meta.get("original_onnuri"),
-                    _orig_lines,
-                ),
-                unsafe_allow_html=True,
+            _pcr_render_window(
+                "결제 전",
+                display_meta.get("original_amount"),
+                display_meta.get("original_method"),
+                _vctx.get("original_date"),
+                display_meta.get("original_onnuri"),
+                _orig_lines,
             )
         with win_r:
-            st.markdown(
-                _pcr_window_html(
-                    "결제 후",
-                    display_meta.get("new_amount"),
-                    display_meta.get("new_method"),
-                    _vctx.get("new_date"),
-                    display_meta.get("new_onnuri"),
-                    _new_lines,
-                ),
-                unsafe_allow_html=True,
+            _pcr_render_window(
+                "결제 후",
+                display_meta.get("new_amount"),
+                display_meta.get("new_method"),
+                _vctx.get("new_date"),
+                display_meta.get("new_onnuri"),
+                _new_lines,
             )
         st.markdown(f"**사유:** {meta.get('reason') or '-'}")
 
@@ -33396,8 +33483,11 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     is_confidential = task.get("category") == _tb.CONFIDENTIAL_CATEGORY
 
     # 결제변경 검증 전용 카드 (메타가 있으면 표시)
-    _render_payment_change_verify_panel(tid, me_uname, role, is_creator,
-                                        task_type=task.get("task_type"))
+    _render_payment_change_verify_panel(
+        tid, me_uname, role, is_creator,
+        task_type=task.get("task_type"),
+        task=task,
+    )
 
     # 상세 필드 편집
     with st.form(f"task_edit_{tid}"):

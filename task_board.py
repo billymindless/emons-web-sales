@@ -133,7 +133,8 @@ def load_tasks_cached(
     _cols_full = (
         "id, parent_task_id, title, description, status, priority, "
         "start_date, due_date, created_by, store_name, db_filename, "
-        "scope, category, tags, is_pinned, created_at, updated_at, closed_at"
+        "scope, category, tags, is_pinned, task_type, verify_status, "
+        "created_at, updated_at, closed_at"
     )
     _cols_no_scope = (
         "id, parent_task_id, title, description, status, priority, "
@@ -151,7 +152,7 @@ def load_tasks_cached(
             rows = _run(cols)
             break
         except Exception as e:
-            if any(c in str(e) for c in ("scope", "category", "tags", "is_pinned")):
+            if any(c in str(e) for c in ("scope", "category", "tags", "is_pinned", "task_type", "verify_status")):
                 continue
             return []
 
