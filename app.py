@@ -8309,7 +8309,7 @@ def _pcr_check_external_verification(db_filename: str, payment_id: int | None) -
     sc, err = get_supabase_client()
     if err or not sc:
         return False, ""
-    _positive = ("matched", "manual_matched", "split_matched")
+    _positive = ("matched_ok", "matched", "manual_matched", "split_matched")
     try:
         r = (
             sc.table("app_external_pay_matches")
@@ -8479,7 +8479,7 @@ def _pcr_bulk_verify(db_filename: str, payment_ids: tuple[int, ...]) -> dict[int
     sc, err = get_supabase_client()
     if err or not sc:
         return out
-    _positive = ("matched", "manual_matched", "split_matched")
+    _positive = ("matched_ok", "matched", "manual_matched", "split_matched")
     try:
         r1 = (
             sc.table("app_external_pay_matches")
@@ -8525,6 +8525,69 @@ def _pcr_bulk_verify(db_filename: str, payment_ids: tuple[int, ...]) -> dict[int
     return out
 
 
+def _pcr_bulk_match_details(
+    db_filename: str, payment_ids: tuple[int, ...],
+) -> dict[int, list[dict]]:
+    """payment_id → 외부원장 매칭 행 목록 (result_code·note 포함). 업로드 검증 표시용."""
+    out: dict[int, list[dict]] = {}
+    if not db_filename or not payment_ids:
+        return out
+    pids: list[int] = []
+    for p in payment_ids:
+        try:
+            if p:
+                pids.append(int(p))
+        except (TypeError, ValueError):
+            continue
+    if not pids:
+        return out
+    for p in pids:
+        out[p] = []
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return out
+    try:
+        r = (
+            sc.table("app_external_pay_matches")
+            .select("source, result_code, note, payment_id")
+            .eq("db_filename", db_filename)
+            .in_("payment_id", pids)
+            .execute()
+        )
+        for row in (r.data or []):
+            try:
+                pid_i = int(row.get("payment_id"))
+            except (TypeError, ValueError):
+                continue
+            if pid_i not in out:
+                continue
+            code = str(row.get("result_code") or "")
+            src = str(row.get("source") or "")
+            out[pid_i].append({
+                "source": src,
+                "result_code": code,
+                "note": str(row.get("note") or "").strip(),
+                "label": _ext_pay_result_label(code, src, has_payment=True),
+            })
+    except Exception as e:
+        st.warning(f"외부 검증 결과 조회 실패: {e}")
+    return out
+
+
+def _pcr_format_match_lines(rows: list[dict] | None, *, verified_fallback: str) -> list[str]:
+    """창에 넣을 검증 결과 줄."""
+    if not rows:
+        return [verified_fallback]
+    lines: list[str] = []
+    for m in rows:
+        src = _ext_pay_src_label(m.get("source") or "")
+        label = m.get("label") or m.get("result_code") or "-"
+        note = m.get("note") or ""
+        head = f"{label} ({src})" if src else str(label)
+        lines.append(f"{head} · {note}" if note else head)
+    return lines
+
+
 def _pcr_build_verify_context(meta: dict) -> dict:
     """결제변경 검증 표에 추가로 보여줄 원본/변경 결제의 결제일자·외부검증 상태.
 
@@ -8546,6 +8609,9 @@ def _pcr_build_verify_context_impl(meta: dict) -> dict:
         "new_date": "-",
         "original_verified": (False, "❌ 미검증"),
         "new_verified": (False, "❌ 미검증"),
+        "original_matches": [],
+        "new_matches": [],
+        "new_pids": [],
     }
     if not isinstance(meta, dict):
         return out
@@ -8579,13 +8645,22 @@ def _pcr_build_verify_context_impl(meta: dict) -> dict:
     _pids_tuple = tuple(_all_pids)
     _dates_map = _pcr_bulk_payment_dates(db_filename, _pids_tuple) if _pids_tuple else {}
     _verify_map = _pcr_bulk_verify(db_filename, _pids_tuple) if _pids_tuple else {}
+    _match_map = _pcr_bulk_match_details(db_filename, _pids_tuple) if _pids_tuple else {}
+    out["new_pids"] = list(new_pids)
 
     # 원본
     if orig_pid_i:
         out["original_date"] = _dates_map.get(orig_pid_i, "-") or "-"
         _v, _src = _verify_map.get(orig_pid_i, (False, ""))
         _src_disp = f" ({_src})" if _src else ""
-        out["original_verified"] = (True, f"✅ 검증됨{_src_disp}") if _v else (False, "❌ 미검증")
+        out["original_matches"] = _match_map.get(orig_pid_i, [])
+        if out["original_matches"]:
+            out["original_verified"] = (
+                _v,
+                " · ".join(_pcr_format_match_lines(out["original_matches"], verified_fallback="❌ 미검증")),
+            )
+        else:
+            out["original_verified"] = (True, f"✅ 검증됨{_src_disp}") if _v else (False, "❌ 미검증")
     else:
         out["original_verified"] = (False, "-")
 
@@ -8594,6 +8669,7 @@ def _pcr_build_verify_context_impl(meta: dict) -> dict:
         _dates = []
         _sources: list[str] = []
         _any_unverified = False
+        _new_match_rows: list[dict] = []
         for pid in new_pids:
             try:
                 pi = int(pid)
@@ -8601,15 +8677,22 @@ def _pcr_build_verify_context_impl(meta: dict) -> dict:
                 continue
             _dates.append(_dates_map.get(pi, "-") or "-")
             _v, _src = _verify_map.get(pi, (False, ""))
+            _new_match_rows.extend(_match_map.get(pi, []))
             if _v:
                 if _src:
                     _sources.append(_src)
             else:
                 _any_unverified = True
+        out["new_matches"] = _new_match_rows
         _dates_clean = [d for d in _dates if d and d != "-"]
         out["new_date"] = " / ".join(_dates_clean) if _dates_clean else "-"
         _src_disp = f" ({' / '.join(sorted(set(_sources)))})" if _sources else ""
-        if _sources and not _any_unverified:
+        if _new_match_rows:
+            out["new_verified"] = (
+                (True if _sources and not _any_unverified else (None if _sources else False)),
+                " · ".join(_pcr_format_match_lines(_new_match_rows, verified_fallback="❌ 미검증")),
+            )
+        elif _sources and not _any_unverified:
             out["new_verified"] = (True, f"✅ 검증됨{_src_disp}")
         elif _sources and _any_unverified:
             out["new_verified"] = (None, f"⚠️ 부분검증{_src_disp}")
@@ -33171,15 +33254,56 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
         _orig_verified_label = _vctx["original_verified"][1]
         _new_verified_label = _vctx["new_verified"][1]
 
-        # 원본 vs 변경 비교 표 — 결제일자·외부검증 컬럼 추가
-        comp = pd.DataFrame([
-            {"항목": "금액", "원본": _fmt_amt(display_meta.get("original_amount")), "변경 후": _fmt_amt(display_meta.get("new_amount"))},
-            {"항목": "결제수단", "원본": display_meta.get("original_method") or "-", "변경 후": display_meta.get("new_method") or "-"},
-            {"항목": "결제일자", "원본": _vctx.get("original_date") or "-", "변경 후": _vctx.get("new_date") or "-"},
-            {"항목": "온누리/승인번호", "원본": display_meta.get("original_onnuri") or "-", "변경 후": display_meta.get("new_onnuri") or "-"},
-            {"항목": "외부검증 (파일 매칭)", "원본": _orig_verified_label, "변경 후": _new_verified_label},
-        ])
-        st.dataframe(comp, width='stretch', hide_index=True)
+        def _pcr_window_html(title: str, amount, method, pay_date, onnuri, verify_lines: list[str]) -> str:
+            bits = [
+                f"<div style='font-size:0.78rem;font-weight:700;color:#1264A3;margin-bottom:6px;'>{html.escape(title)}</div>",
+                f"<div style='font-size:1.05rem;font-weight:700;'>{html.escape(_fmt_amt(amount))}</div>",
+                f"<div>{html.escape(str(method or '-'))}</div>",
+                f"<div style='color:#616061;font-size:0.88rem;'>결제일 {html.escape(str(pay_date or '-'))}"
+                + (f" · {html.escape(str(onnuri))}" if onnuri else "")
+                + "</div>",
+            ]
+            for line in (verify_lines or ["❌ 미검증"]):
+                bits.append(
+                    f"<div style='margin-top:8px;padding:6px 8px;border-radius:6px;"
+                    f"background:#F3F4F6;font-size:0.86rem;'>{html.escape(line)}</div>"
+                )
+            return (
+                "<div style='background:#E8F4FD;border:1px solid #B8D4EE;border-radius:8px;"
+                f"padding:14px 16px;min-height:160px;line-height:1.55;'>{''.join(bits)}</div>"
+            )
+
+        _orig_lines = _pcr_format_match_lines(
+            _vctx.get("original_matches") or [], verified_fallback=_orig_verified_label,
+        )
+        _new_lines = _pcr_format_match_lines(
+            _vctx.get("new_matches") or [], verified_fallback=_new_verified_label,
+        )
+        win_l, win_r = st.columns(2)
+        with win_l:
+            st.markdown(
+                _pcr_window_html(
+                    "결제 전",
+                    display_meta.get("original_amount"),
+                    display_meta.get("original_method"),
+                    _vctx.get("original_date"),
+                    display_meta.get("original_onnuri"),
+                    _orig_lines,
+                ),
+                unsafe_allow_html=True,
+            )
+        with win_r:
+            st.markdown(
+                _pcr_window_html(
+                    "결제 후",
+                    display_meta.get("new_amount"),
+                    display_meta.get("new_method"),
+                    _vctx.get("new_date"),
+                    display_meta.get("new_onnuri"),
+                    _new_lines,
+                ),
+                unsafe_allow_html=True,
+            )
         st.markdown(f"**사유:** {meta.get('reason') or '-'}")
 
         # 부정 방지 경고
