@@ -9,6 +9,7 @@ import io
 import hmac
 import html
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -3590,6 +3591,14 @@ def _ext_pay_rematch_after_payment_change(
             st.session_state["_ext_pay_rematch_error"] = str(e)
         except Exception:
             pass
+    # 결제변경 검증 패널이 참조하는 매칭·원장후보 캐시 무효화 (매칭이 바뀌었으므로 즉시 반영 필요)
+    for _fn_name in ("_pcr_bulk_match_details", "_pcr_bulk_verify", "_pcr_ledger_candidates"):
+        _fn = globals().get(_fn_name)
+        if _fn is not None and hasattr(_fn, "clear"):
+            try:
+                _fn.clear()
+            except Exception:
+                pass
 
 
 def _ext_pay_release_and_rematch_source(
@@ -8552,6 +8561,42 @@ def _pcr_bulk_payment_dates(db_filename: str, payment_ids: tuple[int, ...]) -> d
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def _format_order_payments_display(pay_list: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """주문 결제 DataFrame 을 '결제 내역 조회 및 수정' 표 형태로 가공.
+    `결제 내역 조회 및 수정`과 결제변경 고객 팝업이 같은 형식을 쓰도록 공용 헬퍼로 분리."""
+    pay_display = pay_list.copy()
+    # 복합결제 표기: 같은 결제일에 여러 수단이 사용된 행에 "복합결제" 마킹
+    if "payment_date" in pay_display.columns and "payment_method" in pay_display.columns:
+        _date_method_counts = pay_display.groupby("payment_date")["payment_method"].transform("nunique")
+        pay_display["복합결제"] = _date_method_counts.gt(1).map({True: "✅ 복합", False: ""})
+    else:
+        pay_display["복합결제"] = ""
+    if "amount" in pay_display.columns:
+        pay_display["amount"] = pay_display["amount"].apply(lambda x: f"{x:,.0f}원")
+    if "fee_amount" in pay_display.columns:
+        pay_display["fee_amount"] = pay_display["fee_amount"].fillna(0).apply(lambda x: f"{x:,.0f}원")
+    # 온누리 결제의 경우 card_company 대신 onnuri_approval_code 를 카드사 컬럼에 표시
+    if "onnuri_approval_code" in pay_display.columns and "card_company" in pay_display.columns:
+        mask = pay_display["card_company"].isna() | (pay_display["card_company"].astype(str).isin(["None", "nan", ""]))
+        pay_display.loc[mask, "card_company"] = pay_display.loc[mask, "onnuri_approval_code"]
+    # 신용카드/체크카드인데 card_company 가 비어 있으면 "(카드사 미입력)"으로 표시
+    if "card_company" in pay_display.columns:
+        pay_display["card_company"] = pay_display["card_company"].fillna("").astype(str).replace({"None": "", "nan": "", "none": ""})
+        empty_card = pay_display["card_company"].str.strip() == ""
+        card_method_mask = pay_display["payment_method"].isin(("신용카드", "체크카드"))
+        pay_display.loc[empty_card & card_method_mask, "card_company"] = "(카드사 미입력)"
+        pay_display.loc[empty_card & ~card_method_mask, "card_company"] = pay_display.loc[empty_card & ~card_method_mask, "payment_method"].fillna("-")
+    pay_display = pay_display.rename(columns={
+        "id": "결제ID", "payment_date": "결제일", "amount": "금액",
+        "payment_method": "수단", "card_company": "카드사/승인번호",
+        "fee_amount": "수수료", "business_name": "사업자",
+    })
+    cols = ["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료", "복합결제"]
+    if "사업자" in pay_display.columns:
+        cols.insert(-1, "사업자")
+    return pay_display, cols
+
+
 def _pcr_load_order_payments(db_filename: str, sale_id: int | None) -> list[dict]:
     """주문(sale_id)의 결제 행. 결제변경 전/후 창용."""
     if not db_filename or sale_id in (None, ""):
@@ -8576,6 +8621,62 @@ def _pcr_load_order_payments(db_filename: str, sale_id: int | None) -> list[dict
     except Exception as e:
         st.warning(f"주문 결제 조회 실패: {e}")
         return []
+
+
+@st.dialog("고객 전체 결제 내역", width="large")
+def _pcr_customer_payments_dialog(db_filename: str, sale_id, customer_name: str) -> None:
+    """고객의 모든 주문·결제를 '결제 내역 조회 및 수정'과 같은 형식으로 표시 (읽기 전용).
+    버튼 클릭 시에만 열리므로, 패널 기본 렌더 비용에는 영향이 없다. 기존 캐시 로더를 재사용한다."""
+    st.caption(f"{customer_name} · 읽기 전용 (결제 내역 조회 및 수정과 같은 내용)")
+    if not db_filename:
+        st.warning("매장 DB 정보를 알 수 없어 조회할 수 없습니다.")
+        return
+    try:
+        _sid = int(sale_id) if sale_id not in (None, "") else None
+    except (TypeError, ValueError):
+        _sid = None
+    if _sid is None:
+        st.info("결제변경 요청에 연결된 주문이 없어 전체 결제를 조회할 수 없습니다.")
+        return
+
+    cid = _get_order_customer_id_supabase(db_filename, _sid)
+    if cid is None:
+        st.warning("고객 정보를 찾을 수 없습니다.")
+        return
+
+    _cols = "id, order_date, delivery_date, total_amount, customer_id"
+    orders = _load_orders_by_customer_ids_supabase(db_filename, (int(cid),), _cols)
+    if orders is None or orders.empty:
+        st.info("이 고객의 주문이 없습니다.")
+        return
+
+    _oids_key = tuple(sorted({int(x) for x in orders["id"].tolist() if x is not None}))
+    pays_df = _load_payments_by_order_ids_supabase(db_filename, _oids_key) if _oids_key else pd.DataFrame()
+
+    for _, orow in orders.iterrows():
+        _oid = int(orow["id"])
+        _total = float(orow.get("total_amount") or 0)
+        _pays_order = pays_df[pays_df["order_id"].astype("Int64") == _oid] if not pays_df.empty else pd.DataFrame()
+        _paid = float(_pays_order["amount"].astype(float).sum()) if not _pays_order.empty else 0.0
+        _bal = _total - _paid
+        _od = orow.get("order_date") or ""
+        _dd = orow.get("delivery_date") or ""
+        _od_s = _od.strftime("%Y-%m-%d") if hasattr(_od, "strftime") else str(_od)[:10]
+        _dd_s = _dd.strftime("%Y-%m-%d") if hasattr(_dd, "strftime") else (str(_dd)[:10] if _dd else "")
+        _combined = False
+        if not _pays_order.empty and "payment_date" in _pays_order.columns and "payment_method" in _pays_order.columns:
+            _combined = bool(_pays_order.groupby("payment_date")["payment_method"].nunique().gt(1).any())
+        _combined_badge = " 🔀 복합결제" if _combined else ""
+        exp_label = f"주문 #{_oid} | 계약일 {_od_s} | 배송일 {_dd_s} | 총액 {_total:,.0f}원 | 잔금 {_bal:,.0f}원{_combined_badge}"
+        _is_this = (_sid is not None and _oid == _sid)
+        with st.expander(exp_label, expanded=_is_this):
+            if _pays_order.empty:
+                st.info("해당 주문의 결제 내역이 없습니다.")
+                continue
+            _keep = [c for c in ("id", "payment_date", "amount", "payment_method", "card_company",
+                                 "onnuri_approval_code", "fee_amount", "business_name") if c in _pays_order.columns]
+            _disp, _cols_show = _format_order_payments_display(_pays_order[_keep])
+            st.dataframe(_disp[_cols_show], width='stretch', hide_index=True)
 
 
 def _pcr_pay_approval_and_time(pay: dict) -> tuple[str, str]:
@@ -8700,10 +8801,13 @@ def _pcr_bulk_verify(db_filename: str, payment_ids: tuple[int, ...]) -> dict[int
     return out
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _pcr_bulk_match_details(
     db_filename: str, payment_ids: tuple[int, ...],
 ) -> dict[int, list[dict]]:
-    """payment_id → 외부원장 매칭 행 목록 (result_code·note 포함). 업로드 검증 표시용."""
+    """payment_id → 외부원장 매칭 행 목록 (result_code·note 포함). 업로드 검증 표시용.
+    업무 상세를 다시 그릴 때 반복 조회 비용을 없애기 위해 ttl=60 캐시 적용.
+    원장 업로드/재매칭 완료 지점에서 `.clear()` 로 즉시 반영."""
     out: dict[int, list[dict]] = {}
     if not db_filename or not payment_ids:
         return out
@@ -8770,7 +8874,7 @@ def _pcr_bulk_match_details(
                 "ledger": ledger,
             })
     except Exception as e:
-        st.warning(f"외부 검증 결과 조회 실패: {e}")
+        logging.warning("외부 검증 결과 조회 실패: %s", e)
     return out
 
 
@@ -33531,6 +33635,22 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                 unsafe_allow_html=True,
             )
 
+        # 고객 이름 → 전체 결제 내역 팝업 (클릭 시에만 데이터 로드)
+        _cust_name = str(meta.get("customer_name") or "").strip()
+        if _cust_name:
+            _cust_cols = st.columns([6, 4])
+            with _cust_cols[0]:
+                if st.button(
+                    f"👤 고객: {_cust_name}",
+                    key=f"pcr_cust_dlg_{tid}",
+                    help="클릭하면 이 고객의 전체 주문·결제 내역을 팝업으로 봅니다.",
+                ):
+                    _pcr_customer_payments_dialog(
+                        str(meta.get("db_filename") or ""),
+                        meta.get("sale_id"),
+                        _cust_name,
+                    )
+
         def _fmt_amt(v):
             try:
                 return f"{int(v):,}원" if v not in (None, "") else "-"
@@ -33645,35 +33765,45 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                     continue
             return s
 
+        # 결제 전 창에는 '이번 변경과 관련 있는 결제'만 노출한다.
+        #   - 메타의 payment_id 와 같은 결제 (변경 대상)
+        #   - 상계(음수) 전표와 수단·금액이 짝지어진 양수 결제 (변경 대상 · 상계됨)
+        # 그 외의 양수 결제(이번 변경과 무관한 기존 유지)는 숨긴다 — 전체 결제는 고객 이름 팝업으로 확인.
         _offset_keys: list[tuple[str, int]] = []
         for _op in _offset_pays:
             try:
                 _offset_keys.append((str(_op.get("payment_method") or ""), -int(round(float(_op.get("amount") or 0)))))
             except (TypeError, ValueError):
                 continue
+        _meta_pid_s = str(meta.get("payment_id") or "")
+        _before_show: list[tuple[dict, str]] = []  # (pay, tag)
+        for _bp in _before_pays:
+            try:
+                _bpid = int(_bp.get("id"))
+                _bkey = (str(_bp.get("payment_method") or ""), int(round(float(_bp.get("amount") or 0))))
+            except (TypeError, ValueError):
+                _bpid, _bkey = None, None
+            if _bkey in _offset_keys:
+                _offset_keys.remove(_bkey)
+                _before_show.append((_bp, "변경 대상 · 상계됨"))
+            elif _bpid is not None and str(_bpid) == _meta_pid_s:
+                _before_show.append((_bp, "변경 대상"))
 
         win_l, win_r = st.columns(2)
         with win_l:
             with st.container(border=True):
                 _pcr_window_header(
                     "🧾 기존 결제 내역 (결제 전)",
-                    _pcr_sum(_before_pays) if _before_pays else int(display_meta.get("original_amount") or 0),
+                    _pcr_sum([bp for bp, _ in _before_show]) if _before_show
+                    else int(display_meta.get("original_amount") or 0),
                     bg="#fee2e2", fg="#991b1b",
                 )
-                if _before_pays:
-                    for _bp in _before_pays:
+                if _before_show:
+                    for _bp, _btag in _before_show:
                         try:
                             _bpid = int(_bp.get("id"))
-                            _bkey = (str(_bp.get("payment_method") or ""), int(round(float(_bp.get("amount") or 0))))
                         except (TypeError, ValueError):
-                            _bpid, _bkey = None, None
-                        if _bkey in _offset_keys:
-                            _offset_keys.remove(_bkey)
-                            _btag = "변경 대상 · 상계됨"
-                        elif _bpid is not None and str(_bpid) == str(meta.get("payment_id") or ""):
-                            _btag = "변경 대상"
-                        else:
-                            _btag = "기존 유지"
+                            _bpid = None
                         _pcr_render_pay_block(
                             _bp, _match_map.get(_bpid or 0, []),
                             fallback_label=_orig_verified_label,
@@ -35393,6 +35523,14 @@ def _render_external_pay_admin_section(
                             )
                         else:
                             st.session_state.pop(_conflicts_key, None)
+                        # 결제변경 검증 패널이 참조하는 매칭·원장후보 캐시 즉시 무효화
+                        for _fn_name in ("_pcr_bulk_match_details", "_pcr_bulk_verify", "_pcr_ledger_candidates"):
+                            _fn = globals().get(_fn_name)
+                            if _fn is not None and hasattr(_fn, "clear"):
+                                try:
+                                    _fn.clear()
+                                except Exception:
+                                    pass
                         flash(" · ".join(_msg_parts) or "처리 완료")
                         st.rerun()
 
@@ -44170,30 +44308,8 @@ def render_customer_balance():
                                     if pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0:
                                         st.info("해당 주문의 결제 내역이 없습니다.")
                                     else:
-                                        pay_display = pay_list.copy()
-                                        # 복합결제 표기: 같은 결제일에 여러 수단이 사용된 행에 "복합결제" 마킹
-                                        if "payment_date" in pay_display.columns and "payment_method" in pay_display.columns:
-                                            _date_method_counts = pay_display.groupby("payment_date")["payment_method"].transform("nunique")
-                                            pay_display["복합결제"] = _date_method_counts.gt(1).map({True: "✅ 복합", False: ""})
-                                        else:
-                                            pay_display["복합결제"] = ""
-                                        pay_display["amount"] = pay_display["amount"].apply(lambda x: f"{x:,.0f}원")
-                                        pay_display["fee_amount"] = pay_display["fee_amount"].fillna(0).apply(lambda x: f"{x:,.0f}원")
-                                        # 온누리 결제의 경우 card_company 대신 onnuri_approval_code를 카드사 컬럼에 표시
-                                        if "onnuri_approval_code" in pay_display.columns:
-                                            mask = pay_display["card_company"].isna() | (pay_display["card_company"].astype(str).isin(["None", "nan", ""]))
-                                            pay_display.loc[mask, "card_company"] = pay_display.loc[mask, "onnuri_approval_code"]
-                                        # 신용카드/체크카드인데 card_company가 비어 있으면 "(카드사 미입력)"으로 표시
-                                        pay_display["card_company"] = pay_display["card_company"].fillna("").astype(str).replace({"None": "", "nan": "", "none": ""})
-                                        empty_card = pay_display["card_company"].str.strip() == ""
-                                        card_method_mask = pay_display["payment_method"].isin(("신용카드", "체크카드"))
-                                        pay_display.loc[empty_card & card_method_mask, "card_company"] = "(카드사 미입력)"
-                                        pay_display.loc[empty_card & ~card_method_mask, "card_company"] = pay_display.loc[empty_card & ~card_method_mask, "payment_method"].fillna("-")
-                                        pay_display = pay_display.rename(columns={"id": "결제ID", "payment_date": "결제일", "amount": "금액", "payment_method": "수단", "card_company": "카드사/승인번호", "fee_amount": "수수료", "business_name": "사업자"})
-                                        _pay_cols_show = ["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료", "복합결제"]
-                                        if "사업자" in pay_display.columns:
-                                            _pay_cols_show.insert(-1, "사업자")
-                                        st.dataframe(pay_display[_pay_cols_show], width='stretch')
+                                        _pay_display_df, _pay_cols_show = _format_order_payments_display(pay_list)
+                                        st.dataframe(_pay_display_df[_pay_cols_show], width='stretch')
                                         if not _is_selected_order:
                                             st.caption("👆 결제 수정·결제변경 요청은 위 '수정할 주문 선택'에서 이 주문을 고르면 표시됩니다.")
                                         else:
