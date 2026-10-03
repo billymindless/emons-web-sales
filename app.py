@@ -8566,7 +8566,7 @@ def _pcr_load_order_payments(db_filename: str, sale_id: int | None) -> list[dict
     try:
         r = (
             sc.table("app_payments")
-            .select("id, order_id, payment_date, amount, payment_method, card_company, onnuri_approval_code, created_at")
+            .select("id, order_id, payment_date, amount, payment_method, card_company, onnuri_approval_code, created_at, created_by")
             .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
             .eq("order_id", oid)
             .order("id")
@@ -8597,7 +8597,8 @@ def _pcr_pay_approval_and_time(pay: dict) -> tuple[str, str]:
 
 
 def _pcr_classify_order_pays(pays: list[dict], orig_pid: int | None) -> tuple[list[dict], list[dict], list[dict]]:
-    """원본 양수 / 원본 상계(음수) / 변경 후 양수."""
+    """원본 양수 / 원본 상계(음수) / 변경 후 양수.
+    상계 전표보다 먼저 등록된 양수 결제는 기존 결제(결제 전)로 본다."""
     before: list[dict] = []
     offsets: list[dict] = []
     after: list[dict] = []
@@ -8607,25 +8608,23 @@ def _pcr_classify_order_pays(pays: list[dict], orig_pid: int | None) -> tuple[li
             orig_i = int(orig_pid)
         except (TypeError, ValueError):
             orig_i = None
+    parsed: list[tuple[int, int, dict]] = []
     for p in pays:
         try:
-            pid = int(p.get("id"))
-            amt = int(round(float(p.get("amount") or 0)))
+            parsed.append((int(p.get("id")), int(round(float(p.get("amount") or 0))), p))
         except (TypeError, ValueError):
             continue
+    offset_ids = [pid for pid, amt, _ in parsed if amt < 0 and (orig_i is None or pid > orig_i)]
+    cutoff = min(offset_ids) if offset_ids else None
+    for pid, amt, p in parsed:
         if orig_i is not None and pid == orig_i:
             before.append(p)
-            continue
-        if orig_i is not None and amt < 0:
+        elif amt < 0:
             offsets.append(p)
-            continue
-        if orig_i is not None and amt > 0 and pid > orig_i:
+        elif amt > 0 and cutoff is not None and pid < cutoff:
+            before.append(p)
+        elif amt > 0 and (orig_i is None or pid > orig_i):
             after.append(p)
-            continue
-        if orig_i is None and amt > 0:
-            after.append(p)
-        elif orig_i is None and amt < 0:
-            offsets.append(p)
     return before, offsets, after
 
 
@@ -8725,12 +8724,32 @@ def _pcr_bulk_match_details(
     try:
         r = (
             sc.table("app_external_pay_matches")
-            .select("source, result_code, note, payment_id")
+            .select("source, result_code, note, payment_id, row_id")
             .eq("db_filename", db_filename)
             .in_("payment_id", pids)
             .execute()
         )
-        for row in (r.data or []):
+        match_rows = list(r.data or [])
+        row_ids: list[int] = []
+        for row in match_rows:
+            try:
+                row_ids.append(int(row.get("row_id")))
+            except (TypeError, ValueError):
+                continue
+        ledger_by_id: dict[int, dict] = {}
+        if row_ids:
+            lr = (
+                sc.table("app_external_pay_rows")
+                .select("id, source, tx_date, tx_time, amount, approval_code, card_company, card_kind, tx_status")
+                .in_("id", sorted(set(row_ids)))
+                .execute()
+            )
+            for lrow in (lr.data or []):
+                try:
+                    ledger_by_id[int(lrow.get("id"))] = lrow
+                except (TypeError, ValueError):
+                    continue
+        for row in match_rows:
             try:
                 pid_i = int(row.get("payment_id"))
             except (TypeError, ValueError):
@@ -8739,15 +8758,111 @@ def _pcr_bulk_match_details(
                 continue
             code = str(row.get("result_code") or "")
             src = str(row.get("source") or "")
+            try:
+                ledger = ledger_by_id.get(int(row.get("row_id")))
+            except (TypeError, ValueError):
+                ledger = None
             out[pid_i].append({
                 "source": src,
                 "result_code": code,
                 "note": str(row.get("note") or "").strip(),
                 "label": _ext_pay_result_label(code, src, has_payment=True),
+                "ledger": ledger,
             })
     except Exception as e:
         st.warning(f"외부 검증 결과 조회 실패: {e}")
     return out
+
+
+_PCR_METHOD_LEDGER_SOURCE = {
+    "신용카드": "card",
+    "체크카드": "card",
+    "온누리": "onnuri",
+    "지역화폐": "ulsanpay",
+    "메인페이": "mainpay",
+}
+
+
+def _pcr_ledger_source_for_method(method: str) -> str | None:
+    m = str(method or "").strip()
+    if "지류" in m:
+        return None
+    if m.startswith("온누리"):
+        return "onnuri"
+    return _PCR_METHOD_LEDGER_SOURCE.get(m)
+
+
+def _pcr_format_ledger_row(lrow: dict) -> str:
+    """원장 한 행 → '2026-09-19 18:28:15 · 승인번호 30031706 · 954,000원 · KB국민 · 승인'."""
+    when = " ".join(x for x in (str(lrow.get("tx_date") or "")[:10], str(lrow.get("tx_time") or "")[:8]) if x)
+    parts = [when or "일시 미상"]
+    appr = str(lrow.get("approval_code") or "").strip()
+    if appr:
+        parts.append(f"승인번호 {appr}")
+    try:
+        parts.append(f"{int(round(float(lrow.get('amount') or 0))):,}원")
+    except (TypeError, ValueError):
+        pass
+    cc = str(lrow.get("card_company") or "").strip()
+    if cc:
+        parts.append(cc)
+    kind = str(lrow.get("card_kind") or lrow.get("tx_status") or "").strip()
+    if kind:
+        parts.append(kind)
+    return " · ".join(parts)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _pcr_ledger_candidates(db_filename: str, source: str, amount: int, pay_date: str) -> tuple[list[dict], int]:
+    """미매칭 결제용: 같은 금액 원장 후보(결제일 ±3일)와 결제일 당일 원장 업로드 건수."""
+    if not db_filename or not source or not pay_date:
+        return [], 0
+    try:
+        d0 = date.fromisoformat(str(pay_date)[:10])
+    except ValueError:
+        return [], 0
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return [], 0
+    try:
+        cand = (
+            sc.table("app_external_pay_rows")
+            .select("id, source, tx_date, tx_time, amount, approval_code, card_company, card_kind, tx_status")
+            .eq("db_filename", db_filename)
+            .eq("source", source)
+            .eq("amount", int(amount))
+            .gte("tx_date", (d0 - timedelta(days=3)).isoformat())
+            .lte("tx_date", (d0 + timedelta(days=3)).isoformat())
+            .order("tx_date")
+            .limit(5)
+            .execute()
+        )
+        day = (
+            sc.table("app_external_pay_rows")
+            .select("id", count="exact")
+            .eq("db_filename", db_filename)
+            .eq("source", source)
+            .eq("tx_date", d0.isoformat())
+            .limit(1)
+            .execute()
+        )
+        return list(cand.data or []), int(day.count or 0)
+    except Exception as e:
+        st.warning(f"원장 후보 조회 실패: {e}")
+        return [], 0
+
+
+def _pcr_fmt_created_kst(ts) -> str:
+    """created_at(UTC) → 'YYYY-MM-DD HH:MM:SS' KST."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(ts)[:19]
 
 
 def _pcr_format_match_lines(rows: list[dict] | None, *, verified_fallback: str) -> list[str]:
@@ -33432,7 +33547,19 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
         _orig_verified_label = _vctx["original_verified"][1]
         _new_verified_label = _vctx["new_verified"][1]
 
-        def _pcr_render_pay_block(pay: dict, match_rows: list[dict], *, fallback_label: str) -> None:
+        _pcr_db = str(meta.get("db_filename") or "")
+        _pcr_ok_codes = ("matched_ok", "matched", "manual_matched", "split_matched")
+
+        def _pcr_window_header(title: str, total: int, *, bg: str, fg: str) -> None:
+            st.markdown(
+                f"<div style='padding:8px 12px; border-radius:8px; background:{bg}; color:{fg}; "
+                f"font-weight:700; display:flex; justify-content:space-between;'>"
+                f"<span>{title}</span><span>합계 {total:,}원</span></div>",
+                unsafe_allow_html=True,
+            )
+
+        def _pcr_render_pay_block(pay: dict, match_rows: list[dict], *, fallback_label: str,
+                                  tag: str = "") -> None:
             try:
                 amt = int(round(float(pay.get("amount") or 0)))
             except (TypeError, ValueError):
@@ -33444,17 +33571,56 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
             appr, tx_t = _pcr_pay_approval_and_time(pay)
             pid = pay.get("id")
             pdate = str(pay.get("payment_date") or "-")[:10]
-            st.markdown(f"**{_fmt_amt(amt)} · {method}**")
-            if method in ("신용카드", "체크카드") and cc:
-                st.caption(f"카드사 {cc}")
-            bits = [f"결제ID {pid}" if pid not in (None, "") else "", f"결제일 {pdate}"]
-            if appr and appr != "-":
-                bits.append(f"승인번호 {appr}")
-            if tx_t:
-                bits.append(f"거래시간 {tx_t}")
-            st.caption(" · ".join(b for b in bits if b))
-            for line in _pcr_format_match_lines(match_rows, verified_fallback=fallback_label):
-                st.info(line)
+            source = _pcr_ledger_source_for_method(method)
+            with st.container(border=True):
+                st.markdown(f"**{_fmt_amt(amt)} · {method}**" + (f"  `{tag}`" if tag else ""))
+                if method in ("신용카드", "체크카드") and cc:
+                    st.caption(f"카드사 {cc}")
+                bits = [f"결제ID {pid}" if pid not in (None, "") else "", f"결제일 {pdate}"]
+                if appr and appr != "-":
+                    bits.append(f"승인번호 {appr}")
+                elif source:
+                    bits.append("승인번호 미입력")
+                if tx_t:
+                    bits.append(f"거래시간 {tx_t}")
+                st.caption(" · ".join(b for b in bits if b))
+                _reg = _pcr_fmt_created_kst(pay.get("created_at"))
+                if _reg:
+                    _by = pay.get("created_by")
+                    st.caption(f"모모 등록 {_reg}" + (f" · {_uname_to_display(_by)}" if _by else ""))
+
+                if match_rows:
+                    for m in match_rows:
+                        _src = _ext_pay_src_label(m.get("source") or "")
+                        _label = m.get("label") or m.get("result_code") or "-"
+                        _head = f"{_label} ({_src})" if _src else str(_label)
+                        _note = m.get("note") or ""
+                        _txt = f"{_head} · {_note}" if _note else _head
+                        if m.get("result_code") in _pcr_ok_codes:
+                            st.success(_txt)
+                        else:
+                            st.warning(_txt)
+                        _lrow = m.get("ledger")
+                        if _lrow:
+                            st.caption(f"원장 거래: {_pcr_format_ledger_row(_lrow)}")
+                    return
+
+                st.error(fallback_label or "❌ 미검증")
+                if amt <= 0:
+                    return
+                if not source:
+                    st.caption("현금·계좌이체는 업로드 원장이 없습니다. 입금·이체 증빙으로 확인해 주세요.")
+                    return
+                _ledger_name = _ext_pay_ledger_label(source)
+                cands, day_cnt = _pcr_ledger_candidates(_pcr_db, source, amt, pdate)
+                if cands:
+                    st.caption(f"{_ledger_name} 후보 (같은 금액 · 결제일 ±3일, 아직 매칭 안 됨)")
+                    for c in cands:
+                        st.caption(f"- {_pcr_format_ledger_row(c)}")
+                elif day_cnt:
+                    st.caption(f"{_ledger_name} {pdate} 자료 {day_cnt}건 중 같은 금액 거래가 없습니다.")
+                else:
+                    st.caption(f"{_ledger_name} {pdate} 자료가 업로드되지 않았습니다. 원장 업로드 후 재검증해 주세요.")
 
         _order_pays = _pcr_load_order_payments(str(meta.get("db_filename") or ""), meta.get("sale_id"))
         _before_pays, _offset_pays, _after_pays = _pcr_classify_order_pays(
@@ -33470,19 +33636,48 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
             str(meta.get("db_filename") or ""), tuple(_all_detail_pids),
         ) if _all_detail_pids else {}
 
+        def _pcr_sum(pays: list[dict]) -> int:
+            s = 0
+            for _p in pays:
+                try:
+                    s += int(round(float(_p.get("amount") or 0)))
+                except (TypeError, ValueError):
+                    continue
+            return s
+
+        _offset_keys: list[tuple[str, int]] = []
+        for _op in _offset_pays:
+            try:
+                _offset_keys.append((str(_op.get("payment_method") or ""), -int(round(float(_op.get("amount") or 0)))))
+            except (TypeError, ValueError):
+                continue
+
         win_l, win_r = st.columns(2)
         with win_l:
             with st.container(border=True):
-                st.caption("결제 전")
+                _pcr_window_header(
+                    "🧾 기존 결제 내역 (결제 전)",
+                    _pcr_sum(_before_pays) if _before_pays else int(display_meta.get("original_amount") or 0),
+                    bg="#fee2e2", fg="#991b1b",
+                )
                 if _before_pays:
                     for _bp in _before_pays:
                         try:
                             _bpid = int(_bp.get("id"))
+                            _bkey = (str(_bp.get("payment_method") or ""), int(round(float(_bp.get("amount") or 0))))
                         except (TypeError, ValueError):
-                            _bpid = None
+                            _bpid, _bkey = None, None
+                        if _bkey in _offset_keys:
+                            _offset_keys.remove(_bkey)
+                            _btag = "변경 대상 · 상계됨"
+                        elif _bpid is not None and str(_bpid) == str(meta.get("payment_id") or ""):
+                            _btag = "변경 대상"
+                        else:
+                            _btag = "기존 유지"
                         _pcr_render_pay_block(
                             _bp, _match_map.get(_bpid or 0, []),
                             fallback_label=_orig_verified_label,
+                            tag=_btag,
                         )
                 else:
                     st.markdown(f"**{_fmt_amt(display_meta.get('original_amount'))}**")
@@ -33492,22 +33687,27 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                         + (f" · 승인번호 {display_meta.get('original_onnuri')}" if display_meta.get("original_onnuri") else "")
                     )
                     st.info(_orig_verified_label)
-                for _op in _offset_pays:
-                    try:
-                        _oamt = int(round(float(_op.get("amount") or 0)))
-                    except (TypeError, ValueError):
-                        _oamt = 0
-                    st.caption(
-                        f"상계 {_fmt_amt(_oamt)} · {str(_op.get('payment_date') or '-')[:10]}"
-                        + (f" · 결제ID {_op.get('id')}" if _op.get("id") else "")
-                    )
+                if _offset_pays:
+                    st.markdown("**상계(취소) 전표**")
+                    for _op in _offset_pays:
+                        try:
+                            _opid = int(_op.get("id"))
+                        except (TypeError, ValueError):
+                            _opid = None
+                        _pcr_render_pay_block(
+                            _op, _match_map.get(_opid or 0, []),
+                            fallback_label="상계 전표 · 원장 취소 매칭 없음",
+                            tag="상계",
+                        )
         with win_r:
             with st.container(border=True):
-                st.caption("결제 후 (실제 등록된 결제)")
+                _pcr_window_header(
+                    "✅ 변경 후 결제 내역 (실제 등록)",
+                    _pcr_sum(_after_pays) if _after_pays else int(display_meta.get("new_amount") or 0),
+                    bg="#dbeafe", fg="#1e40af",
+                )
                 if _after_pays:
-                    for i, _ap in enumerate(_after_pays):
-                        if i:
-                            st.divider()
+                    for _ap in _after_pays:
                         try:
                             _apid = int(_ap.get("id"))
                         except (TypeError, ValueError):
@@ -33529,7 +33729,6 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                     else:
                         st.info(_new_verified_label)
                         st.caption("요청 당시 입력값입니다. 실제 결제 행이 아직 없습니다.")
-        st.markdown(f"**사유:** {meta.get('reason') or '-'}")
 
         # 부정 방지 경고
         try:
@@ -33599,6 +33798,7 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                         flash("결제변경 검증이 반려 처리되었습니다.")
                         # fragment-detail: 반려는 태스크 status/verify_status 를 바꾸므로 목록 배지 갱신 → app rerun.
                         st.rerun(scope="app")
+    return str(meta.get("reason") or "").strip()
 
 
 @st.fragment
@@ -33620,24 +33820,39 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     can_edit = role in ("store_admin", "superadmin") or is_creator or is_assignee
     is_confidential = task.get("category") == _tb.CONFIDENTIAL_CATEGORY
 
-    # 결제변경 검증 전용 카드 (메타가 있으면 표시)
-    _render_payment_change_verify_panel(
+    # 결제변경 검증 전용 카드 (메타가 있으면 표시). 표시되면 사유 문자열, 아니면 None.
+    _pcr_reason = _render_payment_change_verify_panel(
         tid, me_uname, role, is_creator,
         task_type=task.get("task_type"),
         task=task,
     )
+    _is_pcr_view = _pcr_reason is not None
 
     # 상세 필드 편집
     with st.form(f"task_edit_{tid}"):
         new_title = st.text_input("제목", value=task.get("title", ""), key=f"et_title_{tid}", disabled=not can_edit)
-        new_desc = st.text_area(
-            "설명",
-            value=task.get("description") or "",
-            key=f"et_desc_{tid}",
-            height=250,  # 약 10줄 — 스크롤 없이 대부분 내용 조망 가능
-            disabled=not can_edit,
-            placeholder="자유 메모 (결제변경 유형·금액·사유는 위 검증 패널에서 확인)",
-        )
+        if _is_pcr_view:
+            # 결제변경 업무: 설명란 대신 요청 사유를 고정 표시하고, 추가 내용은 아래 댓글로 남긴다.
+            new_desc = task.get("description") or ""
+            st.markdown("**사유**")
+            with st.container(border=True):
+                _desc_full = str(new_desc).strip()
+                if _desc_full and _desc_full.startswith(_pcr_reason or "\0"):
+                    st.write(_desc_full)
+                else:
+                    st.write(_pcr_reason or "-")
+                    if _desc_full:
+                        st.caption("기존 메모")
+                        st.write(_desc_full)
+        else:
+            new_desc = st.text_area(
+                "설명",
+                value=task.get("description") or "",
+                key=f"et_desc_{tid}",
+                height=250,  # 약 10줄 — 스크롤 없이 대부분 내용 조망 가능
+                disabled=not can_edit,
+                placeholder="자유 메모",
+            )
         c1, c2, c3 = st.columns(3)
         with c1:
             _sd_default = date.fromisoformat(task["start_date"]) if task.get("start_date") else None
@@ -33730,7 +33945,7 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     # - load_task_attachments_cached / load_task_comments_cached / load_task_activity_cached
     #   SQL 라운드트립 3건 + 하위업무 폼의 _internal_work_employee_options 조회를 모두 생략.
     _detail_extra_key = f"task_detail_extra_open_{tid}"
-    st.session_state.setdefault(_detail_extra_key, False)
+    st.session_state.setdefault(_detail_extra_key, _is_pcr_view)
     _extra_is_open = bool(st.session_state.get(_detail_extra_key, False))
     _extra_label = (
         "🔽 댓글·첨부·하위업무 접기"
@@ -33791,6 +34006,8 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
     st.markdown("---")
 
     # 댓글 트리
+    if _is_pcr_view:
+        st.markdown("#### 💬 댓글 (추가 내용은 여기에 남겨 주세요)")
     comments = _tb.load_task_comments_cached(tid)
     cm_by_parent: dict = {}
     for cm in comments:
