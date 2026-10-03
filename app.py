@@ -3591,8 +3591,8 @@ def _ext_pay_rematch_after_payment_change(
             st.session_state["_ext_pay_rematch_error"] = str(e)
         except Exception:
             pass
-    # 결제변경 검증 패널이 참조하는 매칭·원장후보 캐시 무효화 (매칭이 바뀌었으므로 즉시 반영 필요)
-    for _fn_name in ("_pcr_bulk_match_details", "_pcr_bulk_verify", "_pcr_ledger_candidates"):
+    # 결제변경 검증 패널이 참조하는 매칭 캐시 무효화 (매칭이 바뀌었으므로 즉시 반영 필요)
+    for _fn_name in ("_pcr_bulk_match_details", "_pcr_bulk_verify"):
         _fn = globals().get(_fn_name)
         if _fn is not None and hasattr(_fn, "clear"):
             try:
@@ -8914,46 +8914,6 @@ def _pcr_format_ledger_row(lrow: dict) -> str:
     if kind:
         parts.append(kind)
     return " · ".join(parts)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _pcr_ledger_candidates(db_filename: str, source: str, amount: int, pay_date: str) -> tuple[list[dict], int]:
-    """미매칭 결제용: 같은 금액 원장 후보(결제일 ±3일)와 결제일 당일 원장 업로드 건수."""
-    if not db_filename or not source or not pay_date:
-        return [], 0
-    try:
-        d0 = date.fromisoformat(str(pay_date)[:10])
-    except ValueError:
-        return [], 0
-    sc, err = get_supabase_client()
-    if err or not sc:
-        return [], 0
-    try:
-        cand = (
-            sc.table("app_external_pay_rows")
-            .select("id, source, tx_date, tx_time, amount, approval_code, card_company, card_kind, tx_status")
-            .eq("db_filename", db_filename)
-            .eq("source", source)
-            .eq("amount", int(amount))
-            .gte("tx_date", (d0 - timedelta(days=3)).isoformat())
-            .lte("tx_date", (d0 + timedelta(days=3)).isoformat())
-            .order("tx_date")
-            .limit(5)
-            .execute()
-        )
-        day = (
-            sc.table("app_external_pay_rows")
-            .select("id", count="exact")
-            .eq("db_filename", db_filename)
-            .eq("source", source)
-            .eq("tx_date", d0.isoformat())
-            .limit(1)
-            .execute()
-        )
-        return list(cand.data or []), int(day.count or 0)
-    except Exception as e:
-        st.warning(f"원장 후보 조회 실패: {e}")
-        return [], 0
 
 
 def _pcr_fmt_created_kst(ts) -> str:
@@ -33726,21 +33686,8 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                     return
 
                 st.error(fallback_label or "❌ 미검증")
-                if amt <= 0:
+                if amt <= 0 or not source:
                     return
-                if not source:
-                    st.caption("현금·계좌이체는 업로드 원장이 없습니다. 입금·이체 증빙으로 확인해 주세요.")
-                    return
-                _ledger_name = _ext_pay_ledger_label(source)
-                cands, day_cnt = _pcr_ledger_candidates(_pcr_db, source, amt, pdate)
-                if cands:
-                    st.caption(f"{_ledger_name} 후보 (같은 금액 · 결제일 ±3일, 아직 매칭 안 됨)")
-                    for c in cands:
-                        st.caption(f"- {_pcr_format_ledger_row(c)}")
-                elif day_cnt:
-                    st.caption(f"{_ledger_name} {pdate} 자료 {day_cnt}건 중 같은 금액 거래가 없습니다.")
-                else:
-                    st.caption(f"{_ledger_name} {pdate} 자료가 업로드되지 않았습니다. 원장 업로드 후 재검증해 주세요.")
 
         _order_pays = _pcr_load_order_payments(str(meta.get("db_filename") or ""), meta.get("sale_id"))
         _before_pays, _offset_pays, _after_pays = _pcr_classify_order_pays(
@@ -35523,8 +35470,8 @@ def _render_external_pay_admin_section(
                             )
                         else:
                             st.session_state.pop(_conflicts_key, None)
-                        # 결제변경 검증 패널이 참조하는 매칭·원장후보 캐시 즉시 무효화
-                        for _fn_name in ("_pcr_bulk_match_details", "_pcr_bulk_verify", "_pcr_ledger_candidates"):
+                        # 결제변경 검증 패널이 참조하는 매칭 캐시 즉시 무효화
+                        for _fn_name in ("_pcr_bulk_match_details", "_pcr_bulk_verify"):
                             _fn = globals().get(_fn_name)
                             if _fn is not None and hasattr(_fn, "clear"):
                                 try:
