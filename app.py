@@ -10989,8 +10989,10 @@ def flash(message: str, level: str = "success"):
 @st.dialog("수정 완료")
 def _pay_edit_done_dialog(message: str):
     st.success(message)
+    # dialog-rerun-scope: @st.dialog 내부에서 st.rerun() 은 fragment 범위이므로
+    # 다이얼로그 자체가 닫히지 않는다. scope="app" 으로 전체 재실행해 모달을 확실히 닫는다.
     if st.button("확인", key="_pay_edit_done_ok", type="primary"):
-        st.rerun()
+        st.rerun(scope="app")
 
 
 def _consume_pay_edit_done_dialog():
