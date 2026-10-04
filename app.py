@@ -2596,37 +2596,77 @@ def _ext_pay_parse_ulsanpay_file(uploaded_file) -> tuple[list[dict], str | None]
     return out, None
 
 
-def _ext_pay_parse_card_file(uploaded_file) -> tuple[list[dict], str | None]:
+def _ext_pay_parse_card_file(uploaded_file) -> tuple[list[dict], str | None, dict | None]:
     """카드 매출내역(신용/체크카드 통합) → 정규화 행.
-    필수: 매입일자, 매입금액, 카드사. 승인번호·카드종류는 있으면 저장(매칭 서브키·표시용)."""
+    필수: 매입일자, 매입금액, 카드사. 승인번호·카드종류는 있으면 저장(매칭 서브키·표시용).
+
+    반환 3-tuple: (rows, error_or_None, diag_or_None).
+    diag 는 상위 UI 가 skip 사유를 가시화하기 위한 진단 메타:
+      detected_cols / data_rows / parsed / skip_no_date / skip_no_amount / skip_no_card
+      header_sample / dropped_sample(최대 5건, 각 항목에 _skip_reason 포함)
+    """
     df, err = _ext_pay_read_uploaded_df(uploaded_file)
     if err:
-        return [], err
+        return [], err, None
     df = _ext_pay_promote_header_row(
         df, {"매입일자", "거래일시", "승인번호", "카드사", "매입금액", "결제금액"}
     )
     colmap = _ext_pay_map_columns(df.columns, _CARD_HEADER_ALIASES)
+    header_sample = [str(c) for c in list(df.columns)]
     if "tx_date" not in colmap or "amount" not in colmap or "card_company" not in colmap:
         return [], (
             "필수 컬럼(매입일자, 매입금액, 카드사)을 찾을 수 없습니다. "
             f"감지된 컬럼: {list(df.columns)}"
-        )
+        ), {
+            "detected_cols": dict(colmap),
+            "data_rows": int(len(df)),
+            "parsed": 0,
+            "skip_no_date": 0,
+            "skip_no_amount": 0,
+            "skip_no_card": 0,
+            "header_sample": header_sample,
+            "dropped_sample": [],
+        }
 
     out: list[dict] = []
+    skip_no_date = 0
+    skip_no_amount = 0
+    skip_no_card = 0
+    dropped_sample: list[dict] = []
+
+    def _add_dropped(row, reason: str) -> None:
+        if len(dropped_sample) >= 5:
+            return
+        try:
+            raw_snap = {
+                k: (None if pd.isna(v) else str(v))
+                for k, v in row.items() if v is not None
+            }
+        except Exception as snap_err:
+            raw_snap = {"_snapshot_error": str(snap_err)}
+        raw_snap["_skip_reason"] = reason
+        dropped_sample.append(raw_snap)
+
     for _, row in df.iterrows():
         raw_dt = row.get(colmap["tx_date"])
         tx_date = _ext_pay_parse_date(raw_dt)
         if not tx_date:
+            skip_no_date += 1
+            _add_dropped(row, "no_date")
             continue
         tx_time = _ext_pay_parse_time(raw_dt)
         if not tx_time and "tx_time" in colmap:
             tx_time = _ext_pay_parse_time(row.get(colmap["tx_time"]))
         amt = _ext_pay_parse_amount(row.get(colmap["amount"]))
         if amt is None:
+            skip_no_amount += 1
+            _add_dropped(row, "no_amount")
             continue
         card_raw = str(row.get(colmap["card_company"]) or "").strip() if "card_company" in colmap else ""
         card_norm = _card_company_norm(card_raw)
         if not card_norm:
+            skip_no_card += 1
+            _add_dropped(row, "no_card")
             continue
         appr = str(row.get(colmap["approval_code"]) or "").strip() if "approval_code" in colmap else ""
         card_kind = str(row.get(colmap["card_kind"]) or "").strip() if "card_kind" in colmap else ""
@@ -2645,7 +2685,17 @@ def _ext_pay_parse_card_file(uploaded_file) -> tuple[list[dict], str | None]:
             "card_kind": card_kind or None,
             "raw": raw,
         })
-    return out, None
+    diag = {
+        "detected_cols": dict(colmap),
+        "data_rows": int(len(df)),
+        "parsed": len(out),
+        "skip_no_date": skip_no_date,
+        "skip_no_amount": skip_no_amount,
+        "skip_no_card": skip_no_card,
+        "header_sample": header_sample,
+        "dropped_sample": dropped_sample,
+    }
+    return out, None, diag
 
 
 def _ext_pay_parse_mainpay_file(uploaded_file) -> tuple[list[dict], str | None]:
@@ -3376,7 +3426,9 @@ def _ext_pay_relink_amount_and_near_date(
                 if _dn:
                     notes.append(_dn)
         elif source == "card":
-            # 카드: (카드사, 절대금액) 일치 + 매입일자 gap 최소 후보 1건 재매칭
+            # 카드: (카드사, 절대금액) 일치 + 매입일자 gap 최소 후보 1건 재매칭.
+            # 공식 행은 이미 상단에서 취소상태 skip 되므로 양수(결제) 성격이다. 음수 ERP 상계전표는
+            # _ext_pay_match_card 의 is_cancel 분기에서만 다루고, relink 에선 양수 ERP 결제만 재링크 대상.
             cc = _card_company_norm(r.get("card_company"))
             if not cc:
                 continue
@@ -3385,12 +3437,14 @@ def _ext_pay_relink_amount_and_near_date(
             same = [
                 p for p in leftover
                 if _card_company_norm(p.get("card_company")) == cc
+                and int(p.get("amount") or 0) > 0
                 and abs(int(p.get("amount") or 0)) == oamt
                 and (int(p.get("amount") or 0) < 0) == _want_neg
             ]
             diff_amt = [
                 p for p in leftover
                 if _card_company_norm(p.get("card_company")) == cc
+                and int(p.get("amount") or 0) > 0
                 and abs(int(p.get("amount") or 0)) != oamt
             ]
             if same:
@@ -5659,11 +5713,14 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
         _ext_pay_card_cancel_lookback(sc, db_filename, matched_by)
         return {}, None
 
+    # 월초 공식 매입행(매입일자)이 전월말 ERP 결제(결제일자)와 매칭되는 경계 케이스를 보존하기 위해
+    # ERP 조회 윈도우를 verify_from - 7day 로 확장. 매칭 로직 자체는 그대로.
+    _erp_from = verify_from - timedelta(days=7)
     try:
         def _filt_p(q):
             return (
                 q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
-                .gte("payment_date", verify_from.isoformat())
+                .gte("payment_date", _erp_from.isoformat())
             )
         pays_all = _ext_pay_select_paged(
             sc, "app_payments",
@@ -5716,17 +5773,22 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
 
     neg_orders = {int(p["order_id"]) for p in pays if p.get("order_id") is not None and (p.get("amount") or 0) < 0}
 
-    # 인덱스 키: (카드사정규화, 절대금액)
-    idx: dict[tuple, list[dict]] = {}
+    # 인덱스 키: (카드사정규화, 절대금액). 부호(결제/상계)별로 idx_pos·idx_neg 로 분리하여
+    # 공식 결제완료행 ↔ ERP 양수 결제, 공식 취소행(음/취소상태) ↔ ERP 음수 상계전표를 매칭한다.
+    idx_pos: dict[tuple, list[dict]] = {}
+    idx_neg: dict[tuple, list[dict]] = {}
+    skipped_no_cc_payments = 0
     for p in candidate_pays:
         try:
-            amt_k = abs(int(p.get("amount") or 0))
+            amt_p = int(p.get("amount") or 0)
         except (TypeError, ValueError):
             continue
-        cc = _card_company_norm(p.get("card_company"))
-        if not cc:
+        cc_p = _card_company_norm(p.get("card_company"))
+        if not cc_p:
+            skipped_no_cc_payments += 1
             continue
-        idx.setdefault((cc, amt_k), []).append(p)
+        k = (cc_p, abs(amt_p))
+        (idx_neg if amt_p < 0 else idx_pos).setdefault(k, []).append(p)
 
     # 온누리 원장에서 넘어온 카드결제 행은 카드사가 없다.
     # 날짜·전화번호 뒤 4자리·금액으로 신용/체크카드 결제와 맞춘다.
@@ -5806,13 +5868,14 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
                 result_code = "official_only"
                 note_parts.append("신용카드 결제 없음" if last4 else "카드사 미상")
         else:
-            candidates = list(idx.get((cc, match_amt), []))
             # 취소 행은 양수 매출을 대신 붙이지 않는다. 과거 원매출은 6개월 조회가 맡는다.
             if is_cancel:
-                candidates = [p for p in candidates if int(p.get("amount") or 0) < 0]
+                candidates = list(idx_neg.get((cc, match_amt), []))
+            else:
+                candidates = list(idx_pos.get((cc, match_amt), []))
 
         if candidates:
-            # 매입일자 gap ±2일 이내 우선
+            # 매입일자 gap ±4일 이내 우선 (추석·설·주말 정산 지연 커버)
             def _gap(p):
                 ed = _ext_pay_as_date(p.get("payment_date"))
                 if fd is None or ed is None:
@@ -5822,8 +5885,7 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
             if len(candidates) == 1:
                 matched_pay = candidates[0]
             else:
-                # 매입일자 ±2일 초과 후보 제외
-                near = [p for p in candidates if _gap(p) <= 2]
+                near = [p for p in candidates if _gap(p) <= 4]
                 if len(near) == 1:
                     matched_pay = near[0]
                 elif near:
@@ -5833,7 +5895,7 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
                 else:
                     matched_pay = candidates[0]
                     result_code = "ambiguous"
-                    note_parts.append(f"카드사·금액 후보 {len(candidates)}건 · 근사일 초과")
+                    note_parts.append(f"카드사·금액 후보 {len(candidates)}건 · 근사일 초과(±4일)")
 
             if matched_pay is not None and result_code is None:
                 _dn = _ext_pay_date_gap_note(file_date, matched_pay.get("payment_date"))
@@ -5854,7 +5916,8 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
                         result_code = "matched_ok"
         else:
             if result_code is None:
-                # 금액 다른 카드사 매칭 후보 (amount_mismatch 케이스)
+                # 금액 다른 카드사 매칭 후보 (amount_mismatch 케이스).
+                # 취소행은 idx_neg 를 우선 봤기 때문에 여기선 양수 결제 중 금액이 다른 건을 찾는다.
                 amt_alts = []
                 if cc:
                     for _p in candidate_pays:
@@ -5906,11 +5969,14 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
         counts[result_code] = counts.get(result_code, 0) + 1
         if pay_id is not None:
             used_payment_ids.add(pay_id)
-            for k, lst in list(idx.items()):
-                idx[k] = [x for x in lst if int(x["id"]) != pay_id]
+            for _idx in (idx_pos, idx_neg):
+                for k, lst in list(_idx.items()):
+                    _idx[k] = [x for x in lst if int(x["id"]) != pay_id]
 
     leftover_pays = [p for p in candidate_pays if int(p["id"]) not in used_payment_ids]
     counts["erp_only"] = counts.get("erp_only", 0) + len(leftover_pays)
+    if skipped_no_cc_payments > 0:
+        counts["skipped_no_cc_payments"] = skipped_no_cc_payments
 
     for chunk in (inserts[i : i + 200] for i in range(0, len(inserts), 200)):
         try:
@@ -6906,12 +6972,12 @@ def _ext_pay_rehome_onnuri_card_rows(
 def _ext_pay_rematch_open_rows(
     sc, db_filename: str, source: str, verify_from: date | None,
 ) -> tuple[dict, str | None]:
-    """온누리·울산페이·메인페이 미결 매칭(공식만/ambiguous/금액불일치/공식취소)만 삭제 후 재매칭.
+    """온누리·울산페이·카드·메인페이 미결 매칭(공식만/ambiguous/금액불일치/공식취소)만 삭제 후 재매칭.
 
     - matched_ok / manual_matched / split_matched / erp_canceled_official_paid 는 유지.
     - 온누리/메인페이는 취소 행이 양수 전표에 묶인 레거시 쌍과 잠긴 erp_canceled 를 선 정리.
     - verify_from 이 지정되면 해당 시점 이후의 공식 행(row_id)에 대해서만 삭제한다."""
-    if source not in ("onnuri", "ulsanpay", "mainpay"):
+    if source not in ("onnuri", "ulsanpay", "card", "mainpay"):
         return {}, None
     if sc is None:
         return {}, "Supabase 연결 불가"
@@ -7200,6 +7266,8 @@ def _ext_pay_rematch_open_rows(
         return _ext_pay_match_onnuri(db_filename, vf, matched_by=None)
     if source == "mainpay":
         return _ext_pay_match_mainpay(db_filename, vf, matched_by=None)
+    if source == "card":
+        return _ext_pay_match_card(db_filename, vf, matched_by=None)
     return _ext_pay_match_ulsanpay(db_filename, vf, matched_by=None)
 
 
@@ -35962,6 +36030,58 @@ def _render_approval_edit_dialog_impl(db_filename: str, meta: dict) -> None:
     st.rerun()
 
 
+def _render_card_parse_diag(pdiag: dict) -> None:
+    """카드 파일 파싱 진단 패널. _ext_pay_parse_card_file 가 반환한 diag 를 UI 로 렌더.
+    헤더 미승격·필수 컬럼 누락·행 단위 skip 사유를 담당자가 즉시 확인하도록 표시."""
+    if not isinstance(pdiag, dict):
+        return
+    try:
+        data_rows = int(pdiag.get("data_rows") or 0)
+        parsed_rows = int(pdiag.get("parsed") or 0)
+        s_no_date = int(pdiag.get("skip_no_date") or 0)
+        s_no_amount = int(pdiag.get("skip_no_amount") or 0)
+        s_no_card = int(pdiag.get("skip_no_card") or 0)
+    except (TypeError, ValueError):
+        return
+    pass_ratio = (parsed_rows / data_rows) if data_rows > 0 else 1.0
+    if parsed_rows == 0 or pass_ratio < 0.5:
+        _render = st.warning
+    else:
+        _render = st.info
+    _render(
+        f"파싱 진단 — 원본 데이터 {data_rows}행 중 {parsed_rows}행 통과"
+        f" ({pass_ratio*100:.0f}%) · skip: 날짜누락 {s_no_date} · 금액누락 {s_no_amount}"
+        f" · 카드사누락 {s_no_card}"
+    )
+    detected = pdiag.get("detected_cols") or {}
+    if isinstance(detected, dict) and detected:
+        with st.expander("탐지된 컬럼 매핑 & 원본 헤더", expanded=False):
+            _rows = [
+                {"필드": k, "원본 컬럼": str(v)}
+                for k, v in detected.items()
+            ]
+            st.dataframe(
+                pd.DataFrame(_rows),
+                width="stretch",
+                hide_index=True,
+            )
+            header_sample = pdiag.get("header_sample") or []
+            if header_sample:
+                st.caption("파일에서 승격된 헤더 행 (promote 후): " + " | ".join(header_sample))
+    dropped = pdiag.get("dropped_sample") or []
+    if dropped:
+        with st.expander(f"드롭된 행 샘플 (최대 5건, 총 skip {s_no_date + s_no_amount + s_no_card}건)", expanded=False):
+            try:
+                st.dataframe(
+                    pd.DataFrame(dropped),
+                    width="stretch",
+                    hide_index=True,
+                )
+            except Exception as render_err:
+                st.caption(f"샘플 렌더 실패: {render_err}")
+                st.json(dropped)
+
+
 def _render_external_pay_admin_section(
     role: str, me_uname: str, *, allow_upload: bool = True,
 ) -> None:
@@ -36139,7 +36259,14 @@ def _render_external_pay_admin_section(
                 disabled=_biz_required_block,
             ):
                 with st.spinner("파일을 읽고 매칭하는 중..."):
-                    parsed, perr = _parse_fn(up)
+                    if _src_key == "card":
+                        parsed, perr, pdiag = _ext_pay_parse_card_file(up)
+                    else:
+                        parsed, perr = _parse_fn(up)
+                        pdiag = None
+                # 카드 파서 진단 정보를 항상 노출 — 왜 N건만 통과했는지 즉시 식별 가능.
+                if pdiag is not None:
+                    _render_card_parse_diag(pdiag)
                 card_parsed: list[dict] = []
                 if not perr and _src_key == "onnuri" and parsed:
                     card_parsed = [r for r in parsed if _ext_pay_is_onnuri_card_pay(r.get("pay_method"))]
@@ -36153,6 +36280,8 @@ def _render_external_pay_admin_section(
                     _upload_err: str | None = None
                     _conflicts_key = f"extpay_conflicts_{sel_db}_{_src_key}"
                     conflicts: list[dict] = []
+                    # 카드 매칭에서 ERP 카드사 미입력 결제 수를 모아둬 UI 경고로 노출.
+                    _skipped_no_cc: int = 0
                     if parsed:
                         st.session_state[f"_ext_pay_upload_business_{sel_db}_{_src_key}"] = sel_business or ""
                         inserted, skipped_before, skipped_dup, ierr, conflicts = _ext_pay_insert_batch_and_rows(
@@ -36175,6 +36304,10 @@ def _render_external_pay_admin_section(
                             if merr:
                                 _upload_err = f"매칭 실패: {merr}"
                             else:
+                                if _src_key == "card":
+                                    _skipped_no_cc += int(
+                                        (counts or {}).pop("skipped_no_cc_payments", 0) or 0
+                                    )
                                 _msg_parts.extend([
                                     f"신규 {inserted}건 적재",
                                     f"중복 skip {skipped_dup}건",
@@ -36197,6 +36330,9 @@ def _render_external_pay_admin_section(
                             if c_merr:
                                 _upload_err = f"신용카드 매칭 실패: {c_merr}"
                             else:
+                                _skipped_no_cc += int(
+                                    (c_counts or {}).pop("skipped_no_cc_payments", 0) or 0
+                                )
                                 _msg_parts.append(
                                     f"카드결제 {len(card_parsed)}건은 신용/체크카드로 매칭 "
                                     f"(신규 {c_inserted} · 중복 {c_dup} · 시작일 이전 {c_before})"
@@ -36227,6 +36363,12 @@ def _render_external_pay_admin_section(
                                     pass
                         flash(" · ".join(_msg_parts) or "처리 완료")
                         _ext_pay_clear_appr_popup(sel_db, sel_src)
+                        if _skipped_no_cc > 0:
+                            flash(
+                                f"ERP 결제 중 카드사 미입력 {_skipped_no_cc}건이 매칭 대상에서 제외됐습니다. "
+                                "ERP 결제 화면에서 카드사를 입력한 뒤 재매칭하면 자동 매칭됩니다.",
+                                level="warning",
+                            )
                         st.rerun()
 
         # 중복 skip 된 파일 행 상세 (지문 충돌) — 별개 거래로 강제 등록 가능
@@ -36262,8 +36404,8 @@ def _render_external_pay_admin_section(
             _sc, _sc_err = get_supabase_client()
             if _sc_err or not _sc:
                 st.error(f"Supabase 연결 실패: {_sc_err}")
-            elif sel_src not in ("onnuri", "ulsanpay", "mainpay"):
-                st.info("이 출처는 자동 재매칭 대상이 아닙니다. (온누리·울산페이·메인페이 전용)")
+            elif sel_src not in ("onnuri", "ulsanpay", "mainpay", "card"):
+                st.info("이 출처는 자동 재매칭 대상이 아닙니다. (온누리·울산페이·메인페이·카드 전용)")
             else:
                 with st.spinner("재매칭 중..."):
                     _counts, _rerr = _ext_pay_rematch_open_rows(
@@ -36272,11 +36414,18 @@ def _render_external_pay_admin_section(
                 if _rerr:
                     st.error(f"재매칭 실패: {_rerr}")
                 else:
+                    _skipped_no_cc = int((_counts or {}).pop("skipped_no_cc_payments", 0) or 0)
                     _msg = (
                         " · ".join(f"{k} {v}" for k, v in (_counts or {}).items())
                         or "변경 없음"
                     )
                     flash(f"재매칭 완료: {_msg}")
+                    if _skipped_no_cc > 0 and sel_src == "card":
+                        flash(
+                            f"ERP 결제 중 카드사 미입력 {_skipped_no_cc}건이 매칭 대상에서 제외됐습니다. "
+                            "ERP 결제 화면에서 카드사를 입력한 뒤 재매칭하면 자동 매칭됩니다.",
+                            level="warning",
+                        )
                     try:
                         st.cache_data.clear()
                     except Exception:
