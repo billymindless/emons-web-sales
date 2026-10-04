@@ -43724,9 +43724,21 @@ def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
         _render_mobile_contract_capture(db_filename, cur_cid, user, embedded=embedded)
 
 
+def _mct_done_banner():
+    """직전 업로드 완료 안내. 다음 고객을 고르기 전까지 유지한다."""
+    done = st.session_state.get("_mct_done")
+    if not done:
+        return
+    st.success(
+        f"{done.get('name') or '고객'} 계약서 {done.get('page') or ''}장 업로드가 완료되었습니다. "
+        "다른 고객 이름이나 전화번호로 이어서 찍을 수 있습니다."
+    )
+
+
 def _render_mobile_contract_search(db_filename: str):
     """화면 1·2: 고객 검색 + 결과 리스트."""
     import customer_contract_service as ccs  # noqa: WPS433
+    _mct_done_banner()
     q = st.text_input("고객 이름 또는 전화번호", key="mct_search_q", placeholder="예: 홍길동 또는 010-1234")
     rows = ccs.search_customers(db_filename, q, limit=20)
     if not q or not q.strip():
@@ -43750,12 +43762,13 @@ def _render_mobile_contract_search(db_filename: str):
             unsafe_allow_html=True,
         )
         if st.button(f"선택 →", key=f"mct_pick_{cid}", width="stretch"):
+            st.session_state.pop("_mct_done", None)
             _contract_qp_set(cid=cid)
             st.rerun()
 
 
 def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, embedded: bool = False):
-    """화면 3·4: 촬영 → 즉시 저장 → 다음 장."""
+    """화면 3·4: 사진을 고른 뒤 업로드 버튼으로 저장."""
     import customer_contract_service as ccs  # noqa: WPS433
     pages = ccs.list_pages(db_filename, int(customer_id))
     # 고객 이름 (searching 다시 안 하도록 가볍게)
@@ -43769,6 +43782,7 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
     except Exception:
         pass
 
+    _mct_done_banner()
     st.markdown(f'<div class="mct-title">{cust_name}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="mct-sub">현재 {len(pages)}장 저장됨 · 다음 저장 번호: {len(pages)+1}장</div>', unsafe_allow_html=True)
 
@@ -43837,44 +43851,41 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
             key=f"mct_up_{int(customer_id)}_{seq}",
             label_visibility="collapsed",
         )
-    source_bytes = None
-    if shot is not None:
-        try:
-            source_bytes = shot.getvalue()
-        except Exception:
-            source_bytes = shot.read() if hasattr(shot, "read") else None
-    if source_bytes is None and up is not None:
-        try:
-            source_bytes = up.getvalue()
-        except Exception:
-            source_bytes = up.read() if hasattr(up, "read") else None
-
-    if source_bytes:
-        with st.spinner("저장 중..."):
-            row, err = ccs.save_contract_page(
-                db_filename=db_filename,
-                customer_id=int(customer_id),
-                raw_image=source_bytes,
-                uploaded_by=_contract_actor(user),
-            )
-        if err:
-            st.error(f"저장 실패: {err}")
-        else:
-            st.success(f"✅ {row.get('page_no') or (len(pages)+1)}장 저장 완료")
-            # 다음 장을 위해 카메라 위젯 리셋
-            st.session_state["_mct_shot_seq"] = int(st.session_state.get("_mct_shot_seq", 0)) + 1
-            st.rerun()
+    pending = shot if shot is not None else up
+    if pending is not None:
+        st.image(pending, caption="올릴 사진", use_container_width=True)
+        if st.button("업로드", key=f"mct_upload_{int(customer_id)}_{seq}", type="primary", width="stretch"):
+            try:
+                source_bytes = pending.getvalue()
+            except Exception:
+                source_bytes = pending.read() if hasattr(pending, "read") else b""
+            with st.spinner("업로드 중..."):
+                row, err = ccs.save_contract_page(
+                    db_filename=db_filename,
+                    customer_id=int(customer_id),
+                    raw_image=source_bytes,
+                    uploaded_by=_contract_actor(user),
+                )
+            if err:
+                st.error(f"업로드 실패: {err}")
+            else:
+                st.session_state["_mct_done"] = {
+                    "name": cust_name,
+                    "page": row.get("page_no") or (len(pages) + 1),
+                }
+                st.session_state["_mct_shot_seq"] = seq + 1
+                st.rerun()
 
     st.divider()
     # 끝내기 / 다른 고객 — embedded 는 사이드바로 이동 가능하므로 '끝내기' 숨김
     if embedded:
-        if st.button("🔍 다른 고객 찾기", key="mct_find_other_emb", width="stretch"):
+        if st.button("🔍 다른 고객 검색", key="mct_find_other_emb", type="primary", width="stretch"):
             _contract_qp_set(cid=None)
             st.rerun()
     else:
         end_l, end_r = st.columns(2)
         with end_l:
-            if st.button("🔍 다른 고객 찾기", key="mct_find_other", width="stretch"):
+            if st.button("🔍 다른 고객 검색", key="mct_find_other", type="primary", width="stretch"):
                 _contract_qp_set(cid=None)
                 st.rerun()
         with end_r:
