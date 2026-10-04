@@ -43457,6 +43457,286 @@ def _render_pcr_planned_tab(db_filename: str, role: str, current_user: dict) -> 
                         st.error(f"실패: {err}")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 고객 계약서 보관 (고객_계약서_촬영_보관 플랜 구현)
+# - 모바일(?m=contract 라우트)에서 종이 계약서를 찍어 그 고객에 즉시 저장
+# - PC(render_customer_balance 안)에서 "📄 계약서 N장" 버튼으로 PDF 다이얼로그 열기
+# - 저장 규격은 customer_contract_service.py 가 책임: 세로 A4, 긴 변 2339px, JPEG q=80
+# ─────────────────────────────────────────────────────────────────────
+
+def _contract_actor(user) -> str:
+    return (user or {}).get("name") or (user or {}).get("username") or (user or {}).get("email") or ""
+
+
+def _contract_qp_set(**updates):
+    """st.query_params 를 안전하게 갱신 (값이 None 이면 제거)."""
+    try:
+        q = dict(st.query_params)
+    except Exception:
+        q = {}
+    for k, v in updates.items():
+        if v is None:
+            q.pop(k, None)
+        else:
+            q[k] = str(v)
+    try:
+        st.query_params.from_dict(q)
+    except Exception:
+        try:
+            st.query_params.clear()
+            for k, v in q.items():
+                st.query_params[k] = v
+        except Exception:
+            pass
+
+
+@st.dialog("고객 계약서", width="large")
+def _render_contract_pc_dialog(db_filename: str, customer_id: int, customer_label: str):
+    """PC 에서 그 고객 계약서를 PDF 로 보여주는 다이얼로그."""
+    import customer_contract_service as ccs  # noqa: WPS433
+    st.markdown(f"**{customer_label}** · 저장된 계약서")
+    pages = ccs.list_pages(db_filename, int(customer_id))
+    if not pages:
+        st.info("저장된 계약서가 없습니다. 휴대폰에서 상단 메뉴 → '📱 계약서 촬영' 으로 추가하세요.")
+        return
+    st.caption(f"총 {len(pages)}장 · 세로 A4 PDF 로 자동 저장")
+    # PDF 서명 URL
+    pdf_url = ccs.pdf_signed_url(db_filename, int(customer_id))
+    if pdf_url:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.link_button("📄 PDF 새 창으로 열기", pdf_url, use_container_width=True)
+        with c2:
+            if st.button("🔄 PDF 다시 만들기", key=f"ccs_rebuild_{customer_id}", use_container_width=True):
+                with st.spinner("PDF 재생성 중..."):
+                    ccs.rebuild_pdf(db_filename, int(customer_id))
+                st.toast("PDF 를 다시 만들었습니다.", icon="✅")
+                st.rerun(scope="app")
+        # 미리보기 (iframe)
+        st.components.v1.iframe(pdf_url, height=720, scrolling=True)
+    else:
+        st.warning("PDF 가 아직 준비되지 않았습니다. '🔄 PDF 다시 만들기' 를 눌러 주세요.")
+        if st.button("🔄 PDF 다시 만들기", key=f"ccs_rebuild2_{customer_id}", type="primary"):
+            with st.spinner("PDF 재생성 중..."):
+                ccs.rebuild_pdf(db_filename, int(customer_id))
+            st.rerun(scope="app")
+    # 썸네일로 각 페이지 보기/삭제
+    with st.expander("페이지별 보기 · 삭제", expanded=False):
+        cols = st.columns(4)
+        for i, p in enumerate(pages):
+            with cols[i % 4]:
+                turl = ccs.signed_url(p.get("thumb_path") or p.get("storage_path") or "")
+                if turl:
+                    st.image(turl, caption=f"{p.get('page_no')}장", use_container_width=True)
+                else:
+                    st.write(f"{p.get('page_no')}장 (미리보기 불가)")
+                if st.button("🗑️ 삭제", key=f"ccs_del_{p.get('id')}", use_container_width=True):
+                    err = ccs.delete_page(db_filename, int(p.get("id")))
+                    if err:
+                        st.error(err)
+                    else:
+                        st.toast(f"{p.get('page_no')}장 삭제", icon="🗑️")
+                        st.rerun(scope="app")
+
+
+def _render_contract_pc_button(db_filename: str, customer_id: int, customer_label: str):
+    """고객 상세 영역에 PDF 다이얼로그를 여는 버튼. 목록 단계에서는 쓰지 않음(장수만 표시)."""
+    import customer_contract_service as ccs  # noqa: WPS433
+    cnt = ccs.count_pages_by_customers(db_filename, [int(customer_id)]).get(int(customer_id), 0)
+    label = f"📄 계약서 {cnt}장 보기" if cnt > 0 else "📄 계약서 (없음)"
+    if st.button(label, key=f"ccs_open_pc_{customer_id}", use_container_width=True):
+        st.session_state["_ccs_dialog_cid"] = int(customer_id)
+        st.session_state["_ccs_dialog_label"] = customer_label
+        st.session_state["_ccs_dialog_open"] = True
+        st.rerun()
+    # 다이얼로그 트리거: 한 번만 열림
+    if (
+        st.session_state.get("_ccs_dialog_open")
+        and st.session_state.get("_ccs_dialog_cid") == int(customer_id)
+    ):
+        st.session_state["_ccs_dialog_open"] = False
+        _render_contract_pc_dialog(
+            db_filename, int(customer_id),
+            st.session_state.get("_ccs_dialog_label") or str(customer_id),
+        )
+
+
+def _render_mobile_contract_app(user, db_filename: str):
+    """모바일 전용 계약서 라우트. ?m=contract 로 진입.
+
+    4화면:
+      (1) 고객 검색 (?m=contract)
+      (2) 검색 결과 리스트 → 탭하면 (3) 로 이동
+      (3) 그 고객의 촬영/목록 (?m=contract&cid=N)
+      (4) 저장 성공 토스트 후 즉시 (3) 로 복귀, 카메라 다시 준비
+    """
+    import customer_contract_service as ccs  # noqa: WPS433
+    st.markdown(
+        """
+        <style>
+          /* 모바일 전용 레이아웃 */
+          [data-testid="stSidebar"], [data-testid="stSidebarNav"], [data-testid="collapsedControl"] { display:none !important; }
+          [data-testid="stHeader"] { background: transparent !important; }
+          .block-container { padding: 0.5rem 0.75rem 2rem 0.75rem !important; max-width: 100% !important; }
+          .mct-title { font-weight:700; font-size:1.15rem; margin: 0.2rem 0 0.6rem 0; }
+          .mct-sub   { color:#555; font-size:0.9rem; margin-bottom:0.4rem; }
+          .mct-card  { border:1px solid #e5e5e5; border-radius:10px; padding:0.6rem 0.8rem; margin-bottom:0.5rem; background:#fff; }
+          .mct-badge { display:inline-block; padding:0.1rem 0.5rem; border-radius:999px; background:#fff4e5; color:#d35400; font-size:0.78rem; margin-left:0.3rem; }
+          .stButton>button { min-height: 48px !important; font-size: 1rem !important; }
+          /* A4 가이드 괄호 (카메라 위에 안내) */
+          .mct-guide { border:2px dashed #ff6b00; border-radius:10px; padding:0.6rem; margin:0.3rem 0 0.6rem 0;
+                       color:#d35400; background:rgba(255,107,0,0.04); text-align:center; font-weight:700; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cid_qp = (st.query_params.get("cid") or "").strip()
+    try:
+        cur_cid = int(cid_qp) if cid_qp.isdigit() else None
+    except Exception:
+        cur_cid = None
+
+    # 공통 상단 바
+    top_l, top_r = st.columns([1, 2])
+    with top_l:
+        if cur_cid is not None:
+            if st.button("← 뒤로", key="mct_back", use_container_width=True):
+                _contract_qp_set(cid=None)
+                st.rerun()
+        else:
+            if st.button("🏠 홈", key="mct_home", use_container_width=True):
+                _contract_qp_set(m=None, cid=None)
+                st.session_state["main_tab_idx"] = 0
+                st.rerun()
+    with top_r:
+        st.markdown('<div class="mct-title">📄 계약서 촬영</div>', unsafe_allow_html=True)
+
+    if cur_cid is None:
+        _render_mobile_contract_search(db_filename)
+    else:
+        _render_mobile_contract_capture(db_filename, cur_cid, user)
+
+
+def _render_mobile_contract_search(db_filename: str):
+    """화면 1·2: 고객 검색 + 결과 리스트."""
+    import customer_contract_service as ccs  # noqa: WPS433
+    q = st.text_input("고객 이름 또는 전화번호", key="mct_search_q", placeholder="예: 홍길동 또는 010-1234")
+    rows = ccs.search_customers(db_filename, q, limit=20)
+    if not q or not q.strip():
+        st.markdown('<div class="mct-sub">이름의 일부 또는 전화번호 뒷자리를 입력하세요.</div>', unsafe_allow_html=True)
+        return
+    if not rows:
+        st.info("검색 결과가 없습니다. PC 에서 신규 매출을 먼저 등록하세요.")
+        return
+    # 장수 일괄 조회
+    ids = [int(r["id"]) for r in rows if r.get("id") is not None]
+    counts = ccs.count_pages_by_customers(db_filename, ids)
+    st.markdown(f'<div class="mct-sub">{len(rows)}명 중 선택하세요.</div>', unsafe_allow_html=True)
+    for r in rows:
+        cid = int(r["id"])
+        name = r.get("name") or "-"
+        phone = r.get("phone1") or r.get("phone2") or "-"
+        n = counts.get(cid, 0)
+        badge = f'<span class="mct-badge">계약서 {n}장</span>' if n else ""
+        st.markdown(
+            f'<div class="mct-card"><b>{name}</b> &nbsp; <span style="color:#666">{phone}</span>{badge}</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button(f"선택 →", key=f"mct_pick_{cid}", use_container_width=True):
+            _contract_qp_set(cid=cid)
+            st.rerun()
+
+
+def _render_mobile_contract_capture(db_filename: str, customer_id: int, user):
+    """화면 3·4: 촬영 → 즉시 저장 → 다음 장."""
+    import customer_contract_service as ccs  # noqa: WPS433
+    pages = ccs.list_pages(db_filename, int(customer_id))
+    # 고객 이름 (searching 다시 안 하도록 가볍게)
+    sc, _ = get_supabase_client()
+    cust_name = str(customer_id)
+    try:
+        if sc:
+            r = sc.table("app_customers").select("name, phone1").eq("id", int(customer_id)).maybe_single().execute()
+            if r.data:
+                cust_name = f"{r.data.get('name') or '-'} ({r.data.get('phone1') or '-'})"
+    except Exception:
+        pass
+
+    st.markdown(f'<div class="mct-title">{cust_name}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="mct-sub">현재 {len(pages)}장 저장됨 · 다음 저장 번호: {len(pages)+1}장</div>', unsafe_allow_html=True)
+
+    # 저장된 썸네일 바 (장수만 보이게)
+    if pages:
+        tcols = st.columns(min(4, len(pages)))
+        for i, p in enumerate(pages[-4:]):
+            with tcols[i]:
+                turl = ccs.signed_url(p.get("thumb_path") or p.get("storage_path") or "")
+                if turl:
+                    st.image(turl, caption=f"{p.get('page_no')}장", use_container_width=True)
+                else:
+                    st.write(f"{p.get('page_no')}장")
+
+    # A4 가이드
+    st.markdown(
+        '<div class="mct-guide">📐 A4 세로로 들고 전체가 보이게 찍으세요<br>'
+        '밝은 바닥에서, 그림자/반사 피하기</div>',
+        unsafe_allow_html=True,
+    )
+
+    # 촬영 — rerun 때마다 키 바꿔 카메라 재준비
+    cam_key = f"mct_cam_{int(customer_id)}_{st.session_state.get('_mct_shot_seq', 0)}"
+    shot = st.camera_input("📷 사진 찍기", key=cam_key, label_visibility="collapsed")
+
+    # 갤러리에서 올리기 (예비)
+    with st.expander("갤러리에서 올리기", expanded=False):
+        up = st.file_uploader(
+            "사진 선택", type=["jpg", "jpeg", "png", "webp", "heic"],
+            key=f"mct_up_{int(customer_id)}_{st.session_state.get('_mct_shot_seq', 0)}",
+            label_visibility="collapsed",
+        )
+    source_bytes = None
+    if shot is not None:
+        try:
+            source_bytes = shot.getvalue()
+        except Exception:
+            source_bytes = shot.read() if hasattr(shot, "read") else None
+    if source_bytes is None and up is not None:
+        try:
+            source_bytes = up.getvalue()
+        except Exception:
+            source_bytes = up.read() if hasattr(up, "read") else None
+
+    if source_bytes:
+        with st.spinner("저장 중..."):
+            row, err = ccs.save_contract_page(
+                db_filename=db_filename,
+                customer_id=int(customer_id),
+                raw_image=source_bytes,
+                uploaded_by=_contract_actor(user),
+            )
+        if err:
+            st.error(f"저장 실패: {err}")
+        else:
+            st.success(f"✅ {row.get('page_no') or (len(pages)+1)}장 저장 완료")
+            # 다음 장을 위해 카메라 위젯 리셋
+            st.session_state["_mct_shot_seq"] = int(st.session_state.get("_mct_shot_seq", 0)) + 1
+            st.rerun()
+
+    st.divider()
+    # 끝내기 / 다른 고객
+    end_l, end_r = st.columns(2)
+    with end_l:
+        if st.button("🔍 다른 고객 찾기", key="mct_find_other", use_container_width=True):
+            _contract_qp_set(cid=None)
+            st.rerun()
+    with end_r:
+        if st.button("✅ 끝내기", key="mct_finish", type="primary", use_container_width=True):
+            _contract_qp_set(m=None, cid=None)
+            st.session_state["main_tab_idx"] = 0
+            st.rerun()
+
+
 def render_customer_balance():
     db_filename = st.session_state.get("current_db")
     if not db_filename:
@@ -43634,6 +43914,16 @@ def render_customer_balance():
                                             st.error(f"발송 실패: {_ft_res.get('error')}")
                 except Exception:
                     pass  # customer_channel 미설치 환경에서도 UI가 깨지지 않도록
+
+                # 📄 고객 계약서 PDF 다이얼로그 버튼 (장수만 조회 → 클릭 시 PDF 로드)
+                try:
+                    _render_contract_pc_button(
+                        db_filename,
+                        int(cid),
+                        f"{_sel_name} ({_sel_phone or '-'})",
+                    )
+                except Exception as _cce:
+                    st.caption(f"⚠️ 계약서 모듈 로드 실패: {_cce}")
 
                 if _supabase_orders_payments_available():
                     # 선택된 고객의 주문만 서버에서 필터링 — 매장 전체 스캔 회피.
@@ -47060,6 +47350,19 @@ def main():
 
     user = st.session_state.current_user
     role = user["role"]
+
+    # 모바일 전용 계약서 라우트: ?m=contract (사이드바 숨긴 간결 UI)
+    try:
+        _m_qp = st.query_params.get("m")
+    except Exception:
+        _m_qp = None
+    if _m_qp == "contract":
+        _db_mct = st.session_state.get("current_db") or user.get("db_filename")
+        if not _db_mct:
+            st.warning("매장 DB 정보를 찾을 수 없습니다. PC 에서 먼저 로그인 상태를 확인하세요.")
+            return
+        _render_mobile_contract_app(user, _db_mct)
+        return
 
     # 세션 유지 하트비트: 15분(900,000ms)마다 rerun.
     # (Phase1 성능 개선 — 기존 5분 → 15분: 캐시 재검증·풀 rerun 빈도 감소.
