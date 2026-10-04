@@ -43797,15 +43797,44 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
         unsafe_allow_html=True,
     )
 
-    # 촬영 — rerun 때마다 키 바꿔 카메라 재준비
-    cam_key = f"mct_cam_{int(customer_id)}_{st.session_state.get('_mct_shot_seq', 0)}"
-    shot = st.camera_input("📷 사진 찍기", key=cam_key, label_visibility="collapsed")
+    # 앱 안 카메라(st.camera_input)는 미리보기 영상만 저장하고, 아이폰에서는
+    # iframe 권한 때문에 "allow camera"에서 멈춘다. 파일 선택에 capture 를 붙여
+    # 휴대폰 카메라 앱의 원본 사진을 받는다.
+    seq = int(st.session_state.get("_mct_shot_seq", 0))
+    shot = st.file_uploader(
+        "계약서 찍기",
+        type=["jpg", "jpeg", "png", "webp", "heic"],
+        key=f"mct_cam_{int(customer_id)}_{seq}",
+    )
+    components.html(
+        """
+        <script>
+        (function () {
+          function tag() {
+            var doc = window.parent.document;
+            var boxes = doc.querySelectorAll('[data-testid="stFileUploader"]');
+            if (!boxes.length) return;
+            var input = boxes[0].querySelector('input[type="file"]');
+            if (!input) return;
+            input.setAttribute('accept', 'image/*');
+            input.setAttribute('capture', 'environment');
+            var btn = boxes[0].querySelector('button');
+            if (btn) btn.textContent = '계약서 찍기';
+          }
+          tag();
+          setTimeout(tag, 400);
+          setTimeout(tag, 1200);
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
-    # 갤러리에서 올리기 (예비)
+    # 갤러리에서 올리기 (예비). capture 를 붙이지 않는다.
     with st.expander("갤러리에서 올리기", expanded=False):
         up = st.file_uploader(
-            "사진 선택", type=["jpg", "jpeg", "png", "webp", "heic"],
-            key=f"mct_up_{int(customer_id)}_{st.session_state.get('_mct_shot_seq', 0)}",
+            "갤러리 사진 선택", type=["jpg", "jpeg", "png", "webp", "heic"],
+            key=f"mct_up_{int(customer_id)}_{seq}",
             label_visibility="collapsed",
         )
     source_bytes = None
