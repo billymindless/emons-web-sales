@@ -43601,23 +43601,18 @@ def _render_contract_pc_dialog(
             with st.spinner("PDF 재생성 중..."):
                 ccs.rebuild_pdf(db_filename, int(customer_id))
             st.rerun(scope="app")
-    # 썸네일로 각 페이지 보기/삭제 — 잘못된 장은 여기서 바로 지운다
-    with st.expander("페이지별 보기 · 삭제", expanded=True):
-        cols = st.columns(4)
-        for i, p in enumerate(pages):
-            with cols[i % 4]:
-                turl = ccs.signed_url(p.get("thumb_path") or p.get("storage_path") or "")
-                if turl:
-                    st.image(turl, caption=f"{p.get('page_no')}장", use_container_width=True)
+    # 위에서 이미 각 장 사진을 보여줬다. 여기서는 장별 삭제 버튼만 둔다.
+    st.caption("잘못 올린 장은 아래에서 지웁니다.")
+    cols = st.columns(min(4, len(pages)))
+    for i, p in enumerate(pages):
+        with cols[i % len(cols)]:
+            if st.button(f"🗑️ {p.get('page_no')}장 삭제", key=f"ccs_del_{p.get('id')}", width="stretch"):
+                err = ccs.delete_page(db_filename, int(p.get("id")))
+                if err:
+                    st.error(err)
                 else:
-                    st.write(f"{p.get('page_no')}장 (미리보기 불가)")
-                if st.button("🗑️ 삭제", key=f"ccs_del_{p.get('id')}", width="stretch"):
-                    err = ccs.delete_page(db_filename, int(p.get("id")))
-                    if err:
-                        st.error(err)
-                    else:
-                        st.toast(f"{p.get('page_no')}장 삭제", icon="🗑️")
-                        st.rerun(scope="app")
+                    st.toast(f"{p.get('page_no')}장 삭제", icon="🗑️")
+                    st.rerun(scope="app")
 
 
 def _render_contract_pc_button(
@@ -43713,6 +43708,8 @@ def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
             else:
                 if st.button("🏠 홈", key="mct_home", width="stretch"):
                     _contract_qp_set(m=None, cid=None)
+                    # ERP 레일로 들어왔을 때 계약서 라우팅도 해제
+                    st.session_state.pop("active_admin_page", None)
                     st.session_state["main_tab_idx"] = 0
                     st.rerun()
         with top_r:
@@ -43891,6 +43888,7 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
         with end_r:
             if st.button("✅ 끝내기", key="mct_finish", type="primary", width="stretch"):
                 _contract_qp_set(m=None, cid=None)
+                st.session_state.pop("active_admin_page", None)
                 st.session_state["main_tab_idx"] = 0
                 st.rerun()
 
@@ -47658,7 +47656,7 @@ def main():
     if st.session_state.get("active_admin_page") == "customer_contract":
         _db_contract = st.session_state.get("current_db") or user.get("db_filename")
         if _db_contract:
-            _render_mobile_contract_app(user, _db_contract, embedded=True)
+            _render_mobile_contract_app(user, _db_contract, embedded=False)
         else:
             st.warning("매장 DB 정보를 찾을 수 없습니다.")
         return
@@ -47754,7 +47752,7 @@ def main():
     elif role == "store_admin" and idx == 15:
         _db_contract = st.session_state.get("current_db") or user.get("db_filename")
         if _db_contract:
-            _render_mobile_contract_app(user, _db_contract, embedded=True)
+            _render_mobile_contract_app(user, _db_contract, embedded=False)
         else:
             st.warning("매장 DB 정보를 찾을 수 없습니다.")
     elif role == "user" and idx == 9:
@@ -47766,7 +47764,7 @@ def main():
     elif role == "user" and idx == 11:
         _db_contract = st.session_state.get("current_db") or user.get("db_filename")
         if _db_contract:
-            _render_mobile_contract_app(user, _db_contract, embedded=True)
+            _render_mobile_contract_app(user, _db_contract, embedded=False)
         else:
             st.warning("매장 DB 정보를 찾을 수 없습니다.")
 
