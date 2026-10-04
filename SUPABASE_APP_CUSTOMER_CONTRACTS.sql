@@ -1,6 +1,6 @@
 -- 고객 계약서 보관 스키마
 -- 종이 계약서를 휴대폰으로 찍어 그 고객에 붙이고, PC에서 세로 A4 PDF로 다시 봅니다.
--- 저장 규격: EXIF 적용 후 세로 A4, 긴 변 2339px, JPEG q=80.
+-- 저장 규격: EXIF 적용 후 세로 A4, 긴 변 3508px, JPEG q=85.
 -- 모든 DDL은 멱등 (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS).
 --
 -- 사용 방법:

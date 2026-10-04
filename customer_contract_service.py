@@ -7,7 +7,7 @@ app.py 의 Supabase 클라이언트를 재사용하고, 결제변경/업무 첨�
 저장 규격 (plan: 고객_계약서_촬영_보관):
   - EXIF 회전값을 픽셀에 적용 후 EXIF 제거.
   - 가로가 더 길면 시계방향 90° 회전 → 세로 A4 고정.
-  - 긴 변 2339px (A4 200dpi) 로 축소, JPEG q=80. 1MB 초과면 q=70 재시도.
+  - 긴 변 3508px (A4 300dpi) 로 축소, JPEG q=85. 2MB 초과면 q=75 재시도.
   - 썸네일은 긴 변 480px JPEG. 폰의 장 목록용.
   - 그 고객의 PDF (A4 세로) 를 저장 요청 안에서 다시 만들어 {db}/{cid}/contract.pdf 로 캐시.
 """
@@ -37,12 +37,12 @@ def _admin_client():
 
 
 BUCKET = "customer-contracts"
-A4_LONG_PX = 2339      # A4 세로 긴 변 (200dpi 기준)
-A4_SHORT_PX = 1654     # A4 가로 짧은 변
+A4_LONG_PX = 3508      # A4 세로 긴 변 (300dpi)
+A4_SHORT_PX = 2480     # A4 가로 짧은 변 (300dpi)
 THUMB_LONG_PX = 480
-JPEG_Q_HIGH = 80
-JPEG_Q_LOW = 70
-MAX_PER_PAGE_BYTES = 1024 * 1024  # 1MB
+JPEG_Q_HIGH = 85
+JPEG_Q_LOW = 75
+MAX_PER_PAGE_BYTES = 2 * 1024 * 1024  # 2MB. 넘을 때만 q=75
 
 # PDF 페이지 크기 (A4 세로, PDF 포인트 = 1/72 inch)
 A4_PDF_W_PT = 595
@@ -56,7 +56,7 @@ A4_PDF_H_PT = 842
 def normalize_contract_image(raw: bytes) -> tuple[bytes, bytes]:
     """원본 바이트 → (저장용 JPEG, 썸네일 JPEG).
 
-    세로 A4 긴 변 2339px, q=80. 1MB 초과 시 q=70 재시도.
+    세로 A4 긴 변 3508px, q=85. 2MB 초과 시 q=75 재시도.
     썸네일은 긴 변 480px.
     """
     from PIL import Image, ImageOps  # noqa: WPS433
@@ -75,7 +75,7 @@ def normalize_contract_image(raw: bytes) -> tuple[bytes, bytes]:
         img = img.rotate(-90, expand=True)
         w, h = img.size
 
-    # A4 세로 긴 변 2339px 로 축소. 세로가 긴 변.
+    # A4 세로 긴 변 3508px 로 축소. 세로가 긴 변.
     if h > A4_LONG_PX:
         scale = A4_LONG_PX / float(h)
         new_w = max(1, int(round(w * scale)))
@@ -486,32 +486,6 @@ def rebuild_pdf(db_filename: str, customer_id: int) -> str | None:
         logger.warning("PDF 업로드 실패: %s", up_err)
         return None
     return pdf_p
-
-
-def download_bytes(path: str) -> bytes | None:
-    """Storage 파일을 바이트로 받는다. 실패 시 None."""
-    if not path:
-        return None
-    admin, err = _admin_client()
-    if err or not admin:
-        c, cerr = _client()
-        if cerr or not c:
-            return None
-        admin = c
-    try:
-        data = admin.storage.from_(BUCKET).download(path)
-    except Exception as e:
-        logger.warning("Storage 다운로드 실패 %s: %s", path, e)
-        return None
-    if isinstance(data, bytes):
-        return data
-    return bytes(data) if data else None
-
-
-def pdf_bytes(db_filename: str, customer_id: int) -> bytes | None:
-    if not db_filename or customer_id is None:
-        return None
-    return download_bytes(pdf_path(db_filename, int(customer_id)))
 
 
 def pdf_signed_url(db_filename: str, customer_id: int, expires_in: int = 3600) -> str | None:

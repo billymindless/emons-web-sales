@@ -43474,7 +43474,7 @@ def _render_pcr_planned_tab(db_filename: str, role: str, current_user: dict) -> 
 # 고객 계약서 보관 (고객_계약서_촬영_보관 플랜 구현)
 # - 모바일(?m=contract 라우트)에서 종이 계약서를 찍어 그 고객에 즉시 저장
 # - PC(render_customer_balance 안)에서 "📄 계약서 N장" 버튼으로 PDF 다이얼로그 열기
-# - 저장 규격은 customer_contract_service.py 가 책임: 세로 A4, 긴 변 2339px, JPEG q=80
+# - 저장 규격은 customer_contract_service.py 가 책임: 세로 A4, 긴 변 3508px, JPEG q=85
 # ─────────────────────────────────────────────────────────────────────
 
 def _contract_actor(user) -> str:
@@ -43529,7 +43529,7 @@ def _render_contract_pc_dialog(
 
     # 업로드 영역 (파일/카메라) — 플랜의 "파일 선택도 허용"
     with st.container(border=True):
-        st.caption("계약서 추가 (여러 장 가능) · 세로 A4, 긴 변 2339px, JPEG q=80 으로 자동 변환")
+        st.caption("계약서 추가 (여러 장 가능) · 세로 A4, 긴 변 3508px, JPEG q=85 으로 자동 변환")
         up_key = f"ccs_pc_up_{customer_id}_{st.session_state.get('_ccs_up_seq', 0)}"
         files = st.file_uploader(
             "스캔 파일 또는 사진 선택",
@@ -43584,12 +43584,16 @@ def _render_contract_pc_dialog(
                     ccs.rebuild_pdf(db_filename, int(customer_id))
                 st.toast("PDF 를 다시 만들었습니다.", icon="✅")
                 st.rerun(scope="app")
-        # Supabase 서명 URL 을 iframe 에 넣으면 Chrome 이 X-Frame-Options 로 막는다.
-        # 바이트를 받아 앱 안에서 그린다.
-        pdf_data = ccs.pdf_bytes(db_filename, int(customer_id))
-        if pdf_data:
-            st.pdf(pdf_data, height=720)
-        else:
+        # st.pdf 는 streamlit-pdf 가 없으면 StreamlitAPIException 을 낸다.
+        # 저장된 JPEG 장을 세로로 보여 준다. PDF 파일은 위 버튼으로 연다.
+        shown = 0
+        for p in pages:
+            url = ccs.signed_url(p.get("storage_path") or "")
+            if not url:
+                continue
+            st.image(url, caption=f"{p.get('page_no')}장", use_container_width=True)
+            shown += 1
+        if shown == 0:
             st.info("미리보기를 불러오지 못했습니다. 위의 'PDF 새 창으로 열기'를 사용하세요.")
     else:
         st.warning("PDF 가 아직 준비되지 않았습니다. '🔄 PDF 다시 만들기' 를 눌러 주세요.")
