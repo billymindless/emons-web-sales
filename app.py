@@ -685,6 +685,15 @@ def _render_primary_nav(user: dict, role: str) -> None:
 
     st.markdown("<div class='sales-nav-title'>📋 메뉴</div>", unsafe_allow_html=True)
 
+    # 계약서 촬영은 라디오 맨 아래(16번)라 사이드바에서 잘린다. 맨 위에 고정 버튼으로 연다.
+    _contract_label = next((lb for lb in labels if "계약서 촬영" in str(lb)), None)
+    if _contract_label:
+        if st.button("📄 계약서 촬영", key="nav_contract_top", type="primary", width="stretch"):
+            st.session_state[idx_key] = labels.index(_contract_label)
+            st.session_state[radio_key] = _contract_label
+            st.session_state.pop("active_admin_page", None)
+            st.rerun()
+
     # 라디오 위젯 초기값을 현재 인덱스와 동기화
     _cur_idx = st.session_state[idx_key]
     if radio_key not in st.session_state:
@@ -43581,8 +43590,8 @@ def _render_contract_pc_dialog(
             with st.spinner("PDF 재생성 중..."):
                 ccs.rebuild_pdf(db_filename, int(customer_id))
             st.rerun(scope="app")
-    # 썸네일로 각 페이지 보기/삭제
-    with st.expander("페이지별 보기 · 삭제", expanded=False):
+    # 썸네일로 각 페이지 보기/삭제 — 잘못된 장은 여기서 바로 지운다
+    with st.expander("페이지별 보기 · 삭제", expanded=True):
         cols = st.columns(4)
         for i, p in enumerate(pages):
             with cols[i % 4]:
@@ -43752,16 +43761,23 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
     st.markdown(f'<div class="mct-title">{cust_name}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="mct-sub">현재 {len(pages)}장 저장됨 · 다음 저장 번호: {len(pages)+1}장</div>', unsafe_allow_html=True)
 
-    # 저장된 썸네일 바 (장수만 보이게)
+    # 저장된 장. 잘못된 장은 썸네일 아래 삭제로 지운다.
     if pages:
         tcols = st.columns(min(4, len(pages)))
-        for i, p in enumerate(pages[-4:]):
-            with tcols[i]:
+        for i, p in enumerate(pages):
+            with tcols[i % len(tcols)]:
                 turl = ccs.signed_url(p.get("thumb_path") or p.get("storage_path") or "")
                 if turl:
                     st.image(turl, caption=f"{p.get('page_no')}장", use_container_width=True)
                 else:
                     st.write(f"{p.get('page_no')}장")
+                if st.button("삭제", key=f"mct_del_{p.get('id')}", width="stretch"):
+                    err = ccs.delete_page(db_filename, int(p.get("id")))
+                    if err:
+                        st.error(err)
+                    else:
+                        st.toast(f"{p.get('page_no')}장 삭제", icon="🗑️")
+                        st.rerun()
 
     # A4 가이드
     st.markdown(
@@ -43932,6 +43948,13 @@ def render_customer_balance():
                     ]["id"].tolist()
                 if not all_cids:
                     all_cids = [cid]
+                # 고객 이름 바로 아래. 카카오 줄·주문 표보다 먼저 그린다.
+                _render_contract_pc_button(
+                    db_filename,
+                    int(cid),
+                    [int(x) for x in all_cids if x is not None],
+                    f"{_sel_name} ({_sel_phone or '-'})",
+                )
                 # 병합된 별칭 customer_id 를 UI 에 안내 (다른 이름으로 저장된 케이스 감지)
                 if len(all_cids) > 1:
                     _alias_names = customers[customers["id"].isin(all_cids)]["name"].fillna("").unique().tolist()
@@ -44005,15 +44028,6 @@ def render_customer_balance():
                                             st.error(f"발송 실패: {_ft_res.get('error')}")
                 except Exception:
                     pass  # customer_channel 미설치 환경에서도 UI가 깨지지 않도록
-
-                # 📄 고객 계약서 다이얼로그 버튼 (장수만 조회 → 클릭 시 PDF/업로드)
-                # 같은 전화번호로 합쳐진 고객(all_cids) 전부에서 장수를 센다.
-                _render_contract_pc_button(
-                    db_filename,
-                    int(cid),
-                    [int(x) for x in all_cids if x is not None],
-                    f"{_sel_name} ({_sel_phone or '-'})",
-                )
 
                 if _supabase_orders_payments_available():
                     # 선택된 고객의 주문만 서버에서 필터링 — 매장 전체 스캔 회피.
