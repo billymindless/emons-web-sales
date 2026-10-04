@@ -488,6 +488,32 @@ def rebuild_pdf(db_filename: str, customer_id: int) -> str | None:
     return pdf_p
 
 
+def download_bytes(path: str) -> bytes | None:
+    """Storage 파일을 바이트로 받는다. 실패 시 None."""
+    if not path:
+        return None
+    admin, err = _admin_client()
+    if err or not admin:
+        c, cerr = _client()
+        if cerr or not c:
+            return None
+        admin = c
+    try:
+        data = admin.storage.from_(BUCKET).download(path)
+    except Exception as e:
+        logger.warning("Storage 다운로드 실패 %s: %s", path, e)
+        return None
+    if isinstance(data, bytes):
+        return data
+    return bytes(data) if data else None
+
+
+def pdf_bytes(db_filename: str, customer_id: int) -> bytes | None:
+    if not db_filename or customer_id is None:
+        return None
+    return download_bytes(pdf_path(db_filename, int(customer_id)))
+
+
 def pdf_signed_url(db_filename: str, customer_id: int, expires_in: int = 3600) -> str | None:
     """PDF 가 있으면 서명 URL, 없으면 None."""
     if not db_filename or customer_id is None:

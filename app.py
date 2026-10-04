@@ -43584,8 +43584,13 @@ def _render_contract_pc_dialog(
                     ccs.rebuild_pdf(db_filename, int(customer_id))
                 st.toast("PDF 를 다시 만들었습니다.", icon="✅")
                 st.rerun(scope="app")
-        # 미리보기 (iframe)
-        st.components.v1.iframe(pdf_url, height=720, scrolling=True)
+        # Supabase 서명 URL 을 iframe 에 넣으면 Chrome 이 X-Frame-Options 로 막는다.
+        # 바이트를 받아 앱 안에서 그린다.
+        pdf_data = ccs.pdf_bytes(db_filename, int(customer_id))
+        if pdf_data:
+            st.pdf(pdf_data, height=720)
+        else:
+            st.info("미리보기를 불러오지 못했습니다. 위의 'PDF 새 창으로 열기'를 사용하세요.")
     else:
         st.warning("PDF 가 아직 준비되지 않았습니다. '🔄 PDF 다시 만들기' 를 눌러 주세요.")
         if st.button("🔄 PDF 다시 만들기", key=f"ccs_rebuild2_{customer_id}", type="primary"):
