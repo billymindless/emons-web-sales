@@ -529,6 +529,8 @@ def _render_erp_icon_rail(role: str) -> None:
         for _k in ("nav_radio_main_tab_idx", "nav_radio_superadmin_menu_idx"):
             st.session_state.pop(_k, None)
         # 사이드바 세팅 후 st.rerun 생략 — main() 라우팅이 이번 rerun 안에서 처리.
+    if st.button("📄", key="rail_contract", help="계약서 촬영", width="stretch"):
+        _go("customer_contract")
     if st.button("🗓️", key="rail_erp", help="근태 관리", width="stretch"):
         _go("erp_attendance")
     if st.button("📧", key="rail_mail", help="메일 관리", width="stretch"):
@@ -47602,6 +47604,14 @@ def main():
 
     if st.session_state.get("active_admin_page") == "internal_board":
         render_internal_board()
+        return
+
+    if st.session_state.get("active_admin_page") == "customer_contract":
+        _db_contract = st.session_state.get("current_db") or user.get("db_filename")
+        if _db_contract:
+            _render_mobile_contract_app(user, _db_contract, embedded=True)
+        else:
+            st.warning("매장 DB 정보를 찾을 수 없습니다.")
         return
 
     # Superadmin: 5탭 최고 관리자 메뉴
