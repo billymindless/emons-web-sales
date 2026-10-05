@@ -43957,8 +43957,8 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
         unsafe_allow_html=True,
     )
 
-    # 카메라 한 장씩 대기 목록에 모으고, 갤러리는 한 번에 여러 장. 업로드는 한 번.
-    # capture 는 아이폰·갤럭시 모두 셔터 한 번에 한 장만 돌려준다.
+    # 카메라는 셔터 한 번당 즉시 저장. 갤럭시는 카메라 앱이 열리면 브라우저 세션이
+    # 리셋될 수 있어 대기 목록이 사라지기 때문이다. 갤러리는 한 번에 여러 장을 모아 업로드.
     _MCT_BATCH_MAX = 10
     pending_key = f"_mct_pending_{int(customer_id)}"
     pending: list[bytes] = st.session_state.setdefault(pending_key, [])
@@ -43973,6 +43973,7 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
         except Exception:
             return uploaded.read() if hasattr(uploaded, "read") else b""
 
+    st.caption("찍으면 바로 저장됩니다. 이어서 찍으세요.")
     shot = st.file_uploader(
         "계약서 찍기",
         type=["jpg", "jpeg", "png", "webp", "heic"],
@@ -44012,13 +44013,30 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
         )
 
     absorbed = False
+    # 카메라 셔터 1장은 바로 저장한다. 갤럭시 세션 리셋에도 그 장이 서버에 남는다.
     if shot is not None:
-        if len(pending) >= _MCT_BATCH_MAX:
-            st.session_state["_mct_batch_warn"] = "한 번에 10장까지 올릴 수 있습니다."
-        else:
-            blob = _take_bytes(shot)
-            if blob:
-                pending.append(blob)
+        blob = _take_bytes(shot)
+        if blob:
+            actor = _contract_actor(user)
+            with st.spinner("저장 중..."):
+                _row, err = ccs.save_contract_page(
+                    db_filename=db_filename,
+                    customer_id=int(customer_id),
+                    raw_image=blob,
+                    uploaded_by=actor,
+                )
+            if err:
+                # 저장 실패 시 세션 대기 목록으로 보존해 재시도 가능하게 한다.
+                if len(pending) < _MCT_BATCH_MAX:
+                    pending.append(blob)
+                st.error(f"저장 실패: {err}")
+            else:
+                try:
+                    saved_pages = ccs.list_pages(db_filename, int(customer_id))
+                    _total = len(saved_pages)
+                except Exception:
+                    _total = len(pages) + 1
+                st.session_state["_mct_done"] = {"name": cust_name, "page": _total}
         absorbed = True
     if gallery:
         files = list(gallery)
