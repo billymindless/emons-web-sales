@@ -4854,14 +4854,14 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
             if is_cancel:
                 if int(matched_pay["order_id"]) in neg_orders:
                     result_code = "matched_ok"
-                    note_parts.append("공식 취소 · ERP도 취소 흔적")
+                    note_parts.append("모모 취소 완료 · 공식 원장도 취소됨")
                 else:
                     result_code = "official_canceled"
                     note_parts.append("공식 취소인데 ERP는 잔존")
             else:
                 if int(matched_pay["order_id"]) in neg_orders:
                     result_code = "erp_canceled_official_paid"
-                    note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                    note_parts.append("모모 취소 완료 · 공식 원장은 아직 취소 전")
                 else:
                     result_code = "matched_ok"
         else:
@@ -4876,14 +4876,14 @@ def _ext_pay_match_onnuri(db_filename: str, verify_from: date, matched_by: str |
                 if is_cancel:
                     if int(matched_pay["order_id"]) in neg_orders:
                         result_code = "matched_ok"
-                        note_parts.append("공식 취소 · ERP도 취소 흔적")
+                        note_parts.append("모모 취소 완료 · 공식 원장도 취소됨")
                     else:
                         result_code = "official_canceled"
                         note_parts.append("공식 취소인데 ERP는 잔존")
                 else:
                     if int(matched_pay["order_id"]) in neg_orders:
                         result_code = "erp_canceled_official_paid"
-                        note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                        note_parts.append("모모 취소 완료 · 공식 원장은 아직 취소 전")
                     else:
                         result_code = "matched_ok"
                         note_parts.append("거래시간으로 구분")
@@ -5170,14 +5170,14 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
             if is_cancel:
                 if int(matched_pay["order_id"]) in neg_orders:
                     result_code = "matched_ok"
-                    note_parts.append("공식 취소 · ERP도 취소 흔적")
+                    note_parts.append("모모 취소 완료 · 공식 원장도 취소됨")
                 else:
                     result_code = "official_canceled"
                     note_parts.append("공식 취소인데 ERP는 잔존")
             else:
                 if int(matched_pay["order_id"]) in neg_orders:
                     result_code = "erp_canceled_official_paid"
-                    note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                    note_parts.append("모모 취소 완료 · 공식 원장은 아직 취소 전")
                 else:
                     result_code = "matched_ok"
         else:
@@ -5207,14 +5207,14 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
                 if is_cancel:
                     if int(matched_pay["order_id"]) in neg_orders:
                         result_code = "matched_ok"
-                        note_parts.append("공식 취소 · ERP도 취소 흔적")
+                        note_parts.append("모모 취소 완료 · 공식 원장도 취소됨")
                     else:
                         result_code = "official_canceled"
                         note_parts.append("공식 취소인데 ERP는 잔존")
                 else:
                     if int(matched_pay["order_id"]) in neg_orders:
                         result_code = "erp_canceled_official_paid"
-                        note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                        note_parts.append("모모 취소 완료 · 공식 원장은 아직 취소 전")
                     else:
                         result_code = "matched_ok"
                         if _exact and len(candidates) > 1:
@@ -5841,14 +5841,14 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
                 if is_cancel:
                     if int(matched_pay["order_id"]) in neg_orders:
                         result_code = "matched_ok"
-                        note_parts.append("공식 취소 · ERP도 취소 흔적")
+                        note_parts.append("모모 취소 완료 · 공식 원장도 취소됨")
                     else:
                         result_code = "official_canceled"
                         note_parts.append("공식 취소인데 ERP는 잔존")
                 else:
                     if int(matched_pay["order_id"]) in neg_orders:
                         result_code = "erp_canceled_official_paid"
-                        note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                        note_parts.append("모모 취소 완료 · 공식 원장은 아직 취소 전")
                     else:
                         result_code = "matched_ok"
         else:
@@ -6190,7 +6190,7 @@ def _ext_pay_match_mainpay(db_filename: str, verify_from: date, matched_by: str 
                         # 승인번호가 같으면 Pass-0 에서 이미 묶였어야 한다. 여기까지 왔다면
                         # 쌍이 성립하지 못한 경우이므로 결제 흔적만 남긴다.
                         result_code = "erp_canceled_official_paid"
-                        note_parts.append("공식 결제완료 · ERP는 취소 흔적")
+                        note_parts.append("모모 취소 완료 · 공식 원장은 아직 취소 전")
                     else:
                         result_code = "matched_ok"
         else:
@@ -7456,7 +7456,7 @@ def _ext_pay_list_matches_df(
             "고객명": cust.get("name") or "",
             "고객전화": cust.get("phone1") or "",
             "담당매니저": (emp_map.get(oid_int) or "").strip() if oid_int is not None else "",
-            "메모": _ext_pay_strip_split_pids_note(m.get("note")),
+            "메모": _ext_pay_plain_note(_ext_pay_strip_split_pids_note(m.get("note"))),
             "_fabricated": source == "ulsanpay" and (not ap) and bool(erp_ap),
             "_payment_id": pid_int,
             "_order_id": oid_int,
@@ -9348,7 +9348,7 @@ def _pcr_format_match_lines(rows: list[dict] | None, *, verified_fallback: str) 
     for m in rows:
         src = _ext_pay_src_label(m.get("source") or "")
         label = m.get("label") or m.get("result_code") or "-"
-        note = m.get("note") or ""
+        note = _ext_pay_plain_note(m.get("note") or "")
         head = f"{label} ({src})" if src else str(label)
         lines.append(f"{head} · {note}" if note else head)
     return lines
@@ -13959,17 +13959,31 @@ def _ext_pay_ledger_label(source: str) -> str:
     return f"{_ext_pay_src_label(source)} 원장"
 
 
+def _ext_pay_plain_note(note: str | None) -> str:
+    """이미 저장된 매칭 메모를 화면용 말로 바꾼다. 결과코드는 그대로다."""
+    text = str(note or "")
+    text = text.replace(
+        "공식 결제완료 · ERP는 취소 흔적",
+        "모모 취소 완료 · 공식 원장은 아직 취소 전",
+    )
+    text = text.replace(
+        "공식 취소 · ERP도 취소 흔적",
+        "모모 취소 완료 · 공식 원장도 취소됨",
+    )
+    return text
+
+
 def _ext_pay_result_label(code: str, source: str, *, has_payment: bool | None = None) -> str:
     if code == "official_canceled" and has_payment is False:
         return "공식취소·모모기록없음"
     src = _ext_pay_src_label(source)
     return {
-        "matched_ok": "금액일치",
+        "matched_ok": "금액일치 · 검증완료",
         "amount_mismatch": "금액 다름",
         "official_only": f"{src}만 있음",
         "erp_only": "모모만 있음",
         "official_canceled": f"{src} 취소·모모 잔존",
-        "erp_canceled_official_paid": f"모모 취소·{src} 결제",
+        "erp_canceled_official_paid": f"모모 취소 완료 · {src}는 아직 취소 전",
         "ambiguous": "다중 매치",
         "manual_matched": "수동 매칭",
         "split_matched": "분할 합산 일치",
@@ -13981,7 +13995,7 @@ def _ext_pay_reconcile_reason(code: str, source: str) -> str:
     ledger = _ext_pay_ledger_label(source)
     return {
         "erp_only": f"모모에는 결제가 있으나 {ledger}에 대응 건이 없음 ({ledger} 등록 누락 또는 입력 오류 의심)",
-        "erp_canceled_official_paid": f"{ledger}은 결제완료인데 모모는 취소되어 있음 (모모 취소 처리 확인 필요)",
+        "erp_canceled_official_paid": f"모모 취소는 완료됐는데 {ledger}은 아직 취소 전입니다. 공식 원장을 취소한 뒤 결제변경을 진행하세요.",
         "official_canceled": f"{ledger}은 취소인데 모모에 대응 결제가 남아 있음 (임의취소·환불 처리 확인 필요)",
         "ambiguous": f"동일 승인·금액 {ledger} 후보가 여러 건이라 맞추기 확정 불가 (실물 영수증·상세 정보 확인 필요)",
         "amount_mismatch": f"{ledger} 금액과 모모원장 금액이 다름 (정정 입력 필요)",
@@ -34100,7 +34114,7 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                         _src = _ext_pay_src_label(m.get("source") or "")
                         _label = m.get("label") or m.get("result_code") or "-"
                         _head = f"{_label} ({_src})" if _src else str(_label)
-                        _note = m.get("note") or ""
+                        _note = _ext_pay_plain_note(m.get("note") or "")
                         _txt = f"{_head} · {_note}" if _note else _head
                         if m.get("result_code") in _pcr_ok_codes:
                             st.success(_txt)
@@ -34217,7 +34231,7 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                             _apid = None
                         _pcr_render_pay_block(
                             _ap, _match_map.get(_apid or 0, []),
-                            fallback_label=_new_verified_label,
+                            fallback_label="❌ 미검증",
                         )
                 else:
                     st.markdown(f"**{_fmt_amt(display_meta.get('new_amount'))}**")
@@ -35905,6 +35919,7 @@ def _render_external_pay_admin_section(
                                 except Exception:
                                     pass
                         flash(" · ".join(_msg_parts) or "처리 완료")
+                        _ext_pay_clear_appr_popup(sel_db, sel_src)
                         st.rerun()
 
         # 중복 skip 된 파일 행 상세 (지문 충돌) — 별개 거래로 강제 등록 가능
@@ -35936,6 +35951,7 @@ def _render_external_pay_admin_section(
             key=f"extpay_rematch_{sel_db}_{sel_src}",
             help="기존 미결 매칭(공식만 있음·금액 다름·다중 매치·공식 취소)만 삭제 후, 최신 매칭 로직으로 다시 매칭합니다. matched_ok·수동 매칭·분할 합산 매칭은 유지됩니다.",
         ):
+            _ext_pay_clear_appr_popup(sel_db, sel_src)
             _sc, _sc_err = get_supabase_client()
             if _sc_err or not _sc:
                 st.error(f"Supabase 연결 실패: {_sc_err}")
@@ -36033,12 +36049,12 @@ def _render_external_pay_admin_section(
             return
     # 결과 코드 → 한글 라벨 (표시용, 원본 df 는 유지)
     _result_map = {
-        "matched_ok": "금액일치",
+        "matched_ok": "금액일치 · 검증완료",
         "amount_mismatch": "금액 다름",
         "official_only": f"{_src_side}만 있음",
         "erp_only": "모모만 있음",
         "official_canceled": f"{_src_side} 취소·모모 잔존",
-        "erp_canceled_official_paid": f"모모 취소·{_src_side} 결제",
+        "erp_canceled_official_paid": f"모모 취소 완료 · {_src_side}는 아직 취소 전",
         "ambiguous": "다중 매치",
         "manual_matched": "수동 매칭",
         "split_matched": "분할 합산 일치",
@@ -36124,7 +36140,12 @@ def _render_external_pay_admin_section(
         if 0 <= _row_idx < len(_df_pos):
             _meta_row = _df_pos.iloc[_row_idx]
             _pid = _ext_pay_cell_int(_meta_row.get("_payment_id"))
-            if _pid > 0:
+            if _pid > 0 and _ext_pay_row_amount_negative(_meta_row):
+                st.session_state[_last_opened_key] = (_row_idx, _pid)
+                _cur = st.session_state.get("_extpay_appr_edit_target")
+                if isinstance(_cur, dict) and _cur.get("_src_key") == (sel_db, sel_src):
+                    st.session_state.pop("_extpay_appr_edit_target", None)
+            elif _pid > 0:
                 _this_key = (_row_idx, _pid)
                 if st.session_state.get(_last_opened_key) != _this_key:
                     st.session_state[_last_opened_key] = _this_key
@@ -36132,18 +36153,21 @@ def _render_external_pay_admin_section(
                         _meta_row, sel_db=sel_db, sel_src=sel_src,
                         result_map=_result_map, src_side=_src_side,
                     )
-                    if _built:
+                    if _built and int(_built.get("_amount_int") or 0) >= 0:
                         st.session_state["_extpay_appr_edit_target"] = _built
     else:
         st.session_state.pop(_last_opened_key, None)
 
     _appr_target = st.session_state.get("_extpay_appr_edit_target")
     if _appr_target and _appr_target.get("_src_key") == (sel_db, sel_src) and _appr_target.get("_payment_id"):
-        _open_dialog(
-            f"승인번호 수정 · 결제 #{_appr_target['_payment_id']}",
-            lambda _t=_appr_target, _db=sel_db: _render_approval_edit_dialog_impl(_db, _t),
-            width="medium",
-        )
+        if int(_appr_target.get("_amount_int") or 0) < 0:
+            st.session_state.pop("_extpay_appr_edit_target", None)
+        else:
+            _open_dialog(
+                f"승인번호 수정 · 결제 #{_appr_target['_payment_id']}",
+                lambda _t=_appr_target, _db=sel_db: _render_approval_edit_dialog_impl(_db, _t),
+                width="medium",
+            )
 
     _fb_positions: list[int] = []
     _fb_labels: dict[int, str] = {}
@@ -36421,6 +36445,30 @@ def _ext_pay_selection_row_positions(event) -> list[int]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _ext_pay_clear_appr_popup(db_filename: str, source: str) -> None:
+    """재검증 직후 결과표 선택이 승인번호 창을 열지 않게 선택값과 대상을 지운다."""
+    st.session_state.pop(f"extpay_result_sel_{db_filename}_{source}", None)
+    st.session_state.pop(f"_extpay_appr_last_opened_{db_filename}_{source}", None)
+    tgt = st.session_state.get("_extpay_appr_edit_target")
+    if isinstance(tgt, dict) and tgt.get("_src_key") == (db_filename, source):
+        st.session_state.pop("_extpay_appr_edit_target", None)
+
+
+def _ext_pay_row_amount_negative(row) -> bool:
+    """공식 금액 또는 모모 결제 금액이 0보다 작으면 상계 전표다."""
+    getter = row.get if hasattr(row, "get") else (lambda k, _d=None: _d)
+    try:
+        if int(getter("_amount_int") or 0) < 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    for key in ("공식금액", "ERP금액"):
+        raw = str(getter(key) or "").replace(",", "").replace("원", "").strip()
+        if raw.startswith("-"):
+            return True
+    return False
 
 
 def _ext_pay_build_appr_edit_target(
