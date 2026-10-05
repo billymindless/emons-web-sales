@@ -280,11 +280,14 @@ def save_contract_page(
     uploaded_by: str,
     order_id: int | None = None,
     replace_page_id: int | None = None,
+    rebuild: bool = True,
 ) -> tuple[dict | None, str | None]:
     """한 장 저장. 성공 시 (row, None), 실패 시 (None, err).
 
     replace_page_id 가 있으면 그 page_no 의 사진만 교체 (다시 찍기).
-    새 장이면 그 고객 최대 page_no + 1 로 저장. PDF 는 저장 안에서 재생성한다.
+    새 장이면 그 고객 최대 page_no + 1 로 저장.
+    rebuild 가 True 이면 저장 직후 PDF 를 다시 만든다. 여러 장을 연속 저장할 때는
+    False 로 두고, 마지막에 rebuild_pdf 를 한 번만 호출한다.
     """
     if not db_filename:
         return None, "매장 DB 정보가 없습니다."
@@ -377,11 +380,12 @@ def save_contract_page(
             _storage_remove([new_path, new_thumb])
             return None, f"DB 저장 실패: {e}"
 
-    # PDF 재생성 (실패해도 저장은 유지)
-    try:
-        rebuild_pdf(db_filename, cid)
-    except Exception as e:
-        logger.warning("PDF 재생성 실패 (저장은 유지): %s", e)
+    # PDF 재생성 (실패해도 저장은 유지). 일괄 저장은 호출측이 마지막에 한 번 한다.
+    if rebuild:
+        try:
+            rebuild_pdf(db_filename, cid)
+        except Exception as e:
+            logger.warning("PDF 재생성 실패 (저장은 유지): %s", e)
 
     return row, None
 
