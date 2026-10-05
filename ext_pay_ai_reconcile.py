@@ -140,7 +140,7 @@ def build_ai_context(
         if code in UNMATCHED_OFFICIAL_CODES and row_id > 0:
             if len(unmatched_official) >= max_official:
                 continue
-            unmatched_official.append({
+            _off_item = {
                 "row_id": row_id,
                 "tx_date": _row_pick(row, "공식일자"),
                 "last4": _row_pick(row, "뒤4"),
@@ -149,11 +149,14 @@ def build_ai_context(
                 "buyer_masked": _mask_name(_row_pick(row, "구매자")),
                 "tx_status": _row_pick(row, "공식상태"),
                 "result_code": code,
-            })
+            }
+            if source == "card":
+                _off_item["card_company"] = _row_pick(row, "카드사")
+            unmatched_official.append(_off_item)
         elif code == "erp_only":
             if len(erp_only) >= max_erp_only:
                 continue
-            erp_only.append({
+            _erp_item = {
                 "payment_id": pid,
                 "order_id": oid,
                 "payment_date": _row_pick(row, "ERP일자"),
@@ -164,7 +167,10 @@ def build_ai_context(
                 "customer_masked": _mask_name(_row_pick(row, "고객명")),
                 "phone_masked": _mask_phone(_row_pick(row, "고객전화")),
                 "employee": _row_pick(row, "담당매니저"),
-            })
+            }
+            if source == "card":
+                _erp_item["card_company"] = _row_pick(row, "카드사")
+            erp_only.append(_erp_item)
         elif code in MATCHED_OK_CODES and row_id > 0 and pid is not None:
             if len(matched_examples) >= max_examples:
                 continue
@@ -321,6 +327,15 @@ def suggest_matches_with_gemini(
             "3) 결제일과 tx_date 가 같거나 ±2일 이내\n"
             "4) 구매자 마스킹 이름과 모모 고객 마스킹 이름의 성·끝글자 조각 일치\n"
             "5) 같은 order 내 여러 결제 합이 공식 금액과 일치하면 splits 로 제안\n"
+        )
+    elif source == "card":
+        _priority = (
+            "판단 근거 우선순위(신용카드):\n"
+            "1) 승인번호(approval) 8자리 정확 일치\n"
+            "2) 결제금액이 같고 결제일과 tx_date 가 ±2일 안이면 후보로 제안한다. "
+            "카드사(card_company)가 달라도 제외하지 마라. 예: 공식 BC, 모모 우리.\n"
+            "3) 구매자 마스킹 이름과 모모 고객 마스킹 이름의 성·끝글자 조각 일치\n"
+            "4) 같은 order 내 여러 결제 합이 공식 금액과 일치하면 splits 로 제안\n"
         )
     else:
         _priority = (

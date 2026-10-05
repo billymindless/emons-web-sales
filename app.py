@@ -8933,17 +8933,86 @@ def _pcr_bulk_payment_dates(db_filename: str, payment_ids: tuple[int, ...]) -> d
     return out
 
 
+_EXT_PAY_CONFIRMED_MATCH_CODES = frozenset({
+    "matched_ok",
+    "manual_matched",
+    "split_matched",
+    "erp_canceled_official_paid",
+})
+
+
+def _ext_pay_is_ledger_method(method: str) -> bool:
+    """공식 원장과 맞추는 결제 수단. 현금·계좌이체는 제외."""
+    meth = str(method or "")
+    if meth in ("신용카드", "체크카드", "메인페이"):
+        return True
+    if "지역화폐" in meth:
+        return True
+    return ("온누리" in meth) and ("지류" not in meth)
+
+
+def _ext_pay_matched_payment_ids(db_filename: str, payment_ids: list[int]) -> set[int]:
+    """원장과 연결된 결제 ID. 금액일치·수동·분할·모모 취소 완료만 매칭 완료다."""
+    out: set[int] = set()
+    if not db_filename or not payment_ids:
+        return out
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return out
+    pids: list[int] = []
+    for p in payment_ids:
+        try:
+            if p:
+                pids.append(int(p))
+        except (TypeError, ValueError):
+            continue
+    if not pids:
+        return out
+    try:
+        for chunk in (pids[i : i + 200] for i in range(0, len(pids), 200)):
+            r = (
+                sc.table("app_external_pay_matches")
+                .select("payment_id, result_code")
+                .eq("db_filename", db_filename)
+                .in_("payment_id", chunk)
+                .execute()
+            )
+            for row in r.data or []:
+                if str(row.get("result_code") or "") not in _EXT_PAY_CONFIRMED_MATCH_CODES:
+                    continue
+                try:
+                    out.add(int(row.get("payment_id")))
+                except (TypeError, ValueError):
+                    continue
+    except Exception as e:
+        st.warning(f"매칭 상태 조회 실패: {e}")
+        return out
+    return out
+
+
 @st.cache_data(ttl=60, show_spinner=False)
-def _format_order_payments_display(pay_list: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def _format_order_payments_display(
+    pay_list: pd.DataFrame,
+    matched_payment_ids: tuple[int, ...] = (),
+) -> tuple[pd.DataFrame, list[str]]:
     """주문 결제 DataFrame 을 '결제 내역 조회 및 수정' 표 형태로 가공.
     `결제 내역 조회 및 수정`과 결제변경 고객 팝업이 같은 형식을 쓰도록 공용 헬퍼로 분리."""
     pay_display = pay_list.copy()
-    # 복합결제 표기: 같은 결제일에 여러 수단이 사용된 행에 "복합결제" 마킹
-    if "payment_date" in pay_display.columns and "payment_method" in pay_display.columns:
-        _date_method_counts = pay_display.groupby("payment_date")["payment_method"].transform("nunique")
-        pay_display["복합결제"] = _date_method_counts.gt(1).map({True: "✅ 복합", False: ""})
+    _done = set(matched_payment_ids)
+
+    def _match_cell(row) -> str:
+        if not _ext_pay_is_ledger_method(str(row.get("payment_method") or "")):
+            return ""
+        try:
+            pid = int(row.get("id"))
+        except (TypeError, ValueError):
+            return "미매칭"
+        return "매칭 완료" if pid in _done else "미매칭"
+
+    if "id" in pay_display.columns and "payment_method" in pay_display.columns:
+        pay_display["매칭"] = pay_display.apply(_match_cell, axis=1)
     else:
-        pay_display["복합결제"] = ""
+        pay_display["매칭"] = ""
     if "amount" in pay_display.columns:
         pay_display["amount"] = pay_display["amount"].apply(lambda x: f"{x:,.0f}원")
     if "fee_amount" in pay_display.columns:
@@ -8964,7 +9033,7 @@ def _format_order_payments_display(pay_list: pd.DataFrame) -> tuple[pd.DataFrame
         "payment_method": "수단", "card_company": "카드사/승인번호",
         "fee_amount": "수수료", "business_name": "사업자",
     })
-    cols = ["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료", "복합결제"]
+    cols = ["결제ID", "결제일", "금액", "수단", "카드사/승인번호", "수수료", "매칭"]
     if "사업자" in pay_display.columns:
         cols.insert(-1, "사업자")
     return pay_display, cols
@@ -9025,6 +9094,15 @@ def _pcr_customer_payments_dialog(db_filename: str, sale_id, customer_name: str)
 
     _oids_key = tuple(sorted({int(x) for x in orders["id"].tolist() if x is not None}))
     pays_df = _load_payments_by_order_ids_supabase(db_filename, _oids_key) if _oids_key else pd.DataFrame()
+    _dlg_match_ids: tuple[int, ...] = ()
+    if not pays_df.empty and "id" in pays_df.columns:
+        _dlg_pids: list[int] = []
+        for _pid in pays_df["id"].tolist():
+            try:
+                _dlg_pids.append(int(_pid))
+            except (TypeError, ValueError):
+                continue
+        _dlg_match_ids = tuple(sorted(_ext_pay_matched_payment_ids(db_filename, _dlg_pids)))
 
     for _, orow in orders.iterrows():
         _oid = int(orow["id"])
@@ -9048,7 +9126,7 @@ def _pcr_customer_payments_dialog(db_filename: str, sale_id, customer_name: str)
                 continue
             _keep = [c for c in ("id", "payment_date", "amount", "payment_method", "card_company",
                                  "onnuri_approval_code", "fee_amount", "business_name") if c in _pays_order.columns]
-            _disp, _cols_show = _format_order_payments_display(_pays_order[_keep])
+            _disp, _cols_show = _format_order_payments_display(_pays_order[_keep], _dlg_match_ids)
             st.dataframe(_disp[_cols_show], width='stretch', hide_index=True)
 
 
@@ -36013,19 +36091,14 @@ def _render_external_pay_admin_section(
             return int(s) if s else 0
         except (TypeError, ValueError):
             return 0
-    def _official_in_total(row) -> int:
-        if _ext_pay_cancel_without_momo(row):
-            return 0
-        return _amt_to_int(row.get("공식금액"))
-
-    _official_total = int(df.apply(_official_in_total, axis=1).sum()) if "공식금액" in df.columns else 0
+    _official_total = int(df["공식금액"].map(_amt_to_int).sum()) if "공식금액" in df.columns else 0
     _erp_total = int(df["ERP금액"].map(_amt_to_int).sum()) if "ERP금액" in df.columns else 0
     _diff = _official_total - _erp_total
     m1, m2, m3 = st.columns(3)
     m1.metric(f"{_ledger} 합계", f"{_official_total:,}원")
     m2.metric("모모원장 합계", f"{_erp_total:,}원")
     m3.metric(f"차액 ({_src_side}−모모)", f"{_diff:,}원")
-    st.caption("공식취소·모모기록없음 금액은 원장 합계에 포함하지 않습니다.")
+    st.caption("취소 금액은 공식·모모 합계에서 빼 순액으로 계산합니다.")
 
     if sel_src == "ulsanpay" and "뒤4" in df.columns:
         df = df.drop(columns=["뒤4", "구매자", "정산"], errors="ignore")
@@ -36831,14 +36904,14 @@ def _render_ext_pay_ai_similar_match(
 ) -> None:
     """Gemini 로 미매칭 공식 행 ↔ 미매칭 ERP 결제 사이 유사 매칭 후보를 제안.
 
-    - 온누리·울산페이. 자동 확정 없음. 관리자가 개별 승인 · 거절.
+    - 온누리·울산페이·신용·체크·메인페이. 자동 확정 없음. 관리자가 개별 승인 · 거절.
     - 승인 시 `_ext_pay_manual_link` (pair) 또는 `_ext_pay_manual_link_split` (split) 실행.
     - 승인/거절 모두 `app_import_ai_feedback` 에 `extpay_pair_{source}` / `extpay_split_{source}` /
       `extpay_flag_{source}` kind 로 저장 (원가 대사 피드백과 kind 로 분리).
     """
     if df is None or getattr(df, "empty", True):
         return
-    if sel_src not in ("onnuri", "ulsanpay"):
+    if sel_src not in ("onnuri", "ulsanpay", "card", "mainpay"):
         return
     try:
         import ext_pay_ai_reconcile as _epai
@@ -37240,6 +37313,7 @@ def _render_ext_pay_manual_match_ui(
     with st.expander(f"🔧 {_ledger} 수동 맞추기 ({len(_target)}건 대기)", expanded=False):
         st.caption(
             f"자동 맞추기가 실패한 {_ledger} 행을 특정 모모 결제에 직접 붙일 수 있습니다. "
+            "카드사가 달라도 금액이 같으면 후보에 나옵니다. "
             "결과는 수동 매칭으로 저장되며, 재실행해도 유지됩니다."
         )
         _options: list[tuple[int, str]] = []
@@ -37274,23 +37348,30 @@ def _render_ext_pay_manual_match_ui(
         )
         _row = _target[_target["row_id"] == _sel_row].iloc[0].to_dict()
 
-        # 후보 ERP 결제 조회: 매장·기간·수단·금액
+        # 후보 ERP 결제 조회: 같은 절대금액. 카드사는 거르지 않는다.
         try:
-            _off_amt = int(str(_row.get("공식금액") or "0").replace(",", "").strip() or 0)
+            _off_amt = abs(int(str(_row.get("공식금액") or "0").replace(",", "").strip() or 0))
         except (TypeError, ValueError):
             _off_amt = 0
+        _off_day = _ext_pay_as_date(_row.get("공식일자"))
+        if _off_day is not None:
+            _default_from = _off_day - timedelta(days=2)
+            _default_to = _off_day + timedelta(days=2)
+        else:
+            _default_from = new_from
+            _default_to = (new_from + timedelta(days=2)) if isinstance(new_from, date) else date.today()
 
         c_a, c_b, c_c = st.columns(3)
         with c_a:
             _from_d = st.date_input(
                 "조회 시작",
-                value=new_from,
+                value=_default_from,
                 key=f"extpay_manual_from_{sel_db}_{sel_src}_{_sel_row}",
             )
         with c_b:
             _to_d = st.date_input(
                 "조회 종료",
-                value=(new_from + timedelta(days=90)) if isinstance(new_from, date) else date.today(),
+                value=_default_to,
                 key=f"extpay_manual_to_{sel_db}_{sel_src}_{_sel_row}",
             )
         with c_c:
@@ -37306,25 +37387,43 @@ def _render_ext_pay_manual_match_ui(
         _cand_pays: list[dict] = []
         if not _err and sc:
             try:
-                _q = (
-                    sc.table("app_payments")
-                    .select("id, order_id, payment_date, amount, payment_method, card_company")
-                    .eq(ORDERS_PAYMENTS_TENANT_COL, sel_db)
-                    .gte("payment_date", _from_d.isoformat())
-                    .lte("payment_date", _to_d.isoformat())
-                    .gt("amount", 0)
-                )
-                # 출처별 결제 수단 필터
-                if sel_src == "ulsanpay":
-                    _q = _q.ilike("payment_method", "%지역화폐%")
-                elif sel_src == "onnuri":
-                    _q = _q.ilike("payment_method", "%온누리%")
-                elif sel_src == "card":
-                    _q = _q.in_("payment_method", ["신용카드", "체크카드"])
-                elif sel_src == "mainpay":
-                    _q = _q.eq("payment_method", "메인페이")
-                _r = _q.limit(1000).execute()
-                _cand_pays = _r.data or []
+                _tol_amt = int(_amt_tol)
+                _hi = _off_amt + _tol_amt
+                _lo = max(0, _off_amt - _tol_amt)
+                _bands = [(_lo, _hi)]
+                if _hi > 0:
+                    _bands.append((-_hi, -_lo if _lo else -1))
+                _seen_pids: set[int] = set()
+                for _blo, _bhi in _bands:
+                    if _blo > _bhi:
+                        continue
+                    _q = (
+                        sc.table("app_payments")
+                        .select("id, order_id, payment_date, amount, payment_method, card_company")
+                        .eq(ORDERS_PAYMENTS_TENANT_COL, sel_db)
+                        .gte("payment_date", _from_d.isoformat())
+                        .lte("payment_date", _to_d.isoformat())
+                        .gte("amount", _blo)
+                        .lte("amount", _bhi)
+                    )
+                    if sel_src == "ulsanpay":
+                        _q = _q.ilike("payment_method", "%지역화폐%")
+                    elif sel_src == "onnuri":
+                        _q = _q.ilike("payment_method", "%온누리%")
+                    elif sel_src == "card":
+                        _q = _q.in_("payment_method", ["신용카드", "체크카드"])
+                    elif sel_src == "mainpay":
+                        _q = _q.eq("payment_method", "메인페이")
+                    _r = _q.limit(1000).execute()
+                    for _p in _r.data or []:
+                        try:
+                            _pid_k = int(_p.get("id") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if _pid_k <= 0 or _pid_k in _seen_pids:
+                            continue
+                        _seen_pids.add(_pid_k)
+                        _cand_pays.append(_p)
             except Exception as e:
                 st.error(f"결제 후보 조회 실패: {e}")
                 _cand_pays = []
@@ -37367,6 +37466,17 @@ def _render_ext_pay_manual_match_ui(
             return abs(a - _off_amt) <= int(_amt_tol)
 
         _filtered = [p for p in _cand_pays if _within_amt(p) and int(p.get("id") or 0) not in _used_pids]
+
+        def _cand_gap(p: dict) -> tuple[int, int]:
+            _pd = _ext_pay_as_date(p.get("payment_date"))
+            _gap = abs((_off_day - _pd).days) if _off_day is not None and _pd is not None else 99
+            try:
+                _pid_s = int(p.get("id") or 0)
+            except (TypeError, ValueError):
+                _pid_s = 0
+            return (_gap, _pid_s)
+
+        _filtered.sort(key=_cand_gap)
 
         if not _filtered:
             st.info("조건에 맞는 미매칭 ERP 결제가 없습니다. 기간·금액·허용오차를 조정해 주세요.")
@@ -45269,6 +45379,15 @@ def render_customer_balance():
                                         _pay_all_sql = pd.DataFrame()
                                     finally:
                                         _conn_pay_all.close()
+                            _pay_src = _pay_all if _supabase_orders_payments_available() else _pay_all_sql
+                            _inq_pids: list[int] = []
+                            if not _pay_src.empty and "id" in _pay_src.columns:
+                                for _pid in _pay_src["id"].tolist():
+                                    try:
+                                        _inq_pids.append(int(_pid))
+                                    except (TypeError, ValueError):
+                                        continue
+                            _inq_match_ids = tuple(sorted(_ext_pay_matched_payment_ids(db_filename, _inq_pids)))
                             for _order_id_pay in orders["id"].tolist():
                                 if _supabase_orders_payments_available():
                                     if not _pay_all.empty and "order_id" in _pay_all.columns:
@@ -45316,7 +45435,7 @@ def render_customer_balance():
                                     if pay_list.empty if hasattr(pay_list, 'empty') else len(pay_list) == 0:
                                         st.info("해당 주문의 결제 내역이 없습니다.")
                                     else:
-                                        _pay_display_df, _pay_cols_show = _format_order_payments_display(pay_list)
+                                        _pay_display_df, _pay_cols_show = _format_order_payments_display(pay_list, _inq_match_ids)
                                         st.dataframe(_pay_display_df[_pay_cols_show], width='stretch')
                                         if not _is_selected_order:
                                             st.caption("👆 결제 수정·결제변경 요청은 위 '수정할 주문 선택'에서 이 주문을 고르면 표시됩니다.")
