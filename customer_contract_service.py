@@ -232,19 +232,32 @@ def list_pages(db_filename: str, customer_id: int) -> list[dict]:
         return []
 
 
-def search_customers(db_filename: str, query: str, limit: int = 20) -> list[dict]:
-    """이름/전화번호로 고객 검색. app.py 의 신규 매출 검색과 같은 방식."""
+def search_customers(
+    db_filename: str,
+    query: str,
+    limit: int = 20,
+    store_name: str | None = None,
+) -> list[dict]:
+    """이름/전화번호로 고객 검색. app.py 의 신규 매출 검색과 같은 방식.
+
+    store_name 이 주어지면 app_customers.store_name 완전 일치로 좁힌다.
+    값이 비어 있으면 매장 간 혼선을 막기 위해 빈 목록을 반환한다.
+    """
     import re  # noqa: WPS433
     if not db_filename:
+        return []
+    if not (store_name or "").strip():
         return []
     sc, err = _client()
     if err or not sc:
         return []
     q = (query or "").strip()
     try:
-        qb = sc.table("app_customers").select("id, name, phone1, phone2, store_name")
-        # store_name 필터는 호출자가 current store 로 좁히지만, 여기서는 db_filename 과 매장을 매핑 못하므로
-        # 상위 호출자가 or_ 로 매장을 좁히지 않더라도 limit 로 자른다.
+        qb = (
+            sc.table("app_customers")
+            .select("id, name, phone1, phone2, store_name")
+            .eq("store_name", store_name)
+        )
         if q:
             q_safe = re.sub(r"[*,]", "", q)
             qb = qb.or_(

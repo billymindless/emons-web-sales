@@ -43878,13 +43878,21 @@ def _render_mobile_contract_search(db_filename: str):
     """화면 1·2: 고객 검색 + 결과 리스트."""
     import customer_contract_service as ccs  # noqa: WPS433
     _mct_done_banner()
+    store_name = _get_current_store_name_for_customers(db_filename)
+    if not (store_name or "").strip():
+        st.warning("매장 정보를 찾을 수 없습니다. 사이드바에서 매장을 선택하거나 다시 로그인하세요.")
+        return
+    st.markdown(
+        f'<div class="mct-sub">현재 매장: <b>{html.escape(store_name)}</b></div>',
+        unsafe_allow_html=True,
+    )
     q = st.text_input("고객 이름 또는 전화번호", key="mct_search_q", placeholder="예: 홍길동 또는 010-1234")
-    rows = ccs.search_customers(db_filename, q, limit=20)
+    rows = ccs.search_customers(db_filename, q, limit=20, store_name=store_name)
     if not q or not q.strip():
         st.markdown('<div class="mct-sub">이름의 일부 또는 전화번호 뒷자리를 입력하세요.</div>', unsafe_allow_html=True)
         return
     if not rows:
-        st.info("검색 결과가 없습니다. PC 에서 신규 매출을 먼저 등록하세요.")
+        st.info(f"'{store_name}' 매장에 검색 결과가 없습니다. PC 에서 신규 매출을 먼저 등록하세요.")
         return
     # 장수 일괄 조회
     ids = [int(r["id"]) for r in rows if r.get("id") is not None]
