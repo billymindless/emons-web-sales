@@ -41078,7 +41078,14 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
     _CARD_WITH_COMPANY_SPLIT = ("신용카드", "체크카드")
     if split_method in _CARD_WITH_COMPANY_SPLIT:
         split_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
-        st.text_input("카드 승인번호 8자리 *", key=f"{key_prefix}_card_appr", max_chars=8)
+        # 실입금 0 (초과이관만) 이면 신규 카드 결제가 아니므로 승인번호는 선택 입력.
+        _appr_actual = _parse_comma_to_int(st.session_state.get(_actual_paid_key, "0") or "0")
+        _appr_required = _appr_actual > 0
+        st.text_input(
+            "카드 승인번호 8자리 *" if _appr_required else "카드 승인번호 8자리 (초과이관만 하면 생략)",
+            key=f"{key_prefix}_card_appr",
+            max_chars=8,
+        )
     elif split_method == "메인페이":
         split_card = st.text_input("메인페이 승인번호 8자리", key=f"{key_prefix}_card", max_chars=8)
     elif split_method == "지역화폐":
@@ -41277,9 +41284,12 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         success_count = 0
         transfer_count = 0
 
-        # 신용/체크카드 승인번호 8자리 (분배결제 공용)
+        # 실입금 0 이면 신규 결제가 없고 두 행 모두 초과이관. 결제수단·승인번호 요구 없음.
+        is_pure_transfer = (actual_paid_int == 0)
+
+        # 신용/체크카드 승인번호 8자리 — 신규 입금(실입금 > 0) 일 때만 요구.
         _split_card_appr_val = None
-        if split_method in _CARD_WITH_COMPANY_SPLIT:
+        if split_method in _CARD_WITH_COMPANY_SPLIT and not is_pure_transfer:
             _split_card_appr_val = re.sub(r"\D", "", str(st.session_state.get(f"{key_prefix}_card_appr", "") or "").strip()) or None
             if not _split_card_appr_val or len(_split_card_appr_val) != 8:
                 st.error(f"{split_method} 승인번호 8자리를 정확히 입력하세요.")
@@ -41290,17 +41300,18 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
             if orow_match.empty:
                 continue
             bal = float(orow_match.iloc[0].get("balance") or 0)
-            _is_transfer_row = alloc_amt < 0
-            # 수수료: 양수 결제만 계산. 음수(이관) 행은 수수료 없음.
-            fee = _payment_fee_amount(split_method, alloc_amt) if alloc_amt > 0 else 0.0
+            _is_transfer_row = alloc_amt < 0 or is_pure_transfer
+            _is_new_payment_row = alloc_amt > 0 and not is_pure_transfer
+            # 수수료: 신규 결제 행에만. 이관 행(실입금 0 또는 음수)은 수수료 없음.
+            fee = _payment_fee_amount(split_method, alloc_amt) if _is_new_payment_row else 0.0
             # 이관 행에는 신규 결제 메타(승인번호 등) 를 붙이지 않는다 — audit 오염 방지.
-            _row_method = (split_method or None) if alloc_amt > 0 else None
-            _row_card = split_card if alloc_amt > 0 else None
-            # 승인번호: 신용/체크카드는 8자리, 그 외는 온누리 코드
-            if alloc_amt > 0 and split_method in _CARD_WITH_COMPANY_SPLIT:
+            _row_method = (split_method or None) if _is_new_payment_row else None
+            _row_card = split_card if _is_new_payment_row else None
+            # 승인번호: 신용/체크카드는 8자리, 그 외는 온누리 코드. 신규 결제 행에만.
+            if _is_new_payment_row and split_method in _CARD_WITH_COMPANY_SPLIT:
                 _row_onnuri = _split_card_appr_val
             else:
-                _row_onnuri = onnuri_code if alloc_amt > 0 else None
+                _row_onnuri = onnuri_code if _is_new_payment_row else None
             try:
                 if _supabase_orders_payments_available():
                     old_paid, _ = _sum_payments_by_order_supabase(db_filename, oid)
