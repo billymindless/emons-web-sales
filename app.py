@@ -682,6 +682,16 @@ def _render_primary_nav(user: dict, role: str) -> None:
     radio_key = f"nav_radio_{idx_key}"
     _uname = user.get("username") or ""
 
+    # 계약서 화면의 홈/끝내기: 라디오를 만들기 전에 대시보드로 맞춘다.
+    # 위젯이 생긴 뒤에 값을 바꾸면 Streamlit이 거부하고, 안 바꾸면 다음 실행에서
+    # 라디오가 main_tab_idx 를 다시 계약서 메뉴로 덮어쓴다.
+    if st.session_state.pop("_mct_leave_home", False):
+        st.session_state.pop("active_admin_page", None)
+        st.session_state.pop("_mct_sidebar_once", None)
+        st.session_state[idx_key] = 0
+        if labels:
+            st.session_state[radio_key] = labels[0]
+
     # 즐겨찾기 바로가기 (사용자 지정)
     _render_nav_favorites(_uname, labels, idx_key, radio_key)
 
@@ -43651,6 +43661,19 @@ def _render_contract_pc_button(
         )
 
 
+def _contract_request_home():
+    """계약서 화면에서 대시보드로 나간다.
+
+    라디오 키는 여기서 바꾸지 않는다. 사이드바 라디오가 이미 그려진 뒤라
+    같은 실행에서 수정하면 예외가 난다. 플래그만 두고, 다음 실행의
+    _render_primary_nav 가 라디오를 만들기 전에 대시보드로 맞춘다.
+    """
+    _contract_qp_set(m=None, cid=None)
+    st.session_state["_mct_leave_home"] = True
+    st.session_state.pop("active_admin_page", None)
+    st.rerun()
+
+
 def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
     """계약서 촬영 화면.
 
@@ -43658,17 +43681,22 @@ def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
     - 좌측 메뉴 '계약서 촬영': embedded=True, 사이드바 유지하고 본문만 그림
     """
     import customer_contract_service as ccs  # noqa: WPS433
-    # 공통 카드/가이드 CSS (사이드바는 embedded 가 아닌 경우에만 숨김)
-    if not embedded:
-        st.markdown(
+    # 사이드바를 display:none 으로 지우면 접기 버튼을 눌러도 메뉴가 나오지 않는다.
+    # 들어올 때 한 번만 접고, 이후 접기 버튼은 Streamlit 기본 동작으로 연다.
+    if not embedded and not st.session_state.get("_mct_sidebar_once"):
+        st.session_state["_mct_sidebar_once"] = True
+        components.html(
             """
-            <style>
-              [data-testid="stSidebar"], [data-testid="stSidebarNav"], [data-testid="collapsedControl"] { display:none !important; }
-              [data-testid="stHeader"] { background: transparent !important; }
-              .block-container { padding: 0.5rem 0.75rem 2rem 0.75rem !important; max-width: 100% !important; }
-            </style>
+            <script>
+            (function () {
+              var doc = window.parent.document;
+              var btn = doc.querySelector('[data-testid="stSidebarCollapseButton"]')
+                || doc.querySelector('[data-testid="stSidebar"] button[kind="header"]');
+              if (btn) btn.click();
+            })();
+            </script>
             """,
-            unsafe_allow_html=True,
+            height=0,
         )
     st.markdown(
         """
@@ -43707,11 +43735,7 @@ def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
                     st.rerun()
             else:
                 if st.button("🏠 홈", key="mct_home", width="stretch"):
-                    _contract_qp_set(m=None, cid=None)
-                    # ERP 레일로 들어왔을 때 계약서 라우팅도 해제
-                    st.session_state.pop("active_admin_page", None)
-                    st.session_state["main_tab_idx"] = 0
-                    st.rerun()
+                    _contract_request_home()
         with top_r:
             st.markdown('<div class="mct-title">📄 계약서 촬영</div>', unsafe_allow_html=True)
 
@@ -43887,10 +43911,7 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
                 st.rerun()
         with end_r:
             if st.button("✅ 끝내기", key="mct_finish", type="primary", width="stretch"):
-                _contract_qp_set(m=None, cid=None)
-                st.session_state.pop("active_admin_page", None)
-                st.session_state["main_tab_idx"] = 0
-                st.rerun()
+                _contract_request_home()
 
 
 def render_customer_balance():
