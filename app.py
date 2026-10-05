@@ -43585,9 +43585,9 @@ def _render_contract_pc_dialog(
         )
         return
 
-    st.caption(f"총 {len(pages)}장 · 세로 A4 PDF 로 자동 저장")
+    st.caption(f"총 {len(pages)}장 · 사진은 저장용이고, 내용은 PDF 새 창에서 봅니다.")
 
-    # PDF 서명 URL — 다중 cid 는 primary 의 PDF 를 쓰므로, 필요 시 primary 로 재생성
+    # 앱 안에 장 사진을 다시 그리지 않는다. PDF 는 브라우저 새 창으로만 연다.
     pdf_url = ccs.pdf_signed_url(db_filename, int(customer_id))
     if pdf_url:
         c1, c2 = st.columns([1, 1])
@@ -43599,24 +43599,12 @@ def _render_contract_pc_dialog(
                     ccs.rebuild_pdf(db_filename, int(customer_id))
                 st.toast("PDF 를 다시 만들었습니다.", icon="✅")
                 st.rerun(scope="app")
-        # st.pdf 는 streamlit-pdf 가 없으면 StreamlitAPIException 을 낸다.
-        # 저장된 JPEG 장을 세로로 보여 준다. PDF 파일은 위 버튼으로 연다.
-        shown = 0
-        for p in pages:
-            url = ccs.signed_url(p.get("storage_path") or "")
-            if not url:
-                continue
-            st.image(url, caption=f"{p.get('page_no')}장", use_container_width=True)
-            shown += 1
-        if shown == 0:
-            st.info("미리보기를 불러오지 못했습니다. 위의 'PDF 새 창으로 열기'를 사용하세요.")
     else:
         st.warning("PDF 가 아직 준비되지 않았습니다. '🔄 PDF 다시 만들기' 를 눌러 주세요.")
         if st.button("🔄 PDF 다시 만들기", key=f"ccs_rebuild2_{customer_id}", type="primary"):
             with st.spinner("PDF 재생성 중..."):
                 ccs.rebuild_pdf(db_filename, int(customer_id))
             st.rerun(scope="app")
-    # 위에서 이미 각 장 사진을 보여줬다. 여기서는 장별 삭제 버튼만 둔다.
     st.caption("잘못 올린 장은 아래에서 지웁니다.")
     cols = st.columns(min(4, len(pages)))
     for i, p in enumerate(pages):
@@ -43872,17 +43860,16 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
     st.markdown(f'<div class="mct-title">{cust_name}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="mct-sub">현재 {len(pages)}장 저장됨 · 다음 저장 번호: {len(pages)+1}장</div>', unsafe_allow_html=True)
 
-    # 저장된 장. 잘못된 장은 썸네일 아래 삭제로 지운다.
+    # 저장된 계약서는 PDF 새 창으로만 본다. 장 사진은 보여 주지 않는다.
     if pages:
+        pdf_url = ccs.pdf_signed_url(db_filename, int(customer_id))
+        if pdf_url:
+            st.link_button("📄 PDF 새 창으로 열기", pdf_url, width="stretch")
+        st.caption("잘못 올린 장은 아래에서 지웁니다.")
         tcols = st.columns(min(4, len(pages)))
         for i, p in enumerate(pages):
             with tcols[i % len(tcols)]:
-                turl = ccs.signed_url(p.get("thumb_path") or p.get("storage_path") or "")
-                if turl:
-                    st.image(turl, caption=f"{p.get('page_no')}장", use_container_width=True)
-                else:
-                    st.write(f"{p.get('page_no')}장")
-                if st.button("삭제", key=f"mct_del_{p.get('id')}", width="stretch"):
+                if st.button(f"{p.get('page_no')}장 삭제", key=f"mct_del_{p.get('id')}", width="stretch"):
                     err = ccs.delete_page(db_filename, int(p.get("id")))
                     if err:
                         st.error(err)
