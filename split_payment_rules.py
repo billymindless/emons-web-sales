@@ -22,6 +22,11 @@ def _blank_method(method) -> bool:
     return text == "" or text.lower() in ("none", "nan", "null", "<na>")
 
 
+def hide_payment_method_fields(has_overpaid: bool, actual_paid: int) -> bool:
+    """실입금 0인 초과이관은 새 카드·승인번호가 없다."""
+    return bool(has_overpaid and int(actual_paid) == 0)
+
+
 def is_transfer_alloc(is_transfer_mode: bool, actual_paid: int, alloc_amt: int) -> bool:
     """이번 배분 행을 초과이관 전표로 저장할지.
 

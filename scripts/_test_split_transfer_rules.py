@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from split_payment_rules import (
     TRANSFER_METHOD,
+    hide_payment_method_fields,
     is_transfer_alloc,
     new_transfer_group,
     protects_from_single_delete,
@@ -40,6 +41,12 @@ def test_blank_negative_is_protected_but_real_offset_is_not():
     assert protects_from_single_delete("현금(수금)", 393_000) is False
 
 
+def test_zero_deposit_transfer_hides_approval_fields():
+    assert hide_payment_method_fields(True, 0)
+    assert hide_payment_method_fields(True, 100_000) is False
+    assert hide_payment_method_fields(False, 0) is False
+
+
 def test_group_token_roundtrip():
     token = new_transfer_group()
     assert transfer_group_token(token) == token
@@ -52,5 +59,6 @@ if __name__ == "__main__":
     test_new_money_positive_is_not_transfer_row()
     test_plain_split_stays_a_real_payment()
     test_blank_negative_is_protected_but_real_offset_is_not()
+    test_zero_deposit_transfer_hides_approval_fields()
     test_group_token_roundtrip()
     print("ok")

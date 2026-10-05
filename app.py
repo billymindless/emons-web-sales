@@ -38596,7 +38596,8 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "미수 행에는 양수(예: `17,000`) 를 입력합니다.\n"
             "- 실제 입금액은 **0** 을 입력합니다 (신규 결제가 없기 때문). "
             "배분 합계도 `+17,000 + (-17,000) = 0` 이 되어 실입금과 일치하면 등록됩니다.\n"
-            "- 실입금 0인 이관은 양쪽 전표 모두 수단이 `초과이관`이고, 같은 묶음으로 저장됩니다. "
+            "- 실입금 0이면 결제 수단·카드 승인번호 칸은 나오지 않습니다. "
+            "양쪽 전표 모두 수단이 `초과이관`이고, 같은 묶음으로 저장됩니다. "
             "한쪽만 지우면 다른 주문 미수가 돌아오므로 상계 삭제·잘못 입력 삭제로는 지울 수 없습니다."
         ),
     },
@@ -40946,6 +40947,7 @@ def _recalc_order_actual_margin(conn, order_id: int, db_filename: str | None = N
 
 from split_payment_rules import (
     TRANSFER_METHOD,
+    hide_payment_method_fields,
     is_transfer_alloc,
     new_transfer_group,
     protects_from_single_delete,
@@ -41099,37 +41101,49 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         on_change=lambda: st.session_state.__setitem__(_actual_paid_key, _format_number_comma(st.session_state.get(_actual_paid_key, ""))),
     )
 
-    # 결제 수단 / 날짜
+    # 결제 수단 / 날짜. 실입금 0인 초과이관은 새 결제가 아니므로 수단·승인번호를 받지 않는다.
     _split_date_key = f"{key_prefix}_date"
     if _split_date_key not in st.session_state:
         st.session_state[_split_date_key] = _today_kst()
-    col_m, col_d = st.columns(2)
-    with col_m:
-        split_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
-    with col_d:
-        split_date = st.date_input("결제 날짜 *", key=_split_date_key)
-
-    # 카드사 / 메인페이
+    _actual_paid_now = _parse_comma_to_int(st.session_state.get(_actual_paid_key, "0"))
+    _hide_method = hide_payment_method_fields(_has_overpaid, _actual_paid_now)
     _CARD_WITH_COMPANY_SPLIT = ("신용카드", "체크카드")
-    if split_method in _CARD_WITH_COMPANY_SPLIT:
-        split_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
-        st.text_input("카드 승인번호 8자리 *", key=f"{key_prefix}_card_appr", max_chars=8)
-    elif split_method == "메인페이":
-        split_card = st.text_input("메인페이 승인번호 8자리", key=f"{key_prefix}_card", max_chars=8)
-    elif split_method == "지역화폐":
-        split_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card", max_chars=6)
-        _onnuri_time_input(
-            f"{key_prefix}_ulsan_time",
-            visible=_ulsan_should_ask_time(db_filename, st.session_state.get(f"{key_prefix}_card", "")),
-            label="지역화폐 거래시간 *",
-            help_text=_ULSAN_TIME_HELP,
-        )
-    else:
+    if _hide_method:
+        st.info("실제 입금액이 0원입니다. 이미 받은 금액을 주문 사이에 옮기므로 카드사와 승인번호는 받지 않습니다.")
+        split_method = None
         split_card = None
-        st.session_state.pop(f"{key_prefix}_card", None)
+        split_date = st.date_input("이관 날짜 *", key=_split_date_key)
+    else:
+        col_m, col_d = st.columns(2)
+        with col_m:
+            split_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
+        with col_d:
+            split_date = st.date_input("결제 날짜 *", key=_split_date_key)
 
-    # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리
-    is_onnuri_split = split_method and "온누리" in str(split_method) and "지류" not in str(split_method)
+        if split_method in _CARD_WITH_COMPANY_SPLIT:
+            split_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
+            st.text_input("카드 승인번호 8자리 *", key=f"{key_prefix}_card_appr", max_chars=8)
+        elif split_method == "메인페이":
+            split_card = st.text_input("메인페이 승인번호 8자리", key=f"{key_prefix}_card", max_chars=8)
+        elif split_method == "지역화폐":
+            split_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card", max_chars=6)
+            _onnuri_time_input(
+                f"{key_prefix}_ulsan_time",
+                visible=_ulsan_should_ask_time(db_filename, st.session_state.get(f"{key_prefix}_card", "")),
+                label="지역화폐 거래시간 *",
+                help_text=_ULSAN_TIME_HELP,
+            )
+        else:
+            split_card = None
+            st.session_state.pop(f"{key_prefix}_card", None)
+
+    # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리. 실입금 0 이관에는 없다.
+    is_onnuri_split = (
+        not _hide_method
+        and split_method
+        and "온누리" in str(split_method)
+        and "지류" not in str(split_method)
+    )
     _onnuri_last4_key = f"{key_prefix}_onnuri_last4"
     if is_onnuri_split:
         st.text_input(
