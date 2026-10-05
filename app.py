@@ -8707,6 +8707,44 @@ def _pcr_customer_payments_dialog(db_filename: str, sale_id, customer_name: str)
             st.dataframe(_disp[_cols_show], width='stretch', hide_index=True)
 
 
+@st.dialog("고객 계약서", width="large")
+def _pcr_customer_contract_dialog(db_filename: str, sale_id, customer_name: str) -> None:
+    """결제변경 검증 화면에서 고객 이름 클릭 시 그 고객의 계약서를 PDF 새 창으로 연다.
+    읽기 전용. 업로드/삭제/PDF 재생성은 하지 않는다 (고객 화면의 다이얼로그에만 있음).
+    버튼을 눌렀을 때만 호출되므로 업무 목록/카드/패널 렌더 비용에는 영향이 없다."""
+    import customer_contract_service as ccs  # noqa: WPS433
+    st.caption(f"{customer_name} · 읽기 전용")
+    if not db_filename:
+        st.warning("매장 DB 정보를 알 수 없어 조회할 수 없습니다.")
+        return
+    try:
+        _sid = int(sale_id) if sale_id not in (None, "") else None
+    except (TypeError, ValueError):
+        _sid = None
+    if _sid is None:
+        st.info("결제변경 요청에 연결된 주문이 없어 계약서를 찾을 수 없습니다.")
+        return
+    cid = _get_order_customer_id_supabase(db_filename, _sid)
+    if cid is None:
+        st.warning("고객 정보를 찾을 수 없습니다.")
+        return
+    try:
+        counts = ccs.count_pages_by_customers(db_filename, [int(cid)])
+        cnt = int(counts.get(int(cid), 0))
+    except Exception as _e:
+        logger.warning("계약서 장수 조회 실패: %s", _e)
+        cnt = 0
+    if cnt <= 0:
+        st.info("저장된 계약서가 없습니다.")
+        return
+    st.markdown(f"**총 {cnt}장**")
+    pdf_url = ccs.pdf_signed_url(db_filename, int(cid))
+    if pdf_url:
+        st.link_button("📄 PDF 새 창으로 열기", pdf_url, width="stretch")
+    else:
+        st.warning("PDF 파일이 아직 준비되지 않았습니다. 고객 및 잔금 관리 화면에서 'PDF 다시 만들기' 를 눌러 주세요.")
+
+
 def _pcr_pay_approval_and_time(pay: dict) -> tuple[str, str]:
     """수단별 승인번호·거래시간. (승인표시, HH:MM:SS 또는 '')."""
     method = str(pay.get("payment_method") or "")
@@ -33625,15 +33663,28 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
                 unsafe_allow_html=True,
             )
 
-        # 고객 이름 → 전체 결제 내역 팝업 (클릭 시에만 데이터 로드)
+        # 고객 이름 → 계약서 PDF, 옆 버튼 → 전체 결제 내역. 둘 다 클릭 시에만 조회한다.
         _cust_name = str(meta.get("customer_name") or "").strip()
         if _cust_name:
-            _cust_cols = st.columns([6, 4])
+            _cust_cols = st.columns([3, 3, 4])
             with _cust_cols[0]:
                 if st.button(
                     f"👤 고객: {_cust_name}",
                     key=f"pcr_cust_dlg_{tid}",
-                    help="클릭하면 이 고객의 전체 주문·결제 내역을 팝업으로 봅니다.",
+                    help="클릭하면 이 고객의 계약서를 팝업으로 봅니다.",
+                    width="stretch",
+                ):
+                    _pcr_customer_contract_dialog(
+                        str(meta.get("db_filename") or ""),
+                        meta.get("sale_id"),
+                        _cust_name,
+                    )
+            with _cust_cols[1]:
+                if st.button(
+                    "💳 전체 결제 보기",
+                    key=f"pcr_cust_pay_dlg_{tid}",
+                    help="이 고객의 모든 주문·결제를 팝업으로 봅니다.",
+                    width="stretch",
                 ):
                     _pcr_customer_payments_dialog(
                         str(meta.get("db_filename") or ""),
