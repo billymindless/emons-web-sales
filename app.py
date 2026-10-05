@@ -8614,6 +8614,8 @@ def _format_order_payments_display(pay_list: pd.DataFrame) -> tuple[pd.DataFrame
         card_method_mask = pay_display["payment_method"].isin(("신용카드", "체크카드"))
         pay_display.loc[empty_card & card_method_mask, "card_company"] = "(카드사 미입력)"
         pay_display.loc[empty_card & ~card_method_mask, "card_company"] = pay_display.loc[empty_card & ~card_method_mask, "payment_method"].fillna("-")
+        _xfer_mask = pay_display["card_company"].astype(str).str.startswith("이관그룹:")
+        pay_display.loc[_xfer_mask, "card_company"] = "초과이관"
     pay_display = pay_display.rename(columns={
         "id": "결제ID", "payment_date": "결제일", "amount": "금액",
         "payment_method": "수단", "card_company": "카드사/승인번호",
@@ -38599,7 +38601,9 @@ APP_FAQ_ITEMS: list[dict[str, str]] = [
             "미수 행에는 양수(예: `17,000`) 를 입력합니다.\n"
             "- 실제 입금액은 **0** 을 입력합니다 (신규 결제가 없기 때문). "
             "배분 합계도 `+17,000 + (-17,000) = 0` 이 되어 실입금과 일치하면 등록됩니다.\n"
-            "- 이 경우 이관 행은 결제 수단/승인번호를 붙이지 않고, `분배결제(초과이관)` 이력으로 남습니다."
+            "- 실입금 0이면 결제 수단·카드 승인번호 칸은 나오지 않습니다. "
+            "양쪽 전표 모두 수단이 `초과이관`이고, 같은 묶음으로 저장됩니다. "
+            "한쪽만 지우면 다른 주문 미수가 돌아오므로 상계 삭제·잘못 입력 삭제로는 지울 수 없습니다."
         ),
     },
     {
@@ -40946,6 +40950,95 @@ def _recalc_order_actual_margin(conn, order_id: int, db_filename: str | None = N
     )
 
 
+from split_payment_rules import (
+    TRANSFER_METHOD,
+    hide_payment_method_fields,
+    is_transfer_alloc,
+    new_transfer_group,
+    protects_from_single_delete,
+    transfer_group_token,
+)
+
+
+def _cancel_transfer_group(db_filename: str, token: str) -> tuple[bool, str]:
+    """같은 이관그룹 전표를 함께 지운다. 한쪽만 남기면 상대 주문이 다시 미수가 된다."""
+    if not db_filename or not token:
+        return False, "이관 묶음 정보가 없습니다."
+    client, err = get_supabase_client()
+    if err or not client:
+        return False, err or "Supabase 연결 실패"
+    try:
+        resp = (
+            client.table("app_payments")
+            .select("id, order_id, amount")
+            .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            .eq("card_company", token)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        return False, str(e)
+    if len(rows) < 2:
+        return False, "같은 이관으로 묶인 전표가 2건 미만이라 취소하지 않았습니다."
+    deleted = 0
+    order_ids: set[int] = set()
+    for row in rows:
+        pid = int(row["id"])
+        oid = int(row["order_id"])
+        if _delete_payment_supabase(db_filename, pid):
+            deleted += 1
+            order_ids.add(oid)
+    for oid in order_ids:
+        _recalc_order_actual_margin_supabase(db_filename, oid)
+        cid = _get_order_customer_id_supabase(db_filename, oid)
+        cname = _get_customer_name_supabase(db_filename, cid) if cid else ""
+        _insert_payment_history(
+            None, oid, cname or "", "분배결제(이관취소)",
+            {"transfer_group": token, "order_id": oid},
+            {"deleted_in_group": deleted},
+            "초과이관 묶음 취소",
+            db_filename=db_filename,
+        )
+    if deleted != len(rows):
+        return False, f"{deleted}/{len(rows)}건만 삭제되었습니다. 남은 전표를 확인해 주세요."
+    return True, f"초과이관 {deleted}건을 함께 취소했습니다."
+
+
+def _render_transfer_payment_lock(db_filename: str, prow) -> None:
+    """초과이관 전표는 상계 삭제·잘못 입력 삭제로 한쪽만 지우지 않는다."""
+    st.warning(
+        "이 전표는 주문 사이 초과이관입니다. 이쪽만 지우면 다른 주문 잔금이 다시 미수로 돌아갑니다. "
+        "취소할 때는 같은 이관으로 묶인 전표를 함께 지웁니다."
+    )
+    token = transfer_group_token(prow.get("card_company"))
+    if not token:
+        st.caption("상대 전표와 묶인 표시가 없습니다. 한쪽만 지우는 버튼은 막아 두었습니다.")
+        return
+    pid = int(prow["id"])
+    confirm_key = f"xfer_cancel_confirm_{pid}"
+    st.checkbox("같은 이관 묶음의 전표를 모두 삭제하는 데 동의합니다.", key=confirm_key)
+    if st.button("이관 묶음 전체 취소", key=f"xfer_cancel_btn_{pid}"):
+        if not st.session_state.get(confirm_key):
+            st.warning("확인 체크 후 실행하세요.")
+            return
+        ok, msg = _cancel_transfer_group(db_filename, token)
+        if ok:
+            _invalidate_payments()
+            flash(msg)
+            st.rerun()
+        st.error(msg)
+
+
+def _rollback_split_inserts(db_filename: str, inserted: list[tuple[int, int]]) -> None:
+    """분배 등록 중 한 건이라도 실패하면 이번 배치에서 넣은 결제만 되돌린다."""
+    order_ids: set[int] = set()
+    for oid, pid in inserted:
+        if _delete_payment_supabase(db_filename, pid):
+            order_ids.add(oid)
+    for oid in order_ids:
+        _recalc_order_actual_margin_supabase(db_filename, oid)
+
+
 def _parse_signed_comma_to_int(s) -> int:
     """부호 유지 콤마 → int. '-17,000' → -17000, '+17,000' → 17000, '17,000' → 17000.
 
@@ -41013,37 +41106,49 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         on_change=lambda: st.session_state.__setitem__(_actual_paid_key, _format_number_comma(st.session_state.get(_actual_paid_key, ""))),
     )
 
-    # 결제 수단 / 날짜
+    # 결제 수단 / 날짜. 실입금 0인 초과이관은 새 결제가 아니므로 수단·승인번호를 받지 않는다.
     _split_date_key = f"{key_prefix}_date"
     if _split_date_key not in st.session_state:
         st.session_state[_split_date_key] = _today_kst()
-    col_m, col_d = st.columns(2)
-    with col_m:
-        split_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
-    with col_d:
-        split_date = st.date_input("결제 날짜 *", key=_split_date_key)
-
-    # 카드사 / 메인페이
+    _actual_paid_now = _parse_comma_to_int(st.session_state.get(_actual_paid_key, "0"))
+    _hide_method = hide_payment_method_fields(_has_overpaid, _actual_paid_now)
     _CARD_WITH_COMPANY_SPLIT = ("신용카드", "체크카드")
-    if split_method in _CARD_WITH_COMPANY_SPLIT:
-        split_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
-        st.text_input("카드 승인번호 8자리 *", key=f"{key_prefix}_card_appr", max_chars=8)
-    elif split_method == "메인페이":
-        split_card = st.text_input("메인페이 승인번호 8자리", key=f"{key_prefix}_card", max_chars=8)
-    elif split_method == "지역화폐":
-        split_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card", max_chars=6)
-        _onnuri_time_input(
-            f"{key_prefix}_ulsan_time",
-            visible=_ulsan_should_ask_time(db_filename, st.session_state.get(f"{key_prefix}_card", "")),
-            label="지역화폐 거래시간 *",
-            help_text=_ULSAN_TIME_HELP,
-        )
-    else:
+    if _hide_method:
+        st.info("실제 입금액이 0원입니다. 이미 받은 금액을 주문 사이에 옮기므로 카드사와 승인번호는 받지 않습니다.")
+        split_method = None
         split_card = None
-        st.session_state.pop(f"{key_prefix}_card", None)
+        split_date = st.date_input("이관 날짜 *", key=_split_date_key)
+    else:
+        col_m, col_d = st.columns(2)
+        with col_m:
+            split_method = st.selectbox("결제 수단", options=PAYMENT_METHOD_OPTIONS, key=f"{key_prefix}_method")
+        with col_d:
+            split_date = st.date_input("결제 날짜 *", key=_split_date_key)
 
-    # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리
-    is_onnuri_split = split_method and "온누리" in str(split_method) and "지류" not in str(split_method)
+        if split_method in _CARD_WITH_COMPANY_SPLIT:
+            split_card = st.selectbox("카드사", options=CARD_COMPANY_OPTIONS, key=f"{key_prefix}_card")
+            st.text_input("카드 승인번호 8자리 *", key=f"{key_prefix}_card_appr", max_chars=8)
+        elif split_method == "메인페이":
+            split_card = st.text_input("메인페이 승인번호 8자리", key=f"{key_prefix}_card", max_chars=8)
+        elif split_method == "지역화폐":
+            split_card = st.text_input("지역화폐 승인번호", key=f"{key_prefix}_card", max_chars=6)
+            _onnuri_time_input(
+                f"{key_prefix}_ulsan_time",
+                visible=_ulsan_should_ask_time(db_filename, st.session_state.get(f"{key_prefix}_card", "")),
+                label="지역화폐 거래시간 *",
+                help_text=_ULSAN_TIME_HELP,
+            )
+        else:
+            split_card = None
+            st.session_state.pop(f"{key_prefix}_card", None)
+
+    # 온누리(전자) 식별자: 검증파일 구매자전화번호 뒤 4자리. 실입금 0 이관에는 없다.
+    is_onnuri_split = (
+        not _hide_method
+        and split_method
+        and "온누리" in str(split_method)
+        and "지류" not in str(split_method)
+    )
     _onnuri_last4_key = f"{key_prefix}_onnuri_last4"
     if is_onnuri_split:
         st.text_input(
@@ -41226,34 +41331,44 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
         success_count = 0
         transfer_count = 0
 
-        # 신용/체크카드 승인번호 8자리 (분배결제 공용)
+        # 신용/체크카드 승인번호 8자리. 실입금 0인 순수 이관은 카드 승인을 받지 않는다.
         _split_card_appr_val = None
-        if split_method in _CARD_WITH_COMPANY_SPLIT:
+        if split_method in _CARD_WITH_COMPANY_SPLIT and actual_paid_int > 0:
             _split_card_appr_val = re.sub(r"\D", "", str(st.session_state.get(f"{key_prefix}_card_appr", "") or "").strip()) or None
             if not _split_card_appr_val or len(_split_card_appr_val) != 8:
                 st.error(f"{split_method} 승인번호 8자리를 정확히 입력하세요.")
                 return
 
+        _inserted_ids: list[tuple[int, int]] = []
+        _pending_history: list[dict] = []
+        _xfer_token = new_transfer_group() if is_transfer_mode else None
+        _use_supabase = _supabase_orders_payments_available()
+
         for oid, alloc_amt in _nonzero_allocs:
             orow_match = orders_df[orders_df["id"] == oid]
             if orow_match.empty:
-                continue
+                errors.append(f"주문 #{oid}: 주문 행을 찾지 못했습니다.")
+                break
             bal = float(orow_match.iloc[0].get("balance") or 0)
-            _is_transfer_row = alloc_amt < 0
-            # 수수료: 양수 결제만 계산. 음수(이관) 행은 수수료 없음.
-            fee = _payment_fee_amount(split_method, alloc_amt) if alloc_amt > 0 else 0.0
-            # 이관 행에는 신규 결제 메타(승인번호 등) 를 붙이지 않는다 — audit 오염 방지.
-            _row_method = (split_method or None) if alloc_amt > 0 else None
-            _row_card = split_card if alloc_amt > 0 else None
-            # 승인번호: 신용/체크카드는 8자리, 그 외는 온누리 코드
-            if alloc_amt > 0 and split_method in _CARD_WITH_COMPANY_SPLIT:
-                _row_onnuri = _split_card_appr_val
+            _is_transfer_row = is_transfer_alloc(is_transfer_mode, actual_paid_int, alloc_amt)
+            if _is_transfer_row:
+                fee = 0.0
+                _row_method = TRANSFER_METHOD
+                _row_card = _xfer_token
+                _row_onnuri = None
             else:
-                _row_onnuri = onnuri_code if alloc_amt > 0 else None
+                fee = _payment_fee_amount(split_method, alloc_amt) if alloc_amt > 0 else 0.0
+                _row_method = split_method or None
+                _row_card = split_card
+                if split_method in _CARD_WITH_COMPANY_SPLIT:
+                    _row_onnuri = _split_card_appr_val
+                else:
+                    _row_onnuri = onnuri_code
             try:
-                if _supabase_orders_payments_available():
+                if _use_supabase:
+                    _err_detail: list[str] = []
                     old_paid, _ = _sum_payments_by_order_supabase(db_filename, oid)
-                    _insert_payment_supabase(db_filename, {
+                    new_id = _insert_payment_supabase(db_filename, {
                         "order_id": oid,
                         "payment_date": pay_date_str,
                         "amount": alloc_amt,
@@ -41262,40 +41377,84 @@ def _multi_order_split_payment_ui(db_filename: str, orders_df: pd.DataFrame, key
                         "fee_amount": fee,
                         "onnuri_approval_code": _row_onnuri,
                         "created_by": _current_username(),
-                    })
+                    }, _error_detail=_err_detail)
+                    if not new_id:
+                        errors.append(
+                            f"주문 #{oid}: " + ("; ".join(_err_detail) or "결제 행이 저장되지 않았습니다.")
+                        )
+                        break
+                    _inserted_ids.append((oid, int(new_id)))
                     _recalc_order_actual_margin_supabase(db_filename, oid)
                     new_paid = old_paid + alloc_amt
                     cid_ph = _get_order_customer_id_supabase(db_filename, oid)
                     cname_ph = _get_customer_name_supabase(db_filename, cid_ph) if cid_ph else ""
                     _action = "분배결제(초과이관)" if _is_transfer_row else "분배결제(복수주문)"
-                    _insert_payment_history(
-                        None, oid, cname_ph, _action,
-                        {"order_id": oid, "balance_before": bal, "paid_total_before": old_paid},
-                        {"order_id": oid, "added_amount": alloc_amt, "method": _row_method, "balance_after": bal - alloc_amt, "paid_total_after": new_paid},
-                        split_reason, db_filename=db_filename,
-                    )
+                    _pending_history.append({
+                        "oid": oid,
+                        "cname": cname_ph,
+                        "action": _action,
+                        "old": {"order_id": oid, "balance_before": bal, "paid_total_before": old_paid},
+                        "new": {
+                            "order_id": oid,
+                            "payment_id": int(new_id),
+                            "added_amount": alloc_amt,
+                            "method": _row_method,
+                            "transfer_group": _row_card if _is_transfer_row else None,
+                            "balance_after": bal - alloc_amt,
+                            "paid_total_after": new_paid,
+                        },
+                    })
                 else:
                     conn = get_tenant_conn(db_filename)
                     old_paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM Payments WHERE order_id=?", (oid,)).fetchone()[0] or 0
-                    conn.execute(
+                    cur = conn.execute(
                         "INSERT INTO Payments (order_id, payment_date, amount, payment_method, card_company, fee_amount, onnuri_approval_code, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,datetime('now', '+9 hours'))",
                         (oid, pay_date_str, alloc_amt, _row_method, _row_card, fee, _row_onnuri, _current_username()),
                     )
+                    new_id = int(cur.lastrowid or 0)
                     _recalc_order_actual_margin(conn, oid, db_filename)
                     conn.commit()
                     conn.close()
+                    if not new_id:
+                        errors.append(f"주문 #{oid}: 결제 행이 저장되지 않았습니다.")
+                        break
+                    _inserted_ids.append((oid, new_id))
                 if _is_transfer_row:
                     transfer_count += 1
                 else:
                     success_count += 1
             except Exception as e:
                 errors.append(f"주문 #{oid}: {e}")
+                break
+
+        if errors and _inserted_ids:
+            if _use_supabase:
+                _rollback_split_inserts(db_filename, _inserted_ids)
+            else:
+                for _rb_oid, _rb_pid in _inserted_ids:
+                    _rb_conn = get_tenant_conn(db_filename)
+                    try:
+                        _rb_conn.execute("DELETE FROM Payments WHERE id = ?", (_rb_pid,))
+                        _recalc_order_actual_margin(_rb_conn, _rb_oid, db_filename)
+                        _rb_conn.commit()
+                    finally:
+                        _rb_conn.close()
+            success_count = 0
+            transfer_count = 0
+        elif _use_supabase:
+            for _hist in _pending_history:
+                _insert_payment_history(
+                    None, _hist["oid"], _hist["cname"], _hist["action"],
+                    _hist["old"], _hist["new"], split_reason, db_filename=db_filename,
+                )
 
         # 결제 도메인만 무효화 — 매장/직원/고객 캐시 유지. (주문·매출 캐시 포함)
         _invalidate_payments()
         if errors:
             for err in errors:
                 st.error(err)
+            if _inserted_ids:
+                st.error("분배 결제 일부가 저장되지 않아 이번 등록을 모두 취소했습니다. 잔금은 이전 상태입니다.")
         _total_done = success_count + transfer_count
         if _total_done > 0:
             if transfer_count > 0 and success_count > 0:
@@ -44790,6 +44949,9 @@ def render_customer_balance():
                                             if prow.get("payment_method") in ("신용카드", "체크카드") and _prow_cc:
                                                 _prow_method_label = f"{prow['payment_method']} ({_prow_cc})"
                                             with st.expander(f"결제 ID {prow['id']} — {_prow_method_label} {float(prow['amount'] or 0):,.0f}원"):
+                                                if protects_from_single_delete(prow.get("payment_method"), prow.get("amount")):
+                                                    _render_transfer_payment_lock(db_filename, prow)
+                                                    continue
                                                 col_left, col_right = st.columns(2)
                                                 with col_left:
                                                     st.info("**기존 결제 내역 (비교용)**")
@@ -45671,6 +45833,10 @@ def render_customer_balance():
                                         _pay_detail_cols.append(_c)
                                         _pay_col_rename[_c] = _label
                                 _op_pays_disp = _op_pays[_pay_detail_cols].rename(columns=_pay_col_rename).copy()
+                                if "카드사/승인번호" in _op_pays_disp.columns:
+                                    _op_pays_disp["카드사/승인번호"] = _op_pays_disp["카드사/승인번호"].apply(
+                                        lambda v: "초과이관" if str(v or "").startswith("이관그룹:") else v
+                                    )
                                 _fmt_money_cols = [_pay_col_rename.get(c) for c in ("amount", "fee_amount") if _pay_col_rename.get(c) in _op_pays_disp.columns]
                                 st.caption("📋 현재 결제 내역 — 취소/감액할 건을 아래 수정 패널에서 선택하세요")
                                 st.dataframe(_format_df_display(_op_pays_disp, _fmt_money_cols), width='stretch')
@@ -45680,6 +45846,9 @@ def render_customer_balance():
                                     _prow_amt = float(prow["amount"] or 0)
                                     _prow_method = prow.get("payment_method") or "-"
                                     with st.expander(f"✏️ 결제 ID {prow['id']} — {_prow_method} {_prow_amt:,.0f}원 수정/취소", expanded=False):
+                                        if protects_from_single_delete(prow.get("payment_method"), prow.get("amount")):
+                                            _render_transfer_payment_lock(db_filename, prow)
+                                            continue
                                         col_left, col_right = st.columns(2)
                                         with col_left:
                                             st.info("**기존 결제 내역 (비교용)**")
