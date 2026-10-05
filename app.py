@@ -3380,10 +3380,12 @@ def _ext_pay_relink_amount_and_near_date(
             if not cc:
                 continue
             fd = _ext_pay_as_date(file_date)
+            _want_neg = _ext_pay_is_cancel_status(r.get("tx_status")) or int(r.get("amount") or 0) < 0
             same = [
                 p for p in leftover
                 if _card_company_norm(p.get("card_company")) == cc
                 and abs(int(p.get("amount") or 0)) == oamt
+                and (int(p.get("amount") or 0) < 0) == _want_neg
             ]
             diff_amt = [
                 p for p in leftover
@@ -3391,6 +3393,11 @@ def _ext_pay_relink_amount_and_near_date(
                 and abs(int(p.get("amount") or 0)) != oamt
             ]
             if same:
+                _appr_c = _ext_pay_card_appr8(r.get("approval_code"))
+                if _appr_c:
+                    _same_ap = [p for p in same if _ext_pay_card_appr8(p.get("approval_code")) == _appr_c]
+                    if _same_ap:
+                        same = _same_ap
                 def _gap_c(p):
                     ed = _ext_pay_as_date(p.get("payment_date"))
                     if fd is None or ed is None:
@@ -5273,6 +5280,339 @@ def _ext_pay_match_ulsanpay(db_filename: str, verify_from: date, matched_by: str
     return counts, None
 
 
+_CARD_CANCEL_LOOKBACK_MONTHS = 6
+_CARD_CANCEL_NEG_GRACE_DAYS = 7
+
+
+def _ext_pay_shift_months(d: date, months: int) -> date:
+    """months 만큼 이동. 음수면 과거. 말일은 그 달의 마지막 날로 자른다."""
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    if month == 12:
+        nxt = date(year + 1, 1, 1)
+    else:
+        nxt = date(year, month + 1, 1)
+    last = (nxt - timedelta(days=1)).day
+    return date(year, month, min(d.day, last))
+
+
+def _ext_pay_card_appr8(v) -> str:
+    """카드 승인번호 8자리. 6자리 이상만 인정하고 왼쪽 0을 채운다. 카드사명은 빈 값."""
+    digits = re.sub(r"\D", "", str(v or ""))
+    if len(digits) > 8:
+        digits = digits[-8:]
+    if len(digits) < 6:
+        return ""
+    return digits.zfill(8)
+
+
+def _ext_pay_card_cancel_lookback(sc, db_filename: str, matched_by: str | None) -> int:
+    """공식 카드 취소를 마이너스 전표일 기준 6개월 전 매출과 연결.
+
+    순서: 같은 승인번호의 모모 음수 전표, 같은 승인번호의 과거 양수 매출,
+    승인번호가 없으면 같은 금액, 여러 건이면 같은 고객 전화번호.
+    고객이 정해지면 같은 금액의 온누리 결제를 노트에만 적는다.
+    이미 결제가 연결된 행과 matched_ok 는 다시 쓰지 않는다.
+    """
+    if not sc or not db_filename:
+        return 0
+    try:
+        def _filt_rows(q):
+            return q.eq("db_filename", db_filename).eq("source", "card")
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            "id, tx_date, amount, tx_status, approval_code, phone_last4",
+            _filt_rows, order_col="id",
+        )
+        def _filt_m(q):
+            return q.eq("db_filename", db_filename).eq("source", "card")
+        matches = _ext_pay_select_paged(
+            sc, "app_external_pay_matches",
+            "row_id, payment_id, result_code",
+            _filt_m, order_col="id",
+        )
+    except Exception as e:
+        logger.warning("카드 취소 6개월 조회 실패: %s", e)
+        return 0
+
+    m_by = {int(m["row_id"]): m for m in matches if m.get("row_id") is not None}
+    targets: list[dict] = []
+    for r in rows:
+        try:
+            rid = int(r["id"])
+            amt = int(r.get("amount") or 0)
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not (_ext_pay_is_cancel_status(r.get("tx_status")) or amt < 0):
+            continue
+        m = m_by.get(rid)
+        if m and m.get("payment_id") is not None:
+            continue
+        if m and (m.get("result_code") or "") not in ("official_canceled", "미매칭", "official_only"):
+            continue
+        cancel_date = _ext_pay_as_date(r.get("tx_date"))
+        if cancel_date is None or amt == 0:
+            continue
+        targets.append(r)
+    if not targets:
+        return 0
+
+    cancel_dates = [_ext_pay_as_date(r.get("tx_date")) for r in targets]
+    cancel_dates = [d for d in cancel_dates if d is not None]
+    start = _ext_pay_shift_months(min(cancel_dates), -_CARD_CANCEL_LOOKBACK_MONTHS)
+    end = max(cancel_dates) + timedelta(days=_CARD_CANCEL_NEG_GRACE_DAYS)
+    try:
+        def _filt_p(q):
+            return (
+                q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .gte("payment_date", start.isoformat())
+                .lte("payment_date", end.isoformat())
+            )
+        pays = _ext_pay_select_paged(
+            sc, "app_payments",
+            "id, order_id, payment_date, amount, payment_method, card_company, onnuri_approval_code",
+            _filt_p, order_col="id",
+        )
+    except Exception as e:
+        logger.warning("카드 취소 6개월 결제 조회 실패: %s", e)
+        return 0
+
+    card_pays = [p for p in pays if str(p.get("payment_method") or "") in ("신용카드", "체크카드")]
+    onnuri_pays = [
+        p for p in pays
+        if "온누리" in str(p.get("payment_method") or "") and "지류" not in str(p.get("payment_method") or "")
+        and int(p.get("amount") or 0) > 0
+    ]
+    order_ids = sorted({
+        int(p["order_id"]) for p in card_pays + onnuri_pays if p.get("order_id") is not None
+    })
+    orders_map: dict[int, dict] = {}
+    for chunk in (order_ids[i : i + 200] for i in range(0, len(order_ids), 200)):
+        try:
+            got = (
+                sc.table("app_orders")
+                .select("id, customer_id")
+                .eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+                .in_("id", chunk)
+                .execute()
+            )
+            for row in got.data or []:
+                orders_map[int(row["id"])] = row
+        except Exception as e:
+            logger.warning("카드 취소 주문 조회 실패: %s", e)
+    cust_ids = sorted({
+        int(o["customer_id"]) for o in orders_map.values() if o.get("customer_id") is not None
+    })
+    cust_map: dict[int, dict] = {}
+    for chunk in (cust_ids[i : i + 200] for i in range(0, len(cust_ids), 200)):
+        try:
+            got = sc.table("app_customers").select("id, phone1, phone2").in_("id", list(chunk)).execute()
+            for row in got.data or []:
+                cust_map[int(row["id"])] = row
+        except Exception as e:
+            logger.warning("카드 취소 고객 조회 실패: %s", e)
+
+    def _cust_of(p: dict) -> int | None:
+        o = orders_map.get(int(p["order_id"])) if p.get("order_id") is not None else None
+        if not o or o.get("customer_id") is None:
+            return None
+        try:
+            return int(o["customer_id"])
+        except (TypeError, ValueError):
+            return None
+
+    def _last4s(cid: int | None) -> set[str]:
+        if cid is None:
+            return set()
+        c = cust_map.get(cid) or {}
+        out: set[str] = set()
+        for col in ("phone1", "phone2"):
+            digits = _ext_pay_digits_only(c.get(col))
+            if len(digits) >= 4:
+                out.add(digits[-4:])
+        return out
+
+    used = {int(m["payment_id"]) for m in matches if m.get("payment_id") is not None}
+    updated = 0
+
+    def _in_past(p: dict, cancel_date: date) -> bool:
+        pd_ = _ext_pay_as_date(p.get("payment_date"))
+        if pd_ is None:
+            return False
+        return _ext_pay_shift_months(cancel_date, -_CARD_CANCEL_LOOKBACK_MONTHS) <= pd_ <= cancel_date
+
+    def _in_neg_grace(p: dict, cancel_date: date) -> bool:
+        pd_ = _ext_pay_as_date(p.get("payment_date"))
+        if pd_ is None:
+            return False
+        return cancel_date - timedelta(days=2) <= pd_ <= cancel_date + timedelta(days=_CARD_CANCEL_NEG_GRACE_DAYS)
+
+    for r in targets:
+        rid = int(r["id"])
+        cancel_date = _ext_pay_as_date(r.get("tx_date"))
+        if cancel_date is None:
+            continue
+        try:
+            abs_amt = abs(int(r.get("amount") or 0))
+        except (TypeError, ValueError):
+            continue
+        appr = _ext_pay_card_appr8(r.get("approval_code"))
+        file_last4 = str(r.get("phone_last4") or "").strip()
+        note_parts: list[str] = []
+        chosen: dict | None = None
+        result_code = None
+
+        neg_appr = [
+            p for p in card_pays
+            if int(p.get("amount") or 0) < 0
+            and abs(int(p.get("amount") or 0)) == abs_amt
+            and appr
+            and _ext_pay_card_appr8(p.get("onnuri_approval_code")) == appr
+            and _in_neg_grace(p, cancel_date)
+            and int(p["id"]) not in used
+        ]
+        pos_appr = [
+            p for p in card_pays
+            if int(p.get("amount") or 0) > 0
+            and abs(int(p.get("amount") or 0)) == abs_amt
+            and appr
+            and _ext_pay_card_appr8(p.get("onnuri_approval_code")) == appr
+            and _in_past(p, cancel_date)
+        ]
+        if len(neg_appr) == 1:
+            chosen = neg_appr[0]
+            result_code = "matched_ok"
+            note_parts.append("공식 취소 · ERP 상계 (승인번호)")
+            if len(pos_appr) == 1:
+                note_parts.append(f"원매출 {str(pos_appr[0].get('payment_date') or '')[:10]}")
+        elif len(neg_appr) > 1:
+            result_code = "ambiguous"
+            note_parts.append(f"같은 승인번호 음수 전표 {len(neg_appr)}건")
+        elif len(pos_appr) == 1:
+            origin = pos_appr[0]
+            oid = origin.get("order_id")
+            order_negs = [
+                p for p in card_pays
+                if int(p.get("amount") or 0) < 0
+                and abs(int(p.get("amount") or 0)) == abs_amt
+                and p.get("order_id") == oid
+                and int(p["id"]) not in used
+            ]
+            if len(order_negs) == 1:
+                chosen = order_negs[0]
+                note_parts.append("공식 취소 · ERP 상계 (승인번호)")
+            else:
+                chosen = origin
+                note_parts.append("공식 취소 · 원매출 승인번호")
+            result_code = "matched_ok"
+            note_parts.append(f"원매출 {str(origin.get('payment_date') or '')[:10]}")
+        elif len(pos_appr) > 1:
+            result_code = "ambiguous"
+            note_parts.append(f"같은 승인번호 과거 매출 {len(pos_appr)}건")
+        else:
+            amount_cands = [
+                p for p in card_pays
+                if int(p.get("amount") or 0) > 0
+                and abs(int(p.get("amount") or 0)) == abs_amt
+                and _in_past(p, cancel_date)
+                and (
+                    not appr
+                    or not _ext_pay_card_appr8(p.get("onnuri_approval_code"))
+                )
+            ]
+            if len(amount_cands) > 1 and file_last4:
+                narrowed = [p for p in amount_cands if file_last4 in _last4s(_cust_of(p))]
+                if len(narrowed) == 1:
+                    amount_cands = narrowed
+                elif len(narrowed) > 1:
+                    amount_cands = narrowed
+            if len(amount_cands) == 1:
+                chosen = amount_cands[0]
+                result_code = "matched_ok"
+                note_parts.append("공식 취소 · 같은 금액 과거 매출")
+                note_parts.append(f"원매출 {str(chosen.get('payment_date') or '')[:10]}")
+            elif len(amount_cands) > 1:
+                result_code = "ambiguous"
+                note_parts.append(f"같은 금액 과거 매출 {len(amount_cands)}건")
+
+        if result_code is None:
+            continue
+        if chosen is None and result_code != "ambiguous":
+            continue
+
+        cid = _cust_of(chosen) if chosen is not None else None
+        if cid is not None and result_code == "matched_ok":
+            onnuri_hits = []
+            for p in onnuri_pays:
+                if _cust_of(p) != cid:
+                    continue
+                pd_ = _ext_pay_as_date(p.get("payment_date"))
+                if pd_ is None:
+                    continue
+                if not (cancel_date - timedelta(days=14) <= pd_ <= cancel_date + timedelta(days=45)):
+                    continue
+                try:
+                    pamt = int(p.get("amount") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if pamt == abs_amt or (abs_amt and abs(pamt - abs_amt) / abs_amt <= 0.2):
+                    onnuri_hits.append(p)
+            if onnuri_hits:
+                bits = [
+                    f"{str(p.get('payment_date') or '')[:10]} {int(p.get('amount') or 0):,}원"
+                    for p in sorted(onnuri_hits, key=lambda x: str(x.get("payment_date") or ""))[:3]
+                ]
+                note_parts.append("카드 취소 후 온누리 결제변경 후보 " + ", ".join(bits))
+            timeline = []
+            for p in card_pays:
+                if _cust_of(p) != cid or abs(int(p.get("amount") or 0)) != abs_amt:
+                    continue
+                kind = "카드음수" if int(p.get("amount") or 0) < 0 else "카드양수"
+                timeline.append((str(p.get("payment_date") or "")[:10], kind, abs(int(p.get("amount") or 0))))
+            for p in onnuri_hits:
+                timeline.append((str(p.get("payment_date") or "")[:10], "온누리", int(p.get("amount") or 0)))
+            timeline.sort()
+            if timeline:
+                shown = " / ".join(f"{d} {k} {a:,}원" for d, k, a in timeline[:6])
+                note_parts.append(shown)
+
+        order_id = None
+        pay_id = None
+        if chosen is not None:
+            pay_id = int(chosen["id"])
+            if chosen.get("order_id") is not None:
+                order_id = int(chosen["order_id"])
+        payload = {
+            "result_code": result_code,
+            "note": " · ".join(note_parts) or None,
+            "payment_id": pay_id,
+            "order_id": order_id,
+            "customer_id": cid,
+        }
+        existed = m_by.get(rid)
+        try:
+            if existed:
+                sc.table("app_external_pay_matches").update(payload).eq(
+                    "db_filename", db_filename
+                ).eq("source", "card").eq("row_id", rid).execute()
+            else:
+                sc.table("app_external_pay_matches").insert({
+                    "db_filename": db_filename,
+                    "source": "card",
+                    "row_id": rid,
+                    "matched_by": (matched_by or "").strip() or None,
+                    **payload,
+                }).execute()
+            if pay_id is not None:
+                used.add(pay_id)
+            m_by[rid] = {"row_id": rid, "payment_id": pay_id, "result_code": result_code}
+            updated += 1
+        except Exception as e:
+            logger.warning("카드 취소 6개월 매칭 저장 실패 row=%s: %s", rid, e)
+    return updated
+
+
 def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | None) -> tuple[dict, str | None]:
     """공식 카드매출 행 ↔ ERP 신용/체크카드 결제 매칭.
     키: (카드사 정규화, 절대금액). 서브키: 승인번호. 신규고객 필터 없음."""
@@ -5315,6 +5655,7 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
         matched_ids = set()
     todo = [r for r in rows if int(r["id"]) not in matched_ids]
     if not todo:
+        _ext_pay_card_cancel_lookback(sc, db_filename, matched_by)
         return {}, None
 
     try:
@@ -5465,6 +5806,9 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
                 note_parts.append("신용카드 결제 없음" if last4 else "카드사 미상")
         else:
             candidates = list(idx.get((cc, match_amt), []))
+            # 취소 행은 양수 매출을 대신 붙이지 않는다. 과거 원매출은 6개월 조회가 맡는다.
+            if is_cancel:
+                candidates = [p for p in candidates if int(p.get("amount") or 0) < 0]
 
         if candidates:
             # 매입일자 gap ±2일 이내 우선
@@ -5474,11 +5818,6 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
                     return 99
                 return abs((fd - ed).days)
             candidates = sorted(candidates, key=lambda p: (_gap(p), int(p.get("id") or 0)))
-            # 승인번호 매칭 (서브키)
-            appr = str(r.get("approval_code") or "").strip()
-            if appr:
-                # ERP측 승인번호는 별도 저장 안 됨. 그러나 후보 유일 조건은 유지
-                pass
             if len(candidates) == 1:
                 matched_pay = candidates[0]
             else:
@@ -5532,7 +5871,7 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
                             continue
                         if _pa != match_amt and _pa > 0:
                             amt_alts.append(_p)
-                if len(amt_alts) == 1:
+                if len(amt_alts) == 1 and not is_cancel:
                     matched_pay = amt_alts[0]
                     result_code = "amount_mismatch"
                     note_parts.append("공식파일에 있으나 금액 다름")
@@ -5584,6 +5923,7 @@ def _ext_pay_match_card(db_filename: str, verify_from: date, matched_by: str | N
 
     _ext_pay_relink_amount_and_near_date(sc, db_filename, "card")
     _ext_pay_propagate_business_to_payments(db_filename, "card")
+    _ext_pay_card_cancel_lookback(sc, db_filename, matched_by)
     return counts, None
 
 
@@ -6330,11 +6670,16 @@ def _ext_pay_unmatched_erp_pays(
     erp_to: date | None = None,
 ) -> list[dict]:
     """공식 파일에 매칭되지 않은 ERP 결제 (erp_only).
-    - 모든 source (onnuri/ulsanpay/card/mainpay): 해당 수단의 양수 결제 전체 (신규고객 필터 없음)
+    - 온누리·울산페이·메인페이: 양수 결제. 카드는 미사용 마이너스 전표도 포함.
     - erp_to: 지정 시 payment_date <= erp_to 로 상한 필터 적용."""
     try:
         def _filt(q):
-            q = q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename).gt("amount", 0)
+            q = q.eq(ORDERS_PAYMENTS_TENANT_COL, db_filename)
+            # 카드 마이너스 전표도 미매칭 목록에 남긴다. 다른 수단은 양수만.
+            if source != "card":
+                q = q.gt("amount", 0)
+            else:
+                q = q.neq("amount", 0)
             if erp_from is not None:
                 q = q.gte("payment_date", erp_from.isoformat())
             if erp_to is not None:
@@ -6442,8 +6787,8 @@ def _ext_pay_unmatched_erp_pays(
             approval = _ext_pay_norm_approval6(p.get("card_company"))
             phone4 = ""
         elif source == "card":
-            # 카드: 승인번호는 별도 저장 안 됨(card_company 컬럼에 카드사명이 저장됨)
-            approval = ""
+            # 신용·체크 8자리 승인번호는 onnuri_approval_code, 카드사명은 card_company.
+            approval = _ext_pay_card_appr8(p.get("onnuri_approval_code"))
             phone4 = ""
             card_company = _card_company_norm(p.get("card_company"))
         elif source == "mainpay":
