@@ -8742,7 +8742,7 @@ def _pcr_customer_contract_dialog(db_filename: str, sale_id, customer_name: str)
     if pdf_url:
         st.link_button("📄 PDF 새 창으로 열기", pdf_url, width="stretch")
     else:
-        st.warning("PDF 파일이 아직 준비되지 않았습니다. 고객 및 잔금 관리 화면에서 'PDF 다시 만들기' 를 눌러 주세요.")
+        st.warning("PDF 파일이 아직 없습니다. 고객 화면에서 계약서 사진을 한 번 더 저장하면 PDF가 만들어집니다.")
 
 
 def _pcr_pay_approval_and_time(pay: dict) -> tuple[str, str]:
@@ -43583,6 +43583,24 @@ def _render_contract_pc_dialog(
     """
     import customer_contract_service as ccs  # noqa: WPS433
     st.markdown(f"**{customer_label}**")
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"],
+        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] {
+          padding: 0.15rem 0.45rem !important;
+          min-height: 0 !important;
+        }
+        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"] small,
+        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] small,
+        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"] span,
+        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] span {
+          display: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # 합쳐진 고객 전체 페이지 (page_no 오름차순)
     pages: list[dict] = []
@@ -43593,80 +43611,65 @@ def _render_contract_pc_dialog(
             logger.warning("계약서 목록 조회 실패 cid=%s: %s", _c, _e)
     pages.sort(key=lambda p: (int(p.get("page_no") or 0), int(p.get("id") or 0)))
 
-    # 업로드 영역 (파일/카메라) — 플랜의 "파일 선택도 허용"
-    with st.container(border=True):
-        st.caption("계약서 추가 (여러 장 가능) · 세로 A4, 긴 변 3508px, JPEG q=85 으로 자동 변환")
-        up_key = f"ccs_pc_up_{customer_id}_{st.session_state.get('_ccs_up_seq', 0)}"
-        files = st.file_uploader(
-            "스캔 파일 또는 사진 선택",
-            type=["jpg", "jpeg", "png", "webp", "heic", "pdf"],
-            accept_multiple_files=True,
-            key=up_key,
-            label_visibility="collapsed",
-        )
-        if files:
-            ok, fail = 0, 0
-            with st.spinner(f"{len(files)}개 저장 중..."):
-                for f in files:
-                    try:
-                        data = f.getvalue()
-                    except Exception:
-                        data = f.read() if hasattr(f, "read") else b""
-                    _, err = ccs.save_contract_page(
-                        db_filename=db_filename,
-                        customer_id=int(customer_id),
-                        raw_image=data,
-                        uploaded_by=_contract_actor(st.session_state.get("current_user") or {}),
-                    )
-                    if err:
-                        fail += 1
-                        st.error(f"{getattr(f, 'name', '파일')}: {err}")
-                    else:
-                        ok += 1
-            if ok:
-                st.toast(f"{ok}장 저장 완료", icon="✅")
-            # 업로더 리셋
-            st.session_state["_ccs_up_seq"] = int(st.session_state.get("_ccs_up_seq", 0)) + 1
-            st.rerun(scope="app")
-
     if not pages:
-        st.info(
-            "저장된 계약서가 없습니다. 위에서 파일을 올리거나, "
-            "휴대폰에서 좌측 메뉴 → '📱 계약서 촬영' 으로 추가하세요."
-        )
-        return
-
-    st.caption(f"총 {len(pages)}장 · 사진은 저장용이고, 내용은 PDF 새 창에서 봅니다.")
-
-    # 앱 안에 장 사진을 다시 그리지 않는다. PDF 는 브라우저 새 창으로만 연다.
-    pdf_url = ccs.pdf_signed_url(db_filename, int(customer_id))
-    if pdf_url:
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.link_button("📄 PDF 새 창으로 열기", pdf_url, width="stretch")
-        with c2:
-            if st.button("🔄 PDF 다시 만들기", key=f"ccs_rebuild_{customer_id}", width="stretch"):
-                with st.spinner("PDF 재생성 중..."):
-                    ccs.rebuild_pdf(db_filename, int(customer_id))
-                st.toast("PDF 를 다시 만들었습니다.", icon="✅")
-                st.rerun(scope="app")
+        st.info("저장된 계약서가 없습니다. 아래 칸에서 파일을 올리거나, 휴대폰 계약서 촬영으로 추가하세요.")
     else:
-        st.warning("PDF 가 아직 준비되지 않았습니다. '🔄 PDF 다시 만들기' 를 눌러 주세요.")
-        if st.button("🔄 PDF 다시 만들기", key=f"ccs_rebuild2_{customer_id}", type="primary"):
-            with st.spinner("PDF 재생성 중..."):
-                ccs.rebuild_pdf(db_filename, int(customer_id))
-            st.rerun(scope="app")
-    st.caption("잘못 올린 장은 아래에서 지웁니다.")
-    cols = st.columns(min(4, len(pages)))
-    for i, p in enumerate(pages):
-        with cols[i % len(cols)]:
-            if st.button(f"🗑️ {p.get('page_no')}장 삭제", key=f"ccs_del_{p.get('id')}", width="stretch"):
-                err = ccs.delete_page(db_filename, int(p.get("id")))
+        st.caption(f"총 {len(pages)}장 · PDF 새 창에서 봅니다.")
+        pdf_url = ccs.pdf_signed_url(db_filename, int(customer_id))
+        if pdf_url:
+            st.link_button("📄 PDF 새 창으로 열기", pdf_url, width="stretch")
+        st.caption("잘못 올린 장은 아래 썸네일에서 지웁니다.")
+        per_row = 5
+        for start in range(0, len(pages), per_row):
+            chunk = pages[start:start + per_row]
+            cols = st.columns(per_row)
+            for i, p in enumerate(chunk):
+                with cols[i]:
+                    turl = ccs.signed_url(p.get("thumb_path") or "")
+                    if turl:
+                        st.image(turl, width=120)
+                    st.caption(f"{p.get('page_no')}장")
+                    if st.button("삭제", key=f"ccs_del_{p.get('id')}", width="stretch"):
+                        err = ccs.delete_page(db_filename, int(p.get("id")))
+                        if err:
+                            st.error(err)
+                        else:
+                            st.toast(f"{p.get('page_no')}장 삭제", icon="🗑️")
+                            st.rerun(scope="app")
+
+    # 추가는 맨 아래, 파일 선택 버튼만. 저장 시 PDF 는 save_contract_page 가 다시 만든다.
+    st.caption("계약서 추가 · 올리면 PDF로 자동 변환됩니다.")
+    up_key = f"ccs_pc_up_{customer_id}_{st.session_state.get('_ccs_up_seq', 0)}"
+    files = st.file_uploader(
+        "계약서 추가",
+        type=["jpg", "jpeg", "png", "webp", "heic", "pdf"],
+        accept_multiple_files=True,
+        key=up_key,
+        label_visibility="collapsed",
+    )
+    if files:
+        ok, fail = 0, 0
+        with st.spinner(f"{len(files)}개 저장 중..."):
+            for f in files:
+                try:
+                    data = f.getvalue()
+                except Exception:
+                    data = f.read() if hasattr(f, "read") else b""
+                _, err = ccs.save_contract_page(
+                    db_filename=db_filename,
+                    customer_id=int(customer_id),
+                    raw_image=data,
+                    uploaded_by=_contract_actor(st.session_state.get("current_user") or {}),
+                )
                 if err:
-                    st.error(err)
+                    fail += 1
+                    st.error(f"{getattr(f, 'name', '파일')}: {err}")
                 else:
-                    st.toast(f"{p.get('page_no')}장 삭제", icon="🗑️")
-                    st.rerun(scope="app")
+                    ok += 1
+        if ok:
+            st.toast(f"{ok}장 저장 완료", icon="✅")
+        st.session_state["_ccs_up_seq"] = int(st.session_state.get("_ccs_up_seq", 0)) + 1
+        st.rerun(scope="app")
 
 
 def _render_contract_pc_button(
