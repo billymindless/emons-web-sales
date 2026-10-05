@@ -531,6 +531,8 @@ def _render_erp_icon_rail(role: str) -> None:
         # 사이드바 세팅 후 st.rerun 생략 — main() 라우팅이 이번 rerun 안에서 처리.
     if st.button("📄", key="rail_contract", help="계약서 촬영", width="stretch"):
         _go("customer_contract")
+        st.session_state["_mct_show_sidebar"] = False
+        st.rerun()
     if st.button("🗓️", key="rail_erp", help="근태 관리", width="stretch"):
         _go("erp_attendance")
     if st.button("📧", key="rail_mail", help="메일 관리", width="stretch"):
@@ -704,6 +706,7 @@ def _render_primary_nav(user: dict, role: str) -> None:
             st.session_state[idx_key] = labels.index(_contract_label)
             st.session_state[radio_key] = _contract_label
             st.session_state.pop("active_admin_page", None)
+            st.session_state["_mct_show_sidebar"] = False
             st.rerun()
 
     # 라디오 위젯 초기값을 현재 인덱스와 동기화
@@ -716,6 +719,8 @@ def _render_primary_nav(user: dict, role: str) -> None:
     def _on_nav_change():
         # 세일즈 메뉴 선택 시, 열려있던 ERP/관리자 화면 라우팅 해제
         st.session_state.pop("active_admin_page", None)
+        if "계약서 촬영" in str(st.session_state.get(radio_key) or ""):
+            st.session_state["_mct_show_sidebar"] = False
 
     sel = st.radio(
         "메뉴", labels, key=radio_key,
@@ -43661,6 +43666,55 @@ def _render_contract_pc_button(
         )
 
 
+def _contract_screen_active(role: str) -> bool:
+    """지금 실행이 계약서 촬영 화면인지. 사이드바를 그릴지 결정한다."""
+    if st.session_state.get("active_admin_page") == "customer_contract":
+        return True
+    try:
+        if st.query_params.get("m") == "contract":
+            return True
+    except Exception:
+        pass
+    if role == "superadmin":
+        return False
+    labels = _get_sales_tab_labels(role)
+    try:
+        idx = int(st.session_state.get("main_tab_idx") or 0)
+    except (TypeError, ValueError):
+        idx = 0
+    return 0 <= idx < len(labels) and "계약서 촬영" in str(labels[idx])
+
+
+def _sync_sales_menu_from_radio(role: str) -> None:
+    """사이드바를 그리지 않는 실행에서도 라디오 선택값을 메뉴 인덱스에 반영한다."""
+    if role == "superadmin":
+        return
+    labels = _get_sales_tab_labels(role)
+    radio_key = "nav_radio_main_tab_idx"
+    sel = st.session_state.get(radio_key)
+    if sel in labels:
+        st.session_state["main_tab_idx"] = labels.index(sel)
+
+
+def _consume_contract_home(role: str) -> None:
+    """홈/끝내기 플래그를 사이드바 라디오보다 먼저 적용한다."""
+    if not st.session_state.pop("_mct_leave_home", False):
+        return
+    st.session_state.pop("active_admin_page", None)
+    st.session_state.pop("_mct_show_sidebar", None)
+    st.session_state.pop("_mct_sidebar_once", None)
+    st.session_state["main_tab_idx"] = 0
+    st.session_state["superadmin_menu_idx"] = 0
+    if role == "superadmin":
+        labels = _SUPERADMIN_MENUS
+        radio_key = "nav_radio_superadmin_menu_idx"
+    else:
+        labels = _get_sales_tab_labels(role)
+        radio_key = "nav_radio_main_tab_idx"
+    if labels:
+        st.session_state[radio_key] = labels[0]
+
+
 def _contract_request_home():
     """계약서 화면에서 대시보드로 나간다.
 
@@ -43681,22 +43735,25 @@ def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
     - 좌측 메뉴 '계약서 촬영': embedded=True, 사이드바 유지하고 본문만 그림
     """
     import customer_contract_service as ccs  # noqa: WPS433
-    # 사이드바를 display:none 으로 지우면 접기 버튼을 눌러도 메뉴가 나오지 않는다.
-    # 들어올 때 한 번만 접고, 이후 접기 버튼은 Streamlit 기본 동작으로 연다.
-    if not embedded and not st.session_state.get("_mct_sidebar_once"):
-        st.session_state["_mct_sidebar_once"] = True
-        components.html(
+    # 이미 열려 있는 사이드바는 내용을 안 그려도 폭이 남는다.
+    # 메뉴를 연 실행에서만 패널을 두고, 그 외에는 패널을 접어 본문을 넓힌다.
+    if not embedded and not st.session_state.get("_mct_show_sidebar"):
+        st.markdown(
             """
-            <script>
-            (function () {
-              var doc = window.parent.document;
-              var btn = doc.querySelector('[data-testid="stSidebarCollapseButton"]')
-                || doc.querySelector('[data-testid="stSidebar"] button[kind="header"]');
-              if (btn) btn.click();
-            })();
-            </script>
+            <style>
+            section[data-testid="stSidebar"] {
+              display: none !important;
+              width: 0 !important;
+              min-width: 0 !important;
+              max-width: 0 !important;
+            }
+            [data-testid="stSidebarCollapsedControl"],
+            [data-testid="collapsedControl"] {
+              display: none !important;
+            }
+            </style>
             """,
-            height=0,
+            unsafe_allow_html=True,
         )
     st.markdown(
         """
@@ -43719,7 +43776,7 @@ def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
     except Exception:
         cur_cid = None
 
-    # 상단 바 — embedded 는 사이드바로 이동하므로 '뒤로'만 보여줌
+    # 상단 바. 메뉴 버튼만 사이드바를 다시 그린다.
     if embedded:
         st.header("📄 계약서 촬영")
         if cur_cid is not None:
@@ -43727,7 +43784,7 @@ def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
                 _contract_qp_set(cid=None)
                 st.rerun()
     else:
-        top_l, top_r = st.columns([1, 2])
+        top_l, top_m, top_r = st.columns([1, 1, 2])
         with top_l:
             if cur_cid is not None:
                 if st.button("← 뒤로", key="mct_back", width="stretch"):
@@ -43736,6 +43793,14 @@ def _render_mobile_contract_app(user, db_filename: str, embedded: bool = False):
             else:
                 if st.button("🏠 홈", key="mct_home", width="stretch"):
                     _contract_request_home()
+        with top_m:
+            if st.session_state.get("_mct_show_sidebar"):
+                if st.button("메뉴 닫기", key="mct_close_nav", width="stretch"):
+                    st.session_state["_mct_show_sidebar"] = False
+                    st.rerun()
+            elif st.button("메뉴", key="mct_open_nav", width="stretch"):
+                st.session_state["_mct_show_sidebar"] = True
+                st.rerun()
         with top_r:
             st.markdown('<div class="mct-title">📄 계약서 촬영</div>', unsafe_allow_html=True)
 
@@ -47524,6 +47589,8 @@ def main():
 
     user = st.session_state.current_user
     role = user["role"]
+    _consume_contract_home(role)
+    _sync_sales_menu_from_radio(role)
 
     # 모바일 전용 계약서 라우트: ?m=contract (사이드바 숨긴 간결 UI)
     try:
@@ -47535,6 +47602,8 @@ def main():
         if not _db_mct:
             st.warning("매장 DB 정보를 찾을 수 없습니다. PC 에서 먼저 로그인 상태를 확인하세요.")
             return
+        if st.session_state.get("_mct_show_sidebar"):
+            _render_left_dual_nav(user, role)
         _render_mobile_contract_app(user, _db_mct)
         return
 
@@ -47589,9 +47658,9 @@ def main():
         st.rerun()
         return
 
-    # 로그인 후 좌측 듀얼 내비게이션: [ERP 아이콘 레일 | 세일즈 메뉴]
-    # 로고 클릭 시 ?home=1 로 이동해 세션 복구 후 대시보드로 복귀.
-    _render_left_dual_nav(user, role)
+    # 계약서 촬영은 들어올 때 사이드바를 그리지 않는다. 화면의 메뉴 버튼이 다시 연다.
+    if not (_contract_screen_active(role) and not st.session_state.get("_mct_show_sidebar")):
+        _render_left_dual_nav(user, role)
 
     # 관리자 전용 모니터링 화면 라우팅
     if role in ("store_admin", "superadmin") and st.session_state.get("active_admin_page") == "payment_monitor":
