@@ -47685,11 +47685,9 @@ def render_dashboard():
                             _co_day = orders[orders["id"].isin(_oid_ct)]
                             if not _co_day.empty and "total_amount" in _co_day.columns:
                                 _ct_tot = float(_co_day["total_amount"].fillna(0).astype(float).sum())
-                                _ct_cst = (
-                                    float(_co_day["cost_price"].fillna(0).astype(float).sum())
-                                    if "cost_price" in _co_day.columns
-                                    else 0.0
-                                )
+                                _ct_cst = 0.0
+                                if "cost_price" in _co_day.columns:
+                                    _ct_cst = float(_co_day["cost_price"].fillna(0).astype(float).sum())
                                 if "display_cost_amount" in _co_day.columns:
                                     _ct_cst += float(_co_day["display_cost_amount"].fillna(0).astype(float).sum())
                                 if _ct_tot > 0:
