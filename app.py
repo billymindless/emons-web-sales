@@ -15913,12 +15913,15 @@ def _inject_money_input_live_format():
             try {
                 var pdoc = window.parent.document;
                 var pwin = window.parent;
+                if (pwin.__emonsMoneyFmt) {
+                    pwin.__emonsMoneyFmt();
+                    return;
+                }
                 var nativeSetter = Object.getOwnPropertyDescriptor(pwin.HTMLInputElement.prototype, 'value').set;
 
                 function fmt(digits) {
                     var d = String(digits).replace(/\\D/g, '');
                     if (!d) return '';
-                    // 앞자리 0 방지 (단, 단일 '0' 은 유지)
                     d = d.replace(/^0+(?=\\d)/, '');
                     return parseInt(d, 10).toLocaleString('en-US');
                 }
@@ -15929,14 +15932,15 @@ def _inject_money_input_live_format():
                     input.setAttribute('inputmode', 'numeric');
                     input.addEventListener('input', function(e){
                         var t = e.target;
+                        if (t.dataset.moneyFormatting === '1') return;
                         var oldVal = t.value;
                         var oldStart = t.selectionStart || 0;
-                        var oldCommasBefore = (oldVal.slice(0, oldStart).match(/,/g) || []).length;
                         var newVal = fmt(oldVal);
                         if (newVal === oldVal) return;
+                        t.dataset.moneyFormatting = '1';
                         nativeSetter.call(t, newVal);
                         t.dispatchEvent(new Event('input', { bubbles: true }));
-                        // 커서 위치 보정: 새 문자열에서 원래 위치까지의 숫자 수를 유지
+                        t.dataset.moneyFormatting = '0';
                         try {
                             var digitsBefore = oldVal.slice(0, oldStart).replace(/\\D/g, '').length;
                             var newPos = 0, seen = 0;
@@ -15947,13 +15951,9 @@ def _inject_money_input_live_format():
                             t.setSelectionRange(newPos, newPos);
                         } catch(err) {}
                     });
-                    // 최초 바인딩 시점의 값이 raw 숫자만 있으면 즉시 포맷 적용
                     if (input.value && /^[0-9]+$/.test(input.value)) {
                         var v = fmt(input.value);
-                        if (v !== input.value) {
-                            nativeSetter.call(input, v);
-                            input.dispatchEvent(new Event('input', { bubbles: true }));
-                        }
+                        if (v !== input.value) nativeSetter.call(input, v);
                     }
                 }
 
@@ -15969,9 +15969,10 @@ def _inject_money_input_live_format():
                     });
                 }
 
-                scan();
-                var obs = new MutationObserver(function(){ scan(); });
+                pwin.__emonsMoneyFmt = scan;
+                var obs = new pwin.MutationObserver(function(){ scan(); });
                 obs.observe(pdoc.body, { childList: true, subtree: true });
+                scan();
             } catch(e) {
                 console.warn('[money-live-format] init 실패:', e);
             }
@@ -32952,6 +32953,36 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
     if not st.session_state.get(toggle_key):
         return
 
+    if st.session_state.pop(f"pcr_do_reset_{order_id}", False):
+        _reset_keys = [
+            f"pcr_pid_{order_id}",
+            f"pcr_manual_orig_{order_id}",
+            f"pcr_orig_amt_{order_id}",
+            f"pcr_orig_meth_{order_id}",
+            f"pcr_orig_onnuri_{order_id}",
+            f"pcr_type_{order_id}",
+            f"pcr_reason_{order_id}",
+            f"pcr_refund_bank_{order_id}",
+            f"pcr_refund_account_{order_id}",
+            f"pcr_assignees_{order_id}",
+        ]
+        _line_count_now = int(st.session_state.get(f"pcr_new_count_{order_id}", 1) or 1)
+        for _li in range(_line_count_now):
+            _reset_keys.extend([
+                f"pcr_amt_{order_id}_{_li}",
+                f"pcr_meth_{order_id}_{_li}",
+                f"pcr_onnuri_{order_id}_{_li}",
+                f"pcr_date_{order_id}_{_li}",
+                f"pcr_cardco_{order_id}_{_li}",
+                f"pcr_card_appr_{order_id}_{_li}",
+                f"pcr_mainpay_{order_id}_{_li}",
+                f"pcr_onnuri_last4_{order_id}_{_li}",
+                f"pcr_onnuri_time_{order_id}_{_li}",
+            ])
+        for _rk in _reset_keys:
+            st.session_state.pop(_rk, None)
+        st.session_state[f"pcr_new_count_{order_id}"] = 1
+
     me_uname = _current_username()
     store_name = _get_current_store_name_for_customers(db_filename)
     cur_user = st.session_state.get("current_user") or {}
@@ -33496,238 +33527,218 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         if st.button("📤 요청 등록 (기존 결제 취소 + 신규 결제 자동 저장)",
                      key=f"pcr_submit_{order_id}",
                      type="primary", disabled=not can_submit):
-            new_payment = {
-                "amount": new_amount,
-                "method": (new_method or "").strip(),
-                "onnuri": (new_onnuri or "").strip(),
-            }
-
-            # ── 검증 태스크를 먼저 생성 (결제 반영 전에 담당자 지정·결재 건이 있어야 함) ──
-            _valid_lines = [x for x in new_lines if int(x.get("amount") or 0) > 0 and x.get("method")]
-            _reason_parts: list[str] = [
-                f"[환불계좌] {refund_bank.strip()} / {refund_account.strip()}",
-            ]
-            if len(_valid_lines) > 1:
-                _split_detail = " / ".join(
-                    f"{x['method']} {int(x['amount']):,}원"
-                    + (f"({x['onnuri']})" if x.get("onnuri") else "")
-                    for x in _valid_lines
-                )
-                _reason_parts.append(f"[분할결제] {_split_detail}")
-            _reason_parts.append(reason)
-            _task_reason = "\n".join(_reason_parts)
-            task_id, err = _tb.create_payment_change_task(
-                sale_id=order_id,
-                payment_id=sel_pid,
-                customer_name=customer_name,
-                change_type=change_type,
-                original_payment=orig,
-                new_payment=new_payment,
-                reason=_task_reason,
-                created_by=me_uname,
-                store_name=store_name,
-                db_filename=db_filename,
-                assignees=list(pcr_assignees),
-            )
-            if not task_id:
-                st.error(f"요청 등록 실패: {err}")
-                st.stop()
-
-            # ── 결제 자동 반영: 원본 취소행(음수) + 신규 결제행(양수) ──
-            # 원본 결제행에서 card_company / onnuri_approval_code 를 보존해 취소 audit 를 남긴다.
-            cancel_pay_id: int | None = None
-            new_pay_id: int | None = None
-            payment_ops_errors: list[str] = []
-            _today_str = date.today().isoformat()
-
-            _orig_row: dict = {}
-            if sel_pid is not None:
+            with st.spinner("결제변경 저장 중"):
                 try:
-                    _orig_row = pay_list[pay_list["id"] == sel_pid].iloc[0].to_dict()
-                except Exception:
-                    _orig_row = {}
-            try:
-                _orig_amt = int(round(float(orig.get("amount") or 0)))
-            except (TypeError, ValueError):
-                _orig_amt = 0
+                    new_payment = {
+                        "amount": new_amount,
+                        "method": (new_method or "").strip(),
+                        "onnuri": (new_onnuri or "").strip(),
+                    }
 
-            # 1. 원본 결제 취소 등록 (음수 결제행)
-            if _orig_amt > 0:
-                _cancel_payload = {
-                    "order_id": int(order_id),
-                    "payment_date": _today_str,
-                    "amount": -_orig_amt,
-                    "payment_method": _orig_row.get("payment_method") or orig.get("method") or None,
-                    "card_company": _orig_row.get("card_company") or None,
-                    "onnuri_approval_code": _orig_row.get("onnuri_approval_code") or None,
-                    "fee_amount": 0,
-                    "created_by": me_uname,
-                }
-                _err_detail: list = []
-                cancel_pay_id = _insert_payment_supabase(db_filename, _cancel_payload, _error_detail=_err_detail)
-                if not cancel_pay_id:
-                    payment_ops_errors.append("취소행 저장 실패: " + "; ".join(_err_detail))
-                else:
-                    _insert_payment_history(
-                        conn=None,
-                        sale_id=int(order_id),
-                        customer_name=customer_name or "",
-                        action_type="payment_change_cancel",
-                        old_payment_data={
-                            "payment_id": sel_pid,
-                            "amount": _orig_amt,
-                            "payment_method": _cancel_payload["payment_method"],
-                            "card_company": _cancel_payload["card_company"],
-                            "onnuri_approval_code": _cancel_payload["onnuri_approval_code"],
-                        },
-                        new_payment_data={
-                            "payment_id": cancel_pay_id,
-                            "amount": -_orig_amt,
-                            "note": "결제변경 요청에 의한 취소 등록",
-                        },
-                        reason=reason,
+                    # ── 검증 태스크를 먼저 생성 (결제 반영 전에 담당자 지정·결재 건이 있어야 함) ──
+                    _valid_lines = [x for x in new_lines if int(x.get("amount") or 0) > 0 and x.get("method")]
+                    _reason_parts: list[str] = [
+                        f"[환불계좌] {refund_bank.strip()} / {refund_account.strip()}",
+                    ]
+                    if len(_valid_lines) > 1:
+                        _split_detail = " / ".join(
+                            f"{x['method']} {int(x['amount']):,}원"
+                            + (f"({x['onnuri']})" if x.get("onnuri") else "")
+                            for x in _valid_lines
+                        )
+                        _reason_parts.append(f"[분할결제] {_split_detail}")
+                    _reason_parts.append(reason)
+                    _task_reason = "\n".join(_reason_parts)
+                    task_id, err = _tb.create_payment_change_task(
+                        sale_id=order_id,
+                        payment_id=sel_pid,
+                        customer_name=customer_name,
+                        change_type=change_type,
+                        original_payment=orig,
+                        new_payment=new_payment,
+                        reason=_task_reason,
+                        created_by=me_uname,
+                        store_name=store_name,
                         db_filename=db_filename,
+                        assignees=list(pcr_assignees),
                     )
+                    if not task_id:
+                        st.error(f"요청 등록 실패: {err}")
+                        st.stop()
 
-            # 2. 신규 결제 등록 (여러 라인 각각 양수 결제행 저장)
-            new_pay_ids: list[int] = []
-            for _line in new_lines:
-                try:
-                    _new_amt = int(round(float(_line.get("amount") or 0)))
-                except (TypeError, ValueError):
-                    _new_amt = 0
-                _new_method = (_line.get("method") or "").strip()
-                if _new_amt <= 0 or not _new_method:
-                    continue
-                _new_code = (_line.get("onnuri") or "").strip()
-                _new_card_company: str | None = None
-                _new_onnuri_code: str | None = None
-                _new_digits = re.sub(r"\D", "", _new_code)
-                if "지역화폐" in _new_method:
-                    _new_card_company = _ext_pay_norm_approval6(_new_code) or (_new_code or None)
-                elif _new_method in _CARD_WITH_COMPANY:
-                    _new_card_company = (_line.get("card_company") or "").strip() or None
-                    _new_onnuri_code = _new_digits or None
-                elif _new_method == "메인페이":
-                    _new_card_company = _new_digits or None
-                elif "온누리" in _new_method:
-                    _new_onnuri_code = _new_code or None
-                elif _new_code:
-                    _new_card_company = _new_code
-                _line_date = _line.get("date")
-                try:
-                    _line_date_str = _line_date.isoformat() if hasattr(_line_date, "isoformat") else _today_str
-                except Exception:
-                    _line_date_str = _today_str
-                _new_payload = {
-                    "order_id": int(order_id),
-                    "payment_date": _line_date_str,
-                    "amount": _new_amt,
-                    "payment_method": _new_method,
-                    "card_company": _new_card_company,
-                    "onnuri_approval_code": _new_onnuri_code,
-                    "fee_amount": 0,
-                    "created_by": me_uname,
-                }
-                _err_detail2: list = []
-                _pid = _insert_payment_supabase(db_filename, _new_payload, _error_detail=_err_detail2)
-                if not _pid:
-                    payment_ops_errors.append(
-                        f"신규 결제 저장 실패({_new_method} {_new_amt:,}원): " + "; ".join(_err_detail2)
-                    )
-                    continue
-                new_pay_ids.append(int(_pid))
-                _insert_payment_history(
-                    conn=None,
-                    sale_id=int(order_id),
-                    customer_name=customer_name or "",
-                    action_type="payment_change_new",
-                    old_payment_data={},
-                    new_payment_data={
-                        "payment_id": int(_pid),
-                        "amount": _new_amt,
-                        "payment_method": _new_method,
-                        "card_company": _new_card_company,
-                        "onnuri_approval_code": _new_onnuri_code,
-                        "note": "결제변경 요청에 의한 신규 결제 등록",
-                    },
-                    reason=reason,
-                    db_filename=db_filename,
-                )
-            new_pay_id = new_pay_ids[0] if new_pay_ids else None
+                    # ── 결제 자동 반영: 원본 취소행(음수) + 신규 결제행(양수) ──
+                    # 원본 결제행에서 card_company / onnuri_approval_code 를 보존해 취소 audit 를 남긴다.
+                    cancel_pay_id: int | None = None
+                    new_pay_id: int | None = None
+                    payment_ops_errors: list[str] = []
+                    _today_str = date.today().isoformat()
 
-            # 잔금·actual_margin 재계산 (음수+양수 인서트 후 최신 상태 반영)
-            if cancel_pay_id or new_pay_ids:
-                try:
-                    _recalc_order_actual_margin_supabase(db_filename, int(order_id))
-                except Exception as _mg_ex:
-                    payment_ops_errors.append(f"잔금 재계산 실패: {_mg_ex}")
-                # 결제 도메인 캐시만 무효화 — 매장/직원/고객 캐시는 유지해 재렌더 가속.
-                _invalidate_payments()
+                    _orig_row: dict = {}
+                    if sel_pid is not None:
+                        try:
+                            _orig_row = pay_list[pay_list["id"] == sel_pid].iloc[0].to_dict()
+                        except Exception:
+                            _orig_row = {}
+                    try:
+                        _orig_amt = int(round(float(orig.get("amount") or 0)))
+                    except (TypeError, ValueError):
+                        _orig_amt = 0
 
-            # 증빙 첨부 업로드
-            att_errors = []
-            for f in files or []:
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
-                _row, ferr = _tb.attach_file(task_id=task_id, comment_id=None,
-                                             uploaded_file=f, uploaded_by=me_uname)
-                if ferr:
-                    att_errors.append(f"{f.name}: {ferr}")
-            try:
-                _tb.log_activity(task_id, me_uname, "payment_change_applied", {
-                    "cancel_payment_id": cancel_pay_id,
-                    "new_payment_id": new_pay_id,
-                    "new_payment_ids": new_pay_ids,
-                    "errors": payment_ops_errors[:5],
-                })
-            except Exception:
-                pass
-            st.session_state[f"pcr_files_ver_{order_id}"] = ver + 1
-            # 결제변경 요청 창(패널)은 그대로 열어둔 채 폼 위젯 값만 초기화 →
-            # 사용자가 등록 직후에도 '처음처럼' 빈 폼이 있는 결제변경 창으로 돌아오게 한다.
-            # (기존: toggle_key=False 로 패널을 닫아 사용자가 다시 열어야 했음)
-            _reset_keys = [
-                f"pcr_pid_{order_id}",
-                f"pcr_manual_orig_{order_id}",
-                f"pcr_orig_amt_{order_id}",
-                f"pcr_orig_meth_{order_id}",
-                f"pcr_orig_onnuri_{order_id}",
-                f"pcr_type_{order_id}",
-                f"pcr_reason_{order_id}",
-                f"pcr_refund_bank_{order_id}",
-                f"pcr_refund_account_{order_id}",
-                f"pcr_assignees_{order_id}",
-            ]
-            _line_count_now = int(st.session_state.get(f"pcr_new_count_{order_id}", 1) or 1)
-            for _li in range(_line_count_now):
-                _reset_keys.extend([
-                    f"pcr_amt_{order_id}_{_li}",
-                    f"pcr_meth_{order_id}_{_li}",
-                    f"pcr_onnuri_{order_id}_{_li}",
-                    f"pcr_date_{order_id}_{_li}",
-                    f"pcr_cardco_{order_id}_{_li}",
-                    f"pcr_card_appr_{order_id}_{_li}",
-                    f"pcr_mainpay_{order_id}_{_li}",
-                ])
-            for _rk in _reset_keys:
-                st.session_state.pop(_rk, None)
-            st.session_state[f"pcr_new_count_{order_id}"] = 1
-            # 상위 expander(📝 주문 수정 & 결제 관리) 가 rerun 후에도 다시 펼쳐지도록 표시 (일회성 플래그)
-            st.session_state["_gen_pcr_keep_open"] = True
-            if att_errors:
-                st.warning("검증 요청은 등록됐지만 일부 첨부 실패: " + "; ".join(att_errors))
-            if payment_ops_errors:
-                st.warning("일부 결제 자동 처리 실패: " + "; ".join(payment_ops_errors))
-            _pay_msg = ""
-            if cancel_pay_id:
-                _pay_msg += f" · 취소행 #{cancel_pay_id}"
-            if new_pay_ids:
-                _pay_msg += " · 신규결제 " + ", ".join(f"#{p}" for p in new_pay_ids)
-            flash(f"결제변경 요청 등록 완료 (검증 태스크 #{task_id}){_pay_msg}")
-            st.rerun()
+                    # 1. 원본 결제 취소 등록 (음수 결제행)
+                    if _orig_amt > 0:
+                        _cancel_payload = {
+                            "order_id": int(order_id),
+                            "payment_date": _today_str,
+                            "amount": -_orig_amt,
+                            "payment_method": _orig_row.get("payment_method") or orig.get("method") or None,
+                            "card_company": _orig_row.get("card_company") or None,
+                            "onnuri_approval_code": _orig_row.get("onnuri_approval_code") or None,
+                            "fee_amount": 0,
+                            "created_by": me_uname,
+                        }
+                        _err_detail: list = []
+                        cancel_pay_id = _insert_payment_supabase(db_filename, _cancel_payload, _error_detail=_err_detail)
+                        if not cancel_pay_id:
+                            payment_ops_errors.append("취소행 저장 실패: " + "; ".join(_err_detail))
+                        else:
+                            _insert_payment_history(
+                                conn=None,
+                                sale_id=int(order_id),
+                                customer_name=customer_name or "",
+                                action_type="payment_change_cancel",
+                                old_payment_data={
+                                    "payment_id": sel_pid,
+                                    "amount": _orig_amt,
+                                    "payment_method": _cancel_payload["payment_method"],
+                                    "card_company": _cancel_payload["card_company"],
+                                    "onnuri_approval_code": _cancel_payload["onnuri_approval_code"],
+                                },
+                                new_payment_data={
+                                    "payment_id": cancel_pay_id,
+                                    "amount": -_orig_amt,
+                                    "note": "결제변경 요청에 의한 취소 등록",
+                                },
+                                reason=reason,
+                                db_filename=db_filename,
+                            )
+
+                    # 2. 신규 결제 등록 (여러 라인 각각 양수 결제행 저장)
+                    new_pay_ids: list[int] = []
+                    for _line in new_lines:
+                        try:
+                            _new_amt = int(round(float(_line.get("amount") or 0)))
+                        except (TypeError, ValueError):
+                            _new_amt = 0
+                        _new_method = (_line.get("method") or "").strip()
+                        if _new_amt <= 0 or not _new_method:
+                            continue
+                        _new_code = (_line.get("onnuri") or "").strip()
+                        _new_card_company: str | None = None
+                        _new_onnuri_code: str | None = None
+                        _new_digits = re.sub(r"\D", "", _new_code)
+                        if "지역화폐" in _new_method:
+                            _new_card_company = _ext_pay_norm_approval6(_new_code) or (_new_code or None)
+                        elif _new_method in _CARD_WITH_COMPANY:
+                            _new_card_company = (_line.get("card_company") or "").strip() or None
+                            _new_onnuri_code = _new_digits or None
+                        elif _new_method == "메인페이":
+                            _new_card_company = _new_digits or None
+                        elif "온누리" in _new_method:
+                            _new_onnuri_code = _new_code or None
+                        elif _new_code:
+                            _new_card_company = _new_code
+                        _line_date = _line.get("date")
+                        try:
+                            _line_date_str = _line_date.isoformat() if hasattr(_line_date, "isoformat") else _today_str
+                        except Exception:
+                            _line_date_str = _today_str
+                        _new_payload = {
+                            "order_id": int(order_id),
+                            "payment_date": _line_date_str,
+                            "amount": _new_amt,
+                            "payment_method": _new_method,
+                            "card_company": _new_card_company,
+                            "onnuri_approval_code": _new_onnuri_code,
+                            "fee_amount": 0,
+                            "created_by": me_uname,
+                        }
+                        _err_detail2: list = []
+                        _pid = _insert_payment_supabase(db_filename, _new_payload, _error_detail=_err_detail2)
+                        if not _pid:
+                            payment_ops_errors.append(
+                                f"신규 결제 저장 실패({_new_method} {_new_amt:,}원): " + "; ".join(_err_detail2)
+                            )
+                            continue
+                        new_pay_ids.append(int(_pid))
+                        _insert_payment_history(
+                            conn=None,
+                            sale_id=int(order_id),
+                            customer_name=customer_name or "",
+                            action_type="payment_change_new",
+                            old_payment_data={},
+                            new_payment_data={
+                                "payment_id": int(_pid),
+                                "amount": _new_amt,
+                                "payment_method": _new_method,
+                                "card_company": _new_card_company,
+                                "onnuri_approval_code": _new_onnuri_code,
+                                "note": "결제변경 요청에 의한 신규 결제 등록",
+                            },
+                            reason=reason,
+                            db_filename=db_filename,
+                        )
+                    new_pay_id = new_pay_ids[0] if new_pay_ids else None
+
+                    # 잔금·actual_margin 재계산 (음수+양수 인서트 후 최신 상태 반영)
+                    if cancel_pay_id or new_pay_ids:
+                        try:
+                            _recalc_order_actual_margin_supabase(db_filename, int(order_id))
+                        except Exception as _mg_ex:
+                            payment_ops_errors.append(f"잔금 재계산 실패: {_mg_ex}")
+                        # 결제 도메인 캐시만 무효화 — 매장/직원/고객 캐시는 유지해 재렌더 가속.
+                        _invalidate_payments()
+
+                    # 증빙 첨부 업로드
+                    att_errors = []
+                    for f in files or []:
+                        try:
+                            f.seek(0)
+                        except Exception:
+                            pass
+                        _row, ferr = _tb.attach_file(task_id=task_id, comment_id=None,
+                                                     uploaded_file=f, uploaded_by=me_uname)
+                        if ferr:
+                            att_errors.append(f"{f.name}: {ferr}")
+                    try:
+                        _tb.log_activity(task_id, me_uname, "payment_change_applied", {
+                            "cancel_payment_id": cancel_pay_id,
+                            "new_payment_id": new_pay_id,
+                            "new_payment_ids": new_pay_ids,
+                            "errors": payment_ops_errors[:5],
+                        })
+                    except Exception:
+                        logging.exception("결제변경 활동 로그 기록 실패 task_id=%s", task_id)
+                    st.session_state[f"pcr_files_ver_{order_id}"] = ver + 1
+                    # 위젯 키는 이 실행에서 지우지 않는다. 다음 실행에서 위젯을 그리기 전에 지운다.
+                    st.session_state[f"pcr_do_reset_{order_id}"] = True
+                    # 상위 expander(📝 주문 수정 & 결제 관리) 가 rerun 후에도 다시 펼쳐지도록 표시 (일회성 플래그)
+                    st.session_state["_gen_pcr_keep_open"] = True
+                    if att_errors:
+                        st.warning("검증 요청은 등록됐지만 일부 첨부 실패: " + "; ".join(att_errors))
+                    if payment_ops_errors:
+                        st.warning("일부 결제 자동 처리 실패: " + "; ".join(payment_ops_errors))
+                    _pay_msg = ""
+                    if cancel_pay_id:
+                        _pay_msg += f" · 취소행 #{cancel_pay_id}"
+                    if new_pay_ids:
+                        _pay_msg += " · 신규결제 " + ", ".join(f"#{p}" for p in new_pay_ids)
+                    flash(f"결제변경 요청 등록 완료 (검증 태스크 #{task_id}){_pay_msg}")
+                    st.rerun()
+                except Exception as _pcr_ex:
+                    if type(_pcr_ex).__name__ in ("RerunException", "StopException"):
+                        raise
+                    logging.exception("결제변경 요청 등록 실패 order_id=%s", order_id)
+                    st.error("결제변경 요청 저장 중 오류가 났습니다. 서버 로그를 확인해 주세요.")
 
 
 def _payment_change_verifier_usernames(store_id, role: str, exclude_uname: str) -> list[str]:
