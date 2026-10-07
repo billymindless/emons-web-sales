@@ -44289,14 +44289,33 @@ def _render_contract_pc_dialog(
         <style>
         div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"],
         div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] {
-          padding: 0.15rem 0.45rem !important;
+          border: none !important;
+          background: transparent !important;
+          padding: 0 !important;
           min-height: 0 !important;
+          height: auto !important;
+          gap: 0 !important;
         }
-        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"] small,
-        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] small,
-        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"] span,
-        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] span {
+        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzoneInstructions"],
+        div[data-testid="stModal"] [data-testid="stFileUploaderDropzoneInstructions"] {
           display: none !important;
+        }
+        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"] button,
+        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] button {
+          width: 100% !important;
+        }
+        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"] button,
+        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] button,
+        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"] button *,
+        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] button * {
+          font-size: 0 !important;
+          line-height: 0 !important;
+        }
+        div[data-testid="stDialog"] [data-testid="stFileUploaderDropzone"] button::after,
+        div[data-testid="stModal"] [data-testid="stFileUploaderDropzone"] button::after {
+          content: "계약서 추가";
+          font-size: 0.95rem !important;
+          line-height: 1.2 !important;
         }
         </style>
         """,
