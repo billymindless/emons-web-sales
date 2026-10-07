@@ -33579,6 +33579,9 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             _exp_label = "+ 추가 항목 보기  ·  필수 미입력 (환불 계좌 · 결제자)"
 
         with st.expander(_exp_label, expanded=_req_missing):
+            _pcr_type_key = f"pcr_type_{order_id}"
+            if st.session_state.get(_pcr_type_key) not in _tb.PAYMENT_CHANGE_TYPES:
+                st.session_state[_pcr_type_key] = _tb.PAYMENT_CHANGE_TYPES[0]
             change_type = st.selectbox(
                 "변경 유형",
                 options=_tb.PAYMENT_CHANGE_TYPES,

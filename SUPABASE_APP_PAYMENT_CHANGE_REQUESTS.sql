@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS app_payment_change_requests (
     payment_id       BIGINT,                   -- app_payments.id (NULL이면 신규 결제 건)
     customer_name    TEXT,
     change_type      TEXT NOT NULL,
-    -- 'refund' | 'cancel_card' | 'cancel_transfer' | 'method_change' | 'onnuri_change'
+    -- 신규 선택: 'method_change' | 'refund'
+    -- 과거 값: 'cancel_card' | 'cancel_transfer' | 'onnuri_change'
     original_amount  BIGINT,
     original_method  TEXT,
     original_onnuri  TEXT,

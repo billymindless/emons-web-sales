@@ -88,12 +88,12 @@ ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "im
 
 # 결제변경 검증(사후 검증) 연동
 PAYMENT_CHANGE_TASK_TYPE = "payment_change_request"
-PAYMENT_CHANGE_TYPES = ["refund", "cancel_card", "cancel_transfer", "method_change", "onnuri_change"]
+PAYMENT_CHANGE_TYPES = ["method_change", "refund"]
 PAYMENT_CHANGE_TYPE_LABELS = {
-    "refund": "환불/반품",
+    "method_change": "결제수단 변경",
+    "refund": "환불/반품/취소",
     "cancel_card": "신용카드 취소",
     "cancel_transfer": "계좌이체 취소/반환",
-    "method_change": "결제수단 변경",
     "onnuri_change": "온누리 결제 변경",
 }
 
