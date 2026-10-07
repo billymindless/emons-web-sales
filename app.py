@@ -32958,16 +32958,20 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
     role = (cur_user.get("role") or "user").strip()
     store_id = cur_user.get("store_id") or st.session_state.get("current_store_id")
 
-    # 결제 행 선택지
+    # 결제 행 선택지. 양수 결제가 하나뿐이면 아래에서 그 건을 미리 고른다.
     pay_options = {}
+    _positive_pids: list[int] = []
     try:
         for _, prow in pay_list.iterrows():
             pid = int(prow["id"])
             amt = float(prow.get("amount") or 0)
             meth = prow.get("payment_method") or "-"
             pay_options[pid] = f"결제ID {pid} · {meth} · {amt:,.0f}원"
+            if amt > 0:
+                _positive_pids.append(pid)
     except Exception:
         pay_options = {}
+        _positive_pids = []
 
     with st.container(border=True):
         st.markdown(
@@ -33007,14 +33011,19 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         sel_pid = None
         if pay_options:
             _pid_sentinel = "__pcr_pick__"
+            _pid_key = f"pcr_pid_{order_id}"
+            if len(_positive_pids) == 1 and st.session_state.get(_pid_key, _pid_sentinel) in (
+                None, "", _pid_sentinel,
+            ):
+                st.session_state[_pid_key] = _positive_pids[0]
             _pid_labels = {_pid_sentinel: "— 취소·변경할 결제를 선택하세요 —"}
             _pid_labels.update({k: v for k, v in pay_options.items()})
             _pid_choice = st.selectbox(
-                "대상 결제(참조) *",
+                "취소할 결제 *",
                 options=[_pid_sentinel] + list(pay_options.keys()),
                 format_func=lambda p: _pid_labels.get(p, str(p)),
-                key=f"pcr_pid_{order_id}",
-                help="어떤 결제를 취소·변경할지 반드시 명시적으로 골라야 합니다. 자동 선택하지 않습니다.",
+                key=_pid_key,
+                help="취소할 양수 결제가 하나면 그 건이 미리 선택됩니다. 여러 건이면 직접 고르세요.",
             )
             sel_pid = None if _pid_choice == _pid_sentinel else _pid_choice
 
@@ -33470,10 +33479,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             and not dup_errs
             and not card_errs
         )
-        if not can_submit:
-            if sel_pid is None:
-                st.caption("취소·변경할 결제를 위 대상 결제 목록에서 먼저 선택하세요.")
-            elif not pcr_assignees:
+        if not can_submit and sel_pid is not None:
+            if not pcr_assignees:
                 st.caption("결제자를 1명 이상 지정해야 요청할 수 있습니다.")
             elif not (reason or "").strip():
                 st.caption("변경 사유를 입력해야 요청할 수 있습니다.")
@@ -33484,6 +33491,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             elif card_errs:
                 st.caption("카드사와 승인번호 8자리를 입력해야 요청할 수 있습니다.")
         st.divider()
+        if sel_pid is None:
+            st.error("취소할 결제를 선택하세요.")
         if st.button("📤 요청 등록 (기존 결제 취소 + 신규 결제 자동 저장)",
                      key=f"pcr_submit_{order_id}",
                      type="primary", disabled=not can_submit):
