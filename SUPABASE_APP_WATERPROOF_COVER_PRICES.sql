@@ -19,10 +19,10 @@ VALUES
     ('q',     'Q',            9460,  4, 'size'),
     ('k',     'K',            9900,  5, 'size'),
     ('lk',    'LK 1800*2000', 10450, 6, 'size'),
-    ('kk',    'KK 1800*2100', 12100, 7, 'size'),
-    ('liner', '리너',         7700,  8, 'option'),
-    ('pad',   '밀림방지패드', 7700,  9, 'option')
+    ('kk',    'KK 1800*2100', 12100, 7, 'size')
 ON CONFLICT (code) DO NOTHING;
+
+DELETE FROM app_waterproof_cover_prices WHERE code IN ('liner', 'pad');
 
 ALTER TABLE app_waterproof_cover_prices ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Allow all app_waterproof_cover_prices" ON app_waterproof_cover_prices;

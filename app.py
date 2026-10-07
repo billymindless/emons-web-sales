@@ -38079,8 +38079,6 @@ _WATERPROOF_COVER_DEFAULTS: list[dict] = [
     {"code": "k", "label": "K", "amount": 9900, "sort_order": 5, "kind": "size"},
     {"code": "lk", "label": "LK 1800*2000", "amount": 10450, "sort_order": 6, "kind": "size"},
     {"code": "kk", "label": "KK 1800*2100", "amount": 12100, "sort_order": 7, "kind": "size"},
-    {"code": "liner", "label": "리너", "amount": 7700, "sort_order": 8, "kind": "option"},
-    {"code": "pad", "label": "밀림방지패드", "amount": 7700, "sort_order": 9, "kind": "option"},
 ]
 
 
@@ -38155,16 +38153,11 @@ def _save_waterproof_cover_prices(amounts: dict[str, int], updated_by: str) -> s
     return None
 
 
-def _waterproof_cover_amount(size_code: str, liner_on: bool, pad_on: bool) -> int:
+def _waterproof_cover_amount(size_code: str) -> int:
     rows = {str(row["code"]): row for row in _load_waterproof_cover_prices()}
-    total = 0
     if size_code and size_code in rows and rows[size_code].get("kind") == "size":
-        total += int(rows[size_code]["amount"])
-    if liner_on and "liner" in rows:
-        total += int(rows["liner"]["amount"])
-    if pad_on and "pad" in rows:
-        total += int(rows["pad"]["amount"])
-    return total
+        return int(rows[size_code]["amount"])
+    return 0
 
 
 def _render_waterproof_cover_admin(me_uname: str) -> None:
@@ -38411,7 +38404,7 @@ def render_admin_settings():
 
     # ── 10. 방수커버 단가 (전 매장 공통) ─────────────────────────
     st.subheader("10. 방수커버 단가")
-    with st.expander("사이즈·리너·밀림방지패드 금액", expanded=False):
+    with st.expander("사이즈별 금액", expanded=False):
         _render_waterproof_cover_admin(me_uname)
 
 
@@ -41238,41 +41231,28 @@ def render_new_sales():
         ),
     )
     _cover_extra = 0
+    _size_code = ""
     _bed_selected = bool({"침대", "SSDS침대"} & set(selected_categories or []))
     if _bed_selected:
         _cover_rows = _load_waterproof_cover_prices()
         _size_rows = [row for row in _cover_rows if row.get("kind") == "size"]
-        _opt_rows = {str(row["code"]): row for row in _cover_rows if row.get("kind") == "option"}
         _size_codes = [""] + [str(row["code"]) for row in _size_rows]
 
         def _cover_size_label(code: str) -> str:
             if not code:
-                return "선택 안 함"
+                return "선택하세요"
             row = next((item for item in _size_rows if str(item["code"]) == code), None)
             if not row:
                 return code
             return f"{row['label']} ({int(row['amount']):,}원)"
 
         _size_code = st.selectbox(
-            "방수커버",
+            "방수커버 *",
             options=_size_codes,
             format_func=_cover_size_label,
             key=f"cover_size_{_form_reset}",
         )
-        _liner_amt = int((_opt_rows.get("liner") or {}).get("amount") or 0)
-        _pad_amt = int((_opt_rows.get("pad") or {}).get("amount") or 0)
-        _c1, _c2 = st.columns(2)
-        with _c1:
-            _liner_on = st.checkbox(
-                f"리너 ({_liner_amt:,}원)",
-                key=f"cover_liner_{_form_reset}",
-            )
-        with _c2:
-            _pad_on = st.checkbox(
-                f"밀림방지패드 ({_pad_amt:,}원)",
-                key=f"cover_pad_{_form_reset}",
-            )
-        _cover_extra = _waterproof_cover_amount(_size_code, _liner_on, _pad_on)
+        _cover_extra = _waterproof_cover_amount(_size_code)
         _typed_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
         st.caption(
             f"입력 원가 {_typed_cost:,}원 + 방수커버 {_cover_extra:,}원 = {_typed_cost + _cover_extra:,}원"
@@ -41540,6 +41520,9 @@ def render_new_sales():
             st.stop()
         if not selected_categories:
             st.error("품목/카테고리(필수)를 1개 이상 선택하세요.")
+            st.stop()
+        if _bed_selected and not _size_code:
+            st.error("방수커버(필수)를 선택하세요.")
             st.stop()
         # 방문 이유 필수
         if not visit_reason_sel:
