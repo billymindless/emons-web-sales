@@ -9018,17 +9018,31 @@ def _format_order_payments_display(
         pay_display["amount"] = pay_display["amount"].apply(lambda x: f"{x:,.0f}원")
     if "fee_amount" in pay_display.columns:
         pay_display["fee_amount"] = pay_display["fee_amount"].fillna(0).apply(lambda x: f"{x:,.0f}원")
-    # 온누리 결제의 경우 card_company 대신 onnuri_approval_code 를 카드사 컬럼에 표시
+    # 온누리 결제의 경우 card_company 대신 onnuri_approval_code 를 카드사 컬럼에 표시.
+    # 신용·체크는 카드사 이름이 이 칸에 있으므로 승인번호를 여기서 덮어쓰지 않는다.
     if "onnuri_approval_code" in pay_display.columns and "card_company" in pay_display.columns:
         mask = pay_display["card_company"].isna() | (pay_display["card_company"].astype(str).isin(["None", "nan", ""]))
+        if "payment_method" in pay_display.columns:
+            mask = mask & ~pay_display["payment_method"].isin(_CARD_WITH_COMPANY)
         pay_display.loc[mask, "card_company"] = pay_display.loc[mask, "onnuri_approval_code"]
     # 신용카드/체크카드인데 card_company 가 비어 있으면 "(카드사 미입력)"으로 표시
     if "card_company" in pay_display.columns:
         pay_display["card_company"] = pay_display["card_company"].fillna("").astype(str).replace({"None": "", "nan": "", "none": ""})
         empty_card = pay_display["card_company"].str.strip() == ""
-        card_method_mask = pay_display["payment_method"].isin(("신용카드", "체크카드"))
+        card_method_mask = pay_display["payment_method"].isin(_CARD_WITH_COMPANY)
         pay_display.loc[empty_card & card_method_mask, "card_company"] = "(카드사 미입력)"
         pay_display.loc[empty_card & ~card_method_mask, "card_company"] = pay_display.loc[empty_card & ~card_method_mask, "payment_method"].fillna("-")
+        if "onnuri_approval_code" in pay_display.columns:
+            def _card_company_with_appr(row) -> str:
+                company = str(row.get("card_company") or "").strip()
+                if str(row.get("payment_method") or "") not in _CARD_WITH_COMPANY:
+                    return company
+                digits = re.sub(r"\D", "", str(row.get("onnuri_approval_code") or ""))
+                if len(digits) != 8 or digits in company:
+                    return company
+                return f"{company} {digits}".strip()
+
+            pay_display["card_company"] = pay_display.apply(_card_company_with_appr, axis=1)
     pay_display = pay_display.rename(columns={
         "id": "결제ID", "payment_date": "결제일", "amount": "금액",
         "payment_method": "수단", "card_company": "카드사/승인번호",
