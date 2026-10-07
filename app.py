@@ -33209,7 +33209,6 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     key=f"pcr_meth_{order_id}_{_i}",
                 )
             _meth_norm = str(_meth_i or "")
-            _needs_card = ("신용카드" in _meth_norm) or ("체크카드" in _meth_norm)
             _is_onnuri_e = ("온누리" in _meth_norm) and ("지류" not in _meth_norm)
             _is_ulsan = ("지역화폐" in _meth_norm)
             _needs_approval = _is_onnuri_e or _is_ulsan
@@ -33219,6 +33218,10 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             # 세션 키 미리 선언 (뒤에 거래시간 전용 행에서 사용)
             _last4_key = f"pcr_onnuri_last4_{order_id}_{_i}"
             _time_key = f"pcr_onnuri_time_{order_id}_{_i}"
+            _card_co = ""
+            _code_i = ""
+            _is_card = _meth_norm in _CARD_WITH_COMPANY
+            _is_mainpay = _meth_norm == "메인페이"
             with lc3:
                 if _is_onnuri_e:
                     # 온누리(전자): 뒤 4자리만 lc3 에 — 거래시간은 아래 별도 행으로 분리
@@ -33235,11 +33238,28 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         max_chars=4,
                         placeholder="4자리",
                     )
+                elif _is_card:
+                    _card_co = st.selectbox(
+                        f"카드사 #{_i + 1} *",
+                        options=CARD_COMPANY_OPTIONS,
+                        key=f"pcr_cardco_{order_id}_{_i}",
+                    )
+                    _appr_raw = st.text_input(
+                        f"카드 승인번호 8자리 #{_i + 1} *",
+                        key=f"pcr_card_appr_{order_id}_{_i}",
+                        max_chars=8,
+                    )
+                    _code_i = re.sub(r"\D", "", str(_appr_raw or ""))
+                elif _is_mainpay:
+                    _mp_raw = st.text_input(
+                        f"메인페이 승인번호 8자리 #{_i + 1} *",
+                        key=f"pcr_mainpay_{order_id}_{_i}",
+                        max_chars=8,
+                    )
+                    _code_i = re.sub(r"\D", "", str(_mp_raw or ""))
+                    _card_co = _code_i
                 else:
-                    if _needs_card:
-                        _code_label = f"카드사 #{_i + 1}"
-                        _code_ph = "예: NH농협카드"
-                    elif _is_ulsan:
+                    if _is_ulsan:
                         _code_label = f"지역화폐 승인번호 #{_i + 1}"
                         _code_ph = "6자리"
                     else:
@@ -33250,7 +33270,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         key=f"pcr_onnuri_{order_id}_{_i}",
                         max_chars=20,
                         placeholder=_code_ph,
-                        disabled=not (_needs_card or _is_ulsan),
+                        disabled=not _is_ulsan,
                     )
             with lc4:
                 # 실시간 콤마 포맷은 클라이언트 사이드 JS(_inject_money_input_live_format)에서 처리.
@@ -33271,10 +33291,10 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 ):
                     # 뒤 라인 값을 앞으로 당겨 재배치 후 count 감소
                     for _j in range(_i, _new_count - 1):
-                        for _suf in ("amt", "meth", "onnuri", "date"):
+                        for _suf in ("amt", "meth", "onnuri", "date", "cardco", "card_appr", "mainpay"):
                             _src = st.session_state.get(f"pcr_{_suf}_{order_id}_{_j + 1}")
                             st.session_state[f"pcr_{_suf}_{order_id}_{_j}"] = _src
-                    for _suf in ("amt", "meth", "onnuri", "date"):
+                    for _suf in ("amt", "meth", "onnuri", "date", "cardco", "card_appr", "mainpay"):
                         st.session_state.pop(f"pcr_{_suf}_{order_id}_{_new_count - 1}", None)
                     st.session_state[_count_key] = _new_count - 1
                     st.rerun()
@@ -33306,6 +33326,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 "amount": int(_amt_i or 0),
                 "method": (_meth_i or "").strip(),
                 "onnuri": (_code_i or "").strip(),
+                "card_company": (_card_co or "").strip(),
             })
 
         _add_c1, _add_c2 = st.columns([1, 3])
@@ -33419,6 +33440,24 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         for _de in dup_errs:
             st.error(_de)
 
+        card_errs: list[str] = []
+        for _ci, _cline in enumerate(new_lines):
+            if int(_cline.get("amount") or 0) <= 0:
+                continue
+            _cmeth = str(_cline.get("method") or "")
+            if _cmeth in _CARD_WITH_COMPANY:
+                if not str(_cline.get("card_company") or "").strip():
+                    card_errs.append(f"결제 #{_ci + 1} {_cmeth} 카드사를 선택하세요.")
+                _cappr = re.sub(r"\D", "", str(_cline.get("onnuri") or ""))
+                if len(_cappr) != 8:
+                    card_errs.append(f"결제 #{_ci + 1} {_cmeth} 승인번호 8자리를 정확히 입력하세요.")
+            elif _cmeth == "메인페이":
+                _mappr = re.sub(r"\D", "", str(_cline.get("onnuri") or ""))
+                if len(_mappr) != 8:
+                    card_errs.append(f"결제 #{_ci + 1} 메인페이 승인번호 8자리를 정확히 입력하세요.")
+        for _ce in card_errs:
+            st.error(_ce)
+
         _refund_bank_ok = bool((refund_bank or "").strip())
         _refund_account_ok = bool((refund_account or "").strip())
         can_submit = (
@@ -33429,6 +33468,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             and bool(pcr_assignees)
             and sel_pid is not None
             and not dup_errs
+            and not card_errs
         )
         if not can_submit:
             if sel_pid is None:
@@ -33441,6 +33481,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 st.caption("환불 계좌(은행·예금주)와 계좌번호를 모두 입력해야 합니다.")
             elif not (orig.get("method") or orig.get("amount")):
                 st.caption("원본 결제 정보를 확인해 주세요.")
+            elif card_errs:
+                st.caption("카드사와 승인번호 8자리를 입력해야 요청할 수 있습니다.")
         st.divider()
         if st.button("📤 요청 등록 (기존 결제 취소 + 신규 결제 자동 저장)",
                      key=f"pcr_submit_{order_id}",
@@ -33551,8 +33593,14 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 _new_code = (_line.get("onnuri") or "").strip()
                 _new_card_company: str | None = None
                 _new_onnuri_code: str | None = None
+                _new_digits = re.sub(r"\D", "", _new_code)
                 if "지역화폐" in _new_method:
                     _new_card_company = _ext_pay_norm_approval6(_new_code) or (_new_code or None)
+                elif _new_method in _CARD_WITH_COMPANY:
+                    _new_card_company = (_line.get("card_company") or "").strip() or None
+                    _new_onnuri_code = _new_digits or None
+                elif _new_method == "메인페이":
+                    _new_card_company = _new_digits or None
                 elif "온누리" in _new_method:
                     _new_onnuri_code = _new_code or None
                 elif _new_code:
@@ -33651,6 +33699,9 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     f"pcr_meth_{order_id}_{_li}",
                     f"pcr_onnuri_{order_id}_{_li}",
                     f"pcr_date_{order_id}_{_li}",
+                    f"pcr_cardco_{order_id}_{_li}",
+                    f"pcr_card_appr_{order_id}_{_li}",
+                    f"pcr_mainpay_{order_id}_{_li}",
                 ])
             for _rk in _reset_keys:
                 st.session_state.pop(_rk, None)
