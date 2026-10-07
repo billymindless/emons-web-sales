@@ -47283,7 +47283,8 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
         a) order_date 가 KPI 기간 내 → +display_sales_amount × 1/n × 1회 (정상 신규 계약).
         b) order_date 가 KPI 기간 외 + KPI 기간 내 sales 합이 -total_amount(=누적 sales 0원, 전체 취소) → -display_sales_amount × 1/n × 1회.
         c) 그 외(다른 달 계약 + 단순 금액수정 delta) → 0 (영향 없음).
-        d) sales note 에 |__dm_d:{delta_display}| 가 있으면 해당 KPI 기간에 +delta_display × 1/n 을 추가 분배 (전시판매가 변경분만 분리 반영).
+        d) sales note 에 |__dm_d:{delta_display}| 가 있고 계약월이 KPI 기간 밖일 때만 +delta_display × 1/n 을 추가 분배.
+           같은 달 수정분은 이미 display_sales_amount 에 반영돼 있으므로 중복 가산하지 않는다.
     1/n 분모는 주문의 최신 employee_names를 우선(sales 스냅샷보다 앞섬)."""
     if kpi_m.empty:
         return pd.DataFrame(columns=["employee", "revenue", "margin", "display_sales"])
@@ -47419,15 +47420,18 @@ def _kpi_employee_totals_from_sales_slice(kpi_m: "pd.DataFrame", orders: "pd.Dat
                             disp_per = -base_d / n
                         # 그 외(단순 금액수정 delta) → 0
 
-                # __dm_d 메타: 전시판매가 변경분 추가 분배 (KPI 기간 내 sales 행만 영향)
-                _dm_d_sum = 0.0
-                _order_rows = km_oid[km_oid["order_id"] == _oid_int]
-                for _, _row in _order_rows.iterrows():
-                    _dm_d = _kpi_parse_delta_display_from_sales_note(_row.get("note"))
-                    if _dm_d is not None:
-                        _dm_d_sum += _dm_d
-                if _dm_d_sum != 0:
-                    disp_per += _dm_d_sum / n
+                # __dm_d 메타: 전시판매가 변경분 추가 분배.
+                # 계약월이 KPI 기간 밖일 때만 가산한다 — 같은 달이면 변경 후 금액이
+                # 이미 display_sales_amount 에 반영돼 있어 중복 집계가 된다.
+                if not in_kpi_range:
+                    _dm_d_sum = 0.0
+                    _order_rows = km_oid[km_oid["order_id"] == _oid_int]
+                    for _, _row in _order_rows.iterrows():
+                        _dm_d = _kpi_parse_delta_display_from_sales_note(_row.get("note"))
+                        if _dm_d is not None:
+                            _dm_d_sum += _dm_d
+                    if _dm_d_sum != 0:
+                        disp_per += _dm_d_sum / n
 
                 if disp_per == 0:
                     continue
@@ -47701,8 +47705,10 @@ def render_display_sales_audit():
                     case_label = "(b) 다른 달 계약 + 전체취소"
                 else:
                     case_label = "(c) 다른 달 계약 + 단순수정 → 0"
+        # (d) 전시판매가 변경분: 계약월이 조회 기간 밖일 때만 가산.
+        # 같은 달 수정분은 display_sales_amount 에 이미 포함돼 중복 집계가 된다.
         dm_d = order_dm_d_sum.get(oid, 0.0)
-        if dm_d != 0:
+        if dm_d != 0 and not in_kpi:
             disp_per += dm_d / n
             extra = f"(d) 전시판매가 변경분 {int(round(dm_d)):+,}"
             case_label = f"{case_label} + {extra}" if case_label else extra
