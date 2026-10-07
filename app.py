@@ -5,6 +5,7 @@ momo - 가구 매장 세일즈 및 경영 대시보드
 """
 import base64
 import calendar
+import contextlib
 import io
 import hmac
 import html
@@ -32657,6 +32658,44 @@ def _inject_window_paste_listener(paste_key: str) -> None:
     )
 
 
+def _inject_compact_attach_css() -> None:
+    """댓글 첨부만 파일 놓기 칸을 숨기고 첨부 버튼만 남긴다."""
+    st.markdown(
+        """
+        <style>
+        [class*="st-key-cmtattach"] [data-testid="stFileUploaderDropzone"] {
+            border: none !important;
+            background: transparent !important;
+            padding: 0 !important;
+            min-height: 0 !important;
+            height: auto !important;
+            gap: 0 !important;
+            flex-direction: row !important;
+            align-items: center !important;
+            justify-content: flex-start !important;
+        }
+        [class*="st-key-cmtattach"] [data-testid="stFileUploaderDropzoneInstructions"],
+        [class*="st-key-cmtattach"] [data-testid="stFileUploaderFile"],
+        [class*="st-key-cmtattach"] [data-testid="stFileUploaderFileName"],
+        [class*="st-key-cmtattach"] [data-testid="stFileUploaderPagination"] {
+            display: none !important;
+        }
+        [class*="st-key-cmtattach"] [data-testid="stFileUploaderDropzone"] button,
+        [class*="st-key-cmtattach"] [data-testid="stFileUploaderDropzone"] button * {
+            font-size: 0 !important;
+            line-height: 0 !important;
+        }
+        [class*="st-key-cmtattach"] [data-testid="stFileUploaderDropzone"] button::after {
+            content: "첨부";
+            font-size: 0.95rem !important;
+            line-height: 1.2 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _file_input_with_paste(
     label: str,
     *,
@@ -32665,6 +32704,7 @@ def _file_input_with_paste(
     type: list | None = None,
     help: str | None = None,
     paste_hint: bool = True,
+    compact: bool = False,
 ):
     """st.file_uploader 대체. 붙여넣기(Ctrl+V) 이미지 첨부 지원.
 
@@ -32677,14 +32717,21 @@ def _file_input_with_paste(
     paste_key = f"{key}__paste"
     state_key = f"{key}__pasted_list"
 
-    uploader_files = st.file_uploader(
-        label,
-        accept_multiple_files=accept_multiple_files,
-        type=type,
-        key=upload_key,
-        help=help,
-        label_visibility="collapsed",
-    )
+    if compact:
+        _inject_compact_attach_css()
+        _box_key = "cmtattach_" + re.sub(r"[^0-9A-Za-z_]", "_", key)
+        _upload_box = st.container(key=_box_key)
+    else:
+        _upload_box = contextlib.nullcontext()
+    with _upload_box:
+        uploader_files = st.file_uploader(
+            label,
+            accept_multiple_files=accept_multiple_files,
+            type=type,
+            key=upload_key,
+            help=help,
+            label_visibility="collapsed",
+        )
 
     _inject_window_paste_listener(paste_key)
 
@@ -32721,17 +32768,24 @@ def _file_input_with_paste(
                     st.session_state[state_key] = pasted_list
 
     if pasted_list:
-        if st.button(f"✕ 붙여넣기 {len(pasted_list)}개 지우기",
-                     key=f"{key}__clear_paste"):
+        _clear_label = "지우기" if compact else f"✕ 붙여넣기 {len(pasted_list)}개 지우기"
+        if st.button(_clear_label, key=f"{key}__clear_paste"):
             st.session_state[state_key] = []
             st.rerun()
 
     if accept_multiple_files:
-        base = list(uploader_files or [])
-        return base + list(pasted_list)
-    if uploader_files is not None:
-        return uploader_files
-    return pasted_list[-1] if pasted_list else None
+        result = list(uploader_files or []) + list(pasted_list)
+    elif uploader_files is not None:
+        result = uploader_files
+    else:
+        result = pasted_list[-1] if pasted_list else None
+    if compact:
+        _seq = result if isinstance(result, list) else ([result] if result is not None else [])
+        _names = [str(getattr(_f, "name", "") or "").strip() for _f in _seq]
+        _names = [n for n in _names if n]
+        if _names:
+            st.caption(" · ".join(_names))
+    return result
 
 
 def _clear_pasted_files(key: str) -> None:
@@ -32782,23 +32836,28 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
     for _prev_err in st.session_state.pop(err_key, []):
         st.error(_prev_err)
 
-    files = _file_input_with_paste(
-        "첨부",
-        accept_multiple_files=True,
-        key=files_key,
-    )
-    _render_upload_preview(files)
+    c_body, c_file, c_go = st.columns([6, 1.4, 1.2], vertical_alignment="bottom")
+    with c_file:
+        files = _file_input_with_paste(
+            "첨부",
+            accept_multiple_files=True,
+            key=files_key,
+            compact=True,
+        )
 
     with st.form(f"{key_prefix}_form", clear_on_submit=True):
-        body = st.text_area(
-            "내용",
-            key=f"{key_prefix}_body",
-            height=80,
-            placeholder="댓글 입력",
-            label_visibility="collapsed",
-        )
-        label = "↪ 답글" if parent_cid else "등록"
-        if st.form_submit_button(label, type="primary"):
+        with c_body:
+            body = st.text_area(
+                "내용",
+                key=f"{key_prefix}_body",
+                height=68,
+                placeholder="댓글을 입력하세요",
+                label_visibility="collapsed",
+            )
+        with c_go:
+            label = "↪ 답글" if parent_cid else "등록"
+            submitted = st.form_submit_button(label, type="primary")
+        if submitted:
             if not (body or "").strip() and not files:
                 st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
                 return
@@ -34653,8 +34712,8 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
         "업무 첨부",
         accept_multiple_files=True,
         key=f"task_files_{tid}_{_task_file_ver}",
+        compact=True,
     )
-    _render_upload_preview(_task_files)
     if _task_files and can_edit:
         if st.button("📤 업로드", key=f"task_upload_btn_{tid}", type="primary"):
             _att_errs = []
@@ -34734,15 +34793,52 @@ def _render_task_detail(task: dict, assignees: list[dict], me_uname: str,
         for child in cm_by_parent.get(cm_id, []):
             _render_cm(child, depth + 1)
 
+    activity = _tb.load_task_activity_cached(tid)
     root_comments = cm_by_parent.get(None, [])
+    _timeline: list[tuple[str, str, dict]] = []
     for r in root_comments:
-        _render_cm(r, 0)
+        _timeline.append((str(r.get("created_at") or ""), "comment", r))
+    for ev in activity or []:
+        if str(ev.get("action") or "") != "status_changed":
+            continue
+        payload = ev.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                logging.exception("status_changed payload 파싱 실패")
+                continue
+        if not isinstance(payload, dict):
+            continue
+        fr = _tb.TASK_STATUS_LABELS.get(payload.get("from"), payload.get("from") or "-")
+        to = _tb.TASK_STATUS_LABELS.get(payload.get("to"), payload.get("to") or "-")
+        _timeline.append((
+            str(ev.get("created_at") or ""),
+            "status",
+            {
+                "author": ev.get("actor"),
+                "created_at": ev.get("created_at") or "",
+                "text": f"'{fr}' → '{to}' 상태를 변경하였습니다.",
+            },
+        ))
+    _timeline.sort(key=lambda item: item[0])
+    for _ts, _kind, _obj in _timeline:
+        if _kind == "comment":
+            _render_cm(_obj, 0)
+            continue
+        st.markdown(
+            f"<div style='margin:6px 0 2px 0;'>"
+            f"<span style='font-weight:600;'>{_uname_to_display(_obj.get('author'))}</span>"
+            f"&nbsp;<span style='color:#94a3b8; font-size:0.85rem;'>"
+            f"{str(_obj.get('created_at', ''))[:19]}</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.write(_obj.get("text", ""))
 
     # 새 댓글 작성 (최상위)
     _render_comment_input(tid, me_uname, parent_cid=None, key_prefix=f"new_{tid}")
 
     # 활동 로그
-    activity = _tb.load_task_activity_cached(tid)
     if activity:
         with st.expander("📜 활동 로그", expanded=False):
             for ev in activity:
@@ -34834,23 +34930,28 @@ def _render_post_comment_input(post_id: int, me_uname: str, parent_cid: int | No
     for _prev_err in st.session_state.pop(err_key, []):
         st.error(_prev_err)
 
-    files = _file_input_with_paste(
-        "첨부",
-        accept_multiple_files=True,
-        key=files_key,
-    )
-    _render_upload_preview(files)
+    c_body, c_file, c_go = st.columns([6, 1.4, 1.2], vertical_alignment="bottom")
+    with c_file:
+        files = _file_input_with_paste(
+            "첨부",
+            accept_multiple_files=True,
+            key=files_key,
+            compact=True,
+        )
 
     with st.form(f"{key_prefix}_form", clear_on_submit=True):
-        body = st.text_area(
-            "내용",
-            key=f"{key_prefix}_body",
-            height=80,
-            placeholder="댓글 입력",
-            label_visibility="collapsed",
-        )
-        label = "↪ 답글 등록" if parent_cid else "💬 댓글 등록"
-        if st.form_submit_button(label, type="primary"):
+        with c_body:
+            body = st.text_area(
+                "내용",
+                key=f"{key_prefix}_body",
+                height=68,
+                placeholder="댓글을 입력하세요",
+                label_visibility="collapsed",
+            )
+        with c_go:
+            label = "↪ 답글" if parent_cid else "등록"
+            submitted = st.form_submit_button(label, type="primary")
+        if submitted:
             if not (body or "").strip() and not files:
                 st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
                 return

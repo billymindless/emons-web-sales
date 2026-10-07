@@ -14,15 +14,16 @@
     color: #546e7a;
     font-size: 12px;
     line-height: 1.4;
-    padding: 2px 0;
-    min-height: 16px;
+    padding: 0;
+    min-height: 0;
   }
+  #status:empty { display: none; }
   #status.ok { color: #1b7f4b; }
   #status.err { color: #b3261e; }
 </style>
 </head>
 <body>
-<div id="status">이 화면에서 Ctrl+V 하면 이미지가 바로 첨부됩니다.</div>
+<div id="status"></div>
 <script>
 (function () {
   var status = document.getElementById("status");
@@ -35,7 +36,11 @@
   }
   function sendReady() { post("streamlit:componentReady", { apiVersion: 1 }); }
   function sendHeight(h) {
-    post("streamlit:setFrameHeight", { height: h || 28 });
+    post("streamlit:setFrameHeight", { height: h || 0 });
+  }
+  function syncHeight() {
+    var has = (status.textContent || "").trim().length > 0;
+    sendHeight(has ? 28 : 0);
   }
   function sendValue(v) {
     post("streamlit:setComponentValue", { value: v, dataType: "json" });
@@ -106,11 +111,12 @@
       status.textContent = "이미지 붙여넣기 완료 · " + found.name;
       status.className = "ok";
       sendValue(found);
-      sendHeight(28);
+      syncHeight();
       return true;
     } catch (err) {
       status.textContent = "이미지 붙여넣기에 실패했습니다.";
       status.className = "err";
+      syncHeight();
       return false;
     }
   }
@@ -144,6 +150,7 @@
     } catch (e) {
       status.textContent = "창 붙여넣기를 연결하지 못했습니다. 새로고침 후 다시 시도해 주세요.";
       status.className = "err";
+      syncHeight();
     }
   }
 
@@ -157,6 +164,7 @@
       status.textContent = "이미지 붙여넣기 완료 · " + p.name;
       status.className = "ok";
       sendValue(p);
+      syncHeight();
     } catch (e) {}
   }
 
@@ -166,14 +174,14 @@
     var args = data.args || {};
     myKey = String(args.paste_key || args.key || myKey || "");
     attachParentPaste();
-    sendHeight(28);
+    syncHeight();
   });
 
   sendReady();
-  sendHeight(28);
+  syncHeight();
   setInterval(pollParentPaste, 250);
-  setTimeout(function () { sendHeight(28); attachParentPaste(); }, 50);
-  setTimeout(function () { sendHeight(28); }, 300);
+  setTimeout(function () { syncHeight(); attachParentPaste(); }, 50);
+  setTimeout(function () { syncHeight(); }, 300);
 })();
 </script>
 </body>
