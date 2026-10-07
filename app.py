@@ -33543,11 +33543,16 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             _orig_amt_disp = int(float(orig.get("amount") or 0))
             _diff = _total_new - _orig_amt_disp
             if _diff == 0:
-                _note = "일치 (완납)"
+                _note = "일치 · 원 결제 전액 변경"
+            elif _total_new == 0:
+                _note = "원 결제 전액 환불 (신규 결제 없음)"
             elif _diff < 0:
-                _note = f"잔액 {-_diff:,}원 미수로 남김 (부분 결제변경)"
+                _note = f"잔액 {-_diff:,}원은 원래 수단으로 유지 (부분 결제변경)"
             else:
-                _note = f"초과 {_diff:,}원"
+                _note = (
+                    f"초과 {_diff:,}원 · 저장 불가 · 원금 이하만 결제변경에 넣고 "
+                    "넘는 금액은 일반 결제로 등록하세요"
+                )
             st.markdown(
                 f"합계 **{_total_new:,}원** · 원본 {_orig_amt_disp:,}원 · {_note}"
             )
@@ -33671,6 +33676,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
 
         _refund_bank_ok = bool((refund_bank or "").strip())
         _refund_account_ok = bool((refund_account or "").strip())
+        # 변경 후 합계가 원금보다 크면 저장을 막는다. 추가 수납은 일반 결제로 등록해야 한다.
+        _amount_over = int(_total_new) > int(_orig_amt_disp)
         can_submit = (
             bool((reason or "").strip())
             and _refund_bank_ok
@@ -33680,9 +33687,12 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             and sel_pid is not None
             and not dup_errs
             and not card_errs
+            and not _amount_over
         )
         if not can_submit and sel_pid is not None:
-            if not pcr_assignees:
+            if _amount_over:
+                st.caption("변경 후 합계가 원 결제보다 큽니다. 원금 이하만 결제변경에 넣고, 넘는 금액은 일반 결제로 등록하세요.")
+            elif not pcr_assignees:
                 st.caption("결제자를 1명 이상 지정해야 요청할 수 있습니다.")
             elif not (reason or "").strip():
                 st.caption("변경 사유를 입력해야 요청할 수 있습니다.")
@@ -33737,10 +33747,14 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         st.error(f"요청 등록 실패: {err}")
                         st.stop()
 
-                    # ── 결제 자동 반영: 원본 취소행(음수) + 신규 결제행(양수) ──
-                    # 원본 결제행에서 card_company / onnuri_approval_code 를 보존해 취소 audit 를 남긴다.
+                    # ── 결제 자동 반영 ──
+                    # 1) 변경 후 합계 == 원금: 원 결제 전액 상계 + 신규 결제 저장 (수단 전액 변경)
+                    # 2) 변경 후 합계 == 0: 원 결제 전액 상계 (환불) · 신규 결제 없음
+                    # 3) 0 < 변경 후 합계 < 원금: 원 결제 행 금액을 (원금 - 변경 후 합계)로 감액 (부분 변경)
+                    #    차액은 원래 수단으로 유지되므로 상계 전표를 만들지 않는다.
                     cancel_pay_id: int | None = None
                     new_pay_id: int | None = None
+                    reduced_pay_id: int | None = None
                     payment_ops_errors: list[str] = []
                     _today_str = date.today().isoformat()
 
@@ -33754,9 +33768,48 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         _orig_amt = int(round(float(orig.get("amount") or 0)))
                     except (TypeError, ValueError):
                         _orig_amt = 0
+                    try:
+                        _new_sum = int(_total_new)
+                    except (TypeError, ValueError):
+                        _new_sum = 0
+                    _is_partial_change = (
+                        _orig_amt > 0 and 0 < _new_sum < _orig_amt and sel_pid is not None
+                    )
 
-                    # 1. 원본 결제 취소 등록 (음수 결제행)
-                    if _orig_amt > 0:
+                    if _is_partial_change:
+                        # 부분 결제변경: 원 결제 행을 (원금 - 변경 후 합계) 로 감액한다.
+                        _kept = _orig_amt - _new_sum
+                        _upd_ok = _update_payment_supabase(
+                            db_filename, int(sel_pid), {"amount": _kept},
+                        )
+                        if not _upd_ok:
+                            payment_ops_errors.append(
+                                f"원 결제 감액 실패 (결제ID {sel_pid}, {_orig_amt:,}원 → {_kept:,}원)"
+                            )
+                        else:
+                            reduced_pay_id = int(sel_pid)
+                            _insert_payment_history(
+                                conn=None,
+                                sale_id=int(order_id),
+                                customer_name=customer_name or "",
+                                action_type="payment_change_partial",
+                                old_payment_data={
+                                    "payment_id": sel_pid,
+                                    "amount": _orig_amt,
+                                    "payment_method": _orig_row.get("payment_method") or orig.get("method") or None,
+                                    "card_company": _orig_row.get("card_company") or None,
+                                    "onnuri_approval_code": _orig_row.get("onnuri_approval_code") or None,
+                                },
+                                new_payment_data={
+                                    "payment_id": sel_pid,
+                                    "amount": _kept,
+                                    "note": f"결제변경 요청에 의한 감액 ({_orig_amt:,}원 → {_kept:,}원, 차액 {_new_sum:,}원 신규 결제로 이동)",
+                                },
+                                reason=reason,
+                                db_filename=db_filename,
+                            )
+                    elif _orig_amt > 0:
+                        # 전액 환불 또는 전액 수단 변경: 원 결제 전액을 음수 상계 전표로 지운다.
                         _cancel_payload = {
                             "order_id": int(order_id),
                             "payment_date": _today_str,
@@ -33860,8 +33913,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         )
                     new_pay_id = new_pay_ids[0] if new_pay_ids else None
 
-                    # 잔금·actual_margin 재계산 (음수+양수 인서트 후 최신 상태 반영)
-                    if cancel_pay_id or new_pay_ids:
+                    # 잔금·actual_margin 재계산 (음수+양수 인서트 또는 원 결제 감액 후 최신 상태 반영)
+                    if cancel_pay_id or new_pay_ids or reduced_pay_id:
                         try:
                             _recalc_order_actual_margin_supabase(db_filename, int(order_id))
                         except Exception as _mg_ex:
@@ -33883,6 +33936,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     try:
                         _tb.log_activity(task_id, me_uname, "payment_change_applied", {
                             "cancel_payment_id": cancel_pay_id,
+                            "reduced_payment_id": reduced_pay_id,
                             "new_payment_id": new_pay_id,
                             "new_payment_ids": new_pay_ids,
                             "errors": payment_ops_errors[:5],
@@ -33901,6 +33955,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     _pay_msg = ""
                     if cancel_pay_id:
                         _pay_msg += f" · 취소행 #{cancel_pay_id}"
+                    if reduced_pay_id:
+                        _pay_msg += f" · 원 결제 #{reduced_pay_id} 감액 (잔액 {(_orig_amt - _new_sum):,}원 유지)"
                     if new_pay_ids:
                         _pay_msg += " · 신규결제 " + ", ".join(f"#{p}" for p in new_pay_ids)
                     flash(f"결제변경 요청 등록 완료 (검증 태스크 #{task_id}){_pay_msg}")
@@ -34494,28 +34550,60 @@ def _render_payment_change_verify_panel(tid: int, me_uname: str, role: str, is_c
             except (TypeError, ValueError):
                 continue
         _meta_pid_s = str(meta.get("payment_id") or "")
+        # 부분 결제변경 감지: 요청의 원 결제 금액 > 변경 후 금액 > 0 이고,
+        # 상계 전표가 없이 원 결제 행이 감액만 됐으면 부분 결제변경이다.
+        try:
+            _req_orig_amt = int(round(float(display_meta.get("original_amount") or 0)))
+        except (TypeError, ValueError):
+            _req_orig_amt = 0
+        try:
+            _req_new_amt = int(round(float(display_meta.get("new_amount") or 0)))
+        except (TypeError, ValueError):
+            _req_new_amt = 0
+        _is_partial = (
+            _req_orig_amt > 0
+            and 0 < _req_new_amt < _req_orig_amt
+            and not _offset_pays
+        )
         _before_show: list[tuple[dict, str]] = []  # (pay, tag)
         for _bp in _before_pays:
             try:
                 _bpid = int(_bp.get("id"))
-                _bkey = (str(_bp.get("payment_method") or ""), int(round(float(_bp.get("amount") or 0))))
+                _bamt = int(round(float(_bp.get("amount") or 0)))
+                _bkey = (str(_bp.get("payment_method") or ""), _bamt)
             except (TypeError, ValueError):
-                _bpid, _bkey = None, None
+                _bpid, _bamt, _bkey = None, 0, None
             if _bkey in _offset_keys:
                 _offset_keys.remove(_bkey)
                 _before_show.append((_bp, "변경 대상 · 상계됨"))
             elif _bpid is not None and str(_bpid) == _meta_pid_s:
-                _before_show.append((_bp, "변경 대상"))
+                if _is_partial:
+                    _before_show.append(
+                        (_bp, f"변경 대상 · 감액 유지 {_bamt:,}원")
+                    )
+                else:
+                    _before_show.append((_bp, "변경 대상"))
 
         win_l, win_r = st.columns(2)
         with win_l:
             with st.container(border=True):
+                if _is_partial:
+                    _before_total = _req_orig_amt
+                elif _before_show:
+                    _before_total = _pcr_sum([bp for bp, _ in _before_show])
+                else:
+                    _before_total = int(display_meta.get("original_amount") or 0)
                 _pcr_window_header(
                     "🧾 기존 결제 내역 (결제 전)",
-                    _pcr_sum([bp for bp, _ in _before_show]) if _before_show
-                    else int(display_meta.get("original_amount") or 0),
+                    _before_total,
                     bg="#fee2e2", fg="#991b1b",
                 )
+                if _is_partial:
+                    _kept_sum = _pcr_sum([bp for bp, _ in _before_show])
+                    st.caption(
+                        f"부분 결제변경 · 원 결제 {_req_orig_amt:,}원 → 유지 {_kept_sum:,}원 "
+                        f"(차액 {(_req_orig_amt - _kept_sum):,}원이 변경 후 결제로 이동)"
+                    )
                 if _before_show:
                     for _bp, _btag in _before_show:
                         try:
