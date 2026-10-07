@@ -33042,6 +33042,10 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             ])
         for _rk in _reset_keys:
             st.session_state.pop(_rk, None)
+        st.session_state.pop(f"pcr_hist_{order_id}", None)
+        st.session_state.pop(f"pcr_emp_opts_{order_id}", None)
+        st.session_state.pop(f"pcr_vbadge_{order_id}", None)
+        st.session_state.pop(f"pcr_evidence_open_{order_id}", None)
         st.session_state[f"pcr_new_count_{order_id}"] = 1
 
     me_uname = _current_username()
@@ -33095,8 +33099,14 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             unsafe_allow_html=True,
         )
 
-        # 원본은 현재 결제행이 아니라 최신 결제변경 이력에서 가져온다 (사후 검증 버그 방지)
-        _hist = _load_latest_payment_history_for_pcr(db_filename, int(order_id))
+        # 원본은 현재 결제행이 아니라 최신 결제변경 이력에서 가져온다 (사후 검증 버그 방지).
+        # 수단을 바꿀 때마다 조회하지 않고, 이 폼이 열린 동안 한 번만 담는다.
+        _hist_cache_key = f"pcr_hist_{order_id}"
+        if _hist_cache_key not in st.session_state:
+            st.session_state[_hist_cache_key] = _load_latest_payment_history_for_pcr(
+                db_filename, int(order_id)
+            ) or {}
+        _hist = st.session_state.get(_hist_cache_key) or {}
         _hist_orig = (_hist or {}).get("original") or {}
         _hist_new = (_hist or {}).get("new") or {}
 
@@ -33170,8 +33180,13 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 pid_i = None
             if not pid_i:
                 return "❌ 미검증"
-            _v, _src = _pcr_check_external_verification(db_filename, pid_i)
-            return f"✅ 검증됨 ({_src})" if _v and _src else ("✅ 검증됨" if _v else "❌ 미검증")
+            _badge_cache = st.session_state.setdefault(f"pcr_vbadge_{order_id}", {})
+            if pid_i not in _badge_cache:
+                _v, _src = _pcr_check_external_verification(db_filename, pid_i)
+                _badge_cache[pid_i] = (
+                    f"✅ 검증됨 ({_src})" if _v and _src else ("✅ 검증됨" if _v else "❌ 미검증")
+                )
+            return _badge_cache[pid_i]
 
         # 원래 결제내역 + 변경 내용 + 미검증/검증 (Slack 본문 박스)
         _desc_lines: list[str] = []
@@ -33263,6 +33278,18 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         if _count_key not in st.session_state:
             st.session_state[_count_key] = 1
         _new_count = max(1, int(st.session_state[_count_key]))
+        _del_i = st.session_state.pop(f"pcr_del_i_{order_id}", None)
+        if isinstance(_del_i, int) and _new_count > 1 and 0 <= _del_i < _new_count:
+            _sufs = ("amt", "meth", "onnuri", "date", "cardco", "card_appr", "mainpay")
+            for _j in range(_del_i, _new_count - 1):
+                for _suf in _sufs:
+                    st.session_state[f"pcr_{_suf}_{order_id}_{_j}"] = st.session_state.get(
+                        f"pcr_{_suf}_{order_id}_{_j + 1}"
+                    )
+            for _suf in _sufs:
+                st.session_state.pop(f"pcr_{_suf}_{order_id}_{_new_count - 1}", None)
+            _new_count -= 1
+            st.session_state[_count_key] = _new_count
 
         # 각 라인 세션 초기값: 첫 라인만 이력·현재행 기본값을 상속, 이후 라인은 0/기본 수단
         _today = date.today()
@@ -33374,12 +33401,13 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         disabled=not _is_ulsan,
                     )
             with lc4:
-                # 실시간 콤마 포맷은 클라이언트 사이드 JS(_inject_money_input_live_format)에서 처리.
-                # 라벨은 반드시 '결제금액' prefix 유지 (JS binder 가 이 prefix 로 input 을 찾아 바인딩).
                 st.text_input(
                     f"결제금액 #{_i + 1}",
                     key=_amt_key_i,
                     placeholder="0",
+                    on_change=lambda _k=_amt_key_i: st.session_state.__setitem__(
+                        _k, _format_number_comma(st.session_state.get(_k, ""))
+                    ),
                 )
                 _amt_i = _parse_comma_to_int(st.session_state.get(_amt_key_i, "0"))
             with lc5:
@@ -33390,15 +33418,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     key=f"pcr_del_{order_id}_{_i}",
                     help="이 라인 제거",
                 ):
-                    # 뒤 라인 값을 앞으로 당겨 재배치 후 count 감소
-                    for _j in range(_i, _new_count - 1):
-                        for _suf in ("amt", "meth", "onnuri", "date", "cardco", "card_appr", "mainpay"):
-                            _src = st.session_state.get(f"pcr_{_suf}_{order_id}_{_j + 1}")
-                            st.session_state[f"pcr_{_suf}_{order_id}_{_j}"] = _src
-                    for _suf in ("amt", "meth", "onnuri", "date", "cardco", "card_appr", "mainpay"):
-                        st.session_state.pop(f"pcr_{_suf}_{order_id}_{_new_count - 1}", None)
-                    st.session_state[_count_key] = _new_count - 1
-                    st.rerun()
+                    st.session_state[f"pcr_del_i_{order_id}"] = _i
+                    st.rerun(scope="fragment")
             # ── 온누리 거래시간 전용 행 (수단이 온누리(전자)일 때만 표시) ──
             # lc3 폭이 좁아 숨겨 보이는 문제가 있어 전체 폭의 별도 row 로 분리.
             if _is_onnuri_e:
@@ -33434,7 +33455,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         with _add_c1:
             if st.button("➕ 결제 수단 추가", key=f"pcr_add_{order_id}"):
                 st.session_state[_count_key] = _new_count + 1
-                st.rerun()
+                st.rerun(scope="fragment")
         _total_new = sum(int(x["amount"] or 0) for x in new_lines)
         with _add_c2:
             _orig_amt_disp = int(float(orig.get("amount") or 0))
@@ -33448,8 +33469,6 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
             st.markdown(
                 f"합계 **{_total_new:,}원** · 원본 {_orig_amt_disp:,}원 · {_note}"
             )
-        # 결제금액 입력에 클라이언트 사이드 실시간 콤마 포맷 부착 (rerun 없이 브라우저에서 즉시 처리)
-        _inject_money_input_live_format()
         # 하위 호환: 요약용 대표값 (단건 로직·요약 문자열에 사용)
         new_amount = _total_new
         new_method = " · ".join(x["method"] for x in new_lines if x["method"]) or ""
@@ -33493,7 +33512,10 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                     placeholder="예: 123-45-678901",
                 )
 
-            emp_options = _pcr_assignee_options(store_id, role, me_uname)
+            _emp_cache_key = f"pcr_emp_opts_{order_id}"
+            if _emp_cache_key not in st.session_state:
+                st.session_state[_emp_cache_key] = _pcr_assignee_options(store_id, role, me_uname)
+            emp_options = st.session_state.get(_emp_cache_key) or []
             emp_username_to_label = {u: lbl for u, lbl in emp_options}
             pcr_assignees = st.multiselect(
                 "결제자 *",
@@ -33528,14 +33550,20 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         key=f"pcr_orig_onnuri_{order_id}",
                     )
 
-            # 증빙 첨부 (form 밖: 즉시 미리보기 + 등록 후 리셋)
+            # 증빙은 버튼을 누른 뒤에만 그린다. 수단 변경 때마다 클립보드 컴포넌트를 만들지 않는다.
             ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0))
-            files = _file_input_with_paste(
-                "📎 증빙 사진/파일 첨부 (선택)",
-                accept_multiple_files=True,
-                key=f"pcr_files_{order_id}_{ver}",
-            )
-            _render_upload_preview(files)
+            files = []
+            _ev_open_key = f"pcr_evidence_open_{order_id}"
+            if not st.session_state.get(_ev_open_key):
+                if st.button("증빙 첨부", key=f"pcr_ev_open_{order_id}"):
+                    st.session_state[_ev_open_key] = True
+            if st.session_state.get(_ev_open_key):
+                files = _file_input_with_paste(
+                    "📎 증빙 사진/파일 첨부 (선택)",
+                    accept_multiple_files=True,
+                    key=f"pcr_files_{order_id}_{ver}",
+                )
+                _render_upload_preview(files)
 
         dup_errs = _pcr_duplicate_approval_errors(pay_list, new_lines)
         for _de in dup_errs:
