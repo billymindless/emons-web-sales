@@ -37922,6 +37922,124 @@ def _render_ext_pay_manual_and_erp_only(
                     st.error(err or "취소 실패")
 
 
+_WATERPROOF_COVER_DEFAULTS: list[dict] = [
+    {"code": "s", "label": "S", "amount": 7700, "sort_order": 1, "kind": "size"},
+    {"code": "ss", "label": "SS", "amount": 8030, "sort_order": 2, "kind": "size"},
+    {"code": "w1200", "label": "1200/1300", "amount": 8800, "sort_order": 3, "kind": "size"},
+    {"code": "q", "label": "Q", "amount": 9460, "sort_order": 4, "kind": "size"},
+    {"code": "k", "label": "K", "amount": 9900, "sort_order": 5, "kind": "size"},
+    {"code": "lk", "label": "LK 1800*2000", "amount": 10450, "sort_order": 6, "kind": "size"},
+    {"code": "kk", "label": "KK 1800*2100", "amount": 12100, "sort_order": 7, "kind": "size"},
+    {"code": "liner", "label": "리너", "amount": 7700, "sort_order": 8, "kind": "option"},
+    {"code": "pad", "label": "밀림방지패드", "amount": 7700, "sort_order": 9, "kind": "option"},
+]
+
+
+def _waterproof_cover_defaults() -> list[dict]:
+    return [dict(row) for row in _WATERPROOF_COVER_DEFAULTS]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_waterproof_cover_prices() -> list[dict]:
+    """방수커버 단가. 표가 없거나 비어 있으면 사진의 기본 금액을 쓴다."""
+    defaults = _waterproof_cover_defaults()
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return defaults
+        r = (
+            sc.table("app_waterproof_cover_prices")
+            .select("code, label, amount, sort_order, kind")
+            .order("sort_order")
+            .execute()
+        )
+        rows = list(r.data or [])
+    except Exception:
+        logging.exception("방수커버 단가 조회 실패")
+        return defaults
+    by_code = {str(row.get("code") or ""): row for row in rows}
+    if not by_code:
+        return defaults
+    out: list[dict] = []
+    for base in defaults:
+        saved = by_code.get(base["code"]) or {}
+        try:
+            amount = int(saved.get("amount") if saved else base["amount"])
+        except (TypeError, ValueError):
+            amount = int(base["amount"])
+        out.append({
+            "code": base["code"],
+            "label": base["label"],
+            "amount": max(0, amount),
+            "sort_order": int(base["sort_order"]),
+            "kind": base["kind"],
+        })
+    return out
+
+
+def _save_waterproof_cover_prices(amounts: dict[str, int], updated_by: str) -> str | None:
+    """금액만 저장한다. 이름과 순서는 기본값을 유지한다."""
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return err or "Supabase에 연결하지 못했습니다."
+    payload = []
+    for base in _waterproof_cover_defaults():
+        try:
+            amount = int(amounts.get(base["code"], base["amount"]))
+        except (TypeError, ValueError):
+            amount = int(base["amount"])
+        payload.append({
+            "code": base["code"],
+            "label": base["label"],
+            "amount": max(0, amount),
+            "sort_order": int(base["sort_order"]),
+            "kind": base["kind"],
+            "updated_by": updated_by or None,
+            "updated_at": datetime.now(KST).isoformat(),
+        })
+    try:
+        sc.table("app_waterproof_cover_prices").upsert(payload, on_conflict="code").execute()
+    except Exception:
+        logging.exception("방수커버 단가 저장 실패")
+        return "단가 저장에 실패했습니다. Supabase에 app_waterproof_cover_prices 표가 있는지 확인해 주세요."
+    _load_waterproof_cover_prices.clear()
+    return None
+
+
+def _waterproof_cover_amount(size_code: str, liner_on: bool, pad_on: bool) -> int:
+    rows = {str(row["code"]): row for row in _load_waterproof_cover_prices()}
+    total = 0
+    if size_code and size_code in rows and rows[size_code].get("kind") == "size":
+        total += int(rows[size_code]["amount"])
+    if liner_on and "liner" in rows:
+        total += int(rows["liner"]["amount"])
+    if pad_on and "pad" in rows:
+        total += int(rows["pad"]["amount"])
+    return total
+
+
+def _render_waterproof_cover_admin(me_uname: str) -> None:
+    """관리자 설정: 방수커버 금액만 수정. 전 매장 공통."""
+    rows = _load_waterproof_cover_prices()
+    st.caption("금액만 바꿉니다. 저장하면 전 매장 신규 매출에 적용됩니다. 표가 없으면 사진의 기본 금액을 씁니다.")
+    edited: dict[str, int] = {}
+    for row in rows:
+        edited[row["code"]] = int(st.number_input(
+            f"{row['label']} (원)",
+            min_value=0,
+            step=10,
+            value=int(row["amount"]),
+            key=f"cover_admin_amt_{row['code']}",
+        ))
+    if st.button("방수커버 단가 저장", type="primary", key="cover_admin_save"):
+        err = _save_waterproof_cover_prices(edited, me_uname)
+        if err:
+            st.error(err)
+        else:
+            flash("방수커버 단가를 저장했습니다.")
+            st.rerun()
+
+
 def render_admin_settings():
     """⚙️ 관리자 설정 — ERP 운영 설정을 모아두는 허브.
     알림톡·카카오 채널 설정, 알림 문구 편집 등을 포함하며 항목이 늘어나면 여기에 추가."""
@@ -38139,6 +38257,13 @@ def render_admin_settings():
                         st.rerun()
                     except Exception as _cpw_e:
                         st.error(f"비밀번호 변경에 실패했습니다: {str(_cpw_e)}")
+
+    st.divider()
+
+    # ── 10. 방수커버 단가 (전 매장 공통) ─────────────────────────
+    st.subheader("10. 방수커버 단가")
+    with st.expander("사이즈·리너·밀림방지패드 금액", expanded=False):
+        _render_waterproof_cover_admin(me_uname)
 
 
 # 사내 게시판 섹션 레지스트리 — 나중에 일정/할일/투표 활성화 시
@@ -40963,6 +41088,46 @@ def render_new_sales():
             "cost_price", _format_number_comma(st.session_state.get("cost_price", ""))
         ),
     )
+    _cover_extra = 0
+    _bed_selected = bool({"침대", "SSDS침대"} & set(selected_categories or []))
+    if _bed_selected:
+        _cover_rows = _load_waterproof_cover_prices()
+        _size_rows = [row for row in _cover_rows if row.get("kind") == "size"]
+        _opt_rows = {str(row["code"]): row for row in _cover_rows if row.get("kind") == "option"}
+        _size_codes = [""] + [str(row["code"]) for row in _size_rows]
+
+        def _cover_size_label(code: str) -> str:
+            if not code:
+                return "선택 안 함"
+            row = next((item for item in _size_rows if str(item["code"]) == code), None)
+            if not row:
+                return code
+            return f"{row['label']} ({int(row['amount']):,}원)"
+
+        _size_code = st.selectbox(
+            "방수커버",
+            options=_size_codes,
+            format_func=_cover_size_label,
+            key=f"cover_size_{_form_reset}",
+        )
+        _liner_amt = int((_opt_rows.get("liner") or {}).get("amount") or 0)
+        _pad_amt = int((_opt_rows.get("pad") or {}).get("amount") or 0)
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            _liner_on = st.checkbox(
+                f"리너 ({_liner_amt:,}원)",
+                key=f"cover_liner_{_form_reset}",
+            )
+        with _c2:
+            _pad_on = st.checkbox(
+                f"밀림방지패드 ({_pad_amt:,}원)",
+                key=f"cover_pad_{_form_reset}",
+            )
+        _cover_extra = _waterproof_cover_amount(_size_code, _liner_on, _pad_on)
+        _typed_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
+        st.caption(
+            f"입력 원가 {_typed_cost:,}원 + 방수커버 {_cover_extra:,}원 = {_typed_cost + _cover_extra:,}원"
+        )
     if has_display:
         if "display_sales_amount" not in st.session_state:
             st.session_state["display_sales_amount"] = "0"
@@ -40983,7 +41148,7 @@ def render_new_sales():
         )
     # 실시간 합산: 최종 총 판매금액, 최종 총 원가, 기본 총 마진
     general_sales = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
-    general_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
+    general_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0")) + int(_cover_extra or 0)
     display_sales_val = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
     display_cost_val = _parse_comma_to_int(st.session_state.get("display_cost_amount", "0")) if has_display else 0
     final_sales = general_sales + display_sales_val
@@ -41248,7 +41413,7 @@ def render_new_sales():
         if not selected_employees:
             st.error("담당 직원(필수)을 1명 이상 선택하세요. KPI·실적 분배에 필요합니다.")
             st.stop()
-        cost_price_int = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
+        cost_price_int = _parse_comma_to_int(st.session_state.get("cost_price", "0")) + int(_cover_extra or 0)
         general_sales_int = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
         display_sales_int = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
         display_cost_int = _parse_comma_to_int(st.session_state.get("display_cost_amount", "0")) if has_display else 0
