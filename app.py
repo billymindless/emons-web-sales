@@ -32829,8 +32829,11 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
 
     ver_key = f"{key_prefix}_files_ver"
     err_key = f"{key_prefix}_att_errs"
+    body_key = f"{key_prefix}_body"
     ver = int(st.session_state.get(ver_key, 0))
     files_key = f"{key_prefix}_files_{ver}"
+    if st.session_state.pop(f"{key_prefix}_clear_body", False):
+        st.session_state.pop(body_key, None)
 
     # 이전 rerun에서 저장된 첨부 에러 표시
     for _prev_err in st.session_state.pop(err_key, []):
@@ -32844,51 +32847,50 @@ def _render_comment_input(tid: int, me_uname: str, parent_cid: int | None, key_p
             key=files_key,
             compact=True,
         )
-
-    with st.form(f"{key_prefix}_form", clear_on_submit=True):
-        with c_body:
-            body = st.text_area(
-                "내용",
-                key=f"{key_prefix}_body",
-                height=68,
-                placeholder="댓글을 입력하세요",
-                label_visibility="collapsed",
+    with c_body:
+        body = st.text_area(
+            "내용",
+            key=body_key,
+            height=68,
+            placeholder="댓글을 입력하세요",
+            label_visibility="collapsed",
+        )
+    with c_go:
+        label = "↪ 답글" if parent_cid else "등록"
+        submitted = st.button(label, type="primary", key=f"{key_prefix}_submit")
+    if submitted:
+        if not (body or "").strip() and not files:
+            st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
+            return
+        new_cid, cm_err = _tb.post_comment(
+            tid, me_uname, body or "(첨부)", parent_comment_id=parent_cid
+        )
+        if cm_err:
+            st.error(f"댓글 등록 실패: {cm_err}")
+            return
+        # 첨부 업로드 — 실패 수집 후 rerun 전에 session_state에 보존
+        att_errors: list[str] = []
+        for f in files or []:
+            try:
+                f.seek(0)
+            except Exception:
+                pass
+            _row, ferr = _tb.attach_file(
+                task_id=tid, comment_id=new_cid,
+                uploaded_file=f, uploaded_by=me_uname,
             )
-        with c_go:
-            label = "↪ 답글" if parent_cid else "등록"
-            submitted = st.form_submit_button(label, type="primary")
-        if submitted:
-            if not (body or "").strip() and not files:
-                st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
-                return
-            new_cid, cm_err = _tb.post_comment(
-                tid, me_uname, body or "(첨부)", parent_comment_id=parent_cid
-            )
-            if cm_err:
-                st.error(f"댓글 등록 실패: {cm_err}")
-                return
-            # 첨부 업로드 — 실패 수집 후 rerun 전에 session_state에 보존
-            att_errors: list[str] = []
-            for f in files or []:
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
-                _row, ferr = _tb.attach_file(
-                    task_id=tid, comment_id=new_cid,
-                    uploaded_file=f, uploaded_by=me_uname,
-                )
-                if ferr:
-                    att_errors.append(f"⚠️ 첨부 실패 [{f.name}]: {ferr}")
-            if att_errors:
-                # rerun 후에도 에러가 보이도록 session_state에 저장
-                st.session_state[err_key] = att_errors
-                st.session_state[ver_key] = ver + 1
-                flash("댓글은 등록됐지만 일부 첨부에 실패했습니다. 자세한 내용은 아래 오류를 확인하세요.")
-            else:
-                st.session_state[ver_key] = ver + 1
-                flash("등록되었습니다.")
-            st.rerun()
+            if ferr:
+                att_errors.append(f"⚠️ 첨부 실패 [{f.name}]: {ferr}")
+        if att_errors:
+            # rerun 후에도 에러가 보이도록 session_state에 저장
+            st.session_state[err_key] = att_errors
+            st.session_state[ver_key] = ver + 1
+            flash("댓글은 등록됐지만 일부 첨부에 실패했습니다. 자세한 내용은 아래 오류를 확인하세요.")
+        else:
+            st.session_state[ver_key] = ver + 1
+            flash("등록되었습니다.")
+        st.session_state[f"{key_prefix}_clear_body"] = True
+        st.rerun()
 
 
 def _pcr_approval_key(method: str, raw: str) -> str:
@@ -34924,8 +34926,11 @@ def _render_post_comment_input(post_id: int, me_uname: str, parent_cid: int | No
 
     ver_key = f"{key_prefix}_files_ver"
     err_key = f"{key_prefix}_att_errs"
+    body_key = f"{key_prefix}_body"
     ver = int(st.session_state.get(ver_key, 0))
     files_key = f"{key_prefix}_files_{ver}"
+    if st.session_state.pop(f"{key_prefix}_clear_body", False):
+        st.session_state.pop(body_key, None)
 
     for _prev_err in st.session_state.pop(err_key, []):
         st.error(_prev_err)
@@ -34938,46 +34943,45 @@ def _render_post_comment_input(post_id: int, me_uname: str, parent_cid: int | No
             key=files_key,
             compact=True,
         )
-
-    with st.form(f"{key_prefix}_form", clear_on_submit=True):
-        with c_body:
-            body = st.text_area(
-                "내용",
-                key=f"{key_prefix}_body",
-                height=68,
-                placeholder="댓글을 입력하세요",
-                label_visibility="collapsed",
+    with c_body:
+        body = st.text_area(
+            "내용",
+            key=body_key,
+            height=68,
+            placeholder="댓글을 입력하세요",
+            label_visibility="collapsed",
+        )
+    with c_go:
+        label = "↪ 답글" if parent_cid else "등록"
+        submitted = st.button(label, type="primary", key=f"{key_prefix}_submit")
+    if submitted:
+        if not (body or "").strip() and not files:
+            st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
+            return
+        new_cid, cm_err = _pb.post_comment(
+            post_id, me_uname, body or "(첨부)", parent_comment_id=parent_cid
+        )
+        if cm_err:
+            st.error(f"댓글 등록 실패: {cm_err}")
+            return
+        att_errors: list[str] = []
+        for f in files or []:
+            try:
+                f.seek(0)
+            except Exception:
+                pass
+            _row, ferr = _pb.attach_file(
+                post_id=post_id, comment_id=new_cid,
+                uploaded_file=f, uploaded_by=me_uname,
             )
-        with c_go:
-            label = "↪ 답글" if parent_cid else "등록"
-            submitted = st.form_submit_button(label, type="primary")
-        if submitted:
-            if not (body or "").strip() and not files:
-                st.error("내용 또는 첨부 중 하나는 입력해 주세요.")
-                return
-            new_cid, cm_err = _pb.post_comment(
-                post_id, me_uname, body or "(첨부)", parent_comment_id=parent_cid
-            )
-            if cm_err:
-                st.error(f"댓글 등록 실패: {cm_err}")
-                return
-            att_errors: list[str] = []
-            for f in files or []:
-                try:
-                    f.seek(0)
-                except Exception:
-                    pass
-                _row, ferr = _pb.attach_file(
-                    post_id=post_id, comment_id=new_cid,
-                    uploaded_file=f, uploaded_by=me_uname,
-                )
-                if ferr:
-                    att_errors.append(f"{f.name}: {ferr}")
-            st.session_state[ver_key] = ver + 1
-            if att_errors:
-                st.session_state[err_key] = ["첨부 실패: " + e for e in att_errors]
-            flash("댓글이 등록되었습니다.")
-            st.rerun()
+            if ferr:
+                att_errors.append(f"{f.name}: {ferr}")
+        st.session_state[ver_key] = ver + 1
+        if att_errors:
+            st.session_state[err_key] = ["첨부 실패: " + e for e in att_errors]
+        st.session_state[f"{key_prefix}_clear_body"] = True
+        flash("댓글이 등록되었습니다.")
+        st.rerun()
 
 
 def _render_post_card(post: dict, me_uname: str, role: str):
