@@ -38160,6 +38160,7 @@ def _render_ext_pay_manual_and_erp_only(
 
 
 _WATERPROOF_COVER_DEFAULTS: list[dict] = [
+    {"code": "none", "label": "증정안함", "amount": 0, "sort_order": 0, "kind": "none"},
     {"code": "s", "label": "S", "amount": 7700, "sort_order": 1, "kind": "size"},
     {"code": "ss", "label": "SS", "amount": 8030, "sort_order": 2, "kind": "size"},
     {"code": "w1200", "label": "1200/1300", "amount": 8800, "sort_order": 3, "kind": "size"},
@@ -38254,6 +38255,9 @@ def _render_waterproof_cover_admin(me_uname: str) -> None:
     st.caption("금액만 바꿉니다. 저장하면 전 매장 신규 매출에 적용됩니다. 표가 없으면 사진의 기본 금액을 씁니다.")
     edited: dict[str, int] = {}
     for row in rows:
+        # '증정안함'은 원가가 항상 0원이어야 하므로 편집 UI에서 제외한다.
+        if row.get("kind") == "none":
+            continue
         edited[row["code"]] = int(st.number_input(
             f"{row['label']} (원)",
             min_value=0,
@@ -41323,7 +41327,7 @@ def render_new_sales():
     _bed_selected = bool({"침대", "SSDS침대"} & set(selected_categories or []))
     if _bed_selected:
         _cover_rows = _load_waterproof_cover_prices()
-        _size_rows = [row for row in _cover_rows if row.get("kind") == "size"]
+        _size_rows = [row for row in _cover_rows if row.get("kind") in ("size", "none")]
         _size_codes = [""] + [str(row["code"]) for row in _size_rows]
 
         def _cover_size_label(code: str) -> str:
@@ -41332,6 +41336,8 @@ def render_new_sales():
             row = next((item for item in _size_rows if str(item["code"]) == code), None)
             if not row:
                 return code
+            if row.get("kind") == "none":
+                return str(row["label"])
             return f"{row['label']} ({int(row['amount']):,}원)"
 
         _size_code = st.selectbox(

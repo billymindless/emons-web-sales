@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS app_waterproof_cover_prices (
 
 INSERT INTO app_waterproof_cover_prices (code, label, amount, sort_order, kind)
 VALUES
+    ('none',  '증정안함',     0,     0, 'none'),
     ('s',     'S',            7700,  1, 'size'),
     ('ss',    'SS',           8030,  2, 'size'),
     ('w1200', '1200/1300',    8800,  3, 'size'),
@@ -21,6 +22,11 @@ VALUES
     ('lk',    'LK 1800*2000', 10450, 6, 'size'),
     ('kk',    'KK 1800*2100', 12100, 7, 'size')
 ON CONFLICT (code) DO NOTHING;
+
+-- '증정안함' 금액은 항상 0 이어야 한다. 과거 저장분이 있다면 바로잡는다.
+UPDATE app_waterproof_cover_prices
+   SET amount = 0, kind = 'none', sort_order = 0, label = '증정안함'
+ WHERE code = 'none';
 
 DELETE FROM app_waterproof_cover_prices WHERE code IN ('liner', 'pad');
 
