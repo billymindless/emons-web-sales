@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>contract_capture</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", "맑은 고딕", sans-serif;
+    color: #1f2937;
+  }
+  button, label.btn {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0 0 8px 0;
+    padding: 12px 14px;
+    border: 0;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 650;
+    text-align: center;
+    cursor: pointer;
+  }
+  button.cam, label.cam { background: #111827; color: #fff; }
+  button.gal, label.gal { background: #e5e7eb; color: #111827; }
+  button.upload { background: #b45309; color: #fff; }
+  button.upload:disabled, button.cam:disabled { opacity: 0.55; cursor: default; }
+  button.drop {
+    width: auto;
+    margin: 4px 0 0 0;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    background: #fee2e2;
+    color: #991b1b;
+  }
+  #hint, #status { font-size: 13px; line-height: 1.45; color: #4b5563; margin: 0 0 8px 0; }
+  #status.err { color: #b3261e; }
+  #status.ok { color: #166534; }
+  #grid { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 8px 0; }
+  .card { width: 96px; }
+  .card img { width: 96px; height: 128px; object-fit: cover; border-radius: 6px; background: #f3f4f6; display: block; }
+  input[type="file"] { display: none; }
+</style>
+</head>
+<body>
+<p id="hint">찍은 사진이 여기에 남습니다. 여러 장 찍은 뒤 업로드를 누르세요.</p>
+<button type="button" class="cam" id="camBtn">계약서 찍기</button>
+<input id="cam" type="file" accept="image/*" capture="environment">
+<label class="gal" for="gal">갤러리에서 고르기</label>
+<input id="gal" type="file" accept="image/*" multiple>
+<p id="status"></p>
+<div id="grid"></div>
+<button type="button" class="upload" id="upBtn" hidden>업로드</button>
+<script>
+(function () {
+  var LONG_SIDE = 3508;
+  var MAX_BYTES = 2 * 1024 * 1024;
+  var DB_NAME = "emons_contract_capture";
+  var STORE = "shots";
+  var customerId = "";
+  var maxCount = 10;
+  var shots = [];
+  var uploading = false;
+  var lastSentId = "";
+  var handledAck = "";
+  var urls = [];
+
+  var hint = document.getElementById("hint");
+  var status = document.getElementById("status");
+  var grid = document.getElementById("grid");
+  var camBtn = document.getElementById("camBtn");
+  var cam = document.getElementById("cam");
+  var gal = document.getElementById("gal");
+  var upBtn = document.getElementById("upBtn");
+
+  function post(type, data) {
+    var msg = Object.assign({ isStreamlitMessage: true, type: type }, data || {});
+    try { window.parent.postMessage(msg, "*"); } catch (e) {}
+  }
+  function sendReady() { post("streamlit:componentReady", { apiVersion: 1 }); }
+  function sendHeight() {
+    var h = Math.max(160, document.body.scrollHeight + 12);
+    post("streamlit:setFrameHeight", { height: h });
+  }
+  function sendValue(v) {
+    post("streamlit:setComponentValue", { value: v, dataType: "json" });
+  }
+  function setStatus(text, cls) {
+    status.textContent = text || "";
+    status.className = cls || "";
+    sendHeight();
+  }
+
+  function openDb() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains(STORE)) {
+          var os = db.createObjectStore(STORE, { keyPath: "id" });
+          os.createIndex("by_customer", "customer_id", { unique: false });
+        }
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error || new Error("indexedDB")); };
+    });
+  }
+
+  function idbGetAll(cid) {
+    return openDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(STORE, "readonly");
+        var idx = tx.objectStore(STORE).index("by_customer");
+        var req = idx.getAll(String(cid));
+        req.onsuccess = function () { resolve(req.result || []); };
+        req.onerror = function () { reject(req.error); };
+      });
+    });
+  }
+
+  function idbPut(row) {
+    return openDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(STORE, "readwrite");
+        tx.objectStore(STORE).put(row);
+        tx.oncomplete = function () { resolve(); };
+        tx.onerror = function () { reject(tx.error); };
+      });
+    });
+  }
+
+  function idbDelete(id) {
+    return openDb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(STORE, "readwrite");
+        tx.objectStore(STORE).delete(id);
+        tx.oncomplete = function () { resolve(); };
+        tx.onerror = function () { reject(tx.error); };
+      });
+    });
+  }
+
+  function blobToBase64(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () {
+        var s = String(reader.result || "");
+        var i = s.indexOf(",");
+        resolve(i >= 0 ? s.slice(i + 1) : "");
+      };
+      reader.onerror = function () { reject(reader.error); };
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function canvasToJpeg(canvas, quality) {
+    return new Promise(function (resolve) {
+      canvas.toBlob(function (blob) { resolve(blob); }, "image/jpeg", quality);
+    });
+  }
+
+  function fileToJpeg(file) {
+    if (!file || !file.size) return Promise.resolve(null);
+    var bitmapPromise;
+    try {
+      bitmapPromise = createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch (e) {
+      bitmapPromise = createImageBitmap(file);
+    }
+    return bitmapPromise.then(function (bmp) {
+      var src = document.createElement("canvas");
+      var sctx = src.getContext("2d");
+      var w = bmp.width;
+      var h = bmp.height;
+      if (w > h) {
+        src.width = h;
+        src.height = w;
+        sctx.translate(h, 0);
+        sctx.rotate(Math.PI / 2);
+        sctx.drawImage(bmp, 0, 0);
+      } else {
+        src.width = w;
+        src.height = h;
+        sctx.drawImage(bmp, 0, 0);
+      }
+      bmp.close && bmp.close();
+      var sw = src.width;
+      var sh = src.height;
+      if (sh > LONG_SIDE) {
+        var scale = LONG_SIDE / sh;
+        var dw = Math.max(1, Math.round(sw * scale));
+        var scaled = document.createElement("canvas");
+        scaled.width = dw;
+        scaled.height = LONG_SIDE;
+        scaled.getContext("2d").drawImage(src, 0, 0, dw, LONG_SIDE);
+        src = scaled;
+      }
+      return canvasToJpeg(src, 0.85).then(function (blob) {
+        if (blob && blob.size > MAX_BYTES) return canvasToJpeg(src, 0.75);
+        return blob;
+      });
+    }).catch(function () { return null; });
+  }
+
+  function render() {
+    urls.forEach(function (u) { try { URL.revokeObjectURL(u); } catch (e) {} });
+    urls = [];
+    grid.innerHTML = "";
+    shots.forEach(function (shot) {
+      var card = document.createElement("div");
+      card.className = "card";
+      var img = document.createElement("img");
+      var url = URL.createObjectURL(shot.blob);
+      urls.push(url);
+      img.src = url;
+      img.alt = "계약서";
+      var drop = document.createElement("button");
+      drop.type = "button";
+      drop.className = "drop";
+      drop.textContent = "빼기";
+      drop.disabled = uploading;
+      drop.addEventListener("click", function () {
+        if (uploading) return;
+        idbDelete(shot.id).then(loadShots).catch(function () {
+          setStatus("사진을 빼지 못했습니다.", "err");
+        });
+      });
+      card.appendChild(img);
+      card.appendChild(drop);
+      grid.appendChild(card);
+    });
+    if (shots.length) {
+      upBtn.hidden = false;
+      upBtn.disabled = uploading;
+      upBtn.textContent = uploading ? "업로드 중..." : (shots.length + "장 업로드");
+      hint.textContent = "대기 " + shots.length + "장 · 최대 " + maxCount + "장. 업로드를 누르면 한 번에 저장됩니다.";
+    } else {
+      upBtn.hidden = true;
+      hint.textContent = "찍은 사진이 여기에 남습니다. 여러 장 찍은 뒤 업로드를 누르세요.";
+    }
+    camBtn.disabled = uploading || shots.length >= maxCount;
+    sendHeight();
+  }
+
+  function loadShots() {
+    if (!customerId) {
+      shots = [];
+      render();
+      return Promise.resolve();
+    }
+    return idbGetAll(customerId).then(function (rows) {
+      rows.sort(function (a, b) { return (a.created || 0) - (b.created || 0); });
+      shots = rows.map(function (row) {
+        return { id: row.id, blob: row.blob, created: row.created };
+      });
+      render();
+    }).catch(function () {
+      setStatus("찍어 둔 사진을 열지 못했습니다. 브라우저 저장소를 확인해 주세요.", "err");
+    });
+  }
+
+  function addFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length || !customerId || uploading) return;
+    var chain = Promise.resolve();
+    files.forEach(function (file) {
+      chain = chain.then(function () {
+        if (!file || !file.size) {
+          setStatus("빈 사진이라 넣지 않았습니다.", "err");
+          return;
+        }
+        if (shots.length >= maxCount) {
+          setStatus("한 번에 10장까지 모을 수 있습니다.", "err");
+          return;
+        }
+        return fileToJpeg(file).then(function (blob) {
+          if (!blob || !blob.size) {
+            setStatus("사진을 읽지 못했습니다. 다시 찍어 주세요.", "err");
+            return;
+          }
+          var row = {
+            id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+            customer_id: String(customerId),
+            created: Date.now(),
+            blob: blob
+          };
+          return idbPut(row).then(loadShots).then(function () {
+            setStatus("", "");
+          });
+        });
+      });
+    });
+    chain.catch(function () {
+      setStatus("사진을 보관하지 못했습니다.", "err");
+    });
+  }
+
+  function sendNext() {
+    if (!shots.length) {
+      uploading = false;
+      render();
+      return;
+    }
+    var shot = shots[0];
+    lastSentId = shot.id;
+    handledAck = "";
+    blobToBase64(shot.blob).then(function (b64) {
+      if (!b64) {
+        uploading = false;
+        setStatus("빈 사진이라 올리지 않았습니다.", "err");
+        render();
+        return;
+      }
+      sendValue({
+        action: "save",
+        shot_id: shot.id,
+        jpeg_b64: b64,
+        remaining_after: Math.max(0, shots.length - 1),
+        nonce: Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+      });
+      setStatus("업로드 중... " + shots.length + "장 남음", "");
+    }).catch(function () {
+      uploading = false;
+      setStatus("사진을 보내지 못했습니다.", "err");
+      render();
+    });
+  }
+
+  camBtn.addEventListener("click", function () {
+    if (uploading || shots.length >= maxCount) return;
+    cam.value = "";
+    cam.click();
+  });
+  cam.addEventListener("change", function () {
+    addFiles(cam.files);
+    cam.value = "";
+  });
+  gal.addEventListener("change", function () {
+    addFiles(gal.files);
+    gal.value = "";
+  });
+  upBtn.addEventListener("click", function () {
+    if (uploading || !shots.length) return;
+    uploading = true;
+    setStatus("", "");
+    render();
+    sendNext();
+  });
+
+  window.addEventListener("message", function (event) {
+    var data = event.data || {};
+    if (data.type !== "streamlit:render") return;
+    var args = data.args || {};
+    var nextId = String(args.customer_id || "");
+    maxCount = parseInt(args.max_count, 10) || 10;
+    var switched = nextId !== customerId;
+    customerId = nextId;
+    var acked = String(args.acked_id || "");
+    var error = String(args.error || "");
+    if (switched) {
+      uploading = false;
+      lastSentId = "";
+      handledAck = "";
+      loadShots();
+      return;
+    }
+    if (error && lastSentId && handledAck !== "err:" + lastSentId) {
+      handledAck = "err:" + lastSentId;
+      uploading = false;
+      lastSentId = "";
+      setStatus(error, "err");
+      render();
+      return;
+    }
+    if (acked && acked === lastSentId && handledAck !== acked) {
+      handledAck = acked;
+      idbDelete(acked).then(function () {
+        lastSentId = "";
+        return loadShots();
+      }).then(function () {
+        if (uploading && shots.length) sendNext();
+        else {
+          uploading = false;
+          if (!shots.length) setStatus("업로드가 끝났습니다.", "ok");
+          render();
+        }
+      }).catch(function () {
+        uploading = false;
+        setStatus("올린 사진을 목록에서 빼지 못했습니다.", "err");
+      });
+      return;
+    }
+    if (!shots.length) loadShots();
+    else sendHeight();
+  });
+
+  sendReady();
+  sendHeight();
+  setTimeout(sendHeight, 200);
+})();
+</script>
+</body>
+</html>

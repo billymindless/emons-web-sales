@@ -32517,6 +32517,17 @@ try:
 except Exception:
     _clipboard_paste_component = None
 
+_CONTRACT_CAPTURE_COMPONENT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "components", "contract_capture"
+)
+try:
+    _contract_capture_component = components.declare_component(
+        "emons_contract_capture",
+        path=_CONTRACT_CAPTURE_COMPONENT_DIR,
+    )
+except Exception:
+    _contract_capture_component = None
+
 
 class _PastedUpload:
     """Streamlit UploadedFile 호환 인터페이스. task_board.attach_file / _is_image_upload / _render_upload_preview 에서 그대로 사용 가능."""
@@ -44460,147 +44471,71 @@ def _render_mobile_contract_capture(db_filename: str, customer_id: int, user, em
         unsafe_allow_html=True,
     )
 
-    # 카메라는 셔터 한 번당 즉시 저장. 갤럭시는 카메라 앱이 열리면 브라우저 세션이
-    # 리셋될 수 있어 대기 목록이 사라지기 때문이다. 갤러리는 한 번에 여러 장을 모아 업로드.
-    _MCT_BATCH_MAX = 10
-    pending_key = f"_mct_pending_{int(customer_id)}"
-    pending: list[bytes] = st.session_state.setdefault(pending_key, [])
-    seq = int(st.session_state.get("_mct_shot_seq", 0))
-    _batch_warn = st.session_state.pop("_mct_batch_warn", None)
-    if _batch_warn:
-        st.error(_batch_warn)
-
-    def _take_bytes(uploaded) -> bytes:
-        try:
-            return uploaded.getvalue()
-        except Exception:
-            return uploaded.read() if hasattr(uploaded, "read") else b""
-
-    st.caption("찍으면 바로 저장됩니다. 이어서 찍으세요.")
-    shot = st.file_uploader(
-        "계약서 찍기",
-        type=["jpg", "jpeg", "png", "webp", "heic"],
-        key=f"mct_cam_{int(customer_id)}_{seq}",
-    )
-    components.html(
-        """
-        <script>
-        (function () {
-          function tag() {
-            var doc = window.parent.document;
-            var boxes = doc.querySelectorAll('[data-testid="stFileUploader"]');
-            if (!boxes.length) return;
-            var input = boxes[0].querySelector('input[type="file"]');
-            if (!input) return;
-            input.setAttribute('accept', 'image/*');
-            input.setAttribute('capture', 'environment');
-            var btn = boxes[0].querySelector('button');
-            if (btn) btn.textContent = '계약서 찍기';
-          }
-          tag();
-          setTimeout(tag, 400);
-          setTimeout(tag, 1200);
-        })();
-        </script>
-        """,
-        height=0,
-    )
-
-    with st.expander("갤러리에서 올리기", expanded=False):
-        gallery = st.file_uploader(
-            "갤러리 사진 선택",
-            type=["jpg", "jpeg", "png", "webp", "heic"],
-            accept_multiple_files=True,
-            key=f"mct_up_{int(customer_id)}_{seq}",
-            label_visibility="collapsed",
+    # 셔터는 브라우저에만 쌓는다. 업로드 버튼을 눌렀을 때만 서버에 저장한다.
+    # 갤럭시는 카메라 앱이 세션을 끊으므로 대기 장은 IndexedDB 에 둔다.
+    _cid = int(customer_id)
+    _ack_key = f"_mct_cap_ack_{_cid}"
+    _err_key = f"_mct_cap_err_{_cid}"
+    _nonce_key = f"_mct_cap_nonce_{_cid}"
+    if _contract_capture_component is None:
+        st.error("촬영 화면을 불러오지 못했습니다.")
+    else:
+        _payload = _contract_capture_component(
+            customer_id=_cid,
+            acked_id=str(st.session_state.get(_ack_key) or ""),
+            error=str(st.session_state.get(_err_key) or ""),
+            max_count=10,
+            key=f"mct_capture_{_cid}",
         )
-
-    absorbed = False
-    # 카메라 셔터 1장은 바로 저장한다. 갤럭시 세션 리셋에도 그 장이 서버에 남는다.
-    if shot is not None:
-        blob = _take_bytes(shot)
-        if blob:
-            actor = _contract_actor(user)
-            with st.spinner("저장 중..."):
-                _row, err = ccs.save_contract_page(
-                    db_filename=db_filename,
-                    customer_id=int(customer_id),
-                    raw_image=blob,
-                    uploaded_by=actor,
-                )
-            if err:
-                # 저장 실패 시 세션 대기 목록으로 보존해 재시도 가능하게 한다.
-                if len(pending) < _MCT_BATCH_MAX:
-                    pending.append(blob)
-                st.error(f"저장 실패: {err}")
-            else:
+        if isinstance(_payload, dict) and _payload.get("action") == "save":
+            _nonce = str(_payload.get("nonce") or "")
+            _shot_id = str(_payload.get("shot_id") or "")
+            if _nonce and _shot_id and _nonce != st.session_state.get(_nonce_key):
+                st.session_state[_nonce_key] = _nonce
                 try:
-                    saved_pages = ccs.list_pages(db_filename, int(customer_id))
-                    _total = len(saved_pages)
-                except Exception:
-                    _total = len(pages) + 1
-                st.session_state["_mct_done"] = {"name": cust_name, "page": _total}
-        absorbed = True
-    if gallery:
-        files = list(gallery)
-        if len(pending) + len(files) > _MCT_BATCH_MAX:
-            st.session_state["_mct_batch_warn"] = "한 번에 10장까지 올릴 수 있습니다."
-        else:
-            for f in files:
-                blob = _take_bytes(f)
-                if blob:
-                    pending.append(blob)
-        absorbed = True
-    if absorbed:
-        st.session_state["_mct_shot_seq"] = seq + 1
-        st.rerun()
-
-    if pending:
-        st.caption(f"올릴 사진 {len(pending)}장 · 최대 {_MCT_BATCH_MAX}장")
-        per_row = 5
-        for start in range(0, len(pending), per_row):
-            chunk = pending[start:start + per_row]
-            cols = st.columns(per_row)
-            for i, blob in enumerate(chunk):
-                idx = start + i
-                with cols[i]:
-                    st.image(blob, width=120)
-                    if st.button("빼기", key=f"mct_drop_{int(customer_id)}_{idx}", width="stretch"):
-                        pending.pop(idx)
-                        st.rerun()
-        if st.button(
-            f"{len(pending)}장 업로드",
-            key=f"mct_upload_{int(customer_id)}_{seq}",
-            type="primary",
-            width="stretch",
-        ):
-            ok = 0
-            remain: list[bytes] = []
-            actor = _contract_actor(user)
-            with st.spinner("업로드 중..."):
-                for blob in list(pending):
-                    _row, err = ccs.save_contract_page(
-                        db_filename=db_filename,
-                        customer_id=int(customer_id),
-                        raw_image=blob,
-                        uploaded_by=actor,
-                        rebuild=False,
-                    )
+                    _raw = base64.b64decode(str(_payload.get("jpeg_b64") or ""))
+                except Exception as _dec_e:
+                    _raw = b""
+                    logger.warning("계약서 촬영 디코드 실패: %s", _dec_e)
+                if not _raw:
+                    st.session_state[_err_key] = "빈 사진이라 올리지 않았습니다."
+                    st.session_state[_ack_key] = ""
+                else:
+                    actor = _contract_actor(user)
+                    with st.spinner("업로드 중..."):
+                        _row, err = ccs.save_contract_page(
+                            db_filename=db_filename,
+                            customer_id=_cid,
+                            raw_image=_raw,
+                            uploaded_by=actor,
+                            rebuild=False,
+                        )
                     if err:
-                        remain.append(blob)
-                        st.error(f"업로드 실패: {err}")
+                        st.session_state[_err_key] = f"업로드 실패: {err}"
+                        st.session_state[_ack_key] = ""
+                        try:
+                            ccs.rebuild_pdf(db_filename, _cid)
+                        except Exception as _pdf_e:
+                            logger.warning("업로드 실패 후 PDF 재생성 실패: %s", _pdf_e)
                     else:
-                        ok += 1
-                if ok:
-                    try:
-                        ccs.rebuild_pdf(db_filename, int(customer_id))
-                    except Exception as _pdf_e:
-                        logger.warning("일괄 업로드 후 PDF 재생성 실패: %s", _pdf_e)
-            st.session_state[pending_key] = remain
-            if ok:
-                st.session_state["_mct_done"] = {"name": cust_name, "page": ok}
-            st.session_state["_mct_shot_seq"] = seq + 1
-            st.rerun()
+                        st.session_state[_err_key] = ""
+                        st.session_state[_ack_key] = _shot_id
+                        try:
+                            _remain = int(_payload.get("remaining_after") or 0)
+                        except (TypeError, ValueError):
+                            _remain = 0
+                        if _remain <= 0:
+                            try:
+                                ccs.rebuild_pdf(db_filename, _cid)
+                            except Exception as _pdf_e:
+                                logger.warning("일괄 업로드 후 PDF 재생성 실패: %s", _pdf_e)
+                            try:
+                                _total = len(ccs.list_pages(db_filename, _cid))
+                            except Exception as _list_e:
+                                logger.warning("계약서 장수 조회 실패: %s", _list_e)
+                                _total = len(pages) + 1
+                            st.session_state["_mct_done"] = {"name": cust_name, "page": _total}
+                st.rerun()
 
     st.divider()
     # 끝내기 / 다른 고객 — embedded 는 사이드바로 이동 가능하므로 '끝내기' 숨김
