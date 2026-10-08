@@ -33075,6 +33075,100 @@ def _pcr_assignee_options(store_id, role: str, exclude_uname: str) -> list[tuple
     return [(u, lbl) for u, lbl in emp_options if u and u != exclude_uname]
 
 
+def _inject_pcr_entry_css() -> None:
+    """결제변경 폼 스타일. fragment 밖에 두어 수단 변경 때 다시 보내지 않는다."""
+    st.markdown(
+        """
+        <style>
+        .pcr-slack-title {
+            font-size: 1.35rem; font-weight: 700; color: #1D1C1D;
+            margin: 0 0 0.35rem 0; letter-spacing: -0.02em;
+        }
+        .pcr-slack-desc {
+            background: #E8F4FD; border: 1px solid #B8D4EE;
+            border-radius: 8px; padding: 14px 16px;
+            min-height: 240px; line-height: 1.65; font-size: 0.95rem;
+            color: #1D1C1D; white-space: pre-wrap;
+        }
+        .pcr-slack-desc b { color: #1264A3; font-weight: 600; }
+        textarea[aria-label="변경 사유 *"] {
+            min-height: 280px !important;
+            background: #E8F4FD !important;
+            border: 1px solid #B8D4EE !important;
+            border-radius: 8px !important;
+            font-size: 15px !important;
+            line-height: 1.6 !important;
+            padding: 12px 14px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _pcr_fill_verify_badges(db_filename: str, order_id: int, pids) -> None:
+    """검증 뱃지를 세션에 채운다. 빠진 결제만 bulk 조회 1회로 읽는다."""
+    cache = st.session_state.setdefault(f"pcr_vbadge_{order_id}", {})
+    missing: list[int] = []
+    seen: set[int] = set()
+    for pid in pids or []:
+        try:
+            pid_i = int(pid) if pid not in (None, "", "신규생성(상계처리)") else None
+        except (TypeError, ValueError):
+            pid_i = None
+        if not pid_i or pid_i in cache or pid_i in seen:
+            continue
+        seen.add(pid_i)
+        missing.append(pid_i)
+    if not missing:
+        return
+    found = _pcr_bulk_verify(db_filename, tuple(missing))
+    for pid_i in missing:
+        verified, src = found.get(pid_i, (False, ""))
+        if verified and src:
+            cache[pid_i] = f"✅ 검증됨 ({src})"
+        elif verified:
+            cache[pid_i] = "✅ 검증됨"
+        else:
+            cache[pid_i] = "❌ 미검증"
+
+
+def _pcr_collect_evidence_files(order_id: int) -> list:
+    """증빙 fragment가 세션에 담아 둔 첨부. 업로더를 다시 그리지 않고 읽는다."""
+    if not st.session_state.get(f"pcr_evidence_open_{order_id}"):
+        return []
+    ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0) or 0)
+    key = f"pcr_files_{order_id}_{ver}"
+    uploaded = st.session_state.get(f"{key}__upload")
+    pasted = list(st.session_state.get(f"{key}__pasted_list") or [])
+    if uploaded is None:
+        uploaded_list: list = []
+    elif isinstance(uploaded, list):
+        uploaded_list = list(uploaded)
+    else:
+        uploaded_list = [uploaded]
+    return uploaded_list + pasted
+
+
+@st.fragment
+def _render_pcr_evidence_fragment(order_id: int) -> None:
+    """증빙 첨부. 결제 입력 fragment와 형제로 두어 수단 변경 때 클립보드를 다시 만들지 않는다."""
+    if not st.session_state.get(f"pcr_open_{order_id}"):
+        return
+    ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0) or 0)
+    ev_open_key = f"pcr_evidence_open_{order_id}"
+    if not st.session_state.get(ev_open_key):
+        if st.button("증빙 첨부", key=f"pcr_ev_open_{order_id}"):
+            st.session_state[ev_open_key] = True
+    if st.session_state.get(ev_open_key):
+        files = _file_input_with_paste(
+            "📎 증빙 사진/파일 첨부 (선택)",
+            accept_multiple_files=True,
+            key=f"pcr_files_{order_id}_{ver}",
+        )
+        _render_upload_preview(files)
+
+
 @st.fragment
 def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                                         customer_name: str, pay_list):
@@ -33082,13 +33176,11 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
     기존 결제 저장/상계 로직과 완전히 분리. 결제는 이미 매출관리에서 즉시 반영된 상태이고,
     여기서는 사후 검증용 사내 업무 태스크만 생성한다.
 
-    Phase D-1: @st.fragment 로 감싸 폼 내 위젯 조작(결제 라인 추가, selectbox, radio 등) 시
-    매출관리 페이지 전체가 rerun 되지 않고 이 폼만 다시 그려지도록 한다.
+    열기 버튼만 이 fragment에 둔다. 입력 칸과 증빙은 각각 자식 fragment라
+    수단·금액 변경은 증빙 클립보드를 다시 만들지 않는다.
     최종 '결제 상신' 성공 후에는 상위 매출 목록/결제 내역 갱신을 위해 st.rerun() 을
     호출해 전체 앱을 rerun 시킨다 (fragment 내부의 plain st.rerun() 은 전체 앱 rerun).
     """
-    import task_board as _tb  # noqa: WPS433
-
     toggle_key = f"pcr_open_{order_id}"
     if st.button("💳 결제변경/환불요청", key=f"pcr_btn_{order_id}",
                  help="결제변경 내역을 사내 업무로 올려 관리자/담당자가 증빙을 검증합니다."):
@@ -33130,6 +33222,16 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         st.session_state.pop(f"pcr_evidence_open_{order_id}", None)
         st.session_state[f"pcr_new_count_{order_id}"] = 1
 
+    _render_pcr_editor_fragment(db_filename, order_id, customer_name, pay_list)
+    _render_pcr_evidence_fragment(order_id)
+
+
+@st.fragment
+def _render_pcr_editor_fragment(db_filename: str, order_id: int,
+                                customer_name: str, pay_list):
+    """결제변경 입력·요청 버튼. 증빙 업로더와 분리되어 있다."""
+    import task_board as _tb  # noqa: WPS433
+
     me_uname = _current_username()
     store_name = _get_current_store_name_for_customers(db_filename)
     cur_user = st.session_state.get("current_user") or {}
@@ -33153,31 +33255,7 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
 
     with st.container(border=True):
         st.markdown(
-            """
-            <style>
-            .pcr-slack-title {
-                font-size: 1.35rem; font-weight: 700; color: #1D1C1D;
-                margin: 0 0 0.35rem 0; letter-spacing: -0.02em;
-            }
-            .pcr-slack-desc {
-                background: #E8F4FD; border: 1px solid #B8D4EE;
-                border-radius: 8px; padding: 14px 16px;
-                min-height: 240px; line-height: 1.65; font-size: 0.95rem;
-                color: #1D1C1D; white-space: pre-wrap;
-            }
-            .pcr-slack-desc b { color: #1264A3; font-weight: 600; }
-            textarea[aria-label="변경 사유 *"] {
-                min-height: 280px !important;
-                background: #E8F4FD !important;
-                border: 1px solid #B8D4EE !important;
-                border-radius: 8px !important;
-                font-size: 15px !important;
-                line-height: 1.6 !important;
-                padding: 12px 14px !important;
-            }
-            </style>
-            <div class="pcr-slack-title">결제변경 검증 요청</div>
-            """,
+            "<div class='pcr-slack-title'>결제변경 검증 요청</div>",
             unsafe_allow_html=True,
         )
 
@@ -33264,11 +33342,18 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                 return "❌ 미검증"
             _badge_cache = st.session_state.setdefault(f"pcr_vbadge_{order_id}", {})
             if pid_i not in _badge_cache:
-                _v, _src = _pcr_check_external_verification(db_filename, pid_i)
-                _badge_cache[pid_i] = (
-                    f"✅ 검증됨 ({_src})" if _v and _src else ("✅ 검증됨" if _v else "❌ 미검증")
-                )
-            return _badge_cache[pid_i]
+                _pcr_fill_verify_badges(db_filename, order_id, [pid_i])
+            return _badge_cache.get(pid_i, "❌ 미검증")
+
+        _pcr_fill_verify_badges(
+            db_filename,
+            order_id,
+            [
+                sel_pid,
+                _hist_orig.get("payment_id"),
+                (_hist_new or {}).get("payment_id"),
+            ],
+        )
 
         # 원래 결제내역 + 변경 내용 + 미검증/검증 (Slack 본문 박스)
         _desc_lines: list[str] = []
@@ -33640,21 +33725,6 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         key=f"pcr_orig_onnuri_{order_id}",
                     )
 
-            # 증빙은 버튼을 누른 뒤에만 그린다. 수단 변경 때마다 클립보드 컴포넌트를 만들지 않는다.
-            ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0))
-            files = []
-            _ev_open_key = f"pcr_evidence_open_{order_id}"
-            if not st.session_state.get(_ev_open_key):
-                if st.button("증빙 첨부", key=f"pcr_ev_open_{order_id}"):
-                    st.session_state[_ev_open_key] = True
-            if st.session_state.get(_ev_open_key):
-                files = _file_input_with_paste(
-                    "📎 증빙 사진/파일 첨부 (선택)",
-                    accept_multiple_files=True,
-                    key=f"pcr_files_{order_id}_{ver}",
-                )
-                _render_upload_preview(files)
-
         dup_errs = _pcr_duplicate_approval_errors(pay_list, new_lines)
         for _de in dup_errs:
             st.error(_de)
@@ -33925,7 +33995,9 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
                         # 결제 도메인 캐시만 무효화 — 매장/직원/고객 캐시는 유지해 재렌더 가속.
                         _invalidate_payments()
 
-                    # 증빙 첨부 업로드
+                    # 증빙 첨부 업로드 (업로더는 형제 fragment. 세션에 담긴 파일만 읽는다.)
+                    files = _pcr_collect_evidence_files(order_id)
+                    ver = int(st.session_state.get(f"pcr_files_ver_{order_id}", 0) or 0)
                     att_errors = []
                     for f in files or []:
                         try:
@@ -46007,6 +46079,7 @@ def render_customer_balance():
                                             st.caption("👆 결제 수정·결제변경 요청은 위 '수정할 주문 선택'에서 이 주문을 고르면 표시됩니다.")
                                         else:
                                             # 사내 결제변경 검증 요청 (격리된 기능 — 기존 결제 저장 로직과 무관)
+                                            _inject_pcr_entry_css()
                                             _render_payment_change_verify_entry(
                                                 db_filename, int(_order_id_pay),
                                                 customer_name_for_receipt, pay_list,
