@@ -9020,9 +9020,9 @@ def _ext_pay_is_ledger_method(method: str) -> bool:
     return ("온누리" in meth) and ("지류" not in meth)
 
 
-def _ext_pay_matched_payment_ids(db_filename: str, payment_ids: list[int]) -> set[int]:
-    """원장과 연결된 결제 ID. 금액일치·수동·분할·모모 취소 완료만 매칭 완료다."""
-    out: set[int] = set()
+def _ext_pay_match_sources(db_filename: str, payment_ids: list[int]) -> dict[int, str]:
+    """직접 매칭된 결제 id → 출처. 결제 id 컬럼만 보고, 노트 안 분할 id는 읽지 않는다."""
+    out: dict[int, str] = {}
     if not db_filename or not payment_ids:
         return out
     sc, err = get_supabase_client()
@@ -9041,7 +9041,7 @@ def _ext_pay_matched_payment_ids(db_filename: str, payment_ids: list[int]) -> se
         for chunk in (pids[i : i + 200] for i in range(0, len(pids), 200)):
             r = (
                 sc.table("app_external_pay_matches")
-                .select("payment_id, result_code")
+                .select("payment_id, result_code, source")
                 .eq("db_filename", db_filename)
                 .in_("payment_id", chunk)
                 .execute()
@@ -9050,13 +9050,21 @@ def _ext_pay_matched_payment_ids(db_filename: str, payment_ids: list[int]) -> se
                 if str(row.get("result_code") or "") not in _EXT_PAY_CONFIRMED_MATCH_CODES:
                     continue
                 try:
-                    out.add(int(row.get("payment_id")))
+                    pid_i = int(row.get("payment_id"))
                 except (TypeError, ValueError):
                     continue
+                src = str(row.get("source") or "").strip()
+                if pid_i not in out or (src and not out[pid_i]):
+                    out[pid_i] = src
     except Exception as e:
         st.warning(f"매칭 상태 조회 실패: {e}")
         return out
     return out
+
+
+def _ext_pay_matched_payment_ids(db_filename: str, payment_ids: list[int]) -> set[int]:
+    """원장과 연결된 결제 ID. 금액일치·수동·분할·모모 취소 완료만 매칭 완료다."""
+    return set(_ext_pay_match_sources(db_filename, payment_ids))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -33106,31 +33114,45 @@ def _inject_pcr_entry_css() -> None:
     )
 
 
-def _pcr_fill_verify_badges(db_filename: str, order_id: int, pids) -> None:
-    """검증 뱃지를 세션에 채운다. 빠진 결제만 bulk 조회 1회로 읽는다."""
+def _pcr_fill_verify_badges(order_id: int, pids, match_sources: dict | None) -> None:
+    """검증 뱃지를 결제 표의 직접 매칭 결과로 채운다. 추가 조회는 하지 않는다."""
     cache = st.session_state.setdefault(f"pcr_vbadge_{order_id}", {})
-    missing: list[int] = []
-    seen: set[int] = set()
+    sources = match_sources or {}
     for pid in pids or []:
         try:
             pid_i = int(pid) if pid not in (None, "", "신규생성(상계처리)") else None
         except (TypeError, ValueError):
             pid_i = None
-        if not pid_i or pid_i in cache or pid_i in seen:
+        if not pid_i or pid_i in cache:
             continue
-        seen.add(pid_i)
-        missing.append(pid_i)
-    if not missing:
-        return
-    found = _pcr_bulk_verify(db_filename, tuple(missing))
-    for pid_i in missing:
-        verified, src = found.get(pid_i, (False, ""))
-        if verified and src:
-            cache[pid_i] = f"✅ 검증됨 ({src})"
-        elif verified:
-            cache[pid_i] = "✅ 검증됨"
+        if pid_i in sources:
+            src = str(sources.get(pid_i) or "").strip()
+            cache[pid_i] = f"✅ 검증됨 ({src})" if src else "✅ 검증됨"
         else:
             cache[pid_i] = "❌ 미검증"
+
+
+def _pcr_prefetch_open_context(db_filename: str, order_id: int) -> None:
+    """선택된 주문 화면에서 이력·담당자를 미리 담아, 열기 버튼이 조회를 기다리지 않게 한다."""
+    hist_key = f"pcr_hist_{order_id}"
+    if hist_key not in st.session_state:
+        try:
+            st.session_state[hist_key] = _load_latest_payment_history_for_pcr(
+                db_filename, int(order_id)
+            ) or {}
+        except Exception:
+            logging.exception("결제변경 이력 미리 읽기 실패 order_id=%s", order_id)
+    emp_key = f"pcr_emp_opts_{order_id}"
+    if emp_key not in st.session_state:
+        try:
+            cur_user = st.session_state.get("current_user") or {}
+            role = (cur_user.get("role") or "user").strip()
+            store_id = cur_user.get("store_id") or st.session_state.get("current_store_id")
+            st.session_state[emp_key] = _pcr_assignee_options(
+                store_id, role, _current_username()
+            )
+        except Exception:
+            logging.exception("결제변경 담당자 미리 읽기 실패 order_id=%s", order_id)
 
 
 def _pcr_collect_evidence_files(order_id: int) -> list:
@@ -33171,7 +33193,8 @@ def _render_pcr_evidence_fragment(order_id: int) -> None:
 
 @st.fragment
 def _render_payment_change_verify_entry(db_filename: str, order_id: int,
-                                        customer_name: str, pay_list):
+                                        customer_name: str, pay_list,
+                                        match_sources: dict | None = None):
     """매출관리 결제 섹션에 들어가는 '사내 결제변경 검증 요청' 격리 위젯.
     기존 결제 저장/상계 로직과 완전히 분리. 결제는 이미 매출관리에서 즉시 반영된 상태이고,
     여기서는 사후 검증용 사내 업무 태스크만 생성한다.
@@ -33222,13 +33245,16 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         st.session_state.pop(f"pcr_evidence_open_{order_id}", None)
         st.session_state[f"pcr_new_count_{order_id}"] = 1
 
-    _render_pcr_editor_fragment(db_filename, order_id, customer_name, pay_list)
+    _render_pcr_editor_fragment(
+        db_filename, order_id, customer_name, pay_list, match_sources,
+    )
     _render_pcr_evidence_fragment(order_id)
 
 
 @st.fragment
 def _render_pcr_editor_fragment(db_filename: str, order_id: int,
-                                customer_name: str, pay_list):
+                                customer_name: str, pay_list,
+                                match_sources: dict | None = None):
     """결제변경 입력·요청 버튼. 증빙 업로더와 분리되어 있다."""
     import task_board as _tb  # noqa: WPS433
 
@@ -33342,17 +33368,17 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                 return "❌ 미검증"
             _badge_cache = st.session_state.setdefault(f"pcr_vbadge_{order_id}", {})
             if pid_i not in _badge_cache:
-                _pcr_fill_verify_badges(db_filename, order_id, [pid_i])
+                _pcr_fill_verify_badges(order_id, [pid_i], match_sources)
             return _badge_cache.get(pid_i, "❌ 미검증")
 
         _pcr_fill_verify_badges(
-            db_filename,
             order_id,
             [
                 sel_pid,
                 _hist_orig.get("payment_id"),
                 (_hist_new or {}).get("payment_id"),
             ],
+            match_sources,
         )
 
         # 원래 결제내역 + 변경 내용 + 미검증/검증 (Slack 본문 박스)
@@ -46025,7 +46051,8 @@ def render_customer_balance():
                                         _inq_pids.append(int(_pid))
                                     except (TypeError, ValueError):
                                         continue
-                            _inq_match_ids = tuple(sorted(_ext_pay_matched_payment_ids(db_filename, _inq_pids)))
+                            _inq_match_sources = _ext_pay_match_sources(db_filename, _inq_pids)
+                            _inq_match_ids = tuple(sorted(_inq_match_sources))
                             for _order_id_pay in orders["id"].tolist():
                                 if _supabase_orders_payments_available():
                                     if not _pay_all.empty and "order_id" in _pay_all.columns:
@@ -46080,9 +46107,11 @@ def render_customer_balance():
                                         else:
                                             # 사내 결제변경 검증 요청 (격리된 기능 — 기존 결제 저장 로직과 무관)
                                             _inject_pcr_entry_css()
+                                            _pcr_prefetch_open_context(db_filename, int(_order_id_pay))
                                             _render_payment_change_verify_entry(
                                                 db_filename, int(_order_id_pay),
                                                 customer_name_for_receipt, pay_list,
+                                                _inq_match_sources,
                                             )
                                         for _, prow in (pay_list if _is_selected_order else pay_list.iloc[0:0]).iterrows():
                                             _prow_cc = str(prow.get("card_company") or "").strip()
