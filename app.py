@@ -3652,6 +3652,7 @@ def _ext_pay_rematch_after_payment_change(
     old_pay: dict | None,
     new_pay: dict | None,
     matched_by: str = "payment_change",
+    rows_cache: dict | None = None,
 ) -> None:
     """결제 금액·수단·승인번호 변경 후 관련 공식 행 매칭을 해제하고 재매칭."""
     if not db_filename:
@@ -3676,7 +3677,7 @@ def _ext_pay_rematch_after_payment_change(
         for source in sources:
             _ext_pay_release_and_rematch_source(
                 sc, db_filename, source, payment_id, old_pay, new_pay,
-                verify_from, extra_dates, matched_by,
+                verify_from, extra_dates, matched_by, rows_cache=rows_cache,
             )
     except Exception as e:
         try:
@@ -3697,14 +3698,21 @@ def _ext_pay_release_and_rematch_source(
     sc, db_filename: str, source: str, payment_id: int | None,
     old_pay: dict | None, new_pay: dict | None,
     verify_from: date, extra_dates: list[date], matched_by: str,
+    rows_cache: dict | None = None,
 ) -> None:
     def _filt_rows(q):
         return q.eq("db_filename", db_filename).eq("source", source)
-    rows = _ext_pay_select_paged(
-        sc, "app_external_pay_rows",
-        "id, tx_date, amount, approval_code, phone_last4",
-        _filt_rows, order_col="id",
-    )
+    _row_cols = "id, tx_date, amount, approval_code, phone_last4"
+    _row_key = (db_filename, source, _row_cols)
+    rows = rows_cache.get(_row_key) if rows_cache is not None else None
+    if rows is None:
+        rows = _ext_pay_select_paged(
+            sc, "app_external_pay_rows",
+            _row_cols,
+            _filt_rows, order_col="id",
+        )
+        if rows_cache is not None:
+            rows_cache[_row_key] = rows
     def _filt_m(q):
         return q.eq("db_filename", db_filename).eq("source", source)
     matches = _ext_pay_select_paged(
@@ -9908,13 +9916,17 @@ def _invalidate_orders() -> None:
             pass
 
 
-def _invalidate_payments() -> None:
-    """결제 CRUD 후 호출. 결제 · 결제내역 · 매출(잔금 반영) · PCR 검증 컨텍스트 캐시 무효화."""
-    for _name in ("_load_payments_supabase", "_load_payments_by_order_ids_supabase",
-                  "load_payments_cached",
-                  "load_payment_history_dashboard_cached",
-                  "load_sales_cached", "load_orders_cached", "_load_orders_supabase",
-                  "_load_orders_by_customer_ids_supabase",
+def _invalidate_payments(*, include_sales: bool = True) -> None:
+    """결제 CRUD 후 호출. 결제 · 결제내역 · 매출(잔금 반영) · PCR 검증 컨텍스트 캐시 무효화.
+    include_sales=False 면 매출 원장 캐시는 유지한다. 결제변경 저장은 주문 잔액만 바뀐다."""
+    _names = ["_load_payments_supabase", "_load_payments_by_order_ids_supabase",
+              "load_payments_cached",
+              "load_payment_history_dashboard_cached",
+              "load_orders_cached", "_load_orders_supabase",
+              "_load_orders_by_customer_ids_supabase"]
+    if include_sales:
+        _names.append("load_sales_cached")
+    for _name in (*_names,
                   # PCR 검증 관련 헬퍼도 결제 CRUD 시 함께 무효화
                   "_load_latest_payment_history_for_pcr",
                   "_pcr_load_payment_date",
@@ -10596,6 +10608,7 @@ def _insert_payment_supabase(
     payload: dict,
     *,
     _error_detail: list | None = None,
+    skip_rematch: bool = False,
 ) -> int | None:
     """app_payments에 1건 INSERT. payload에 db_filename 없으면 자동 설정. 반환: 새 id 또는 None."""
     if not db_filename:
@@ -10638,7 +10651,10 @@ def _insert_payment_supabase(
                 _load_payments_supabase.clear()
             except Exception:
                 pass
-            if _ext_pay_source_from_method(payload.get("payment_method")):
+            if (
+                not skip_rematch
+                and _ext_pay_source_from_method(payload.get("payment_method"))
+            ):
                 _ext_pay_rematch_after_payment_change(
                     db_filename, payment_id=new_id, old_pay=None, new_pay=payload,
                 )
@@ -10673,7 +10689,9 @@ def _get_payment_row_supabase(db_filename: str, payment_id: int) -> dict | None:
         return None
 
 
-def _update_payment_supabase(db_filename: str, payment_id: int, updates: dict) -> bool:
+def _update_payment_supabase(
+    db_filename: str, payment_id: int, updates: dict, *, skip_rematch: bool = False,
+) -> bool:
     """app_payments 1건 업데이트."""
     if not db_filename:
         return False
@@ -10688,8 +10706,10 @@ def _update_payment_supabase(db_filename: str, payment_id: int, updates: dict) -
             except (TypeError, ValueError):
                 pass
     old_pay = None
-    if _ext_pay_match_fields_changed(None, updates) or any(
-        k in updates for k in ("amount", "payment_method", "card_company", "onnuri_approval_code", "payment_date")
+    if not skip_rematch and (
+        _ext_pay_match_fields_changed(None, updates) or any(
+            k in updates for k in ("amount", "payment_method", "card_company", "onnuri_approval_code", "payment_date")
+        )
     ):
         old_pay = _get_payment_row_supabase(db_filename, payment_id)
     try:
@@ -10701,7 +10721,11 @@ def _update_payment_supabase(db_filename: str, payment_id: int, updates: dict) -
         _load_payments_supabase.clear()
     except Exception:
         pass
-    if old_pay is not None and _ext_pay_match_fields_changed(old_pay, updates):
+    if (
+        not skip_rematch
+        and old_pay is not None
+        and _ext_pay_match_fields_changed(old_pay, updates)
+    ):
         merged = dict(old_pay)
         merged.update(updates)
         _ext_pay_rematch_after_payment_change(
@@ -14975,6 +14999,54 @@ def _insert_payment_history(
             if supa_error is None and not _supabase_orders_payments_available():
                 supa_error = f"SQLite 저장 오류: {_sqlite_e}"
     return supa_error
+
+
+def _insert_payment_histories(db_filename: str, entries: list[dict]) -> str | None:
+    """결제 이력 여러 건을 한 번의 insert 로 저장한다. 필드 구성은 단건 저장과 같다."""
+    if not entries or not db_filename:
+        return None
+    if not _supabase_orders_payments_available():
+        return "Supabase 결제 이력을 쓸 수 없습니다."
+    import math
+
+    def _safe_json(obj):
+        if obj is None:
+            return None
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+            return None
+        if isinstance(obj, dict):
+            return {k: _safe_json(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_safe_json(v) for v in obj]
+        return obj
+
+    now_iso = datetime.now(tz=KST).isoformat()
+    changed_by = _current_username() or "unknown"
+    payload = []
+    for entry in entries:
+        payload.append({
+            "db_filename": db_filename,
+            "sale_id": int(entry["sale_id"]),
+            "customer_name": entry.get("customer_name") or "",
+            "action_type": entry["action_type"],
+            "old_payment_data": _safe_json(entry.get("old_payment_data") or {}),
+            "new_payment_data": _safe_json(entry.get("new_payment_data") or {}),
+            "reason": str(entry.get("reason") or "").strip(),
+            "changed_by": changed_by,
+            "changed_at": now_iso,
+            "receipt_image_path": entry.get("receipt_image_path") or None,
+        })
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return f"Supabase 클라이언트 오류: {err}"
+        result = sc.table("app_payment_history").insert(payload).execute()
+        if hasattr(result, "error") and result.error:
+            return str(result.error)
+    except Exception as _e:
+        logging.exception("결제 이력 일괄 저장 실패 db=%s count=%s", db_filename, len(payload))
+        return str(_e)
+    return None
 
 
 def _render_order_cost_verify(db_filename: str, order_id: int):
@@ -33104,7 +33176,10 @@ def _inject_pcr_entry_css() -> None:
         }
         .pcr-slack-desc b { color: #1264A3; font-weight: 600; }
         textarea[aria-label="변경 사유 *"] {
-            min-height: 280px !important;
+            height: 140px !important;
+            min-height: 140px !important;
+            max-height: 140px !important;
+            overflow-y: auto !important;
             background: #E8F4FD !important;
             border: 1px solid #B8D4EE !important;
             border-radius: 8px !important;
@@ -33118,8 +33193,94 @@ def _inject_pcr_entry_css() -> None:
     )
 
 
+def _pcr_verify_badge_text(pid, badges: dict) -> str:
+    try:
+        pid_i = int(pid) if pid not in (None, "", "신규생성(상계처리)") else None
+    except (TypeError, ValueError):
+        pid_i = None
+    if not pid_i:
+        return "❌ 미검증"
+    label = badges.get(pid_i)
+    if not label:
+        return "확인 중"
+    return label
+
+
+def _pcr_render_context_box(
+    order_id: int,
+    sel_pid: int | None,
+    orig_amount: int,
+    orig_method: str,
+    orig_onnuri: str,
+    orig_date: str,
+) -> None:
+    """이미 세션에 담긴 이력·검증 결과로 파란 안내 상자를 그린다. 조회는 하지 않는다."""
+    hist = st.session_state.get(f"pcr_hist_{order_id}") or {}
+    badges = st.session_state.get(f"pcr_vbadge_{order_id}") or {}
+    hist_orig = (hist or {}).get("original") or {}
+    hist_new = (hist or {}).get("new") or {}
+    lines: list[str] = []
+
+    def _line(amt, method, onnuri) -> str:
+        try:
+            amt_s = f"{int(float(amt or 0)):,}원"
+        except (TypeError, ValueError):
+            amt_s = "-"
+        bits = [amt_s, str(method or "-")]
+        if onnuri:
+            bits.append(str(onnuri))
+        return " / ".join(bits)
+
+    if orig_amount or orig_method:
+        lines.append("<b>원래 결제내역</b>")
+        lines.append(html.escape(_line(orig_amount, orig_method, orig_onnuri)))
+        meta = []
+        if sel_pid is not None:
+            meta.append(f"결제ID {int(sel_pid)}")
+        if orig_date:
+            meta.append(f"결제일 {orig_date}")
+        meta.append(_pcr_verify_badge_text(sel_pid, badges))
+        lines.append("<span style='color:#616061'>" + html.escape(" · ".join(meta)) + "</span>")
+    if hist_orig.get("method") or hist_orig.get("amount"):
+        try:
+            oa = f"{int(float(hist_orig.get('amount') or 0)):,}원"
+        except (TypeError, ValueError):
+            oa = "-"
+        try:
+            na = f"{int(float(hist_new.get('amount') or 0)):,}원"
+        except (TypeError, ValueError):
+            na = "-"
+        hist_from = (
+            f"{oa} / {hist_orig.get('method') or '-'}"
+            + (f" · {hist_orig.get('onnuri')}" if hist_orig.get("onnuri") else "")
+        )
+        hist_to = (
+            f"{na} / {hist_new.get('method') or '-'}"
+            + (f" · {hist_new.get('onnuri')}" if hist_new.get("onnuri") else "")
+        )
+        lines.append("<br/><b>변경 내용</b>")
+        lines.append(html.escape(
+            f"{hist.get('action_type') or '결제변경'}  ·  원본: {hist_from}  ·  "
+            f"{_pcr_verify_badge_text(hist_orig.get('payment_id'), badges)}"
+        ))
+        lines.append(html.escape(
+            f"변경 후: {hist_to}  ·  {_pcr_verify_badge_text((hist_new or {}).get('payment_id'), badges)}"
+        ))
+        reason = str(hist.get("reason") or "").strip()
+        if reason:
+            lines.append(html.escape(f"사유: {reason}"))
+    if not lines:
+        if not st.session_state.get(f"pcr_aux_done_{order_id}"):
+            st.caption("이전 결제 변경 이력을 확인하는 중입니다.")
+        return
+    st.markdown(
+        "<div class='pcr-slack-desc'>" + "<br/>".join(lines) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _pcr_fill_verify_badges(order_id: int, pids, match_sources: dict | None) -> None:
-    """검증 뱃지를 결제 표의 직접 매칭 결과로 채운다. 추가 조회는 하지 않는다."""
+    """이미 알고 있는 직접 매칭만 뱃지에 넣는다. 없는 결제는 비워 두어 이후 일괄 검증이 채운다."""
     cache = st.session_state.setdefault(f"pcr_vbadge_{order_id}", {})
     sources = match_sources or {}
     for pid in pids or []:
@@ -33127,13 +33288,10 @@ def _pcr_fill_verify_badges(order_id: int, pids, match_sources: dict | None) -> 
             pid_i = int(pid) if pid not in (None, "", "신규생성(상계처리)") else None
         except (TypeError, ValueError):
             pid_i = None
-        if not pid_i or pid_i in cache:
+        if not pid_i or pid_i in cache or pid_i not in sources:
             continue
-        if pid_i in sources:
-            src = str(sources.get(pid_i) or "").strip()
-            cache[pid_i] = f"✅ 검증됨 ({src})" if src else "✅ 검증됨"
-        else:
-            cache[pid_i] = "❌ 미검증"
+        src = str(sources.get(pid_i) or "").strip()
+        cache[pid_i] = f"✅ 검증됨 ({src})" if src else "✅ 검증됨"
 
 
 def _pcr_prefetch_open_context(db_filename: str, order_id: int) -> None:
@@ -33146,17 +33304,23 @@ def _pcr_prefetch_open_context(db_filename: str, order_id: int) -> None:
             ) or {}
         except Exception:
             logging.exception("결제변경 이력 미리 읽기 실패 order_id=%s", order_id)
-    emp_key = f"pcr_emp_opts_{order_id}"
-    if emp_key not in st.session_state:
+    try:
+        cur_user = st.session_state.get("current_user") or {}
+        role = (cur_user.get("role") or "user").strip()
+        store_id = cur_user.get("store_id") or st.session_state.get("current_store_id")
         try:
-            cur_user = st.session_state.get("current_user") or {}
-            role = (cur_user.get("role") or "user").strip()
-            store_id = cur_user.get("store_id") or st.session_state.get("current_store_id")
-            st.session_state[emp_key] = _pcr_assignee_options(
-                store_id, role, _current_username()
-            )
-        except Exception:
-            logging.exception("결제변경 담당자 미리 읽기 실패 order_id=%s", order_id)
+            store_id_i = int(store_id) if store_id not in (None, "") else 0
+        except (TypeError, ValueError):
+            store_id_i = 0
+        emp_key = f"pcr_emp_opts_{order_id}"
+        store_emp_key = f"pcr_emp_opts_store_{store_id_i}"
+        if emp_key not in st.session_state or store_emp_key not in st.session_state:
+            opts = _pcr_assignee_options(store_id, role, _current_username())
+            st.session_state[emp_key] = opts
+            if store_emp_key not in st.session_state:
+                st.session_state[store_emp_key] = opts
+    except Exception:
+        logging.exception("결제변경 담당자 미리 읽기 실패 order_id=%s", order_id)
 
 
 def _pcr_collect_evidence_files(order_id: int) -> list:
@@ -33193,6 +33357,69 @@ def _render_pcr_evidence_fragment(order_id: int) -> None:
             key=f"pcr_files_{order_id}_{ver}",
         )
         _render_upload_preview(files)
+
+
+@st.fragment(run_every=timedelta(seconds=1))
+def _pcr_load_open_context(
+    db_filename: str,
+    order_id: int,
+    store_id: int,
+    role: str,
+    me_uname: str,
+    pay_ids: tuple[int, ...],
+    sel_pid: int,
+    orig_amount: int,
+    orig_method: str,
+    orig_onnuri: str,
+    orig_date: str,
+    match_sources: dict | None = None,
+) -> None:
+    """폼이 열린 뒤 이력·검증·결제자 목록을 한 번만 읽는다. 클릭 실행에서는 조회하지 않는다."""
+    arm_key = f"pcr_aux_arm_{order_id}"
+    done_key = f"pcr_aux_done_{order_id}"
+    _pcr_fill_verify_badges(order_id, pay_ids, match_sources)
+    if not st.session_state.get(done_key):
+        if not st.session_state.get(arm_key):
+            st.session_state[arm_key] = True
+            _pcr_render_context_box(
+                order_id, sel_pid or None, orig_amount, orig_method, orig_onnuri, orig_date,
+            )
+            return
+        hist_key = f"pcr_hist_{order_id}"
+        hist = st.session_state.get(hist_key)
+        if hist is None:
+            hist = _load_latest_payment_history_for_pcr(db_filename, int(order_id)) or {}
+            st.session_state[hist_key] = hist
+        pids = set(int(p) for p in pay_ids if p)
+        for blob in ((hist.get("original") or {}), (hist.get("new") or {})):
+            hp = blob.get("payment_id")
+            try:
+                if hp not in (None, "", "신규생성(상계처리)"):
+                    pids.add(int(hp))
+            except (TypeError, ValueError):
+                continue
+        _pcr_fill_verify_badges(order_id, pids, match_sources)
+        badges = dict(st.session_state.get(f"pcr_vbadge_{order_id}") or {})
+        missing = tuple(sorted(p for p in pids if p not in badges))
+        if missing:
+            for pid, (ok, src) in _pcr_bulk_verify(db_filename, missing).items():
+                badges[int(pid)] = (
+                    f"✅ 검증됨 ({src})" if ok and src else ("✅ 검증됨" if ok else "❌ 미검증")
+                )
+            st.session_state[f"pcr_vbadge_{order_id}"] = badges
+        emp_key = f"pcr_emp_opts_store_{store_id}"
+        if emp_key not in st.session_state:
+            order_opts = st.session_state.get(f"pcr_emp_opts_{order_id}")
+            if order_opts is not None:
+                st.session_state[emp_key] = order_opts
+            else:
+                st.session_state[emp_key] = _pcr_assignee_options(
+                    store_id or None, role, me_uname,
+                )
+        st.session_state[done_key] = True
+    _pcr_render_context_box(
+        order_id, sel_pid or None, orig_amount, orig_method, orig_onnuri, orig_date,
+    )
 
 
 @st.fragment
@@ -33246,6 +33473,8 @@ def _render_payment_change_verify_entry(db_filename: str, order_id: int,
         st.session_state.pop(f"pcr_hist_{order_id}", None)
         st.session_state.pop(f"pcr_emp_opts_{order_id}", None)
         st.session_state.pop(f"pcr_vbadge_{order_id}", None)
+        st.session_state.pop(f"pcr_aux_arm_{order_id}", None)
+        st.session_state.pop(f"pcr_aux_done_{order_id}", None)
         st.session_state.pop(f"pcr_evidence_open_{order_id}", None)
         st.session_state[f"pcr_new_count_{order_id}"] = 1
 
@@ -33289,14 +33518,8 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
             unsafe_allow_html=True,
         )
 
-        # 원본은 현재 결제행이 아니라 최신 결제변경 이력에서 가져온다 (사후 검증 버그 방지).
-        # 수단을 바꿀 때마다 조회하지 않고, 이 폼이 열린 동안 한 번만 담는다.
-        _hist_cache_key = f"pcr_hist_{order_id}"
-        if _hist_cache_key not in st.session_state:
-            st.session_state[_hist_cache_key] = _load_latest_payment_history_for_pcr(
-                db_filename, int(order_id)
-            ) or {}
-        _hist = st.session_state.get(_hist_cache_key) or {}
+        # 이력·검증은 클릭 실행에서 조회하지 않는다. 열린 뒤 fragment 가 세션에 담는다.
+        _hist = st.session_state.get(f"pcr_hist_{order_id}") or {}
         _hist_orig = (_hist or {}).get("original") or {}
         _hist_new = (_hist or {}).get("new") or {}
 
@@ -33353,95 +33576,33 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                 except (TypeError, ValueError):
                     pass
 
-        def _pcr_fmt_pay_line(amt, method, onnuri) -> str:
-            try:
-                amt_s = f"{int(float(amt or 0)):,}원"
-            except Exception:
-                amt_s = "-"
-            bits = [amt_s, str(method or "-")]
-            if onnuri:
-                bits.append(str(onnuri))
-            return " / ".join(bits)
-
-        def _pcr_verify_label(pid) -> str:
-            try:
-                pid_i = int(pid) if pid not in (None, "", "신규생성(상계처리)") else None
-            except (TypeError, ValueError):
-                pid_i = None
-            if not pid_i:
-                return "❌ 미검증"
-            _badge_cache = st.session_state.setdefault(f"pcr_vbadge_{order_id}", {})
-            if pid_i not in _badge_cache:
-                _pcr_fill_verify_badges(order_id, [pid_i], match_sources)
-            return _badge_cache.get(pid_i, "❌ 미검증")
-
-        _pcr_fill_verify_badges(
-            order_id,
-            [
-                sel_pid,
-                _hist_orig.get("payment_id"),
-                (_hist_new or {}).get("payment_id"),
-            ],
+        _sel_date = ""
+        try:
+            if sel_pid is not None and pay_list is not None:
+                _sr = pay_list[pay_list["id"] == sel_pid]
+                if not _sr.empty:
+                    _sel_date = str(_sr.iloc[0].get("payment_date") or "")[:10]
+        except Exception:
+            _sel_date = ""
+        _pay_ids = tuple(int(pid) for pid in pay_options.keys())
+        try:
+            _store_id_arg = int(store_id) if store_id not in (None, "") else 0
+        except (TypeError, ValueError):
+            _store_id_arg = 0
+        _pcr_load_open_context(
+            db_filename,
+            int(order_id),
+            _store_id_arg,
+            role,
+            me_uname or "",
+            _pay_ids,
+            int(sel_pid or 0),
+            int(float(orig.get("amount") or 0)),
+            str(orig.get("method") or ""),
+            str(orig.get("onnuri") or ""),
+            _sel_date,
             match_sources,
         )
-
-        # 원래 결제내역 + 변경 내용 + 미검증/검증 (Slack 본문 박스)
-        _desc_lines: list[str] = []
-        if orig:
-            try:
-                _sel_date = ""
-                if sel_pid is not None and pay_list is not None:
-                    _sr = pay_list[pay_list["id"] == sel_pid]
-                    if not _sr.empty:
-                        _sel_date = str(_sr.iloc[0].get("payment_date") or "")[:10]
-            except Exception:
-                _sel_date = ""
-            _orig_line = _pcr_fmt_pay_line(orig.get("amount"), orig.get("method"), orig.get("onnuri"))
-            _orig_v = _pcr_verify_label(sel_pid if sel_pid is not None else orig.get("payment_id"))
-            _desc_lines.append("<b>원래 결제내역</b>")
-            _desc_lines.append(html.escape(_orig_line))
-            _meta_bits = []
-            if sel_pid is not None:
-                _meta_bits.append(f"결제ID {int(sel_pid)}")
-            if _sel_date:
-                _meta_bits.append(f"결제일 {_sel_date}")
-            _meta_bits.append(_orig_v)
-            _desc_lines.append(
-                "<span style='color:#616061'>" + html.escape(" · ".join(_meta_bits)) + "</span>"
-            )
-        if _orig_has_history:
-            try:
-                _oa = f"{int(float(_hist_orig.get('amount') or 0)):,}원"
-            except Exception:
-                _oa = "-"
-            _na = "-"
-            if _hist_new:
-                try:
-                    _na = f"{int(float(_hist_new.get('amount') or 0)):,}원"
-                except Exception:
-                    _na = "-"
-            _hist_from = (
-                f"{_oa} / {_hist_orig.get('method') or '-'}"
-                f"{(' · ' + str(_hist_orig.get('onnuri'))) if _hist_orig.get('onnuri') else ''}"
-            )
-            _hist_to = (
-                f"{_na} / {_hist_new.get('method') or '-'}"
-                f"{(' · ' + str(_hist_new.get('onnuri'))) if _hist_new.get('onnuri') else ''}"
-            )
-            _hv_from = _pcr_verify_label(_hist_orig.get("payment_id"))
-            _hv_to = _pcr_verify_label(_hist_new.get("payment_id") if _hist_new else None)
-            _act = str((_hist or {}).get("action_type") or "결제변경")
-            _hrs = str((_hist or {}).get("reason") or "").strip()
-            _desc_lines.append("<br/><b>변경 내용</b>")
-            _desc_lines.append(html.escape(f"{_act}  ·  원본: {_hist_from}  ·  {_hv_from}"))
-            _desc_lines.append(html.escape(f"변경 후: {_hist_to}  ·  {_hv_to}"))
-            if _hrs:
-                _desc_lines.append(html.escape(f"사유: {_hrs}"))
-        if _desc_lines:
-            st.markdown(
-                "<div class='pcr-slack-desc'>" + "<br/>".join(_desc_lines) + "</div>",
-                unsafe_allow_html=True,
-            )
 
         # 원본 수동 수정이 켜져 있으면 세션 값으로 orig 를 상위에서 override (UI 는 하단 expander 에서 렌더)
         if bool(st.session_state.get(f"pcr_manual_orig_{order_id}", False)):
@@ -33676,11 +33837,11 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
         new_method = " · ".join(x["method"] for x in new_lines if x["method"]) or ""
         new_onnuri = " · ".join(x["onnuri"] for x in new_lines if x["onnuri"]) or ""
 
-        # ── 변경 사유 (전체폭, 높이 150 — 긴 텍스트 스크롤 확보) ──
+        # ── 변경 사유 (5줄. 넘는 글은 칸 안에서 스크롤) ──
         st.divider()
         reason = st.text_area(
-            "변경 사유 *", key=f"pcr_reason_{order_id}", height=280,
-            placeholder="결제변경 유형, 고객, 원본 결제 등을 적어 주세요. (약 10줄)",
+            "변경 사유 *", key=f"pcr_reason_{order_id}", height=140,
+            placeholder="결제변경 유형, 고객, 원본 결제 등을 적어 주세요. (약 5줄)",
         )
 
         # ── 추가 항목 (환불 계좌 · 결제자 · 변경 유형 · 원본 수동 수정 · 증빙 첨부) ──
@@ -33717,10 +33878,14 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                     placeholder="예: 123-45-678901",
                 )
 
-            _emp_cache_key = f"pcr_emp_opts_{order_id}"
-            if _emp_cache_key not in st.session_state:
-                st.session_state[_emp_cache_key] = _pcr_assignee_options(store_id, role, me_uname)
-            emp_options = st.session_state.get(_emp_cache_key) or []
+            _emp_cache_key = f"pcr_emp_opts_store_{_store_id_arg}"
+            emp_options = (
+                st.session_state.get(_emp_cache_key)
+                or st.session_state.get(f"pcr_emp_opts_{order_id}")
+                or []
+            )
+            if not emp_options:
+                st.caption("결제자 목록을 불러오는 중입니다.")
             emp_username_to_label = {u: lbl for u, lbl in emp_options}
             pcr_assignees = st.multiselect(
                 "결제자 *",
@@ -33878,12 +34043,14 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                     _is_partial_change = (
                         _orig_amt > 0 and 0 < _new_sum < _orig_amt and sel_pid is not None
                     )
+                    _history_entries: list[dict] = []
+                    _rematch_jobs: list[dict] = []
 
                     if _is_partial_change:
                         # 부분 결제변경: 원 결제 행을 (원금 - 변경 후 합계) 로 감액한다.
                         _kept = _orig_amt - _new_sum
                         _upd_ok = _update_payment_supabase(
-                            db_filename, int(sel_pid), {"amount": _kept},
+                            db_filename, int(sel_pid), {"amount": _kept}, skip_rematch=True,
                         )
                         if not _upd_ok:
                             payment_ops_errors.append(
@@ -33891,26 +34058,38 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                             )
                         else:
                             reduced_pay_id = int(sel_pid)
-                            _insert_payment_history(
-                                conn=None,
-                                sale_id=int(order_id),
-                                customer_name=customer_name or "",
-                                action_type="payment_change_partial",
-                                old_payment_data={
+                            _old_for_match = {
+                                "payment_method": _orig_row.get("payment_method") or orig.get("method") or None,
+                                "amount": _orig_amt,
+                                "card_company": _orig_row.get("card_company") or None,
+                                "onnuri_approval_code": _orig_row.get("onnuri_approval_code") or None,
+                                "payment_date": _orig_row.get("payment_date"),
+                            }
+                            _new_for_match = dict(_old_for_match)
+                            _new_for_match["amount"] = _kept
+                            _rematch_jobs.append({
+                                "payment_id": int(sel_pid),
+                                "old_pay": _old_for_match,
+                                "new_pay": _new_for_match,
+                            })
+                            _history_entries.append({
+                                "sale_id": int(order_id),
+                                "customer_name": customer_name or "",
+                                "action_type": "payment_change_partial",
+                                "old_payment_data": {
                                     "payment_id": sel_pid,
                                     "amount": _orig_amt,
-                                    "payment_method": _orig_row.get("payment_method") or orig.get("method") or None,
-                                    "card_company": _orig_row.get("card_company") or None,
-                                    "onnuri_approval_code": _orig_row.get("onnuri_approval_code") or None,
+                                    "payment_method": _old_for_match["payment_method"],
+                                    "card_company": _old_for_match["card_company"],
+                                    "onnuri_approval_code": _old_for_match["onnuri_approval_code"],
                                 },
-                                new_payment_data={
+                                "new_payment_data": {
                                     "payment_id": sel_pid,
                                     "amount": _kept,
                                     "note": f"결제변경 요청에 의한 감액 ({_orig_amt:,}원 → {_kept:,}원, 차액 {_new_sum:,}원 신규 결제로 이동)",
                                 },
-                                reason=reason,
-                                db_filename=db_filename,
-                            )
+                                "reason": reason,
+                            })
                     elif _orig_amt > 0:
                         # 전액 환불 또는 전액 수단 변경: 원 결제 전액을 음수 상계 전표로 지운다.
                         _cancel_payload = {
@@ -33924,30 +34103,35 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                             "created_by": me_uname,
                         }
                         _err_detail: list = []
-                        cancel_pay_id = _insert_payment_supabase(db_filename, _cancel_payload, _error_detail=_err_detail)
+                        cancel_pay_id = _insert_payment_supabase(
+                            db_filename, _cancel_payload, _error_detail=_err_detail, skip_rematch=True,
+                        )
                         if not cancel_pay_id:
                             payment_ops_errors.append("취소행 저장 실패: " + "; ".join(_err_detail))
                         else:
-                            _insert_payment_history(
-                                conn=None,
-                                sale_id=int(order_id),
-                                customer_name=customer_name or "",
-                                action_type="payment_change_cancel",
-                                old_payment_data={
+                            _rematch_jobs.append({
+                                "payment_id": int(cancel_pay_id),
+                                "old_pay": None,
+                                "new_pay": _cancel_payload,
+                            })
+                            _history_entries.append({
+                                "sale_id": int(order_id),
+                                "customer_name": customer_name or "",
+                                "action_type": "payment_change_cancel",
+                                "old_payment_data": {
                                     "payment_id": sel_pid,
                                     "amount": _orig_amt,
                                     "payment_method": _cancel_payload["payment_method"],
                                     "card_company": _cancel_payload["card_company"],
                                     "onnuri_approval_code": _cancel_payload["onnuri_approval_code"],
                                 },
-                                new_payment_data={
+                                "new_payment_data": {
                                     "payment_id": cancel_pay_id,
                                     "amount": -_orig_amt,
                                     "note": "결제변경 요청에 의한 취소 등록",
                                 },
-                                reason=reason,
-                                db_filename=db_filename,
-                            )
+                                "reason": reason,
+                            })
 
                     # 2. 신규 결제 등록 (여러 라인 각각 양수 결제행 저장)
                     new_pay_ids: list[int] = []
@@ -33990,20 +34174,26 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                             "created_by": me_uname,
                         }
                         _err_detail2: list = []
-                        _pid = _insert_payment_supabase(db_filename, _new_payload, _error_detail=_err_detail2)
+                        _pid = _insert_payment_supabase(
+                            db_filename, _new_payload, _error_detail=_err_detail2, skip_rematch=True,
+                        )
                         if not _pid:
                             payment_ops_errors.append(
                                 f"신규 결제 저장 실패({_new_method} {_new_amt:,}원): " + "; ".join(_err_detail2)
                             )
                             continue
                         new_pay_ids.append(int(_pid))
-                        _insert_payment_history(
-                            conn=None,
-                            sale_id=int(order_id),
-                            customer_name=customer_name or "",
-                            action_type="payment_change_new",
-                            old_payment_data={},
-                            new_payment_data={
+                        _rematch_jobs.append({
+                            "payment_id": int(_pid),
+                            "old_pay": None,
+                            "new_pay": _new_payload,
+                        })
+                        _history_entries.append({
+                            "sale_id": int(order_id),
+                            "customer_name": customer_name or "",
+                            "action_type": "payment_change_new",
+                            "old_payment_data": {},
+                            "new_payment_data": {
                                 "payment_id": int(_pid),
                                 "amount": _new_amt,
                                 "payment_method": _new_method,
@@ -34011,10 +34201,30 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                                 "onnuri_approval_code": _new_onnuri_code,
                                 "note": "결제변경 요청에 의한 신규 결제 등록",
                             },
-                            reason=reason,
-                            db_filename=db_filename,
-                        )
+                            "reason": reason,
+                        })
                     new_pay_id = new_pay_ids[0] if new_pay_ids else None
+
+                    _rows_cache: dict = {}
+                    for _job in _rematch_jobs:
+                        try:
+                            _ext_pay_rematch_after_payment_change(
+                                db_filename,
+                                payment_id=_job["payment_id"],
+                                old_pay=_job["old_pay"],
+                                new_pay=_job["new_pay"],
+                                rows_cache=_rows_cache,
+                            )
+                        except Exception as _rm_ex:
+                            logging.exception(
+                                "결제변경 재매칭 실패 order_id=%s payment_id=%s",
+                                order_id, _job.get("payment_id"),
+                            )
+                            payment_ops_errors.append(f"재매칭 실패: {_rm_ex}")
+                    if _history_entries:
+                        _hist_err = _insert_payment_histories(db_filename, _history_entries)
+                        if _hist_err:
+                            payment_ops_errors.append(f"결제 이력 저장 실패: {_hist_err}")
 
                     # 잔금·actual_margin 재계산 (음수+양수 인서트 또는 원 결제 감액 후 최신 상태 반영)
                     if cancel_pay_id or new_pay_ids or reduced_pay_id:
@@ -34022,8 +34232,8 @@ def _render_pcr_editor_fragment(db_filename: str, order_id: int,
                             _recalc_order_actual_margin_supabase(db_filename, int(order_id))
                         except Exception as _mg_ex:
                             payment_ops_errors.append(f"잔금 재계산 실패: {_mg_ex}")
-                        # 결제 도메인 캐시만 무효화 — 매장/직원/고객 캐시는 유지해 재렌더 가속.
-                        _invalidate_payments()
+                        # 결제·주문 잔액 캐시만 무효화. 매출 원장은 이 저장에서 바꾸지 않는다.
+                        _invalidate_payments(include_sales=False)
 
                     # 증빙 첨부 업로드 (업로더는 형제 fragment. 세션에 담긴 파일만 읽는다.)
                     files = _pcr_collect_evidence_files(order_id)
