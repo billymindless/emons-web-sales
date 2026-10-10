@@ -41424,7 +41424,7 @@ def render_new_sales():
         ),
     )
     _cover_extra = 0
-    _size_code = ""
+    _cover_codes: list[str] = []
     _bed_selected = bool({"침대", "SSDS침대"} & set(selected_categories or []))
     if _bed_selected:
         _cover_rows = _load_waterproof_cover_prices()
@@ -41441,13 +41441,41 @@ def render_new_sales():
                 return str(row["label"])
             return f"{row['label']} ({int(row['amount']):,}원)"
 
-        _size_code = st.selectbox(
-            "방수커버 *",
-            options=_size_codes,
-            format_func=_cover_size_label,
-            key=f"cover_size_{_form_reset}",
-        )
-        _cover_extra = _waterproof_cover_amount(_size_code)
+        _count_key = f"cover_count_{_form_reset}"
+        if _count_key not in st.session_state:
+            st.session_state[_count_key] = 1
+        _cover_count = max(1, int(st.session_state.get(_count_key) or 1))
+        _del_i = st.session_state.pop(f"cover_del_{_form_reset}", None)
+        if isinstance(_del_i, int) and _cover_count > 1 and 0 <= _del_i < _cover_count:
+            for _j in range(_del_i, _cover_count - 1):
+                st.session_state[f"cover_size_{_form_reset}_{_j}"] = st.session_state.get(
+                    f"cover_size_{_form_reset}_{_j + 1}", ""
+                )
+            st.session_state.pop(f"cover_size_{_form_reset}_{_cover_count - 1}", None)
+            _cover_count -= 1
+            st.session_state[_count_key] = _cover_count
+
+        for _i in range(_cover_count):
+            _cc1, _cc2 = st.columns([6, 1])
+            with _cc1:
+                _code_i = st.selectbox(
+                    f"방수커버 #{_i + 1} *",
+                    options=_size_codes,
+                    format_func=_cover_size_label,
+                    key=f"cover_size_{_form_reset}_{_i}",
+                )
+            with _cc2:
+                st.write("")
+                st.write("")
+                if _cover_count > 1 and st.button("삭제", key=f"cover_del_btn_{_form_reset}_{_i}"):
+                    st.session_state[f"cover_del_{_form_reset}"] = _i
+                    st.rerun()
+            _code_s = str(_code_i or "")
+            _cover_codes.append(_code_s)
+            _cover_extra += _waterproof_cover_amount(_code_s)
+        if st.button("방수커버 추가", key=f"cover_add_{_form_reset}"):
+            st.session_state[_count_key] = _cover_count + 1
+            st.rerun()
         _typed_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
         st.caption(
             f"입력 원가 {_typed_cost:,}원 + 방수커버 {_cover_extra:,}원 = {_typed_cost + _cover_extra:,}원"
@@ -41716,7 +41744,7 @@ def render_new_sales():
         if not selected_categories:
             st.error("품목/카테고리(필수)를 1개 이상 선택하세요.")
             st.stop()
-        if _bed_selected and not _size_code:
+        if _bed_selected and (not _cover_codes or any(not _code for _code in _cover_codes)):
             st.error("방수커버(필수)를 선택하세요.")
             st.stop()
         # 방문 이유 필수
