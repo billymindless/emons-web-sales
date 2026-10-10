@@ -350,6 +350,7 @@ def _get_sales_tab_labels(role: str) -> list[str]:
             "14. 🗺️ 상권 퍼포먼스 맵",
             "15. 💳 결제 대조",
             "16. 📄 계약서 촬영",
+            "17. 방수커버·사은품 집계",
         ]
     return [
         "1. 대시보드",
@@ -364,6 +365,7 @@ def _get_sales_tab_labels(role: str) -> list[str]:
         "10. FAQ (도움말)",
         "11. 💳 결제 대조",
         "12. 📄 계약서 촬영",
+        "13. 방수커버·사은품 집계",
     ]
 
 
@@ -12550,8 +12552,10 @@ def _approve_delete_order(db_filename: str, order_id: int) -> tuple:
                 }).eq("converted_order_id", int(order_id)).execute()
             except Exception as _lead_e:
                 return False, f"리드 연결 해제 실패: {_lead_e}"
+            _delete_order_cost_addons(db_filename, int(order_id))
             sc.table("app_orders").delete().eq("id", int(order_id)).eq("db_filename", db_filename).execute()
         else:
+            _delete_order_cost_addons(db_filename, int(order_id))
             conn = get_tenant_conn(db_filename)
             try:
                 conn.execute("DELETE FROM Payments WHERE order_id = ?", (int(order_id),))
@@ -38375,6 +38379,370 @@ def _render_waterproof_cover_admin(me_uname: str) -> None:
             st.rerun()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_extra_gift_items(active_only: bool = False) -> list[dict]:
+    """추가 사은품 단가. 표가 없으면 빈 목록."""
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            return []
+        q = sc.table("app_extra_gift_items").select("id, label, amount, active, sort_order").order("sort_order").order("id")
+        if active_only:
+            q = q.eq("active", True)
+        rows = list(q.execute().data or [])
+    except Exception:
+        logging.exception("추가 사은품 조회 실패")
+        return []
+    out: list[dict] = []
+    for row in rows:
+        try:
+            amount = int(row.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        out.append({
+            "id": int(row["id"]),
+            "label": str(row.get("label") or "").strip(),
+            "amount": max(0, amount),
+            "active": bool(row.get("active")),
+            "sort_order": int(row.get("sort_order") or 0),
+        })
+    return [row for row in out if row["label"]]
+
+
+def _extra_gift_amount(item_id: str) -> int:
+    rows = {str(row["id"]): row for row in _load_extra_gift_items(active_only=False)}
+    row = rows.get(str(item_id or ""))
+    if not row:
+        return 0
+    return int(row["amount"])
+
+
+def _save_extra_gift_edits(
+    edits: list[dict],
+    new_label: str,
+    new_amount: int,
+    updated_by: str,
+) -> str | None:
+    """기존 사은품의 단가·사용 여부를 저장하고, 이름이 있으면 새 항목을 추가한다."""
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return err or "Supabase에 연결하지 못했습니다."
+    now = datetime.now(KST).isoformat()
+    try:
+        for row in edits:
+            sc.table("app_extra_gift_items").update({
+                "amount": max(0, int(row["amount"])),
+                "active": bool(row["active"]),
+                "updated_by": updated_by or None,
+                "updated_at": now,
+            }).eq("id", int(row["id"])).execute()
+        label = (new_label or "").strip()
+        if label:
+            sort_order = 1
+            if edits:
+                sort_order = max(int(row.get("sort_order") or 0) for row in edits) + 1
+            sc.table("app_extra_gift_items").insert({
+                "label": label,
+                "amount": max(0, int(new_amount or 0)),
+                "active": True,
+                "sort_order": sort_order,
+                "updated_by": updated_by or None,
+                "updated_at": now,
+            }).execute()
+    except Exception:
+        logging.exception("추가 사은품 저장 실패")
+        return "사은품 저장에 실패했습니다. Supabase에 app_extra_gift_items 표가 있는지 확인해 주세요."
+    _load_extra_gift_items.clear()
+    return None
+
+
+def _render_extra_gift_admin(me_uname: str) -> None:
+    """관리자 설정: 추가 사은품 이름·단가. 전 매장 공통."""
+    if st.session_state.pop("gift_admin_clear_new", False):
+        st.session_state["gift_admin_new_label"] = ""
+        st.session_state["gift_admin_new_amt"] = 0
+    rows = _load_extra_gift_items(active_only=False)
+    st.caption("이름과 단가를 추가합니다. 끄면 신규 매출 목록에서만 빠지고, 이미 저장된 주문은 그대로입니다.")
+    edits: list[dict] = []
+    for row in rows:
+        c1, c2, c3 = st.columns([3, 2, 1])
+        with c1:
+            st.text_input("이름", value=row["label"], disabled=True, key=f"gift_admin_label_{row['id']}")
+        with c2:
+            amount = int(st.number_input(
+                "단가 (원)",
+                min_value=0,
+                step=100,
+                value=int(row["amount"]),
+                key=f"gift_admin_amt_{row['id']}",
+            ))
+        with c3:
+            st.write("")
+            st.write("")
+            active = st.checkbox("사용", value=bool(row["active"]), key=f"gift_admin_on_{row['id']}")
+        edits.append({
+            "id": row["id"],
+            "amount": amount,
+            "active": active,
+            "sort_order": row["sort_order"],
+        })
+    new_label = st.text_input("새 사은품 이름", key="gift_admin_new_label")
+    new_amount = int(st.number_input("새 사은품 단가 (원)", min_value=0, step=100, key="gift_admin_new_amt"))
+    if st.button("추가 사은품 저장", type="primary", key="gift_admin_save"):
+        err = _save_extra_gift_edits(edits, new_label, new_amount, me_uname)
+        if err:
+            st.error(err)
+        else:
+            st.session_state["gift_admin_clear_new"] = True
+            flash("추가 사은품을 저장했습니다.")
+            st.rerun()
+
+
+def _build_order_cost_addon_lines(cover_codes: list[str], gift_codes: list[str]) -> list[dict]:
+    """저장 당시 이름·단가를 줄로 만든다. 빈 코드는 건너뛴다."""
+    lines: list[dict] = []
+    covers = {str(row["code"]): row for row in _load_waterproof_cover_prices()}
+    for code in cover_codes:
+        row = covers.get(str(code or ""))
+        if not row:
+            continue
+        is_size = row.get("kind") == "size"
+        lines.append({
+            "kind": "cover",
+            "item_code": str(row["code"]),
+            "item_label": str(row["label"]),
+            "unit_amount": int(row["amount"]) if is_size else 0,
+            "qty": 1,
+        })
+    gifts = {str(row["id"]): row for row in _load_extra_gift_items(active_only=False)}
+    for code in gift_codes:
+        row = gifts.get(str(code or ""))
+        if not row:
+            continue
+        lines.append({
+            "kind": "gift",
+            "item_code": str(row["id"]),
+            "item_label": str(row["label"]),
+            "unit_amount": int(row["amount"]),
+            "qty": 1,
+        })
+    return lines
+
+
+def _insert_order_cost_addons(db_filename: str, order_id: int, lines: list[dict]) -> str | None:
+    """주문에 방수커버·사은품 줄을 넣는다. 줄이 없으면 아무것도 하지 않는다."""
+    if not lines:
+        return None
+    sc, err = get_supabase_client()
+    if err or not sc:
+        logging.error("사은품 줄 저장 실패: %s", err or "no client")
+        return err or "Supabase에 연결하지 못했습니다."
+    payload = []
+    for line in lines:
+        payload.append({
+            "db_filename": db_filename,
+            "order_id": int(order_id),
+            "kind": line["kind"],
+            "item_code": line["item_code"],
+            "item_label": line["item_label"],
+            "unit_amount": int(line["unit_amount"]),
+            "qty": int(line.get("qty") or 1),
+        })
+    try:
+        sc.table("app_order_cost_addons").insert(payload).execute()
+    except Exception:
+        logging.exception("사은품 줄 저장 실패")
+        return "방수커버·사은품 내역을 저장하지 못했습니다. Supabase에 app_order_cost_addons 표가 있는지 확인해 주세요."
+    return None
+
+
+def _save_new_sale_cost_addons(
+    db_filename: str,
+    order_id: int,
+    cover_codes: list[str],
+    gift_codes: list[str],
+) -> str | None:
+    lines = _build_order_cost_addon_lines(cover_codes, gift_codes)
+    expected = len([code for code in cover_codes if code]) + len([code for code in gift_codes if code])
+    err = _insert_order_cost_addons(db_filename, order_id, lines)
+    if len(lines) != expected:
+        missing = "일부 방수커버·사은품을 단가표에서 찾지 못했습니다."
+        logging.error(missing)
+        return f"{err} {missing}".strip() if err else missing
+    return err
+
+
+def _delete_order_cost_addons(db_filename: str, order_id: int) -> None:
+    """주문 삭제 시 집계 줄을 함께 지운다. 표가 없어도 주문 삭제는 막지 않는다."""
+    try:
+        sc, err = get_supabase_client()
+        if err or not sc:
+            logging.error("사은품 줄 삭제 실패: %s", err or "no client")
+            return
+        (
+            sc.table("app_order_cost_addons")
+            .delete()
+            .eq("order_id", int(order_id))
+            .eq("db_filename", db_filename)
+            .execute()
+        )
+    except Exception:
+        logging.exception("주문 사은품 줄 삭제 실패")
+
+
+def _format_addon_qty(value: float) -> str:
+    nearest = round(value)
+    if abs(value - nearest) < 1e-9:
+        return str(int(nearest))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _fetch_order_cost_addons(db_filename: str, order_ids: list[int]) -> tuple[list[dict], str | None]:
+    sc, err = get_supabase_client()
+    if err or not sc:
+        return [], err or "Supabase에 연결하지 못했습니다."
+    rows: list[dict] = []
+    try:
+        for start in range(0, len(order_ids), 200):
+            chunk = [int(oid) for oid in order_ids[start:start + 200]]
+            if not chunk:
+                continue
+            found = (
+                sc.table("app_order_cost_addons")
+                .select("order_id, kind, item_code, item_label, unit_amount, qty")
+                .eq("db_filename", db_filename)
+                .in_("order_id", chunk)
+                .execute()
+            )
+            rows.extend(list(found.data or []))
+    except Exception:
+        logging.exception("사은품 집계 조회 실패")
+        return [], "집계 표를 읽지 못했습니다. Supabase에 app_order_cost_addons 표가 있는지 확인해 주세요."
+    return rows, None
+
+
+def _render_addon_usage_report() -> None:
+    """이번 매장·선택 연월의 방수커버 사이즈별 개수와 판매자 1/n 개수."""
+    st.header("방수커버·사은품 집계")
+    db_filename = st.session_state.get("current_db") or ""
+    if not db_filename:
+        st.warning("매장 DB 정보를 찾을 수 없습니다.")
+        return
+    store_name = _get_store_name_by_db(db_filename) or db_filename
+    st.caption(f"{store_name} · 계약일 기준. 이 메뉴를 넣기 전에 등록한 주문은 사이즈가 저장되지 않아 나오지 않습니다.")
+    today = _today_kst()
+    ycol, mcol = st.columns(2)
+    with ycol:
+        year = int(st.selectbox("연도", [today.year, today.year - 1, today.year - 2], key="addon_report_year"))
+    with mcol:
+        month = int(st.selectbox(
+            "월",
+            list(range(1, 13)),
+            index=today.month - 1,
+            format_func=lambda m: f"{m}월",
+            key="addon_report_month",
+        ))
+    start = date(year, month, 1).isoformat()
+    end = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
+    orders_df = _load_orders_supabase(db_filename, "id, employee_names, order_date", start_date=start, end_date=end)
+    if orders_df.empty or "id" not in orders_df.columns:
+        st.info("이 달에 저장된 방수커버·사은품이 없습니다.")
+        return
+    order_ids = [int(oid) for oid in orders_df["id"].tolist() if oid is not None]
+    emp_by_order = {
+        int(row["id"]): row.get("employee_names")
+        for _, row in orders_df.iterrows()
+        if row.get("id") is not None
+    }
+    lines, err = _fetch_order_cost_addons(db_filename, order_ids)
+    if err:
+        st.error(err)
+        return
+    if not lines:
+        st.info("이 달에 저장된 방수커버·사은품이 없습니다.")
+        return
+
+    cover_order = {str(row["code"]): int(row["sort_order"]) for row in _load_waterproof_cover_prices()}
+    item_qty: dict[tuple, dict] = {}
+    none_qty = 0
+    emp_qty: dict[tuple, dict] = {}
+    for line in lines:
+        try:
+            oid = int(line.get("order_id"))
+            qty = int(line.get("qty") or 1)
+            unit = int(line.get("unit_amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        kind = str(line.get("kind") or "")
+        code = str(line.get("item_code") or "")
+        label = str(line.get("item_label") or code)
+        if kind == "cover" and code == "none":
+            none_qty += qty
+        else:
+            bucket = item_qty.setdefault((kind, code, label), {"qty": 0, "amount": 0})
+            bucket["qty"] += qty
+            bucket["amount"] += unit * qty
+        emps = _kpi_parse_employee_list(emp_by_order.get(oid)) or ["미지정"]
+        share = qty / len(emps)
+        cost_share = (unit * qty) / len(emps)
+        for emp in emps:
+            eb = emp_qty.setdefault((emp, kind, code, label), {"qty": 0.0, "amount": 0.0})
+            eb["qty"] += share
+            eb["amount"] += cost_share
+
+    def _kind_label(kind: str) -> str:
+        return "방수커버" if kind == "cover" else "사은품"
+
+    def _item_sort(key: tuple) -> tuple:
+        kind, code, label = key
+        if kind == "cover":
+            return (0, cover_order.get(code, 99), label)
+        return (1, 0, label)
+
+    given_qty = sum(row["qty"] for key, row in item_qty.items() if key[0] == "cover")
+    gift_qty = sum(row["qty"] for key, row in item_qty.items() if key[0] == "gift")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("방수커버 지급", f"{given_qty}개")
+    m2.metric("증정안함", f"{none_qty}건")
+    m3.metric("사은품", f"{gift_qty}개")
+
+    size_rows = []
+    for key in sorted(item_qty, key=_item_sort):
+        kind, _code, label = key
+        row = item_qty[key]
+        size_rows.append({
+            "구분": _kind_label(kind),
+            "항목": label,
+            "개수": int(row["qty"]),
+            "원가 합계": f"{int(row['amount']):,}원",
+        })
+    if none_qty:
+        size_rows.append({"구분": "방수커버", "항목": "증정안함", "개수": int(none_qty), "원가 합계": "0원"})
+
+    emp_rows = []
+    for key in sorted(emp_qty, key=lambda k: (k[0],) + _item_sort(k[1:])):
+        emp, kind, _code, label = key
+        row = emp_qty[key]
+        emp_rows.append({
+            "판매자": emp,
+            "구분": _kind_label(kind),
+            "항목": label,
+            "개수": _format_addon_qty(float(row["qty"])),
+            "원가": f"{int(round(row['amount'])):,}원",
+        })
+
+    tab_size, tab_emp = st.tabs(["사이즈별", "판매자별"])
+    with tab_size:
+        st.dataframe(pd.DataFrame(size_rows), width="stretch", hide_index=True)
+        st.caption("증정안함은 지급 개수에 넣지 않습니다.")
+    with tab_emp:
+        st.dataframe(pd.DataFrame(emp_rows), width="stretch", hide_index=True)
+        st.caption(
+            f"판매자가 여러 명이면 줄마다 1/n입니다. 위 칸을 더하면 반올림 때문에 어긋날 수 있고, "
+            f"나누기 전 합계는 방수커버 {given_qty}개, 증정안함 {none_qty}건, 사은품 {gift_qty}개입니다."
+        )
+
+
 def render_admin_settings():
     """⚙️ 관리자 설정 — ERP 운영 설정을 모아두는 허브.
     알림톡·카카오 채널 설정, 알림 문구 편집 등을 포함하며 항목이 늘어나면 여기에 추가."""
@@ -38599,6 +38967,13 @@ def render_admin_settings():
     st.subheader("10. 방수커버 단가")
     with st.expander("사이즈별 금액", expanded=False):
         _render_waterproof_cover_admin(me_uname)
+
+    st.divider()
+
+    # ── 11. 추가 사은품 (전 매장 공통) ───────────────────────────
+    st.subheader("11. 추가 사은품")
+    with st.expander("이름·단가", expanded=False):
+        _render_extra_gift_admin(me_uname)
 
 
 # 사내 게시판 섹션 레지스트리 — 나중에 일정/할일/투표 활성화 시
@@ -41114,6 +41489,8 @@ def render_new_sales():
     if "_sales_complete_banner" in st.session_state:
         _b = st.session_state.pop("_sales_complete_banner")
         st.success(f"✅ 입력 완료! {_b['cust_name']}님 {_b['amount']:,}원 매출 등록이 완료되었습니다.")
+    if "_addon_save_error_banner" in st.session_state:
+        st.warning(st.session_state.pop("_addon_save_error_banner"))
     # sales 테이블 INSERT 실패 경고 배너 (주문·결제는 저장되었으나 매출 집계·KPI 반영 실패)
     if "_sales_insert_error_banner" in st.session_state:
         _se = st.session_state.pop("_sales_insert_error_banner")
@@ -41476,9 +41853,64 @@ def render_new_sales():
         if st.button("방수커버 추가", key=f"cover_add_{_form_reset}"):
             st.session_state[_count_key] = _cover_count + 1
             st.rerun()
+    _gift_extra = 0
+    _gift_codes: list[str] = []
+    _gift_rows = _load_extra_gift_items(active_only=True)
+    _gift_count_key = f"gift_count_{_form_reset}"
+    if _gift_count_key not in st.session_state:
+        st.session_state[_gift_count_key] = 0
+    _gift_count = max(0, int(st.session_state.get(_gift_count_key) or 0))
+    _gift_del = st.session_state.pop(f"gift_del_{_form_reset}", None)
+    if isinstance(_gift_del, int) and _gift_count > 0 and 0 <= _gift_del < _gift_count:
+        for _j in range(_gift_del, _gift_count - 1):
+            st.session_state[f"gift_item_{_form_reset}_{_j}"] = st.session_state.get(
+                f"gift_item_{_form_reset}_{_j + 1}", ""
+            )
+        st.session_state.pop(f"gift_item_{_form_reset}_{_gift_count - 1}", None)
+        _gift_count -= 1
+        st.session_state[_gift_count_key] = _gift_count
+    if _gift_rows or _gift_count:
+        _gift_by_id = {str(row["id"]): row for row in _gift_rows}
+
+        def _gift_item_label(code: str) -> str:
+            if not code:
+                return "선택하세요"
+            row = _gift_by_id.get(str(code))
+            if not row:
+                return code
+            return f"{row['label']} ({int(row['amount']):,}원)"
+
+        for _i in range(_gift_count):
+            _picked = str(st.session_state.get(f"gift_item_{_form_reset}_{_i}") or "")
+            _gift_options = [""] + [str(row["id"]) for row in _gift_rows]
+            if _picked and _picked not in _gift_options:
+                _gift_options.append(_picked)
+            _gc1, _gc2 = st.columns([6, 1])
+            with _gc1:
+                _gift_code_i = st.selectbox(
+                    f"추가 사은품 #{_i + 1} *",
+                    options=_gift_options,
+                    format_func=_gift_item_label,
+                    key=f"gift_item_{_form_reset}_{_i}",
+                )
+            with _gc2:
+                st.write("")
+                st.write("")
+                if st.button("삭제", key=f"gift_del_btn_{_form_reset}_{_i}"):
+                    st.session_state[f"gift_del_{_form_reset}"] = _i
+                    st.rerun()
+            _gift_code_s = str(_gift_code_i or "")
+            _gift_codes.append(_gift_code_s)
+            _gift_extra += _extra_gift_amount(_gift_code_s)
+        if _gift_rows and st.button("사은품 추가", key=f"gift_add_{_form_reset}"):
+            st.session_state[_gift_count_key] = _gift_count + 1
+            st.rerun()
+    elif not _gift_rows:
+        st.caption("추가 사은품은 관리자 설정에서 등록한 뒤에 고를 수 있습니다.")
+    if _bed_selected or _gift_count:
         _typed_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0"))
         st.caption(
-            f"입력 원가 {_typed_cost:,}원 + 방수커버 {_cover_extra:,}원 = {_typed_cost + _cover_extra:,}원"
+            f"입력 원가 {_typed_cost:,}원 + 방수커버 {_cover_extra:,}원 + 사은품 {_gift_extra:,}원 = {_typed_cost + _cover_extra + _gift_extra:,}원"
         )
     if has_display:
         if "display_sales_amount" not in st.session_state:
@@ -41500,7 +41932,7 @@ def render_new_sales():
         )
     # 실시간 합산: 최종 총 판매금액, 최종 총 원가, 기본 총 마진
     general_sales = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
-    general_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0")) + int(_cover_extra or 0)
+    general_cost = _parse_comma_to_int(st.session_state.get("cost_price", "0")) + int(_cover_extra or 0) + int(_gift_extra or 0)
     display_sales_val = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
     display_cost_val = _parse_comma_to_int(st.session_state.get("display_cost_amount", "0")) if has_display else 0
     final_sales = general_sales + display_sales_val
@@ -41747,6 +42179,9 @@ def render_new_sales():
         if _bed_selected and (not _cover_codes or any(not _code for _code in _cover_codes)):
             st.error("방수커버(필수)를 선택하세요.")
             st.stop()
+        if _gift_codes and any(not _code for _code in _gift_codes):
+            st.error("추가 사은품을 선택하세요.")
+            st.stop()
         # 방문 이유 필수
         if not visit_reason_sel:
             st.error("방문 이유(필수)를 선택하세요.")
@@ -41768,7 +42203,7 @@ def render_new_sales():
         if not selected_employees:
             st.error("담당 직원(필수)을 1명 이상 선택하세요. KPI·실적 분배에 필요합니다.")
             st.stop()
-        cost_price_int = _parse_comma_to_int(st.session_state.get("cost_price", "0")) + int(_cover_extra or 0)
+        cost_price_int = _parse_comma_to_int(st.session_state.get("cost_price", "0")) + int(_cover_extra or 0) + int(_gift_extra or 0)
         general_sales_int = _parse_comma_to_int(st.session_state.get("total_amount", "0"))
         display_sales_int = _parse_comma_to_int(st.session_state.get("display_sales_amount", "0")) if has_display else 0
         display_cost_int = _parse_comma_to_int(st.session_state.get("display_cost_amount", "0")) if has_display else 0
@@ -41981,6 +42416,7 @@ def render_new_sales():
             if order_id is None:
                 st.error("주문 등록에 실패했습니다. Supabase를 확인해 주세요.")
                 st.stop()
+            _addon_err = _save_new_sale_cost_addons(db_filename, order_id, _cover_codes, _gift_codes)
             total_fees = 0.0
             total_paid_initial = 0
             for i in range(slot_count):
@@ -42096,6 +42532,8 @@ def render_new_sales():
                     except Exception:
                         pass
             st.session_state["_sales_complete_banner"] = {"amount": final_sales_save, "cust_name": cust_name}
+            if _addon_err:
+                st.session_state["_addon_save_error_banner"] = _addon_err
             st.rerun()
         else:
             conn = get_tenant_conn(db_filename)
@@ -42126,6 +42564,7 @@ def render_new_sales():
                     "미납",
                 ))
                 order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                _addon_err = _save_new_sale_cost_addons(db_filename, order_id, _cover_codes, _gift_codes)
                 total_fees = 0.0
                 total_paid_initial = 0
                 for i in range(slot_count):
@@ -42211,6 +42650,8 @@ def render_new_sales():
                     except Exception:
                         pass
             st.session_state["_sales_complete_banner"] = {"amount": final_sales_save, "cust_name": cust_name}
+            if _addon_err:
+                st.session_state["_addon_save_error_banner"] = _addon_err
             st.rerun()
 
 
@@ -49206,6 +49647,8 @@ def main():
             _render_mobile_contract_app(user, _db_contract, embedded=False)
         else:
             st.warning("매장 DB 정보를 찾을 수 없습니다.")
+    elif (role == "store_admin" and idx == 16) or (role == "user" and idx == 12):
+        _render_addon_usage_report()
 
 
 if __name__ == "__main__":
